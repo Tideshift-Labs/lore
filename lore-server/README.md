@@ -27,11 +27,16 @@ LORE_ENV=production cargo run --bin loreserver
 
 ### Configuration
 
-Configuration files are TOML-based and loaded in the following order:
-1. `{config_path}/default.toml` - Base configuration
-2. `{config_path}/{LORE_ENV}.toml` - Environment-specific overrides
-3. `{config_path}/local.toml` - Local overrides (optional)
-4. Environment variables with `LORE__` prefix
+Configuration is TOML-based and applied in the following order (later sources win):
+
+1. **Compiled-in defaults** — `config/default.toml` is baked into the binary at compile time. The server starts with sensible defaults even with no config files on disk.
+2. **On-disk `default.toml`** — if `{config_path}/default.toml` exists it is layered on top, letting operators override compiled-in defaults without a rebuild.
+3. **Environment config** — `{config_path}/{LORE_ENV}.toml` (optional)
+4. **Regional override** — `{config_path}/{LORE_ENV}_{LORE_PLATFORM_REGION}.toml` (optional)
+5. **Local overrides** — `{config_path}/local.toml` (optional)
+6. **Environment variables** — prefixed with `LORE__`, using `__` as separator
+
+`config_path` defaults to `lore-server/config` and can be overridden with `--config` or `LORE_CONFIG_PATH`. All on-disk files are optional.
 
 See the `examples/` directory for complete configuration examples:
 - `config-local.toml` - Local storage with fixed topology

@@ -103,12 +103,15 @@ impl Settings {
     ///
     /// Layering order (later sources win):
     /// 1. The built-in [`DEFAULT_CONFIG_TOML`] (always present).
-    /// 2. The optional files `<environment>.toml`,
+    /// 2. The optional on-disk `default.toml` from the config directory.
+    ///    When present it lets operators tune the compiled-in defaults without
+    ///    requiring a rebuild.
+    /// 3. The optional files `<environment>.toml`,
     ///    `<environment>_<region>.toml`, and `local.toml` from the config
     ///    directory. The directory comes from `config_path` (via `--config` /
     ///    `LORE_CONFIG_PATH`) when supplied, otherwise it falls back to
     ///    [`DEFAULT_CONFIG_DIR`].
-    /// 3. Environment variables prefixed with `LORE__`.
+    /// 4. Environment variables prefixed with `LORE__`.
     ///
     /// Every on-disk file is optional, so the server still starts from the
     /// built-in defaults (and environment variables) even when the config
@@ -129,12 +132,17 @@ impl Settings {
             config::FileFormat::Toml,
         ));
 
-        // Layer optional on-disk overrides. Use the config directory supplied
-        // on the command line (or via LORE_CONFIG_PATH) when present, otherwise
-        // fall back to the default `lore-server/config` directory. Every file is
-        // optional: missing files (or a missing directory) are silently skipped.
+        // Resolve the config directory: use the path supplied on the command
+        // line (or via LORE_CONFIG_PATH) when present, otherwise fall back to
+        // the default `lore-server/config` directory. Every on-disk file below
+        // is optional: missing files (or a missing directory) are silently skipped.
         let config_path = config_path.unwrap_or(DEFAULT_CONFIG_DIR);
         println!("Using config path: {config_path}");
+
+        // Layer an optional on-disk default.toml for env/region agnostic settings
+        // extending the built-in defaults
+        settings_builder = settings_builder
+            .add_source(config::File::with_name(&format!("{config_path}/default")).required(false));
         settings_builder = settings_builder.add_source(
             config::File::with_name(&format!("{config_path}/{environment}")).required(false),
         );

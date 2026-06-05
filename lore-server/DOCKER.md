@@ -14,7 +14,7 @@ telemetry integration, or replication is configured.
 From the repository root:
 
 ```sh
-docker build --platform linux/amd64 -f urc-server/Dockerfile -t loreserver .
+docker build --platform linux/amd64 -f lore-server/Dockerfile -t loreserver .
 ```
 
 The build compiles the `loreserver` binary and generates self-signed TLS certificates for QUIC
@@ -52,14 +52,14 @@ docker run \
 
 ## Configuration
 
-The image uses two config files in `/etc/urc/config/`:
+The image stores config files in `/etc/lore/config/` (`LORE_CONFIG_PATH`):
 
-- `default.toml` — base server configuration (copied from `urc-server/config/default.toml`)
-- `docker.toml` — overrides store paths to `/data` and configures QUIC TLS certificates
+- `default.toml` — copied from `lore-server/config/default.toml` at image build time. Loaded as the on-disk default layer on top of the compiled-in defaults, so you can mount a custom `default.toml` to override compiled-in values without rebuilding the image.
+- `docker.toml` — overrides store paths to `/data` and configures QUIC TLS certificates. Loaded as the `docker` environment layer (`LORE_ENV=docker`).
 
-Settings can be overridden via environment variables with the `URC__` prefix and `__` as the
+Settings can be overridden via environment variables with the `LORE__` prefix and `__` as the
 separator. For example:
 
 ```sh
-docker run -e URC__SERVER__HTTP__PORT=8080 -p 8080:8080 -p 41337:41337/tcp -p 41337:41337/udp loreserver
+docker run -e LORE__SERVER__HTTP__PORT=8080 -p 8080:8080 -p 41337:41337/tcp -p 41337:41337/udp loreserver
 ```

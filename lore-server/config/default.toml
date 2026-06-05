@@ -5,13 +5,16 @@
 # Environment-specific configs (ci.toml, gamedev.toml, etc.) override these.
 #
 # NOTE: This file is BAKED INTO THE SERVER BINARY at compile time via
-# `include_str!` (see `Settings::load` in lore-server/src/settings.rs). It is the
-# single source of truth for the built-in defaults, so the server starts with
-# sensible settings and NO external config files. It is NOT read from disk at
-# runtime and does NOT need to be packaged or deployed alongside the binary.
-# Editing it changes the compiled-in defaults and requires a rebuild to take
-# effect. On-disk config files (passed via `--config` / `LORE_CONFIG_PATH`) are
-# layered on top of these defaults as optional overrides.
+# `include_str!` (see `Settings::load` in lore-server/src/settings.rs). It is
+# the single source of truth for the compiled-in defaults, so the server starts
+# with sensible settings even when no external config files are present.
+#
+# In addition, if a `default.toml` is found on disk inside the config directory
+# at startup (the directory set by `--config` / `LORE_CONFIG_PATH`, defaulting
+# to `lore-server/config`), it is layered on top of the compiled-in defaults.
+# This allows operators to override defaults without requiring a rebuild.
+# Editing this file changes the compiled-in defaults and requires a rebuild to
+# take effect.
 
 [server]
 connection_close_timeout_seconds = 5
