@@ -934,7 +934,7 @@ Branch latest related commands
 
 ###### **Subcommands:**
 
-* `list` — 
+* `list` —
 
 
 
@@ -2674,9 +2674,9 @@ Manage the shared store
 
 ###### **Subcommands:**
 
-* `create` — 
-* `info` — 
-* `set-use-automatically` — 
+* `create` —
+* `info` —
+* `set-use-automatically` —
 
 
 

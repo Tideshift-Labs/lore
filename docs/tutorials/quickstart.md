@@ -99,8 +99,8 @@ On branch main revision 0 -> 0000000000000000...
 Remote revision 0 -> 0000000000000000...
 Local branch in sync with remote
 Changes staged for commit:
-A hello.txt 
-A sample.bin 
+A hello.txt
+A sample.bin
 ```
 
 (Your repository ID will differ. The `A` prefix means the file is newly added.)
