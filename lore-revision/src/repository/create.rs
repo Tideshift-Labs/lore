@@ -138,7 +138,7 @@ pub async fn create_with_metadata(
     let context = execution_context();
     let call = context.globals();
 
-    let (remote_url, name) = repository::parse_url(repository_url, call.offline())
+    let (remote_url, name) = repository::parse_url(repository_url, call.offline_or_local())
         .forward::<CreateError>("parsing repository URL")?;
 
     if !repository::is_valid_name(name.as_str()) {
@@ -177,7 +177,7 @@ pub async fn create_with_metadata(
         Context::from(uuid::Uuid::now_v7())
     };
 
-    let connection = if !call.offline() {
+    let connection = if !call.offline_or_local() {
         // Try to create the repository on server
         let connection = protocol::connect(
             remote_url.as_str(),

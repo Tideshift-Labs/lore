@@ -791,13 +791,20 @@ pub fn handle_repository_list(globals: LoreGlobalArgs, args: &RepositoryListArgs
 pub fn handle_repository_create(globals: LoreGlobalArgs, args: &RepositoryCreateArgs) -> u8 {
     // Check if we have a full URL or just a name
     let url = if !args.url.contains("/") {
-        let Ok(mut url) = std::env::var("LORE_REMOTE_URL") else {
-            println!("Repository URL must include a host name");
-            return 1;
-        };
-        url.push('/');
-        url.push_str(args.url.as_str());
-        url
+        match std::env::var("LORE_REMOTE_URL") {
+            Ok(mut url) => {
+                url.push('/');
+                url.push_str(args.url.as_str());
+                url
+            }
+            // Offline/local create never connects to a remote, so a bare
+            // repository name is accepted as-is without a host name.
+            Err(_) if globals.offline() || globals.local() => args.url.clone(),
+            Err(_) => {
+                println!("Repository URL must include a host name");
+                return 1;
+            }
+        }
     } else {
         args.url.clone()
     };

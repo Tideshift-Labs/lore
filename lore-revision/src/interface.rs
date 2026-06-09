@@ -558,6 +558,12 @@ impl LoreGlobalArgs {
         self.local != 0
     }
 
+    /// True when the operation should avoid the server: either explicit
+    /// offline mode or local-only data mode.
+    pub fn offline_or_local(&self) -> bool {
+        self.offline() || self.local()
+    }
+
     pub fn remote(&self) -> bool {
         self.remote != 0
     }
