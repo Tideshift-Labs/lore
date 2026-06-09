@@ -365,9 +365,19 @@ async fn file_size_from_node_change_path(
         Ok(0)
     } else {
         let path_str = change.path.as_str().to_string();
-        let metadata = tokio::fs::metadata(change.path.to_absolute_path(repository_path))
-            .await
-            .internal_with(|| format!("accessing metadata for file {path_str}"))?;
+        let result = tokio::fs::metadata(change.path.to_absolute_path(repository_path)).await;
+        // The file may have vanished between the diff's filesystem walk and
+        // this stat — e.g. a concurrent `branch switch` deleted it from the
+        // working directory. Treat the concurrent deletion as benign and
+        // report size 0 (matching the `FileAction::Delete` branch above)
+        // rather than failing the whole status command with an Internal error.
+        if let Err(err) = &result
+            && err.kind() == std::io::ErrorKind::NotFound
+        {
+            return Ok(0);
+        }
+        let metadata =
+            result.internal_with(|| format!("accessing metadata for file {path_str}"))?;
         #[cfg(target_family = "windows")]
         let size = metadata.file_size();
         #[cfg(target_family = "unix")]

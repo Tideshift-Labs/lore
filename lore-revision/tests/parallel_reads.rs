@@ -7,6 +7,8 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
     use std::time::Instant;
 
@@ -295,6 +297,160 @@ mod tests {
             .expect("Test task failed");
     }
 
+    // Race-repro configuration. A wide working-directory delta (many files)
+    // and a long-running switcher maximize the TOCTOU window between the
+    // status scan's directory walk and its per-file metadata stat.
+    const RACE_EXTRA_FILES: usize = 400;
+    const RACE_SWITCH_ITERS: usize = 80;
+    const RACE_SCANNER_TASKS: usize = 6;
+    // Safety cap so scanners can never spin forever if the switcher wedges.
+    const RACE_MAX_SCANS_PER_TASK: usize = 5000;
+
+    /// Regression test for a TOCTOU race between `branch switch` and a
+    /// concurrent `status --scan`.
+    ///
+    /// When a branch switch moves from a revision that *has* a set of files to
+    /// one that does *not*, it deletes those files from the working directory
+    /// (`sync::sync` → `realize_changes_delete`) *before* it updates the
+    /// current anchor. A simultaneous `status --scan` walks the filesystem and
+    /// then, for each detected change, performs an independent
+    /// `tokio::fs::metadata` stat (`file_size_from_node_change_path`). If the
+    /// switch unlinks a file between the walk and that stat, the stat fails
+    /// with `NotFound` — which previously surfaced as an `Internal` error and
+    /// failed the whole `status` command.
+    ///
+    /// The scanner runs on a **read-only** repository context: it shares the
+    /// process-local repository flock with the switching writer (so the two
+    /// interleave at filesystem granularity) but holds no write token, so its
+    /// scan never serializes on the per-path write mutex. This mirrors an
+    /// embedded SDK host (e.g. the desktop client) displaying status while
+    /// another in-process context performs a branch switch.
+    ///
+    /// Before the fix this test fails: at least one concurrent scan observes a
+    /// file mid-delete and returns an error. After the fix, a `NotFound` during
+    /// the size stat is treated as a benign concurrent deletion and every scan
+    /// succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn status_scan_survives_concurrent_branch_switch_delete() {
+        let execution = setup_test_execution();
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let SeededRepo {
+                    repository,
+                    sig2,
+                    path,
+                    _tempdir,
+                    ..
+                } = Box::pin(setup_seeded_repo(repository_id)).await;
+
+                // Commit a large set of extra files on top of sig2. `sig_full`
+                // contains them; `sig2` does not. Switching the anchor
+                // sig_full → sig2 realizes a delete of all RACE_EXTRA_FILES from
+                // the working directory; sig2 → sig_full restores them. Both
+                // revisions are on the default branch, so `branch_switch`
+                // accepts either via its `signature` option.
+                let sig_full =
+                    commit_n_files(&repository, &path, "race", RACE_EXTRA_FILES, 0x33).await;
+
+                // Read-only status context (see the doc comment): shares the
+                // flock, holds no write token.
+                let status_repo =
+                    repository::load_and_connect(path.as_path(), RepositoryAccess::ReadOnly)
+                        .await
+                        .expect("read-only status context");
+
+                let main_branch = branch::DEFAULT_DEFAULT_NAME.to_string();
+                let done = Arc::new(AtomicBool::new(false));
+
+                // Switcher: alternate the working directory between the
+                // file-rich and file-poor revisions, deleting/restoring
+                // RACE_EXTRA_FILES on each switch.
+                let mut switcher: JoinSet<()> = JoinSet::new();
+                {
+                    let repo = repository.clone();
+                    let main_branch = main_branch.clone();
+                    let done = done.clone();
+                    lore_spawn!(switcher, async move {
+                        let token = repo
+                            .try_write_token()
+                            .expect("switcher requires write-mode repository context");
+                        for i in 0..RACE_SWITCH_ITERS {
+                            let signature = if i % 2 == 0 { sig2 } else { sig_full };
+                            Box::pin(repository::branch_switch(
+                                repo.clone(),
+                                token,
+                                main_branch.clone(),
+                                repository::BranchSwitchOptions {
+                                    signature: Some(signature.to_string()),
+                                    local: true,
+                                    ..Default::default()
+                                },
+                            ))
+                            .await
+                            .expect("branch switch");
+                        }
+                        done.store(true, Ordering::Relaxed);
+                    });
+                }
+
+                // Scanners: hammer `status --scan` for as long as the switcher
+                // runs, collecting any errors instead of unwrapping inline.
+                let mut scanners: JoinSet<Vec<String>> = JoinSet::new();
+                for _ in 0..RACE_SCANNER_TASKS {
+                    let repo = status_repo.clone();
+                    let done = done.clone();
+                    lore_spawn!(scanners, async move {
+                        let mut errors: Vec<String> = Vec::new();
+                        let mut scans = 0usize;
+                        while !done.load(Ordering::Relaxed) && scans < RACE_MAX_SCANS_PER_TASK {
+                            scans += 1;
+                            let res = repository::status::status(
+                                repo.clone(),
+                                None,
+                                repository::status::StatusOptions {
+                                    staged: false,
+                                    scan: true,
+                                    check_dirty: false,
+                                    reset: false,
+                                    sync_point: false,
+                                    revision_only: false,
+                                    count: false,
+                                },
+                            )
+                            .await;
+                            if let Err(err) = res {
+                                errors.push(format!("{err:?}"));
+                            }
+                        }
+                        errors
+                    });
+                }
+
+                switcher
+                    .join_next()
+                    .await
+                    .expect("switcher panicked")
+                    .expect("switcher task");
+
+                let mut all_errors: Vec<String> = Vec::new();
+                while let Some(joined) = scanners.join_next().await {
+                    all_errors.extend(joined.expect("scanner task panicked"));
+                }
+
+                assert!(
+                    all_errors.is_empty(),
+                    "status --scan must not error during a concurrent branch switch \
+                     delete; got {} error(s), first: {}",
+                    all_errors.len(),
+                    all_errors.first().map_or("", String::as_str),
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// Setup state shared by both tests: a fresh on-disk repository with
     /// two seed commits, built via the production `create_local` →
     /// `load_and_connect_with_token` path. The `_tempdir` field keeps the
@@ -443,6 +599,60 @@ mod tests {
         ))
         .await
         .expect("Failed to commit seed revision")
+    }
+
+    /// Write `count` files named `{prefix}_{i}.bin` filled with `byte` under
+    /// `path`, stage them with scan enabled, and commit. Returns the commit
+    /// signature. Used to create a wide, switchable working-directory delta.
+    async fn commit_n_files(
+        repository: &Arc<RepositoryContext>,
+        path: &std::path::Path,
+        prefix: &str,
+        count: usize,
+        byte: u8,
+    ) -> Hash {
+        for i in 0..count {
+            let file_path = path.join(format!("{prefix}_{i:04}.bin"));
+            let mut f = std::fs::File::options()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&file_path)
+                .expect("Failed to create race file");
+            f.write_all(&vec![byte; SEED_FILE_BYTES])
+                .expect("Failed to write race file");
+        }
+        let token = repository
+            .try_write_token()
+            .expect("commit_n_files requires write-mode repository context");
+        file::stage::stage(
+            repository.clone(),
+            token,
+            LoreArray::from_vec(vec![LoreString::from(path)]),
+            StageOptions {
+                case_change: stage::StageCaseChange::Error,
+                node_flags: NodeFlags::NoFlags,
+                file_id: None,
+                no_children: false,
+                scan: true,
+            },
+        )
+        .await
+        .expect("Failed to stage race files");
+        Box::pin(commit::commit(
+            repository.clone(),
+            token,
+            CommitOptions {
+                message: String::new(),
+                link_messages: std::collections::HashMap::new(),
+                link: None,
+                layer_messages: std::collections::HashMap::new(),
+                layer: None,
+            },
+        ))
+        .await
+        .expect("Failed to commit race revision")
     }
 
     fn summarize(label: &str, samples: &mut [Duration]) {
