@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::fs;
+use std::io::Read;
+use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
@@ -10,6 +13,7 @@ use base64::prelude::BASE64_STANDARD;
 use base64::prelude::Engine as _;
 use lore_base::directories::project_directory;
 use lore_base::error::TokenNotFound;
+use lore_base::fs::lock::FSLock;
 use lore_base::lore_debug;
 use lore_base::lore_trace;
 use lore_base::lore_warn;
@@ -28,9 +32,6 @@ use ring::rand::SecureRandom;
 use ring::rand::SystemRandom;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use toml;
 use zerocopy::IntoBytes;
@@ -114,6 +115,9 @@ fn token_map() -> &'static Mutex<Option<TokenMap>> {
     TOKEN_MAP.get_or_init(|| Mutex::new(None))
 }
 
+/// Base directory holding the auth store files (`tokens.toml` and the
+/// encryption-key fallback). The `LORE_AUTH_PATH` environment variable
+/// overrides the default per-user configuration directory.
 fn base_path(create_dir: bool) -> Result<PathBuf, TokenStoreError> {
     if let Ok(path) = std::env::var("LORE_AUTH_PATH")
         && !path.is_empty()
@@ -202,7 +206,8 @@ pub async fn load_all_identities(
         let token_map = token_map();
         let mut store = token_map.lock().await;
         if store.is_none()
-            && let Ok(loaded_map) = load_token_map().await
+            && let Ok(guard) = lock_token_map().await
+            && let Ok(loaded_map) = load_token_map(&guard)
         {
             store.replace(loaded_map);
         }
@@ -249,23 +254,67 @@ pub async fn load_all_identities(
 
 /// Clear token map and tokens.toml file.
 pub async fn reset_tokens() -> Result<(), TokenStoreError> {
-    store_token_map(&TokenMap::default()).await?;
     let token_map = token_map();
     let mut store = token_map.lock().await;
+    let guard = lock_token_map().await?;
+    store_token_map(&guard, &TokenMap::default())?;
     if store.is_some() {
         store.replace(TokenMap::default());
     }
     Ok(())
 }
 
-async fn load_token_map() -> Result<TokenMap, TokenStoreError> {
-    let path = token_map_path(false)?;
-    let mut config_file = match OpenOptions::new()
-        .create(false)
-        .read(true)
-        .open(path.as_path())
-        .await
+/// Open options for the store files. On Windows the share mode admits
+/// concurrent readers but denies other writers for as long as the file is
+/// open, excluding even processes that do not take the store lock.
+fn store_open_options() -> fs::OpenOptions {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut options = fs::OpenOptions::new();
+    #[cfg(windows)]
     {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
+    }
+    options
+}
+
+/// Serializes store file access across lore processes via the `<file>.lock`
+/// sidecar, released when the returned guard drops. Hold the guard across a
+/// whole load -> modify -> store span (not just the individual file
+/// operations) so concurrent processes cannot interleave their updates.
+async fn lock_store_file(path: &Path) -> Result<FSLock, TokenStoreError> {
+    let path = path.to_path_buf();
+    lore_base::lore_spawn_blocking!(move || FSLock::acquire_file_lock(path))
+        .await
+        .map_err(|e| TokenStoreError::internal_with_context(e, "Failed to lock store file"))?
+        .map_err(|e| {
+            lore_warn!("Failed to lock store file: {e}");
+            TokenStoreError::internal_with_context(e, "Failed to lock store file")
+        })
+}
+
+/// Cross-process guard for `tokens.toml`, creating the store directory so
+/// the lock sidecar can be placed next to the file.
+async fn lock_token_map() -> Result<FSLock, TokenStoreError> {
+    lock_store_file(token_map_path(true)?.as_path()).await
+}
+
+/// Refreshes the in-memory token map from disk ahead of a mutation: another
+/// process may have updated the file since it was cached. Callers hold the
+/// store lock, so the reloaded state cannot change before it is written back.
+fn reload_token_map(guard: &FSLock, store: &mut Option<TokenMap>) {
+    if let Ok(loaded_map) = load_token_map(guard) {
+        store.replace(loaded_map);
+    }
+}
+
+/// Loads `tokens.toml`. The `_guard` parameter proves the caller holds the
+/// cross-process store lock for the duration of the read.
+fn load_token_map(_guard: &FSLock) -> Result<TokenMap, TokenStoreError> {
+    let path = token_map_path(false)?;
+    let mut options = store_open_options();
+    options.read(true);
+    let mut config_file = match options.open(path.as_path()) {
         Ok(file) => file,
         Err(err) => {
             lore_debug!("Failed to load token map file: {err}");
@@ -277,13 +326,13 @@ async fn load_token_map() -> Result<TokenMap, TokenStoreError> {
     };
 
     let mut config = String::default();
-    config_file
-        .read_to_string(&mut config)
-        .await
-        .map_err(|err| {
-            lore_warn!("Failed to read token map file in {}: {err}", path.display());
-            TokenStoreError::internal_with_context(err, "Failed to load token map")
-        })?;
+    // Read via the guarded handle; `fs::read_to_string` would re-open the
+    // file without the cross-process guard.
+    #[allow(clippy::verbose_file_reads)]
+    config_file.read_to_string(&mut config).map_err(|err| {
+        lore_warn!("Failed to read token map file in {}: {err}", path.display());
+        TokenStoreError::internal_with_context(err, "Failed to load token map")
+    })?;
 
     let config = toml::from_str(config.as_str()).map_err(|err| {
         lore_warn!(
@@ -297,15 +346,20 @@ async fn load_token_map() -> Result<TokenMap, TokenStoreError> {
     Ok(config)
 }
 
-async fn store_token_map(token_map: &TokenMap) -> Result<(), TokenStoreError> {
+/// Stores `tokens.toml`. The `_guard` parameter proves the caller holds the
+/// cross-process store lock for the duration of the write.
+fn store_token_map(_guard: &FSLock, token_map: &TokenMap) -> Result<(), TokenStoreError> {
     let path = token_map_path(true)?;
-    let mut config_file = match OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .await
-    {
+
+    lore_trace!("Store token map: {token_map:?}");
+    let config_string = toml::to_string_pretty(token_map).map_err(|e| {
+        lore_warn!("Failed to store token map: {e}");
+        TokenStoreError::internal_with_context(e, "Failed to store token map")
+    })?;
+
+    let mut options = store_open_options();
+    options.create(true).write(true);
+    let mut config_file = match options.open(path.as_path()) {
         Ok(file) => file,
         Err(err) => {
             lore_debug!("Failed to store token map file: {err}");
@@ -316,23 +370,15 @@ async fn store_token_map(token_map: &TokenMap) -> Result<(), TokenStoreError> {
         }
     };
 
-    lore_trace!("Store token map: {token_map:?}");
-    let config_string = toml::to_string_pretty(token_map).map_err(|e| {
-        lore_warn!("Failed to store token map: {e}");
-        TokenStoreError::internal_with_context(e, "Failed to store token map")
-    })?;
-
+    // Truncate only after the write guard is held, so a concurrent reader
+    // can never observe a partially written file.
     config_file
-        .write_all(config_string.as_bytes())
-        .await
+        .set_len(0)
+        .and_then(|()| config_file.write_all(config_string.as_bytes()))
         .map_err(|e| {
             lore_warn!("Failed to store token map: {e}");
             TokenStoreError::internal_with_context(e, "Failed to store token map")
-        })?;
-    config_file.flush().await.map_err(|e| {
-        lore_warn!("Failed to store token map: {e}");
-        TokenStoreError::internal_with_context(e, "Failed to store token map")
-    })
+        })
 }
 
 fn use_secure_store() -> bool {
@@ -420,11 +466,8 @@ pub async fn store_user_token(
 
     let token_map = token_map();
     let mut map_lock = token_map.lock().await;
-    if map_lock.is_none()
-        && let Ok(loaded_map) = load_token_map().await
-    {
-        map_lock.replace(loaded_map);
-    }
+    let guard = lock_token_map().await?;
+    reload_token_map(&guard, &mut map_lock);
     if let Some(map) = map_lock.as_mut() {
         if let Some(remote) = map
             .remotes
@@ -473,7 +516,7 @@ pub async fn store_user_token(
     }
 
     if let Some(map) = map_lock.as_ref() {
-        store_token_map(map).await
+        store_token_map(&guard, map)
     } else {
         lore_debug!("Unexpected, no token map to store to file");
         Err(TokenStoreError::internal("Failed to store token map"))
@@ -508,7 +551,8 @@ where
         let token_map = token_map();
         let mut store = token_map.lock().await;
         if store.is_none()
-            && let Ok(loaded_map) = load_token_map().await
+            && let Ok(guard) = lock_token_map().await
+            && let Ok(loaded_map) = load_token_map(&guard)
         {
             store.replace(loaded_map);
         }
@@ -574,11 +618,8 @@ pub async fn remove_user_tokens_for_auth_url(
 
     let token_map = token_map();
     let mut store = token_map.lock().await;
-    if store.is_none()
-        && let Ok(loaded_map) = load_token_map().await
-    {
-        store.replace(loaded_map);
-    }
+    let guard = lock_token_map().await?;
+    reload_token_map(&guard, &mut store);
 
     let mut modified = false;
 
@@ -617,7 +658,7 @@ pub async fn remove_user_tokens_for_auth_url(
     }
 
     if modified && let Some(store) = store.as_ref() {
-        store_token_map(store).await?;
+        store_token_map(&guard, store)?;
     }
 
     Ok(())
@@ -632,11 +673,8 @@ pub async fn remove_all_tokens_for_auth_url(auth_url: &str) -> Result<(), TokenS
 
     let token_map = token_map();
     let mut store = token_map.lock().await;
-    if store.is_none()
-        && let Ok(loaded_map) = load_token_map().await
-    {
-        store.replace(loaded_map);
-    }
+    let guard = lock_token_map().await?;
+    reload_token_map(&guard, &mut store);
 
     let mut modified = false;
 
@@ -653,7 +691,7 @@ pub async fn remove_all_tokens_for_auth_url(auth_url: &str) -> Result<(), TokenS
     }
 
     if modified && let Some(store) = store.as_ref() {
-        store_token_map(store).await?;
+        store_token_map(&guard, store)?;
     }
 
     Ok(())
@@ -664,11 +702,8 @@ pub async fn remove_user_token(endpoint: &str, identity: &str) -> Result<(), Tok
 
     let token_map = token_map();
     let mut store = token_map.lock().await;
-    if store.is_none()
-        && let Ok(loaded_map) = load_token_map().await
-    {
-        store.replace(loaded_map);
-    }
+    let guard = lock_token_map().await?;
+    reload_token_map(&guard, &mut store);
 
     let mut modified = false;
 
@@ -698,7 +733,7 @@ pub async fn remove_user_token(endpoint: &str, identity: &str) -> Result<(), Tok
     }
 
     if modified && let Some(store) = store.as_ref() {
-        store_token_map(store).await?;
+        store_token_map(&guard, store)?;
     }
 
     Ok(())
@@ -712,7 +747,8 @@ pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenSt
     let token_map = token_map();
     let mut store = token_map.lock().await;
     if store.is_none()
-        && let Ok(loaded_map) = load_token_map().await
+        && let Ok(guard) = lock_token_map().await
+        && let Ok(loaded_map) = load_token_map(&guard)
     {
         store.replace(loaded_map);
     }
@@ -754,11 +790,8 @@ pub async fn store_refresh_token(
 
     let token_map = token_map();
     let mut map_lock = token_map.lock().await;
-    if map_lock.is_none()
-        && let Ok(loaded_map) = load_token_map().await
-    {
-        map_lock.replace(loaded_map);
-    }
+    let guard = lock_token_map().await?;
+    reload_token_map(&guard, &mut map_lock);
 
     if let Some(map) = map_lock.as_mut()
         && let Some(remote) = map
@@ -779,7 +812,7 @@ pub async fn store_refresh_token(
     }
 
     if let Some(map) = map_lock.as_ref() {
-        store_token_map(map).await
+        store_token_map(&guard, map)
     } else {
         Err(TokenStoreError::internal("Failed to store token map"))
     }
@@ -800,7 +833,8 @@ pub async fn load_refresh_token(
         let token_map = token_map();
         let mut store = token_map.lock().await;
         if store.is_none()
-            && let Ok(loaded_map) = load_token_map().await
+            && let Ok(guard) = lock_token_map().await
+            && let Ok(loaded_map) = load_token_map(&guard)
         {
             store.replace(loaded_map);
         }
@@ -841,7 +875,8 @@ async fn encrypt_token(user_token: &str) -> Result<String, TokenStoreError> {
     set_secret_in_store(
         ENCRYPTION_KEY_TARGET,
         get_encryption_key_with_nonce(encryption.key.clone(), new_nonce),
-    )?;
+    )
+    .await?;
     *guard = Some(Encryption {
         key: encryption.key.clone(),
         nonce: new_nonce,
@@ -926,7 +961,7 @@ async fn get_token_encryption_key() -> Result<Encryption, TokenStoreError> {
 /// Callers must serialize this with respect to other writers — it is intended
 /// to be invoked only while holding the [`ENCRYPTION_CACHE`] lock.
 async fn load_or_init_encryption() -> Result<Encryption, TokenStoreError> {
-    let encryption_key_nonce = get_secret_from_store(ENCRYPTION_KEY_TARGET)?;
+    let encryption_key_nonce = get_secret_from_store(ENCRYPTION_KEY_TARGET).await?;
     if let Ok(encryption) = get_encryption(encryption_key_nonce) {
         return Ok(encryption);
     }
@@ -939,7 +974,7 @@ async fn load_or_init_encryption() -> Result<Encryption, TokenStoreError> {
     reset_tokens().await?;
 
     // Set encryption key nonce.
-    set_secret_in_store(ENCRYPTION_KEY_TARGET, encryption_key_nonce.clone())?;
+    set_secret_in_store(ENCRYPTION_KEY_TARGET, encryption_key_nonce.clone()).await?;
 
     get_encryption(encryption_key_nonce)
 }
@@ -961,7 +996,7 @@ fn get_encryption(encryption_key_nonce: Vec<u8>) -> Result<Encryption, TokenStor
     }
 }
 
-fn get_secret_from_store(target: &str) -> Result<Vec<u8>, TokenStoreError> {
+async fn get_secret_from_store(target: &str) -> Result<Vec<u8>, TokenStoreError> {
     if use_secure_store()
         && let Ok(entry) = keyring_entry(target)
     {
@@ -980,23 +1015,42 @@ fn get_secret_from_store(target: &str) -> Result<Vec<u8>, TokenStoreError> {
         lore_warn!("Failed to make fallback path: {e}");
         TokenStoreError::internal_with_context(e, "Failed to make fallback path")
     })?;
-    if path.exists() {
-        lore_trace!(
-            "Loaded secret from insecure fallback path {}",
-            path.display()
-        );
-
-        let secret = fs::read(path).map_err(|e| {
-            lore_warn!("Failed to read secret from fallback path: {e}");
-            TokenStoreError::internal_with_context(e, "Failed to read secret from fallback path")
-        })?;
-        return Ok(secret);
+    if !path.exists() {
+        return Ok(Vec::default());
     }
+    let _guard = lock_store_file(path.as_path()).await?;
+    let mut options = store_open_options();
+    options.read(true);
+    let mut secret_file = match options.open(path.as_path()) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::default());
+        }
+        Err(err) => {
+            lore_warn!("Failed to read secret from fallback path: {err}");
+            return Err(TokenStoreError::internal_with_context(
+                err,
+                "Failed to read secret from fallback path",
+            ));
+        }
+    };
+    lore_trace!(
+        "Loaded secret from insecure fallback path {}",
+        path.display()
+    );
 
-    Ok(Vec::default())
+    let mut secret = Vec::default();
+    // Read via the guarded handle; `fs::read` would re-open the file
+    // without the cross-process guard.
+    #[allow(clippy::verbose_file_reads)]
+    secret_file.read_to_end(&mut secret).map_err(|e| {
+        lore_warn!("Failed to read secret from fallback path: {e}");
+        TokenStoreError::internal_with_context(e, "Failed to read secret from fallback path")
+    })?;
+    Ok(secret)
 }
 
-fn set_secret_in_store(target: &str, secret: Vec<u8>) -> Result<Vec<u8>, TokenStoreError> {
+async fn set_secret_in_store(target: &str, secret: Vec<u8>) -> Result<Vec<u8>, TokenStoreError> {
     if use_secure_store()
         && let Ok(entry) = keyring_entry(target)
     {
@@ -1021,10 +1075,20 @@ fn set_secret_in_store(target: &str, secret: Vec<u8>) -> Result<Vec<u8>, TokenSt
         lore_warn!("Failed to make fallback path: {e}");
         TokenStoreError::internal_with_context(e, "Failed to make fallback path")
     })?;
-    fs::write(path.as_path(), &secret).map_err(|e| {
+    let _guard = lock_store_file(path.as_path()).await?;
+    let mut options = store_open_options();
+    options.create(true).write(true);
+    let mut secret_file = options.open(path.as_path()).map_err(|e| {
         lore_warn!("Failed to write secret to fallback path: {e}");
         TokenStoreError::internal_with_context(e, "Failed to write secret to fallback path")
     })?;
+    secret_file
+        .set_len(0)
+        .and_then(|()| secret_file.write_all(&secret))
+        .map_err(|e| {
+            lore_warn!("Failed to write secret to fallback path: {e}");
+            TokenStoreError::internal_with_context(e, "Failed to write secret to fallback path")
+        })?;
     lore_trace!("Stored secret in insecure fallback path {}", path.display());
     Ok(secret)
 }
