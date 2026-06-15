@@ -464,6 +464,19 @@ impl AwsImmutableStore {
             })
     }
 
+    async fn ensure_exists(
+        &self,
+        repository: Context,
+        address: Address,
+        match_required: StoreMatch,
+    ) -> Result<(), StoreError> {
+        if !self.exists(repository, address, match_required).await? {
+            return Err(StoreError::from(AddressNotFound::from(address)));
+        }
+
+        Ok(())
+    }
+
     async fn exists(
         &self,
         repository: Context,
@@ -1260,14 +1273,31 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         let repository: Context = partition.into();
         let result: Result<(Fragment, Bytes), StoreError> =
             timed!(self.latency_histogram, &self.labels_get, {
-                if !self.exists(repository, address, match_required).await? {
-                    return Err(StoreError::from(AddressNotFound::from(address)));
-                }
+                // Run both futures concurrently. The select! loop breaks as soon as exists resolves.
+                // If load finishes first its result is stashed, and we keep waiting for exists check.
+                let exists_fut = self.ensure_exists(repository, address, match_required);
+                let load_fut = self.load(address.hash);
+                tokio::pin!(exists_fut, load_fut);
 
-                // `get` is boxed anyway via async_trait, so future state machine
-                // is already heap allocated
-                #[allow(clippy::large_futures)]
-                self.load(address.hash).await
+                let mut load_result = None;
+                let exists_result = loop {
+                    tokio::select! {
+                        result = &mut exists_fut => break result,
+                        result = &mut load_fut, if load_result.is_none() => {
+                            load_result = Some(result);
+                        }
+                    }
+                };
+                // If exists failed, its error is returned here; load_fut is dropped (canceled) on the
+                // early return. Exists error takes priority over any load error.
+                exists_result?;
+
+                let load_output = match load_result {
+                    Some(r) => r?,
+                    None => load_fut.await?,
+                };
+
+                Ok(load_output)
             })
             .into();
         let (fragment, payload) = result?;
@@ -2569,9 +2599,9 @@ mod test {
     #[tokio::test]
     async fn test_get_immutable_not_found() {
         let repository = random::<Context>();
-        let address = random::<Address>();
+        let (fragment, address, payload) = fragment::generate_random();
 
-        let s3mock = MockS3Impl::default();
+        let mut s3mock = MockS3Impl::default();
         let mut dynamodb_mock = MockDynamoDb::default();
 
         let entry = FragmentsEntry::new(repository, address);
@@ -2583,6 +2613,43 @@ mod test {
             StoreMatch::MatchHash,
             StoreMatch::MatchNone,
         );
+
+        // `load` runs concurrently with `ensure_exists` in `get`, and its two internal
+        // futures (`load_metadata` and `get_s3_object_contents`) also race each other.
+        // Depending on select! polling order either or both may be called before being
+        // cancelled by the `ensure_exists` error, so these expectations are optional.
+        {
+            let metadata_entry = FragmentMetadataEntry::new(address.hash);
+            let av_map: HashMap<String, AttributeValue> =
+                serde_dynamo::to_item(metadata_entry.clone()).unwrap();
+            let full_entry_av_map =
+                serde_dynamo::to_item(metadata_entry.with_fragment(fragment)).unwrap();
+            dynamodb_mock
+                .expect_get_item()
+                .with(
+                    eq(Arc::<str>::from(METADATA_TABLE_NAME)),
+                    eq(av_map),
+                    eq(true),
+                )
+                .times(..=1)
+                .return_once(move |_, _, _| {
+                    Ok(GetItemOutput::builder()
+                        .set_item(Some(full_entry_av_map))
+                        .build())
+                });
+
+            let mut s3payload = vec![];
+            s3payload.extend_from_slice(payload.as_ref());
+            s3mock
+                .expect_get_object()
+                .with(eq(BUCKET), eq(address.hash.to_string()), eq(None))
+                .times(..=1)
+                .return_once(move |_, _, _| {
+                    Ok(GetObjectOutput::builder()
+                        .set_body(Some(s3payload.into()))
+                        .build())
+                });
+        }
 
         let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
         let store = Arc::new(store);
