@@ -137,7 +137,7 @@ lore stage hello.txt sample.bin
 Confirm the staged state:
 
 ```bash
-lore status --unstaged
+lore status --scan
 ```
 
 Expected output (no revisions yet, so the revision number is 0 and its hash is all zeros):
