@@ -13,6 +13,8 @@ use std::time::Duration;
 use lore_aws::clients::AwsClientBuilder;
 use lore_aws::clients::HttpClientSettings;
 use lore_aws::clients::TimeoutConfig;
+use lore_aws::store::bucket_resolver::BucketResolver;
+use lore_aws::store::bucket_resolver::DynamoBucketResolver;
 use lore_aws::store::immutable_store::AwsImmutableStore;
 use lore_aws::store::immutable_store::AwsImmutableStoreSettings;
 use lore_aws::store::immutable_store::DedupScope;
@@ -116,6 +118,54 @@ pub struct AwsImmutableStorePluginConfig {
     /// to `false` and validate on demand instead.
     #[serde(default = "default_validate_bucket_on_startup")]
     pub validate_bucket_on_startup: bool,
+
+    /// Which bucket resolver routes a repository's fragments to a bucket:
+    /// `"static"` (default) sends every repository to `s3_bucket`, preserving
+    /// the historical single-bucket behaviour; `"dynamo"` resolves each
+    /// repository's bucket from a DynamoDB routing table (see
+    /// [`dynamo_bucket_resolver`](Self::dynamo_bucket_resolver)).
+    #[serde(default)]
+    pub bucket_resolver: BucketResolverKind,
+
+    /// Configuration for the `"dynamo"` bucket resolver. Required when
+    /// `bucket_resolver = "dynamo"`, ignored otherwise.
+    #[serde(default)]
+    pub dynamo_bucket_resolver: Option<DynamoBucketResolverConfig>,
+}
+
+/// Selects which [`BucketResolver`] the AWS immutable store installs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BucketResolverKind {
+    /// Every repository maps to the single configured `s3_bucket`. This is the
+    /// default and reproduces the historical behaviour exactly.
+    #[default]
+    Static,
+    /// Each repository's bucket is resolved from a DynamoDB routing table,
+    /// read-through cached, failing closed for unrouted repositories.
+    Dynamo,
+}
+
+/// Configuration for the `"dynamo"` bucket resolver.
+///
+/// The resolver reads a host-provisioned routing table (one row per repository,
+/// keyed by the repository's canonical `Context` string, with a `bucket`
+/// attribute). It needs only `dynamodb:GetItem` on this table; creating and
+/// populating the table is the host's responsibility.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DynamoBucketResolverConfig {
+    /// Name of the DynamoDB routing table mapping repositories to buckets.
+    pub routing_table: String,
+
+    /// Optional DynamoDB endpoint URL for the routing table. Defaults to the
+    /// store's `dynamodb_endpoint_url` when unset.
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
+
+    /// Optional DynamoDB region for the routing table. Defaults to the store's
+    /// `dynamodb_region` when unset.
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 /// Configuration for the AWS mutable store plugin.
@@ -246,7 +296,32 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
             "Creating AWS immutable store: {plugin_config:?}"
         );
 
-        let (s3_client, dynamodb_client) = tokio::task::block_in_place(|| {
+        // Resolve which bucket resolver to install. The dynamo resolver needs
+        // its own routing-table config; fail fast if it is selected without one.
+        let dynamo_resolver_config = match plugin_config.bucket_resolver {
+            BucketResolverKind::Static => None,
+            BucketResolverKind::Dynamo => Some(
+                plugin_config
+                    .dynamo_bucket_resolver
+                    .clone()
+                    .ok_or_else(|| {
+                        PluginError::from(PluginConfigError {
+                            plugin_name: plugin_name.to_string(),
+                            message: "bucket_resolver = \"dynamo\" requires a \
+                                  [dynamo_bucket_resolver] section with a routing_table"
+                                .to_string(),
+                        })
+                    })?,
+            ),
+        };
+
+        // The single-bucket startup check only makes sense for the static
+        // resolver; dynamo routing has no single canonical bucket to validate
+        // (buckets are per-repository and provisioned by the host).
+        let validate_bucket_on_startup =
+            plugin_config.validate_bucket_on_startup && dynamo_resolver_config.is_none();
+
+        let (s3_client, dynamodb_client, routing_client) = tokio::task::block_in_place(|| {
             runtime().block_on(Box::pin(async {
                 // Build S3 client
                 let s3_builder = Box::pin(
@@ -270,7 +345,7 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
                 // Validate the configured bucket at startup unless disabled.
                 // Per-repository routing provisions buckets after boot, so those
                 // deployments skip the boot-time check and validate on demand.
-                let s3_builder = if plugin_config.validate_bucket_on_startup {
+                let s3_builder = if validate_bucket_on_startup {
                     s3_builder.ensure_bucket(&plugin_config.s3_bucket)
                 } else {
                     s3_builder
@@ -316,7 +391,56 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
                             })
                         })?;
 
-                Ok::<_, PluginError>((s3_client, dynamodb_client))
+                // Build a separate DynamoDB client for the routing table when the
+                // dynamo bucket resolver is selected. It falls back to the store's
+                // DynamoDB endpoint/region when the resolver does not override them.
+                let routing_client = if let Some(cfg) = dynamo_resolver_config.as_ref() {
+                    let routing_client_builder = Box::pin(
+                        AwsClientBuilder::builder()
+                            .with_http_settings(&plugin_config.http)
+                            .maybe_endpoint(
+                                cfg.endpoint_url
+                                    .clone()
+                                    .or_else(|| plugin_config.dynamodb_endpoint_url.clone()),
+                            )
+                            .maybe_region(
+                                cfg.region
+                                    .clone()
+                                    .or_else(|| plugin_config.dynamodb_region.clone()),
+                            )
+                            .with_timeout_config(
+                                TimeoutConfig::builder()
+                                    .operation_timeout(Duration::from_millis(
+                                        plugin_config.timeout_millis,
+                                    ))
+                                    .build(),
+                            )
+                            .build_config(),
+                    )
+                    .await
+                    .with_slow_operation_threshold(
+                        plugin_config.dynamodb_slow_operation_threshold_millis,
+                    )
+                    .dynamodb()
+                    .ensure_table(&cfg.routing_table);
+
+                    Some(
+                        Box::pin(routing_client_builder.build())
+                            .await
+                            .map_err(|e| {
+                                PluginError::from(PluginInitError {
+                                    plugin_name: plugin_name.to_string(),
+                                    message: format!(
+                                        "Failed to create DynamoDB routing client: {e}"
+                                    ),
+                                })
+                            })?,
+                    )
+                } else {
+                    None
+                };
+
+                Ok::<_, PluginError>((s3_client, dynamodb_client, routing_client))
             }))
         })?;
 
@@ -345,7 +469,26 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
         )
         .with_dedup_scope(plugin_config.dedup_scope);
 
-        let store = AwsImmutableStore::new(s3_client, dynamodb_client, &store_settings);
+        // Install the dynamo resolver when its routing client was built (which
+        // happens iff `dynamo_resolver_config` is `Some`); otherwise fall back to
+        // the default static, single-bucket resolver.
+        let store = match (routing_client, dynamo_resolver_config) {
+            (Some(routing_client), Some(cfg)) => {
+                info!(
+                    routing_table = %cfg.routing_table,
+                    "Installing DynamoBucketResolver for per-repository bucket routing"
+                );
+                let resolver: Arc<dyn BucketResolver> =
+                    Arc::new(DynamoBucketResolver::new(routing_client, cfg.routing_table));
+                AwsImmutableStore::with_bucket_resolver(
+                    s3_client,
+                    dynamodb_client,
+                    &store_settings,
+                    resolver,
+                )
+            }
+            _ => AwsImmutableStore::new(s3_client, dynamodb_client, &store_settings),
+        };
 
         Ok(Arc::new(store))
     }
@@ -719,6 +862,35 @@ mod tests {
         );
         assert_eq!(plugin_config.timeout_millis, 5000);
         assert!(!plugin_config.force_write);
+        // The bucket resolver defaults to static (historical single-bucket
+        // behaviour) with no dynamo routing configured.
+        assert_eq!(plugin_config.bucket_resolver, BucketResolverKind::Static);
+        assert!(plugin_config.dynamo_bucket_resolver.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_config_deserialization_with_dynamo_bucket_resolver() {
+        let config_str = r#"
+            s3_bucket = "test-bucket"
+            dynamodb_fragments_table = "fragments"
+            dynamodb_metadata_table = "metadata"
+            bucket_resolver = "dynamo"
+
+            [dynamo_bucket_resolver]
+            routing_table = "repository-bucket-routing"
+            region = "us-west-2"
+        "#;
+
+        let config: toml::Value = toml::from_str(config_str).unwrap();
+        let plugin_config: AwsImmutableStorePluginConfig = config.try_into().unwrap();
+
+        assert_eq!(plugin_config.bucket_resolver, BucketResolverKind::Dynamo);
+        let resolver_config = plugin_config
+            .dynamo_bucket_resolver
+            .expect("dynamo_bucket_resolver should be present");
+        assert_eq!(resolver_config.routing_table, "repository-bucket-routing");
+        assert_eq!(resolver_config.region, Some("us-west-2".to_string()));
+        assert!(resolver_config.endpoint_url.is_none());
     }
 
     #[tokio::test]

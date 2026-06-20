@@ -48,6 +48,35 @@ dynamodb_timeout_millis = 15000
 # Force write mode for debugging/profiling purposes, always overwrites data already present
 # force_write = false
 
+# --- Per-repository storage isolation (optional; defaults preserve the
+# --- historical single-bucket, global-dedup behaviour). See ADR-00011 and
+# --- ADR-00017.
+#
+# Deduplication/isolation scope: "global" (default) deduplicates across all
+# repositories and keys the metadata table by hash alone; "partition" scopes
+# dedup/existence/metadata to each repository (requires a metadata table keyed
+# by (hash, repository) — see ADR-00011's migration notes).
+# dedup_scope = "partition"
+#
+# Bucket resolver: "static" (default) routes every repository to `s3_bucket`;
+# "dynamo" resolves each repository's bucket from a DynamoDB routing table,
+# read-through cached, failing closed for unrouted repositories.
+# bucket_resolver = "dynamo"
+#
+# Validate `s3_bucket` exists at startup. Default true; ignored when
+# `bucket_resolver = "dynamo"` (per-repository buckets are provisioned by the
+# host after boot and validated on demand).
+# validate_bucket_on_startup = false
+#
+# Routing table for `bucket_resolver = "dynamo"`. The host provisions it: one
+# row per repository, partition key `repository` (the canonical Context string,
+# e.g. "0123456789abcdef0123456789abcdef") and a string `bucket` attribute. The
+# resolver needs only dynamodb:GetItem on it. endpoint_url/region default to the
+# store's dynamodb_* values when unset.
+# [plugins.aws.immutable_store.dynamo_bucket_resolver]
+# routing_table = "urc-repository-bucket-routing"
+# region = "us-east-1"
+
 # Mutable store settings (DynamoDB)
 [plugins.aws.mutable_store]
 dynamodb_table = "urc-mutable"
