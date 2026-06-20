@@ -15,6 +15,7 @@ use lore_aws::clients::HttpClientSettings;
 use lore_aws::clients::TimeoutConfig;
 use lore_aws::store::immutable_store::AwsImmutableStore;
 use lore_aws::store::immutable_store::AwsImmutableStoreSettings;
+use lore_aws::store::immutable_store::DedupScope;
 use lore_aws::store::immutable_store::DynamoDbImmutableStoreSettings;
 use lore_aws::store::immutable_store::S3StoreSettings;
 use lore_aws::store::lock_store::DynamoDbLockStore;
@@ -100,6 +101,21 @@ pub struct AwsImmutableStorePluginConfig {
     /// non-AWS hostnames like `MinIO` in Docker).
     #[serde(default)]
     pub s3_force_path_style: bool,
+
+    /// Scope at which fragment deduplication/existence is decided:
+    /// `"global"` (default) deduplicates across all repositories and keys the
+    /// metadata table by hash alone; `"partition"` scopes deduplication,
+    /// existence and metadata to each repository. See the [`DedupScope`] docs
+    /// and ADR-00011 for the migration implications of `"partition"`.
+    #[serde(default)]
+    pub dedup_scope: DedupScope,
+
+    /// Whether to validate that `s3_bucket` exists when the store is created.
+    /// Defaults to `true` (the historical behaviour). Deployments that route
+    /// repositories to per-repository buckets provisioned after boot set this
+    /// to `false` and validate on demand instead.
+    #[serde(default = "default_validate_bucket_on_startup")]
+    pub validate_bucket_on_startup: bool,
 }
 
 /// Configuration for the AWS mutable store plugin.
@@ -172,6 +188,10 @@ fn default_slow_threshold() -> u64 {
     u64::MAX
 }
 
+fn default_validate_bucket_on_startup() -> bool {
+    true
+}
+
 fn default_timeout() -> u64 {
     5000
 }
@@ -229,7 +249,7 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
         let (s3_client, dynamodb_client) = tokio::task::block_in_place(|| {
             runtime().block_on(Box::pin(async {
                 // Build S3 client
-                let s3_client = Box::pin(
+                let s3_builder = Box::pin(
                     AwsClientBuilder::builder()
                         .with_http_settings(&plugin_config.http)
                         .maybe_endpoint(plugin_config.s3_endpoint_url.clone())
@@ -245,11 +265,18 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
                 )
                 .await
                 .with_slow_operation_threshold(plugin_config.s3_slow_operation_threshold_millis)
-                .s3_with_path_style(plugin_config.s3_force_path_style)
-                .ensure_bucket(&plugin_config.s3_bucket)
-                .build()
-                .await
-                .map_err(|e| {
+                .s3_with_path_style(plugin_config.s3_force_path_style);
+
+                // Validate the configured bucket at startup unless disabled.
+                // Per-repository routing provisions buckets after boot, so those
+                // deployments skip the boot-time check and validate on demand.
+                let s3_builder = if plugin_config.validate_bucket_on_startup {
+                    s3_builder.ensure_bucket(&plugin_config.s3_bucket)
+                } else {
+                    s3_builder
+                };
+
+                let s3_client = Box::pin(s3_builder.build()).await.map_err(|e| {
                     PluginError::from(PluginInitError {
                         plugin_name: plugin_name.to_string(),
                         message: format!("Failed to create S3 client: {e}"),
@@ -315,7 +342,8 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
             s3_settings,
             dynamodb_settings,
             plugin_config.force_write,
-        );
+        )
+        .with_dedup_scope(plugin_config.dedup_scope);
 
         let store = AwsImmutableStore::new(s3_client, dynamodb_client, &store_settings);
 

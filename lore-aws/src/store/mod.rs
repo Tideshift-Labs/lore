@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub mod bucket_resolver;
 pub mod immutable_store;
 pub mod lock_store;
 pub mod mutable_store;
