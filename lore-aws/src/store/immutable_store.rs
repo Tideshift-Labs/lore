@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::string::ToString;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use aws_sdk_dynamodb::error::SdkError;
@@ -65,6 +68,8 @@ use crate::dynamodb::DynamoDbPutCondition;
 use crate::dynamodb::DynamoDbQuery;
 use crate::dynamodb::error::SdkError as DynamoDbSdkError;
 use crate::s3::S3;
+use crate::store::bucket_resolver::BucketResolver;
+use crate::store::bucket_resolver::StaticBucketResolver;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct FragmentsEntry {
@@ -107,6 +112,15 @@ impl FragmentsEntry {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct FragmentMetadataEntry {
     hash: Hash,
+    // Repository dimension for the metadata table's key. Present only when the
+    // store runs with `DedupScope::Partition`, where metadata is keyed by
+    // (hash, repository) so each repository owns independent
+    // metadata/lifecycle for a given hash. When absent (the default, global
+    // scope) the entry serializes byte-for-byte identically to the historical
+    // hash-only schema, so the `repository` attribute never appears on the
+    // table and existing data/tests are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<Context>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(flatten)]
     fragment: Option<Fragment>,
@@ -116,8 +130,17 @@ impl FragmentMetadataEntry {
     fn new(hash: Hash) -> Self {
         Self {
             hash,
+            repository: None,
             fragment: None,
         }
+    }
+
+    /// Sets the repository dimension of the metadata key. `None` (the default)
+    /// keeps the hash-only, global key.
+    fn with_repository(mut self, repository: Option<Context>) -> Self {
+        self.repository = repository;
+
+        self
     }
 
     fn with_fragment(mut self, fragment: Fragment) -> Self {
@@ -125,6 +148,29 @@ impl FragmentMetadataEntry {
 
         self
     }
+}
+
+/// Scope at which fragment deduplication and existence are decided.
+///
+/// This only affects the client-facing existence path (`exist`/`exist_batch`)
+/// and the partitioning of the `metadata` table — never how content is hashed
+/// or chunked.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DedupScope {
+    /// Deduplicate globally across all repositories: a fragment present in any
+    /// repository is reported as present everywhere, and the `metadata` table
+    /// is keyed by hash alone. This is the historical behaviour and the
+    /// default, so single-tenant deployments are unaffected.
+    #[default]
+    Global,
+    /// Deduplicate per repository: existence is only reported within the
+    /// querying repository (`MatchPartition`), and the `metadata` table is
+    /// keyed by (hash, repository) so each repository has independent
+    /// metadata and lifecycle for a given hash. Use this for multi-tenant
+    /// deployments where repositories must not observe or share each other's
+    /// fragments.
+    Partition,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -203,6 +249,11 @@ pub struct AwsImmutableStoreSettings {
     pub force_write: bool,
     #[serde(default = "default_submission_limit")]
     pub batch_exist_submission_limit: usize,
+    /// Scope at which deduplication/existence is decided. Defaults to
+    /// [`DedupScope::Global`], preserving the historical single-tenant
+    /// behaviour.
+    #[serde(default)]
+    pub dedup_scope: DedupScope,
 }
 
 impl AwsImmutableStoreSettings {
@@ -216,7 +267,14 @@ impl AwsImmutableStoreSettings {
             dynamodb,
             force_write,
             batch_exist_submission_limit: default_submission_limit(),
+            dedup_scope: DedupScope::default(),
         }
+    }
+
+    /// Sets the deduplication scope (defaults to [`DedupScope::Global`]).
+    pub fn with_dedup_scope(mut self, dedup_scope: DedupScope) -> Self {
+        self.dedup_scope = dedup_scope;
+        self
     }
 }
 
@@ -226,6 +284,10 @@ pub const FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE: &str = "repository_context";
 #[derive(Debug, Clone, PartialEq)]
 enum FragmentsQuery {
     Repository(Hash, Context),
+    /// Consistent count of associations for a hash within a single repository
+    /// (across all of that repository's contexts). Used as the per-repository
+    /// refcount under `DedupScope::Partition`.
+    RepositoryCount(Hash, Context),
     Hash(Hash),
     HashCount(Hash),
 }
@@ -233,23 +295,27 @@ enum FragmentsQuery {
 impl DynamoDbQuery for FragmentsQuery {
     fn key_condition_expression(&self) -> &str {
         match self {
-            FragmentsQuery::Repository(_, _) => "#pk = :hash and begins_with(#sk, :repository)",
+            FragmentsQuery::Repository(_, _) | FragmentsQuery::RepositoryCount(_, _) => {
+                "#pk = :hash and begins_with(#sk, :repository)"
+            }
             FragmentsQuery::Hash(_) | FragmentsQuery::HashCount(_) => "#pk = :hash",
         }
     }
 
     fn expression_attribute_names(&self) -> HashMap<String, String> {
         match self {
-            FragmentsQuery::Repository(_, _) => HashMap::from([
-                (
-                    "#pk".to_string(),
-                    FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-                ),
-                (
-                    "#sk".to_string(),
-                    FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
-                ),
-            ]),
+            FragmentsQuery::Repository(_, _) | FragmentsQuery::RepositoryCount(_, _) => {
+                HashMap::from([
+                    (
+                        "#pk".to_string(),
+                        FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
+                    ),
+                    (
+                        "#sk".to_string(),
+                        FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
+                    ),
+                ])
+            }
             FragmentsQuery::Hash(_) | FragmentsQuery::HashCount(_) => HashMap::from([(
                 "#pk".to_string(),
                 FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
@@ -259,7 +325,8 @@ impl DynamoDbQuery for FragmentsQuery {
 
     fn expression_attribute_values(&self) -> HashMap<String, AttributeValue> {
         match self {
-            FragmentsQuery::Repository(hash, repository) => HashMap::from([
+            FragmentsQuery::Repository(hash, repository)
+            | FragmentsQuery::RepositoryCount(hash, repository) => HashMap::from([
                 (
                     ":hash".to_string(),
                     AttributeValue::B(Blob::new(hash.data())),
@@ -279,19 +346,24 @@ impl DynamoDbQuery for FragmentsQuery {
     fn limit(&self) -> Option<i32> {
         match self {
             FragmentsQuery::Repository(_, _) | FragmentsQuery::Hash(_) => Some(1),
-            FragmentsQuery::HashCount(_) => None,
+            FragmentsQuery::HashCount(_) | FragmentsQuery::RepositoryCount(_, _) => None,
         }
     }
 
     fn select(&self) -> Option<Select> {
         match self {
             FragmentsQuery::Repository(_, _) | FragmentsQuery::Hash(_) => None,
-            FragmentsQuery::HashCount(_) => Some(Select::Count),
+            FragmentsQuery::HashCount(_) | FragmentsQuery::RepositoryCount(_, _) => {
+                Some(Select::Count)
+            }
         }
     }
 
     fn consistent_read(&self) -> bool {
-        matches!(self, FragmentsQuery::HashCount(_))
+        matches!(
+            self,
+            FragmentsQuery::HashCount(_) | FragmentsQuery::RepositoryCount(_, _)
+        )
     }
 }
 
@@ -339,7 +411,12 @@ pub struct AwsImmutableStore {
     s3: S3,
     dynamodb: DynamoDb,
     task_queue: TaskQueue<BatchTaskResult>,
-    bucket: String,
+    bucket_resolver: Arc<dyn BucketResolver>,
+    dedup_scope: DedupScope,
+    // Buckets we've already confirmed exist via `ensure_bucket_exists`. Only
+    // populated when callers opt into on-demand validation (multi-bucket
+    // routing); the static, single-bucket path validates at startup instead.
+    validated_buckets: Mutex<HashSet<String>>,
     fragments_table_name: Arc<str>,
     metadata_table_name: Arc<str>,
     force_write: bool,
@@ -354,7 +431,29 @@ pub struct AwsImmutableStore {
 }
 
 impl AwsImmutableStore {
+    /// Creates a store that routes every repository's fragments to the single
+    /// bucket named in `settings.s3.bucket` (via a [`StaticBucketResolver`]).
+    /// This is the default, backward-compatible construction.
     pub fn new(s3: S3, dynamodb: DynamoDb, settings: &AwsImmutableStoreSettings) -> Self {
+        let bucket_resolver = Arc::new(StaticBucketResolver::new(settings.s3.bucket.clone()));
+        Self::with_bucket_resolver(s3, dynamodb, settings, bucket_resolver)
+    }
+
+    /// Creates a store that resolves the destination bucket per repository via
+    /// the supplied [`BucketResolver`]. Deployments that physically isolate
+    /// repositories across buckets (for example a multi-tenant platform) use
+    /// this to inject their own routing; the resolver's logic lives entirely in
+    /// the caller. `settings.s3.bucket` is ignored on this path.
+    ///
+    /// Because buckets may be provisioned after the server boots, this path does
+    /// not validate buckets at startup — call [`Self::ensure_bucket_exists`]
+    /// on-demand (for example when provisioning a repository) instead.
+    pub fn with_bucket_resolver(
+        s3: S3,
+        dynamodb: DynamoDb,
+        settings: &AwsImmutableStoreSettings,
+        bucket_resolver: Arc<dyn BucketResolver>,
+    ) -> Self {
         let provider = AwsImmutableStoreInstrumentProvider;
 
         let latency_histogram =
@@ -378,7 +477,9 @@ impl AwsImmutableStore {
                     "store.immutable.aws",
                 )],
             ),
-            bucket: settings.s3.bucket.clone(),
+            bucket_resolver,
+            dedup_scope: settings.dedup_scope,
+            validated_buckets: Mutex::new(HashSet::new()),
             fragments_table_name: Arc::from(settings.dynamodb.fragments_table_name.clone()),
             metadata_table_name: Arc::from(settings.dynamodb.metadata_table_name.clone()),
             force_write: settings.force_write,
@@ -391,6 +492,74 @@ impl AwsImmutableStore {
             labels_query,
             labels_copy,
         }
+    }
+
+    /// Returns the bucket that holds `repository`'s fragments. Borrows from the
+    /// resolver where possible (the default static resolver allocates nothing),
+    /// so the hot read/write paths stay allocation-free as they were before
+    /// routing.
+    fn bucket_for(&self, repository: Context) -> Cow<'_, str> {
+        self.bucket_resolver.bucket_for(&repository)
+    }
+
+    /// The repository dimension to stamp onto a `metadata` table key. Under
+    /// [`DedupScope::Global`] this is `None` (hash-only key, historical
+    /// schema); under [`DedupScope::Partition`] it is `Some(repository)` so
+    /// metadata is keyed by (hash, repository).
+    fn metadata_repository(&self, repository: Context) -> Option<Context> {
+        match self.dedup_scope {
+            DedupScope::Global => None,
+            DedupScope::Partition => Some(repository),
+        }
+    }
+
+    /// Translates a client-requested existence match level to the level the
+    /// store should actually query at. Under [`DedupScope::Partition`] a
+    /// `MatchHash` (global) existence check is narrowed to `MatchPartition` so
+    /// a fragment in repository A is never reported as present for repository
+    /// B. All other levels (and all of global scope) pass through unchanged.
+    fn effective_exist_match(&self, requested: StoreMatch) -> StoreMatch {
+        match (self.dedup_scope, requested) {
+            (DedupScope::Partition, StoreMatch::MatchHash) => StoreMatch::MatchPartition,
+            (_, requested) => requested,
+        }
+    }
+
+    /// Lazily validates that the bucket backing `repository` exists, caching the
+    /// result so each distinct bucket is only checked once. Intended to replace
+    /// the single boot-time bucket check when buckets are provisioned on demand
+    /// (multi-bucket routing): a hosting platform can call this when it creates
+    /// a repository. Returns whether the bucket exists.
+    pub async fn ensure_bucket_exists(&self, partition: Partition) -> Result<bool, StoreError> {
+        let repository: Context = partition.into();
+        let bucket = self.bucket_for(repository).into_owned();
+
+        if self
+            .validated_buckets
+            .lock()
+            .expect("validated_buckets mutex poisoned")
+            .contains(&bucket)
+        {
+            return Ok(true);
+        }
+
+        let exists = self.s3.bucket_exists(bucket.clone()).await.map_err(|e| {
+            warn!("Failed to check whether bucket {bucket} exists: {e:?}");
+            if matches!(&e, AwsError::AwsSdkError(_)) {
+                StoreError::from(SlowDown)
+            } else {
+                StoreError::internal_with_context(e, "S3 head bucket failed")
+            }
+        })?;
+
+        if exists {
+            self.validated_buckets
+                .lock()
+                .expect("validated_buckets mutex poisoned")
+                .insert(bucket);
+        }
+
+        Ok(exists)
     }
 
     async fn exists_exact(&self, entry: &FragmentsEntry) -> Result<bool, StoreError> {
@@ -483,6 +652,14 @@ impl AwsImmutableStore {
         address: Address,
         match_requested: StoreMatch,
     ) -> Result<bool, StoreError> {
+        // Narrow a global (`MatchHash`) check to the repository under
+        // partition-scoped dedup. Applying it here — the single chokepoint used
+        // by `exist`, `ensure_exists` (the read path) and `lookup` (query/put/
+        // copy) — keeps every existence decision repository-scoped, so no path
+        // observes another repository's fragments and `do_query`'s per-repository
+        // metadata load never targets a (hash, repository) that does not exist.
+        let match_requested = self.effective_exist_match(match_requested);
+
         if match_requested == StoreMatch::MatchNone {
             return Ok(false);
         }
@@ -721,7 +898,7 @@ impl AwsImmutableStore {
             });
         }
 
-        let fragment = self.load_metadata(address.hash).await.map_err(|e| {
+        let fragment = self.load_metadata(repository, address.hash).await.map_err(|e| {
             warn!(
                 "Load metadata failed for address: {address:?} in repository: {repository:?}: {e:?}"
             );
@@ -748,7 +925,9 @@ impl AwsImmutableStore {
         address: Address,
         fragment: Fragment,
     ) -> Result<(), StoreError> {
-        let metadata = FragmentMetadataEntry::new(address.hash).with_fragment(fragment);
+        let metadata = FragmentMetadataEntry::new(address.hash)
+            .with_repository(self.metadata_repository(repository))
+            .with_fragment(fragment);
         let item = serde_dynamo::to_item(&metadata).map_err(|e| {
             warn!("Failed to serialize metadata entry for repository: {repository:?} and address: {address:?} to dynamo av map: {e:?}");
             StoreError::internal_with_context(e, "Failed to serialize metadata for DynamoDB write")
@@ -768,11 +947,14 @@ impl AwsImmutableStore {
 
     async fn update_metadata(
         &self,
+        repository: Context,
         address: Address,
         updated: Fragment,
         expected: Fragment,
     ) -> Result<(), StoreError> {
-        let metadata = FragmentMetadataEntry::new(address.hash).with_fragment(updated);
+        let metadata = FragmentMetadataEntry::new(address.hash)
+            .with_repository(self.metadata_repository(repository))
+            .with_fragment(updated);
         let item = serde_dynamo::to_item(&metadata).map_err(|e| {
             warn!("Failed to serialize metadata entry for fragment with address: {address}: {e:?}");
             StoreError::internal_with_context(e, "Failed to serialize metadata for DynamoDB update")
@@ -860,9 +1042,21 @@ impl AwsImmutableStore {
         Ok(())
     }
 
-    async fn has_associations(&self, hash: Hash) -> Result<bool, StoreError> {
+    /// Returns whether any association still references `hash`. Under
+    /// [`DedupScope::Global`] this counts associations across *all*
+    /// repositories (the historical refcount). Under [`DedupScope::Partition`]
+    /// it is scoped to `repository`, so a hash still referenced by another
+    /// repository does not keep this repository's (separately stored) payload
+    /// alive — each repository's bytes are deleted as soon as that repository
+    /// stops referencing them.
+    async fn has_associations(&self, repository: Context, hash: Hash) -> Result<bool, StoreError> {
+        let query = match self.dedup_scope {
+            DedupScope::Global => FragmentsQuery::HashCount(hash),
+            DedupScope::Partition => FragmentsQuery::RepositoryCount(hash, repository),
+        };
+
         self.dynamodb
-            .query_single(&self.fragments_table_name, FragmentsQuery::HashCount(hash))
+            .query_single(&self.fragments_table_name, query)
             .await
             .map(|output| output.count > 0)
             .map_err(|e| {
@@ -932,8 +1126,9 @@ impl AwsImmutableStore {
         let mut dst = [0u8; 64];
         let hash = lore_revision::util::to_hex_str(address.hash.data(), &mut dst);
 
+        let bucket = self.bucket_for(repository);
         self.s3
-            .put_object(self.bucket.as_str(), hash, payload.to_vec())
+            .put_object(bucket.as_ref(), hash, payload.to_vec())
             .await
             .map(|_| ())
             .map_err(|e| {
@@ -957,14 +1152,16 @@ impl AwsImmutableStore {
         Ok(())
     }
 
-    /// Permanently delete a payload from S3 by removing *ALL* versions from the bucket.
-    async fn delete_payload(&self, hash: Hash) -> Result<(), StoreError> {
+    /// Permanently delete a payload from S3 by removing *ALL* versions from the
+    /// bucket that backs `repository`.
+    async fn delete_payload(&self, repository: Context, hash: Hash) -> Result<(), StoreError> {
         let mut dst = [0u8; 64];
         let hash = lore_revision::util::to_hex_str(hash.data(), &mut dst);
 
+        let bucket = self.bucket_for(repository);
         let versions: Option<Vec<Option<String>>> = self
             .s3
-            .list_versions(self.bucket.as_str(), hash)
+            .list_versions(bucket.as_ref(), hash)
             .await
             .map(|output| {
                 output
@@ -983,7 +1180,7 @@ impl AwsImmutableStore {
         if let Some(versions) = versions {
             for version in versions {
                 self.s3
-                    .delete_object(self.bucket.as_str(), hash, version)
+                    .delete_object(bucket.as_ref(), hash, version)
                     .await
                     .map_err(|e| {
                         warn!("Failed to delete payload for hash: {hash}: {e:?}");
@@ -996,7 +1193,7 @@ impl AwsImmutableStore {
             }
         } else {
             self.s3
-                .delete_object(self.bucket.as_str(), hash, None)
+                .delete_object(bucket.as_ref(), hash, None)
                 .await
                 .map_err(|e| {
                     warn!("Failed to delete payload for hash: {hash}: {e:?}");
@@ -1012,8 +1209,12 @@ impl AwsImmutableStore {
     }
 
     /// Loads fragment metadata, with just size validation
-    async fn metadata_with_size_validation(&self, hash: Hash) -> Result<Fragment, StoreError> {
-        let metadata = self.load_metadata(hash).await?;
+    async fn metadata_with_size_validation(
+        &self,
+        repository: Context,
+        hash: Hash,
+    ) -> Result<Fragment, StoreError> {
+        let metadata = self.load_metadata(repository, hash).await?;
         // Reject upfront before issuing the S3 GET: a corrupt metadata entry
         // could declare a payload larger than the protocol threshold, which
         // would then be happily extended into the in-memory buffer below.
@@ -1023,8 +1224,12 @@ impl AwsImmutableStore {
 
     /// Loads fragment metadata, applying all validation
     /// to ensure it is a valid fragment to load
-    async fn metadata_with_load_validation(&self, hash: Hash) -> Result<Fragment, StoreError> {
-        let metadata = self.metadata_with_size_validation(hash).await?;
+    async fn metadata_with_load_validation(
+        &self,
+        repository: Context,
+        hash: Hash,
+    ) -> Result<Fragment, StoreError> {
+        let metadata = self.metadata_with_size_validation(repository, hash).await?;
 
         if (metadata.flags & FragmentFlags::PayloadObliteration) != 0 {
             return Err(StoreError::from(AddressNotFound::from(
@@ -1035,8 +1240,10 @@ impl AwsImmutableStore {
         Ok(metadata)
     }
 
-    async fn load_metadata(&self, hash: Hash) -> Result<Fragment, StoreError> {
-        let item = serde_dynamo::to_item(FragmentMetadataEntry::new(hash)).map_err(|e| {
+    async fn load_metadata(&self, repository: Context, hash: Hash) -> Result<Fragment, StoreError> {
+        let key =
+            FragmentMetadataEntry::new(hash).with_repository(self.metadata_repository(repository));
+        let item = serde_dynamo::to_item(key).map_err(|e| {
             warn!("Failed to serialize fragment metadata entry for {hash}: {e:?}");
             StoreError::internal_with_context(
                 e,
@@ -1083,13 +1290,15 @@ impl AwsImmutableStore {
 
     async fn get_s3_object_contents(
         &self,
+        repository: Context,
         hash: Hash,
     ) -> Result<GetS3objectContentsOutput, StoreError> {
         let mut dst = [0u8; 64];
+        let bucket = self.bucket_for(repository);
         let mut output = self
             .s3
             .get_object(
-                self.bucket.as_str(),
+                bucket.as_ref(),
                 lore_revision::util::to_hex_str(hash.data(), &mut dst),
                 None,
             )
@@ -1165,11 +1374,11 @@ impl AwsImmutableStore {
         }
     }
 
-    async fn load(&self, hash: Hash) -> Result<(Fragment, Bytes), StoreError> {
+    async fn load(&self, repository: Context, hash: Hash) -> Result<(Fragment, Bytes), StoreError> {
         // Run both futures concurrently. The select! loop breaks as soon as metadata resolves.
         // If S3 finishes first its result is stashed, and we keep waiting for metadata.
-        let metadata_fut = self.metadata_with_load_validation(hash);
-        let s3_fut = self.get_s3_object_contents(hash);
+        let metadata_fut = self.metadata_with_load_validation(repository, hash);
+        let s3_fut = self.get_s3_object_contents(repository, hash);
         tokio::pin!(metadata_fut, s3_fut);
         let mut s3_result = None;
         let metadata_result = loop {
@@ -1206,6 +1415,10 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         match_requested: StoreMatch,
     ) -> Result<StoreMatch, StoreError> {
         let repository: Context = partition.into();
+        // Under partition-scoped dedup a global (`MatchHash`) existence check is
+        // narrowed to the repository so a fragment in another repository is not
+        // reported as present here.
+        let match_requested = self.effective_exist_match(match_requested);
         timed!(self.latency_histogram, &self.labels_exist, {
             if self.exists(repository, address, match_requested).await? {
                 Ok(match_requested)
@@ -1224,6 +1437,9 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         match_requested: StoreMatch,
     ) -> Result<Vec<StoreMatch>, StoreError> {
         let repository: Context = partition.into();
+        // See `exist`: partition-scoped dedup narrows a global existence check
+        // to the repository.
+        let match_requested = self.effective_exist_match(match_requested);
         timed!(self.latency_histogram, &self.labels_exist_batch, {
             match match_requested {
                 StoreMatch::MatchNone => {
@@ -1276,7 +1492,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 // Run both futures concurrently. The select! loop breaks as soon as exists resolves.
                 // If load finishes first its result is stashed, and we keep waiting for exists check.
                 let exists_fut = self.ensure_exists(repository, address, match_required);
-                let load_fut = self.load(address.hash);
+                let load_fut = self.load(repository, address.hash);
                 tokio::pin!(exists_fut, load_fut);
 
                 let mut load_result = None;
@@ -1409,7 +1625,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             let span = tracing::Span::current();
 
             let original_metadata = self
-                .metadata_with_size_validation(address.hash)
+                .metadata_with_size_validation(repository, address.hash)
                 .instrument(span.clone())
                 .await?;
 
@@ -1421,7 +1637,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 let mut updated_metadata = original_metadata;
                 updated_metadata.flags |= FragmentFlags::PayloadObliterating;
 
-                self.update_metadata(address, updated_metadata, original_metadata)
+                self.update_metadata(repository, address, updated_metadata, original_metadata)
                     .instrument(span.clone())
                     .await?;
                 info!("Acquired obliteration lock, updated metadata: {updated_metadata:?}");
@@ -1437,7 +1653,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 // only cares about the size fields (which haven't changed), but it feels wrong given it
                 // doesn't explicitly match the metadata for what's currently in S3.
                 let payload = self
-                    .read_payload(self.get_s3_object_contents(address.hash).await?, address.hash, original_metadata)?
+                    .read_payload(self.get_s3_object_contents(repository, address.hash).await?, address.hash, original_metadata)?
                     .to_aligned::<FragmentReference>();
 
                 let sub_fragments = payload.as_type_slice::<FragmentReference>();
@@ -1503,7 +1719,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             //  fragment association while we maintain the lock.
             info!("Association deleted, re-checking for other association...");
             let remain_associated = self
-                .has_associations(address.hash)
+                .has_associations(repository, address.hash)
                 .instrument(span.clone())
                 .await?;
 
@@ -1512,7 +1728,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             if remain_associated {
                 info!("Fragment still associated, nothing more to do");
                 return self
-                    .update_metadata(address, original_metadata, updated_metadata)
+                    .update_metadata(repository, address, original_metadata, updated_metadata)
                     .instrument(span.clone())
                     .await
                     .inspect_err(|e| {
@@ -1520,7 +1736,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     });
             }
 
-            self.delete_payload(address.hash)
+            self.delete_payload(repository, address.hash)
                 .instrument(span.clone())
                 .await?;
 
@@ -1534,7 +1750,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             obliterated_metadata.size_content = 0;
 
             // Final metadata update to clear out the sizes and set the flags to `Obliterated`.
-            self.update_metadata(address, obliterated_metadata, updated_metadata)
+            self.update_metadata(repository, address, obliterated_metadata, updated_metadata)
                 .await
                 .inspect_err(|e| {
                     // At this point we've already deleted the underlying payload, so there's not any
@@ -1577,6 +1793,45 @@ impl ImmutableStoreTrait for AwsImmutableStore {
 
             if query.match_made != StoreMatch::MatchFull {
                 return Err(StoreError::from(AddressNotFound::from(source_address)));
+            }
+
+            // Under per-repository bucket routing the source and destination may
+            // resolve to different buckets. A copy is otherwise a pure
+            // DynamoDB metadata/association association and never touches S3, so
+            // without this the destination would reference bytes that only live
+            // in the source's bucket. Perform a real server-side object copy so
+            // the payload is reachable from the destination's bucket; same-bucket
+            // copies stay metadata-only.
+            let source_bucket = self.bucket_for(source_repository);
+            let destination_bucket = self.bucket_for(destination_repository);
+            if source_bucket != destination_bucket {
+                let mut dst = [0u8; 64];
+                let key = lore_revision::util::to_hex_str(source_address.hash.data(), &mut dst);
+                info!(
+                    "Cross-bucket copy of {key} from {source_bucket} to {destination_bucket}"
+                );
+                self.s3
+                    .copy_object(source_bucket.as_ref(), key, destination_bucket.as_ref(), key)
+                    .await
+                    .map_err(|e| {
+                        warn!(
+                            "Failed to copy object {key} from {source_bucket} to {destination_bucket}: {e:?}"
+                        );
+                        if matches!(&e, AwsError::AwsSdkError(_)) {
+                            StoreError::from(SlowDown)
+                        } else {
+                            StoreError::internal_with_context(e, "S3 copy object failed")
+                        }
+                    })?;
+            }
+
+            // Under partition-scoped dedup, metadata is keyed by (hash,
+            // repository), so the destination repository needs its own metadata
+            // entry. Under global scope metadata is hash-only and already
+            // present, so this is skipped.
+            if self.dedup_scope == DedupScope::Partition {
+                self.write_metadata(destination_repository, destination_address, query.fragment)
+                    .await?;
             }
 
             self.associate_fragment(destination_repository, destination_address)
@@ -1772,8 +2027,8 @@ mod test {
             });
     }
 
-    async fn initialize_immutable_store(s3: S3, dynamodb: DynamoDb) -> AwsImmutableStore {
-        let settings = AwsImmutableStoreSettings {
+    fn test_settings(dedup_scope: DedupScope) -> AwsImmutableStoreSettings {
+        AwsImmutableStoreSettings {
             s3: S3StoreSettings::new(BUCKET.to_string()),
             dynamodb: DynamoDbImmutableStoreSettings::new(
                 FRAGMENTS_TABLE_NAME.to_string(),
@@ -1781,12 +2036,48 @@ mod test {
             ),
             force_write: false,
             batch_exist_submission_limit: 1000,
-        };
+            dedup_scope,
+        }
+    }
+
+    async fn initialize_immutable_store(s3: S3, dynamodb: DynamoDb) -> AwsImmutableStore {
+        let settings = test_settings(DedupScope::Global);
 
         let execution = setup_execution("test".to_string());
         LORE_CONTEXT
             .scope(execution.clone(), async move {
                 AwsImmutableStore::new(s3, dynamodb, &settings)
+            })
+            .await
+    }
+
+    async fn initialize_immutable_store_scoped(
+        s3: S3,
+        dynamodb: DynamoDb,
+        dedup_scope: DedupScope,
+    ) -> AwsImmutableStore {
+        let settings = test_settings(dedup_scope);
+
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                AwsImmutableStore::new(s3, dynamodb, &settings)
+            })
+            .await
+    }
+
+    async fn initialize_immutable_store_with_resolver(
+        s3: S3,
+        dynamodb: DynamoDb,
+        dedup_scope: DedupScope,
+        resolver: Arc<dyn BucketResolver>,
+    ) -> AwsImmutableStore {
+        let settings = test_settings(dedup_scope);
+
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                AwsImmutableStore::with_bucket_resolver(s3, dynamodb, &settings, resolver)
             })
             .await
     }
@@ -3303,7 +3594,7 @@ mod test {
 
         assert!(
             store
-                .load_metadata(address.hash)
+                .load_metadata(random::<Context>(), address.hash)
                 .await
                 .unwrap_err()
                 .is_slow_down()
@@ -3343,7 +3634,7 @@ mod test {
 
         assert!(
             store
-                .load_metadata(address.hash)
+                .load_metadata(random::<Context>(), address.hash)
                 .await
                 .unwrap_err()
                 .is_address_not_found()
@@ -4026,5 +4317,559 @@ mod test {
             )
             .await
             .expect("copy should succeed");
+    }
+
+    // =========================================================================
+    // Per-repository bucket routing and partition-scoped dedup
+    // =========================================================================
+
+    const BUCKET_A: &str = "bucket-a";
+    const BUCKET_B: &str = "bucket-b";
+
+    /// Test resolver mapping specific repositories to specific buckets, with a
+    /// fallback for any other repository. Mirrors the shape of the resolver a
+    /// hosting platform supplies, without any tenant/org concepts leaking into
+    /// Lore.
+    struct MapBucketResolver {
+        map: HashMap<Context, String>,
+        fallback: String,
+    }
+
+    impl MapBucketResolver {
+        fn new(entries: impl IntoIterator<Item = (Context, &'static str)>) -> Self {
+            Self {
+                map: entries
+                    .into_iter()
+                    .map(|(ctx, bucket)| (ctx, bucket.to_string()))
+                    .collect(),
+                fallback: BUCKET.to_string(),
+            }
+        }
+    }
+
+    impl BucketResolver for MapBucketResolver {
+        fn bucket_for(&self, repository: &Context) -> std::borrow::Cow<'_, str> {
+            std::borrow::Cow::Borrowed(self.map.get(repository).unwrap_or(&self.fallback))
+        }
+    }
+
+    fn mock_put_payload(
+        s3mock: &mut MockS3Impl,
+        bucket: &'static str,
+        address: Address,
+        payload: Bytes,
+    ) {
+        s3mock
+            .expect_put_object()
+            .with(
+                eq(bucket),
+                eq(address.hash.to_string()),
+                eq(payload.to_vec()),
+            )
+            .return_once(move |_, _, _: Vec<u8>| Ok(PutObjectOutput::builder().build()));
+    }
+
+    fn mock_get_payload(
+        s3mock: &mut MockS3Impl,
+        bucket: &'static str,
+        address: Address,
+        payload: Bytes,
+    ) {
+        let mut bytes = vec![];
+        bytes.extend_from_slice(payload.as_ref());
+        s3mock
+            .expect_get_object()
+            .with(eq(bucket), eq(address.hash.to_string()), eq(None))
+            .return_once(move |_, _, _| {
+                Ok(GetObjectOutput::builder()
+                    .set_body(Some(bytes.into()))
+                    .build())
+            });
+    }
+
+    fn mock_metadata_put(dynamodb_mock: &mut MockDynamoDb, address: Address, fragment: Fragment) {
+        let item: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(FragmentMetadataEntry::new(address.hash).with_fragment(fragment))
+                .unwrap();
+        dynamodb_mock
+            .expect_put_item()
+            .with(eq(Arc::<str>::from(METADATA_TABLE_NAME)), eq(item.clone()))
+            .return_once(move |_, _| {
+                Ok(PutItemOutput::builder().set_attributes(Some(item)).build())
+            });
+    }
+
+    /// Two repositories routed to two buckets: each repository's write lands in
+    /// its own bucket. The `put_object` expectations are pinned per-bucket, so a
+    /// cross-bucket write would fail the test.
+    #[tokio::test]
+    async fn test_put_routes_to_partition_bucket() {
+        let repo_a = random::<Context>();
+        let repo_b = random::<Context>();
+        let (fragment_a, address_a, payload_a) = fragment::generate_random();
+        let (fragment_b, address_b, payload_b) = fragment::generate_random();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry_a = FragmentsEntry::new(repo_a, address_a);
+        mock_lookup_fragments(
+            &mut dynamodb_mock,
+            entry_a.clone(),
+            StoreMatch::MatchFull,
+            StoreMatch::MatchNone,
+        );
+        mock_metadata_put(&mut dynamodb_mock, address_a, fragment_a);
+        mock_associate_fragment(&mut dynamodb_mock, &entry_a);
+        mock_put_payload(&mut s3mock, BUCKET_A, address_a, payload_a.clone());
+
+        let entry_b = FragmentsEntry::new(repo_b, address_b);
+        mock_lookup_fragments(
+            &mut dynamodb_mock,
+            entry_b.clone(),
+            StoreMatch::MatchFull,
+            StoreMatch::MatchNone,
+        );
+        mock_metadata_put(&mut dynamodb_mock, address_b, fragment_b);
+        mock_associate_fragment(&mut dynamodb_mock, &entry_b);
+        mock_put_payload(&mut s3mock, BUCKET_B, address_b, payload_b.clone());
+
+        let resolver = Arc::new(MapBucketResolver::new([
+            (repo_a, BUCKET_A),
+            (repo_b, BUCKET_B),
+        ]));
+        let store = Arc::new(
+            initialize_immutable_store_with_resolver(
+                s3mock,
+                dynamodb_mock,
+                DedupScope::Global,
+                resolver,
+            )
+            .await,
+        );
+
+        store
+            .clone()
+            .put(repo_a.into(), address_a, fragment_a, Some(payload_a), false)
+            .await
+            .expect("put A failed");
+        store
+            .put(repo_b.into(), address_b, fragment_b, Some(payload_b), false)
+            .await
+            .expect("put B failed");
+    }
+
+    /// Two repositories routed to two buckets: each repository's read is served
+    /// from its own bucket. The `get_object` expectations are pinned per-bucket,
+    /// so a cross-bucket read would fail the test.
+    #[tokio::test]
+    async fn test_get_routes_to_partition_bucket() {
+        let repo_a = random::<Context>();
+        let repo_b = random::<Context>();
+        let (fragment_a, address_a, payload_a) = fragment::generate_random();
+        let (fragment_b, address_b, payload_b) = fragment::generate_random();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        for (repo, address, fragment, bucket, payload) in [
+            (repo_a, address_a, fragment_a, BUCKET_A, payload_a.clone()),
+            (repo_b, address_b, fragment_b, BUCKET_B, payload_b.clone()),
+        ] {
+            mock_lookup_fragments(
+                &mut dynamodb_mock,
+                FragmentsEntry::new(repo, address),
+                StoreMatch::MatchHash,
+                StoreMatch::MatchHash,
+            );
+            let metadata_entry = FragmentMetadataEntry::new(address.hash);
+            let av_map: HashMap<String, AttributeValue> =
+                serde_dynamo::to_item(metadata_entry.clone()).unwrap();
+            let full = serde_dynamo::to_item(metadata_entry.with_fragment(fragment)).unwrap();
+            dynamodb_mock
+                .expect_get_item()
+                .with(
+                    eq(Arc::<str>::from(METADATA_TABLE_NAME)),
+                    eq(av_map),
+                    eq(true),
+                )
+                .return_once(move |_, _, _| {
+                    Ok(GetItemOutput::builder().set_item(Some(full)).build())
+                });
+            mock_get_payload(&mut s3mock, bucket, address, payload);
+        }
+
+        let resolver = Arc::new(MapBucketResolver::new([
+            (repo_a, BUCKET_A),
+            (repo_b, BUCKET_B),
+        ]));
+        let store = Arc::new(
+            initialize_immutable_store_with_resolver(
+                s3mock,
+                dynamodb_mock,
+                DedupScope::Global,
+                resolver,
+            )
+            .await,
+        );
+
+        let (got_frag_a, got_payload_a) = store
+            .clone()
+            .get(repo_a.into(), address_a, StoreMatch::MatchHash)
+            .await
+            .expect("get A failed");
+        assert_eq!(fragment_a, got_frag_a);
+        assert_eq!(payload_a.as_ref(), got_payload_a.as_ref());
+
+        let (got_frag_b, got_payload_b) = store
+            .get(repo_b.into(), address_b, StoreMatch::MatchHash)
+            .await
+            .expect("get B failed");
+        assert_eq!(fragment_b, got_frag_b);
+        assert_eq!(payload_b.as_ref(), got_payload_b.as_ref());
+    }
+
+    /// Under partition-scoped dedup, a client `MatchHash` existence check is
+    /// narrowed to the querying repository: a fragment present in repo A is not
+    /// reported as present for repo B.
+    #[tokio::test]
+    async fn test_partition_dedup_scopes_existence() {
+        let repo_a = random::<Context>();
+        let repo_b = random::<Context>();
+        let address = random::<Address>();
+
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        // Present in A's repository...
+        dynamodb_mock
+            .expect_query_single()
+            .with(
+                eq(Arc::<str>::from(FRAGMENTS_TABLE_NAME)),
+                eq(FragmentsQuery::Repository(address.hash, repo_a)),
+            )
+            .return_once(move |_, _| Ok(QueryOutput::builder().count(1).build()));
+        // ...but not in B's.
+        dynamodb_mock
+            .expect_query_single()
+            .with(
+                eq(Arc::<str>::from(FRAGMENTS_TABLE_NAME)),
+                eq(FragmentsQuery::Repository(address.hash, repo_b)),
+            )
+            .return_once(move |_, _| Ok(QueryOutput::builder().count(0).build()));
+
+        let store = Arc::new(
+            initialize_immutable_store_scoped(s3mock, dynamodb_mock, DedupScope::Partition).await,
+        );
+
+        // A global (MatchHash) request is answered at the repository scope.
+        let in_a = store
+            .clone()
+            .exist(repo_a.into(), address, StoreMatch::MatchHash)
+            .await
+            .expect("exist A failed");
+        assert_eq!(StoreMatch::MatchPartition, in_a);
+
+        let in_b = store
+            .exist(repo_b.into(), address, StoreMatch::MatchHash)
+            .await
+            .expect("exist B failed");
+        assert_eq!(StoreMatch::MatchNone, in_b);
+    }
+
+    /// Under partition-scoped dedup, the metadata table is keyed by
+    /// (hash, repository): the same hash carries independent metadata per
+    /// repository. The two `get_item` expectations are pinned to distinct
+    /// (hash, repository) keys, so a hash-only lookup would fail the test.
+    #[tokio::test]
+    async fn test_partition_metadata_is_isolated_per_repository() {
+        let repo_a = random::<Context>();
+        let repo_b = random::<Context>();
+        let (fragment_a, address, _) = fragment::generate_random();
+        let mut fragment_b = fragment_a;
+        fragment_b.size_content += 1;
+
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        for (repo, fragment) in [(repo_a, fragment_a), (repo_b, fragment_b)] {
+            mock_lookup_fragments(
+                &mut dynamodb_mock,
+                FragmentsEntry::new(repo, address),
+                StoreMatch::MatchPartition,
+                StoreMatch::MatchPartition,
+            );
+
+            let key = FragmentMetadataEntry::new(address.hash).with_repository(Some(repo));
+            let av_map: HashMap<String, AttributeValue> =
+                serde_dynamo::to_item(key.clone()).unwrap();
+            let full = serde_dynamo::to_item(key.with_fragment(fragment)).unwrap();
+            dynamodb_mock
+                .expect_get_item()
+                .with(
+                    eq(Arc::<str>::from(METADATA_TABLE_NAME)),
+                    eq(av_map),
+                    eq(true),
+                )
+                .return_once(move |_, _, _| {
+                    Ok(GetItemOutput::builder().set_item(Some(full)).build())
+                });
+        }
+
+        let store = Arc::new(
+            initialize_immutable_store_scoped(s3mock, dynamodb_mock, DedupScope::Partition).await,
+        );
+
+        let result_a = store
+            .clone()
+            .query(repo_a.into(), address, StoreMatch::MatchPartition)
+            .await
+            .expect("query A failed");
+        assert_eq!(fragment_a, result_a.fragment);
+
+        let result_b = store
+            .query(repo_b.into(), address, StoreMatch::MatchPartition)
+            .await
+            .expect("query B failed");
+        assert_eq!(fragment_b, result_b.fragment);
+    }
+
+    /// Under partition scope, the internal lookup used by `query`/`get`/`put` is
+    /// also repository-scoped: a `query` for a fragment that exists only in
+    /// another repository returns a clean `MatchNone` rather than leaking the
+    /// cross-repository match (which would then fail the per-repository metadata
+    /// load).
+    #[tokio::test]
+    async fn test_partition_query_does_not_leak_cross_repository() {
+        let querying_repo = random::<Context>();
+        let address = random::<Address>();
+
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        // The fragment is absent from the querying repository at every level.
+        // The lookup walks Partition then Hash; under partition scope both
+        // resolve to the same repository-scoped query, so it may be issued more
+        // than once.
+        dynamodb_mock
+            .expect_query_single()
+            .with(
+                eq(Arc::<str>::from(FRAGMENTS_TABLE_NAME)),
+                eq(FragmentsQuery::Repository(address.hash, querying_repo)),
+            )
+            .returning(move |_, _| Ok(QueryOutput::builder().count(0).build()));
+
+        let store = Arc::new(
+            initialize_immutable_store_scoped(s3mock, dynamodb_mock, DedupScope::Partition).await,
+        );
+
+        let result = store
+            .query(querying_repo.into(), address, StoreMatch::MatchPartition)
+            .await
+            .expect("query should succeed with MatchNone");
+        assert_eq!(StoreMatch::MatchNone, result.match_made);
+    }
+
+    /// A copy whose source and destination resolve to different buckets performs
+    /// a real S3 object copy so the bytes are reachable from the destination
+    /// bucket, then associates the destination.
+    #[tokio::test]
+    async fn test_copy_cross_bucket_copies_object() {
+        let source_repository = random::<Context>();
+        let destination_repository = random::<Context>();
+        let (fragment, source_address, _) = fragment::generate_random();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        mock_lookup_fragments(
+            &mut dynamodb_mock,
+            FragmentsEntry::new(source_repository, source_address),
+            StoreMatch::MatchFull,
+            StoreMatch::MatchFull,
+        );
+
+        // do_query loads metadata once the match is made (global key).
+        let metadata_entry = FragmentMetadataEntry::new(source_address.hash);
+        let av_map: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
+        let full = serde_dynamo::to_item(metadata_entry.with_fragment(fragment)).unwrap();
+        dynamodb_mock
+            .expect_get_item()
+            .with(
+                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
+                eq(av_map),
+                eq(true),
+            )
+            .return_once(move |_, _, _| Ok(GetItemOutput::builder().set_item(Some(full)).build()));
+
+        // The cross-bucket object copy.
+        s3mock
+            .expect_copy_object()
+            .with(
+                eq(BUCKET_A),
+                eq(source_address.hash.to_string()),
+                eq(BUCKET_B),
+                eq(source_address.hash.to_string()),
+            )
+            .return_once(move |_, _, _, _| {
+                Ok(aws_sdk_s3::operation::copy_object::CopyObjectOutput::builder().build())
+            });
+
+        // The destination association.
+        let destination_entry = FragmentsEntry::new(destination_repository, source_address);
+        mock_associate_fragment(&mut dynamodb_mock, &destination_entry);
+
+        let resolver = Arc::new(MapBucketResolver::new([
+            (source_repository, BUCKET_A),
+            (destination_repository, BUCKET_B),
+        ]));
+        let store = Arc::new(
+            initialize_immutable_store_with_resolver(
+                s3mock,
+                dynamodb_mock,
+                DedupScope::Global,
+                resolver,
+            )
+            .await,
+        );
+
+        store
+            .copy(
+                source_repository.into(),
+                source_address,
+                destination_repository.into(),
+                source_address.context,
+                false,
+            )
+            .await
+            .expect("cross-bucket copy should succeed");
+    }
+
+    /// Obliterating a fragment deletes its payload from the bucket that backs
+    /// the obliterating repository (not the statically configured one).
+    #[tokio::test]
+    #[traced_test]
+    async fn test_obliterate_routes_delete_to_partition_bucket() {
+        let repository = random::<Context>();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let (fragment, address) =
+            mock_load_fragment_metadata(&mut dynamodb_mock, None, false /* fail */);
+
+        mock_acquire_obliterate_lock(
+            &mut dynamodb_mock,
+            fragment,
+            address.hash,
+            MockLockMode::Finalize,
+            true, /* in sequence */
+        );
+        mock_count_associations(&mut dynamodb_mock, address.hash, 0, false /* fail */);
+        mock_remove_association(
+            &mut dynamodb_mock,
+            repository,
+            address,
+            false, /* fail */
+        );
+
+        // The delete must target BUCKET_A, the routed bucket for `repository`.
+        let version_id = Some("v1".to_string());
+        s3mock
+            .expect_list_versions()
+            .with(eq(BUCKET_A), eq(address.hash.to_string()))
+            .return_once({
+                let version_id = version_id.clone();
+                move |_, _| {
+                    Ok(ListObjectVersionsOutput::builder()
+                        .set_versions(Some(vec![
+                            ObjectVersion::builder().set_version_id(version_id).build(),
+                        ]))
+                        .build())
+                }
+            });
+        s3mock
+            .expect_delete_object()
+            .with(eq(BUCKET_A), eq(address.hash.to_string()), eq(version_id))
+            .return_once(move |_, _, _| Ok(DeleteObjectOutput::builder().build()));
+
+        let resolver = Arc::new(MapBucketResolver::new([(repository, BUCKET_A)]));
+        let store = Arc::new(
+            initialize_immutable_store_with_resolver(
+                s3mock,
+                dynamodb_mock,
+                DedupScope::Global,
+                resolver,
+            )
+            .await,
+        );
+
+        let stats: Arc<StoreObliterateStats> = Default::default();
+        store
+            .obliterate(repository.into(), address, stats.clone())
+            .await
+            .expect("obliterate failed");
+
+        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 1);
+    }
+
+    /// `ensure_bucket_exists` validates a routed bucket on demand and caches the
+    /// result, so a given bucket is only checked once.
+    #[tokio::test]
+    async fn test_ensure_bucket_exists_validates_and_caches() {
+        let repository = random::<Context>();
+
+        let mut s3mock = MockS3Impl::default();
+        let dynamodb_mock = MockDynamoDb::default();
+
+        s3mock
+            .expect_bucket_exists()
+            .with(eq(BUCKET_A.to_string()))
+            .times(1)
+            .return_once(move |_| Ok(true));
+
+        let resolver = Arc::new(MapBucketResolver::new([(repository, BUCKET_A)]));
+        let store = initialize_immutable_store_with_resolver(
+            s3mock,
+            dynamodb_mock,
+            DedupScope::Global,
+            resolver,
+        )
+        .await;
+
+        assert!(store.ensure_bucket_exists(repository.into()).await.unwrap());
+        // Second call is served from cache; `bucket_exists` is only invoked once
+        // (enforced by `.times(1)` above).
+        assert!(store.ensure_bucket_exists(repository.into()).await.unwrap());
+    }
+
+    /// A missing bucket is reported as absent and not cached, so a later call
+    /// re-checks.
+    #[tokio::test]
+    async fn test_ensure_bucket_exists_missing_bucket() {
+        let repository = random::<Context>();
+
+        let mut s3mock = MockS3Impl::default();
+        let dynamodb_mock = MockDynamoDb::default();
+
+        s3mock
+            .expect_bucket_exists()
+            .with(eq(BUCKET_A.to_string()))
+            .times(2)
+            .returning(move |_| Ok(false));
+
+        let resolver = Arc::new(MapBucketResolver::new([(repository, BUCKET_A)]));
+        let store = initialize_immutable_store_with_resolver(
+            s3mock,
+            dynamodb_mock,
+            DedupScope::Global,
+            resolver,
+        )
+        .await;
+
+        assert!(!store.ensure_bucket_exists(repository.into()).await.unwrap());
+        // Not cached, so a second call re-checks (enforced by `.times(2)`).
+        assert!(!store.ensure_bucket_exists(repository.into()).await.unwrap());
     }
 }
