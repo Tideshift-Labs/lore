@@ -54,6 +54,12 @@ pub trait BucketResolver: Send + Sync {
 }
 ```
 
+> **Note (superseded signature).** This is the original, synchronous/infallible
+> trait. [ADR-00017](00017-dynamodb-bucket-resolver.md) later evolved it to
+> `async fn bucket_for(&self, repository: &Context) -> Result<String, StoreError>`
+> so a resolver can do I/O (a DynamoDB lookup) and fail closed on a cache miss.
+> The `Arc<dyn BucketResolver>` injection and everything else below are unchanged.
+
 The store holds an `Arc<dyn BucketResolver>` instead of a fixed bucket string, and resolves the
 bucket on every S3 read, write and delete. The default `StaticBucketResolver` returns the single
 configured bucket and preserves current behaviour exactly. The standard `AwsImmutableStore::new`

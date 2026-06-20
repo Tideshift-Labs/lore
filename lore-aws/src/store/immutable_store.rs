@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -1384,7 +1383,7 @@ impl AwsImmutableStore {
         let mut dst = [0u8; 64];
         let hash = lore_revision::util::to_hex_str(hash.data(), &mut dst);
 
-        let bucket = self.bucket_for(repository);
+        let bucket = self.bucket_for(repository).await?;
         let versions: Option<Vec<Option<String>>> = self
             .s3
             .list_versions(bucket.as_ref(), hash)
@@ -1597,7 +1596,7 @@ impl AwsImmutableStore {
         hash: Hash,
     ) -> Result<GetS3objectContentsOutput, StoreError> {
         let mut dst = [0u8; 64];
-        let bucket = self.bucket_for(repository);
+        let bucket = self.bucket_for(repository).await?;
         let mut output = self
             .s3
             .get_object(
@@ -4307,9 +4306,10 @@ mod test {
         }
     }
 
+    #[async_trait]
     impl BucketResolver for MapBucketResolver {
-        fn bucket_for(&self, repository: &Context) -> std::borrow::Cow<'_, str> {
-            std::borrow::Cow::Borrowed(self.map.get(repository).unwrap_or(&self.fallback))
+        async fn bucket_for(&self, repository: &Context) -> Result<String, StoreError> {
+            Ok(self.map.get(repository).unwrap_or(&self.fallback).clone())
         }
     }
 
@@ -4417,6 +4417,91 @@ mod test {
             .put(repo_b.into(), address_b, fragment_b, Some(payload_b), false)
             .await
             .expect("put B failed");
+    }
+
+    /// End-to-end through a `DynamoBucketResolver`: a partition-scoped put is
+    /// routed to the bucket the routing table returns. The resolver's own
+    /// DynamoDB mock answers the routing `GetItem` (consistent read) with
+    /// `routed-bucket`, and the payload `put_object` is pinned to that bucket —
+    /// a misroute would fail the S3 expectation.
+    #[tokio::test]
+    async fn test_dynamo_resolver_routes_put_under_partition_scope() {
+        const ROUTING_TABLE: &str = "repository-bucket-routing";
+        const ROUTED_BUCKET: &str = "dynamo-routed-bucket";
+
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        // Resolver-side DynamoDB mock: serves only the routing-table lookup,
+        // keyed by the canonical `Context` string, with a consistent read.
+        let mut routing_dynamo = MockDynamoDb::default();
+        let routing_key = HashMap::from([(
+            "repository".to_string(),
+            AttributeValue::S(repository.to_string()),
+        )]);
+        routing_dynamo
+            .expect_get_item()
+            .with(
+                eq(Arc::<str>::from(ROUTING_TABLE)),
+                eq(routing_key),
+                eq(true),
+            )
+            .return_once(|_, _, _| {
+                Ok(GetItemOutput::builder()
+                    .set_item(Some(HashMap::from([(
+                        "bucket".to_string(),
+                        AttributeValue::S(ROUTED_BUCKET.to_string()),
+                    )])))
+                    .build())
+            });
+        let resolver = Arc::new(DynamoBucketResolver::new(routing_dynamo, ROUTING_TABLE));
+
+        // Store-side mocks: fragment existence walk, then metadata + association
+        // writes once the put decides to store the new payload.
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+        let entry = FragmentsEntry::new(repository, address);
+        mock_lookup_fragments(
+            &mut dynamodb_mock,
+            entry.clone(),
+            StoreMatch::MatchFull,
+            StoreMatch::MatchNone,
+        );
+        // Under partition scope the metadata key carries the repository.
+        let metadata_item: HashMap<String, AttributeValue> = serde_dynamo::to_item(
+            FragmentMetadataEntry::new(address.hash)
+                .with_repository(Some(repository))
+                .with_fragment(fragment),
+        )
+        .unwrap();
+        dynamodb_mock
+            .expect_put_item()
+            .with(
+                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
+                eq(metadata_item.clone()),
+            )
+            .return_once(move |_, _| {
+                Ok(PutItemOutput::builder()
+                    .set_attributes(Some(metadata_item))
+                    .build())
+            });
+        mock_associate_fragment(&mut dynamodb_mock, &entry);
+        mock_put_payload(&mut s3mock, ROUTED_BUCKET, address, payload.clone());
+
+        let store = Arc::new(
+            initialize_immutable_store_with_resolver(
+                s3mock,
+                dynamodb_mock,
+                DedupScope::Partition,
+                resolver,
+            )
+            .await,
+        );
+
+        store
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("routed put failed");
     }
 
     /// Two repositories routed to two buckets: each repository's read is served
