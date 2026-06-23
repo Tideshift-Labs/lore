@@ -10,6 +10,7 @@ use lore_proto::auth::GetUserIdRequest;
 use lore_proto::auth::GetUserInfoRequest;
 use lore_proto::auth::StartAuthSessionRequest;
 use lore_proto::auth::urc_auth_api_client::UrcAuthApiClient;
+use tonic::transport::ClientTlsConfig;
 
 use crate::error::ProtocolError;
 use crate::grpc::CorrelationInterceptor;
