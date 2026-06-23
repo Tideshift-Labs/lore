@@ -10,6 +10,7 @@ use lore_proto::auth::GetUserIdRequest;
 use lore_proto::auth::GetUserInfoRequest;
 use lore_proto::auth::StartAuthSessionRequest;
 use lore_proto::auth::urc_auth_api_client::UrcAuthApiClient;
+use tonic::transport::ClientTlsConfig;
 
 use crate::error::ProtocolError;
 use crate::grpc::CorrelationInterceptor;
@@ -45,8 +46,22 @@ async fn connect_client(
     ProtocolError,
 > {
     let endpoint = grpc_endpoint(auth_url);
-    let channel = tonic::transport::Endpoint::new(endpoint)
-        .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?
+    let mut ep = tonic::transport::Endpoint::new(endpoint.clone())
+        .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?;
+    // Trust the OS/native root store for TLS, matching the data channel
+    // (`grpc::connect_to_endpoint`) and loreserver's own auth client
+    // (`lore-server/src/authnz/auth.rs`). Without this, tonic establishes no
+    // TLS for an `https://` endpoint and the exchange handshake fails.
+    if endpoint.starts_with("https://") {
+        ep = ep
+            .tls_config(
+                ClientTlsConfig::new()
+                    .assume_http2(true)
+                    .with_native_roots(),
+            )
+            .map_err(|e| ProtocolError::internal(format!("auth endpoint TLS config: {e}")))?;
+    }
+    let channel = ep
         .connect()
         .await
         .map_err(|e| ProtocolError::internal(format!("failed to connect to auth endpoint: {e}")))?;
