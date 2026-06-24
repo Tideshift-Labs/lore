@@ -47,7 +47,9 @@ use super::rpc_code_to_str;
 use super::send_err;
 use super::simple_map_message_handle_error;
 use super::warn_error_to_status;
+use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::require_permission;
 use crate::legacy::rpc::storage_service_server::StorageService;
 use crate::protocol::attribute_map::get_user_id_from_context;
 use crate::protocol::attribute_map::repository_id_from_context;
@@ -74,6 +76,7 @@ pub struct LoreStorageService {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     local_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    enforce_write_permission: bool,
 }
 
 impl LoreStorageService {
@@ -81,12 +84,18 @@ impl LoreStorageService {
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         local_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
+        enforce_write_permission: bool,
     ) -> Self {
         Self {
             immutable_store,
             local_store,
             mutable_store,
+            enforce_write_permission,
         }
+    }
+
+    pub fn enforce_write_permission(&self) -> bool {
+        self.enforce_write_permission
     }
 
     pub fn local_immutable_store(&self) -> &Arc<dyn lore_storage::ImmutableStore> {
@@ -251,6 +260,13 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::PutRequest>>,
     ) -> Result<Response<Self::PutStream>, Status> {
+        let repository = get_repository(request.metadata())?;
+        require_permission(
+            request.extensions(),
+            repository,
+            "write",
+            self.enforce_write_permission,
+        )?;
         let attrs = Arc::new(metadata_to_attribute(
             request.metadata(),
             request.extensions(),
@@ -458,6 +474,13 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
+        let repository = get_repository(request.metadata())?;
+        require_permission(
+            request.extensions(),
+            repository,
+            "write",
+            self.enforce_write_permission,
+        )?;
         let attrs = Arc::new(metadata_to_attribute(
             request.metadata(),
             request.extensions(),
@@ -719,6 +742,13 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<lore_proto::MutableStoreRequest>,
     ) -> Result<Response<lore_proto::MutableStoreResponse>, Status> {
+        let repository = get_repository(request.metadata())?;
+        require_permission(
+            request.extensions(),
+            repository,
+            "write",
+            self.enforce_write_permission,
+        )?;
         let mutable_store = self.mutable_store.clone();
 
         let user_id = get_user_id(request.extensions());
@@ -757,6 +787,13 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<lore_proto::MutableCompareAndSwapRequest>,
     ) -> Result<Response<lore_proto::MutableCompareAndSwapResponse>, Status> {
+        let repository = get_repository(request.metadata())?;
+        require_permission(
+            request.extensions(),
+            repository,
+            "write",
+            self.enforce_write_permission,
+        )?;
         let mutable_store = self.mutable_store.clone();
 
         let user_id = get_user_id(request.extensions());

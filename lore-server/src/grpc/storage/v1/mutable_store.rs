@@ -87,6 +87,7 @@ mod tests {
                     immutable_store.clone(),
                     immutable_store,
                     mutable_store,
+                    false,
                 );
 
                 let store_request = storage_v1::MutableStoreRequest {

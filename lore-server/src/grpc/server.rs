@@ -493,11 +493,17 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
     pub fn with_jwt_verifier(
         self,
         jwt_verifier: Option<JwtVerifier>,
+        enforce_write_permission: bool,
     ) -> Result<GrpcServerBuilder<WantsAddress>> {
+        // Auth-OFF wires services with no interceptor → no token in request
+        // extensions, so write-permission enforcement no-ops regardless; pass
+        // `false` for clarity when there's no verifier.
+        let enforce_write_permission = jwt_verifier.is_some() && enforce_write_permission;
         let storage_svc = LoreStorageService::new(
             self.0.immutable_store.clone(),
             self.0.local_store.clone(),
             self.0.mutable_store.clone(),
+            enforce_write_permission,
         );
         let history_step_size = self
             .0
@@ -514,6 +520,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             history_step_size,
             acceleration,
             rpc_timeout,
+            enforce_write_permission,
         ));
         let revision_v1_svc = LoreRevisionV1Service::new(
             self.0.immutable_store.clone(),
@@ -523,6 +530,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             history_step_size,
             acceleration,
             rpc_timeout,
+            enforce_write_permission,
         );
         let revision_diff_config = crate::grpc::thinclient::v1::revision_diff::RevisionDiffConfig {
             source_cap: self.0.feature.revision_diff_source_cap.unwrap_or(
@@ -560,6 +568,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                     lock_store.clone(),
                     self.0.notification_sender.clone(),
                     rpc_timeout,
+                    enforce_write_permission,
                 ))
             }
             None => None,

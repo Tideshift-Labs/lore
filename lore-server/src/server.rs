@@ -425,6 +425,13 @@ async fn launch_grpc_server(
         .clone()
         .ok_or(anyhow!("Missing gRPC settings"))?;
     let service_settings = settings.server.grpc_public_services.clone();
+    // Enforce the JWT permission vector on write RPCs (default ON; ADR-00011).
+    // No-op when auth is OFF — `with_jwt_verifier` gates it on token presence.
+    let enforce_write_permission = settings
+        .server
+        .auth
+        .as_ref()
+        .is_none_or(|auth| auth.enforce_write_permission);
 
     let addr =
         SocketAddr::from_str(format!("{}:{}", grpc_settings.host, grpc_settings.port).as_str())?;
@@ -489,7 +496,7 @@ async fn launch_grpc_server(
             service_settings,
             user_agent_filter,
         )
-        .with_jwt_verifier(jwt_verifier)?
+        .with_jwt_verifier(jwt_verifier, enforce_write_permission)?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
         })

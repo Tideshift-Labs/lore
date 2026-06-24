@@ -322,6 +322,26 @@ pub fn has_required_permission(
         })
 }
 
+/// Enforce a write-path permission. No-op when auth is OFF (no token in
+/// extensions — keeps the auth-disabled dev/CI stack green) or when `enforce`
+/// is false; otherwise the token must carry `permission` for this repository,
+/// else permission_denied. Lorehub's mint stacks role→scopes, so admin/owner
+/// tokens already carry `write`; loreserver stays policy-dumb.
+pub fn require_permission(
+    extensions: &Extensions,
+    repository: RepositoryId,
+    permission: &str,
+    enforce: bool,
+) -> Result<(), Status> {
+    if get_authorization(extensions).is_err() {
+        return Ok(()); // auth OFF (no token) ⇒ no enforcement
+    }
+    if enforce && !has_required_permission(extensions, repository, permission) {
+        return Err(Status::permission_denied("Permission denied"));
+    }
+    Ok(())
+}
+
 pub fn user_permissions(extensions: &Extensions, repository: RepositoryId) -> Vec<String> {
     let user_resources = resources_from_token(get_authorization(extensions).ok());
     for resource in user_resources {
