@@ -23,6 +23,7 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
+use crate::grpc::require_permission;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -92,10 +93,15 @@ pub async fn handler(
     request: Request<BranchMetadataSetRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    enforce_write_permission: bool,
 ) -> Result<Response<BranchMetadataSetResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    // Capture the auth token before the request is consumed; the
+    // PROTECT-set gate below needs it once both metadata blobs are
+    // deserialized.
+    let extensions = request.extensions().clone();
     let req = request.into_inner();
 
     let branch_id = BranchId::from(req.branch_id);
@@ -140,6 +146,24 @@ pub async fn handler(
                         ))
                     })
                 })?;
+
+            // Enforce write authorization. Toggling the PROTECT bit
+            // requires `admin` (branch protection is an admin act); any
+            // other metadata write requires `write`. No-op when auth is
+            // OFF or the flag is disabled.
+            let protect_changed = current_metadata
+                .get_bool(branch::PROTECT)
+                .unwrap_or_default()
+                != proposed_metadata
+                    .get_bool(branch::PROTECT)
+                    .unwrap_or_default();
+            let required_permission = if protect_changed { "admin" } else { "write" };
+            require_permission(
+                &extensions,
+                repository_id,
+                required_permission,
+                enforce_write_permission,
+            )?;
 
             // Validate read-only fields are unchanged
             validate_read_only_fields(&current_metadata, &proposed_metadata)?;
@@ -282,7 +306,7 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let response = handler(request, immutable_store, mutable_store)
+            let response = handler(request, immutable_store, mutable_store, false)
                 .await
                 .expect("Handler failed");
 
@@ -319,7 +343,7 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let result = handler(request, immutable_store, mutable_store).await;
+            let result = handler(request, immutable_store, mutable_store, false).await;
 
             assert!(result.is_err());
             let status = result.unwrap_err();
@@ -353,7 +377,7 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let result = handler(request, immutable_store, mutable_store).await;
+            let result = handler(request, immutable_store, mutable_store, false).await;
 
             assert!(result.is_err());
             let status = result.unwrap_err();
@@ -389,7 +413,7 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let response = handler(request, immutable_store, mutable_store)
+            let response = handler(request, immutable_store, mutable_store, false)
                 .await
                 .expect("Handler failed — protect should be writable");
 
@@ -425,7 +449,7 @@ mod test {
             // Use a bogus expected hash
             let stale_hash = Hash::from(random::<[u8; 32]>());
             let request = make_request(repository_id, branch_id, stale_hash, new_hash);
-            let result = handler(request, immutable_store, mutable_store).await;
+            let result = handler(request, immutable_store, mutable_store, false).await;
 
             // CAS should fail because expected_hash doesn't match (it can't be deserialized)
             assert!(result.is_err());
@@ -446,7 +470,7 @@ mod test {
             Hash::default(),
             Hash::default(),
         );
-        let result = handler(request, immutable_store, mutable_store).await;
+        let result = handler(request, immutable_store, mutable_store, false).await;
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
@@ -478,7 +502,7 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let result = handler(request, immutable_store, mutable_store).await;
+            let result = handler(request, immutable_store, mutable_store, false).await;
 
             assert!(result.is_err());
             let status = result.unwrap_err();

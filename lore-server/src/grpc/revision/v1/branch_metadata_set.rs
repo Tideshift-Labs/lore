@@ -26,6 +26,7 @@ use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::handlers::branch_metadata_set::validate_binary_blobs;
 use crate::grpc::handlers::branch_metadata_set::validate_read_only_fields;
+use crate::grpc::require_permission;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -45,10 +46,15 @@ pub async fn handler(
     request: Request<BranchMetadataSetRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    enforce_write_permission: bool,
 ) -> Result<Response<BranchMetadataSetResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    // Capture the auth token before the request is consumed; the
+    // PROTECT-set gate below needs it once both metadata blobs are
+    // deserialized.
+    let extensions = request.extensions().clone();
     let req = request.into_inner();
 
     let branch_id = BranchId::from(req.id);
@@ -113,6 +119,24 @@ pub async fn handler(
                         ))
                     })
                 })?;
+
+            // Enforce write authorization. Toggling the PROTECT bit
+            // requires `admin` (branch protection is an admin act); any
+            // other metadata write requires `write`. No-op when auth is
+            // OFF or the flag is disabled.
+            let protect_changed = current_metadata
+                .get_bool(branch::PROTECT)
+                .unwrap_or_default()
+                != proposed_metadata
+                    .get_bool(branch::PROTECT)
+                    .unwrap_or_default();
+            let required_permission = if protect_changed { "admin" } else { "write" };
+            require_permission(
+                &extensions,
+                repository_id,
+                required_permission,
+                enforce_write_permission,
+            )?;
 
             validate_read_only_fields(&current_metadata, &proposed_metadata)?;
             validate_binary_blobs(repository.clone(), &proposed_metadata).await?;
@@ -249,6 +273,7 @@ mod test {
                 make_request(repository_id, branch_id, current, updated),
                 immutable_store,
                 mutable_store,
+                false,
             )
             .await
             .expect("CAS hit should succeed");
@@ -295,6 +320,7 @@ mod test {
                 make_request(repository_id, branch_id, stale_expected, updated),
                 immutable_store,
                 mutable_store,
+                false,
             )
             .await
             .expect("CAS miss should still return Ok");
@@ -334,6 +360,7 @@ mod test {
                 make_request(repository_id, branch_id, current, updated),
                 immutable_store,
                 mutable_store,
+                false,
             )
             .await
             .expect_err("read-only name modification must fail");
@@ -370,6 +397,7 @@ mod test {
                 make_request(repository_id, branch_id, current, updated),
                 immutable_store,
                 mutable_store,
+                false,
             )
             .await
             .expect_err("read-only category modification must fail");
@@ -404,6 +432,7 @@ mod test {
                 make_request(repository_id, branch_id, current, updated),
                 immutable_store,
                 mutable_store,
+                false,
             )
             .await
             .expect_err("removal of read-only creator must fail");
@@ -440,6 +469,7 @@ mod test {
                 make_request(repository_id, branch_id, current, updated),
                 immutable_store,
                 mutable_store,
+                false,
             )
             .await
             .expect("protect toggle must succeed");
@@ -460,6 +490,7 @@ mod test {
                 make_request(repository_id, branch_id, Hash::default(), Hash::default()),
                 immutable_store,
                 mutable_store,
+                false,
             )
             .await
             .expect_err("unknown branch must fail");
@@ -561,6 +592,7 @@ mod test {
                 make_request(repository_id, child_id, current, updated),
                 immutable_store,
                 mutable_store,
+                false,
             )
             .await
             .expect("CAS on deleted branch must succeed");
@@ -592,6 +624,7 @@ mod test {
                 make_request(repository_id, branch_id, current, garbage),
                 immutable_store,
                 mutable_store,
+                false,
             )
             .await
             .expect_err("garbage updated hash must fail to deserialize");
@@ -629,6 +662,7 @@ mod test {
                 make_request(repository_id, branch_id, garbage, updated),
                 immutable_store,
                 mutable_store,
+                false,
             )
             .await
             .expect_err("garbage expected hash must fail to deserialize");
@@ -669,6 +703,7 @@ mod test {
                 make_request(repository_id, branch_id, current, updated),
                 immutable_store,
                 mutable_store,
+                false,
             )
             .await
             .expect_err("dangling address reference must fail");
@@ -693,6 +728,7 @@ mod test {
             ),
             immutable_store,
             mutable_store,
+            false,
         )
         .await
         .expect_err("zero branch id must fail");
@@ -710,9 +746,206 @@ mod test {
             expected: Hash::default().into(),
             updated: Hash::default().into(),
         });
-        let err = handler(request, immutable_store, mutable_store)
+        let err = handler(request, immutable_store, mutable_store, false)
             .await
             .expect_err("missing repository must fail");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// Attach an `AuthorizationToken` carrying a single `urc-<repo>`
+    /// resource with the given permission set, mirroring a minted Lore
+    /// JWT.
+    fn with_perms(
+        mut request: Request<BranchMetadataSetRequest>,
+        repository: RepositoryId,
+        perms: &[&str],
+    ) -> Request<BranchMetadataSetRequest> {
+        request
+            .extensions_mut()
+            .insert(crate::auth::jwt::AuthorizationToken {
+                user_id: "test-user".into(),
+                resources: Some(vec![crate::auth::jwt::ResourcePermission {
+                    resource_id: format!("urc-{repository}"),
+                    permission: perms.iter().map(|p| p.to_string()).collect(),
+                }]),
+                ..Default::default()
+            });
+        request
+    }
+
+    /// Build a branch then propose metadata that toggles PROTECT on.
+    /// Returns `(current_hash, updated_hash)` ready for a CAS request.
+    async fn branch_with_protect_toggle(
+        repository: Arc<RepositoryContext>,
+        branch_id: BranchId,
+    ) -> (Hash, Hash) {
+        let current = create_branch(repository.clone(), branch_id).await;
+        let mut proposed = Metadata::deserialize(repository.clone(), current)
+            .await
+            .expect("deserialize current");
+        proposed
+            .set_bool(branch::PROTECT, true)
+            .expect("set protect");
+        let updated = serialize(repository, &proposed).await;
+        (current, updated)
+    }
+
+    #[tokio::test]
+    async fn protect_change_with_write_only_token_is_denied() {
+        let repository_id = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+            ));
+            let (current, updated) =
+                branch_with_protect_toggle(repository.clone(), branch_id).await;
+
+            let request = with_perms(
+                make_request(repository_id, branch_id, current, updated),
+                repository_id,
+                &["read", "write"],
+            );
+            let err = handler(request, immutable_store, mutable_store, true)
+                .await
+                .expect_err("toggling protect requires admin");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn protect_change_with_admin_token_is_accepted() {
+        let repository_id = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+            ));
+            let (current, updated) =
+                branch_with_protect_toggle(repository.clone(), branch_id).await;
+
+            let request = with_perms(
+                make_request(repository_id, branch_id, current, updated),
+                repository_id,
+                &["read", "write", "admin"],
+            );
+            let response = handler(request, immutable_store, mutable_store, true)
+                .await
+                .expect("admin may toggle protect");
+            assert_eq!(Hash::from(response.into_inner().metadata), updated);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn non_protect_change_needs_only_write() {
+        let repository_id = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+            ));
+            let current = create_branch(repository.clone(), branch_id).await;
+            let mut proposed = Metadata::deserialize(repository.clone(), current)
+                .await
+                .expect("deserialize current");
+            proposed
+                .set_string("custom-key", "custom-value")
+                .expect("set custom key");
+            let updated = serialize(repository.clone(), &proposed).await;
+
+            let request = with_perms(
+                make_request(repository_id, branch_id, current, updated),
+                repository_id,
+                &["read", "write"],
+            );
+            let response = handler(request, immutable_store, mutable_store, true)
+                .await
+                .expect("a write token may set non-protect metadata");
+            assert_eq!(Hash::from(response.into_inner().metadata), updated);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn read_only_token_cannot_write_metadata() {
+        let repository_id = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+            ));
+            let current = create_branch(repository.clone(), branch_id).await;
+            let mut proposed = Metadata::deserialize(repository.clone(), current)
+                .await
+                .expect("deserialize current");
+            proposed
+                .set_string("custom-key", "custom-value")
+                .expect("set custom key");
+            let updated = serialize(repository.clone(), &proposed).await;
+
+            let request = with_perms(
+                make_request(repository_id, branch_id, current, updated),
+                repository_id,
+                &["read"],
+            );
+            let err = handler(request, immutable_store, mutable_store, true)
+                .await
+                .expect_err("a read-only token must not write metadata");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn protect_change_allowed_when_enforcement_disabled() {
+        let repository_id = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+            ));
+            let (current, updated) =
+                branch_with_protect_toggle(repository.clone(), branch_id).await;
+
+            // Read-only token would be denied under enforcement, but the
+            // flag is off → the request is accepted (instant rollback).
+            let request = with_perms(
+                make_request(repository_id, branch_id, current, updated),
+                repository_id,
+                &["read"],
+            );
+            let response = handler(request, immutable_store, mutable_store, false)
+                .await
+                .expect("enforcement disabled lets any token through");
+            assert_eq!(Hash::from(response.into_inner().metadata), updated);
+        }))
+        .await;
     }
 }

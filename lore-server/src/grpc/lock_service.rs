@@ -36,6 +36,7 @@ use super::get_user_id;
 use super::is_owner_or_admin;
 use super::timeout_grpc;
 use crate::grpc::can_admin_lock;
+use crate::grpc::require_permission;
 use crate::util::setup_execution;
 
 const STATUS_MAX_RESOURCE_LEN: usize = 100;
@@ -91,6 +92,7 @@ pub struct LoreLockService {
     lock_store: Arc<dyn LockStore>,
     notification: Arc<dyn NotificationSender>,
     rpc_timeout: Duration,
+    enforce_write_permission: bool,
 
     instrument_provider: LoreLockServiceInstrumentProvider,
     locking_histogram: Histogram<u64>,
@@ -102,6 +104,7 @@ impl LoreLockService {
         lock_store: Arc<dyn LockStore>,
         notification: Arc<dyn NotificationSender>,
         rpc_timeout: Duration,
+        enforce_write_permission: bool,
     ) -> Self {
         let instrument_provider = LoreLockServiceInstrumentProvider {};
 
@@ -109,6 +112,7 @@ impl LoreLockService {
             lock_store,
             notification,
             rpc_timeout,
+            enforce_write_permission,
             locking_histogram: instrument_provider.length_histogram(
                 "locking.request.resources.length",
                 vec![1., 5., 10., 25., 50., 75., 100., 200.],
@@ -376,6 +380,13 @@ impl LoreLockService {
 impl LockService for LoreLockService {
     #[tracing::instrument(name = "LoreLockService::lock", skip_all)]
     async fn lock(&self, request: Request<LockRequest>) -> Result<Response<LockResponse>, Status> {
+        let repository = get_repository(request.metadata())?;
+        require_permission(
+            request.extensions(),
+            repository,
+            "write",
+            self.enforce_write_permission,
+        )?;
         timeout_grpc(self.rpc_timeout, self.handle_lock(request)).await
     }
 
@@ -400,6 +411,13 @@ impl LockService for LoreLockService {
         &self,
         request: Request<UnlockRequest>,
     ) -> Result<Response<UnlockResponse>, Status> {
+        let repository = get_repository(request.metadata())?;
+        require_permission(
+            request.extensions(),
+            repository,
+            "write",
+            self.enforce_write_permission,
+        )?;
         timeout_grpc(self.rpc_timeout, self.handle_unlock(request)).await
     }
 
@@ -484,6 +502,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                false,
             );
 
             let resources: Vec<Resource> = (0..101)
@@ -521,6 +540,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                false,
             );
 
             let resources: Vec<Resource> = (0..100)
@@ -564,6 +584,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                false,
             );
 
             let mut request = Request::new(LockRequest { resources: vec![] });
@@ -588,6 +609,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                false,
             );
 
             let mut request = Request::new(UnlockRequest { resources: vec![] });
@@ -612,6 +634,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                false,
             );
 
             let mut request = Request::new(StatusRequest { resources: vec![] });
@@ -636,6 +659,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                false,
             );
 
             let mut request = Request::new(AdminLockRequest {
@@ -666,6 +690,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                false,
             );
 
             let mut request = Request::new(UnlockRequest {
@@ -687,6 +712,123 @@ mod test {
                 .expect_err("Unlock did not return error status");
 
             assert_eq!(error_status.code(), Code::FailedPrecondition);
+        }
+    }
+
+    mod permission {
+        use lore_proto::lock::LockRequest;
+        use lore_proto::lock::Resource;
+        use lore_proto::lock::UnlockRequest;
+
+        use super::*;
+        use crate::auth::jwt::AuthorizationToken;
+        use crate::auth::jwt::ResourcePermission;
+        use crate::notification::local::NotificationSender;
+
+        fn make_service(enforce: bool) -> LoreLockService {
+            let lock_store = super::store::MockMockLockStore::new();
+            LoreLockService::new(
+                Arc::new(lock_store),
+                Arc::new(NotificationSender::default()),
+                Duration::from_secs(60),
+                enforce,
+            )
+        }
+
+        fn with_token<T>(
+            mut request: Request<T>,
+            repository: RepositoryId,
+            perms: &[&str],
+        ) -> Request<T> {
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            request.extensions_mut().insert(AuthorizationToken {
+                user_id: "test-user".into(),
+                resources: Some(vec![ResourcePermission {
+                    resource_id: format!("urc-{repository}"),
+                    permission: perms.iter().map(|p| p.to_string()).collect(),
+                }]),
+                ..Default::default()
+            });
+            request
+        }
+
+        fn one_resource() -> Vec<Resource> {
+            vec![Resource {
+                branch: Default::default(),
+                hash: Default::default(),
+                description: String::new(),
+            }]
+        }
+
+        #[tokio::test]
+        async fn read_only_lock_is_denied() {
+            let service = make_service(true);
+            let repository = random::<RepositoryId>();
+            let request = with_token(
+                Request::new(LockRequest {
+                    resources: one_resource(),
+                }),
+                repository,
+                &["read"],
+            );
+            let err = service
+                .lock(request)
+                .await
+                .expect_err("read-only lock must be denied");
+            assert_eq!(err.code(), Code::PermissionDenied);
+        }
+
+        #[tokio::test]
+        async fn read_only_unlock_is_denied() {
+            let service = make_service(true);
+            let repository = random::<RepositoryId>();
+            let request = with_token(
+                Request::new(UnlockRequest {
+                    resources: one_resource(),
+                }),
+                repository,
+                &["read"],
+            );
+            let err = service
+                .unlock(request)
+                .await
+                .expect_err("read-only unlock must be denied");
+            assert_eq!(err.code(), Code::PermissionDenied);
+        }
+
+        #[tokio::test]
+        async fn write_token_lock_passes_permission_check() {
+            let service = make_service(true);
+            let repository = random::<RepositoryId>();
+            // Empty resources → `handle_lock` returns early, after the
+            // gate has already been cleared by the write permission.
+            let request = with_token(
+                Request::new(LockRequest { resources: vec![] }),
+                repository,
+                &["read", "write"],
+            );
+            service
+                .lock(request)
+                .await
+                .expect("a write token may acquire locks");
+        }
+
+        #[tokio::test]
+        async fn enforcement_disabled_allows_read_only_lock() {
+            let service = make_service(false);
+            let repository = random::<RepositoryId>();
+            let request = with_token(
+                Request::new(LockRequest { resources: vec![] }),
+                repository,
+                &["read"],
+            );
+            service
+                .lock(request)
+                .await
+                .expect("enforcement disabled lets a read-only token through");
         }
     }
 }
