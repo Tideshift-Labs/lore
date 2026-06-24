@@ -224,6 +224,16 @@ pub struct AuthSettings {
     pub jwk: Option<JWKServiceSettings>,
     pub jwt_audience: Option<Vec<String>>,
     pub jwt_issuer: Option<String>,
+    /// Enforce the JWT `resources[].permission` vector on write RPCs (read ≠
+    /// write). Default ON — the mint already emits `write` for write-capable
+    /// identities, so there is no inert window; the flag exists purely as an
+    /// instant rollback (ADR-00011).
+    #[serde(default = "default_enforce_write_permission")]
+    pub enforce_write_permission: bool,
+}
+
+fn default_enforce_write_permission() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]

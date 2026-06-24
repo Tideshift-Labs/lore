@@ -123,6 +123,7 @@ mod tests {
                     immutable_store.clone(),
                     immutable_store,
                     mutable_store,
+                    false,
                 );
 
                 let v1_address: model_v1::Address = address.into();
@@ -159,6 +160,7 @@ mod tests {
                     immutable_store.clone(),
                     immutable_store,
                     mutable_store,
+                    false,
                 );
 
                 let query_request = storage_v1::QueryRequest { addresses: vec![] };
@@ -217,6 +219,7 @@ mod tests {
                     immutable_store.clone(),
                     immutable_store,
                     mutable_store,
+                    false,
                 );
 
                 let v1_addr1: model_v1::Address = address1.into();

@@ -96,6 +96,7 @@ mod tests {
                     immutable_store.clone(),
                     immutable_store,
                     mutable_store,
+                    false,
                 );
 
                 let load_request = storage_v1::MutableLoadRequest {

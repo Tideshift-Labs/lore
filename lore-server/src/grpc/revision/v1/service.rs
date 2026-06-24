@@ -37,6 +37,8 @@ use super::branch_metadata_get;
 use super::branch_metadata_set;
 use super::branch_push;
 use super::revision_list;
+use crate::grpc::get_repository;
+use crate::grpc::require_permission;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
@@ -74,11 +76,13 @@ pub struct LoreRevisionV1Service {
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     rpc_timeout: Duration,
+    enforce_write_permission: bool,
     instrument_provider: RevisionServiceInstrumentProvider,
     revision_list_instruments: RevisionListInstruments,
 }
 
 impl LoreRevisionV1Service {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
@@ -87,6 +91,7 @@ impl LoreRevisionV1Service {
         history_step_size: u64,
         acceleration: crate::grpc::server::RevisionListAcceleration,
         rpc_timeout: Duration,
+        enforce_write_permission: bool,
     ) -> Self {
         let instrument_provider = RevisionServiceInstrumentProvider;
         let seconds_in_one_day = 86400f64;
@@ -117,6 +122,7 @@ impl LoreRevisionV1Service {
             history_step_size,
             acceleration,
             rpc_timeout,
+            enforce_write_permission,
             instrument_provider,
             revision_list_instruments,
         }
@@ -149,6 +155,13 @@ impl RevisionService for LoreRevisionV1Service {
         &self,
         request: Request<BranchCreateRequest>,
     ) -> Result<Response<BranchCreateResponse>, Status> {
+        let repository = get_repository(request.metadata())?;
+        require_permission(
+            request.extensions(),
+            repository,
+            "write",
+            self.enforce_write_permission,
+        )?;
         timeout_grpc(
             self.rpc_timeout,
             branch_create::handler(
@@ -167,6 +180,13 @@ impl RevisionService for LoreRevisionV1Service {
         &self,
         request: Request<BranchDeleteRequest>,
     ) -> Result<Response<BranchDeleteResponse>, Status> {
+        let repository = get_repository(request.metadata())?;
+        require_permission(
+            request.extensions(),
+            repository,
+            "write",
+            self.enforce_write_permission,
+        )?;
         timeout_grpc(
             self.rpc_timeout,
             branch_delete::handler(
@@ -214,6 +234,13 @@ impl RevisionService for LoreRevisionV1Service {
         &self,
         request: Request<BranchPushRequest>,
     ) -> Result<Response<BranchPushResponse>, Status> {
+        let repository = get_repository(request.metadata())?;
+        require_permission(
+            request.extensions(),
+            repository,
+            "write",
+            self.enforce_write_permission,
+        )?;
         timeout_grpc(
             self.rpc_timeout,
             branch_push::handler(
@@ -255,6 +282,7 @@ impl RevisionService for LoreRevisionV1Service {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.enforce_write_permission,
             ),
         )
         .await
@@ -281,9 +309,21 @@ impl RevisionService for LoreRevisionV1Service {
 
 #[cfg(test)]
 mod tests {
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::Hash;
     use lore_proto::lore::revision::v1::revision_service_server::RevisionServiceServer;
+    use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
+    use lore_revision::lore::BranchId;
+    use lore_revision::lore::RepositoryId;
+    use lore_transport::grpc::REPOSITORY_ID_KEY;
+    use rand::random;
+    use tonic::Code;
 
     use super::*;
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::auth::jwt::ResourcePermission;
+    use crate::notification::testing::MockNotificationSender;
+    use crate::store::test_store_create;
 
     /// Compile-time check that `LoreRevisionV1Service` fully implements
     /// the generated `RevisionService` trait — wrapping it in
@@ -293,5 +333,177 @@ mod tests {
         service: LoreRevisionV1Service,
     ) -> RevisionServiceServer<LoreRevisionV1Service> {
         RevisionServiceServer::new(service)
+    }
+
+    fn service_with(
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+        enforce: bool,
+    ) -> LoreRevisionV1Service {
+        LoreRevisionV1Service::new(
+            immutable_store,
+            mutable_store,
+            Arc::new(MockNotificationSender::new()),
+            Arc::new(HookDispatcher::empty()),
+            DEFAULT_HISTORY_STEP_SIZE,
+            crate::grpc::server::RevisionListAcceleration::default(),
+            Duration::from_secs(60),
+            enforce,
+        )
+    }
+
+    /// Insert an `AuthorizationToken` carrying a single `urc-<repo>`
+    /// resource with `perms`, optionally flagged as a service account.
+    fn insert_token<T>(
+        request: &mut Request<T>,
+        repository: RepositoryId,
+        perms: &[&str],
+        service_account: bool,
+    ) {
+        request.extensions_mut().insert(AuthorizationToken {
+            user_id: "test-user".into(),
+            is_service_account: Some(service_account),
+            resources: Some(vec![ResourcePermission {
+                resource_id: format!("urc-{repository}"),
+                permission: perms.iter().map(|p| p.to_string()).collect(),
+            }]),
+            ..Default::default()
+        });
+    }
+
+    fn push_request(
+        repository: RepositoryId,
+        perms: &[&str],
+        service_account: bool,
+    ) -> Request<BranchPushRequest> {
+        let mut request = Request::new(BranchPushRequest {
+            id: BranchId::from(uuid::Uuid::now_v7()).into(),
+            revision_signature: Hash::from([1u8; 32].as_slice()).into(),
+            force: false,
+            fast_forward_merge: false,
+        });
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+        insert_token(&mut request, repository, perms, service_account);
+        request
+    }
+
+    #[tokio::test]
+    async fn read_only_token_push_is_denied() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, _execution) =
+            test_store_create().await.expect("stores");
+        let service = service_with(immutable_store, mutable_store, true);
+
+        let err = service
+            .branch_push(push_request(repository, &["read"], false))
+            .await
+            .expect_err("read-only push must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn write_token_push_passes_permission_check() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("stores");
+        let service = service_with(immutable_store, mutable_store, true);
+
+        // A write token clears the gate; the push then fails downstream
+        // because the branch doesn't exist — proving the check passed.
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let err = service
+                .branch_push(push_request(repository, &["read", "write"], false))
+                .await
+                .expect_err("non-existent branch should be NotFound");
+            assert_eq!(err.code(), Code::NotFound);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn enforcement_disabled_allows_read_only_push() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("stores");
+        let service = service_with(immutable_store, mutable_store, false);
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let err = service
+                .branch_push(push_request(repository, &["read"], false))
+                .await
+                .expect_err("non-existent branch should be NotFound");
+            // Not PermissionDenied — the flag is off.
+            assert_eq!(err.code(), Code::NotFound);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn read_only_service_account_push_is_denied() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, _execution) =
+            test_store_create().await.expect("stores");
+        let service = service_with(immutable_store, mutable_store, true);
+
+        // Service accounts are NOT exempt from write enforcement.
+        let err = service
+            .branch_push(push_request(repository, &["read"], true))
+            .await
+            .expect_err("read-only service account must not write");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    /// Every unary write RPC on the v1 revision service must reject a
+    /// read-only token, so a newly added write RPC can't silently bypass.
+    #[tokio::test]
+    async fn all_write_rpcs_reject_read_only_token() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, _execution) =
+            test_store_create().await.expect("stores");
+        let service = service_with(immutable_store, mutable_store, true);
+
+        // branch_push
+        let err = service
+            .branch_push(push_request(repository, &["read"], false))
+            .await
+            .expect_err("push denied");
+        assert_eq!(err.code(), Code::PermissionDenied, "branch_push");
+
+        // branch_create
+        let mut create = Request::new(BranchCreateRequest {
+            id: BranchId::from(uuid::Uuid::now_v7()).into(),
+            name: "main".into(),
+            creator: Some("alice".into()),
+            category: "default".into(),
+            stack: vec![],
+        });
+        create.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+        insert_token(&mut create, repository, &["read"], false);
+        let err = service
+            .branch_create(create)
+            .await
+            .expect_err("create denied");
+        assert_eq!(err.code(), Code::PermissionDenied, "branch_create");
+
+        // branch_delete
+        let mut delete = Request::new(BranchDeleteRequest {
+            id: BranchId::from(uuid::Uuid::now_v7()).into(),
+        });
+        delete.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+        insert_token(&mut delete, repository, &["read"], false);
+        let err = service
+            .branch_delete(delete)
+            .await
+            .expect_err("delete denied");
+        assert_eq!(err.code(), Code::PermissionDenied, "branch_delete");
     }
 }
