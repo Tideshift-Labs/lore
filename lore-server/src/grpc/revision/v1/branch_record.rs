@@ -35,6 +35,10 @@ pub(super) async fn build_branch(
         .iter()
         .map(model_v1::BranchPoint::from)
         .collect();
+    // The metadata blob is already deserialized in scope, so reading the
+    // PROTECT bit here costs no extra blob read on the BranchList/BranchGet
+    // hot path.
+    let protected = branch::protected(metadata);
     Ok(model_v1::Branch {
         id: branch_id.into(),
         name,
@@ -45,5 +49,6 @@ pub(super) async fn build_branch(
         deleted,
         metadata: metadata_hash.into(),
         stack,
+        protected,
     })
 }
