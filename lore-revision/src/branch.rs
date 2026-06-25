@@ -1380,6 +1380,13 @@ pub fn created(metadata: &Metadata) -> u64 {
     metadata.get_u64(CREATED).unwrap_or_default()
 }
 
+/// Read the branch's PROTECT bit from its metadata blob. A branch with no
+/// `protect` key (legacy / partial blob) reports `false`. Mirrors the
+/// delete-guard read in `branch::delete`.
+pub fn protected(metadata: &Metadata) -> bool {
+    metadata.get_bool(PROTECT).unwrap_or_default()
+}
+
 pub async fn branch_metadata(
     repository: Arc<RepositoryContext>,
     branch: BranchId,

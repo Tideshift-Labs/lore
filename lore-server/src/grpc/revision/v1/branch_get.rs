@@ -422,4 +422,109 @@ mod test {
         }))
         .await;
     }
+
+    #[tokio::test]
+    async fn get_by_id_fresh_branch_reports_protected_false() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            create_test_branch(repository_context, branch_id).await;
+
+            let response = handler(
+                make_request_id(repository, branch_id),
+                immutable_store.clone(),
+                mutable_store.clone(),
+            )
+            .await
+            .expect("Request failed");
+
+            let branch = response.into_inner().branch.expect("Branch present");
+            assert!(
+                !branch.protected,
+                "fresh branch should report protected=false"
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn get_by_id_protected_branch_reports_protected_true() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            create_test_branch(repository_context.clone(), branch_id).await;
+            branch::protect(repository_context, branch_id)
+                .await
+                .expect("protect should succeed");
+
+            let response = handler(
+                make_request_id(repository, branch_id),
+                immutable_store.clone(),
+                mutable_store.clone(),
+            )
+            .await
+            .expect("Request failed");
+
+            let branch = response.into_inner().branch.expect("Branch present");
+            assert!(
+                branch.protected,
+                "protected branch should report protected=true"
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn get_by_id_branch_after_protect_then_unprotect_reports_protected_false() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            create_test_branch(repository_context.clone(), branch_id).await;
+            branch::protect(repository_context.clone(), branch_id)
+                .await
+                .expect("protect should succeed");
+            branch::unprotect(repository_context, branch_id)
+                .await
+                .expect("unprotect should succeed");
+
+            let response = handler(
+                make_request_id(repository, branch_id),
+                immutable_store.clone(),
+                mutable_store.clone(),
+            )
+            .await
+            .expect("Request failed");
+
+            let branch = response.into_inner().branch.expect("Branch present");
+            assert!(
+                !branch.protected,
+                "branch after protect+unprotect should report protected=false"
+            );
+        }))
+        .await;
+    }
 }

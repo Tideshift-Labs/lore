@@ -129,4 +129,8 @@ message Branch {
   // Ancestry chain — parent-first, root-last. stack[0] is the immediate
   // parent the branch was forked from; stack[N-1] is the ultimate root.
   repeated BranchPoint stack = 9;
+  // Whether the branch's PROTECT bit is set (read-only surfacing of the
+  // "protect" key in the metadata blob; toggle via BranchProtect/Unprotect
+  // or BranchMetadataSet). A branch with no protect key reports false.
+  bool protected = 10;
 }
