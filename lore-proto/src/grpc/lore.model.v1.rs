@@ -205,6 +205,11 @@ pub struct Branch {
     /// parent the branch was forked from; stack\[N-1\] is the ultimate root.
     #[prost(message, repeated, tag = "9")]
     pub stack: ::prost::alloc::vec::Vec<BranchPoint>,
+    /// Whether the branch's PROTECT bit is set (read-only surfacing of the
+    /// "protect" key in the metadata blob; toggle via BranchProtect/Unprotect
+    /// or BranchMetadataSet). A branch with no protect key reports false.
+    #[prost(bool, tag = "10")]
+    pub protected: bool,
 }
 impl ::prost::Name for Branch {
     const NAME: &'static str = "Branch";

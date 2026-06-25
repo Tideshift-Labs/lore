@@ -705,4 +705,143 @@ mod test {
         }))
         .await;
     }
+
+    #[tokio::test]
+    async fn list_fresh_branch_reports_protected_false() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            create_root_branch(&repository_context, "main", "alice").await;
+
+            let response = handler(
+                make_request(repository, None, false),
+                immutable_store.clone(),
+                mutable_store.clone(),
+            )
+            .await
+            .expect("Request failed");
+
+            let items: Vec<_> = collect_response(response)
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item ok"))
+                .collect();
+
+            assert_eq!(items.len(), 1);
+            assert!(
+                !items[0].branch.as_ref().unwrap().protected,
+                "fresh branch should report protected=false"
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn list_protected_branch_reports_protected_true_sibling_reports_false() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main", "alice").await;
+            let main_latest = seed_revision(&repository_context, main).await;
+            let feature =
+                create_child_branch(&repository_context, "feature", "bob", main, main_latest).await;
+
+            branch::protect(repository_context.clone(), feature)
+                .await
+                .expect("protect should succeed");
+
+            let response = handler(
+                make_request(repository, None, false),
+                immutable_store.clone(),
+                mutable_store.clone(),
+            )
+            .await
+            .expect("Request failed");
+
+            let items: Vec<_> = collect_response(response)
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item ok"))
+                .collect();
+
+            assert_eq!(items.len(), 2);
+
+            let main_item = items
+                .iter()
+                .find(|r| r.branch.as_ref().unwrap().name == "main")
+                .expect("main branch present");
+            assert!(
+                !main_item.branch.as_ref().unwrap().protected,
+                "main (unprotected sibling) should report protected=false"
+            );
+
+            let feature_item = items
+                .iter()
+                .find(|r| r.branch.as_ref().unwrap().name == "feature")
+                .expect("feature branch present");
+            assert!(
+                feature_item.branch.as_ref().unwrap().protected,
+                "feature (protected) should report protected=true"
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn list_branch_after_protect_then_unprotect_reports_protected_false() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main", "alice").await;
+
+            branch::protect(repository_context.clone(), main)
+                .await
+                .expect("protect should succeed");
+            branch::unprotect(repository_context.clone(), main)
+                .await
+                .expect("unprotect should succeed");
+
+            let response = handler(
+                make_request(repository, None, false),
+                immutable_store.clone(),
+                mutable_store.clone(),
+            )
+            .await
+            .expect("Request failed");
+
+            let items: Vec<_> = collect_response(response)
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item ok"))
+                .collect();
+
+            assert_eq!(items.len(), 1);
+            assert!(
+                !items[0].branch.as_ref().unwrap().protected,
+                "branch after protect+unprotect should report protected=false"
+            );
+        }))
+        .await;
+    }
 }
