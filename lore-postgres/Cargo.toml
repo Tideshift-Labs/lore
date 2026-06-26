@@ -9,5 +9,15 @@ publish = false
 # Co-located, off-AWS metadata/lock backend for loreserver (CR-007).
 # Mutable (branch-tip CAS), lock, and immutable-metadata stores on one Postgres
 # DB; immutable fragment bytes live in S3-compatible object storage. Store impls
-# are landed incrementally — deps are added as each store is implemented.
+# are landed incrementally — deps grow as each store is implemented.
 [dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+tracing = { workspace = true }
+lore-base = { workspace = true }
+lore-revision = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
