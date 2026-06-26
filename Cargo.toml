@@ -13,6 +13,7 @@ members = [
     "lore-integration-tests",
     "lore-macro",
     "lore-notification",
+    "lore-postgres",
     "lore-proto",
     "lore-revision",
     "lore-server",
@@ -27,6 +28,7 @@ version = "0.8.4-nightly"
 [workspace.dependencies]
 lore = { path = "lore" }
 lore-aws = { path = "lore-aws" }
+lore-postgres = { path = "lore-postgres" }
 lore-base = { path = "lore-base" }
 lore-credential = { path = "lore-credential" }
 lore-error-set = { path = "lore-error-set" }

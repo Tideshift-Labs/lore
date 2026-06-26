@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+[package]
+name = "lore-postgres"
+edition = "2024"
+version.workspace = true
+publish = false
+
+# Co-located, off-AWS metadata/lock backend for loreserver (CR-007).
+# Mutable (branch-tip CAS), lock, and immutable-metadata stores on one Postgres
+# DB; immutable fragment bytes live in S3-compatible object storage. Store impls
+# are landed incrementally — deps are added as each store is implemented.
+[dependencies]

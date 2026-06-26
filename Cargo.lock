@@ -2700,6 +2700,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lore-postgres"
+version = "0.8.4-nightly"
+
+[[package]]
 name = "lore-proto"
 version = "0.1.60"
 dependencies = [
