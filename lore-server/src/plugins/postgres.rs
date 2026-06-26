@@ -21,6 +21,8 @@ use std::sync::Arc;
 
 use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
+use lore_base::runtime::runtime;
+use lore_postgres::store::lock_store::PostgresLockStore;
 use lore_revision::lock::LockStore;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
@@ -118,8 +120,23 @@ impl LockStorePluginFactory for PostgresLockStorePluginFactory {
         parse_config(self.name(), config).map(|_| ())
     }
 
-    fn create(&self, _config: &toml::Value) -> Result<Arc<dyn LockStore>, PluginError> {
-        Err(not_implemented(self.name(), "lock"))
+    fn create(&self, config: &toml::Value) -> Result<Arc<dyn LockStore>, PluginError> {
+        let plugin_name = self.name();
+        let cfg = parse_config(plugin_name, config)?;
+
+        // Plugin `create` is synchronous, but building the pool + ensuring the
+        // schema is async — drive it to completion like the AWS plugin does.
+        let store = tokio::task::block_in_place(|| {
+            runtime().block_on(PostgresLockStore::connect(&cfg.url, cfg.pool_max))
+        })
+        .map_err(|e| {
+            PluginError::from(PluginInitError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("Failed to create Postgres lock store: {e}"),
+            })
+        })?;
+
+        Ok(Arc::new(store))
     }
 }
 
