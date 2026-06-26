@@ -23,6 +23,7 @@ use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
 use lore_postgres::store::lock_store::PostgresLockStore;
+use lore_postgres::store::mutable_store::PostgresMutableStore;
 use lore_revision::lock::LockStore;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
@@ -101,10 +102,25 @@ impl MutableStorePluginFactory for PostgresMutableStorePluginFactory {
 
     fn create(
         &self,
-        _config: &toml::Value,
+        config: &toml::Value,
         _immutable_store: Arc<dyn ImmutableStore>,
     ) -> Result<Arc<dyn MutableStore>, PluginError> {
-        Err(not_implemented(self.name(), "mutable"))
+        // The Postgres mutable store is standalone (branch-tip CAS needs no
+        // fragment storage), so the immutable-store dependency is unused.
+        let plugin_name = self.name();
+        let cfg = parse_config(plugin_name, config)?;
+
+        let store = tokio::task::block_in_place(|| {
+            runtime().block_on(PostgresMutableStore::connect(&cfg.url, cfg.pool_max))
+        })
+        .map_err(|e| {
+            PluginError::from(PluginInitError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("Failed to create Postgres mutable store: {e}"),
+            })
+        })?;
+
+        Ok(Arc::new(store))
     }
 }
 
