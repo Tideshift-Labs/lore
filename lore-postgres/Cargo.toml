@@ -18,6 +18,7 @@ deadpool-postgres = "0.14"
 tracing = { workspace = true }
 lore-base = { workspace = true }
 lore-revision = { workspace = true }
+lore-storage = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
