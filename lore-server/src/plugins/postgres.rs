@@ -22,6 +22,7 @@ use std::sync::Arc;
 use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
+use lore_postgres::pool::TlsConfig;
 use lore_postgres::store::immutable_store::ObjectStoreSettings;
 use lore_postgres::store::immutable_store::PostgresImmutableStore;
 use lore_postgres::store::lock_store::PostgresLockStore;
@@ -57,6 +58,12 @@ pub struct PostgresStoreConfig {
     /// (default `prefer`); set `sslmode=require` in the URL to enforce it.
     #[serde(default)]
     pub ca_cert_path: Option<String>,
+    /// Skip Postgres server-certificate verification (encrypt-only, libpq
+    /// `require` semantics). MITM-exposed; off by default. Use only when you
+    /// cannot supply the cluster CA via `ca_cert_path`. rustls always verifies
+    /// otherwise, so `sslmode=require` behaves like `verify-ca`.
+    #[serde(default)]
+    pub tls_insecure_skip_verify: bool,
     /// S3-compatible object storage for fragment **bytes**. Required by the
     /// immutable-store factory; unused (and typically absent) for the
     /// mutable/lock stores, which keep everything in Postgres.
@@ -117,17 +124,22 @@ fn parse_config(name: &str, config: &toml::Value) -> Result<PostgresStoreConfig,
     })
 }
 
-/// Read the optional CA PEM bundle for the Postgres TLS trust store.
-fn load_ca_cert(name: &str, cfg: &PostgresStoreConfig) -> Result<Option<String>, PluginError> {
-    match cfg.ca_cert_path.as_deref() {
-        None => Ok(None),
-        Some(path) => std::fs::read_to_string(path).map(Some).map_err(|e| {
+/// Build the Postgres TLS settings from config: read the optional CA PEM bundle
+/// and carry the verification-skip flag.
+fn build_tls(name: &str, cfg: &PostgresStoreConfig) -> Result<TlsConfig, PluginError> {
+    let ca_cert = match cfg.ca_cert_path.as_deref() {
+        None => None,
+        Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
             PluginError::from(PluginConfigError {
                 plugin_name: name.to_string(),
                 message: format!("Failed to read Postgres CA cert at {path}: {e}"),
             })
-        }),
-    }
+        })?),
+    };
+    Ok(TlsConfig {
+        ca_cert,
+        insecure_skip_verify: cfg.tls_insecure_skip_verify,
+    })
 }
 
 /// Factory for the Postgres-backed immutable store (metadata in PG, bytes in S3).
@@ -156,7 +168,7 @@ impl ImmutableStorePluginFactory for PostgresImmutableStorePluginFactory {
     fn create(&self, config: &toml::Value) -> Result<Arc<dyn ImmutableStore>, PluginError> {
         let plugin_name = self.name();
         let cfg = parse_config(plugin_name, config)?;
-        let ca_cert = load_ca_cert(plugin_name, &cfg)?;
+        let tls = build_tls(plugin_name, &cfg)?;
         let object = cfg.object_store.ok_or_else(|| {
             PluginError::from(PluginConfigError {
                 plugin_name: plugin_name.to_string(),
@@ -185,7 +197,7 @@ impl ImmutableStorePluginFactory for PostgresImmutableStorePluginFactory {
             runtime().block_on(Box::pin(PostgresImmutableStore::connect(
                 &cfg.url,
                 cfg.pool_max,
-                ca_cert.as_deref(),
+                &tls,
                 object,
             )))
         })
@@ -221,14 +233,10 @@ impl MutableStorePluginFactory for PostgresMutableStorePluginFactory {
         // fragment storage), so the immutable-store dependency is unused.
         let plugin_name = self.name();
         let cfg = parse_config(plugin_name, config)?;
-        let ca_cert = load_ca_cert(plugin_name, &cfg)?;
+        let tls = build_tls(plugin_name, &cfg)?;
 
         let store = tokio::task::block_in_place(|| {
-            runtime().block_on(PostgresMutableStore::connect(
-                &cfg.url,
-                cfg.pool_max,
-                ca_cert.as_deref(),
-            ))
+            runtime().block_on(PostgresMutableStore::connect(&cfg.url, cfg.pool_max, &tls))
         })
         .map_err(|e| {
             PluginError::from(PluginInitError {
@@ -256,16 +264,12 @@ impl LockStorePluginFactory for PostgresLockStorePluginFactory {
     fn create(&self, config: &toml::Value) -> Result<Arc<dyn LockStore>, PluginError> {
         let plugin_name = self.name();
         let cfg = parse_config(plugin_name, config)?;
-        let ca_cert = load_ca_cert(plugin_name, &cfg)?;
+        let tls = build_tls(plugin_name, &cfg)?;
 
         // Plugin `create` is synchronous, but building the pool + ensuring the
         // schema is async — drive it to completion like the AWS plugin does.
         let store = tokio::task::block_in_place(|| {
-            runtime().block_on(PostgresLockStore::connect(
-                &cfg.url,
-                cfg.pool_max,
-                ca_cert.as_deref(),
-            ))
+            runtime().block_on(PostgresLockStore::connect(&cfg.url, cfg.pool_max, &tls))
         })
         .map_err(|e| {
             PluginError::from(PluginInitError {

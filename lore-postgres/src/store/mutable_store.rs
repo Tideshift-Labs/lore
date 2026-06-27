@@ -41,10 +41,14 @@ pub struct PostgresMutableStore {
 
 impl PostgresMutableStore {
     /// Build the pool (rustls TLS; see [`crate::pool`]) and ensure the schema.
-    /// `ca_cert` is an optional PEM bundle for a private cluster CA. Async
-    /// (schema DDL needs a connection).
-    pub async fn connect(url: &str, pool_max: u32, ca_cert: Option<&str>) -> Result<Self, String> {
-        let pool = crate::pool::build_pool(url, pool_max, ca_cert)?;
+    /// `tls` carries the CA bundle / verification mode. Async (schema DDL needs a
+    /// connection).
+    pub async fn connect(
+        url: &str,
+        pool_max: u32,
+        tls: &crate::pool::TlsConfig,
+    ) -> Result<Self, String> {
+        let pool = crate::pool::build_pool(url, pool_max, tls)?;
         crate::pool::ensure_schema(&pool, SCHEMA).await?;
         Ok(Self {
             pool,

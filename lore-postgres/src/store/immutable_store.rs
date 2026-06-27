@@ -113,10 +113,10 @@ impl PostgresImmutableStore {
     pub async fn connect(
         pg_url: &str,
         pool_max: u32,
-        ca_cert: Option<&str>,
+        tls: &crate::pool::TlsConfig,
         object: ObjectStoreSettings,
     ) -> Result<Self, String> {
-        let pool = crate::pool::build_pool(pg_url, pool_max, ca_cert)?;
+        let pool = crate::pool::build_pool(pg_url, pool_max, tls)?;
         crate::pool::ensure_schema(&pool, SCHEMA).await?;
 
         // Build the S3-compatible byte client via lore-aws's client builder so
