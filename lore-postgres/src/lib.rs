@@ -16,4 +16,5 @@
 //! See `docs/lore-change-requests/cr-007-lore-postgres-backend.md` (Lorehub repo).
 //! Store implementations are landed incrementally.
 
+pub mod pool;
 pub mod store;

@@ -11,19 +11,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use deadpool_postgres::Manager;
-use deadpool_postgres::ManagerConfig;
 use deadpool_postgres::Pool;
-use deadpool_postgres::RecyclingMethod;
+use deadpool_postgres::PoolError;
 use lore_base::types::Address;
 use lore_base::types::KeyType;
 use lore_storage::Hash;
 use lore_storage::MutableStore;
 use lore_storage::Partition;
 use lore_storage::errors::AddressNotFound;
+use lore_storage::errors::SlowDown;
 use lore_storage::immutable_store::StoreError;
 use lore_storage::store_types::KeyValueStream;
-use tokio_postgres::NoTls;
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS lore_mutable (
@@ -41,22 +39,11 @@ pub struct PostgresMutableStore {
 }
 
 impl PostgresMutableStore {
-    /// Build the pool and ensure the schema. Async (schema DDL needs a connection).
-    pub async fn connect(url: &str, pool_max: u32) -> Result<Self, String> {
-        let pg_config = url
-            .parse::<tokio_postgres::Config>()
-            .map_err(|e| format!("invalid postgres url: {e}"))?;
-        let manager = Manager::from_config(
-            pg_config,
-            NoTls,
-            ManagerConfig {
-                recycling_method: RecyclingMethod::Fast,
-            },
-        );
-        let pool = Pool::builder(manager)
-            .max_size(pool_max as usize)
-            .build()
-            .map_err(|e| format!("failed to build postgres pool: {e}"))?;
+    /// Build the pool (rustls TLS; see [`crate::pool`]) and ensure the schema.
+    /// `ca_cert` is an optional PEM bundle for a private cluster CA. Async
+    /// (schema DDL needs a connection).
+    pub async fn connect(url: &str, pool_max: u32, ca_cert: Option<&str>) -> Result<Self, String> {
+        let pool = crate::pool::build_pool(url, pool_max, ca_cert)?;
         let client = pool
             .get()
             .await
@@ -65,12 +52,28 @@ impl PostgresMutableStore {
             .batch_execute(SCHEMA)
             .await
             .map_err(|e| format!("postgres mutable-store schema failed: {e}"))?;
+        drop(client);
         Ok(Self { pool })
     }
 }
 
-fn db_err<E: std::fmt::Display>(e: E) -> StoreError {
-    StoreError::internal(format!("postgres mutable store: {e}"))
+/// Map a query/execute error, surfacing transient failures as `SlowDown` so
+/// clients retry rather than treating them as permanent (A2).
+fn db_err(e: tokio_postgres::Error) -> StoreError {
+    if crate::pool::is_transient_pg(&e) {
+        StoreError::from(SlowDown)
+    } else {
+        StoreError::internal(format!("postgres mutable store: {e}"))
+    }
+}
+
+/// Map a pool-checkout error (transient ⇒ `SlowDown`).
+fn pool_err(e: PoolError) -> StoreError {
+    if crate::pool::is_transient_pool(&e) {
+        StoreError::from(SlowDown)
+    } else {
+        StoreError::internal(format!("postgres mutable store pool: {e}"))
+    }
 }
 
 fn not_found(key: Hash) -> StoreError {
@@ -85,7 +88,7 @@ impl MutableStore for PostgresMutableStore {
         key: Hash,
         key_type: KeyType,
     ) -> Result<Hash, StoreError> {
-        let client = self.pool.get().await.map_err(db_err)?;
+        let client = self.pool.get().await.map_err(pool_err)?;
         let row = client
             .query_opt(
                 "SELECT value FROM lore_mutable \
@@ -114,7 +117,7 @@ impl MutableStore for PostgresMutableStore {
         value: Hash,
         key_type: KeyType,
     ) -> Result<(), StoreError> {
-        let client = self.pool.get().await.map_err(db_err)?;
+        let client = self.pool.get().await.map_err(pool_err)?;
         let part = partition.data().as_slice();
         let kt = key_type as i16;
         let k = key.data().as_slice();
@@ -150,7 +153,7 @@ impl MutableStore for PostgresMutableStore {
         value: Hash,
         key_type: KeyType,
     ) -> Result<Hash, StoreError> {
-        let client = self.pool.get().await.map_err(db_err)?;
+        let client = self.pool.get().await.map_err(pool_err)?;
         let part = partition.data().as_slice();
         let kt = key_type as i16;
         let k = key.data().as_slice();
@@ -201,7 +204,7 @@ impl MutableStore for PostgresMutableStore {
         partition: Partition,
         key_type: KeyType,
     ) -> Result<KeyValueStream, StoreError> {
-        let client = self.pool.get().await.map_err(db_err)?;
+        let client = self.pool.get().await.map_err(pool_err)?;
         let kt = key_type as i16;
         // A null partition matches all partitions (trait contract).
         let rows = if partition.is_zero() {

@@ -30,7 +30,7 @@ async fn lock_lifecycle() {
         eprintln!("LORE_TEST_PG_URL unset; skipping Postgres lock-store test");
         return;
     };
-    let store = PostgresLockStore::connect(&url, 5)
+    let store = PostgresLockStore::connect(&url, 5, None)
         .await
         .expect("connect + schema");
 
