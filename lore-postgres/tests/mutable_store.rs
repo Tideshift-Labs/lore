@@ -24,7 +24,7 @@ async fn mutable_cas_lifecycle() {
         return;
     };
     let store = Arc::new(
-        PostgresMutableStore::connect(&url, 5)
+        PostgresMutableStore::connect(&url, 5, None)
             .await
             .expect("connect + schema"),
     );

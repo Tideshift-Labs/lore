@@ -27,9 +27,15 @@ mode = "postgres"
 # ---------------------------------------------------------------------
 
 # Immutable store: fragment METADATA in Postgres, fragment BYTES in object storage.
+#
+# Postgres TLS is driven by the URL's sslmode (libpq semantics): the default
+# `prefer` tries TLS and falls back to plaintext (fine for local/CI); DO Managed
+# Postgres requires `?sslmode=require` (or verify-full) in the URL. When the
+# cluster presents a private CA, point ca_cert_path at its ca-certificate.crt.
 [plugins.postgres.immutable_store]
-url = "postgres://postgres:postgres@localhost:5432/lore"
+url = "postgres://postgres:postgres@localhost:5432/lore?sslmode=require"
 # pool_max = 10
+# ca_cert_path = "/etc/lore/do-ca-certificate.crt"
 
 # S3-compatible object storage for the fragment bytes. Keys mirror lore-aws's
 # endpoint/region/bucket/path-style so the same backend points at DO Spaces.

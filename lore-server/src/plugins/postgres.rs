@@ -51,6 +51,12 @@ pub struct PostgresStoreConfig {
     /// Max pooled connections (default 10).
     #[serde(default = "default_pool_max")]
     pub pool_max: u32,
+    /// Optional path to a PEM CA bundle for the Postgres TLS trust store (e.g.
+    /// DO Managed Postgres's per-cluster `ca-certificate.crt`). When unset, the
+    /// platform trust store is used. TLS itself is driven by the URL's `sslmode`
+    /// (default `prefer`); set `sslmode=require` in the URL to enforce it.
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
     /// S3-compatible object storage for fragment **bytes**. Required by the
     /// immutable-store factory; unused (and typically absent) for the
     /// mutable/lock stores, which keep everything in Postgres.
@@ -111,6 +117,19 @@ fn parse_config(name: &str, config: &toml::Value) -> Result<PostgresStoreConfig,
     })
 }
 
+/// Read the optional CA PEM bundle for the Postgres TLS trust store.
+fn load_ca_cert(name: &str, cfg: &PostgresStoreConfig) -> Result<Option<String>, PluginError> {
+    match cfg.ca_cert_path.as_deref() {
+        None => Ok(None),
+        Some(path) => std::fs::read_to_string(path).map(Some).map_err(|e| {
+            PluginError::from(PluginConfigError {
+                plugin_name: name.to_string(),
+                message: format!("Failed to read Postgres CA cert at {path}: {e}"),
+            })
+        }),
+    }
+}
+
 /// Factory for the Postgres-backed immutable store (metadata in PG, bytes in S3).
 pub struct PostgresImmutableStorePluginFactory;
 
@@ -137,6 +156,7 @@ impl ImmutableStorePluginFactory for PostgresImmutableStorePluginFactory {
     fn create(&self, config: &toml::Value) -> Result<Arc<dyn ImmutableStore>, PluginError> {
         let plugin_name = self.name();
         let cfg = parse_config(plugin_name, config)?;
+        let ca_cert = load_ca_cert(plugin_name, &cfg)?;
         let object = cfg.object_store.ok_or_else(|| {
             PluginError::from(PluginConfigError {
                 plugin_name: plugin_name.to_string(),
@@ -165,6 +185,7 @@ impl ImmutableStorePluginFactory for PostgresImmutableStorePluginFactory {
             runtime().block_on(Box::pin(PostgresImmutableStore::connect(
                 &cfg.url,
                 cfg.pool_max,
+                ca_cert.as_deref(),
                 object,
             )))
         })
@@ -200,9 +221,14 @@ impl MutableStorePluginFactory for PostgresMutableStorePluginFactory {
         // fragment storage), so the immutable-store dependency is unused.
         let plugin_name = self.name();
         let cfg = parse_config(plugin_name, config)?;
+        let ca_cert = load_ca_cert(plugin_name, &cfg)?;
 
         let store = tokio::task::block_in_place(|| {
-            runtime().block_on(PostgresMutableStore::connect(&cfg.url, cfg.pool_max))
+            runtime().block_on(PostgresMutableStore::connect(
+                &cfg.url,
+                cfg.pool_max,
+                ca_cert.as_deref(),
+            ))
         })
         .map_err(|e| {
             PluginError::from(PluginInitError {
@@ -230,11 +256,16 @@ impl LockStorePluginFactory for PostgresLockStorePluginFactory {
     fn create(&self, config: &toml::Value) -> Result<Arc<dyn LockStore>, PluginError> {
         let plugin_name = self.name();
         let cfg = parse_config(plugin_name, config)?;
+        let ca_cert = load_ca_cert(plugin_name, &cfg)?;
 
         // Plugin `create` is synchronous, but building the pool + ensuring the
         // schema is async — drive it to completion like the AWS plugin does.
         let store = tokio::task::block_in_place(|| {
-            runtime().block_on(PostgresLockStore::connect(&cfg.url, cfg.pool_max))
+            runtime().block_on(PostgresLockStore::connect(
+                &cfg.url,
+                cfg.pool_max,
+                ca_cert.as_deref(),
+            ))
         })
         .map_err(|e| {
             PluginError::from(PluginInitError {

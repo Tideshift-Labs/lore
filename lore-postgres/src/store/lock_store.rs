@@ -10,13 +10,12 @@
 //! TTL/lease — locks persist until explicitly released.
 
 use async_trait::async_trait;
-use deadpool_postgres::Manager;
-use deadpool_postgres::ManagerConfig;
 use deadpool_postgres::Pool;
-use deadpool_postgres::RecyclingMethod;
+use deadpool_postgres::PoolError;
 use lore_base::error::InvalidArguments;
 use lore_base::error::LockNotFound;
 use lore_base::error::LockNotOwned;
+use lore_base::error::SlowDown;
 use lore_base::types::Hash;
 use lore_base::types::LockData;
 use lore_base::types::LockResource;
@@ -26,7 +25,6 @@ use lore_revision::lock::LockStore;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::util;
-use tokio_postgres::NoTls;
 use tokio_postgres::Row;
 
 /// Self-bootstrapping schema. The `PRIMARY KEY` is the exclusivity constraint;
@@ -60,21 +58,8 @@ impl PostgresLockStore {
     ///
     /// Async because the schema DDL needs a live connection; the plugin factory
     /// drives it to completion via `block_on` at startup.
-    pub async fn connect(url: &str, pool_max: u32) -> Result<Self, String> {
-        let pg_config = url
-            .parse::<tokio_postgres::Config>()
-            .map_err(|e| format!("invalid postgres url: {e}"))?;
-        let manager = Manager::from_config(
-            pg_config,
-            NoTls,
-            ManagerConfig {
-                recycling_method: RecyclingMethod::Fast,
-            },
-        );
-        let pool = Pool::builder(manager)
-            .max_size(pool_max as usize)
-            .build()
-            .map_err(|e| format!("failed to build postgres pool: {e}"))?;
+    pub async fn connect(url: &str, pool_max: u32, ca_cert: Option<&str>) -> Result<Self, String> {
+        let pool = crate::pool::build_pool(url, pool_max, ca_cert)?;
         let client = pool
             .get()
             .await
@@ -83,14 +68,29 @@ impl PostgresLockStore {
             .batch_execute(SCHEMA)
             .await
             .map_err(|e| format!("postgres lock-store schema failed: {e}"))?;
+        drop(client);
         Ok(Self { pool })
     }
 }
 
-/// Map any pool/query error to an opaque `LockError` (DB internals are not leaked
-/// to clients; the message is logged-level detail).
-fn db_err<E: std::fmt::Display>(e: E) -> LockError {
-    LockError::internal(format!("postgres lock store: {e}"))
+/// Map a query/execute error to an opaque `LockError`; transient failures become
+/// `SlowDown` so clients retry rather than treat them as permanent (A2). DB
+/// internals are not leaked to clients beyond log-level detail.
+fn db_err(e: tokio_postgres::Error) -> LockError {
+    if crate::pool::is_transient_pg(&e) {
+        LockError::from(SlowDown)
+    } else {
+        LockError::internal(format!("postgres lock store: {e}"))
+    }
+}
+
+/// Map a pool-checkout error (transient ⇒ `SlowDown`).
+fn pool_err(e: PoolError) -> LockError {
+    if crate::pool::is_transient_pool(&e) {
+        LockError::from(SlowDown)
+    } else {
+        LockError::internal(format!("postgres lock store pool: {e}"))
+    }
 }
 
 fn row_to_lock_data(row: &Row) -> LockData {
@@ -115,7 +115,7 @@ impl LockStore for PostgresLockStore {
         repository: RepositoryId,
         resources: &[LockResource],
     ) -> Result<Vec<LockData>, LockError> {
-        let mut client = self.pool.get().await.map_err(db_err)?;
+        let mut client = self.pool.get().await.map_err(pool_err)?;
         let tx = client.transaction().await.map_err(db_err)?;
         let timestamp = util::time::timestamp();
         let ts = timestamp as i64;
@@ -168,7 +168,7 @@ impl LockStore for PostgresLockStore {
     }
 
     async fn query_locks(&self, query: LockQuery) -> Result<Vec<LockData>, LockError> {
-        let client = self.pool.get().await.map_err(db_err)?;
+        let client = self.pool.get().await.map_err(pool_err)?;
         let rows = match query {
             LockQuery::Repository(repo) => {
                 client
@@ -247,7 +247,7 @@ impl LockStore for PostgresLockStore {
         repository: RepositoryId,
         resources: &[LockResource],
     ) -> Result<Vec<LockData>, LockError> {
-        let client = self.pool.get().await.map_err(db_err)?;
+        let client = self.pool.get().await.map_err(pool_err)?;
         let repo = repository.data().as_slice();
         let mut locked = Vec::new();
         for resource in resources {
@@ -276,7 +276,7 @@ impl LockStore for PostgresLockStore {
         repository: RepositoryId,
         resources: &[LockResource],
     ) -> Result<Vec<LockResource>, LockError> {
-        let mut client = self.pool.get().await.map_err(db_err)?;
+        let mut client = self.pool.get().await.map_err(pool_err)?;
         let tx = client.transaction().await.map_err(db_err)?;
         let repo = repository.data().as_slice();
 

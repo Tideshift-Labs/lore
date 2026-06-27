@@ -22,16 +22,15 @@
 //! `lore-aws` features that are out of scope for this crate (CR-007 §"Out of
 //! scope": the byte target is just "an S3-compatible store").
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use bytes::BytesMut;
-use deadpool_postgres::Manager;
-use deadpool_postgres::ManagerConfig;
 use deadpool_postgres::Pool;
-use deadpool_postgres::RecyclingMethod;
+use deadpool_postgres::PoolError;
 use lore_aws::aws_error::AwsError;
 use lore_aws::clients::AwsClientBuilder;
 use lore_aws::clients::HttpClientSettings;
@@ -54,7 +53,6 @@ use lore_storage::StoreQueryResult;
 use lore_storage::errors::AddressNotFound;
 use lore_storage::errors::SlowDown;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
-use tokio_postgres::NoTls;
 
 /// Self-bootstrapping schema. The `(hash, repository, context)` primary key is
 /// the association identity; its B-tree also serves the leftmost-prefix
@@ -114,22 +112,10 @@ impl PostgresImmutableStore {
     pub async fn connect(
         pg_url: &str,
         pool_max: u32,
+        ca_cert: Option<&str>,
         object: ObjectStoreSettings,
     ) -> Result<Self, String> {
-        let pg_config = pg_url
-            .parse::<tokio_postgres::Config>()
-            .map_err(|e| format!("invalid postgres url: {e}"))?;
-        let manager = Manager::from_config(
-            pg_config,
-            NoTls,
-            ManagerConfig {
-                recycling_method: RecyclingMethod::Fast,
-            },
-        );
-        let pool = Pool::builder(manager)
-            .max_size(pool_max as usize)
-            .build()
-            .map_err(|e| format!("failed to build postgres pool: {e}"))?;
+        let pool = crate::pool::build_pool(pg_url, pool_max, ca_cert)?;
         let client = pool
             .get()
             .await
@@ -193,7 +179,7 @@ impl PostgresImmutableStore {
         if match_requested == StoreMatch::MatchNone {
             return Ok(false);
         }
-        let client = self.pool.get().await.map_err(db_err)?;
+        let client = self.pool.get().await.map_err(pool_err)?;
         let hash = address.hash.data().as_slice();
         let row = match match_requested {
             StoreMatch::MatchFull => {
@@ -297,7 +283,7 @@ impl PostgresImmutableStore {
     }
 
     async fn load_metadata(&self, hash: Hash) -> Result<Fragment, StoreError> {
-        let client = self.pool.get().await.map_err(db_err)?;
+        let client = self.pool.get().await.map_err(pool_err)?;
         let row = client
             .query_opt(
                 "SELECT flags, size_payload, size_content FROM lore_fragment_metadata \
@@ -316,28 +302,6 @@ impl PostgresImmutableStore {
         }
     }
 
-    async fn write_metadata(&self, hash: Hash, fragment: Fragment) -> Result<(), StoreError> {
-        let client = self.pool.get().await.map_err(db_err)?;
-        client
-            .execute(
-                "INSERT INTO lore_fragment_metadata (hash, flags, size_payload, size_content) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (hash) DO UPDATE SET \
-                     flags = EXCLUDED.flags, \
-                     size_payload = EXCLUDED.size_payload, \
-                     size_content = EXCLUDED.size_content",
-                &[
-                    &hash.data().as_slice(),
-                    &(fragment.flags as i64),
-                    &(fragment.size_payload as i64),
-                    &(fragment.size_content as i64),
-                ],
-            )
-            .await
-            .map_err(db_err)?;
-        Ok(())
-    }
-
     /// Conditional metadata update — applies `updated` only if the row still
     /// equals `expected` (the DynamoDB conditional-put used for the obliteration
     /// state machine). A zero rowcount means another writer raced us.
@@ -347,7 +311,7 @@ impl PostgresImmutableStore {
         updated: Fragment,
         expected: Fragment,
     ) -> Result<(), StoreError> {
-        let client = self.pool.get().await.map_err(db_err)?;
+        let client = self.pool.get().await.map_err(pool_err)?;
         let affected = client
             .execute(
                 "UPDATE lore_fragment_metadata \
@@ -378,7 +342,7 @@ impl PostgresImmutableStore {
         repository: Context,
         address: Address,
     ) -> Result<(), StoreError> {
-        let client = self.pool.get().await.map_err(db_err)?;
+        let client = self.pool.get().await.map_err(pool_err)?;
         client
             .execute(
                 "INSERT INTO lore_fragments (hash, repository, context) \
@@ -399,7 +363,7 @@ impl PostgresImmutableStore {
         repository: Context,
         address: Address,
     ) -> Result<(), StoreError> {
-        let client = self.pool.get().await.map_err(db_err)?;
+        let client = self.pool.get().await.map_err(pool_err)?;
         client
             .execute(
                 "DELETE FROM lore_fragments \
@@ -417,7 +381,7 @@ impl PostgresImmutableStore {
 
     /// Whether any association still references `hash` (global refcount).
     async fn has_associations(&self, hash: Hash) -> Result<bool, StoreError> {
-        let client = self.pool.get().await.map_err(db_err)?;
+        let client = self.pool.get().await.map_err(pool_err)?;
         let row = client
             .query_opt(
                 "SELECT 1 FROM lore_fragments WHERE hash = $1 LIMIT 1",
@@ -447,11 +411,41 @@ impl PostgresImmutableStore {
             .await
             .map_err(|e| s3_err(e, "S3 put object failed"))?;
 
-        // Metadata + association are written after the bytes. As with the AWS
-        // store, a crash between these leaves recoverable state: a later
-        // query/get treats the fragment as absent and the client re-sends it.
-        self.write_metadata(address.hash, fragment).await?;
-        self.associate_fragment(repository, address).await?;
+        // Metadata upsert + association insert run in ONE transaction (B4): the
+        // fragment is either fully indexed or not at all, never metadata without
+        // its association (or vice versa). Bytes are written first (above); a
+        // crash before commit leaves recoverable state — a later query/get treats
+        // the fragment as absent and the client re-sends it, as in the AWS store.
+        let mut client = self.pool.get().await.map_err(pool_err)?;
+        let tx = client.transaction().await.map_err(db_err)?;
+        tx.execute(
+            "INSERT INTO lore_fragment_metadata (hash, flags, size_payload, size_content) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (hash) DO UPDATE SET \
+                 flags = EXCLUDED.flags, \
+                 size_payload = EXCLUDED.size_payload, \
+                 size_content = EXCLUDED.size_content",
+            &[
+                &address.hash.data().as_slice(),
+                &(fragment.flags as i64),
+                &(fragment.size_payload as i64),
+                &(fragment.size_content as i64),
+            ],
+        )
+        .await
+        .map_err(db_err)?;
+        tx.execute(
+            "INSERT INTO lore_fragments (hash, repository, context) \
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            &[
+                &address.hash.data().as_slice(),
+                &repository.data().as_slice(),
+                &address.context.data().as_slice(),
+            ],
+        )
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -510,8 +504,23 @@ impl PostgresImmutableStore {
     }
 }
 
-fn db_err<E: std::fmt::Display>(e: E) -> StoreError {
-    StoreError::internal(format!("postgres immutable store: {e}"))
+/// Map a query/execute error; transient failures become `SlowDown` so clients
+/// retry rather than treat them as permanent (A2).
+fn db_err(e: tokio_postgres::Error) -> StoreError {
+    if crate::pool::is_transient_pg(&e) {
+        StoreError::from(SlowDown)
+    } else {
+        StoreError::internal(format!("postgres immutable store: {e}"))
+    }
+}
+
+/// Map a pool-checkout error (transient ⇒ `SlowDown`).
+fn pool_err(e: PoolError) -> StoreError {
+    if crate::pool::is_transient_pool(&e) {
+        StoreError::from(SlowDown)
+    } else {
+        StoreError::internal(format!("postgres immutable store pool: {e}"))
+    }
 }
 
 fn s3_err<E: std::fmt::Debug>(e: AwsError<E>, context: &str) -> StoreError {
@@ -543,17 +552,87 @@ impl ImmutableStore for PostgresImmutableStore {
         addresses: &[Address],
         match_requested: StoreMatch,
     ) -> Result<Vec<StoreMatch>, StoreError> {
-        let repository: Context = partition.into();
-        let mut out = Vec::with_capacity(addresses.len());
-        for address in addresses {
-            let m = if self.exists(repository, *address, match_requested).await? {
-                match_requested
-            } else {
-                StoreMatch::MatchNone
-            };
-            out.push(m);
+        if addresses.is_empty() || match_requested == StoreMatch::MatchNone {
+            return Ok(vec![StoreMatch::MatchNone; addresses.len()]);
         }
-        Ok(out)
+        let repository: Context = partition.into();
+        let client = self.pool.get().await.map_err(pool_err)?;
+        // One query for the whole batch via `hash = ANY($n)` (B3) — a fragment
+        // push existence-checks thousands of hashes, so we collapse N round-trips
+        // into a single statement instead of probing each address individually.
+        let hashes: Vec<&[u8]> = addresses.iter().map(|a| a.hash.data().as_slice()).collect();
+
+        match match_requested {
+            StoreMatch::MatchHash => {
+                let rows = client
+                    .query(
+                        "SELECT DISTINCT hash FROM lore_fragments WHERE hash = ANY($1)",
+                        &[&hashes],
+                    )
+                    .await
+                    .map_err(db_err)?;
+                let present: HashSet<Vec<u8>> =
+                    rows.iter().map(|r| r.get::<_, Vec<u8>>("hash")).collect();
+                Ok(addresses
+                    .iter()
+                    .map(|a| {
+                        if present.contains(a.hash.data().as_slice()) {
+                            StoreMatch::MatchHash
+                        } else {
+                            StoreMatch::MatchNone
+                        }
+                    })
+                    .collect())
+            }
+            StoreMatch::MatchPartition => {
+                let rows = client
+                    .query(
+                        "SELECT DISTINCT hash FROM lore_fragments \
+                         WHERE repository = $1 AND hash = ANY($2)",
+                        &[&repository.data().as_slice(), &hashes],
+                    )
+                    .await
+                    .map_err(db_err)?;
+                let present: HashSet<Vec<u8>> =
+                    rows.iter().map(|r| r.get::<_, Vec<u8>>("hash")).collect();
+                Ok(addresses
+                    .iter()
+                    .map(|a| {
+                        if present.contains(a.hash.data().as_slice()) {
+                            StoreMatch::MatchPartition
+                        } else {
+                            StoreMatch::MatchNone
+                        }
+                    })
+                    .collect())
+            }
+            StoreMatch::MatchFull => {
+                let rows = client
+                    .query(
+                        "SELECT hash, context FROM lore_fragments \
+                         WHERE repository = $1 AND hash = ANY($2)",
+                        &[&repository.data().as_slice(), &hashes],
+                    )
+                    .await
+                    .map_err(db_err)?;
+                let present: HashSet<(Vec<u8>, Vec<u8>)> = rows
+                    .iter()
+                    .map(|r| (r.get::<_, Vec<u8>>("hash"), r.get::<_, Vec<u8>>("context")))
+                    .collect();
+                Ok(addresses
+                    .iter()
+                    .map(|a| {
+                        let key = (a.hash.data().to_vec(), a.context.data().to_vec());
+                        if present.contains(&key) {
+                            StoreMatch::MatchFull
+                        } else {
+                            StoreMatch::MatchNone
+                        }
+                    })
+                    .collect())
+            }
+            StoreMatch::MatchNone => Ok(vec![StoreMatch::MatchNone; addresses.len()]),
+        }
     }
 
     async fn query(

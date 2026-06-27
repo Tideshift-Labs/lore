@@ -22,6 +22,14 @@ tracing = { workspace = true }
 # only fragment METADATA moves to Postgres. This is an "off-AWS" backend in the
 # sense of off-DynamoDB — the S3 client points at DO Spaces / MinIO, not AWS.
 aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["rt-tokio"] }
+# Postgres TLS: DO Managed Postgres (the deployment target) mandates SSL. We use
+# rustls (ring, no aws-lc) to match the rest of the workspace.
+# No crypto feature: we supply the rustls ClientConfig (ring provider) ourselves,
+# and disable defaults so this never pulls aws-lc (excluded workspace-wide).
+tokio-postgres-rustls = { version = "0.13", default-features = false }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls-pemfile = "2"
 lore-aws = { workspace = true }
 lore-base = { workspace = true }
 lore-revision = { workspace = true }

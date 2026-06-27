@@ -84,7 +84,7 @@ async fn make_store(
         validate_bucket_on_startup: false,
     };
     Arc::new(
-        PostgresImmutableStore::connect(pg_url, 5, settings)
+        PostgresImmutableStore::connect(pg_url, 5, None, settings)
             .await
             .expect("connect + schema + S3 client"),
     )
@@ -583,5 +583,107 @@ async fn get_never_put_address_errors() {
     assert!(
         result.is_err(),
         "get on a never-put address must return an error, not Ok"
+    );
+}
+
+/// 8. `exist_batch` (B3 batched query) — order preservation and correctness.
+///
+/// The B3 rewrite collapses N per-address probes into a single
+/// `hash = ANY($1)` query and reconstructs the per-index result from a
+/// `HashSet`. This test verifies that the reconstruction preserves input order
+/// even when present and absent addresses are interleaved, and that the empty
+/// input short-circuit works.
+#[tokio::test]
+#[serial]
+async fn exist_batch_order_preservation() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let s = make_store(&pg, &ep, &bucket, &region).await;
+
+    let partition: Partition = rand::random();
+
+    // Three distinct present addresses.
+    let present0: Address = rand::random();
+    let present1: Address = rand::random();
+    let present2: Address = rand::random();
+    // Two addresses never put.
+    let absent0: Address = rand::random();
+    let absent1: Address = rand::random();
+
+    put_fragment(s.clone(), partition, present0, 256).await;
+    put_fragment(s.clone(), partition, present1, 256).await;
+    put_fragment(s.clone(), partition, present2, 256).await;
+
+    // Interleaved slice: [present0, absent0, present1, absent1, present2].
+    let addresses = [present0, absent0, present1, absent1, present2];
+
+    // --- MatchHash batch ---
+    // MatchHash is global (no partition filter) so any put hash in the DB
+    // returns MatchHash regardless of which partition it was stored under.
+    let results = s
+        .clone()
+        .exist_batch(partition, &addresses, StoreMatch::MatchHash)
+        .await
+        .expect("exist_batch MatchHash");
+
+    assert_eq!(
+        results.len(),
+        5,
+        "result length must equal address slice length"
+    );
+    assert_eq!(results[0], StoreMatch::MatchHash, "present0 → MatchHash");
+    assert_eq!(results[1], StoreMatch::MatchNone, "absent0 → MatchNone");
+    assert_eq!(results[2], StoreMatch::MatchHash, "present1 → MatchHash");
+    assert_eq!(results[3], StoreMatch::MatchNone, "absent1 → MatchNone");
+    assert_eq!(results[4], StoreMatch::MatchHash, "present2 → MatchHash");
+
+    // --- empty input short-circuit ---
+    let empty_results = s
+        .clone()
+        .exist_batch(partition, &[], StoreMatch::MatchHash)
+        .await
+        .expect("exist_batch empty MatchHash");
+    assert!(
+        empty_results.is_empty(),
+        "empty address slice must return empty Vec"
+    );
+
+    // --- MatchFull batch: same hash, different context ---
+    // put at (hash, ctxA); exist_batch MatchFull over [(hash,ctxA), (hash,ctxB)].
+    // Only the exact (hash, context) pair matches; the other context returns MatchNone.
+    let hash: Hash = rand::random();
+    let ctx_a: Context = rand::random();
+    let ctx_b: Context = rand::random();
+    let addr_a = Address {
+        hash,
+        context: ctx_a,
+    };
+    let addr_b = Address {
+        hash,
+        context: ctx_b,
+    };
+    put_fragment(s.clone(), partition, addr_a, 256).await;
+
+    let full_results = s
+        .clone()
+        .exist_batch(partition, &[addr_a, addr_b], StoreMatch::MatchFull)
+        .await
+        .expect("exist_batch MatchFull");
+
+    assert_eq!(full_results.len(), 2, "MatchFull result length must be 2");
+    assert_eq!(
+        full_results[0],
+        StoreMatch::MatchFull,
+        "addr_a (exact match) → MatchFull"
+    );
+    assert_eq!(
+        full_results[1],
+        StoreMatch::MatchNone,
+        "addr_b (same hash, different context) → MatchNone"
     );
 }
