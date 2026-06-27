@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+[package]
+name = "lore-postgres"
+edition = "2024"
+version.workspace = true
+publish = false
+
+# Co-located, off-AWS metadata/lock backend for loreserver (CR-007).
+# Mutable (branch-tip CAS), lock, and immutable-metadata stores on one Postgres
+# DB; immutable fragment bytes live in S3-compatible object storage. Store impls
+# are landed incrementally — deps grow as each store is implemented.
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+tracing = { workspace = true }
+# The immutable store keeps fragment BYTES in S3-compatible object storage and
+# reuses lore-aws's S3 client (aws-sdk-s3 is the standard S3-compatible client);
+# only fragment METADATA moves to Postgres. This is an "off-AWS" backend in the
+# sense of off-DynamoDB — the S3 client points at DO Spaces / MinIO, not AWS.
+aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["rt-tokio"] }
+lore-aws = { workspace = true }
+lore-base = { workspace = true }
+lore-revision = { workspace = true }
+lore-storage = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+serial_test = { workspace = true }
