@@ -51,6 +51,7 @@ const SELECT_COLS: &str =
 /// Postgres advisory lock store.
 pub struct PostgresLockStore {
     pool: Pool,
+    instruments: crate::metrics::Instruments,
 }
 
 impl PostgresLockStore {
@@ -60,16 +61,11 @@ impl PostgresLockStore {
     /// drives it to completion via `block_on` at startup.
     pub async fn connect(url: &str, pool_max: u32, ca_cert: Option<&str>) -> Result<Self, String> {
         let pool = crate::pool::build_pool(url, pool_max, ca_cert)?;
-        let client = pool
-            .get()
-            .await
-            .map_err(|e| format!("postgres connect failed: {e}"))?;
-        client
-            .batch_execute(SCHEMA)
-            .await
-            .map_err(|e| format!("postgres lock-store schema failed: {e}"))?;
-        drop(client);
-        Ok(Self { pool })
+        crate::pool::ensure_schema(&pool, SCHEMA).await?;
+        Ok(Self {
+            pool,
+            instruments: crate::metrics::Instruments::new("lock"),
+        })
     }
 }
 
@@ -109,12 +105,14 @@ fn row_to_lock_data(row: &Row) -> LockData {
 
 #[async_trait]
 impl LockStore for PostgresLockStore {
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn lock_resources(
         &self,
         owner_id: &str,
         repository: RepositoryId,
         resources: &[LockResource],
     ) -> Result<Vec<LockData>, LockError> {
+        let _t = self.instruments.start("lock_resources", self.pool.status());
         let mut client = self.pool.get().await.map_err(pool_err)?;
         let tx = client.transaction().await.map_err(db_err)?;
         let timestamp = util::time::timestamp();
@@ -167,7 +165,9 @@ impl LockStore for PostgresLockStore {
         Ok(locks)
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn query_locks(&self, query: LockQuery) -> Result<Vec<LockData>, LockError> {
+        let _t = self.instruments.start("query_locks", self.pool.status());
         let client = self.pool.get().await.map_err(pool_err)?;
         let rows = match query {
             LockQuery::Repository(repo) => {
@@ -242,11 +242,15 @@ impl LockStore for PostgresLockStore {
         Ok(rows.iter().map(row_to_lock_data).collect())
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn check_locks_status(
         &self,
         repository: RepositoryId,
         resources: &[LockResource],
     ) -> Result<Vec<LockData>, LockError> {
+        let _t = self
+            .instruments
+            .start("check_locks_status", self.pool.status());
         let client = self.pool.get().await.map_err(pool_err)?;
         let repo = repository.data().as_slice();
         let mut locked = Vec::new();
@@ -269,6 +273,7 @@ impl LockStore for PostgresLockStore {
         Ok(locked)
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn unlock_resources(
         &self,
         owner_id: &str,
@@ -276,6 +281,9 @@ impl LockStore for PostgresLockStore {
         repository: RepositoryId,
         resources: &[LockResource],
     ) -> Result<Vec<LockResource>, LockError> {
+        let _t = self
+            .instruments
+            .start("unlock_resources", self.pool.status());
         let mut client = self.pool.get().await.map_err(pool_err)?;
         let tx = client.transaction().await.map_err(db_err)?;
         let repo = repository.data().as_slice();

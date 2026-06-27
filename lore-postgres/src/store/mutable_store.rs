@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS lore_mutable (
 /// Postgres mutable (key→value, branch-tip CAS) store.
 pub struct PostgresMutableStore {
     pool: Pool,
+    instruments: crate::metrics::Instruments,
 }
 
 impl PostgresMutableStore {
@@ -44,16 +45,11 @@ impl PostgresMutableStore {
     /// (schema DDL needs a connection).
     pub async fn connect(url: &str, pool_max: u32, ca_cert: Option<&str>) -> Result<Self, String> {
         let pool = crate::pool::build_pool(url, pool_max, ca_cert)?;
-        let client = pool
-            .get()
-            .await
-            .map_err(|e| format!("postgres connect failed: {e}"))?;
-        client
-            .batch_execute(SCHEMA)
-            .await
-            .map_err(|e| format!("postgres mutable-store schema failed: {e}"))?;
-        drop(client);
-        Ok(Self { pool })
+        crate::pool::ensure_schema(&pool, SCHEMA).await?;
+        Ok(Self {
+            pool,
+            instruments: crate::metrics::Instruments::new("mutable"),
+        })
     }
 }
 
@@ -82,12 +78,14 @@ fn not_found(key: Hash) -> StoreError {
 
 #[async_trait]
 impl MutableStore for PostgresMutableStore {
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn load(
         self: Arc<Self>,
         partition: Partition,
         key: Hash,
         key_type: KeyType,
     ) -> Result<Hash, StoreError> {
+        let _t = self.instruments.start("load", self.pool.status());
         let client = self.pool.get().await.map_err(pool_err)?;
         let row = client
             .query_opt(
@@ -110,6 +108,7 @@ impl MutableStore for PostgresMutableStore {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn store(
         self: Arc<Self>,
         partition: Partition,
@@ -117,6 +116,7 @@ impl MutableStore for PostgresMutableStore {
         value: Hash,
         key_type: KeyType,
     ) -> Result<(), StoreError> {
+        let _t = self.instruments.start("store", self.pool.status());
         let client = self.pool.get().await.map_err(pool_err)?;
         let part = partition.data().as_slice();
         let kt = key_type as i16;
@@ -145,6 +145,7 @@ impl MutableStore for PostgresMutableStore {
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn compare_and_swap(
         self: Arc<Self>,
         partition: Partition,
@@ -153,6 +154,9 @@ impl MutableStore for PostgresMutableStore {
         value: Hash,
         key_type: KeyType,
     ) -> Result<Hash, StoreError> {
+        let _t = self
+            .instruments
+            .start("compare_and_swap", self.pool.status());
         let client = self.pool.get().await.map_err(pool_err)?;
         let part = partition.data().as_slice();
         let kt = key_type as i16;
@@ -199,11 +203,13 @@ impl MutableStore for PostgresMutableStore {
         Ok(Hash::from(current.as_slice()))
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn list(
         self: Arc<Self>,
         partition: Partition,
         key_type: KeyType,
     ) -> Result<KeyValueStream, StoreError> {
+        let _t = self.instruments.start("list", self.pool.status());
         let client = self.pool.get().await.map_err(pool_err)?;
         let kt = key_type as i16;
         // A null partition matches all partitions (trait contract).

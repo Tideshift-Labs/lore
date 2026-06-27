@@ -101,6 +101,7 @@ pub struct PostgresImmutableStore {
     pool: Pool,
     s3: S3Impl,
     bucket: String,
+    instruments: crate::metrics::Instruments,
 }
 
 impl PostgresImmutableStore {
@@ -116,15 +117,7 @@ impl PostgresImmutableStore {
         object: ObjectStoreSettings,
     ) -> Result<Self, String> {
         let pool = crate::pool::build_pool(pg_url, pool_max, ca_cert)?;
-        let client = pool
-            .get()
-            .await
-            .map_err(|e| format!("postgres connect failed: {e}"))?;
-        client
-            .batch_execute(SCHEMA)
-            .await
-            .map_err(|e| format!("postgres immutable-store schema failed: {e}"))?;
-        drop(client);
+        crate::pool::ensure_schema(&pool, SCHEMA).await?;
 
         // Build the S3-compatible byte client via lore-aws's client builder so
         // endpoint / region / path-style handling matches the AWS backend.
@@ -156,6 +149,7 @@ impl PostgresImmutableStore {
             pool,
             s3,
             bucket: object.bucket,
+            instruments: crate::metrics::Instruments::new("immutable"),
         })
     }
 
@@ -487,12 +481,19 @@ impl PostgresImmutableStore {
     }
 
     async fn load(&self, hash: Hash) -> Result<(Fragment, Bytes), StoreError> {
-        let fragment = self.load_metadata(hash).await?;
+        // Fetch metadata (Postgres) and bytes (S3) concurrently — on the hot
+        // read/clone path this makes per-fragment latency max(meta, bytes)
+        // instead of the sum, mirroring the AWS store. Metadata is authoritative:
+        // its error/obliteration verdict takes priority over the byte fetch.
+        let (meta_res, bytes_res) =
+            tokio::join!(self.load_metadata(hash), self.get_payload_bytes(hash));
+
+        let fragment = meta_res?;
         lore_storage::validate_fragment_size(&fragment)?;
         if fragment.flags & FragmentFlags::PayloadObliteration.bits() != 0 {
             return Err(Self::not_found(hash));
         }
-        let payload = self.get_payload_bytes(hash).await?;
+        let payload = bytes_res?;
         if payload.len() != fragment.size_payload as usize {
             return Err(StoreError::internal(format!(
                 "Failed to load from immutable store, size mismatch (load {}, expected {}) for get {hash}",
@@ -532,12 +533,14 @@ fn s3_err<E: std::fmt::Debug>(e: AwsError<E>, context: &str) -> StoreError {
 
 #[async_trait]
 impl ImmutableStore for PostgresImmutableStore {
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn exist(
         self: Arc<Self>,
         partition: Partition,
         address: Address,
         match_requested: StoreMatch,
     ) -> Result<StoreMatch, StoreError> {
+        let _t = self.instruments.start("exist", self.pool.status());
         let repository: Context = partition.into();
         if self.exists(repository, address, match_requested).await? {
             Ok(match_requested)
@@ -546,6 +549,7 @@ impl ImmutableStore for PostgresImmutableStore {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn exist_batch(
         self: Arc<Self>,
         partition: Partition,
@@ -555,6 +559,7 @@ impl ImmutableStore for PostgresImmutableStore {
         if addresses.is_empty() || match_requested == StoreMatch::MatchNone {
             return Ok(vec![StoreMatch::MatchNone; addresses.len()]);
         }
+        let _t = self.instruments.start("exist_batch", self.pool.status());
         let repository: Context = partition.into();
         let client = self.pool.get().await.map_err(pool_err)?;
         // One query for the whole batch via `hash = ANY($n)` (B3) — a fragment
@@ -635,23 +640,27 @@ impl ImmutableStore for PostgresImmutableStore {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn query(
         self: Arc<Self>,
         partition: Partition,
         address: Address,
         match_requested: StoreMatch,
     ) -> Result<StoreQueryResult, StoreError> {
+        let _t = self.instruments.start("query", self.pool.status());
         let repository: Context = partition.into();
         self.do_query(repository, address, match_requested, true)
             .await
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn get(
         self: Arc<Self>,
         partition: Partition,
         address: Address,
         match_required: StoreMatch,
     ) -> Result<(Fragment, Bytes), StoreError> {
+        let _t = self.instruments.start("get", self.pool.status());
         let repository: Context = partition.into();
         self.ensure_exists(repository, address, match_required)
             .await?;
@@ -660,6 +669,7 @@ impl ImmutableStore for PostgresImmutableStore {
         Ok((fragment, payload))
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn put(
         self: Arc<Self>,
         partition: Partition,
@@ -668,6 +678,7 @@ impl ImmutableStore for PostgresImmutableStore {
         payload: Option<Bytes>,
         _force: bool,
     ) -> Result<(), StoreError> {
+        let _t = self.instruments.start("put", self.pool.status());
         sanitise_fragment_behavior_flags(&mut fragment);
         if let Some(payload) = payload.as_ref() {
             lore_storage::validate_fragment_payload(&fragment, payload.len())?;
@@ -722,12 +733,14 @@ impl ImmutableStore for PostgresImmutableStore {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn obliterate(
         self: Arc<Self>,
         partition: Partition,
         address: Address,
         stats: Arc<StoreObliterateStats>,
     ) -> Result<(), StoreError> {
+        let _t = self.instruments.start("obliterate", self.pool.status());
         let repository: Context = partition.into();
 
         let original = self.load_metadata(address.hash).await?;
@@ -786,6 +799,7 @@ impl ImmutableStore for PostgresImmutableStore {
             .await
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn copy(
         self: Arc<Self>,
         source_partition: Partition,
@@ -794,6 +808,7 @@ impl ImmutableStore for PostgresImmutableStore {
         destination_context: Context,
         _durable: bool,
     ) -> Result<(), StoreError> {
+        let _t = self.instruments.start("copy", self.pool.status());
         let source_repository: Context = source_partition.into();
         let destination_repository: Context = destination_partition.into();
         let destination_address = Address {

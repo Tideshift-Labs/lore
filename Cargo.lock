@@ -2811,6 +2811,8 @@ dependencies = [
  "lore-base",
  "lore-revision",
  "lore-storage",
+ "lore-telemetry",
+ "opentelemetry",
  "rand 0.9.4",
  "rustls",
  "rustls-native-certs",

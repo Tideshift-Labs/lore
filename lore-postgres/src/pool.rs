@@ -28,6 +28,39 @@ use rustls::ClientConfig;
 use rustls::RootCertStore;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
+/// Advisory-lock key guarding schema provisioning. A single shared key
+/// serializes all `CREATE TABLE/INDEX IF NOT EXISTS` across every store and
+/// every replica: Postgres `IF NOT EXISTS` DDL is *not* concurrency-safe (two
+/// simultaneous runs can fail with "tuple concurrently updated" /
+/// "duplicate key … pg_type"), which bites when multiple loreserver replicas in
+/// a cell boot at once. The value is arbitrary but must be stable across the
+/// fleet.
+const SCHEMA_LOCK_KEY: i64 = 0x_6C6F_7265_7067; // "lorepg"
+
+/// Provision a store's schema under the shared advisory lock so concurrent
+/// boots (multi-replica cells) can't race the `IF NOT EXISTS` DDL. The lock is
+/// transaction-scoped, so it is released on commit.
+pub async fn ensure_schema(pool: &Pool, ddl: &str) -> Result<(), String> {
+    let mut client = pool
+        .get()
+        .await
+        .map_err(|e| format!("postgres connect failed: {e}"))?;
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| format!("postgres schema txn failed: {e}"))?;
+    tx.execute("SELECT pg_advisory_xact_lock($1)", &[&SCHEMA_LOCK_KEY])
+        .await
+        .map_err(|e| format!("postgres advisory lock failed: {e}"))?;
+    tx.batch_execute(ddl)
+        .await
+        .map_err(|e| format!("postgres schema DDL failed: {e}"))?;
+    tx.commit()
+        .await
+        .map_err(|e| format!("postgres schema commit failed: {e}"))?;
+    Ok(())
+}
+
 /// Build a pooled Postgres connector with a rustls TLS provider.
 ///
 /// `ca_cert` is an optional PEM bundle added to the trust roots (for a private

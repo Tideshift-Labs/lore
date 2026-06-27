@@ -30,10 +30,12 @@ tokio-postgres-rustls = { version = "0.13", default-features = false }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pemfile = "2"
+opentelemetry = { workspace = true }
 lore-aws = { workspace = true }
 lore-base = { workspace = true }
 lore-revision = { workspace = true }
 lore-storage = { workspace = true }
+lore-telemetry = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
