@@ -2763,11 +2763,15 @@ name = "lore-postgres"
 version = "0.8.4-nightly"
 dependencies = [
  "async-trait",
+ "aws-sdk-s3",
+ "bytes",
  "deadpool-postgres",
+ "lore-aws",
  "lore-base",
  "lore-revision",
  "lore-storage",
  "rand 0.9.4",
+ "serial_test",
  "tokio",
  "tokio-postgres",
  "tracing",

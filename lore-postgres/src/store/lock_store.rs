@@ -132,14 +132,7 @@ impl LockStore for PostgresLockStore {
                      (repository, branch, hash, owner, description, locked_at) \
                      VALUES ($1, $2, $3, $4, $5, $6) \
                      ON CONFLICT (repository, branch, hash) DO NOTHING RETURNING owner",
-                    &[
-                        &repo,
-                        &branch,
-                        &hash,
-                        &owner_id,
-                        &resource.description,
-                        &ts,
-                    ],
+                    &[&repo, &branch, &hash, &owner_id, &resource.description, &ts],
                 )
                 .await
                 .map_err(db_err)?;
@@ -193,16 +186,18 @@ impl LockStore for PostgresLockStore {
                     )
                     .await
             }
-            LockQuery::RepositoryBranchDescription(repo, branch, description) => {
-                client
-                    .query(
-                        &format!(
-                            "{SELECT_COLS} WHERE repository = $1 AND branch = $2 AND description = $3"
-                        ),
-                        &[&repo.data().as_slice(), &branch.data().as_slice(), &description],
-                    )
-                    .await
-            }
+            LockQuery::RepositoryBranchDescription(repo, branch, description) => client
+                .query(
+                    &format!(
+                        "{SELECT_COLS} WHERE repository = $1 AND branch = $2 AND description = $3"
+                    ),
+                    &[
+                        &repo.data().as_slice(),
+                        &branch.data().as_slice(),
+                        &description,
+                    ],
+                )
+                .await,
             LockQuery::OwnerRepository(owner, repo) => {
                 client
                     .query(
@@ -227,7 +222,11 @@ impl LockStore for PostgresLockStore {
                         &format!(
                             "{SELECT_COLS} WHERE hash = $1 AND repository = $2 AND branch = $3"
                         ),
-                        &[&hash.data().as_slice(), &repo.data().as_slice(), &branch.data().as_slice()],
+                        &[
+                            &hash.data().as_slice(),
+                            &repo.data().as_slice(),
+                            &branch.data().as_slice(),
+                        ],
                     )
                     .await
             }
@@ -254,9 +253,7 @@ impl LockStore for PostgresLockStore {
         for resource in resources {
             let row = client
                 .query_opt(
-                    &format!(
-                        "{SELECT_COLS} WHERE repository = $1 AND branch = $2 AND hash = $3"
-                    ),
+                    &format!("{SELECT_COLS} WHERE repository = $1 AND branch = $2 AND hash = $3"),
                     &[
                         &repo,
                         &resource.branch.data().as_slice(),
