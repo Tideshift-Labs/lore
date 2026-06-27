@@ -69,8 +69,7 @@ impl Instruments {
     fn record_pool(&self, status: Status) {
         let labels = [KeyValue::new("store", self.store)];
         self.pool_waiting.record(status.waiting as u64, &labels);
-        self.pool_available
-            .record(status.available as u64, &labels);
+        self.pool_available.record(status.available as u64, &labels);
     }
 }
 

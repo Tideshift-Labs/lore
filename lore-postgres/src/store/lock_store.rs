@@ -59,8 +59,12 @@ impl PostgresLockStore {
     ///
     /// Async because the schema DDL needs a live connection; the plugin factory
     /// drives it to completion via `block_on` at startup.
-    pub async fn connect(url: &str, pool_max: u32, ca_cert: Option<&str>) -> Result<Self, String> {
-        let pool = crate::pool::build_pool(url, pool_max, ca_cert)?;
+    pub async fn connect(
+        url: &str,
+        pool_max: u32,
+        tls: &crate::pool::TlsConfig,
+    ) -> Result<Self, String> {
+        let pool = crate::pool::build_pool(url, pool_max, tls)?;
         crate::pool::ensure_schema(&pool, SCHEMA).await?;
         Ok(Self {
             pool,

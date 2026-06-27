@@ -84,9 +84,14 @@ async fn make_store(
         validate_bucket_on_startup: false,
     };
     Arc::new(
-        PostgresImmutableStore::connect(pg_url, 5, None, settings)
-            .await
-            .expect("connect + schema + S3 client"),
+        PostgresImmutableStore::connect(
+            pg_url,
+            5,
+            &lore_postgres::pool::TlsConfig::default(),
+            settings,
+        )
+        .await
+        .expect("connect + schema + S3 client"),
     )
 }
 
