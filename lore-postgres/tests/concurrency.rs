@@ -16,6 +16,7 @@ use lore_base::types::LockResource;
 use lore_postgres::pool::TlsConfig;
 use lore_postgres::store::lock_store::PostgresLockStore;
 use lore_postgres::store::mutable_store::PostgresMutableStore;
+use lore_revision::lock::LockError;
 use lore_revision::lock::LockStore;
 use lore_revision::lore::RepositoryId;
 use lore_storage::Hash;
@@ -145,12 +146,13 @@ async fn batch_lock_all_or_nothing() {
 
     // Bob tries to acquire [r2, r1]. r2 is free; r1 is held by alice.
     // The whole batch must fail because r1 cannot be acquired.
-    let batch_result = store
+    let batch_err = store
         .lock_resources("bob", repo, &[r2.clone(), r1.clone()])
-        .await;
+        .await
+        .unwrap_err();
     assert!(
-        batch_result.is_err(),
-        "bob's batch must fail because r1 is already held by alice"
+        matches!(batch_err, LockError::LockNotOwned(_)),
+        "expected LockNotOwned for bob's batch conflict, got {batch_err:?}"
     );
 
     // The batch transaction rolled back — r2 must NOT be left locked by bob.

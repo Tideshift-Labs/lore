@@ -8,6 +8,7 @@
 
 use lore_base::types::LockResource;
 use lore_postgres::store::lock_store::PostgresLockStore;
+use lore_revision::lock::LockError;
 use lore_revision::lock::LockQuery;
 use lore_revision::lock::LockStore;
 use lore_revision::lore::RepositoryId;
@@ -55,20 +56,24 @@ async fn lock_lifecycle() {
     assert!(again.is_empty());
 
     // Conflict: bob cannot take r1.
+    let err = store
+        .lock_resources("bob", repo, std::slice::from_ref(&r1))
+        .await
+        .unwrap_err();
     assert!(
-        store
-            .lock_resources("bob", repo, std::slice::from_ref(&r1))
-            .await
-            .is_err()
+        matches!(err, LockError::LockNotOwned(_)),
+        "expected LockNotOwned, got {err:?}"
     );
 
     // Batch atomicity: bob acquires [r2 (free), r1 (held)] → whole batch fails,
     // and r2 must NOT be left locked (transaction rolled back).
+    let batch_err = store
+        .lock_resources("bob", repo, &[r2.clone(), r1.clone()])
+        .await
+        .unwrap_err();
     assert!(
-        store
-            .lock_resources("bob", repo, &[r2.clone(), r1.clone()])
-            .await
-            .is_err()
+        matches!(batch_err, LockError::LockNotOwned(_)),
+        "expected LockNotOwned for batch conflict, got {batch_err:?}"
     );
     let r2_status = store
         .check_locks_status(repo, std::slice::from_ref(&r2))
