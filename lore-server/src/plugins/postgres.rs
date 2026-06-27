@@ -22,6 +22,8 @@ use std::sync::Arc;
 use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
+use lore_postgres::store::immutable_store::ObjectStoreSettings;
+use lore_postgres::store::immutable_store::PostgresImmutableStore;
 use lore_postgres::store::lock_store::PostgresLockStore;
 use lore_postgres::store::mutable_store::PostgresMutableStore;
 use lore_revision::lock::LockStore;
@@ -49,10 +51,55 @@ pub struct PostgresStoreConfig {
     /// Max pooled connections (default 10).
     #[serde(default = "default_pool_max")]
     pub pool_max: u32,
+    /// S3-compatible object storage for fragment **bytes**. Required by the
+    /// immutable-store factory; unused (and typically absent) for the
+    /// mutable/lock stores, which keep everything in Postgres.
+    #[serde(default)]
+    pub object_store: Option<ObjectStoreConfig>,
+}
+
+/// S3-compatible object-storage sub-config for the immutable store's fragment
+/// bytes. Keys mirror the endpoint/region/bucket/path-style that `lore-aws`
+/// exposes so the same backend can point at DO Spaces, MinIO, or LocalStack.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ObjectStoreConfig {
+    /// Bucket holding fragment payloads.
+    pub bucket: String,
+    /// Optional endpoint URL (set for S3-compatible stores like Spaces/MinIO).
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
+    /// Optional region.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Force path-style addressing (required for S3-compatible stores behind
+    /// non-AWS hostnames like MinIO in Docker).
+    #[serde(default)]
+    pub force_path_style: bool,
+    /// Slow-operation log threshold in milliseconds.
+    #[serde(default = "default_slow_threshold")]
+    pub slow_operation_threshold_millis: u64,
+    /// Per-operation timeout in milliseconds.
+    #[serde(default = "default_timeout")]
+    pub timeout_millis: u64,
+    /// Whether to HEAD the bucket at startup to fail fast on misconfiguration.
+    #[serde(default = "default_validate_bucket_on_startup")]
+    pub validate_bucket_on_startup: bool,
 }
 
 fn default_pool_max() -> u32 {
     10
+}
+
+fn default_slow_threshold() -> u64 {
+    u64::MAX
+}
+
+fn default_timeout() -> u64 {
+    5000
+}
+
+fn default_validate_bucket_on_startup() -> bool {
+    true
 }
 
 fn parse_config(name: &str, config: &toml::Value) -> Result<PostgresStoreConfig, PluginError> {
@@ -61,13 +108,6 @@ fn parse_config(name: &str, config: &toml::Value) -> Result<PostgresStoreConfig,
             plugin_name: name.to_string(),
             message: format!("Failed to deserialize Postgres store config: {e}"),
         })
-    })
-}
-
-fn not_implemented(name: &str, store: &str) -> PluginError {
-    PluginError::from(PluginInitError {
-        plugin_name: name.to_string(),
-        message: format!("lore-postgres {store} store not yet implemented (CR-007)"),
     })
 }
 
@@ -80,11 +120,62 @@ impl ImmutableStorePluginFactory for PostgresImmutableStorePluginFactory {
     }
 
     fn validate_config(&self, config: &toml::Value) -> Result<(), PluginError> {
-        parse_config(self.name(), config).map(|_| ())
+        let cfg = parse_config(self.name(), config)?;
+        // The immutable store needs the object-storage sub-config; catch its
+        // absence at validation time rather than at first write.
+        if cfg.object_store.is_none() {
+            return Err(PluginError::from(PluginConfigError {
+                plugin_name: self.name().to_string(),
+                message: "Postgres immutable store requires an [object_store] section \
+                          (bucket + endpoint/region/path-style)"
+                    .to_string(),
+            }));
+        }
+        Ok(())
     }
 
-    fn create(&self, _config: &toml::Value) -> Result<Arc<dyn ImmutableStore>, PluginError> {
-        Err(not_implemented(self.name(), "immutable"))
+    fn create(&self, config: &toml::Value) -> Result<Arc<dyn ImmutableStore>, PluginError> {
+        let plugin_name = self.name();
+        let cfg = parse_config(plugin_name, config)?;
+        let object = cfg.object_store.ok_or_else(|| {
+            PluginError::from(PluginConfigError {
+                plugin_name: plugin_name.to_string(),
+                message: "Postgres immutable store requires an [object_store] section \
+                          (bucket + endpoint/region/path-style)"
+                    .to_string(),
+            })
+        })?;
+        let object = ObjectStoreSettings {
+            bucket: object.bucket,
+            endpoint_url: object.endpoint_url,
+            region: object.region,
+            force_path_style: object.force_path_style,
+            slow_operation_threshold_millis: object.slow_operation_threshold_millis,
+            timeout_millis: object.timeout_millis,
+            validate_bucket_on_startup: object.validate_bucket_on_startup,
+        };
+
+        // `create` is synchronous, but building the pool + S3 client and ensuring
+        // the schema is async — drive it to completion like the AWS plugin does.
+        // The future is `Box::pin`ned: building the AWS S3 client holds a large
+        // `SdkConfig`/builder state that overflows the main thread's stack if
+        // polled inline by `block_on` (aws.rs boxes its builder block for the
+        // same reason).
+        let store = tokio::task::block_in_place(|| {
+            runtime().block_on(Box::pin(PostgresImmutableStore::connect(
+                &cfg.url,
+                cfg.pool_max,
+                object,
+            )))
+        })
+        .map_err(|e| {
+            PluginError::from(PluginInitError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("Failed to create Postgres immutable store: {e}"),
+            })
+        })?;
+
+        Ok(Arc::new(store))
     }
 }
 

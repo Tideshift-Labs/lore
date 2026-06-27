@@ -1,0 +1,58 @@
+# Lore Server Configuration Example: Postgres + S3-compatible object storage
+# =====================================================================
+# CR-007 off-AWS (off-DynamoDB) data-plane backend. All three coordination
+# stores run on ONE Postgres database per region cell; immutable fragment BYTES
+# live in S3-compatible object storage (DO Spaces / MinIO / LocalStack). This is
+# the single-vendor "DO cell" backend (ADR-00008 option B2 / ADR-00009 §2).
+#
+# Required services:
+# - A Postgres database (the three stores self-bootstrap their tables; or apply
+#   lore-postgres/migrations/0001_init.sql out-of-band).
+# - An S3-compatible bucket for immutable fragment payloads.
+#
+# Postgres-specific settings are under [plugins.postgres.*]. Each store group
+# carries its own connection (they may point at the same database).
+
+[immutable_store]
+mode = "postgres"
+
+[mutable_store]
+mode = "postgres"
+
+[lock_store]
+mode = "postgres"
+
+# ---------------------------------------------------------------------
+# Postgres Plugin Configuration
+# ---------------------------------------------------------------------
+
+# Immutable store: fragment METADATA in Postgres, fragment BYTES in object storage.
+[plugins.postgres.immutable_store]
+url = "postgres://postgres:postgres@localhost:5432/lore"
+# pool_max = 10
+
+# S3-compatible object storage for the fragment bytes. Keys mirror lore-aws's
+# endpoint/region/bucket/path-style so the same backend points at DO Spaces.
+# Credentials come from the standard AWS env chain (AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY) or instance role.
+[plugins.postgres.immutable_store.object_store]
+bucket = "lore-fragments"
+# endpoint_url = "https://nyc3.digitaloceanspaces.com"   # MinIO: http://localhost:9000
+region = "us-east-1"
+# Path-style is required for S3-compatible stores reached by a non-AWS hostname
+# (MinIO in Docker). DO Spaces works with either; leave false for AWS S3.
+force_path_style = false
+# slow_operation_threshold_millis = 5000
+# timeout_millis = 30000
+# Set false when the bucket is provisioned after boot (skip the startup HEAD).
+# validate_bucket_on_startup = true
+
+# Mutable store: branch-tip compare-and-swap. No object storage needed.
+[plugins.postgres.mutable_store]
+url = "postgres://postgres:postgres@localhost:5432/lore"
+# pool_max = 10
+
+# Lock store: advisory locks. No object storage needed.
+[plugins.postgres.lock_store]
+url = "postgres://postgres:postgres@localhost:5432/lore"
+# pool_max = 10

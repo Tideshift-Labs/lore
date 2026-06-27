@@ -39,8 +39,15 @@ async fn mutable_cas_lifecycle() {
     assert!(store.clone().load(part, key, kt).await.is_err());
 
     // store + load.
-    store.clone().store(part, key, v1, kt).await.expect("store v1");
-    assert_eq!(store.clone().load(part, key, kt).await.expect("load v1"), v1);
+    store
+        .clone()
+        .store(part, key, v1, kt)
+        .await
+        .expect("store v1");
+    assert_eq!(
+        store.clone().load(part, key, kt).await.expect("load v1"),
+        v1
+    );
 
     // CAS with matching expected → swaps, returns expected.
     let prev = store
@@ -49,7 +56,10 @@ async fn mutable_cas_lifecycle() {
         .await
         .expect("cas v1->v2");
     assert_eq!(prev, v1);
-    assert_eq!(store.clone().load(part, key, kt).await.expect("load v2"), v2);
+    assert_eq!(
+        store.clone().load(part, key, kt).await.expect("load v2"),
+        v2
+    );
 
     // CAS with stale expected → no swap, returns the actual current value.
     let v3: Hash = rand::random();
@@ -60,7 +70,11 @@ async fn mutable_cas_lifecycle() {
         .expect("cas stale");
     assert_eq!(got, v2, "stale CAS returns current");
     assert_eq!(
-        store.clone().load(part, key, kt).await.expect("load unchanged"),
+        store
+            .clone()
+            .load(part, key, kt)
+            .await
+            .expect("load unchanged"),
         v2,
         "stale CAS must not modify"
     );
@@ -82,16 +96,27 @@ async fn mutable_cas_lifecycle() {
         .await
         .expect("cas absent");
     assert_eq!(r, exp_absent);
-    assert_eq!(store.clone().load(part, key, kt).await.expect("load v4"), v4);
+    assert_eq!(
+        store.clone().load(part, key, kt).await.expect("load v4"),
+        v4
+    );
 
     // list by (partition, key_type) → both keys.
     let key2: Hash = rand::random();
     let v5: Hash = rand::random();
-    store.clone().store(part, key2, v5, kt).await.expect("store key2");
+    store
+        .clone()
+        .store(part, key2, v5, kt)
+        .await
+        .expect("store key2");
     let mut rx = store.clone().list(part, kt).await.expect("list").channel();
     let mut items = Vec::new();
     while let Some(kv) = rx.recv().await {
         items.push(kv);
     }
-    assert_eq!(items.len(), 2, "list returns both keys for the partition+type");
+    assert_eq!(
+        items.len(),
+        2,
+        "list returns both keys for the partition+type"
+    );
 }
