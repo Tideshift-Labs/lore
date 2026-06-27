@@ -162,7 +162,11 @@ impl LockStore for PostgresLockStore {
             if existing_owner == owner_id {
                 continue;
             }
-            return Err(LockError::internal("resource already locked"));
+            // Held by a different owner: fail the whole batch with LockNotOwned,
+            // matching the DynamoDB store (CR-007 §scope: "different owner =
+            // ROLLBACK … (LockNotOwned)") rather than the `LocalLockStore`'s
+            // generic internal error. Dropping `tx` rolls back the partial batch.
+            return Err(LockNotOwned.into());
         }
 
         tx.commit().await.map_err(db_err)?;
