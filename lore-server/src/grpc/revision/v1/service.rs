@@ -37,6 +37,7 @@ use super::branch_metadata_get;
 use super::branch_metadata_set;
 use super::branch_push;
 use super::revision_list;
+use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::get_repository;
 use crate::grpc::require_permission;
 use crate::grpc::timeout_grpc;
@@ -75,6 +76,7 @@ pub struct LoreRevisionV1Service {
     hook_dispatcher: Arc<HookDispatcher>,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
     enforce_write_permission: bool,
     instrument_provider: RevisionServiceInstrumentProvider,
@@ -90,6 +92,7 @@ impl LoreRevisionV1Service {
         hook_dispatcher: Arc<HookDispatcher>,
         history_step_size: u64,
         acceleration: crate::grpc::server::RevisionListAcceleration,
+        forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
         enforce_write_permission: bool,
     ) -> Self {
@@ -121,6 +124,7 @@ impl LoreRevisionV1Service {
             hook_dispatcher,
             history_step_size,
             acceleration,
+            forwarded_requests,
             rpc_timeout,
             enforce_write_permission,
             instrument_provider,
@@ -169,6 +173,7 @@ impl RevisionService for LoreRevisionV1Service {
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
+                &self.forwarded_requests,
                 &self.hook_dispatcher,
                 &self.instrument_provider,
             ),
@@ -194,6 +199,7 @@ impl RevisionService for LoreRevisionV1Service {
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
+                &self.forwarded_requests,
                 &self.hook_dispatcher,
                 &self.instrument_provider,
             ),
@@ -211,6 +217,7 @@ impl RevisionService for LoreRevisionV1Service {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                &self.forwarded_requests,
             ),
         )
         .await
