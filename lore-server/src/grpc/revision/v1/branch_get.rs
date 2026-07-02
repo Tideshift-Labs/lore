@@ -757,6 +757,7 @@ mod test {
                 make_request_id(repository, branch_id),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                &None,
             )
             .await
             .expect("Request failed");
@@ -792,6 +793,7 @@ mod test {
                 make_request_id(repository, branch_id),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                &None,
             )
             .await
             .expect("Request failed");
@@ -830,6 +832,7 @@ mod test {
                 make_request_id(repository, branch_id),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                &None,
             )
             .await
             .expect("Request failed");

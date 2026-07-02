@@ -40,7 +40,32 @@ Per the `lore-fork-patches-inventory`: our `tideshift/main` commits are mostly S
 not the CLI itself). As you test a delta, record here **which crate it's in and how it's covered**, so
 the next run starts from the map instead of rediscovering it.
 
-_(seed entries as runs surface them)_
+- **CR-004 (write-permission enforcement)** — `lore-server/src/grpc/revision/v1/service.rs`. Gate is
+  `require_permission(...)` inline in `branch_create`/`branch_delete`/`branch_push` (NOT
+  `branch_metadata_set`, which instead threads `enforce_write_permission` down into its own handler).
+  Tests: `grpc::revision::v1::service::tests` (`read_only_token_push_is_denied`,
+  `all_write_rpcs_reject_read_only_token`, etc.) — `cargo test -p lore-server --lib -- grpc::revision::v1::service`.
+- **CR-006 (protected-flag surfacing)** — `lore-server/src/grpc/revision/v1/branch_get.rs`, the
+  `get_by_id_*_protected_*` tests near the bottom of the file, calling `handler(...)` directly (not
+  `branch_get_implementation`) so they also exercise the forwarding seam.
+  `cargo test -p lore-server --lib -- grpc::revision::v1::branch_get`.
+- **CR-007 (Postgres stores)** — `lore-postgres/`. Only 2 real unit tests in `src/` (`pool::tests::*`);
+  the meat is in `tests/{lock_store,mutable_store,immutable_store,concurrency}.rs`, gated on
+  `LORE_TEST_PG_URL` — each test does `let Some(url) = pg_url() else { eprintln!(...); return; }`
+  when unset, so `cargo test -p lore-postgres --tests` reports **green with zero real assertions run**
+  when no Postgres is reachable. Don't read a bare pass as coverage; check for the "skipping" eprintln
+  or set `LORE_TEST_PG_URL` (see `integration-harness` skill for a local Postgres, e.g.
+  `postgres-cell-pg` compose profile) to actually exercise CR-007.
+- **lore-aws (DynamoBucketResolver / per-tenant isolation)** — `lore-aws/src/store/`. Unit tests run
+  fully offline (mocked SDK clients), `cargo test -p lore-aws --lib`: 86 passed, 2 `#[ignore]`d
+  (`test_put_immutable_partial*`, need real S3 multipart) — pre-existing ignores, not ours.
+  `store::bucket_resolver::test::*` covers the tenant-routing/fail-closed behavior.
+- **CR-005 (lorehub_notify post-commit hook)** — `lore-server/src/hooks/`. Fully unit-tested, no
+  external service needed: `cargo test -p lore-server --lib -- hooks` (98 passed).
+- **lore-transport native TLS roots (CLIENT, commit 2176c74)** — `lore-transport/src/auth/ucs_auth.rs`
+  `connect_client`. No dedicated unit test (the commit was verified end-to-end manually, per its
+  message); existing `auth::ucs_auth::tests::*` cover URL/scheme parsing, not the TLS config itself.
+  `cargo test -p lore-transport --lib` is cheap (~40s cold) and green; treat as smoke-only for this delta.
 
 ---
 
@@ -50,4 +75,18 @@ _(seed entries as runs surface them)_
 > do**, with a `cargo` command or `file:line`. Terse. If a finding generalizes beyond testing, flag it
 > for a close-out learning/skill (or a `lorehub/docs/lore-change-requests/` note).
 
-_(none yet)_
+- **Upstream merge that adds a handler param breaks our tests silently until you build.** Merging
+  `upstream/main` (v0.8.5, commit eab1984) added a `forwarded_requests: Option<Arc<dyn
+  ForwardedRequests>>` parameter to both `LoreRevisionV1Service::new` and
+  `branch_get::handler`. Our CR-004 test helper (`service.rs::tests::service_with`) and three CR-006
+  tests (`branch_get.rs::tests::get_by_id_*_protected_*`) called the old arities and failed to
+  compile (`E0061 this function takes N arguments but N-1 were supplied`) — `cargo test` never got far
+  enough to run anything. `git diff` on the merge commit's stat won't show this; you have to actually
+  `cargo build -p <crate> --tests` after a merge that touches a signature our tests call directly.
+  Fix (stale-test, ours to fix): pass `None` / `&None` for the new forwarding param in tests that don't
+  exercise the forwarding path — `lore-server/src/grpc/revision/v1/service.rs:357`,
+  `lore-server/src/grpc/revision/v1/branch_get.rs:743,778,816`.
+- **After a merge touching our patched files, `cargo build -p <crate> --tests` before `cargo test`.**
+  A stale call-site is a compile error, not a test failure — `cargo test` output on a broken build can
+  look like "no tests ran" rather than pointing you at the real cause; build first to get the real
+  rustc diagnostic.
