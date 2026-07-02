@@ -354,6 +354,7 @@ mod tests {
             Arc::new(HookDispatcher::empty()),
             DEFAULT_HISTORY_STEP_SIZE,
             crate::grpc::server::RevisionListAcceleration::default(),
+            None,
             Duration::from_secs(60),
             enforce,
         )

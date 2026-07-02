@@ -2801,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "lore-postgres"
-version = "0.8.4-nightly"
+version = "0.8.5-nightly"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",
