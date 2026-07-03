@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod authnz;
 pub mod cache;
+pub mod drain;
 pub mod execution_state;
 pub mod grpc;
 pub mod hooks;

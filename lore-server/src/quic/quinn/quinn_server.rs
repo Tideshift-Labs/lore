@@ -26,6 +26,8 @@ use tracing::info_span;
 use tracing::trace;
 use tracing::warn;
 
+use crate::drain::HandshakeGuard;
+use crate::drain::QuinnConnectionRegistry;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::quic::StreamDataHandler;
@@ -153,6 +155,7 @@ impl QuinnServer {
 }
 
 fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<()> {
+    let connection_registry = settings.connection_registry.clone();
     let stream_handler_factory = Arc::new(settings.stream_handler_factory);
     let metrics_interval = settings.metrics_frequency;
 
@@ -192,6 +195,7 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
         let endpoint = endpoint.clone();
         let monitor = monitor.clone();
         let stream_handler_factory = stream_handler_factory.clone();
+        let connection_registry = connection_registry.clone();
 
         runtime().spawn(
             LORE_CONTEXT.scope(
@@ -199,10 +203,27 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
                 async move {
                     debug!("Spawned task {i} is waiting to accept connections");
                     while let Some(connection) = endpoint.accept().await {
+                        // Draining: refuse new connections while established
+                        // ones finish. The client's reconnect logic retries
+                        // against whatever the address currently routes to.
+                        if connection_registry.is_draining() {
+                            debug!(
+                                remote_address = %connection.remote_address(),
+                                "Refusing new connection: endpoint is draining"
+                            );
+                            connection.refuse();
+                            continue;
+                        }
+
                         debug!("Spawned task {i} received a connection: {connection:?}");
 
                         let monitor = monitor.clone();
                         let stream_handler_factory = stream_handler_factory.clone();
+                        let connection_registry = connection_registry.clone();
+                        // Taken synchronously before the handler task is
+                        // spawned so an admitted connection is never invisible
+                        // to a concurrent drain while it handshakes.
+                        let handshake_guard = connection_registry.begin_handshake();
 
                         runtime().spawn(
                             LORE_CONTEXT.scope(
@@ -213,6 +234,8 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
                                         monitor.clone(),
                                         metrics_interval,
                                         stream_handler_factory.clone(),
+                                        connection_registry,
+                                        handshake_guard,
                                     )
                                     .await
                                     {
@@ -256,8 +279,17 @@ async fn handle_conn(
     monitor: TaskMonitor,
     connection_metrics_interval: Duration,
     stream_handler_factory: Arc<Box<dyn StreamHandlerFactory>>,
+    connection_registry: Arc<QuinnConnectionRegistry>,
+    handshake_guard: HandshakeGuard<quinn::Connection>,
 ) -> anyhow::Result<()> {
     let connection = conn.await?;
+
+    // Track the established connection for the graceful-drain machinery; the
+    // guard deregisters when this handler returns. The handshake guard is
+    // released only after registration so a concurrent drain always sees the
+    // connection in at least one of the two counts.
+    let _drain_guard = connection_registry.register(connection.clone());
+    drop(handshake_guard);
 
     let protocol = get_protocol(&connection)?;
 

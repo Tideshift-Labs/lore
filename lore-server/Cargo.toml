@@ -87,6 +87,10 @@ indexmap = { workspace = true }
 mockall = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = { workspace = true }
+# Paused/advanceable clock for deterministic drain-loop tests (drain.rs) that
+# would otherwise need real multi-second sleeps to cross DRAIN_TICK/stall
+# windows.
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []

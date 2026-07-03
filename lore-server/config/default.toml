@@ -19,6 +19,14 @@
 [server]
 connection_close_timeout_seconds = 5
 runtime_shutdown_timeout_seconds = 25
+# Graceful drain (off by default): when true, a shutdown signal refuses new
+# QUIC connections but lets established connections finish before closing.
+graceful_drain = false
+# Ceiling on the graceful drain in seconds; 0 waits indefinitely.
+drain_timeout_seconds = 0
+# During a graceful drain, close a connection with no stream activity for this
+# many seconds (keep-alives don't count); 0 disables the stall guard.
+drain_stall_timeout_seconds = 300
 
 # public facing server settings
 [server.quic]
