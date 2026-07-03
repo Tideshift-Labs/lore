@@ -13,6 +13,8 @@ use rustls::server::NoClientAuth;
 use rustls::server::danger::ClientCertVerifier;
 use tracing::info;
 
+use crate::drain::ConnectionRegistry;
+use crate::drain::QuinnConnectionRegistry;
 use crate::quic::StreamHandlerFactory;
 
 pub struct QuinnConfig {
@@ -35,6 +37,8 @@ pub struct QuinnConfig {
     pub(crate) metrics_frequency: Duration,
     pub(crate) transport_bits_per_second: usize,
     pub(crate) transport_rtt: usize,
+    /// Tracks established connections for the graceful-drain machinery.
+    pub(crate) connection_registry: Arc<QuinnConnectionRegistry>,
 }
 
 impl fmt::Debug for QuinnConfig {
@@ -80,6 +84,7 @@ pub struct QuinnConfigBuilder {
     pub(crate) metrics_frequency: Option<Duration>,
     pub(crate) transport_bits_per_second: Option<usize>,
     pub(crate) transport_rtt: Option<usize>,
+    pub(crate) connection_registry: Option<Arc<QuinnConnectionRegistry>>,
 }
 
 const DEFAULT_IDLE_TIMEOUT_MILLIS: u64 = 30_000;
@@ -185,6 +190,11 @@ impl QuinnConfigBuilder {
         self
     }
 
+    pub fn connection_registry(mut self, registry: Arc<QuinnConnectionRegistry>) -> Self {
+        self.connection_registry = Some(registry);
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<QuinnConfig> {
         let stream_handler_factory = self
             .stream_handler_factory
@@ -227,6 +237,7 @@ impl QuinnConfigBuilder {
                 .transport_bits_per_second
                 .unwrap_or(DEFAULT_TRANSPORT_BITS_PER_SECOND),
             transport_rtt: self.transport_rtt.unwrap_or(DEFAULT_TRANSPORT_RTT),
+            connection_registry,
         })
     }
 }
