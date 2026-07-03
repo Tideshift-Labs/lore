@@ -1,0 +1,62 @@
+# docs/worklogs/
+
+Append-only chronological journal of work in **this repo** (`lore`, our fork on
+`tideshift/main`). One entry per discrete chunk, numbered monotonically. Entries are written
+*after* the work lands so a future session can catch up cold without reading the whole git log.
+
+Convention borrowed from the `lorehub` repo's `docs/worklogs/README.md` (same shape, same
+close-out `worklog-scribe` lane) — adopted here starting with the CR-009 chunk, per the workspace
+`CLAUDE.md` ("`lore/` adopts them for substantial fork-side work").
+
+## Naming
+
+`NNN-kebab-case-summary.md`
+
+- `NNN` is a zero-padded 3-digit number, monotonically increasing. **Never renumber existing
+  entries.** Pick the next number; if two chunks land close together, file them in commit order.
+- The slug should be specific enough to locate something from the directory listing.
+
+## When to add
+
+After any chunk that would be the body of a substantive PR description — a CR (change request)
+landing, a multi-file refactor, or a bugfix spanning more than one crate. Skip trivial one-line
+fixes; a commit message is enough for those.
+
+## What goes in an entry
+
+Aim for 30-60 lines. Required at the top:
+
+- **Date** and **Status** (Done / In progress / etc.)
+- **Summary** — one paragraph.
+- **What changed** — concrete file/crate list or grouped notes.
+- **Why now** — what triggered this.
+
+Optional, high-value: **What this unblocks**, **Reviewer findings** (applied vs deferred, from
+`lore-reviewer`), **Follow-ups created**, **Notes / surprises**.
+
+Classify the change **[SERVER]** vs **[CLIENT]** where relevant (see `lore/CLAUDE.md` and the
+`lore-fork-patches-inventory` learning) — SERVER-side is low-risk (we control the build);
+CLIENT-side is gated on upstream merge.
+
+Don't repeat content that lives in code or `docs/testing-guide.md`. Cross-reference instead.
+
+## Relationship to other docs
+
+| Doc | Scope | Cadence |
+|---|---|---|
+| `worklogs/` (this dir) | Chronological journal of work chunks | After each chunk |
+| `docs/testing-guide.md` | How our fork-delta tests are organized + deep gotchas | Every `lore-test-specialist` run |
+| `../lorehub/docs/lore-change-requests/` | The CR spec that drove a fork-side change (Lorehub-side tracking) | When a Lorehub need drives a Lore change |
+
+## Index
+
+No `bun`/JS tooling lives in this Rust workspace, so there is no `worklog-toc` auto-generation
+script here (unlike `lorehub`) — the table below is maintained by hand; keep it newest-first.
+
+<!-- toc:start -->
+
+| # | Date | Title |
+|---|---|---|
+| 001 | 2026-07-03 | [Opt-in graceful QUIC drain for loreserver (CR-009)](001-graceful-quic-drain-cr009.md) |
+
+<!-- toc:end -->
