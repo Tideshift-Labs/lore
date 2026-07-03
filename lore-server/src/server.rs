@@ -64,6 +64,12 @@ use tracing::warn;
 
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
+use crate::drain::ConnectionRegistry;
+use crate::drain::DrainState;
+use crate::drain::DrainTimeouts;
+use crate::drain::QuinnConnectionRegistry;
+use crate::drain::run_drain;
+use crate::drain::spawn_drain_metrics;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -204,11 +210,12 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
 /// 2. Records the time the signal was received.
 /// 3. Joins all remaining endpoint tasks.
 /// 4. If the elapsed time since the signal exceeds `connection_close_timeout`,
-///    force-closes any remaining endpoints.
+///    force-closes any remaining endpoints. `None` disables the deadline and
+///    waits indefinitely (graceful drain with `drain_timeout_seconds = 0`).
 async fn wait_for_shutdown(
     mut endpoints: JoinSet<Result<()>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
-    connection_close_timeout: Duration,
+    connection_close_timeout: Option<Duration>,
 ) -> Result<()> {
     let mut shutdown_rx = shutdown_tx.subscribe();
 
@@ -238,9 +245,14 @@ async fn wait_for_shutdown(
         }
     }
 
-    // Phase 2: drain remaining endpoints, timeout measured from now
-    let deadline = tokio::time::Instant::now() + connection_close_timeout;
-    info!("Draining remaining endpoints (timeout: {connection_close_timeout:?})");
+    // Phase 2: drain remaining endpoints, timeout measured from now. With no
+    // timeout configured (graceful drain, unbounded) the deadline arm never
+    // fires and we wait for every endpoint to finish on its own.
+    let deadline = connection_close_timeout.map(|t| tokio::time::Instant::now() + t);
+    match connection_close_timeout {
+        Some(timeout) => info!("Draining remaining endpoints (timeout: {timeout:?})"),
+        None => info!("Draining remaining endpoints (no timeout: waiting for graceful drain)"),
+    }
 
     loop {
         tokio::select! {
@@ -255,7 +267,12 @@ async fn wait_for_shutdown(
                     }
                 }
             }
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 warn!(
                     "Connection close timeout ({connection_close_timeout:?}) exceeded, \
                      force-closing remaining endpoints"
@@ -330,6 +347,7 @@ impl From<QuicSettings> for QuinnConfigBuilder {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn launch_quinn_server(
     name: &'static str,
     stream_handler_factory: Box<dyn StreamHandlerFactory>,
@@ -337,6 +355,8 @@ async fn launch_quinn_server(
     quic_settings: QuicSettings,
     generate_ephemeral_cert: bool,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    connection_registry: Arc<QuinnConnectionRegistry>,
+    drain_timeouts: Option<DrainTimeouts>,
 ) -> Result<()> {
     let span = info_span!("QUIC server", name);
 
@@ -371,15 +391,25 @@ async fn launch_quinn_server(
             .pkey_file(cert_settings.pkey_file)
             .client_cert_verifier(client_verifier)
             .stream_handler_factory(stream_handler_factory)
-            .metrics_frequency(metrics_frequency);
+            .metrics_frequency(metrics_frequency)
+            .connection_registry(connection_registry.clone());
 
         info!(address = %addr, "server starting");
         let server = QuinnServer::start(settings_builder.build()?)?;
 
-        // Wait for the shutdown signal, then close the endpoint gracefully.
-        // close() sends CONNECTION_CLOSE frames to all peers and causes
-        // accept() loops to return None.
+        // Wait for the shutdown signal. With graceful drain enabled, first
+        // refuse new connections and wait for established ones to finish;
+        // then close the endpoint. close() sends CONNECTION_CLOSE frames to
+        // all peers and causes accept() loops to return None.
         let _ = shutdown_rx.wait_for(|&v| v).await;
+        if let Some(timeouts) = drain_timeouts {
+            run_drain(
+                &connection_registry,
+                timeouts.drain_timeout,
+                timeouts.stall_timeout,
+            )
+            .await;
+        }
         info!("closing endpoint");
         server.close().await;
 
@@ -623,14 +653,24 @@ async fn launch_http_server(
     mutable_store: Arc<dyn MutableStore>,
     jwt_verifier: Option<JwtVerifier>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    drain_state: Arc<DrainState>,
+    graceful_drain: bool,
 ) -> Result<()> {
     LoreHttpServer::serve(
         settings,
         immutable_store,
         mutable_store,
         jwt_verifier,
+        Some(drain_state.clone()),
         async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
+            // Under graceful drain, keep the health/status surface up until
+            // the QUIC endpoints are empty so the load balancer keeps seeing
+            // the draining 503 and a deploy controller can poll
+            // /drain_status through the whole drain.
+            if graceful_drain {
+                drain_state.wait_idle().await;
+            }
         },
     )
     .await
@@ -1734,6 +1774,39 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     let connection_close_timeout =
         Duration::from_secs(settings.server.connection_close_timeout_seconds as u64);
 
+    // Graceful drain (CR semantics): opt-in via [server] graceful_drain. When
+    // enabled, the QUIC endpoints refuse new connections on shutdown but let
+    // established connections finish (bounded by drain_timeout_seconds, 0 =
+    // unbounded; stalled connections are culled by the stall guard). The
+    // endpoint-join force-abort deadline is lifted accordingly; disabled, the
+    // historic connection_close_timeout semantics apply unchanged.
+    let graceful_drain = settings.server.graceful_drain;
+    let drain_timeouts = graceful_drain.then(|| DrainTimeouts {
+        drain_timeout: (settings.server.drain_timeout_seconds > 0)
+            .then(|| Duration::from_secs(settings.server.drain_timeout_seconds as u64)),
+        stall_timeout: (settings.server.drain_stall_timeout_seconds > 0)
+            .then(|| Duration::from_secs(settings.server.drain_stall_timeout_seconds as u64)),
+    });
+    if let Some(timeouts) = drain_timeouts
+        && timeouts.drain_timeout.is_none()
+        && timeouts.stall_timeout.is_none()
+    {
+        warn!(
+            "graceful_drain is enabled with drain_timeout_seconds = 0 AND \
+             drain_stall_timeout_seconds = 0: shutdown has no backstop and will \
+             wait forever for a wedged or idle peer. Set a stall timeout unless \
+             an external controller enforces its own drain ceiling"
+        );
+    }
+    let endpoint_join_timeout = if graceful_drain {
+        drain_timeouts
+            .and_then(|t| t.drain_timeout)
+            .map(|d| d + connection_close_timeout)
+    } else {
+        Some(connection_close_timeout)
+    };
+    let drain_state = DrainState::new();
+
     let is_maintenance = if std::env::var("LORE_SERVER_MAINTENANCE").is_ok_and(|v| v == "1") {
         info!(
             "Server is running in maintenance mode - only environment and health endpoints will be served"
@@ -1781,6 +1854,21 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         let shutdown_tx = shutdown_tx.clone();
         listen_for_termination(shutdown_tx)
     });
+
+    if graceful_drain {
+        // Flip the aggregate draining flag the moment the signal fires so the
+        // health check goes 503 and the LB starts pulling the node while the
+        // per-endpoint drains run.
+        lore_spawn!({
+            let drain_state = drain_state.clone();
+            let mut shutdown_rx = _shutdown_rx.clone();
+            async move {
+                let _ = shutdown_rx.wait_for(|&v| v).await;
+                info!("Graceful drain: marking server as draining");
+                drain_state.begin_drain();
+            }
+        });
+    }
 
     if !is_maintenance {
         let (notification, notification_service) = configure_notification(
@@ -1890,12 +1978,16 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         && let Some(quic_settings) = settings.server.quic.as_ref()
         && quic_settings.enabled
     {
+        let public_registry = ConnectionRegistry::new("public");
+        drain_state.add_registry(public_registry.clone());
+
         lore_spawn!(endpoints, {
             let immutable_store = immutable_store.clone();
             let mutable_store = mutable_store.clone();
             let settings = settings.clone();
             let jwt_verifier = jwt_verifier.clone();
             let shutdown_rx = _shutdown_rx.clone();
+            let connection_registry = public_registry.clone();
 
             let quic_settings = settings
                 .server
@@ -1937,6 +2029,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 // none is configured so the server runs with zero config.
                 true,
                 shutdown_rx,
+                connection_registry,
+                drain_timeouts,
             )
         });
     }
@@ -1961,10 +2055,14 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                  clients"
             );
         }
+        let internal_registry = ConnectionRegistry::new("internal");
+        drain_state.add_registry(internal_registry.clone());
+
         lore_spawn!(endpoints, {
             let immutable_store = immutable_store.clone();
             let settings = settings.clone();
             let shutdown_rx = _shutdown_rx.clone();
+            let connection_registry = internal_registry.clone();
 
             let quic_settings = settings
                 .server
@@ -1995,6 +2093,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 // never fall back to an ephemeral one.
                 false,
                 shutdown_rx,
+                connection_registry,
+                drain_timeouts,
             )
         });
     }
@@ -2023,6 +2123,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let immutable_store = immutable_store.clone();
             let mutable_store = mutable_store.clone();
             let shutdown_rx = _shutdown_rx.clone();
+            let drain_state = drain_state.clone();
 
             lore_spawn!(
                 endpoints,
@@ -2032,6 +2133,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     mutable_store,
                     jwt_verifier,
                     shutdown_rx,
+                    drain_state,
+                    graceful_drain,
                 )
             );
         }
@@ -2070,8 +2173,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         }
     });
 
+    spawn_drain_metrics(drain_state.clone(), frequency);
+
     up_gauge.record(1, &up_attributes);
-    wait_for_shutdown(endpoints, shutdown_tx, connection_close_timeout).await?;
+    wait_for_shutdown(endpoints, shutdown_tx, endpoint_join_timeout).await?;
     up_gauge.record(0, &up_attributes);
 
     info!("Flushing stores");
@@ -2184,6 +2289,88 @@ mod tests {
             assert!(message.contains(LABEL), "label must appear: {message}");
             assert!(message.contains("partially configured"), "got: {message}");
             assert!(message.contains("cert_chain"), "got: {message}");
+        }
+    }
+
+    mod wait_for_shutdown_tests {
+        use std::time::Duration;
+
+        use tokio::sync::watch;
+        use tokio::task::JoinSet;
+
+        use super::super::wait_for_shutdown;
+
+        /// CR-009 default-off regression: `Some(timeout)` — today's behavior
+        /// (`connection_close_timeout_seconds`, unaffected by graceful_drain)
+        /// — must still force-abort a stuck endpoint once the timeout elapses,
+        /// not before and not never.
+        #[tokio::test(start_paused = true)]
+        async fn bounded_timeout_force_aborts_a_stuck_endpoint() {
+            let (shutdown_tx, _rx) = watch::channel(false);
+            let mut endpoints: JoinSet<anyhow::Result<()>> = JoinSet::new();
+            endpoints.spawn(async {
+                std::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                Ok(())
+            });
+
+            shutdown_tx.send(true).expect("receiver still alive");
+
+            let start = tokio::time::Instant::now();
+            wait_for_shutdown(endpoints, shutdown_tx, Some(Duration::from_secs(2)))
+                .await
+                .expect("wait_for_shutdown should not error even when force-aborting");
+
+            assert!(
+                tokio::time::Instant::now() - start >= Duration::from_secs(2),
+                "must wait out the full connection_close_timeout before force-aborting"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn bounded_timeout_returns_early_once_endpoint_finishes_on_its_own() {
+            let (shutdown_tx, _rx) = watch::channel(false);
+            let mut endpoints: JoinSet<anyhow::Result<()>> = JoinSet::new();
+            endpoints.spawn(async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok(())
+            });
+
+            shutdown_tx.send(true).expect("receiver still alive");
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                wait_for_shutdown(endpoints, shutdown_tx, Some(Duration::from_secs(30))),
+            )
+            .await
+            .expect(
+                "wait_for_shutdown should return once the endpoint finishes, \
+                 well before the 30s ceiling",
+            )
+            .expect("wait_for_shutdown returned an error");
+        }
+
+        /// The new unbounded mode (`drain_timeout_seconds = 0` -> `None`):
+        /// must outlast a transfer longer than the old hard-coded 5s default
+        /// instead of force-aborting it.
+        #[tokio::test(start_paused = true)]
+        async fn unbounded_none_timeout_waits_for_a_slow_endpoint_instead_of_force_aborting() {
+            let (shutdown_tx, _rx) = watch::channel(false);
+            let mut endpoints: JoinSet<anyhow::Result<()>> = JoinSet::new();
+            endpoints.spawn(async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok(())
+            });
+
+            shutdown_tx.send(true).expect("receiver still alive");
+
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                wait_for_shutdown(endpoints, shutdown_tx, None),
+            )
+            .await
+            .expect("wait_for_shutdown should eventually return once the slow endpoint finishes")
+            .expect("wait_for_shutdown returned an error");
         }
     }
 }

@@ -346,6 +346,25 @@ pub struct ServerSettings {
         alias = "shutdown_delay_seconds"
     )]
     pub runtime_shutdown_timeout_seconds: u16,
+    /// When true, a shutdown signal drains the QUIC endpoints instead of
+    /// force-closing them: new connections are refused while established
+    /// connections run to completion. Default false preserves the historic
+    /// close-everything-after-`connection_close_timeout_seconds` behavior.
+    #[serde(default)]
+    pub graceful_drain: bool,
+    /// Ceiling on the graceful drain in seconds; 0 (the default) waits
+    /// indefinitely for active connections to finish. Only read when
+    /// `graceful_drain` is true.
+    #[serde(default)]
+    pub drain_timeout_seconds: u32,
+    /// During a graceful drain, close a connection that has shown no stream
+    /// activity for this many seconds (keep-alives do not count as activity);
+    /// 0 disables the stall guard. Only read when `graceful_drain` is true.
+    /// WARNING: setting this to 0 together with `drain_timeout_seconds = 0`
+    /// removes every backstop — a wedged or idle peer then blocks shutdown
+    /// forever.
+    #[serde(default = "default_drain_stall_timeout")]
+    pub drain_stall_timeout_seconds: u32,
     #[serde(default)]
     pub user_agent: UserAgentSettings,
 }
@@ -371,6 +390,10 @@ fn default_connection_close_timeout() -> u16 {
 
 fn default_runtime_shutdown_timeout() -> u16 {
     25
+}
+
+fn default_drain_stall_timeout() -> u32 {
+    300
 }
 
 ///
@@ -1463,6 +1486,103 @@ mod tests {
 
         // Should not have AWS plugin config (or if it does, it's optional)
         // This is intentional - default should work without any cloud services
+    }
+
+    #[test]
+    fn test_default_config_graceful_drain_is_off() {
+        // config/default.toml sets these explicitly (documenting the
+        // behavior for operators); confirm the compiled-in defaults still
+        // parse to the CR-009 default-off values.
+        let config_dir = find_config_dir();
+        let default_path = config_dir.join("default.toml");
+
+        let settings = load_merged_config(&default_path).expect("default.toml should load");
+
+        assert!(!settings.server.graceful_drain);
+        assert_eq!(settings.server.drain_timeout_seconds, 0);
+        assert_eq!(settings.server.drain_stall_timeout_seconds, 300);
+    }
+
+    #[test]
+    fn test_graceful_drain_settings_parse_when_present() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+            graceful_drain = true
+            drain_timeout_seconds = 120
+            drain_stall_timeout_seconds = 60
+
+            [server.http]
+            enabled = false
+            host = "127.0.0.1"
+            max_file_size = 1024
+            port = 8080
+            request_timeout_seconds = 30
+            request_body_timeout_seconds = 30
+            available_interval_seconds = 5
+            available_timeout_seconds = 30
+            store_health_check = false
+
+            [immutable_store]
+            mode = "local"
+
+            [immutable_store.local]
+            path = "/tmp/immutable"
+            flush_delay_seconds = 5
+
+            [mutable_store]
+            mode = "local"
+
+            [mutable_store.local]
+            path = "/tmp/mutable"
+            flush_delay_seconds = 5
+        "#;
+
+        let settings: Settings = toml::from_str(config).unwrap();
+        assert!(settings.server.graceful_drain);
+        assert_eq!(settings.server.drain_timeout_seconds, 120);
+        assert_eq!(settings.server.drain_stall_timeout_seconds, 60);
+    }
+
+    #[test]
+    fn test_graceful_drain_settings_default_when_absent() {
+        // Absent [server] drain keys must fall back to today's behavior:
+        // drain disabled, unbounded drain_timeout (moot while disabled), and
+        // a 300s stall guard.
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [server.http]
+            enabled = false
+            host = "127.0.0.1"
+            max_file_size = 1024
+            port = 8080
+            request_timeout_seconds = 30
+            request_body_timeout_seconds = 30
+            available_interval_seconds = 5
+            available_timeout_seconds = 30
+            store_health_check = false
+
+            [immutable_store]
+            mode = "local"
+
+            [immutable_store.local]
+            path = "/tmp/immutable"
+            flush_delay_seconds = 5
+
+            [mutable_store]
+            mode = "local"
+
+            [mutable_store.local]
+            path = "/tmp/mutable"
+            flush_delay_seconds = 5
+        "#;
+
+        let settings: Settings = toml::from_str(config).unwrap();
+        assert!(!settings.server.graceful_drain);
+        assert_eq!(settings.server.drain_timeout_seconds, 0);
+        assert_eq!(settings.server.drain_stall_timeout_seconds, 300);
     }
 
     #[test]

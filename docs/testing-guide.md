@@ -22,8 +22,13 @@ Large cargo workspace. Match each crate's existing test style — read a neighbo
 docs before adding one.
 
 - **Unit** — co-located `#[cfg(test)]` modules. `cargo test -p <crate>` for the crate in scope (don't
-  rebuild the whole workspace for a one-crate change).
+  rebuild the whole workspace for a one-crate change; workspace-wide test builds add tens of GB to
+  `target/` — see `lore/CLAUDE.md` "Local-test gotchas").
 - **Integration** — `lore-integration-tests` + per-crate `tests/`; heavier, may need fixtures/backends.
+- Filter to a module path with `cargo test -p <crate> --lib <module>::` — note cargo only accepts
+  **one** filter argument; run separate invocations per module rather than a space-joined list.
+- `cargo clippy -p <crate> --tests --no-deps -- -D warnings` scoped the same way is fast (~30s
+  incremental) once the lib itself has compiled once; use it as a pre-report gate on test code.
 
 ## Gates (match `lore-reviewer`'s bar)
 
@@ -66,6 +71,18 @@ the next run starts from the map instead of rediscovering it.
   `connect_client`. No dedicated unit test (the commit was verified end-to-end manually, per its
   message); existing `auth::ucs_auth::tests::*` cover URL/scheme parsing, not the TLS config itself.
   `cargo test -p lore-transport --lib` is cheap (~40s cold) and green; treat as smoke-only for this delta.
+- **CR-009 (graceful QUIC drain, [SERVER])** — entirely in `lore-server`: new `src/drain.rs`
+  (`DrainConnection` trait, `ConnectionRegistry<C>`, `DrainState`, `run_drain`),
+  `ServerSettings.{graceful_drain, drain_timeout_seconds, drain_stall_timeout_seconds}` (all
+  `#[serde(default)]`, default-off), `wait_for_shutdown` changed `Duration` → `Option<Duration>`
+  (`None` = unbounded), `ServerHealth.drain: Option<Arc<DrainState>>` gating a 503 in
+  `/health_check`, and the new unauthenticated `/drain_status` JSON route. Coverage:
+  `cargo test -p lore-server --lib drain::` (registry + pending-handshake mechanics, `run_drain`
+  timing/stall-guard incl. single-close-per-window), `--lib server::tests::wait_for_shutdown_tests`
+  (bounded force-abort unchanged, unbounded mode actually waits), `--lib settings::tests` (new keys
+  parse + default), `--lib health_check::` / `--lib drain_status::` (503-on-drain, JSON shape, route
+  placement). Real QUIC endpoint behavior (accept-loop refusal in `quic/quinn/quinn_server.rs`)
+  intentionally left to manual/e2e — no mock-friendly seam there.
 
 ---
 
@@ -90,3 +107,33 @@ the next run starts from the map instead of rediscovering it.
   A stale call-site is a compile error, not a test failure — `cargo test` output on a broken build can
   look like "no tests ran" rather than pointing you at the real cause; build first to get the real
   rustc diagnostic.
+- **Deterministic tokio-timer tests: `#[tokio::test(start_paused = true)]`.** `lore-server`'s `drain`
+  module runs on real `tokio::time::interval` ticks (1s drain loop, 250ms wait_idle poll) — too slow
+  to assert with real sleeps. Under a paused clock, tokio auto-advances virtual time to the next timer
+  once every task is blocked on one — no manual `advance()` needed; wrap awaited futures in
+  `tokio::time::timeout(...)`. Pattern throughout `drain::tests`. **Gotcha:** `start_paused` needs the
+  tokio `test-util` feature, which the workspace `tokio` dep does NOT enable — add it as a crate-local
+  `[dev-dependencies]` override (`tokio = { workspace = true, features = ["test-util"] }`,
+  `lore-server/Cargo.toml`). Symptom without it: `error[E0599]: no method named 'start_paused' found
+  for struct tokio::runtime::Builder` — a misleading error; it's the macro expansion failing on the
+  feature-gated method.
+- **White-box state via a same-file `#[cfg(test)] mod tests`.** A test module declared inside the
+  defining file is a child module and gets field-privacy access to its parent's private fields — use
+  it to simulate otherwise-unconstructible states (e.g. a `ConnectionRegistry<quinn::Connection>` with
+  N "active" connections, since a real `quinn::Connection` only comes from a live handshake:
+  `registry.count.store(n, Ordering::Relaxed)`). A *sibling* module (e.g. `http::drain_status::tests`)
+  cannot reach those fields and must use the public API.
+- **`DrainConnection` mock pattern (`drain::tests::MockConn`).** Wraps `Arc<AtomicU64>` frame count +
+  `Arc<AtomicU64>` close-call counter so a clone kept by the test observes the same state as the clone
+  the registry holds (registries store connections by value). `drain_close()` only counts the call; it
+  does NOT deregister — mirroring production, where the connection *handler* drops the
+  `ConnectionGuard`. Stall-guard tests therefore hold the guard and assert the counter, not
+  `active() == 0`. Note `DrainState` is concretely typed to `QuinnConnectionRegistry`, so mocks only
+  inject at the `ConnectionRegistry<C>`/`run_drain` layer; at the `DrainState` layer use the
+  private-field poke instead.
+- **`lore-server` HTTP handler tests — `axum_test::TestServer` pattern.** Single-route
+  `axum::Router::new().route(..., routing::get(handler).with_state(...))` for handler-only tests; go
+  through `crate::http::server::create_router(...)` (needs `crate::store::test_store_create()`) when
+  testing route **placement** (e.g. `/drain_status` in the unauthenticated merge, not the `/v1` nest).
+  Assert JSON bodies via `serde_json::Value` rather than adding `Deserialize` to a prod-`Serialize`-only
+  response struct.

@@ -24,12 +24,14 @@ use ring::hmac;
 use tokio::net::TcpListener;
 use tracing::info;
 
+use super::drain_status;
 use super::health_check;
 use super::presigned;
 use super::tracing::lore_http_tracing;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_axum_middleware::jwt_axum_verify_authorization;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
+use crate::drain::DrainState;
 use crate::http::repositories;
 
 #[derive(Clone, Debug)]
@@ -62,6 +64,10 @@ pub struct ServerHealth {
     pub available: AtomicBool,
     pub interval_timeout: Option<(Duration, Duration)>,
     pub store_health_check: bool,
+    /// Aggregate drain view; when present and draining, `/health_check`
+    /// reports 503 so load balancers pull the node, and `/drain_status`
+    /// reports the remaining active connections.
+    pub drain: Option<Arc<DrainState>>,
 }
 
 impl ServerHealth {
@@ -73,6 +79,7 @@ impl ServerHealth {
             available: AtomicBool::new(true),
             interval_timeout: None,
             store_health_check: false,
+            drain: None,
         }
     }
 }
@@ -125,10 +132,15 @@ pub fn create_router(
         .with_state(shared_state.clone());
 
     let server_health = Arc::new(health);
-    let unauthenticated_router = Router::new().route(
-        "/health_check",
-        routing::get(health_check::handler).with_state(server_health.clone()),
-    );
+    let unauthenticated_router = Router::new()
+        .route(
+            "/health_check",
+            routing::get(health_check::handler).with_state(server_health.clone()),
+        )
+        .route(
+            "/drain_status",
+            routing::get(drain_status::handler).with_state(server_health.clone()),
+        );
 
     crate::store::spawn_immutable_store_availability_monitor(server_health);
 
@@ -197,6 +209,7 @@ impl LoreHttpServer {
             available: AtomicBool::new(true),
             interval_timeout: None,
             store_health_check: false,
+            drain: None,
         });
 
         let app = Router::new()
@@ -221,6 +234,7 @@ impl LoreHttpServer {
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
+        drain: Option<Arc<DrainState>>,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let addr = SocketAddr::from_str(format!("{}:{}", settings.host, settings.port).as_str())
@@ -245,6 +259,7 @@ impl LoreHttpServer {
                 None
             },
             store_health_check: settings.store_health_check,
+            drain,
         };
 
         let presign_config = build_presign_config(&settings.presign)?;
