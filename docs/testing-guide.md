@@ -99,6 +99,26 @@ the next run starts from the map instead of rediscovering it.
   unreachable from a sibling test module. Asserting that directly would need a `#[cfg(test)]`-gated
   accessor on `NotificationSender` — an implementation change, so flag it rather than add it
   unilaterally from a test-only pass.
+- **CR-011 (repository-scoped authz on RepositoryMetadataGet/Set, [SERVER])** —
+  `lore-server/src/grpc/handlers/repository_metadata_{get,set}.rs` (v0) and
+  `lore-server/src/grpc/repository/v1/repository_metadata_{get,set}.rs` (v1). `RepositoryService`
+  rides the authn-only `JWTAuthnInterceptor` (UCS-13506), so the repository id in the request body
+  was never authorized upstream; all four handlers now re-check it via
+  `check_repository_query_authorization` (the same ReBAC callback the sibling read RPCs use,
+  `lore-server/src/grpc/handlers/repository_query.rs`) before any store read/CAS, gated on
+  `auth_url: Option<String>` (auth-OFF is a no-op). 12 tests, 3 per handler (deny + does-not-CAS
+  proof, accept-own-repo, auth-off) in each handler's own `#[cfg(test)] mod tests` (v1 set nests its
+  new `mod authorization` alongside the pre-existing `mod validate_read_only_fields`, untouched).
+  The own-repo accept case is the headline: it's the proof that a legitimate stock-`lore`-CLI client
+  operating on its own repository is unaffected. Deny cases additionally seed a well-formed,
+  would-succeed CAS payload and re-read `repository::metadata_hash` after the denial to prove the
+  CAS never ran, not just that the handler returned an error. `check_repository_query_authorization`'s
+  `Unauthenticated`-remap branch is untested (the stub server only ever returns `Ok` or
+  `PermissionDenied`) — deferred, not a one-liner to add. Shared fixtures:
+  `authz_test_support` in `repository_query.rs` (stub auth server + store/seed helpers — see the
+  two "Deep findings" entries below for the reusable technique).
+  `cargo test -p lore-server --lib -- repository_metadata` (23 tests: 12 new + 10 pre-existing
+  `validate_read_only_fields` + 1 unrelated substring match).
 
 ---
 
@@ -179,3 +199,46 @@ the next run starts from the map instead of rediscovering it.
   regression that silently drops the event would otherwise hang the test instead of failing fast.
   Default pattern for any stream-delivery assertion, not a one-off — see
   `notification_service.rs::tests::subscribe_accepts_exact_repository_match_and_streams_events`.
+- **`auth_api.proto`/`rebac_api.proto` compile with `.build_server(false)`** (`lore-proto/build.rs:178`)
+  — `lore-server` is only ever a *client* of `UrcAuthApi` (`authnz/auth.rs`'s
+  `LoreAuthClientHelper`), so there's no generated `UrcAuthApiServer` to bind a fake to for a test
+  that needs the real ReBAC callback exercised end-to-end over the wire. Don't flip the build flag
+  (out of test-code scope, and no CR asks for it); hand-roll a minimal stand-in mirroring the shape
+  `tonic-prost-build` emits for a service that DOES have server codegen (compare
+  `lore.repository.v1.rs`'s `repository_service_server`): `#[derive(Clone)] struct StubXService`
+  implementing `tonic::server::NamedService` (`NAME` = the proto package+service, e.g.
+  `"epic_urc.UrcAuthApi"`) and `tonic::codegen::Service<http::Request<B>>` (generic over `B: Body +
+  Send`), dispatching on `req.uri().path()` to a per-RPC `tonic::server::UnaryService<Req>` impl via
+  `tonic_prost::ProstCodec::default()` + `tonic::server::Grpc::new(codec).unary(...)`. `use
+  tonic::codegen::*;` pulls in `BoxFuture`/`Body`/`StdError`/`Context`(task)/`Poll`/`http` the same
+  way generated code does — don't hand-import those individually, it's fragile against tonic version
+  bumps. Reusable implementation: `lore-server/src/grpc/handlers/repository_query.rs`'s
+  `#[cfg(test)] pub(crate) mod authz_test_support::StubAuthService` (CR-011) — reuse it (it's
+  `pub(crate)`) before re-deriving this for any other `UrcAuthApi` consumer.
+- **Ephemeral-port test server: bind once, `serve_with_incoming`, no sleep.** Don't bind a
+  `std::net::TcpListener`, read the port, drop it, and hand `Server::serve(addr)` a bare address to
+  rebind — that drop-then-rebind window is a real TOCTOU race (another process can grab the port
+  before the rebind), and it invites masking the remaining startup race with a fixed `sleep`, which
+  is still flaky under load. Instead: `tokio::net::TcpListener::bind("127.0.0.1:0").await`, read
+  `local_addr()` off it, then `.serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+  listener))` on that same listener in a detached `tokio::spawn` — the socket is already in the OS
+  listen backlog as soon as `bind` returns, before the spawned task's future is even first polled,
+  so no readiness sleep is needed either. (CR-011's `authz_test_support::start_stub_auth_server`;
+  caught in review after an initial bind-drop-rebind-plus-`sleep(100ms)` pass.)
+- **Real store fixture for a handler test, without a full repo checkout.** Handlers taking raw
+  `Arc<dyn lore_storage::ImmutableStore>` / `Arc<dyn lore_storage::MutableStore>` (most
+  `lore-server/src/grpc/handlers/*.rs` signatures) don't need a full `RepositoryContext` to call —
+  only to *seed* state before/after. `LocalImmutableStore::new(None,
+  ImmutableStoreSettings::default())` → `Arc<LocalImmutableStore>` (coerces to `Arc<dyn
+  ImmutableStore>`); `Arc::new(LocalMutableStore::new(None::<&Path>,
+  MutableStoreSettings::default(), immutable.clone()))`; then
+  `RepositoryContext::new_server_context(immutable, mutable, repository_id)` only where you need to
+  seed/read directly (mirrors `handlers/path_diff.rs::tests::new_test_context`). To seed a
+  repository's metadata pointer for `metadata_hash`/CAS tests: `repository::metadata_store(repo,
+  RepositoryMetadata { .. })` (serializes into CAS, returns a `Hash`) then
+  `repository::metadata_store_hash(repo, hash)` (publishes it as the mutable-store pointer).
+  `RepositoryMetadata`'s `READ_ONLY_KEYS` (name/default-branch/default-branch-name/creator/created)
+  must stay byte-identical between an `expected` and a proposed CAS blob or
+  `RepositoryMetadataSet::validate_read_only_fields` rejects it before the CAS is even attempted —
+  vary only `description` when building a "valid update" fixture for a CAS-success test. (CR-011's
+  `authz_test_support::{new_test_stores, seed_repository_metadata}`.)
