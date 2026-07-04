@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 002 | 2026-07-03 | [Bind notification Subscribe to the JWT-authorized repository (CR-010)](002-notification-subscribe-repo-authz-cr010.md) |
 | 001 | 2026-07-03 | [Opt-in graceful QUIC drain for loreserver (CR-009)](001-graceful-quic-drain-cr009.md) |
 
 <!-- toc:end -->
