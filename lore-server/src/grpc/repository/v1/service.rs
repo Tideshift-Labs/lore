@@ -164,6 +164,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_metadata_get::handler(
                 request,
+                self.auth_url(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -179,6 +180,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_metadata_set::handler(
                 request,
+                self.auth_url(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
