@@ -41,6 +41,14 @@ pub async fn handler(
         return Err(Status::invalid_argument("Missing repository id"));
     }
 
+    // Scope the read to the caller's repository. RepositoryService rides the
+    // authn-only interceptor (UCS-13506), so the body repository id is not
+    // authorized upstream; re-check it via the same ReBAC callback the sibling
+    // read RPCs use. Auth-OFF (no auth_url) leaves behavior unchanged.
+    if let Some(auth_url) = auth_url {
+        check_repository_query_authorization(auth_url, authorization, repository_id.into()).await?;
+    }
+
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
