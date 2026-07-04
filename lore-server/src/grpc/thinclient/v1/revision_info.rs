@@ -175,6 +175,20 @@ async fn load_revision(
         })
         .ok();
 
+    // Total content size is an enrichment (the recursive byte sum carried
+    // on the tree root). A failure to read the tree header must not fail
+    // the whole RevisionInfo call — fall back to unset (unknown).
+    let total_size_bytes = match state.tree(repository.clone()).await {
+        Ok(tree) => Some(tree.size),
+        Err(err) => {
+            warn!(
+                {REPOSITORY_ID} = %repository.id, {REVISION} = %signature, ?err,
+                "Failed to read tree size for revision info; omitting total_size_bytes",
+            );
+            None
+        }
+    };
+
     Ok(thin_client_v1::Revision {
         signature: signature.into(),
         identifier: Some(identifier),
@@ -186,6 +200,7 @@ async fn load_revision(
         parent_self,
         parent_other,
         number: state.revision_number(),
+        total_size_bytes,
     })
 }
 
@@ -776,6 +791,157 @@ mod test {
                 branch_id: branch_id.into(),
                 number: 0,
             };
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn empty_revision_has_zero_total_size_bytes() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            // `create_branch_with_history` never adds any tree nodes, so
+            // the tree is genuinely empty (hash_tree stays zero).
+            let (_branch, signatures) = create_branch_with_history(&repository_context, 1).await;
+
+            let response = handler(
+                make_request(repository, Query::Signature(signatures[0].into())),
+                immutable_store,
+                mutable_store,
+            )
+            .await
+            .expect("Request failed")
+            .into_inner();
+
+            let revision = response.revision.expect("revision");
+            assert_eq!(
+                revision.total_size_bytes,
+                Some(0),
+                "an empty revision's tree carries no bytes",
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn total_size_bytes_is_present_for_revision_with_files() {
+        // NOTE: this handler-level push helper builds `State` via raw
+        // `node_add` calls and never runs the real staging/commit
+        // pipeline (`commit.rs`'s `rehash_directory_recurse` +
+        // `update_tree_root_hash`), which is what rolls individual
+        // `node.size` values up into the tree root's aggregate size that
+        // `state.tree(..).await?.size` reads. Reproducing that
+        // aggregation here would mean driving a full client-side
+        // stage+commit (working directory, real fragment writes) inside
+        // a lore-server handler unit test — disproportionate for this
+        // test tier and orthogonal to CR-008 (which only wires
+        // `total_size_bytes` to the existing `tree.size` field; it does
+        // not touch how that field is computed). So this asserts the
+        // plumbing invariant CR-008 owns: the field is populated
+        // (`Some`, i.e. the tree read succeeded) for a non-empty
+        // revision, matching the tree's actual (here: 0, per the note
+        // above) size.
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let write_token = get_write_token();
+            let branch_id = BranchId::from(uuid::Uuid::now_v7());
+            branch::create(
+                repository_context.clone(),
+                &write_token,
+                branch_id,
+                "test-branch",
+                branch::default_category(),
+                "creator",
+                1,
+                vec![],
+                false,
+                false,
+            )
+            .await
+            .expect("create branch");
+
+            let mut metadata = Metadata::new();
+            metadata.set_branch(branch_id).expect("set branch");
+            let metadata_hash = metadata
+                .serialize(repository_context.clone())
+                .await
+                .expect("serialize metadata");
+
+            let state = State::new();
+            state.set_parent_self(Hash::default());
+            state.set_revision_number(1);
+            state.set_metadata_hash(metadata_hash);
+
+            let node = lore_revision::node::Node {
+                flags: lore_revision::node::NodeFlags::File.bits(),
+                name_hash: lore_storage::hash::hash_string("a.txt"),
+                size: 123,
+                ..Default::default()
+            };
+            state
+                .node_add(
+                    repository_context.clone(),
+                    lore_revision::node::ROOT_NODE,
+                    node,
+                    "a.txt",
+                )
+                .await
+                .expect("node_add");
+
+            let serialized = state
+                .serialize(repository_context.clone(), &write_token)
+                .await
+                .expect("serialize state");
+            let signature = branch_push::push(
+                repository_context.clone(),
+                branch_id,
+                serialized,
+                true,
+                true,
+                false,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+            )
+            .await
+            .expect("push")
+            .revision;
+
+            let response = handler(
+                make_request(repository, Query::Signature(signature.into())),
+                immutable_store,
+                mutable_store,
+            )
+            .await
+            .expect("Request failed")
+            .into_inner();
+
+            let revision = response.revision.expect("revision");
+            // Verified (not assumed): with this raw `node_add`-based
+            // fixture, the tree root's aggregate size is 0 (see the NOTE
+            // above) — so `Some(0)`, not the file's 123-byte size. The
+            // meaningful assertion for CR-008 is that the field is
+            // present at all (`Some`, meaning the tree read succeeded)
+            // for a non-empty revision.
+            assert_eq!(
+                revision.total_size_bytes,
+                Some(0),
+                "total_size_bytes must be populated (tree read succeeds) for a normal revision",
+            );
         }))
         .await;
     }

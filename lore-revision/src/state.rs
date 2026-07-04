@@ -3315,6 +3315,11 @@ pub struct TreePath {
     pub path: RelativePath,
     pub address: Option<Address>,
     pub flags: NodeFlags,
+    /// Raw `node.size` for this entry. Meaningful for files (its content
+    /// length). For directories `node.size` is the recursive subtree
+    /// aggregate and for links it is unset/0 — callers should read this
+    /// only for FILE entries and ignore it otherwise.
+    pub size: u64,
 }
 
 pub type CanReadRepository = Arc<dyn Fn(RepositoryId) -> bool + Send + Sync>;
@@ -3478,6 +3483,7 @@ async fn gather_tree_paths_node(
         path: node_path.clone(),
         address,
         flags,
+        size: node.size,
     });
 
     let depth_remaining = max_depth == 0 || depth + 1 < max_depth;
