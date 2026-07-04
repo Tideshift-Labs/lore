@@ -83,6 +83,22 @@ the next run starts from the map instead of rediscovering it.
   parse + default), `--lib health_check::` / `--lib drain_status::` (503-on-drain, JSON shape, route
   placement). Real QUIC endpoint behavior (accept-loop refusal in `quic/quinn/quinn_server.rs`)
   intentionally left to manual/e2e — no mock-friendly seam there.
+- **CR-010 (`NotificationService.Subscribe` repo-authz cross-check, [SERVER])** —
+  `lore-server/src/grpc/notification_service.rs`. The JWT interceptor authorizes the repository in
+  request **metadata**; `subscribe` streams the repository in the request **body** — previously no
+  cross-check. Fix: when an `AuthorizationToken` extension is present, `verify_authorization(token,
+  body_repository)` before `sender.register(...)`; no token (auth-OFF) is unaffected. Tests:
+  `grpc::notification_service::tests` — `subscribe_denies_body_repository_not_covered_by_token`,
+  `subscribe_denies_token_with_no_granted_resources`,
+  `subscribe_accepts_exact_repository_match_and_streams_events`,
+  `subscribe_accepts_wildcard_token_for_any_repository`, `subscribe_unaffected_when_auth_is_off`,
+  plus 2 zero-repository regression cases (with/without a token) —
+  `cargo test -p lore-server --lib -- grpc::notification_service`. The deny path is verified via the
+  returned `Status` only, not by also asserting no stream got registered for the denied repository:
+  `crate::notification::local::NotificationSender`'s internal `DashMap` is private to that module and
+  unreachable from a sibling test module. Asserting that directly would need a `#[cfg(test)]`-gated
+  accessor on `NotificationSender` — an implementation change, so flag it rather than add it
+  unilaterally from a test-only pass.
 
 ---
 
@@ -137,3 +153,29 @@ the next run starts from the map instead of rediscovering it.
   testing route **placement** (e.g. `/drain_status` in the unauthenticated merge, not the `/v1` nest).
   Assert JSON bodies via `serde_json::Value` rather than adding `Deserialize` to a prod-`Serialize`-only
   response struct.
+- **Constructing gRPC-service unit tests without a live server.** `tonic::Request::new(SomeRequest {
+  .. })`, then either `.metadata_mut().insert_bin(REPOSITORY_ID_KEY,
+  tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()))` (what the JWT interceptor
+  would have derived from request metadata) or `.extensions_mut().insert(AuthorizationToken { .. })`
+  (what handlers reading the token straight out of extensions expect, e.g.
+  `notification_service.rs::subscribe`) — then call the trait method directly on a
+  directly-constructed service (`NotificationService::new(Arc::new(sender))`,
+  `LoreLockService::new(...)`); `#[tokio::test]` is enough, no tonic transport needed.
+  `RepositoryId = lore_base::types::Partition`, `BranchId = lore_base::types::Context`; both have
+  `Distribution<_> for StandardUniform` (`rand::random::<RepositoryId>()` works) and `From`/`Into` to
+  `bytes::Bytes` (`lore-base/src/types/mod.rs`), so building proto message bytes is just
+  `Bytes::from(repository)`. `AuthorizationToken` derives `Default` — build with `AuthorizationToken {
+  resources: Some(vec![ResourcePermission { resource_id: format!("urc-{repository}"), permission:
+  vec![] }]), ..Default::default() }` (wildcard = `"urc-*"`), matching `forwarded_requests.rs`'s
+  existing test style.
+- **`Result::expect_err` won't compile on a streaming RPC response.** `Response<Pin<Box<dyn
+  Stream<...> + Send>>>` (e.g. `SubscribeStream`) isn't `Debug`, and `expect_err` requires the `Ok`
+  side to impl it — `error[E0277]` pointing at `expect_err`. Use `.err().expect("msg")` instead; only
+  the `Err`/`Status` side needs `Debug`.
+- **Wrap stream-delivery assertions in `tokio::time::timeout`.** After a successful `subscribe`,
+  calling a `NotificationSender` trait method (`branch_created`, ...) and then `.next().await`ing the
+  returned stream to assert an event arrives: wrap that await, e.g.
+  `tokio::time::timeout(Duration::from_secs(5), stream.next()).await.expect("timed out ...")`. A
+  regression that silently drops the event would otherwise hang the test instead of failing fast.
+  Default pattern for any stream-delivery assertion, not a one-off — see
+  `notification_service.rs::tests::subscribe_accepts_exact_repository_match_and_streams_events`.
