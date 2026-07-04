@@ -111,6 +111,12 @@ pub struct TreeNode {
     /// Content address for FILE / LINK entries; unused for DIRECTORY.
     #[prost(message, optional, tag = "3")]
     pub address: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Content length in bytes of a FILE entry. Set only for FILE nodes;
+    /// unset (treated as unknown) for DIRECTORY and LINK entries. A present
+    /// value of 0 is a genuinely empty file, distinct from "unknown". Older
+    /// servers never set this, so consumers must treat unset as unknown.
+    #[prost(uint64, optional, tag = "4")]
+    pub size_bytes: ::core::option::Option<u64>,
 }
 impl ::prost::Name for TreeNode {
     const NAME: &'static str = "TreeNode";
@@ -161,6 +167,12 @@ pub struct Revision {
     /// Per-branch revision number.
     #[prost(uint64, tag = "10")]
     pub number: u64,
+    /// Total content length in bytes of every FILE in this revision's tree
+    /// (the recursive sum carried on the root node). Lets callers show a
+    /// repository "size" stat without walking the tree. Unset on older
+    /// servers that do not compute it; treat unset as unknown.
+    #[prost(uint64, optional, tag = "11")]
+    pub total_size_bytes: ::core::option::Option<u64>,
 }
 /// Nested message and enum types in `Revision`.
 pub mod revision {
