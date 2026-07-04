@@ -176,6 +176,12 @@ pub struct Revision {
     /// Per-branch revision number.
     #[prost(uint64, tag = "10")]
     pub number: u64,
+    /// Total content length in bytes of every FILE in this revision's tree
+    /// (the recursive sum carried on the root node). Lets callers show a
+    /// repository "size" stat without walking the tree. Unset on older
+    /// servers that do not compute it; treat unset as unknown.
+    #[prost(uint64, optional, tag = "11")]
+    pub total_size_bytes: ::core::option::Option<u64>,
 }
 /// Nested message and enum types in `Revision`.
 pub mod revision {

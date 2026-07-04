@@ -162,6 +162,11 @@ message Revision {
   optional Parent parent_other = 9;
   // Per-branch revision number.
   uint64 number = 10;
+  // Total content length in bytes of every FILE in this revision's tree
+  // (the recursive sum carried on the root node). Lets callers show a
+  // repository "size" stat without walking the tree. Unset on older
+  // servers that do not compute it; treat unset as unknown.
+  optional uint64 total_size_bytes = 11;
 
   // A parent reference grouping the parent revision's signature and
   // resolved identifier.

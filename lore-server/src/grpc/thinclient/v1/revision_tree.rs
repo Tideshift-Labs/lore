@@ -154,6 +154,12 @@ async fn stream_tree(
 
     let mut emitted: u64 = 0;
     for tree_path in result.paths {
+        // Size is only meaningful for files; leave directories and links
+        // unset so consumers can tell "unknown" from a real 0-byte file.
+        let size_bytes = tree_path
+            .flags
+            .contains(lore_revision::node::NodeFlags::File)
+            .then_some(tree_path.size);
         let node = thin_client_v1::TreeNode {
             path: tree_path.path.to_string(),
             node_type: node_flags_to_node_type(tree_path.flags) as i32,
@@ -488,6 +494,80 @@ mod test {
         response: Response<RevisionTreeStream>,
     ) -> Vec<Result<RevisionTreeResponse, Status>> {
         response.into_inner().collect().await
+    }
+
+    /// Pushes a fresh branch with one revision whose root contains one
+    /// File node per `(name, size)` pair, with `node.size` set directly
+    /// to the given value. This bypasses the real staging/commit
+    /// pipeline (which would write actual fragment bytes and roll
+    /// `node.size` up from `fragment.size_content` — see
+    /// `commit.rs::commit_nodes` / `stage.rs`), but exercises exactly
+    /// the plumbing CR-008 adds: `TreePath.size` <- `node.size` <-
+    /// `TreeNode.size_bytes`.
+    async fn push_branch_with_sized_files(
+        repository: &Arc<RepositoryContext>,
+        files: &[(&str, u64)],
+    ) -> (BranchId, Hash) {
+        let write_token = get_write_token();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        branch::create(
+            repository.clone(),
+            &write_token,
+            branch_id,
+            "test-branch",
+            branch::default_category(),
+            "creator",
+            1,
+            vec![],
+            false,
+            false,
+        )
+        .await
+        .expect("create branch");
+
+        let mut metadata = Metadata::new();
+        metadata.set_branch(branch_id).expect("set branch");
+        let metadata_hash = metadata
+            .serialize(repository.clone())
+            .await
+            .expect("serialize metadata");
+
+        let state = state::State::new();
+        state.set_parent_self(Hash::default());
+        state.set_revision_number(1);
+        state.set_metadata_hash(metadata_hash);
+
+        for (name, size) in files {
+            let node = Node {
+                flags: NodeFlags::File.bits(),
+                name_hash: hash_string(name),
+                size: *size,
+                ..Default::default()
+            };
+            state
+                .node_add(repository.clone(), ROOT_NODE, node, name)
+                .await
+                .expect("node_add");
+        }
+
+        let serialized = state
+            .serialize(repository.clone(), &write_token)
+            .await
+            .expect("serialize state");
+        let signature = branch_push::push(
+            repository.clone(),
+            branch_id,
+            serialized,
+            true,
+            true,
+            false,
+            DEFAULT_HISTORY_STEP_SIZE,
+            crate::grpc::server::RevisionListAcceleration::default(),
+        )
+        .await
+        .expect("push")
+        .revision;
+        (branch_id, signature)
     }
 
     #[tokio::test]
@@ -1543,6 +1623,164 @@ mod test {
             ));
             let err = items[1].as_ref().expect_err("expected error item");
             assert_eq!(err.code(), tonic::Code::NotFound);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn file_size_bytes_reflects_node_content_size() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (_branch, signature) = push_branch_with_sized_files(
+                &repository_context,
+                &[("a.txt", 123), ("empty.txt", 0)],
+            )
+            .await;
+
+            let response = handler(
+                make_request(repository, Query::Signature(signature.into()), None, None),
+                immutable_store,
+                mutable_store,
+            )
+            .await
+            .expect("handler ok");
+
+            let nodes: Vec<thin_client_v1::TreeNode> = collect(response)
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item"))
+                .filter_map(|item| match item.payload {
+                    Some(Payload::Node(n)) => Some(n),
+                    _ => None,
+                })
+                .collect();
+
+            let a = nodes.iter().find(|n| n.path == "a.txt").expect("a.txt");
+            assert_eq!(
+                a.size_bytes,
+                Some(123),
+                "FILE size_bytes should reflect the node's content size",
+            );
+
+            // A genuinely empty file must be `Some(0)`, distinct from
+            // "unknown" (`None`).
+            let empty = nodes
+                .iter()
+                .find(|n| n.path == "empty.txt")
+                .expect("empty.txt");
+            assert_eq!(
+                empty.size_bytes,
+                Some(0),
+                "a 0-byte FILE must report Some(0), not None (unknown)",
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn directory_size_bytes_is_unset() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (_branch, signature) = push_branch_with_subdir(&repository_context).await;
+
+            let response = handler(
+                make_request(repository, Query::Signature(signature.into()), None, None),
+                immutable_store,
+                mutable_store,
+            )
+            .await
+            .expect("handler ok");
+
+            let nodes: Vec<thin_client_v1::TreeNode> = collect(response)
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item"))
+                .filter_map(|item| match item.payload {
+                    Some(Payload::Node(n)) => Some(n),
+                    _ => None,
+                })
+                .collect();
+
+            let subdir = nodes.iter().find(|n| n.path == "subdir").expect("subdir");
+            assert_eq!(subdir.node_type, thin_client_v1::NodeType::Directory as i32);
+            assert_eq!(
+                subdir.size_bytes, None,
+                "DIRECTORY entries must leave size_bytes unset",
+            );
+
+            // Sanity: the files alongside it are still FILE entries (the
+            // push helper doesn't set a content size, so they default to
+            // Some(0) — still distinct from the directory's None).
+            let top = nodes.iter().find(|n| n.path == "top.txt").expect("top.txt");
+            assert_eq!(top.node_type, thin_client_v1::NodeType::File as i32);
+            assert_eq!(top.size_bytes, Some(0));
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn link_size_bytes_is_unset() {
+        let repository = random::<RepositoryId>();
+        let target_repo = random::<RepositoryId>();
+        let target_revision = Hash::from(random::<[u8; 32]>());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (_branch, signature) = push_branch_with_link(
+                &repository_context,
+                "linked",
+                target_repo,
+                target_revision,
+                ROOT_NODE,
+            )
+            .await;
+
+            let response = handler(
+                make_request(repository, Query::Signature(signature.into()), None, None),
+                immutable_store,
+                mutable_store,
+            )
+            .await
+            .expect("handler ok");
+
+            let nodes: Vec<thin_client_v1::TreeNode> = collect(response)
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item"))
+                .filter_map(|item| match item.payload {
+                    Some(Payload::Node(n)) => Some(n),
+                    _ => None,
+                })
+                .collect();
+
+            assert_eq!(nodes.len(), 1, "expected exactly the link entry");
+            assert_eq!(nodes[0].node_type, thin_client_v1::NodeType::Link as i32);
+            assert_eq!(
+                nodes[0].size_bytes, None,
+                "LINK entries must leave size_bytes unset",
+            );
         }))
         .await;
     }
