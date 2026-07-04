@@ -22,6 +22,7 @@ use tonic::Status;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
+use crate::grpc::handlers::repository_query::check_repository_query_authorization;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -39,16 +40,30 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RepositoryMetadataSet::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryMetadataSetRequest>,
+    auth_url: Option<String>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryMetadataSetResponse>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    let authorization = request
+        .metadata()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(|s| s.to_string());
     let req = request.into_inner();
 
     let repository_id: Context = req.id.into();
     if repository_id == Context::default() {
         return Err(Status::invalid_argument("Missing repository id"));
+    }
+
+    // Scope the CAS to the caller's repository — see RepositoryMetadataGet.
+    // RepositoryService rides the authn-only interceptor (UCS-13506), so the
+    // body repository id carries no upstream authorization; re-check it before
+    // any mutation. Auth-OFF (no auth_url) leaves behavior unchanged.
+    if let Some(auth_url) = auth_url {
+        check_repository_query_authorization(auth_url, authorization, repository_id.into()).await?;
     }
 
     let expected: Hash = req.expected.into();
@@ -329,6 +344,172 @@ mod tests {
                 .expect_err("type change on a read-only key must be rejected");
             assert_eq!(err.code(), tonic::Code::InvalidArgument);
             assert!(err.message().contains(repository::CREATED));
+        }
+    }
+
+    mod authorization {
+        use std::sync::Arc;
+
+        use lore_base::types::Hash;
+        use lore_proto::lore::repository::v1::RepositoryMetadataSetRequest;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::repository;
+        use lore_revision::repository::RepositoryContext;
+        use lore_revision::repository::RepositoryMetadata;
+        use tonic::Request;
+
+        use super::super::handler;
+        use crate::grpc::handlers::repository_query::authz_test_support::new_test_stores;
+        use crate::grpc::handlers::repository_query::authz_test_support::seed_repository_metadata;
+        use crate::grpc::handlers::repository_query::authz_test_support::start_stub_auth_server;
+
+        fn request_for(
+            repository_id: RepositoryId,
+            expected: Hash,
+            updated: Hash,
+        ) -> Request<RepositoryMetadataSetRequest> {
+            let mut request = Request::new(RepositoryMetadataSetRequest {
+                id: repository_id.into(),
+                expected: expected.into(),
+                updated: updated.into(),
+            });
+            request
+                .metadata_mut()
+                .insert("authorization", "Bearer test-token".parse().unwrap());
+            request
+        }
+
+        /// Serializes an updated metadata blob for `repository_id` that
+        /// keeps every read-only field identical to what
+        /// `seed_repository_metadata` wrote (only `description` changes),
+        /// so a CAS against it is well-formed and would land if the
+        /// handler ever reached the CAS.
+        async fn build_valid_update(
+            immutable: Arc<dyn lore_storage::ImmutableStore>,
+            mutable: Arc<dyn lore_storage::MutableStore>,
+            repository_id: RepositoryId,
+        ) -> Hash {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable,
+                mutable,
+                repository_id,
+            ));
+            repository::metadata_store(
+                repository,
+                RepositoryMetadata {
+                    name: "acme".to_string(),
+                    description: "updated description".to_string(),
+                    default_branch: Default::default(),
+                    default_branch_name: "main".to_string(),
+                    creator: "alice".to_string(),
+                    created: 0,
+                },
+            )
+            .await
+            .expect("serialize updated metadata")
+        }
+
+        #[tokio::test]
+        async fn denies_metadata_set_for_a_repository_the_caller_is_not_authorized_for_and_does_not_cas()
+         {
+            let caller_authorized_repo = RepositoryId::from([31u8; 16]);
+            let target_repo = RepositoryId::from([32u8; 16]);
+            let (immutable, mutable) = new_test_stores().await;
+            let original_hash = seed_repository_metadata(
+                immutable.clone(),
+                mutable.clone(),
+                target_repo,
+                "victim",
+                "original",
+            )
+            .await;
+            // Well-formed update that WOULD succeed if the CAS were reached.
+            let updated = build_valid_update(immutable.clone(), mutable.clone(), target_repo).await;
+            let auth_url = start_stub_auth_server(caller_authorized_repo).await;
+
+            let result = handler(
+                request_for(target_repo, original_hash, updated),
+                Some(auth_url),
+                immutable.clone(),
+                mutable.clone(),
+            )
+            .await;
+
+            let err = result.expect_err("caller is not authorized for the target repository");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+            // Prove the CAS never ran: the published pointer is still the
+            // original, despite the update above being one that would have
+            // landed had the handler reached the store.
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable,
+                mutable,
+                target_repo,
+            ));
+            let current = repository::metadata_hash(repository)
+                .await
+                .expect("metadata must still be readable");
+            assert_eq!(
+                current, original_hash,
+                "a denied request must not perform the CAS"
+            );
+        }
+
+        #[tokio::test]
+        async fn accepts_metadata_set_for_the_callers_own_repository() {
+            let repository_id = RepositoryId::from([33u8; 16]);
+            let (immutable, mutable) = new_test_stores().await;
+            let expected = seed_repository_metadata(
+                immutable.clone(),
+                mutable.clone(),
+                repository_id,
+                "acme",
+                "original",
+            )
+            .await;
+            let updated =
+                build_valid_update(immutable.clone(), mutable.clone(), repository_id).await;
+            let auth_url = start_stub_auth_server(repository_id).await;
+
+            let response = handler(
+                request_for(repository_id, expected, updated),
+                Some(auth_url),
+                immutable,
+                mutable,
+            )
+            .await
+            .expect("a legitimate client CAS-writing its own repository must be unaffected");
+
+            // v1 signals CAS hit/miss in-band: success means
+            // response.metadata == request.updated.
+            assert_eq!(Hash::from(response.into_inner().metadata), updated);
+        }
+
+        #[tokio::test]
+        async fn auth_off_allows_cas_without_an_authorization_check() {
+            let repository_id = RepositoryId::from([34u8; 16]);
+            let (immutable, mutable) = new_test_stores().await;
+            let expected = seed_repository_metadata(
+                immutable.clone(),
+                mutable.clone(),
+                repository_id,
+                "acme",
+                "original",
+            )
+            .await;
+            let updated =
+                build_valid_update(immutable.clone(), mutable.clone(), repository_id).await;
+
+            let response = handler(
+                request_for(repository_id, expected, updated),
+                None,
+                immutable,
+                mutable,
+            )
+            .await
+            .expect("auth-off must leave behavior unchanged");
+
+            assert_eq!(Hash::from(response.into_inner().metadata), updated);
         }
     }
 }
