@@ -119,6 +119,20 @@ the next run starts from the map instead of rediscovering it.
   two "Deep findings" entries below for the reusable technique).
   `cargo test -p lore-server --lib -- repository_metadata` (23 tests: 12 new + 10 pre-existing
   `validate_read_only_fields` + 1 unrelated substring match).
+- **CR-008 (per-entry byte size on tree reads, [SERVER])** — additive proto3 optional
+  `TreeNode.size_bytes` (FILE only, unset for DIRECTORY/LINK) + `Revision.total_size_bytes` on
+  `lore.thin_client.v1`; `lore-revision/src/state.rs` `TreePath.size` (<- `node.size`, populated in
+  `gather_tree_paths_node`); handlers `thinclient/v1/revision_tree.rs` (File-gates the field) and
+  `revision_info.rs` (`total_size_bytes` <- `state.tree(repo).await?.size`, non-fatal → `None` on
+  error). Tests in the existing `#[cfg(test)] mod test` blocks:
+  `revision_tree.rs` — `file_size_bytes_reflects_node_content_size` (asserts `Some(123)` + a 0-byte
+  file `Some(0)`, distinct from unknown `None`), `directory_size_bytes_is_unset`,
+  `link_size_bytes_is_unset` (new fixture `push_branch_with_sized_files`, sets `node.size` directly);
+  `revision_info.rs` — `total_size_bytes_is_present_for_revision_with_files`,
+  `empty_revision_has_zero_total_size_bytes`. `cargo test -p lore-server --lib -- thinclient::v1::revision_`.
+  The per-file field is verified with a real value; the aggregate asserts only `Some(0)`/`Some(_)` at
+  the unit tier — see the tree-root aggregation gotcha below. Regenerating the proto bindings needs
+  `protoc` on `PATH` (or `PROTOC=`); the crate otherwise builds off the committed `src/grpc/*.rs`.
 
 ---
 
@@ -242,3 +256,18 @@ the next run starts from the map instead of rediscovering it.
   `RepositoryMetadataSet::validate_read_only_fields` rejects it before the CAS is even attempted —
   vary only `description` when building a "valid update" fixture for a CAS-success test. (CR-011's
   `authz_test_support::{new_test_stores, seed_repository_metadata}`.)
+- **Tree-root size aggregate reads back `Some(0)` in handler unit tests even with sized files.**
+  Symptom: a field sourced from `state.tree(repo).await?.size` (the root's rolled-up content sum, e.g.
+  CR-008's `Revision.total_size_bytes`) is `Some(0)` though the test pushed File nodes with non-zero
+  `node.size`. Cause: the rollup is only done by the real commit pipeline — `commit.rs`'s
+  `rehash_directory_recurse` sums child `node.size` up each directory and `State::update_tree_root_hash`
+  (`lore-revision/src/state.rs:1009`) moves the root's total into `Tree.size`. The flat handler-test
+  fixture pattern (`State::new()` + raw `node_add(...)` + `serialize` + `branch_push::push`) never drives
+  staging/commit, so nothing rolls up past the node you set. What to do: for a *per-node* size
+  (`TreeNode.size_bytes` <- `TreePath.size` <- `node.size`) setting `size` on the `Node { .. }` literal
+  before `node_add` is legitimate (see `push_branch_with_sized_files`). For an *aggregate* field, don't
+  fake the rollup with low-level block writes or drive a full stage+commit in a handler unit test
+  (disproportionate — a different tier); assert the plumbing invariant (`Some(_)` for a non-empty rev,
+  `Some(0)` for an empty one where `hash_tree` stays zero and `state.tree()` returns `Tree::new_zeroed()`)
+  and defer the real aggregate to the integration/e2e tier. The exact `Some(0)` was confirmed
+  empirically (`eprintln!` + `-- --nocapture`), not assumed.
