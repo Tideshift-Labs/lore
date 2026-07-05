@@ -73,7 +73,7 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             lore_spawn!(async move {
-                let task_limiter = Arc::new(Semaphore::new(super::STREAM_PROCESS_LIMIT));
+                let task_limiter = Arc::new(Semaphore::new(super::put_task_concurrency()));
                 while let Some(req) = stream.next().await {
                     let permit = match Arc::clone(&task_limiter).acquire_owned().await {
                         Ok(p) => p,
