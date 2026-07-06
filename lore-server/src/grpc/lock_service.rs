@@ -37,6 +37,9 @@ use super::is_owner_or_admin;
 use super::timeout_grpc;
 use crate::grpc::can_admin_lock;
 use crate::grpc::require_permission;
+use crate::hooks::HookContext;
+use crate::hooks::HookDispatcher;
+use crate::hooks::HookPoint;
 use crate::util::setup_execution;
 
 const STATUS_MAX_RESOURCE_LEN: usize = 100;
@@ -91,6 +94,10 @@ fn handle_lock_error(error: LockError) -> Status {
 pub struct LoreLockService {
     lock_store: Arc<dyn LockStore>,
     notification: Arc<dyn NotificationSender>,
+    /// Fires the compile-in post-commit hooks (e.g. `lorehub_notify`) on
+    /// lock/unlock — the lock service is the one write service that historically
+    /// wasn't handed a dispatcher (CR-015).
+    hook_dispatcher: Arc<HookDispatcher>,
     rpc_timeout: Duration,
     enforce_write_permission: bool,
 
@@ -103,6 +110,7 @@ impl LoreLockService {
     pub fn new(
         lock_store: Arc<dyn LockStore>,
         notification: Arc<dyn NotificationSender>,
+        hook_dispatcher: Arc<HookDispatcher>,
         rpc_timeout: Duration,
         enforce_write_permission: bool,
     ) -> Self {
@@ -111,6 +119,7 @@ impl LoreLockService {
         Self {
             lock_store,
             notification,
+            hook_dispatcher,
             rpc_timeout,
             enforce_write_permission,
             locking_histogram: instrument_provider.length_histogram(
@@ -141,6 +150,7 @@ impl LoreLockService {
         repository: RepositoryId,
         resources: Vec<lore_proto::lock::Resource>,
         owner_id: &str,
+        correlation_id: &str,
     ) -> Result<Vec<lore_proto::lock::Lock>, Status> {
         if resources.is_empty() {
             return Err(Status::invalid_argument("At least one resource needed"));
@@ -164,10 +174,53 @@ impl LoreLockService {
             .resource_locked(repository, branch, owner_id, &locked_resources)
             .await;
 
+        // CR-015: also notify the Lorehub platform over the `lorehub_notify` HTTP hook
+        // (post-commit, fire-and-forget — never blocks or fails the lock). One event per
+        // RPC; the first request resource carries the batch's branch/hash for the
+        // event-id discriminator. `spawn_post` is a no-op when no hook is registered.
+        // Caveat (accepted for partition-only liveness): the discriminator is only the
+        // FIRST resource's hash, so two distinct lock RPCs in the same second on the same
+        // repo whose first resource matches would collide on `event_id` and the receiver
+        // would drop one — a momentarily-missing lock row the next lock/unlock corrects.
+        self.hook_dispatcher.spawn_post(
+            HookPoint::ResourceLock,
+            lock_hook_context(
+                correlation_id,
+                HookPoint::ResourceLock,
+                repository,
+                branch,
+                owner_id,
+                &lock_resources[0],
+            ),
+        );
+
         let locks = locks.into_iter().map(Into::into).collect();
 
         Ok(locks)
     }
+}
+
+/// Builds the [`HookContext`] for a lock/unlock post-hook. The path is not available
+/// server-side (the `hash` is a client-computed digest of it); the human `description`
+/// rides `metadata` for anyone who wants it, but Lorehub's liveness consumer (WP-065)
+/// reads only the partition off the resulting payload-free hint.
+fn lock_hook_context(
+    correlation_id: &str,
+    point: HookPoint,
+    repository: RepositoryId,
+    branch: lore_revision::lore::BranchId,
+    user_id: &str,
+    resource: &LockResource,
+) -> HookContext {
+    HookContext::builder()
+        .correlation_id(correlation_id)
+        .hook_point(point)
+        .repository(repository)
+        .user(user_id)
+        .branch(branch)
+        .metadata("lock_hash", resource.hash.to_string())
+        .metadata("lock_description", resource.description.clone())
+        .build()
 }
 
 impl LoreLockService {
@@ -193,11 +246,11 @@ impl LoreLockService {
 
         let resources = lock_request.resources;
 
-        let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
+        let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
 
         LORE_CONTEXT
             .scope(execution, async move {
-                self.lock_as_user(repository, resources, &user_id)
+                self.lock_as_user(repository, resources, &user_id, &correlation_id)
                     .await
                     .map(|locks| Response::new(LockResponse { locks }))
             })
@@ -309,7 +362,7 @@ impl LoreLockService {
         let resources: Vec<LockResource> =
             unlock_request.resources.iter().map(Into::into).collect();
 
-        let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
+        let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
 
         LORE_CONTEXT
             .scope(execution, async move {
@@ -325,6 +378,19 @@ impl LoreLockService {
                     self.notification
                         .resource_unlocked(repository, resources[0].branch, &user_id, &resources)
                         .await;
+
+                    // CR-015: notify the Lorehub platform (post-commit, fire-and-forget).
+                    self.hook_dispatcher.spawn_post(
+                        HookPoint::ResourceUnlock,
+                        lock_hook_context(
+                            &correlation_id,
+                            HookPoint::ResourceUnlock,
+                            repository,
+                            resources[0].branch,
+                            &user_id,
+                            &resources[0],
+                        ),
+                    );
                 }
 
                 Ok(Response::new(UnlockResponse {
@@ -359,7 +425,7 @@ impl LoreLockService {
         let resources = lock_request.resources;
         let owner = lock_request.owner;
 
-        let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
+        let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
 
         LORE_CONTEXT
             .scope(execution, async move {
@@ -368,7 +434,7 @@ impl LoreLockService {
                     return Err(Status::permission_denied("Permission denied"));
                 }
 
-                self.lock_as_user(repository, resources, &owner)
+                self.lock_as_user(repository, resources, &owner, &correlation_id)
                     .await
                     .map(|locks| Response::new(AdminLockResponse { locks }))
             })
@@ -444,6 +510,85 @@ mod test {
 
     use crate::grpc::lock_service::LoreLockService;
 
+    /// CR-015: `lock_hook_context` is the pure builder that both `lock_as_user` and
+    /// `handle_unlock` feed into `hook_dispatcher.spawn_post(...)`. Asserting the
+    /// spawned post-handler actually fired end-to-end would need to await a detached
+    /// `lore_spawn!` task with no join handle — flaky by construction — so we pin the
+    /// context-building contract here instead, which is deterministic and exercises
+    /// the exact CR-015 delta (metadata keys + which fields get threaded through).
+    mod hook_context {
+        use lore_base::types::Hash;
+        use lore_base::types::LockResource;
+        use lore_revision::lore::BranchId;
+        use lore_revision::lore::RepositoryId;
+        use rand::random;
+
+        use crate::grpc::lock_service::lock_hook_context;
+        use crate::hooks::HookPoint;
+
+        #[test]
+        fn builds_context_with_repository_user_branch_and_lock_metadata() {
+            let repository = random::<RepositoryId>();
+            let branch = random::<BranchId>();
+            let resource = LockResource {
+                branch,
+                hash: Hash::from([0x42u8; 32]),
+                description: "content/characters/hero.uasset".to_string(),
+            };
+
+            let ctx = lock_hook_context(
+                "corr-abc",
+                HookPoint::ResourceLock,
+                repository,
+                branch,
+                "user-1",
+                &resource,
+            );
+
+            assert_eq!(ctx.correlation_id(), "corr-abc");
+            assert_eq!(ctx.hook_point(), HookPoint::ResourceLock);
+            assert_eq!(ctx.repository(), repository);
+            assert_eq!(ctx.user(), Some("user-1"));
+            assert_eq!(ctx.branch(), Some(branch));
+            assert_eq!(
+                ctx.get_metadata("lock_hash"),
+                Some(resource.hash.to_string()).as_deref()
+            );
+            assert_eq!(
+                ctx.get_metadata("lock_description"),
+                Some("content/characters/hero.uasset")
+            );
+            // No revision on a lock/unlock event.
+            assert!(ctx.revision().is_none());
+        }
+
+        #[test]
+        fn builds_distinct_context_for_unlock_point() {
+            let repository = random::<RepositoryId>();
+            let branch = random::<BranchId>();
+            let resource = LockResource {
+                branch,
+                hash: Hash::from([0x99u8; 32]),
+                description: "content/props/box.uasset".to_string(),
+            };
+
+            let ctx = lock_hook_context(
+                "corr-xyz",
+                HookPoint::ResourceUnlock,
+                repository,
+                branch,
+                "user-2",
+                &resource,
+            );
+
+            assert_eq!(ctx.hook_point(), HookPoint::ResourceUnlock);
+            assert_eq!(
+                ctx.get_metadata("lock_hash"),
+                Some(resource.hash.to_string()).as_deref()
+            );
+        }
+    }
+
     mod store {
         use async_trait::async_trait;
         use lore_base::types::LockData;
@@ -501,6 +646,7 @@ mod test {
             let lock_service = LoreLockService::new(
                 Arc::new(lock_store),
                 notification_sender,
+                Arc::new(crate::hooks::HookDispatcher::empty()),
                 Duration::from_secs(60),
                 false,
             );
@@ -539,6 +685,7 @@ mod test {
             let lock_service = LoreLockService::new(
                 Arc::new(lock_store),
                 notification_sender,
+                Arc::new(crate::hooks::HookDispatcher::empty()),
                 Duration::from_secs(60),
                 false,
             );
@@ -583,6 +730,7 @@ mod test {
             let lock_service = LoreLockService::new(
                 Arc::new(lock_store),
                 notification_sender,
+                Arc::new(crate::hooks::HookDispatcher::empty()),
                 Duration::from_secs(60),
                 false,
             );
@@ -608,6 +756,7 @@ mod test {
             let lock_service = LoreLockService::new(
                 Arc::new(lock_store),
                 notification_sender,
+                Arc::new(crate::hooks::HookDispatcher::empty()),
                 Duration::from_secs(60),
                 false,
             );
@@ -633,6 +782,7 @@ mod test {
             let lock_service = LoreLockService::new(
                 Arc::new(lock_store),
                 notification_sender,
+                Arc::new(crate::hooks::HookDispatcher::empty()),
                 Duration::from_secs(60),
                 false,
             );
@@ -658,6 +808,7 @@ mod test {
             let lock_service = LoreLockService::new(
                 Arc::new(lock_store),
                 notification_sender,
+                Arc::new(crate::hooks::HookDispatcher::empty()),
                 Duration::from_secs(60),
                 false,
             );
@@ -689,6 +840,7 @@ mod test {
             let lock_service = LoreLockService::new(
                 Arc::new(lock_store),
                 notification_sender,
+                Arc::new(crate::hooks::HookDispatcher::empty()),
                 Duration::from_secs(60),
                 false,
             );
@@ -730,6 +882,7 @@ mod test {
             LoreLockService::new(
                 Arc::new(lock_store),
                 Arc::new(NotificationSender::default()),
+                Arc::new(crate::hooks::HookDispatcher::empty()),
                 Duration::from_secs(60),
                 enforce,
             )

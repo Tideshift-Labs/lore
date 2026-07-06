@@ -574,6 +574,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                 Some(LoreLockService::new(
                     lock_store.clone(),
                     self.0.notification_sender.clone(),
+                    self.0.hook_dispatcher.clone(),
                     rpc_timeout,
                     enforce_write_permission,
                 ))

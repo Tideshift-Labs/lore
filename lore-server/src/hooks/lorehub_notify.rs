@@ -87,16 +87,22 @@ const HOOK_NAME: &str = "lorehub_notify";
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
 /// The lifecycle points this hook fires for — the full write set
-/// (`BranchPush`/`BranchCreate`/`BranchDelete`/`RepositoryCreate`/`Obliterate`).
+/// (`BranchPush`/`BranchCreate`/`BranchDelete`/`RepositoryCreate`/`Obliterate`) plus
+/// lock/unlock (`ResourceLock`/`ResourceUnlock`, CR-015).
 const HOOK_POINTS: &[HookPoint] = &[
     HookPoint::BranchPush,
     HookPoint::BranchCreate,
     HookPoint::BranchDelete,
     HookPoint::RepositoryCreate,
     HookPoint::Obliterate,
+    HookPoint::ResourceLock,
+    HookPoint::ResourceUnlock,
 ];
 
 /// Maps a [`HookPoint`] to the Lorehub event-type string in the contract.
+///
+/// The `lock_acquire`/`lock_release` strings are the contract Lorehub's
+/// `/internal/lore-events` receiver matches on (WP-065) — keep them in lockstep.
 fn event_type(point: HookPoint) -> &'static str {
     match point {
         HookPoint::BranchPush => "branch_push",
@@ -104,6 +110,8 @@ fn event_type(point: HookPoint) -> &'static str {
         HookPoint::BranchDelete => "branch_delete",
         HookPoint::RepositoryCreate => "repository_create",
         HookPoint::Obliterate => "obliterate",
+        HookPoint::ResourceLock => "lock_acquire",
+        HookPoint::ResourceUnlock => "lock_release",
     }
 }
 
@@ -126,6 +134,13 @@ struct EventFields {
     occurred_at: String,
     /// Originating client IP, from `HookContext` metadata; `None` when absent.
     client_ip: Option<String>,
+    /// The first locked/unlocked resource's hash (hex), from `HookContext`
+    /// metadata on a `lock_acquire`/`lock_release` event; `None` otherwise.
+    /// Folded into [`Self::event_id`] so two distinct locks in the same second on
+    /// the same repo don't collide (a lock carries no `revision_signature`). Not
+    /// serialized onto the wire — the payload shape is unchanged (WP-065 reads
+    /// only the partition).
+    lock_hash: Option<String>,
 }
 
 impl EventFields {
@@ -141,14 +156,20 @@ impl EventFields {
             revision_number: ctx.revision_number(),
             occurred_at: occurred_at.to_rfc3339_opts(SecondsFormat::Secs, true),
             client_ip: ctx.get_metadata("client_ip").map(str::to_string),
+            lock_hash: ctx.get_metadata("lock_hash").map(str::to_string),
         }
     }
 
     /// Synthesizes the deterministic idempotency key
-    /// `blake3(partition | type | revision_signature | occurred_at)`.
+    /// `blake3(partition | type | revision_signature | occurred_at | lock_hash)`.
     ///
     /// Deterministic on the event's own identity (not on delivery attempt), so a
     /// duplicated/retried POST carries the same `event_id` and the receiver dedups.
+    ///
+    /// `lock_hash` disambiguates lock events, which carry no `revision_signature`:
+    /// without it, two distinct locks on the same repo within the same second would
+    /// synthesize the same id and the receiver would drop the second. It is empty
+    /// for revision-producing events, so their id is unchanged.
     fn event_id(&self) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.partition.as_bytes());
@@ -158,6 +179,8 @@ impl EventFields {
         hasher.update(self.revision_signature.as_deref().unwrap_or("").as_bytes());
         hasher.update(b"|");
         hasher.update(self.occurred_at.as_bytes());
+        hasher.update(b"|");
+        hasher.update(self.lock_hash.as_deref().unwrap_or("").as_bytes());
         hasher.finalize().to_hex().to_string()
     }
 
@@ -349,6 +372,8 @@ mod tests {
         assert_eq!(event_type(HookPoint::BranchDelete), "branch_delete");
         assert_eq!(event_type(HookPoint::RepositoryCreate), "repository_create");
         assert_eq!(event_type(HookPoint::Obliterate), "obliterate");
+        assert_eq!(event_type(HookPoint::ResourceLock), "lock_acquire");
+        assert_eq!(event_type(HookPoint::ResourceUnlock), "lock_release");
         // The hook subscribes to exactly that set.
         assert_eq!(HOOK_POINTS, HookPoint::all());
     }
@@ -428,6 +453,84 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 6, 24, 12, 34, 57).unwrap(),
         );
         assert_ne!(a.event_id(), later.event_id());
+    }
+
+    /// Builds a lock-acquire context: repository + branch + user + `lock_hash`/
+    /// `lock_description` metadata, no revision (mirrors what
+    /// `lock_service.rs::lock_hook_context` builds for a real lock/unlock).
+    fn lock_context(lock_hash: &str) -> HookContext {
+        let partition = RepositoryId::from([0xABu8; 16]);
+        let branch = Context::from([0x11u8; 16]);
+        HookContext::builder()
+            .correlation_id("corr-lock")
+            .hook_point(HookPoint::ResourceLock)
+            .repository(partition)
+            .user("user-sub-123")
+            .branch(branch)
+            .metadata("lock_hash", lock_hash)
+            .metadata("lock_description", "some/path.uasset")
+            .build()
+    }
+
+    #[test]
+    fn lock_hash_disambiguates_event_id_for_same_second_same_repo() {
+        // Two distinct locks on the same repo/branch, same occurred_at second: both
+        // carry no revision_signature, so without the lock_hash discriminator they'd
+        // synthesize the same event_id and the receiver would dedup the second away.
+        let a = EventFields::from_context(&lock_context("aaaa"), fixed_time());
+        let b = EventFields::from_context(&lock_context("bbbb"), fixed_time());
+
+        assert_eq!(a.partition, b.partition);
+        assert_eq!(a.event_type, b.event_type);
+        assert_eq!(a.occurred_at, b.occurred_at);
+        assert!(a.revision_signature.is_none());
+        assert!(b.revision_signature.is_none());
+        assert_ne!(a.event_id(), b.event_id());
+    }
+
+    #[test]
+    fn revision_event_id_unaffected_by_absent_lock_hash() {
+        // A revision-producing event carries no lock_hash (None). Folding an empty
+        // string in for the discriminator must hash identically to None, so a
+        // revision event's id is unchanged by the CR-015 field addition.
+        let fields = EventFields::from_context(&push_context(), fixed_time());
+        assert!(fields.lock_hash.is_none());
+
+        let mut with_empty_lock_hash = fields.clone();
+        with_empty_lock_hash.lock_hash = Some(String::new());
+        assert_eq!(fields.event_id(), with_empty_lock_hash.event_id());
+    }
+
+    #[test]
+    fn lock_payload_matches_contract_shape_and_omits_lock_hash() {
+        let fields = EventFields::from_context(&lock_context("deadbeef"), fixed_time());
+        let payload = fields.to_payload();
+        let obj = payload.as_object().expect("payload is a JSON object");
+
+        // Wire shape is unchanged: the same 9 contract keys, no `lock_hash` key.
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "actor",
+                "branch",
+                "client_ip",
+                "event_id",
+                "occurred_at",
+                "partition",
+                "revision_number",
+                "revision_signature",
+                "type",
+            ]
+        );
+        assert!(!obj.contains_key("lock_hash"));
+
+        assert_eq!(payload["type"], "lock_acquire");
+        assert_eq!(payload["actor"], "user-sub-123");
+        assert!(payload["branch"].is_string());
+        assert!(payload["revision_signature"].is_null());
+        assert!(payload["revision_number"].is_null());
     }
 
     #[test]

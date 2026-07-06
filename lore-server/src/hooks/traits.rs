@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Hook traits for compile-time event-driven extensions.
 //!
@@ -122,6 +123,14 @@ pub enum HookPoint {
     /// Triggered when data is obliterated.
     /// Context includes: repository
     Obliterate,
+
+    /// Triggered when one or more resources are locked.
+    /// Context includes: repository, branch, user (+ `lock_hash`/`lock_description` metadata)
+    ResourceLock,
+
+    /// Triggered when one or more resources are unlocked.
+    /// Context includes: repository, branch, user (+ `lock_hash`/`lock_description` metadata)
+    ResourceUnlock,
 }
 
 impl HookPoint {
@@ -133,6 +142,8 @@ impl HookPoint {
             HookPoint::BranchDelete,
             HookPoint::RepositoryCreate,
             HookPoint::Obliterate,
+            HookPoint::ResourceLock,
+            HookPoint::ResourceUnlock,
         ]
     }
 }
@@ -145,6 +156,8 @@ impl std::fmt::Display for HookPoint {
             HookPoint::BranchDelete => write!(f, "BranchDelete"),
             HookPoint::RepositoryCreate => write!(f, "RepositoryCreate"),
             HookPoint::Obliterate => write!(f, "Obliterate"),
+            HookPoint::ResourceLock => write!(f, "ResourceLock"),
+            HookPoint::ResourceUnlock => write!(f, "ResourceUnlock"),
         }
     }
 }
@@ -656,17 +669,21 @@ mod tests {
         assert_eq!(HookPoint::BranchDelete.to_string(), "BranchDelete");
         assert_eq!(HookPoint::RepositoryCreate.to_string(), "RepositoryCreate");
         assert_eq!(HookPoint::Obliterate.to_string(), "Obliterate");
+        assert_eq!(HookPoint::ResourceLock.to_string(), "ResourceLock");
+        assert_eq!(HookPoint::ResourceUnlock.to_string(), "ResourceUnlock");
     }
 
     #[test]
     fn test_hook_point_all() {
         let all = HookPoint::all();
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 7);
         assert!(all.contains(&HookPoint::BranchPush));
         assert!(all.contains(&HookPoint::BranchCreate));
         assert!(all.contains(&HookPoint::BranchDelete));
         assert!(all.contains(&HookPoint::RepositoryCreate));
         assert!(all.contains(&HookPoint::Obliterate));
+        assert!(all.contains(&HookPoint::ResourceLock));
+        assert!(all.contains(&HookPoint::ResourceUnlock));
     }
 
     #[test]

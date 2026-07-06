@@ -119,6 +119,34 @@ the next run starts from the map instead of rediscovering it.
   two "Deep findings" entries below for the reusable technique).
   `cargo test -p lore-server --lib -- repository_metadata` (23 tests: 12 new + 10 pre-existing
   `validate_read_only_fields` + 1 unrelated substring match).
+- **CR-015 (lock/unlock fires `lorehub_notify`, [SERVER])** — three files: `hooks/traits.rs`
+  (`HookPoint` gained `ResourceLock`/`ResourceUnlock`, `all()` now length 7),
+  `hooks/lorehub_notify.rs` (`HOOK_POINTS`/`event_type()` extended; `EventFields.lock_hash: Option<String>`
+  sourced from `ctx.get_metadata("lock_hash")`, folded into `event_id()` as a trailing segment but
+  **not** serialized in `to_payload()` — wire shape unchanged), and `grpc/lock_service.rs`
+  (`LoreLockService` gained a 3rd ctor arg `hook_dispatcher: Arc<HookDispatcher>`; `lock_as_user` gained
+  a trailing `correlation_id: &str`; new private fn `lock_hook_context(...)` builds the
+  `HookContext` with `metadata` keys `lock_hash`/`lock_description`; `lock`/`admin_lock`/`unlock` call
+  `hook_dispatcher.spawn_post(HookPoint::ResourceLock|ResourceUnlock, lock_hook_context(...))`).
+  Coverage: `cargo test -p lore-server --lib -- hooks` (101 passed, was 98 pre-CR-015 — 3 new:
+  `lock_hash_disambiguates_event_id_for_same_second_same_repo`,
+  `revision_event_id_unaffected_by_absent_lock_hash`,
+  `lock_payload_matches_contract_shape_and_omits_lock_hash`); `traits::tests` updated for the 7-variant
+  `all()`/`Display`; `cargo test -p lore-server --lib -- grpc::lock_service` (13 passed) including a
+  new `grpc::lock_service::test::hook_context` submodule that pure-function-tests the private
+  `lock_hook_context` builder directly (context fields + the two metadata keys) — chosen over asserting
+  the fire-and-forget `spawn_post` end-to-end, since that's a detached `lore_spawn!` task with no join
+  handle (would need a sleep-based race to observe). **Gotcha:** every one of the ~8
+  `LoreLockService::new(...)` call sites in that file's `#[cfg(test)] mod test` needed the new 3rd arg
+  inserted (`Arc::new(crate::hooks::HookDispatcher::empty())`, mirroring `branch_delete.rs`'s pattern) —
+  a `replace_all` Edit on the common `notification_sender,\n  Duration::from_secs(60),\n  false,`
+  tail handled 7 of 8; the 8th (`permission::make_service`, using `enforce` not a literal `false`)
+  needed its own edit. **`cargo +nightly fmt --all -- --check` flags pre-existing impl code, not test
+  code, here:** CR-015's own `lock_as_user` (lines ~178-186, the `self.hook_dispatcher.spawn_post(...)`
+  call wrapping `lock_hook_context(...)`) is itself not nightly-fmt-clean — a real gap in the
+  implementation commit, reported back rather than reformatted (out of test-code scope). Confirmed via
+  `cargo +nightly fmt --all -- --check` showing only that one `Diff in ... lock_service.rs:178/186`
+  after all test-code edits were applied.
 - **CR-008 (per-entry byte size on tree reads, [SERVER])** — additive proto3 optional
   `TreeNode.size_bytes` (FILE only, unset for DIRECTORY/LINK) + `Revision.total_size_bytes` on
   `lore.thin_client.v1`; `lore-revision/src/state.rs` `TreePath.size` (<- `node.size`, populated in
