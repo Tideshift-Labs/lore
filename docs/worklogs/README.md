@@ -57,6 +57,8 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 005 | 2026-07-08 | [Bounded retry on the lorehub_notify post-commit hook (WP-066 Chunk 2)](005-lorehub-notify-bounded-retry-wp066.md) |
+| 004 | 2026-07-04 | [Expose per-entry + revision total byte size on revision reads (CR-008)](004-tree-entry-size-cr008.md) |
 | 003 | 2026-07-03 | [Scope RepositoryMetadataGet/Set to the caller's repository (CR-011)](003-repository-metadata-repo-authz-cr011.md) |
 | 002 | 2026-07-03 | [Bind notification Subscribe to the JWT-authorized repository (CR-010)](002-notification-subscribe-repo-authz-cr010.md) |
 | 001 | 2026-07-03 | [Opt-in graceful QUIC drain for loreserver (CR-009)](001-graceful-quic-drain-cr009.md) |
