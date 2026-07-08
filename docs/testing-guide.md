@@ -202,6 +202,85 @@ the next run starts from the map instead of rediscovering it.
     `serialize_error` `Err` arm) and `:320` (the `outcome = if e.is_timeout() {...}` binding) are not
     nightly-fmt-clean. Reported back rather than reformatted (out of test-code scope), same pattern
     as the CR-015 gotcha above.
+- **WP-066 Part 2 / Chunk 2 (`lorehub_notify` bounded in-process retry, option C,
+  [SERVER])** — same file, `lore-server/src/hooks/lorehub_notify.rs`. `post_handler` now
+  wraps the POST in a bounded retry loop over `lore_revision::util::time::{RetryPolicy,
+  Retry}`: a transport error/timeout OR a 5xx/429 is always retried (with backoff); any
+  other 4xx (or a 2xx) is terminal. The signed body + timestamp are computed **once**
+  and reused across attempts (raw_body is cloned per attempt) so the receiver dedups a
+  retried POST on `event_id`. New optional `[hooks.lorehub_notify.retry]` sub-table →
+  `RetrySettings` (`initial_backoff_ms`/`max_backoff_ms`/`max_attempts`/`jitter`);
+  omitted → `DEFAULT_RETRY_LIMIT` = 2 retries, 200 ms→2 s backoff. `LorehubNotifyHook`
+  gained a `retry_policy: RetryPolicy` field (any direct struct-literal construction in
+  tests needs it — `RetryPolicy` is `Copy`, so `self.retry_policy.retry()` behind `&self`
+  is fine). Coverage: `cargo test -p lore-server --lib -- hooks::lorehub_notify` (22
+  tests, was 16 pre-Chunk-2) —
+  `post_handler_recovers_after_transient_5xx_then_succeeds` (503×2 then 200 → `Ok`, exact
+  attempt count asserted, the headline behavior this chunk adds),
+  `post_handler_fails_fast_on_4xx_with_no_retry` (exactly 1 request),
+  `post_handler_exhausts_retries_and_errors_on_persistent_5xx` (`max_attempts + 1`
+  requests then `Err`), `factory_builds_hook_from_valid_retry_table` /
+  `factory_rejects_malformed_retry_table` (config parse), plus two end-to-end-through-
+  the-factory behavior tests — `factory_built_hook_honors_configured_retry_table_attempt_count`
+  and `factory_built_hook_uses_default_retry_policy_when_retry_table_omitted` — that go
+  through `LorehubNotifyHookFactory::create` (a real `toml::Value`) rather than a direct
+  struct literal, then call `.post_handler(...)` straight on the returned `Box<dyn Hook>`
+  (no downcast needed — `Hook::post_handler` dispatches fine through the trait object),
+  proving the parsed `[retry]` table / its absence actually thread through to observed
+  attempt counts. The default-policy test pays ~0.5-1s of *real* backoff wall-time
+  (deliberate — it's proving the factory's omitted-table path uses the real defaults,
+  not a hardcoded assertion against the constants) — the only test in the file that
+  isn't near-zero-backoff.
+  - **Gotcha — request-counting stub receiver.** Existing ephemeral-port stub
+    (`start_stub_receiver`, always-same-status) can't observe attempt counts. Added
+    `start_counting_stub_receiver<F: Fn(usize) -> StatusCode>(respond)` — axum handler
+    closure wraps an `Arc<AtomicUsize>` call counter, calls `respond(idx)` with the
+    0-based call index so a test can script "503, 503, 200" etc., and returns
+    `(url, Arc<AtomicUsize>)` so the test asserts the final count after `post_handler`
+    returns. `start_stub_receiver` is now a 1-line wrapper over this that ignores the
+    counter.
+  - **Gotcha — keep retry-exercising tests fast.** A `fast_retry_policy(max_attempts)`
+    helper builds `RetryPolicy` with `initial_backoff_ms = max_backoff_ms = 1` so tests
+    that actually retry (recovery/exhaustion/transport-error) don't pay real backoff
+    wall-time; only the deliberate default-policy test uses the real constants.
+  - **Gate note (same pattern as CR-015/WP-066 Part 1):** `cargo +nightly fmt -p
+    lore-server -- --check` flags one diff in **implementation** code added by this same
+    delta — `lorehub_notify.rs:381-386` (the `let retryable = status.is_server_error() ||
+    ...` binding wraps differently under nightly rustfmt). Reported back, not
+    reformatted (out of test-code scope). **Fixed** in a follow-up (reviewer pass) — now
+    fmt-clean.
+  - **Follow-up (reviewer pass) — 3 more cases, 24 tests total:**
+    `post_handler_retries_429_then_succeeds` (429 is a distinct predicate in
+    `post_handler` — `status == TOO_MANY_REQUESTS`, not `is_server_error()` — covered
+    separately rather than assumed to share the 5xx branch); `factory_rejects_zero_timeout`
+    (the factory now rejects `timeout = 0` — reviewer-driven impl fix); positive-timeout-
+    still-builds was already covered by `factory_builds_hook_from_valid_config`
+    (`timeout = 5`), not re-added.
+  - **Skipped, on purpose: a "transient transport-error-then-recovers" case.** Asked for
+    but not added — genuinely awkward to script without introducing real flakiness, two
+    approaches considered and rejected:
+    1. *Port-rebind* (drop the listener so the port refuses, then re-bind the same port
+       once "the handler comes up"): needs a second task to race the retry loop's own
+       backoff sleep to rebind in the window between attempts — timing-sensitive, and
+       exactly the drop-then-rebind TOCTOU pattern this guide already warns against
+       ("Ephemeral-port test server: bind once..." finding above).
+    2. *Raw-socket half-open* (accept then immediately drop the socket for the first N
+       connections to force a real `ECONNRESET`, then hand off to a real HTTP responder
+       for the rest, all on one already-bound listener — no rebind race): mechanically
+       sound but needs either hand-rolled HTTP/1.1 framing or a new direct `hyper`
+       dev-dependency (not currently in `lore-server/Cargo.toml`; axum wraps it but
+       doesn't re-export it) — more test-only machinery than the assertion is worth, and
+       still not risk-free (RST timing vs. reqwest's connection pool/retry-on-connect
+       behavior isn't fully controllable from the test side).
+    What *is* covered instead for the transport-error path: persistent unreachable-port
+    (`post_handler_errors_and_records_transport_error_when_unreachable`, retries then
+    errors) and the `is_timeout()` predicate itself
+    (`reqwest_is_timeout_distinguishes_timeout_from_connection_refused`). The *recovery*
+    half of "transport error retried, then succeeds" is asserted at the unit-test tier
+    only for the two response-code-driven cases (503, 429); a transport-level recovery
+    is structurally the same code path (`Err(e) if !terminal => retry.wait() then
+    continue`) and would need an integration/e2e tier with a real bounce-able backend to
+    add without flake risk — flag if wanted there.
 - **CR-008 (per-entry byte size on tree reads, [SERVER])** — additive proto3 optional
   `TreeNode.size_bytes` (FILE only, unset for DIRECTORY/LINK) + `Revision.total_size_bytes` on
   `lore.thin_client.v1`; `lore-revision/src/state.rs` `TreePath.size` (<- `node.size`, populated in
@@ -354,3 +433,20 @@ the next run starts from the map instead of rediscovering it.
   `Some(0)` for an empty one where `hash_tree` stays zero and `state.tree()` returns `Tree::new_zeroed()`)
   and defer the real aggregate to the integration/e2e tier. The exact `Some(0)` was confirmed
   empirically (`eprintln!` + `-- --nocapture`), not assumed.
+- **Pre-existing flake, not ours: `hooks::dispatch::tests::test_dispatch_pre_panic_isolation`.**
+  Symptom: `cargo test -p lore-server --lib -- hooks` intermittently fails with "Expected
+  Panic error" at `dispatch.rs:1187` (~1-in-3 on this rig); the same filtered run is
+  green on another invocation with no code change. Cause: `std::panic::set_hook` is
+  process-wide, and several `dispatch.rs` tests (`test_dispatch_pre_panic_isolation`,
+  `test_dispatch_pre_panic_does_not_affect_other_hooks`, `test_spawn_post_panic_isolation`,
+  `test_spawn_post_timeout_isolation`) install/restore it concurrently under the default
+  multi-threaded test runner — same shared-global-state class of issue as the OTel
+  `METER_PROVIDER` finding above, but in Epic's own `dispatch.rs` (`git log --oneline --
+  lore-server/src/hooks/dispatch.rs` shows only the initial fork-copy commit — we've
+  never touched this file). Confirmed unrelated to WP-066: reproduces identically with
+  `lore-server/src/hooks/lorehub_notify.rs` fully `git stash`ed back to its last-committed
+  state. Not ours to fix (not our delta, and it's implementation code besides). What to
+  do: don't read a solo red `-- hooks` run as a WP-066 regression — re-run once, and
+  scope the real gate to `-- hooks::lorehub_notify` (unaffected, always green) rather
+  than treating the whole `hooks` module run as the pass/fail signal for a delta that
+  doesn't touch `dispatch.rs`.

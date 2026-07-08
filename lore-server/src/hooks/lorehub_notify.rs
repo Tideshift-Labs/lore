@@ -16,9 +16,12 @@
 //! 30 s post-handler timeout, and unable to fail the operation. The synchronous
 //! `pre_handler` (200 ms budget, can veto) is the wrong phase: a network round-trip
 //! does not fit its budget, and gate-on-push policy belongs at token-mint time, not
-//! here. Delivery is therefore **at-least-once and possibly lossy** (no retry/outbox in
-//! v1) — the receiver is idempotent on `event_id`, which this hook synthesizes
-//! deterministically.
+//! here. Delivery is **at-least-once**: the POST is retried a bounded number of times
+//! on a transient failure (transport error/timeout or 5xx/429) with backoff (WP-066
+//! option C), but there is no persistent outbox — a loreserver crash or an outage
+//! longer than the retry budget still drops the event. The receiver is idempotent on
+//! `event_id` (synthesized deterministically), so a retried POST that already landed
+//! is a no-op.
 //!
 //! # The event contract (pinned by Lorehub WP-026)
 //!
@@ -58,7 +61,15 @@
 //! enabled     = true
 //! webhook_url = "https://host.docker.internal:8787/internal/lore-events"
 //! hmac_secret = "<LH_LORE_EVENTS_SECRET>"
-//! timeout     = 10           # HTTP request timeout, seconds (optional, default 10)
+//! timeout     = 5            # per-attempt HTTP timeout, seconds (optional, default 5)
+//!
+//! # Optional bounded retry (WP-066 option C). Omitted → default: 2 retries,
+//! # 200 ms→2 s backoff. Keep timeout * (max_attempts + 1) + backoffs under 30 s.
+//! [hooks.lorehub_notify.retry]
+//! initial_backoff_ms = 200
+//! max_backoff_ms     = 2000
+//! max_attempts       = 2      # number of RETRIES (2 → up to 3 total sends)
+//! # jitter           = 0.1    # optional
 //! ```
 
 use std::sync::OnceLock;
@@ -67,6 +78,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::SecondsFormat;
 use chrono::Utc;
+use lore_revision::util::time::RetryPolicy;
+use lore_revision::util::time::RetrySettings;
 use lore_telemetry::InstrumentProvider;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
@@ -86,9 +99,19 @@ use crate::hooks::HookRegistry;
 /// Configuration section name (`[hooks.lorehub_notify]`) and hook identity.
 const HOOK_NAME: &str = "lorehub_notify";
 
-/// Default HTTP request timeout (seconds) when `timeout` is omitted from config.
-/// Kept comfortably under the dispatcher's 30 s post-handler timeout.
-const DEFAULT_TIMEOUT_SECS: u64 = 10;
+/// Default per-request HTTP timeout (seconds) when `timeout` is omitted. Applies to
+/// EACH attempt; with the default retry policy the worst-case total (attempts +
+/// backoff sleeps) must stay under the dispatcher's 30 s post-handler timeout, so
+/// this is 5 s (5 + 0.2 + 5 + 0.4 + 5 ≈ 16 s for 3 attempts), not the old 10 s.
+const DEFAULT_TIMEOUT_SECS: u64 = 5;
+
+/// Default retry policy for the POST when `[hooks.lorehub_notify.retry]` is omitted.
+/// `LIMIT` is the number of RETRIES (so 2 → up to 3 total sends). Catches the common
+/// transient failure (api restart, brief blip / 5xx) without persistence (WP-066
+/// option C). Keep `timeout * (LIMIT + 1) + backoffs` under the 30 s post-handler cap.
+const DEFAULT_RETRY_LIMIT: usize = 2;
+const DEFAULT_RETRY_INITIAL_BACKOFF_MS: u64 = 200;
+const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 2_000;
 
 /// The lifecycle points this hook fires for — the full write set
 /// (`BranchPush`/`BranchCreate`/`BranchDelete`/`RepositoryCreate`/`Obliterate`) plus
@@ -231,6 +254,7 @@ impl InstrumentProvider for LorehubNotifyInstrumentProvider {
 
 struct LorehubNotifyInstruments {
     deliveries: Counter<u64>,
+    retries: Counter<u64>,
 }
 
 impl LorehubNotifyInstruments {
@@ -242,6 +266,12 @@ impl LorehubNotifyInstruments {
                 .u64_counter(provider.scope_name("lorehub_notify.deliveries"))
                 .with_description(
                     "lorehub_notify event POSTs to the Lorehub platform, by event_type + outcome",
+                )
+                .build(),
+            retries: meter
+                .u64_counter(provider.scope_name("lorehub_notify.retries"))
+                .with_description(
+                    "lorehub_notify POST retry attempts (WP-066 option C), by event_type",
                 )
                 .build(),
         }
@@ -270,11 +300,22 @@ fn record_delivery(event_type: &'static str, outcome: &'static str) {
     );
 }
 
+/// Increment the retry counter for one retried POST attempt (WP-066 option C).
+/// Fire-and-forget; `event_type` is the only (bounded) label.
+fn record_retry(event_type: &'static str) {
+    LorehubNotifyInstruments::instance()
+        .retries
+        .add(1, &[KeyValue::new("event_type", event_type)]);
+}
+
 /// A configured `lorehub_notify` hook instance.
 struct LorehubNotifyHook {
     webhook_url: String,
     hmac_secret: String,
     client: reqwest::Client,
+    /// Bounded retry for a transient POST failure (WP-066 option C). `retry()` yields
+    /// a fresh waiter per event, so the hook stays `Sync` and attempts don't share state.
+    retry_policy: RetryPolicy,
 }
 
 #[async_trait]
@@ -306,6 +347,9 @@ impl Hook for LorehubNotifyHook {
             }
         };
         let signature = sign_event(&self.hmac_secret, timestamp, &raw_body);
+        // Header values are stable across attempts (the signed body + timestamp don't
+        // change), so the receiver dedups a retried POST on its deterministic `event_id`.
+        let timestamp_header = timestamp.to_string();
 
         debug!(
             correlation_id = %ctx.correlation_id(),
@@ -314,39 +358,58 @@ impl Hook for LorehubNotifyHook {
             "Posting lorehub event"
         );
 
-        let response = match self
-            .client
-            .post(&self.webhook_url)
-            .header(http::header::CONTENT_TYPE, "application/json")
-            .header("X-Lorehub-Timestamp", timestamp.to_string())
-            .header("X-Lorehub-Signature", signature)
-            .body(raw_body)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                // A per-request timeout surfaces here too; split it out for a cleaner signal.
-                let outcome = if e.is_timeout() {
-                    "timeout"
-                } else {
-                    "transport_error"
-                };
-                record_delivery(event_type, outcome);
-                return Err(HookError::execution_failed(HOOK_NAME, format!("post: {e}")));
+        // Bounded retry (WP-066 option C): retry a transient failure — a transport
+        // error/timeout, or a 5xx/429 — with backoff; a 4xx is permanent (bad
+        // signature/shape) and fails fast. Only the TERMINAL outcome hits the delivery
+        // counter; each retried attempt bumps the retries counter.
+        let mut retry = self.retry_policy.retry();
+        loop {
+            let attempt = self
+                .client
+                .post(&self.webhook_url)
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .header("X-Lorehub-Timestamp", timestamp_header.as_str())
+                .header("X-Lorehub-Signature", signature.as_str())
+                .body(raw_body.clone())
+                .send()
+                .await;
+
+            match attempt {
+                Ok(response) if response.status().is_success() => {
+                    record_delivery(event_type, "success");
+                    return Ok(());
+                }
+                Ok(response) => {
+                    let status = response.status();
+                    let retryable = status.is_server_error()
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                    if retryable && retry.wait().await {
+                        record_retry(event_type);
+                        continue;
+                    }
+                    record_delivery(event_type, "http_error");
+                    return Err(HookError::execution_failed(
+                        HOOK_NAME,
+                        format!("receiver returned {status}"),
+                    ));
+                }
+                Err(e) => {
+                    // Transport errors + timeouts are always transient — always retryable.
+                    if retry.wait().await {
+                        record_retry(event_type);
+                        continue;
+                    }
+                    // A per-request timeout surfaces here too; split it for a cleaner signal.
+                    let outcome = if e.is_timeout() {
+                        "timeout"
+                    } else {
+                        "transport_error"
+                    };
+                    record_delivery(event_type, outcome);
+                    return Err(HookError::execution_failed(HOOK_NAME, format!("post: {e}")));
+                }
             }
-        };
-
-        if !response.status().is_success() {
-            record_delivery(event_type, "http_error");
-            return Err(HookError::execution_failed(
-                HOOK_NAME,
-                format!("receiver returned {}", response.status()),
-            ));
         }
-
-        record_delivery(event_type, "success");
-        Ok(())
     }
 }
 
@@ -388,9 +451,16 @@ impl HookFactory for LorehubNotifyHookFactory {
                 let secs = v.as_integer().ok_or_else(|| {
                     HookError::config_error(HOOK_NAME, "'timeout' must be an integer (seconds)")
                 })?;
-                u64::try_from(secs).map_err(|_| {
+                let secs = u64::try_from(secs).map_err(|_| {
                     HookError::config_error(HOOK_NAME, "'timeout' must be a positive integer")
-                })?
+                })?;
+                if secs == 0 {
+                    return Err(HookError::config_error(
+                        HOOK_NAME,
+                        "'timeout' must be a positive integer (seconds), not 0",
+                    ));
+                }
+                secs
             }
         };
 
@@ -399,10 +469,28 @@ impl HookFactory for LorehubNotifyHookFactory {
             .build()
             .map_err(|e| HookError::init_error(HOOK_NAME, format!("build http client: {e}")))?;
 
+        // Optional `[hooks.lorehub_notify.retry]` sub-table → RetrySettings; absent → the
+        // default policy. Deserialized via serde (RetrySettings derives Deserialize), same
+        // shape as the server's other retry knobs.
+        let retry_policy = match config.get("retry") {
+            None => RetryPolicy::builder()
+                .with_initial_backoff_millis(DEFAULT_RETRY_INITIAL_BACKOFF_MS)
+                .with_max_backoff_millis(DEFAULT_RETRY_MAX_BACKOFF_MS)
+                .with_limit(DEFAULT_RETRY_LIMIT)
+                .build(),
+            Some(v) => {
+                let settings: RetrySettings = v.clone().try_into().map_err(|e| {
+                    HookError::config_error(HOOK_NAME, format!("invalid 'retry' table: {e}"))
+                })?;
+                RetryPolicy::from(&settings)
+            }
+        };
+
         Ok(Box::new(LorehubNotifyHook {
             webhook_url,
             hmac_secret,
             client,
+            retry_policy,
         }))
     }
 }
@@ -416,6 +504,10 @@ pub fn register(registry: &mut HookRegistry, _ctx: &HookRegistrationContext) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
     use chrono::TimeZone;
     use lore_base::types::Context;
     use lore_base::types::Hash;
@@ -704,10 +796,71 @@ mod tests {
         assert_eq!(hook.hook_points(), HookPoint::all());
     }
 
+    #[test]
+    fn factory_builds_hook_from_valid_retry_table() {
+        let factory = LorehubNotifyHookFactory;
+        let config: toml::Value = toml::from_str(
+            r#"
+            webhook_url = "https://host.docker.internal:8787/internal/lore-events"
+            hmac_secret = "abc123"
+
+            [retry]
+            initial_backoff_ms = 10
+            max_backoff_ms = 50
+            max_attempts = 4
+            "#,
+        )
+        .unwrap();
+
+        let hook = factory
+            .create(&config)
+            .expect("a well-formed retry table builds a hook");
+        assert_eq!(hook.name(), "lorehub_notify");
+    }
+
+    #[test]
+    fn factory_rejects_malformed_retry_table() {
+        let factory = LorehubNotifyHookFactory;
+        // `max_attempts` must be an integer; a string fails RetrySettings deserialization.
+        let config: toml::Value = toml::from_str(
+            r#"
+            webhook_url = "https://example.test/internal/lore-events"
+            hmac_secret = "abc123"
+
+            [retry]
+            initial_backoff_ms = 200
+            max_backoff_ms = 2000
+            max_attempts = "two"
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            factory.create(&config),
+            Err(HookError::ConfigError { .. })
+        ));
+    }
+
+    /// A near-zero-backoff retry policy so retry-exercising tests don't pay
+    /// real backoff wall-time. `max_attempts` here is the number of RETRIES
+    /// (matches `RetrySettings`/`DEFAULT_RETRY_LIMIT`'s convention), so total
+    /// requests sent on total exhaustion is `max_attempts + 1`.
+    fn fast_retry_policy(max_attempts: usize) -> RetryPolicy {
+        RetryPolicy::builder()
+            .with_initial_backoff_millis(1)
+            .with_max_backoff_millis(1)
+            .with_limit(max_attempts)
+            .build()
+    }
+
     /// Builds a `LorehubNotifyHook` pointed at `webhook_url`, with a client
     /// timeout of `client_timeout` (short for the timeout-path test, generous
-    /// for the others).
-    fn hook_with_url(webhook_url: String, client_timeout: Duration) -> LorehubNotifyHook {
+    /// for the others) and the given `retry_policy`.
+    fn hook_with_url(
+        webhook_url: String,
+        client_timeout: Duration,
+        retry_policy: RetryPolicy,
+    ) -> LorehubNotifyHook {
         LorehubNotifyHook {
             webhook_url,
             hmac_secret: "test-secret".to_string(),
@@ -715,6 +868,7 @@ mod tests {
                 .timeout(client_timeout)
                 .build()
                 .expect("build reqwest client"),
+            retry_policy,
         }
     }
 
@@ -725,33 +879,55 @@ mod tests {
     /// (no drop-rebind TOCTOU, no readiness sleep needed: the socket is in the
     /// OS backlog as soon as `bind` returns).
     async fn start_stub_receiver(status: axum::http::StatusCode) -> String {
+        let (url, _calls) = start_counting_stub_receiver(move |_idx| status).await;
+        url
+    }
+
+    /// Starts a real HTTP server on an ephemeral loopback port whose response
+    /// per request is driven by `respond(call_index)` (0-based), so retry
+    /// behavior (transient-then-recovers, persistent failure, fail-fast) can
+    /// be exercised and the number of attempts asserted. Returns the URL and a
+    /// shared counter of requests received so far.
+    async fn start_counting_stub_receiver<F>(respond: F) -> (String, Arc<AtomicUsize>)
+    where
+        F: Fn(usize) -> axum::http::StatusCode + Send + Sync + 'static,
+    {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
         let addr = listener.local_addr().expect("read local_addr");
 
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_handler = calls.clone();
+        let respond = Arc::new(respond);
         let app = axum::Router::new().route(
             "/internal/lore-events",
-            axum::routing::post(move || async move { status }),
+            axum::routing::post(move || {
+                let calls = calls_for_handler.clone();
+                let respond = respond.clone();
+                async move {
+                    let idx = calls.fetch_add(1, Ordering::SeqCst);
+                    respond(idx)
+                }
+            }),
         );
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
 
-        format!("http://{addr}/internal/lore-events")
+        (format!("http://{addr}/internal/lore-events"), calls)
     }
 
     // `post_handler`'s error-return behavior is the only outcome-classification
     // signal observable without reading the OTel counter (see the module-level
     // gotcha note below on why the counter itself is left untested at this
-    // tier). These three cases distinguish the branches that produce a
-    // different `Result`; success and http_error additionally distinguish by
-    // message content.
+    // tier). Attempt counts (via `start_counting_stub_receiver`) are the signal
+    // for the WP-066 Chunk 2 retry behavior itself.
 
     #[tokio::test]
     async fn post_handler_succeeds_and_records_success_on_2xx() {
         let url = start_stub_receiver(axum::http::StatusCode::OK).await;
-        let hook = hook_with_url(url, Duration::from_secs(5));
+        let hook = hook_with_url(url, Duration::from_secs(5), fast_retry_policy(2));
 
         let result = hook.post_handler(&push_context()).await;
         assert!(
@@ -761,17 +937,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_handler_errors_and_records_http_error_on_non_2xx() {
-        let url = start_stub_receiver(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
-        let hook = hook_with_url(url, Duration::from_secs(5));
+    async fn post_handler_recovers_after_transient_5xx_then_succeeds() {
+        // 503 for the first 2 requests, 200 on the 3rd: the whole point of
+        // WP-066 Chunk 2 is that this now succeeds instead of failing on the
+        // first 503.
+        const TRANSIENT_FAILURES: usize = 2;
+        let (url, calls) = start_counting_stub_receiver(|idx| {
+            if idx < TRANSIENT_FAILURES {
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                axum::http::StatusCode::OK
+            }
+        })
+        .await;
+        let hook = hook_with_url(
+            url,
+            Duration::from_secs(5),
+            fast_retry_policy(TRANSIENT_FAILURES + 1),
+        );
+
+        let result = hook.post_handler(&push_context()).await;
+        assert!(
+            result.is_ok(),
+            "expected Ok after recovering from transient 503s, got {result:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            TRANSIENT_FAILURES + 1,
+            "stub should have been hit exactly once per failure plus the succeeding attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_handler_retries_429_then_succeeds() {
+        // 429 is a distinct predicate from `is_server_error()` in `post_handler`
+        // (`status == reqwest::StatusCode::TOO_MANY_REQUESTS`) — cover it
+        // separately from the 5xx case rather than assuming the same branch.
+        const TRANSIENT_FAILURES: usize = 2;
+        let (url, calls) = start_counting_stub_receiver(|idx| {
+            if idx < TRANSIENT_FAILURES {
+                axum::http::StatusCode::TOO_MANY_REQUESTS
+            } else {
+                axum::http::StatusCode::OK
+            }
+        })
+        .await;
+        let hook = hook_with_url(
+            url,
+            Duration::from_secs(5),
+            fast_retry_policy(TRANSIENT_FAILURES + 1),
+        );
+
+        let result = hook.post_handler(&push_context()).await;
+        assert!(
+            result.is_ok(),
+            "expected Ok after recovering from transient 429s, got {result:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            TRANSIENT_FAILURES + 1,
+            "stub should have been hit exactly once per 429 plus the succeeding attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_handler_fails_fast_on_4xx_with_no_retry() {
+        // A 4xx is a permanent failure (bad signature/shape) and must not
+        // consume any of the retry budget.
+        let (url, calls) =
+            start_counting_stub_receiver(|_idx| axum::http::StatusCode::BAD_REQUEST).await;
+        let hook = hook_with_url(url, Duration::from_secs(5), fast_retry_policy(3));
 
         let err = hook
             .post_handler(&push_context())
             .await
-            .expect_err("expected Err on a 500 response");
+            .expect_err("expected Err on a 400 response");
+        assert!(
+            format!("{err}").contains("400"),
+            "error should surface the receiver's status: {err}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a permanent 4xx must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_handler_exhausts_retries_and_errors_on_persistent_5xx() {
+        const MAX_RETRIES: usize = 2;
+        let (url, calls) =
+            start_counting_stub_receiver(|_idx| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .await;
+        let hook = hook_with_url(url, Duration::from_secs(5), fast_retry_policy(MAX_RETRIES));
+
+        let err = hook
+            .post_handler(&push_context())
+            .await
+            .expect_err("expected Err once the retry budget is exhausted");
         assert!(
             format!("{err}").contains("500"),
             "error should surface the receiver's status: {err}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            MAX_RETRIES + 1,
+            "should send the initial attempt plus {MAX_RETRIES} retries"
         );
     }
 
@@ -790,6 +1061,7 @@ mod tests {
         let hook = hook_with_url(
             format!("http://{addr}/internal/lore-events"),
             Duration::from_secs(5),
+            fast_retry_policy(2),
         );
 
         let err = hook
@@ -799,6 +1071,79 @@ mod tests {
         assert!(
             format!("{err}").contains("post:"),
             "error should be the post-phase error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_built_hook_honors_configured_retry_table_attempt_count() {
+        // End-to-end through the real parse path (not a direct struct literal):
+        // a `[retry]` table with `max_attempts = 1` against a persistent 500
+        // must send exactly 2 requests (1 initial + 1 retry) before erroring.
+        let (url, calls) =
+            start_counting_stub_receiver(|_idx| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .await;
+        let factory = LorehubNotifyHookFactory;
+        let config: toml::Value = toml::from_str(&format!(
+            r#"
+            webhook_url = "{url}"
+            hmac_secret = "abc123"
+
+            [retry]
+            initial_backoff_ms = 1
+            max_backoff_ms = 1
+            max_attempts = 1
+            "#,
+        ))
+        .unwrap();
+        let hook = factory
+            .create(&config)
+            .expect("a well-formed retry table builds a hook");
+
+        let err = hook
+            .post_handler(&push_context())
+            .await
+            .expect_err("persistent 500 should exhaust the configured retry budget");
+        assert!(format!("{err}").contains("500"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "configured max_attempts = 1 retry -> 2 total requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_built_hook_uses_default_retry_policy_when_retry_table_omitted() {
+        // No `[retry]` table -> DEFAULT_RETRY_LIMIT retries against a
+        // persistent 500 must send DEFAULT_RETRY_LIMIT + 1 total requests.
+        // Uses the real default backoff (not near-zero), so this test pays a
+        // little real wall-clock time (well under a second) — the point is to
+        // prove the factory's omitted-`[retry]` path, not just our own
+        // hardcoded expectation of the constants.
+        let (url, calls) =
+            start_counting_stub_receiver(|_idx| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .await;
+        let factory = LorehubNotifyHookFactory;
+        let config: toml::Value = toml::from_str(&format!(
+            r#"
+            webhook_url = "{url}"
+            hmac_secret = "abc123"
+            "#,
+        ))
+        .unwrap();
+        let hook = factory
+            .create(&config)
+            .expect("config without a retry table builds a hook");
+
+        let err = hook
+            .post_handler(&push_context())
+            .await
+            .expect_err("persistent 500 should exhaust the default retry budget");
+        assert!(format!("{err}").contains("500"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            DEFAULT_RETRY_LIMIT + 1,
+            "default policy is {DEFAULT_RETRY_LIMIT} retries -> {} total requests",
+            DEFAULT_RETRY_LIMIT + 1
         );
     }
 
@@ -875,5 +1220,24 @@ mod tests {
             factory.create(&config),
             Err(HookError::ConfigError { .. })
         ));
+    }
+
+    #[test]
+    fn factory_rejects_zero_timeout() {
+        let factory = LorehubNotifyHookFactory;
+        let config: toml::Value = toml::from_str(
+            r#"
+            webhook_url = "https://example.test/internal/lore-events"
+            hmac_secret = "abc123"
+            timeout = 0
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            factory.create(&config),
+            Err(HookError::ConfigError { .. })
+        ));
+        // A positive timeout still builds fine — already covered by
+        // `factory_builds_hook_from_valid_config` (`timeout = 5`).
     }
 }
