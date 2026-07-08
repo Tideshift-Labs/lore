@@ -61,11 +61,15 @@
 //! timeout     = 10           # HTTP request timeout, seconds (optional, default 10)
 //! ```
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::SecondsFormat;
 use chrono::Utc;
+use lore_telemetry::InstrumentProvider;
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::Counter;
 use ring::hmac;
 use serde_json::Value;
 use serde_json::json;
@@ -213,6 +217,59 @@ fn sign_event(secret: &str, timestamp: i64, raw_body: &[u8]) -> String {
     format!("sha256={}", hex::encode(tag.as_ref()))
 }
 
+/// OpenTelemetry instruments for the notify hook (WP-066 Part 1 observability). A
+/// failed POST is otherwise invisible (logged and dropped), so we cannot know the
+/// loss rate. Cached in a `OnceLock` so the counter is built once, not per event —
+/// mirrors `crate::util::cert_metrics`.
+struct LorehubNotifyInstrumentProvider;
+
+impl InstrumentProvider for LorehubNotifyInstrumentProvider {
+    fn namespace(&self) -> &'static str {
+        "urc.hooks"
+    }
+}
+
+struct LorehubNotifyInstruments {
+    deliveries: Counter<u64>,
+}
+
+impl LorehubNotifyInstruments {
+    fn new() -> Self {
+        let provider = LorehubNotifyInstrumentProvider;
+        let meter = provider.meter();
+        Self {
+            deliveries: meter
+                .u64_counter(provider.scope_name("lorehub_notify.deliveries"))
+                .with_description(
+                    "lorehub_notify event POSTs to the Lorehub platform, by event_type + outcome",
+                )
+                .build(),
+        }
+    }
+
+    fn instance() -> &'static LorehubNotifyInstruments {
+        // Caches the counter against whatever meter the global provider yields on the
+        // FIRST event. Safe because hooks fire long after telemetry init at boot; if
+        // init ever moved after the first post-commit hook, this would pin a no-op
+        // counter (same ordering assumption as `crate::util::cert_metrics`).
+        static INSTANCE: OnceLock<LorehubNotifyInstruments> = OnceLock::new();
+        INSTANCE.get_or_init(LorehubNotifyInstruments::new)
+    }
+}
+
+/// Increment the delivery counter for one POST outcome. Fire-and-forget: metrics
+/// must never affect delivery. `outcome` ∈
+/// `success | http_error | transport_error | timeout | serialize_error`.
+fn record_delivery(event_type: &'static str, outcome: &'static str) {
+    LorehubNotifyInstruments::instance().deliveries.add(
+        1,
+        &[
+            KeyValue::new("event_type", event_type),
+            KeyValue::new("outcome", outcome),
+        ],
+    );
+}
+
 /// A configured `lorehub_notify` hook instance.
 struct LorehubNotifyHook {
     webhook_url: String,
@@ -234,10 +291,20 @@ impl Hook for LorehubNotifyHook {
         let now = Utc::now();
         let timestamp = now.timestamp();
         let fields = EventFields::from_context(ctx, now);
+        // `&'static str` label; safe as an OTel attribute value.
+        let event_type = fields.event_type;
 
         // Serialize once; these exact bytes are both signed and sent.
-        let raw_body = serde_json::to_vec(&fields.to_payload())
-            .map_err(|e| HookError::execution_failed(HOOK_NAME, format!("serialize: {e}")))?;
+        let raw_body = match serde_json::to_vec(&fields.to_payload()) {
+            Ok(body) => body,
+            Err(e) => {
+                record_delivery(event_type, "serialize_error");
+                return Err(HookError::execution_failed(
+                    HOOK_NAME,
+                    format!("serialize: {e}"),
+                ));
+            }
+        };
         let signature = sign_event(&self.hmac_secret, timestamp, &raw_body);
 
         debug!(
@@ -247,7 +314,7 @@ impl Hook for LorehubNotifyHook {
             "Posting lorehub event"
         );
 
-        let response = self
+        let response = match self
             .client
             .post(&self.webhook_url)
             .header(http::header::CONTENT_TYPE, "application/json")
@@ -256,15 +323,29 @@ impl Hook for LorehubNotifyHook {
             .body(raw_body)
             .send()
             .await
-            .map_err(|e| HookError::execution_failed(HOOK_NAME, format!("post: {e}")))?;
+        {
+            Ok(response) => response,
+            Err(e) => {
+                // A per-request timeout surfaces here too; split it out for a cleaner signal.
+                let outcome = if e.is_timeout() {
+                    "timeout"
+                } else {
+                    "transport_error"
+                };
+                record_delivery(event_type, outcome);
+                return Err(HookError::execution_failed(HOOK_NAME, format!("post: {e}")));
+            }
+        };
 
         if !response.status().is_success() {
+            record_delivery(event_type, "http_error");
             return Err(HookError::execution_failed(
                 HOOK_NAME,
                 format!("receiver returned {}", response.status()),
             ));
         }
 
+        record_delivery(event_type, "success");
         Ok(())
     }
 }
@@ -621,6 +702,162 @@ mod tests {
         let hook = factory.create(&config).expect("valid config builds a hook");
         assert_eq!(hook.name(), "lorehub_notify");
         assert_eq!(hook.hook_points(), HookPoint::all());
+    }
+
+    /// Builds a `LorehubNotifyHook` pointed at `webhook_url`, with a client
+    /// timeout of `client_timeout` (short for the timeout-path test, generous
+    /// for the others).
+    fn hook_with_url(webhook_url: String, client_timeout: Duration) -> LorehubNotifyHook {
+        LorehubNotifyHook {
+            webhook_url,
+            hmac_secret: "test-secret".to_string(),
+            client: reqwest::Client::builder()
+                .timeout(client_timeout)
+                .build()
+                .expect("build reqwest client"),
+        }
+    }
+
+    /// Starts a real HTTP server on an ephemeral loopback port that always
+    /// responds with `status`, so `post_handler`'s `reqwest` client has a real
+    /// socket to talk to. Mirrors `repository_query.rs`'s
+    /// `authz_test_support::start_stub_auth_server` bind-then-serve pattern
+    /// (no drop-rebind TOCTOU, no readiness sleep needed: the socket is in the
+    /// OS backlog as soon as `bind` returns).
+    async fn start_stub_receiver(status: axum::http::StatusCode) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("read local_addr");
+
+        let app = axum::Router::new().route(
+            "/internal/lore-events",
+            axum::routing::post(move || async move { status }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        format!("http://{addr}/internal/lore-events")
+    }
+
+    // `post_handler`'s error-return behavior is the only outcome-classification
+    // signal observable without reading the OTel counter (see the module-level
+    // gotcha note below on why the counter itself is left untested at this
+    // tier). These three cases distinguish the branches that produce a
+    // different `Result`; success and http_error additionally distinguish by
+    // message content.
+
+    #[tokio::test]
+    async fn post_handler_succeeds_and_records_success_on_2xx() {
+        let url = start_stub_receiver(axum::http::StatusCode::OK).await;
+        let hook = hook_with_url(url, Duration::from_secs(5));
+
+        let result = hook.post_handler(&push_context()).await;
+        assert!(
+            result.is_ok(),
+            "expected Ok on a 2xx response, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_handler_errors_and_records_http_error_on_non_2xx() {
+        let url = start_stub_receiver(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        let hook = hook_with_url(url, Duration::from_secs(5));
+
+        let err = hook
+            .post_handler(&push_context())
+            .await
+            .expect_err("expected Err on a 500 response");
+        assert!(
+            format!("{err}").contains("500"),
+            "error should surface the receiver's status: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_handler_errors_and_records_transport_error_when_unreachable() {
+        // Bind then immediately drop: nothing listens on this port, so the
+        // connection is refused (a `transport_error` outcome, distinct from
+        // `timeout`). Tiny TOCTOU window (another process could grab the port
+        // before we connect) is an accepted, extremely unlikely flake source.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("read local_addr");
+        drop(listener);
+
+        let hook = hook_with_url(
+            format!("http://{addr}/internal/lore-events"),
+            Duration::from_secs(5),
+        );
+
+        let err = hook
+            .post_handler(&push_context())
+            .await
+            .expect_err("expected Err when the receiver is unreachable");
+        assert!(
+            format!("{err}").contains("post:"),
+            "error should be the post-phase error: {err}"
+        );
+    }
+
+    /// `post_handler` classifies a failed POST as `"timeout"` vs
+    /// `"transport_error"` purely on `reqwest::Error::is_timeout()` — confirm
+    /// that predicate actually distinguishes a client-side timeout from a
+    /// connection refusal on this reqwest version, since that classification
+    /// itself is only observable through the OTel counter label (untestable
+    /// here, see the gotcha note below), not through `post_handler`'s return
+    /// value.
+    #[tokio::test]
+    async fn reqwest_is_timeout_distinguishes_timeout_from_connection_refused() {
+        // Connection refused: nobody listens.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let refused_addr = listener.local_addr().expect("read local_addr");
+        drop(listener);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build reqwest client");
+        let refused_err = client
+            .get(format!("http://{refused_addr}/"))
+            .send()
+            .await
+            .expect_err("connection should be refused");
+        assert!(
+            !refused_err.is_timeout(),
+            "a connection-refused error must not read as a timeout"
+        );
+
+        // Client-side timeout: something accepts the connection and holds it
+        // open, but never writes a response.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let hung_addr = listener.local_addr().expect("read local_addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket); // keep the connection open; never respond
+            }
+        });
+
+        let timeout_client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .expect("build reqwest client");
+        let timeout_err = timeout_client
+            .get(format!("http://{hung_addr}/"))
+            .send()
+            .await
+            .expect_err("request should time out");
+        assert!(
+            timeout_err.is_timeout(),
+            "a held-open, non-responding connection must read as a timeout"
+        );
     }
 
     #[test]

@@ -147,6 +147,61 @@ the next run starts from the map instead of rediscovering it.
   implementation commit, reported back rather than reformatted (out of test-code scope). Confirmed via
   `cargo +nightly fmt --all -- --check` showing only that one `Diff in ... lock_service.rs:178/186`
   after all test-code edits were applied.
+- **WP-066 Part 1 (`lorehub_notify.deliveries` OTel counter, [SERVER])** —
+  `lore-server/src/hooks/lorehub_notify.rs`. A `Counter<u64>` (`urc.hooks.lorehub_notify.deliveries`,
+  labels `event_type` + `outcome` ∈ `success|http_error|transport_error|timeout|serialize_error`),
+  built via `lore_telemetry::InstrumentProvider` and cached in a module-local `OnceLock`
+  (`LorehubNotifyInstruments::instance()`, mirrors `util/cert_metrics.rs`); `record_delivery(...)`
+  called at all 5 terminal sites in `post_handler`. **The counter itself is deliberately left
+  untested at the unit tier** — decided not to force it, for two compounding reasons found while
+  investigating:
+  1. `lore_telemetry::metrics::METER_PROVIDER` (`lore-telemetry/src/metrics/mod.rs:27`) is a
+     **process-wide** `OnceLock<RwLock<Arc<SdkMeterProvider>>>`, not per-test/per-thread — it's
+     `lore-server`'s own indirection layer in front of OTel (NOT `opentelemetry::global`), shared by
+     `cargo test -p lore-server`'s single test binary across every module. Swapping it to an
+     in-memory reader (`opentelemetry_sdk`'s `testing` feature — already a `[dev-dependencies]`
+     entry, `lore-server/Cargo.toml:90`, so no new dep needed) for one test would rebind whichever
+     other concurrently-running test's instrument happens to be first-constructed after the swap too
+     — a real shared-mutable-global-state test-isolation violation (`lore/CLAUDE.md` "Tests must be
+     independent/isolated"), not a one-line fix.
+  2. Even ignoring that, `LorehubNotifyInstruments::instance()`'s `OnceLock` binds the `Counter` to
+     whichever `SdkMeterProvider` was active at **first-ever** construction in the process — a later
+     `set_meter_provider` call doesn't rebind an already-built instrument. Since nothing else in
+     `lore-server` currently calls `record_delivery`/`post_handler`, a test-first swap is
+     order-dependent (works today only because no other test races it) and would silently stop
+     working the moment a second test anywhere touches this hook — a fragile invariant to build a
+     real assertion on.
+  - What's covered instead: `post_handler`-level behavior tests for the 3 outcomes distinguishable
+    via its **returned `Result`** (the POST's error-return behavior, unchanged by this delta) —
+    `post_handler_succeeds_and_records_success_on_2xx` (real ephemeral-port `axum::serve` stub
+    returning 200 → `Ok`), `post_handler_errors_and_records_http_error_on_non_2xx` (500 → `Err`
+    containing the status), `post_handler_errors_and_records_transport_error_when_unreachable`
+    (bind-then-drop a port → `Err` containing `"post:"`). Plus one predicate-level test,
+    `reqwest_is_timeout_distinguishes_timeout_from_connection_refused`, that empirically confirms
+    `reqwest::Error::is_timeout()` — the exact boolean `post_handler`'s `outcome` classification
+    branches on — reads `false` for connection-refused and `true` for a held-open,
+    never-responding connection (300 ms client timeout; stable across repeat local runs). The
+    `timeout` vs `transport_error` **label** split itself is NOT independently verifiable this way
+    (both produce an identical `Err` shape from `post_handler` — the distinction is only visible in
+    the counter), and `serialize_error` is practically unreachable (the `Value` here is built from
+    known-finite strings/`Option<u64>`, so `serde_json::to_vec` doesn't fail in practice) — both left
+    to manual/integration verification (e.g. scraping `/metrics` against a real dev stack). Coverage:
+    `cargo test -p lore-server --lib -- hooks::lorehub_notify` (16 tests, was 12 pre-WP-066).
+  - **Gotcha — new tests need a real listening socket for `reqwest` to connect to**, not
+    `axum_test::TestServer`'s default in-process mock transport (used everywhere else in
+    `lore-server` for handler tests, e.g. `http/health_check.rs`) — that only works because those
+    tests exercise the *server* side. Here we're testing our own HTTP *client* code, so the receiver
+    needs a real port: `tokio::net::TcpListener::bind("127.0.0.1:0")` + `axum::serve(listener, app)`
+    in a `tokio::spawn`, mirroring `repository_query.rs::authz_test_support::start_stub_auth_server`'s
+    bind-then-serve pattern (no drop-rebind TOCTOU, no readiness sleep — socket is already in the OS
+    backlog when `bind` returns). For the deliberately-unreachable case, bind-then-**drop** (opposite
+    of that pattern) is the right tool — we want the port empty so the connection is refused; tiny
+    accepted TOCTOU risk (another process could theoretically grab the port first).
+  - **Gate note:** `cargo +nightly fmt --all -- --check` on this file flags 2 diffs in the
+    **implementation** (not test) code added by this same delta — `lorehub_notify.rs:295` (the
+    `serialize_error` `Err` arm) and `:320` (the `outcome = if e.is_timeout() {...}` binding) are not
+    nightly-fmt-clean. Reported back rather than reformatted (out of test-code scope), same pattern
+    as the CR-015 gotcha above.
 - **CR-008 (per-entry byte size on tree reads, [SERVER])** — additive proto3 optional
   `TreeNode.size_bytes` (FILE only, unset for DIRECTORY/LINK) + `Revision.total_size_bytes` on
   `lore.thin_client.v1`; `lore-revision/src/state.rs` `TreePath.size` (<- `node.size`, populated in
