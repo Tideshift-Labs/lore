@@ -65,6 +65,18 @@ fn cache() -> &'static AuthzCache {
     AUTHZ_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Evicts every exchanged authorization token from the in-memory cache.
+/// Entries are keyed per `(auth_url, identity, resource, recipient_domain)`
+/// and otherwise live until process exit — a credential reset (sign-out) must
+/// drop them so a later session cannot reuse the previous identity's tokens.
+/// Called from `connection::drop_connections()` as part of the full transport
+/// reset.
+pub async fn clear_authz_cache() {
+    if let Some(cache) = AUTHZ_CACHE.get() {
+        cache.lock().await.clear();
+    }
+}
+
 pub fn is_expired(expires: u64) -> bool {
     let expires = expires as u128;
     let current_time = SystemTime::now()

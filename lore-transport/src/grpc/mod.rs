@@ -251,8 +251,27 @@ async fn grpc_auth_refresher(
         )
         .await;
 
-        let mut auth = auth.write();
+        apply_refreshed_tokens(&auth, authentication_token, authorization_token);
+    }
+}
+
+/// Folds a refresh exchange's result into the cached auth. An empty result must
+/// not clobber a still-valid token: `inject_authorization` sends NO
+/// `authorization` header at all for an empty token, so a transient
+/// auth-endpoint outage would otherwise wedge every subsequent request until
+/// process exit even after the endpoint recovers. Keeping the previous token is
+/// safe — if it has really expired the server rejects it as a bad token, which
+/// is classifiable, unlike a missing header.
+fn apply_refreshed_tokens(
+    auth: &parking_lot::RwLock<GRPCAuth>,
+    authentication_token: String,
+    authorization_token: String,
+) {
+    let mut auth = auth.write();
+    if !authentication_token.is_empty() {
         auth.authentication_token = authentication_token;
+    }
+    if !authorization_token.is_empty() {
         auth.authorization_token = authorization_token;
     }
 }
@@ -285,9 +304,7 @@ async fn grpc_auth_refresher_custom_resource(
         )
         .await;
 
-        let mut auth = auth.write();
-        auth.authentication_token = authentication_token;
-        auth.authorization_token = authorization_token;
+        apply_refreshed_tokens(&auth, authentication_token, authorization_token);
     }
 }
 
@@ -611,6 +628,19 @@ impl GRPCConnection {
 #[allow(clippy::type_complexity)]
 static CONNECTION_MAP: OnceLock<Mutex<Option<HashMap<String, Arc<RwLock<Weak<GRPCConnection>>>>>>> =
     OnceLock::new();
+
+/// Clears the process-global gRPC connection cache. The cache holds a
+/// `Weak<GRPCConnection>` per remote; if any strong reference to a
+/// `GRPCConnection` (and the per-resource `GRPCAuth` token cache it carries)
+/// survives a credential reset, `connect(reuse=true)` upgrades the `Weak` and
+/// resurrects the stale connection — auth state included — for the rest of the
+/// process's life. Dropping the map entries severs that resurrection path so
+/// the next connect builds a fresh channel and a fresh auth exchange. Called
+/// from `connection::drop_connections()` as part of the full transport reset.
+pub async fn drop_grpc_connections() {
+    let mut map = CONNECTION_MAP.get_or_init(|| Mutex::new(None)).lock().await;
+    *map = None;
+}
 
 async fn lock_connection(remote_url: &Url) -> Arc<RwLock<Weak<GRPCConnection>>> {
     let remote_url = remote_url.to_string();
@@ -1860,5 +1890,97 @@ mod tests {
             (1..=MAX_RECONNECTS_PER_OP as u32).collect::<Vec<_>>(),
             "each attempt must observe the epoch left by the previous rebuild",
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seeded_auth(authn: &str, authz: &str) -> parking_lot::RwLock<GRPCAuth> {
+        parking_lot::RwLock::new(GRPCAuth {
+            remote_domain: "example.com".to_string(),
+            authentication_token: authn.to_string(),
+            authorization_token: authz.to_string(),
+            refresher: None,
+        })
+    }
+
+    // CR-017(b): a refresh exchange that comes back empty (transient
+    // auth-endpoint outage) must not clobber a still-valid cached token --
+    // `inject_authorization` sends no header at all for an empty token, which
+    // would otherwise wedge every subsequent request.
+
+    #[test]
+    fn apply_refreshed_tokens_both_empty_leaves_previous_values() {
+        let auth = seeded_auth("prev-authn", "prev-authz");
+        apply_refreshed_tokens(&auth, String::new(), String::new());
+        let auth = auth.read();
+        assert_eq!(auth.authentication_token, "prev-authn");
+        assert_eq!(auth.authorization_token, "prev-authz");
+    }
+
+    #[test]
+    fn apply_refreshed_tokens_both_non_empty_overwrites() {
+        let auth = seeded_auth("prev-authn", "prev-authz");
+        apply_refreshed_tokens(&auth, "new-authn".to_string(), "new-authz".to_string());
+        let auth = auth.read();
+        assert_eq!(auth.authentication_token, "new-authn");
+        assert_eq!(auth.authorization_token, "new-authz");
+    }
+
+    #[test]
+    fn apply_refreshed_tokens_empty_authn_updates_only_authz() {
+        let auth = seeded_auth("prev-authn", "prev-authz");
+        apply_refreshed_tokens(&auth, String::new(), "new-authz".to_string());
+        let auth = auth.read();
+        assert_eq!(auth.authentication_token, "prev-authn");
+        assert_eq!(auth.authorization_token, "new-authz");
+    }
+
+    #[test]
+    fn apply_refreshed_tokens_empty_authz_updates_only_authn() {
+        let auth = seeded_auth("prev-authn", "prev-authz");
+        apply_refreshed_tokens(&auth, "new-authn".to_string(), String::new());
+        let auth = auth.read();
+        assert_eq!(auth.authentication_token, "new-authn");
+        assert_eq!(auth.authorization_token, "prev-authz");
+    }
+
+    #[test]
+    fn apply_refreshed_tokens_empty_over_empty_stays_empty() {
+        let auth = seeded_auth("", "");
+        apply_refreshed_tokens(&auth, String::new(), String::new());
+        let auth = auth.read();
+        assert_eq!(auth.authentication_token, "");
+        assert_eq!(auth.authorization_token, "");
+    }
+
+    // CR-017(a): dropping the gRPC connection cache must sever the
+    // resurrection path -- a fresh `lock_connection` for the same URL after
+    // `drop_grpc_connections()` must be a distinct map entry, not the same
+    // one. Uses a unique URL per test and asserts only on that key's identity
+    // (never on global map size) since `CONNECTION_MAP` is process-global and
+    // shared with every other test in this crate's test binary.
+
+    #[tokio::test]
+    async fn drop_grpc_connections_clears_seeded_entry() {
+        let url = Url::parse("http://cr017-test-host-a:41337").expect("valid test url");
+        let first = lock_connection(&url).await;
+        drop_grpc_connections().await;
+        let second = lock_connection(&url).await;
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "expected a fresh map entry after drop_grpc_connections, got the same Arc"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_grpc_connections_is_noop_when_map_absent() {
+        // Calling drop twice in a row: the second call always finds the map
+        // already `None` (the first call just cleared it), proving the
+        // never-populated / already-cleared path doesn't panic.
+        drop_grpc_connections().await;
+        drop_grpc_connections().await;
     }
 }
