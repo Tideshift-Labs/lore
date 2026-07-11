@@ -20,6 +20,7 @@ impl From<tonic::Status> for ProtocolError {
     fn from(value: tonic::Status) -> Self {
         match value.code() {
             tonic::Code::Unavailable | tonic::Code::Unknown => ProtocolError::from(Disconnected),
+            tonic::Code::Unauthenticated => ProtocolError::from(NotAuthenticated),
             tonic::Code::PermissionDenied => ProtocolError::from(NotAuthorized),
             tonic::Code::NotFound => ProtocolError::from(NotFound),
             tonic::Code::ResourceExhausted => ProtocolError::from(SlowDown),
@@ -55,5 +56,42 @@ impl From<ProtocolError> for tonic::Status {
                 tonic::Status::new(tonic::Code::Internal, msg)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // CR-017(c): a server-side auth rejection must classify as `NotAuthenticated`
+    // (FFI 12), not collapse into the catch-all `Internal` (FFI -1) — a client
+    // needs to distinguish "not authenticated" from an opaque internal error to
+    // drive recovery (WP-074 Phase 1).
+    #[test]
+    fn unauthenticated_status_maps_to_not_authenticated() {
+        let status = tonic::Status::unauthenticated("authorization header required");
+        let err = ProtocolError::from(status);
+        assert!(matches!(err, ProtocolError::NotAuthenticated(_)));
+        assert_eq!(err.ffi_code(), 12);
+    }
+
+    // Regression pin: a neighboring arm untouched by CR-017(c) still classifies
+    // correctly.
+    #[test]
+    fn unavailable_status_maps_to_disconnected() {
+        let status = tonic::Status::unavailable("server unreachable");
+        let err = ProtocolError::from(status);
+        assert!(matches!(err, ProtocolError::Disconnected(_)));
+        assert_eq!(err.ffi_code(), 6);
+    }
+
+    // An unmapped tonic code still falls through to `Internal`, not
+    // `NotAuthenticated` or any other handleable variant.
+    #[test]
+    fn unmapped_status_falls_back_to_internal() {
+        let status = tonic::Status::internal("something went wrong");
+        let err = ProtocolError::from(status);
+        assert!(matches!(err, ProtocolError::Internal(_)));
+        assert_eq!(err.ffi_code(), -1);
     }
 }

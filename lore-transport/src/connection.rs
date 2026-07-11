@@ -128,11 +128,17 @@ pub fn remove_connection(connection: Arc<Connection>) {
 }
 
 pub fn drop_connections() {
-    if let Some(map) = CONNECTION_MAP.lock().take() {
-        // This is done during library shutdown, setup a dummy context
-        // for dropping the remaining connections
-        tokio::task::block_in_place(move || {
-            runtime().block_on(async {
+    let map = CONNECTION_MAP.lock().take();
+    // This is done during library shutdown, setup a dummy context
+    // for dropping the remaining connections.
+    //
+    // NOTE: `block_in_place` now runs even when the pool is already empty (the
+    // cache clears below must run unconditionally), so this panics if called
+    // from a CURRENT-THREAD tokio runtime — same constraint the non-empty path
+    // always had, now unconditional. Callers run on multi-thread runtimes.
+    tokio::task::block_in_place(move || {
+        runtime().block_on(async {
+            if let Some(map) = map {
                 for connection in map {
                     let _ = connection.1.cancel_connect().await;
                     // Drain in-flight streams and flush transport close frames to the peer
@@ -140,9 +146,16 @@ pub fn drop_connections() {
                     // outstanding stream read as a transport error on client exit.
                     connection.1.close_transport().await;
                 }
-            });
+            }
+            // A full transport reset also has to cover the OTHER process-global
+            // auth-bearing caches, even when this pool is already empty: the
+            // gRPC connection cache can resurrect a stale connection (and its
+            // token cache) via a surviving strong reference, and the exchanged
+            // authz-token cache has no expiry-driven eviction of its own.
+            crate::grpc::drop_grpc_connections().await;
+            crate::auth::exchange::clear_authz_cache().await;
         });
-    }
+    });
 }
 
 pub fn parse(remote_url: &str) -> Result<(Url, Arc<dyn Protocol>), ProtocolError> {

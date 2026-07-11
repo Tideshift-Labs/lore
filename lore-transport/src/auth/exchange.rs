@@ -53,6 +53,18 @@ fn cache() -> &'static AuthzCache {
     AUTHZ_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Evicts every exchanged authorization token from the in-memory cache.
+/// Entries are keyed per `(auth_url, identity, resource, recipient_domain)`
+/// and otherwise live until process exit — a credential reset (sign-out) must
+/// drop them so a later session cannot reuse the previous identity's tokens.
+/// Called from `connection::drop_connections()` as part of the full transport
+/// reset.
+pub async fn clear_authz_cache() {
+    if let Some(cache) = AUTHZ_CACHE.get() {
+        cache.lock().await.clear();
+    }
+}
+
 pub fn is_expired(expires: u64) -> bool {
     let expires = expires as u128;
     let current_time = SystemTime::now()
@@ -614,4 +626,41 @@ async fn auth_exchange_custom_resource_for_identity(
         authorization_token,
         identity.to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // CR-017(a): a full transport reset must evict the authz-exchange cache --
+    // it has no expiry-driven eviction of its own, so a post-logout identity
+    // switch would otherwise be able to reuse the previous identity's tokens.
+
+    #[tokio::test]
+    async fn clear_authz_cache_evicts_seeded_entry() {
+        let key = (
+            "https://auth.cr017-test.example".to_string(),
+            "identity-cr017".to_string(),
+            "resource-cr017".to_string(),
+            "domain-cr017.example".to_string(),
+        );
+        cache()
+            .lock()
+            .await
+            .insert(key.clone(), "token-value".to_string());
+
+        clear_authz_cache().await;
+
+        assert!(!cache().lock().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn clear_authz_cache_is_noop_when_never_populated() {
+        // `AUTHZ_CACHE` is a process-global `OnceLock` shared with every other
+        // test in this crate's test binary, so this can't prove the OnceLock
+        // is literally unset when this runs -- it proves the no-op path
+        // (nothing to clear, or already cleared) doesn't panic either way.
+        clear_authz_cache().await;
+        clear_authz_cache().await;
+    }
 }

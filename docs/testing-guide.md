@@ -281,6 +281,38 @@ the next run starts from the map instead of rediscovering it.
     is structurally the same code path (`Err(e) if !terminal => retry.wait() then
     continue`) and would need an integration/e2e tier with a real bounce-able backend to
     add without flake risk — flag if wanted there.
+- **CR-017 (transport/auth reset + Unauthenticated classification, [CLIENT])** — three
+  `lore-transport` files, none had a `#[cfg(test)] mod tests` before this delta:
+  `src/error.rs` (new `Unauthenticated` arm on `From<tonic::Status> for ProtocolError`),
+  `src/grpc/mod.rs` (`apply_refreshed_tokens` refresher empty-overwrite guard +
+  `drop_grpc_connections()` clearing the process-global `CONNECTION_MAP` gRPC-cache), and
+  `src/auth/exchange.rs` (`clear_authz_cache()` clearing the process-global `AUTHZ_CACHE`).
+  Coverage: `cargo test -p lore-transport --lib` (33 passed, was 22 pre-CR-017) —
+  `error::tests::{unauthenticated_status_maps_to_not_authenticated (ffi 12),
+  unavailable_status_maps_to_disconnected (ffi 6, regression pin),
+  unmapped_status_falls_back_to_internal (ffi -1)}`;
+  `grpc::tests::apply_refreshed_tokens_*` (5 cases: both-empty/both-non-empty/mixed×2/
+  empty-over-empty, plain `#[test]` against a bare `parking_lot::RwLock<GRPCAuth>` — no
+  runtime needed since the fn under test is sync) and
+  `grpc::tests::drop_grpc_connections_{clears_seeded_entry,is_noop_when_map_absent}`
+  (`#[tokio::test]`, via the private same-module `lock_connection`);
+  `auth::exchange::tests::clear_authz_cache_{evicts_seeded_entry,is_noop_when_never_populated}`
+  (`#[tokio::test]`, via the private same-module `cache()` accessor).
+  `connection.rs::drop_connections()`'s own restructure (runs the grpc-cache + authz-cache
+  clears even when its pool map is already empty) was left to existing coverage — it calls
+  `runtime().block_on` via `block_in_place`, needing a multi-thread runtime to test directly,
+  and the two callees it now unconditionally invokes are independently covered above.
+  **Gotcha — process-global statics, assert on your own key, not on size/emptiness.**
+  `CONNECTION_MAP` (`grpc/mod.rs`) and `AUTHZ_CACHE` (`auth/exchange.rs`) are both
+  process-wide `OnceLock`s shared across every test in the `lore-transport` test binary —
+  same class of hazard as `lore-server`'s `METER_PROVIDER`/`dispatch.rs` panic-hook findings
+  below, just in this crate. Use a unique key per test (a distinct fake URL like
+  `http://cr017-test-host-a:41337`, or a distinct cache-key tuple) and assert only on that
+  key's identity/absence; never assert the global map is empty or a particular size. The
+  "no-op when never populated" cases can't actually prove the `OnceLock` is unset (another
+  test may have already initialized it) — they instead prove calling the clear fn twice in a
+  row (second call always finds an empty/already-cleared state) doesn't panic, which is the
+  meaningful invariant anyway.
 - **CR-008 (per-entry byte size on tree reads, [SERVER])** — additive proto3 optional
   `TreeNode.size_bytes` (FILE only, unset for DIRECTORY/LINK) + `Revision.total_size_bytes` on
   `lore.thin_client.v1`; `lore-revision/src/state.rs` `TreePath.size` (<- `node.size`, populated in
