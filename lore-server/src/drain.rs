@@ -801,4 +801,104 @@ mod tests {
             .expect("run_drain should notice the pending handshake clear and return")
             .expect("run_drain task panicked");
     }
+
+    // --- gRPC/HTTP shutdown-signal composition --------------------------
+    //
+    // `server.rs::launch_grpc_server` (and `launch_http_server`, the
+    // pre-existing pattern it mirrors) build the tonic/axum shutdown future
+    // inline as `shutdown_rx.wait_for(|&v| v).await; if graceful_drain {
+    // drain_state.wait_idle().await; }` — there is no free fn to call
+    // directly, and pinning the "active connections keep it pending" case
+    // needs the same private `count` poke on `QuinnConnectionRegistry` used
+    // above, which is only reachable from a `drain`-module test. `shutdown_signal`
+    // below is a same-shape, test-only mirror (not a call into server.rs) kept
+    // behavior-identical to the two call sites; a future edit to either that
+    // changes the composition itself won't be caught here, only a drift in
+    // `wait_idle`/`total_active` semantics will.
+
+    async fn shutdown_signal(
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        drain_state: std::sync::Arc<DrainState>,
+        graceful_drain: bool,
+    ) {
+        let _ = shutdown_rx.wait_for(|&v| v).await;
+        if graceful_drain {
+            drain_state.wait_idle().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_signal_does_not_resolve_before_shutdown_fires() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let state = DrainState::new();
+
+        let handle = tokio::spawn(shutdown_signal(rx, state, true));
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !handle.is_finished(),
+            "must wait for the shutdown watch to fire before considering the drain state at all"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_signal_resolves_immediately_when_graceful_drain_is_off() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let state = DrainState::new();
+        let registry = super::QuinnConnectionRegistry::new("public");
+        registry.count.store(3, Ordering::Relaxed);
+        state.add_registry(registry);
+
+        tx.send(true).expect("receiver still alive");
+
+        tokio::time::timeout(Duration::from_secs(1), shutdown_signal(rx, state, false))
+            .await
+            .expect(
+                "graceful_drain=false must resolve on the shutdown signal alone, ignoring \
+                 active connections entirely",
+            );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_signal_with_graceful_drain_and_zero_active_resolves_promptly() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let state = DrainState::new();
+        tx.send(true).expect("receiver still alive");
+
+        tokio::time::timeout(Duration::from_secs(1), shutdown_signal(rx, state, true))
+            .await
+            .expect(
+                "graceful_drain=true with nothing active must resolve promptly, not hang \
+                 waiting on a wait_idle poll that was already satisfied",
+            );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_signal_with_graceful_drain_waits_for_active_then_resolves() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let state = DrainState::new();
+        let registry = super::QuinnConnectionRegistry::new("public");
+        registry.count.store(1, Ordering::Relaxed);
+        state.add_registry(registry.clone());
+
+        tx.send(true).expect("receiver still alive");
+
+        let handle = tokio::spawn(shutdown_signal(rx, state, true));
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !handle.is_finished(),
+            "graceful_drain=true must keep the signal future pending — this is the exact \
+             behavior the gRPC leg was missing before this delta — while a connection is active"
+        );
+
+        registry.count.store(0, Ordering::Relaxed);
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("shutdown_signal should resolve once total_active() reaches zero")
+            .expect("shutdown_signal task panicked");
+    }
 }
