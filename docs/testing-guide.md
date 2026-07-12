@@ -313,6 +313,26 @@ the next run starts from the map instead of rediscovering it.
   test may have already initialized it) — they instead prove calling the clear fn twice in a
   row (second call always finds an empty/already-cleared state) doesn't panic, which is the
   meaningful invariant anyway.
+- **CR-009 follow-up: gRPC-leg drain wiring, [SERVER]** — `lore-server/src/server.rs`.
+  `launch_grpc_server` gained `drain_state: Arc<DrainState>, graceful_drain: bool` params; its
+  tonic shutdown future now does `shutdown_rx.wait_for(...).await; if graceful_drain {
+  drain_state.wait_idle().await; }` before letting tonic begin graceful shutdown — mirroring
+  `launch_http_server`'s pre-existing identical pattern (that one was already wired to
+  `DrainState`; the public gRPC server previously wasn't, so it tore down ~instantly on SIGTERM
+  and could sever a push's finalizing `branch_push` RPC mid-QUIC-drain). No implementation
+  changes made for this delta (test-only pass). **No dedicated unit test for `launch_grpc_server`
+  itself** — same as `launch_http_server`, its shutdown future is inline (an `async move` block
+  passed straight into `.serve(...)`), not a named/callable fn, so neither call site has one.
+  Instead, `lore-server/src/drain.rs::tests` (NOT `server.rs::tests` — see gotcha below) gained
+  a `shutdown_signal` test-only mirror of the exact composition plus 4 tests pinning its shape:
+  `shutdown_signal_does_not_resolve_before_shutdown_fires`,
+  `shutdown_signal_resolves_immediately_when_graceful_drain_is_off`,
+  `shutdown_signal_with_graceful_drain_and_zero_active_resolves_promptly`,
+  `shutdown_signal_with_graceful_drain_waits_for_active_then_resolves`.
+  `cargo test -p lore-server --lib -- drain::` (21 tests, was 17). Real cross-process SIGTERM
+  behavior (does the actual gRPC listener answer `branch_push` mid-drain) is left to the live
+  e2e in the desktop repo that found the bug in the first place — no mock-friendly seam for that
+  tier either, same call as CR-009's own QUIC-endpoint note above.
 - **CR-008 (per-entry byte size on tree reads, [SERVER])** — additive proto3 optional
   `TreeNode.size_bytes` (FILE only, unset for DIRECTORY/LINK) + `Revision.total_size_bytes` on
   `lore.thin_client.v1`; `lore-revision/src/state.rs` `TreePath.size` (<- `node.size`, populated in
@@ -465,6 +485,22 @@ the next run starts from the map instead of rediscovering it.
   `Some(0)` for an empty one where `hash_tree` stays zero and `state.tree()` returns `Tree::new_zeroed()`)
   and defer the real aggregate to the integration/e2e tier. The exact `Some(0)` was confirmed
   empirically (`eprintln!` + `-- --nocapture`), not assumed.
+- **A `server.rs`-inline shutdown/signal composition that touches `DrainState` may only be
+  pinnable from `drain.rs`'s own test module, not `server.rs`'s.** Symptom: want to prove
+  "shutdown fires, then (if graceful_drain) blocks until `DrainState` is empty" for
+  `launch_grpc_server`/`launch_http_server`'s inline shutdown future, using an "active
+  connections > 0" case — but there's no public way to make `DrainState::total_active() > 0`
+  without a real `quinn::Connection`. Cause: `QuinnConnectionRegistry`'s `count` field is
+  private to the `drain` module; the existing drain tests simulate activity by poking it
+  directly (`registry.count.store(n, Ordering::Relaxed)`, only legal because `drain::tests` is
+  a *child* module of `drain` and inherits field access — see the "White-box state" finding
+  above). `server::tests` is a sibling module, not a descendant, so it can't reach that field.
+  What to do: write the mirror/composition test in `drain.rs::tests` instead (it already has
+  the private-field access and everything `DrainState`-shaped needed), not in `server.rs`'s test
+  module, even though the behavior under test conceptually "belongs" to `server.rs`. Don't add a
+  `pub(crate)` test-only accessor on `ConnectionRegistry`/`DrainState` to unblock the other
+  direction unless the delta's author signs off — that's an implementation change. See CR-009
+  gRPC-leg follow-up above for the applied example (`drain::tests::shutdown_signal*`).
 - **Pre-existing flake, not ours: `hooks::dispatch::tests::test_dispatch_pre_panic_isolation`.**
   Symptom: `cargo test -p lore-server --lib -- hooks` intermittently fails with "Expected
   Panic error" at `dispatch.rs:1187` (~1-in-3 on this rig); the same filtered run is

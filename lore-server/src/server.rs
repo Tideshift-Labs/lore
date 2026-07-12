@@ -451,6 +451,8 @@ async fn launch_grpc_server(
     user_agent_filter: Arc<UserAgentFilter>,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    drain_state: Arc<DrainState>,
+    graceful_drain: bool,
 ) -> Result<()> {
     let grpc_settings = settings
         .server
@@ -533,6 +535,16 @@ async fn launch_grpc_server(
         .with_jwt_verifier(jwt_verifier, enforce_write_permission)?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
+            // Under graceful drain, keep the public gRPC surface up until the
+            // QUIC endpoints are empty. A push issues its finalizing
+            // `branch_push` RPC AFTER the fragment transfer, so tearing gRPC
+            // down at SIGTERM (while QUIC drains the transfer) fails exactly
+            // the in-flight work the drain exists to protect.
+            if graceful_drain {
+                info!("Draining gRPC server: serving until active transfers finish");
+                drain_state.wait_idle().await;
+                info!("gRPC server drained");
+            }
         })
         .await
 }
@@ -1907,6 +1919,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let user_agent_filter = user_agent_filter.clone();
             let forwarded_requests = forwarded_requests.clone();
             let shutdown_rx = _shutdown_rx.clone();
+            let drain_state = drain_state.clone();
 
             let local_immutable_store = local_store().unwrap_or_else(|| {
                 warn!("No local store available for gRPC server, operations requiring local store will route to the main store");
@@ -1926,6 +1939,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 user_agent_filter,
                 forwarded_requests,
                 shutdown_rx,
+                drain_state,
+                graceful_drain,
             )
         });
 
