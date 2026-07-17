@@ -71,8 +71,8 @@ pub(crate) fn extract_client_ip<T>(request: &Request<T>) -> Option<IpAddr> {
     request.remote_addr().map(|socket_addr| socket_addr.ip())
 }
 
-#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "BranchPush::handle", skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub async fn handler(
     request: Request<BranchPushRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
@@ -82,6 +82,7 @@ pub async fn handler(
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     instrument_provider: &impl InstrumentProvider,
+    lock_enforcement: Option<&Arc<dyn lore_revision::lock::LockStore>>,
 ) -> Result<Response<BranchPushResponse>, Status> {
     let user_info = get_authorization(request.extensions());
     let user_id = get_user_id(request.extensions());
@@ -143,6 +144,21 @@ pub async fn handler(
             hook_dispatcher
                 .dispatch_pre(HookPoint::BranchPush, &hook_ctx)
                 .map_err(hook_error_to_status)?;
+
+            // Opt-in advisory-lock enforcement (CR-019): reject if a changed
+            // path is locked by another user on this branch. `Some` only when
+            // the `enforce_locks_on_push` feature is on AND a lock store exists;
+            // absent → no behavior change (Lore's default advisory semantics).
+            if let Some(lock_store) = lock_enforcement {
+                crate::grpc::handlers::push_lock_guard::enforce_push_locks(
+                    repository.clone(),
+                    lock_store,
+                    branch,
+                    revision,
+                    &user_id,
+                )
+                .await?;
+            }
 
             let PushResult {
                 success,
