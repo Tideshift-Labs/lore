@@ -483,7 +483,9 @@ impl QuicService for StorageService {
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
         // Write-path permission gate (read ≠ write). The verified token lives in
         // the connection context (inserted by Connect); Load reads and is not
-        // gated, Store/Cas write, Verify writes only when healing.
+        // gated, Store/Cas write, Verify writes only when healing. EXHAUSTIVE on
+        // purpose: a new variant from an upstream merge must fail to compile here
+        // rather than silently fall through to "ungated".
         match &request {
             ParsedStorageRequest::Put(_) => self.require_write(&context, "Put")?,
             ParsedStorageRequest::Copy(_) => self.require_write(&context, "Copy")?,
@@ -494,7 +496,14 @@ impl QuicService for StorageService {
             ParsedStorageRequest::Verify(verify) if verify.heal != 0 => {
                 self.require_write(&context, "Verify(heal)")?
             }
-            _ => {}
+            // Reads (and Verify without heal) are ungated.
+            ParsedStorageRequest::Verify(_)
+            | ParsedStorageRequest::Get(_)
+            | ParsedStorageRequest::GetMetadata(_)
+            | ParsedStorageRequest::Query(_)
+            | ParsedStorageRequest::MutableLoad(_)
+            | ParsedStorageRequest::Connect(_)
+            | ParsedStorageRequest::Correlate(_) => {}
         }
 
         let lore_response = match request {

@@ -274,26 +274,28 @@ impl QuicService for StorageServiceV4 {
                 // Write-path permission gate (read ≠ write). The session has no
                 // per-request token; enforcement runs against the permissions
                 // snapshotted at AuthorizeStart. Verify counts as a write only
-                // when healing (it rewrites stored fragments).
+                // when healing (it rewrites stored fragments). The match is
+                // EXHAUSTIVE on purpose: a new `ParsedStorageRequest` variant
+                // (e.g. from an upstream merge) must fail to compile here so its
+                // write-vs-read classification is a deliberate decision, never a
+                // silent fall-through to "ungated".
+                use crate::quic::storage_service::ParsedStorageRequest as Req;
                 match &parsed {
-                    crate::quic::storage_service::ParsedStorageRequest::Put(_) => {
-                        self.require_write(&permissions, "Put")?;
+                    Req::Put(_) => self.require_write(&permissions, "Put")?,
+                    Req::Copy(_) => self.require_write(&permissions, "Copy")?,
+                    Req::MutableStoreOp(_) => self.require_write(&permissions, "MutableStore")?,
+                    Req::MutableCas(_) => self.require_write(&permissions, "MutableCas")?,
+                    Req::Verify(verify) if verify.heal != 0 => {
+                        self.require_write(&permissions, "Verify(heal)")?
                     }
-                    crate::quic::storage_service::ParsedStorageRequest::Copy(_) => {
-                        self.require_write(&permissions, "Copy")?;
-                    }
-                    crate::quic::storage_service::ParsedStorageRequest::MutableStoreOp(_) => {
-                        self.require_write(&permissions, "MutableStore")?;
-                    }
-                    crate::quic::storage_service::ParsedStorageRequest::MutableCas(_) => {
-                        self.require_write(&permissions, "MutableCas")?;
-                    }
-                    crate::quic::storage_service::ParsedStorageRequest::Verify(verify)
-                        if verify.heal != 0 =>
-                    {
-                        self.require_write(&permissions, "Verify(heal)")?;
-                    }
-                    _ => {}
+                    // Reads (and Verify without heal) are ungated.
+                    Req::Verify(_)
+                    | Req::Get(_)
+                    | Req::GetMetadata(_)
+                    | Req::Query(_)
+                    | Req::MutableLoad(_)
+                    | Req::Connect(_)
+                    | Req::Correlate(_) => {}
                 }
 
                 // Dispatch to standalone handler functions with explicit session context

@@ -36,6 +36,7 @@ use tower_http::classify::GrpcErrorsAsFailures;
 use tower_http::classify::SharedClassifier;
 use tower_http::trace::TraceLayer;
 use tracing::info;
+use tracing::warn;
 
 use super::lock_service::LoreLockService;
 use crate::auth::jwt::JwtVerifier;
@@ -531,6 +532,15 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         // the opt-in feature is on AND a lock store is configured; otherwise
         // `None` → the push handler behaves as stock Lore (no enforcement).
         let push_lock_enforcement = if self.0.feature.enforce_locks_on_push.unwrap_or(false) {
+            if self.0.lock_store.is_none() {
+                // Flag on but no lock store: enforcement silently cannot run.
+                // Warn loudly so this misconfiguration is not mistaken for
+                // "enforcement active".
+                warn!(
+                    "[feature] enforce_locks_on_push is true but no lock_store is configured; \
+                     push-lock enforcement is INACTIVE. Configure a lock_store or unset the flag."
+                );
+            }
             self.0.lock_store.clone()
         } else {
             None
