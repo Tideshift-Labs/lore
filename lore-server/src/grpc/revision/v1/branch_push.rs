@@ -60,6 +60,7 @@ pub async fn handler(
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     instrument_provider: &impl InstrumentProvider,
+    lock_enforcement: Option<&Arc<dyn lore_revision::lock::LockStore>>,
 ) -> Result<Response<BranchPushResponse>, Status> {
     let user_info = get_authorization(request.extensions());
     let user_id = get_user_id(request.extensions());
@@ -126,6 +127,19 @@ pub async fn handler(
                 .map_err(hook_error_to_status)?;
 
             ensure_branch_pushable(repository.clone(), branch_id).await?;
+
+            // Opt-in advisory-lock enforcement (CR-019); `Some` only when the
+            // feature is on AND a lock store exists. See the shared handler.
+            if let Some(lock_store) = lock_enforcement {
+                crate::grpc::handlers::push_lock_guard::enforce_push_locks(
+                    repository.clone(),
+                    lock_store,
+                    branch_id,
+                    revision,
+                    &user_id,
+                )
+                .await?;
+            }
 
             let PushResult {
                 success,
@@ -456,6 +470,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect("Request failed");
@@ -495,6 +510,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect_err("zero revision should fail");
@@ -536,6 +552,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect("first push should succeed");
@@ -552,6 +569,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect_err("stale parent push should fail");
@@ -593,6 +611,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect("first push should succeed");
@@ -607,6 +626,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect("force push should succeed");
@@ -657,6 +677,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect_err("protected push should fail");
@@ -702,6 +723,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect("first push should succeed");
@@ -716,6 +738,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect("idempotent re-push should succeed");
@@ -749,6 +772,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect_err("unknown branch should fail");
@@ -792,6 +816,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect("service account should bypass protection");
@@ -836,6 +861,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect("seed push should succeed");
@@ -867,6 +893,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect("push to deleted branch should reinstate and succeed");
@@ -913,6 +940,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect("seed push should succeed");
@@ -936,6 +964,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect_err("push to deleted branch with claimed name should fail");
@@ -981,6 +1010,7 @@ mod test {
                     DEFAULT_HISTORY_STEP_SIZE,
                     crate::grpc::server::RevisionListAcceleration::default(),
                     &instrument_provider,
+                    None,
                 )
                 .await
                 .expect("seed push should succeed");
@@ -1002,6 +1032,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
             )
             .await
             .expect("fast-forward merge with clean diff should succeed");

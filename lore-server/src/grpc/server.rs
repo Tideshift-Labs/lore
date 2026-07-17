@@ -132,6 +132,13 @@ pub struct FeatureSettings {
     /// holds an `Arc<State>` over a deserialised revision blob;
     /// the wall-clock benefit saturates well below 64.
     pub revision_diff_history_walk_concurrency: Option<usize>,
+    /// Opt-in push-time advisory-lock enforcement (CR-019). When `true` AND a
+    /// lock store is configured, `BranchPush` rejects a push whose changed paths
+    /// are locked by another user on that branch. Defaults to `false` — stock
+    /// Lore semantics (locks are advisory; the push path does not consult them).
+    /// Naive present-tense model; superseded by the successor-locks LEP when it
+    /// lands.
+    pub enforce_locks_on_push: Option<bool>,
 }
 
 /// Toggles for `RevisionList` acceleration features. Resolved once at
@@ -520,6 +527,14 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             .unwrap_or(DEFAULT_HISTORY_STEP_SIZE);
         let acceleration = RevisionListAcceleration::from_feature(&self.0.feature);
         let rpc_timeout = self.0.request_handler_timeout;
+        // Push-time advisory-lock enforcement (CR-019): `Some(store)` only when
+        // the opt-in feature is on AND a lock store is configured; otherwise
+        // `None` → the push handler behaves as stock Lore (no enforcement).
+        let push_lock_enforcement = if self.0.feature.enforce_locks_on_push.unwrap_or(false) {
+            self.0.lock_store.clone()
+        } else {
+            None
+        };
         let revision_svc = ServiceBuilder::new().service(LoreRevisionService::new(
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
@@ -529,6 +544,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             acceleration,
             rpc_timeout,
             enforce_write_permission,
+            push_lock_enforcement.clone(),
         ));
         let revision_v1_svc = LoreRevisionV1Service::new(
             self.0.immutable_store.clone(),
@@ -540,6 +556,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.forwarded_requests.clone(),
             rpc_timeout,
             enforce_write_permission,
+            push_lock_enforcement,
         );
         let revision_diff_config = crate::grpc::thinclient::v1::revision_diff::RevisionDiffConfig {
             source_cap: self.0.feature.revision_diff_source_cap.unwrap_or(

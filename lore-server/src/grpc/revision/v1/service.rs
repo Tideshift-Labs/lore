@@ -77,6 +77,9 @@ pub struct LoreRevisionV1Service {
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
     enforce_write_permission: bool,
+    /// `Some` only when `enforce_locks_on_push` is on AND a lock store exists;
+    /// see `LoreRevisionService::push_lock_enforcement`.
+    push_lock_enforcement: Option<Arc<dyn lore_revision::lock::LockStore>>,
     instrument_provider: RevisionServiceInstrumentProvider,
     revision_list_instruments: RevisionListInstruments,
 }
@@ -93,6 +96,7 @@ impl LoreRevisionV1Service {
         forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
         enforce_write_permission: bool,
+        push_lock_enforcement: Option<Arc<dyn lore_revision::lock::LockStore>>,
     ) -> Self {
         let instrument_provider = RevisionServiceInstrumentProvider;
         let seconds_in_one_day = 86400f64;
@@ -125,6 +129,7 @@ impl LoreRevisionV1Service {
             forwarded_requests,
             rpc_timeout,
             enforce_write_permission,
+            push_lock_enforcement,
             instrument_provider,
             revision_list_instruments,
         }
@@ -258,6 +263,7 @@ impl RevisionService for LoreRevisionV1Service {
                 self.history_step_size,
                 self.acceleration,
                 &self.instrument_provider,
+                self.push_lock_enforcement.as_ref(),
             ),
         )
         .await
@@ -356,6 +362,7 @@ mod tests {
             None,
             Duration::from_secs(60),
             enforce,
+            None,
         )
     }
 
