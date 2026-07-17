@@ -405,6 +405,7 @@ pub struct StorageService {
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
+    enforce_write_permission: bool,
 }
 
 impl StorageService {
@@ -413,13 +414,47 @@ impl StorageService {
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
+        enforce_write_permission: bool,
     ) -> Self {
         Self {
             jwt_verifier,
             immutable_store,
             local_store,
             mutable_store,
+            enforce_write_permission,
         }
+    }
+
+    /// Enforce the write-path permission for a storage command (read ≠ write).
+    /// Mirrors the gRPC-side `require_permission` semantics: a no-op when auth
+    /// is off (no verifier) or enforcement is disabled. On this legacy protocol
+    /// the verified `AuthorizationToken` lives in the connection's context
+    /// (inserted by Connect), so permissions are checked against the connected
+    /// repository. Fails closed if the token or repository is missing while a
+    /// verifier is configured.
+    fn require_write(
+        &self,
+        context: &Arc<AttributeMap>,
+        operation: &'static str,
+    ) -> Result<(), MessageHandleError> {
+        if self.jwt_verifier.is_none() || !self.enforce_write_permission {
+            return Ok(());
+        }
+        let Some(repository) = context.get::<RepositoryId>() else {
+            return Err(MessageHandleError::NotConnected);
+        };
+        let Some(authorization) = context.get::<AuthorizationToken>() else {
+            return Err(MessageHandleError::AuthorizationFailure(
+                "missing authorization for write operation".to_string(),
+            ));
+        };
+        let permissions = crate::auth::jwt::matching_permissions(&authorization, *repository);
+        if crate::auth::jwt::write_permission_granted(true, true, &permissions) {
+            return Ok(());
+        }
+        Err(MessageHandleError::AuthorizationFailure(format!(
+            "write permission required for {operation}"
+        )))
     }
 }
 
@@ -446,6 +481,22 @@ impl QuicService for StorageService {
         context: Arc<AttributeMap>,
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
+        // Write-path permission gate (read ≠ write). The verified token lives in
+        // the connection context (inserted by Connect); Load reads and is not
+        // gated, Store/Cas write, Verify writes only when healing.
+        match &request {
+            ParsedStorageRequest::Put(_) => self.require_write(&context, "Put")?,
+            ParsedStorageRequest::Copy(_) => self.require_write(&context, "Copy")?,
+            ParsedStorageRequest::MutableStoreOp(_) => {
+                self.require_write(&context, "MutableStore")?
+            }
+            ParsedStorageRequest::MutableCas(_) => self.require_write(&context, "MutableCas")?,
+            ParsedStorageRequest::Verify(verify) if verify.heal != 0 => {
+                self.require_write(&context, "Verify(heal)")?
+            }
+            _ => {}
+        }
+
         let lore_response = match request {
             ParsedStorageRequest::Connect(request) => {
                 request

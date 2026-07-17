@@ -248,6 +248,7 @@ pub mod tests {
                             immutable_store.clone(),
                             immutable_store.clone(),
                             mutable_store.clone(),
+                            false,
                         );
                         Box::new(StreamHandler::new(
                             Arc::new(storage_protocol),
@@ -269,6 +270,7 @@ pub mod tests {
                             immutable_store.clone(),
                             immutable_store.clone(),
                             mutable_store.clone(),
+                            false,
                         );
                         Box::new(StreamHandler::new(
                             Arc::new(v4_service),

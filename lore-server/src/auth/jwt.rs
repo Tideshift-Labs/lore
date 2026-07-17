@@ -224,6 +224,45 @@ impl JwtVerifier {
     }
 }
 
+/// Union of the `permission` strings across every token resource matching
+/// `repository` (wildcard `urc-*` resources included), deduplicated. Empty when
+/// the token carries no `resources` or none match. Used to snapshot a session's
+/// effective permissions at authorization time (e.g. the QUIC storage session,
+/// which has no per-request token to re-check).
+pub fn matching_permissions(
+    authorization: &AuthorizationToken,
+    repository: lore_revision::lore::RepositoryId,
+) -> Vec<String> {
+    let checked_repository = format!("urc-{repository}");
+    let mut permissions: Vec<String> = Vec::new();
+    if let Some(resources) = authorization.resources.as_ref() {
+        for resource in resources
+            .iter()
+            .filter(|resource| resource.matches_repository(&checked_repository))
+        {
+            for permission in resource.permission.iter() {
+                if !permissions.contains(permission) {
+                    permissions.push(permission.clone());
+                }
+            }
+        }
+    }
+    permissions
+}
+
+/// The write-path permission decision, factored out so both transport surfaces
+/// (gRPC `require_permission` and the QUIC storage services) share one rule and
+/// one set of tests. `has_verifier` is false when auth is off (no token to
+/// check); `enforce` is the `enforce_write_permission` setting. Returns true
+/// (allow) when auth is off or enforcement is disabled, otherwise only when the
+/// snapshotted permissions contain `write`.
+pub fn write_permission_granted(has_verifier: bool, enforce: bool, permissions: &[String]) -> bool {
+    if !has_verifier || !enforce {
+        return true;
+    }
+    permissions.iter().any(|permission| permission == "write")
+}
+
 pub fn verify_authorization(
     authorization: &AuthorizationToken,
     repository: lore_revision::lore::RepositoryId,
@@ -314,6 +353,74 @@ mod tests {
         verify_authorization(&authorization_token, allowed_context).expect("verify auth failed");
         verify_authorization(&authorization_token, unexpected_context)
             .expect_err("verify auth should have failed");
+    }
+
+    #[test]
+    fn matching_permissions_unions_across_matching_resources() {
+        let repo = "0194b726b34e72b0b45550b88a967076";
+        let repo_id: RepositoryId = Context::from_str(repo).unwrap().into();
+        let token = AuthorizationToken {
+            audience: vec!["test".to_string()],
+            env: "test".to_string(),
+            expires: 1234,
+            user_id: "test".to_string(),
+            idp: "test".to_string(),
+            issuer: "test".to_string(),
+            name: "test".to_string(),
+            preferred_username: "test".to_string(),
+            groups: None,
+            is_service_account: Some(false),
+            issued_at: 123,
+            resources: Some(vec![
+                ResourcePermission {
+                    resource_id: format!("urc-{repo}"),
+                    permission: vec!["read".to_string()],
+                },
+                ResourcePermission {
+                    resource_id: "urc-*".to_string(),
+                    permission: vec!["read".to_string(), "write".to_string()],
+                },
+                ResourcePermission {
+                    resource_id: "urc-f6ca55437aa34198ba0f0fdc33154d51".to_string(),
+                    permission: vec!["obliterate".to_string()],
+                },
+            ]),
+        };
+        let mut perms = matching_permissions(&token, repo_id);
+        perms.sort();
+        // read (direct + wildcard, deduped) and write (wildcard); NOT obliterate
+        // (that resource is a different repo).
+        assert_eq!(perms, vec!["read".to_string(), "write".to_string()]);
+    }
+
+    #[test]
+    fn write_permission_granted_decision_table() {
+        let write = vec!["read".to_string(), "write".to_string()];
+        let read_only = vec!["read".to_string()];
+
+        // Auth off (no verifier): always allowed regardless of enforce/permissions.
+        assert!(write_permission_granted(false, true, &[]));
+        assert!(write_permission_granted(false, true, &read_only));
+
+        // Enforcement disabled: allowed even for a read-only token.
+        assert!(write_permission_granted(true, false, &read_only));
+
+        // Enforced + verifier present: only a `write` permission passes.
+        assert!(write_permission_granted(true, true, &write));
+        assert!(!write_permission_granted(true, true, &read_only));
+        assert!(!write_permission_granted(true, true, &[]));
+    }
+
+    #[test]
+    fn matching_permissions_empty_when_no_resources() {
+        let repo_id: RepositoryId = Context::from_str("0194b726b34e72b0b45550b88a967076")
+            .unwrap()
+            .into();
+        let token = AuthorizationToken {
+            resources: None,
+            ..Default::default()
+        };
+        assert!(matching_permissions(&token, repo_id).is_empty());
     }
 
     #[test]

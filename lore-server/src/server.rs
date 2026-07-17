@@ -782,6 +782,7 @@ impl QuicPublicStreamHandler {
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
+        enforce_write_permission: bool,
         process_limit: usize,
         handler_duration_timeout: Option<Duration>,
     ) -> Self {
@@ -798,6 +799,7 @@ impl QuicPublicStreamHandler {
                         immutable_store.clone(),
                         local_store.clone(),
                         mutable_store.clone(),
+                        enforce_write_permission,
                     );
                     Box::new(StreamHandler::new(
                         Arc::new(storage_protocol),
@@ -830,6 +832,7 @@ impl QuicPublicStreamHandler {
                         immutable_store.clone(),
                         local_store.clone(),
                         mutable_store.clone(),
+                        enforce_write_permission,
                     );
                     Box::new(StreamHandler::new(
                         Arc::new(v4_service),
@@ -2106,6 +2109,14 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 jwt_verifier.as_ref().map_or("no", |_| "yes")
             );
 
+            // Same read≠write gate as the gRPC surface (default ON; a token must
+            // carry `write` to mutate storage). ADR-00011.
+            let enforce_write_permission = settings
+                .server
+                .auth
+                .as_ref()
+                .is_none_or(|auth| auth.enforce_write_permission);
+
             launch_quinn_server(
                 "public",
                 Box::new(QuicPublicStreamHandler::new(
@@ -2113,6 +2124,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     local_immutable_store,
                     mutable_store,
                     jwt_verifier,
+                    enforce_write_permission,
                     quic_settings
                         .connection_message_limit
                         .unwrap_or(DEFAULT_PROCESS_LIMIT),
