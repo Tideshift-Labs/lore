@@ -90,6 +90,7 @@ pub struct StorageServiceV4 {
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     session_map: Arc<SessionMap>,
+    enforce_write_permission: bool,
 }
 
 impl StorageServiceV4 {
@@ -98,6 +99,7 @@ impl StorageServiceV4 {
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
+        enforce_write_permission: bool,
     ) -> Self {
         Self {
             jwt_verifier,
@@ -105,7 +107,29 @@ impl StorageServiceV4 {
             local_store,
             mutable_store,
             session_map: Arc::new(SessionMap::default()),
+            enforce_write_permission,
         }
+    }
+
+    /// Enforce the write-path permission for a storage command. Mirrors the
+    /// gRPC-side `require_permission` semantics: a no-op when auth is off (no
+    /// verifier) or enforcement is disabled; otherwise the session must have
+    /// snapshotted `write` for its repository at `AuthorizeStart`.
+    fn require_write(
+        &self,
+        permissions: &[String],
+        operation: &'static str,
+    ) -> Result<(), MessageHandleError> {
+        if crate::auth::jwt::write_permission_granted(
+            self.jwt_verifier.is_some(),
+            self.enforce_write_permission,
+            permissions,
+        ) {
+            return Ok(());
+        }
+        Err(MessageHandleError::AuthorizationFailure(format!(
+            "write permission required for {operation}"
+        )))
     }
 }
 
@@ -169,6 +193,7 @@ impl QuicService for StorageServiceV4 {
                 auth_token,
             } => {
                 let mut user_id = String::new();
+                let mut permissions: Vec<String> = Vec::new();
 
                 if let Some(jwt_verifier) = self.jwt_verifier.as_ref() {
                     let token_str = String::from_utf8(auth_token).map_err(|err| {
@@ -189,11 +214,13 @@ impl QuicService for StorageServiceV4 {
                     crate::auth::jwt::verify_authorization(&authorization, repository)
                         .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
 
+                    permissions =
+                        crate::auth::jwt::matching_permissions(&authorization, repository);
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
                 }
 
                 let session_map = self.session_map.clone();
-                match session_map.start(repository, correlation_id, user_id) {
+                match session_map.start(repository, correlation_id, user_id, permissions) {
                     Ok((session_id, correlation_id)) => {
                         debug!(
                             session_id,
@@ -234,6 +261,7 @@ impl QuicService for StorageServiceV4 {
                 let repository = session.repository;
                 let correlation_id = session.correlation_id.clone();
                 let user_id = session.user_id.clone();
+                let permissions = session.permissions.clone();
                 drop(session);
 
                 // Parse the storage command payload using v4-aware parsers — Copy carries an
@@ -242,6 +270,31 @@ impl QuicService for StorageServiceV4 {
                     tracing::warn!("Failed to parse v4 storage command: {err}");
                     MessageHandleError::InternalError
                 })?;
+
+                // Write-path permission gate (read ≠ write). The session has no
+                // per-request token; enforcement runs against the permissions
+                // snapshotted at AuthorizeStart. Verify counts as a write only
+                // when healing (it rewrites stored fragments).
+                match &parsed {
+                    crate::quic::storage_service::ParsedStorageRequest::Put(_) => {
+                        self.require_write(&permissions, "Put")?;
+                    }
+                    crate::quic::storage_service::ParsedStorageRequest::Copy(_) => {
+                        self.require_write(&permissions, "Copy")?;
+                    }
+                    crate::quic::storage_service::ParsedStorageRequest::MutableStoreOp(_) => {
+                        self.require_write(&permissions, "MutableStore")?;
+                    }
+                    crate::quic::storage_service::ParsedStorageRequest::MutableCas(_) => {
+                        self.require_write(&permissions, "MutableCas")?;
+                    }
+                    crate::quic::storage_service::ParsedStorageRequest::Verify(verify)
+                        if verify.heal != 0 =>
+                    {
+                        self.require_write(&permissions, "Verify(heal)")?;
+                    }
+                    _ => {}
+                }
 
                 // Dispatch to standalone handler functions with explicit session context
                 let response = match parsed {
@@ -468,6 +521,7 @@ mod tests {
             immutable_store.clone(),
             immutable_store.clone(),
             mutable_store,
+            false,
         );
 
         let repo = random::<lore_revision::lore::RepositoryId>();
