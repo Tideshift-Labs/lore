@@ -44,6 +44,14 @@ pub struct LockConflict {
     pub owner: String,
 }
 
+/// Map an internal engine error to a `Status::internal` that fails the push
+/// closed, logging via the house `warn_mapped_error_status` convention.
+fn to_internal<E: std::error::Error>(error: &E, message: &'static str) -> Status {
+    let status = Status::internal(message);
+    crate::grpc::warn_mapped_error_status(error, &status);
+    status
+}
+
 /// Enforce advisory locks against a push. Returns `Ok(())` when the push is
 /// clear; returns a `permission_denied` `Status` naming the first blocking lock
 /// when a changed path is locked by another user on this branch.
@@ -112,10 +120,7 @@ pub(crate) async fn collect_push_lock_conflicts(
 
     let prior_tip = load_latest(repository.clone(), branch)
         .await
-        .map_err(|err| {
-            warn!(error = %err, "Failed to load branch tip for push-lock check");
-            Status::internal("failed to load branch tip for lock check")
-        })?;
+        .map_err(|err| to_internal(&err, "failed to load branch tip for lock check"))?;
 
     let changed_paths = changed_paths(repository, prior_tip, new_revision).await?;
 
@@ -143,10 +148,7 @@ async fn others_locks_by_hash(
     let locks = lock_store
         .query_locks(LockQuery::RepositoryBranch(repository_id, branch))
         .await
-        .map_err(|err| {
-            warn!(error = %err, "Failed to query locks for push-lock check");
-            Status::internal("failed to query locks for lock check")
-        })?;
+        .map_err(|err| to_internal(&err, "failed to query locks for lock check"))?;
 
     Ok(locks
         .into_iter()
@@ -163,25 +165,16 @@ async fn changed_paths(
 ) -> Result<Vec<String>, Status> {
     let state_source = State::deserialize(repository.clone(), source)
         .await
-        .map_err(|err| {
-            warn!(error = %err, "Failed to deserialize source state for push-lock check");
-            Status::internal("failed to read source revision for lock check")
-        })?;
+        .map_err(|err| to_internal(&err, "failed to read source revision for lock check"))?;
     let state_target = State::deserialize(repository.clone(), target)
         .await
-        .map_err(|err| {
-            warn!(error = %err, "Failed to deserialize target state for push-lock check");
-            Status::internal("failed to read target revision for lock check")
-        })?;
+        .map_err(|err| to_internal(&err, "failed to read target revision for lock check"))?;
 
     let (_, changes): (_, Vec<NodeChange>) = collect_stream_with_summary(|tx| {
         diff_revision_paths(repository.clone(), state_source, state_target, None, tx)
     })
     .await
-    .map_err(|err| {
-        warn!(error = %err, "Failed to diff revisions for push-lock check");
-        Status::internal("failed to diff revisions for lock check")
-    })?;
+    .map_err(|err| to_internal(&err, "failed to diff revisions for lock check"))?;
 
     let mut paths = Vec::with_capacity(changes.len());
     for change in changes {
