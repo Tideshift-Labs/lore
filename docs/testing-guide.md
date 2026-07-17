@@ -333,6 +333,87 @@ the next run starts from the map instead of rediscovering it.
   behavior (does the actual gRPC listener answer `branch_push` mid-drain) is left to the live
   e2e in the desktop repo that found the bug in the first place — no mock-friendly seam for that
   tier either, same call as CR-009's own QUIC-endpoint note above.
+- **CR-018 (QUIC write-permission enforcement, [SERVER]) + CR-019 (push-time lock
+  enforcement, [SERVER])** — both default-**off**; this pass closed the review-flagged gap
+  that only pure/unit logic had coverage, with no test exercising the actual DENY path at
+  the handler seam.
+  - **CR-018** — `lore-server/src/quic/storage_service_v4.rs` (`StorageServiceV4::require_write`,
+    gating `Put`/`Copy`/`MutableStoreOp`/`MutableCas`/`Verify(heal)` in the `StorageCommand`
+    dispatch match) and the legacy `lore-server/src/quic/storage_service.rs`
+    (`StorageService::require_write`, same gate but reading the verified
+    `AuthorizationToken` out of the connection `AttributeMap` instead of a session, since
+    urc/0.2 has no session concept). New tests:
+    `cargo test -p lore-server --lib -- quic::storage_service_v4::tests::require_write_dispatch_gate`
+    (4: read-only denied, write allowed, enforcement-off bypass, auth-off bypass — all via
+    `MutableStoreOp`) and
+    `cargo test -p lore-server --lib -- quic::storage_service::tests::require_write_fails_closed`
+    (3: missing-repository-and-token, missing-token-only, enforcement-off bypass).
+    **v4 white-box seeding, not a minted JWT**: `require_write`'s gate only reads
+    `self.jwt_verifier.is_some()` (a bool, "is a verifier configured") + the session's
+    already-snapshotted `permissions` — it never re-verifies a token (that already happened
+    once, at `AuthorizeStart`). So tests seed a session directly via
+    `service.session_map.start(repo, corr, user, permissions)` (private field, reachable
+    because `tests` is a same-file child module — the guide's existing "White-box state"
+    finding) instead of round-tripping a real JWT through `AuthorizeStart`. `jwt_verifier`
+    still needs to be `Some(..)` to represent "a verifier is configured" (`has_verifier`),
+    so both files add a `JWKService` impl (`UnusedJwkService`) whose `get_key` is
+    `unreachable!()` — proof the seeded-session path never calls it. Wire payload for a
+    `MutableStoreOp` `StorageCommand` is `key(32) + value(32) + key_type(1)` — mirrors
+    `mutable_store_handler.rs::tests::test_parse`'s own byte layout exactly; reuse that
+    shape rather than re-deriving it (`Put`'s wire format is heavier: needs
+    `lore_revision::fragment::generate_random()` + `validate_fragment_metadata` to pass,
+    so prefer `MutableStoreOp` for gate-only tests where the specific opcode doesn't matter).
+    v0's `require_write` fails closed at two independent points (missing `RepositoryId` →
+    `NotConnected`; `RepositoryId` present but no `AuthorizationToken` → `AuthorizationFailure`)
+    — both covered as distinct cases, not collapsed into one "context missing" test, since
+    they're different code paths inside the same fn.
+  - **CR-019** — `lore-server/src/grpc/handlers/push_lock_guard.rs`
+    (`collect_push_lock_conflicts`, `pub(crate)`). New tests in a nested
+    `collect_push_lock_conflicts_tests` submodule (kept separate from the pre-existing
+    `others_locks_by_hash`-only tests one level up):
+    `cargo test -p lore-server --lib -- grpc::handlers::push_lock_guard` (8: the 2
+    pre-existing `others_locks_by_hash` cases + 6 new) — foreign lock on the changed path
+    is a conflict, self-lock is not, a lock on an untouched path is not (guards against
+    "any foreign lock blocks" over-broadening), the empty-foreign-locks short-circuit
+    returns `Ok(empty)` **without attempting the diff** (proved by passing a
+    never-serialized revision hash that would surface as `Err` if the diff ran), the
+    branch-creation case (no prior tip → zero hash → diff against the empty tree still
+    catches a locked new file — see `branch::load_latest`'s zero-hash-when-no-revision-yet
+    behavior), and a rename catching both endpoints.
+    **Real repo fixture, no wire/RPC layer needed**: build via
+    `RepositoryContext::new_server_context` over `test_store_create()`'s in-memory
+    `LocalImmutableStore`/`LocalMutableStore`, `branch::create` for the branch, and
+    `state::State::new()` + `state.node_add(repo, ROOT_NODE, node, name)` +
+    `state.serialize(repo, &write_token)` to build revisions — mirrors
+    `grpc/revision/v1/branch_push.rs::test`'s `create_root_branch`/`build_revision`
+    helpers (referenced from the task spec) rather than the heavier
+    `grpc/thinclient/v1/revision_tree.rs::push_branch_with_revisions` pattern, since
+    `collect_push_lock_conflicts` only needs `Hash`es and a `RepositoryContext`, not a
+    tonic `Request`/RPC handler. **`push_revision` (via
+    `crate::grpc::handlers::branch_push::push`, the v0 push fn — reusable regardless of
+    which RPC generation actually lands a revision) establishes the *prior tip* only.**
+    The revision being tested as the incoming push is built with `state.serialize(...)`
+    alone and deliberately **not** pushed — `collect_push_lock_conflicts` diffs the
+    about-to-be-pushed revision against the branch's *current* tip, which is exactly the
+    state before `push()` would advance it (see the fn's own doc comment); pushing the
+    second revision too would silently make `load_latest` return the wrong "prior" tip.
+    **Rename fixture — match on `Node.address.context`, not content hash.**
+    `detect_and_coalesce_moves` (`lore-revision/src/state.rs:4296`) coalesces an add/delete
+    pair into a `Move` when their `Address.context` (the node/file-identity field, public,
+    `lore_base::types::Context` — the same type alias as `BranchId`, so
+    `random::<Context>()` works) matches and is non-zero; it does **not** compare content
+    hash. Build two revisions with the same explicit `Context` at different paths (helper:
+    `serialize_file_revision_with_context`) to get a real coalesced rename with
+    `NodeChange.from_path` set, without needing any actual file-content plumbing.
+    **The v1 `branch_push.rs` handler's own `lock_enforcement: Option<&Arc<dyn LockStore>>`
+    param is still always called with `None` in every existing test** (`grep -n
+    lock_enforcement lore-server/src/grpc/revision/v1/branch_push.rs` — one `if let
+    Some(...)` call site, zero `Some(...)` call sites in tests) — i.e. the full RPC-level
+    wiring of CR-019 (not just `collect_push_lock_conflicts` itself) has no test exercising
+    `Some(lock_store)` end-to-end through `handler(...)`. Left as-is per the task's explicit
+    scope (test `collect_push_lock_conflicts` directly, the "pure core" the fn's own doc
+    comment calls out); flagged here as a real remaining gap if a future pass wants the
+    full-handler-level proof too.
 - **CR-008 (per-entry byte size on tree reads, [SERVER])** — additive proto3 optional
   `TreeNode.size_bytes` (FILE only, unset for DIRECTORY/LINK) + `Revision.total_size_bytes` on
   `lore.thin_client.v1`; `lore-revision/src/state.rs` `TreePath.size` (<- `node.size`, populated in

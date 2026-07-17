@@ -502,13 +502,60 @@ impl QuicService for StorageServiceV4 {
 
 #[cfg(test)]
 mod tests {
+    use bytes::BytesMut;
+    use lore_base::types::KeyType;
     use lore_transport::quic::QuicServiceError;
     use rand::random;
+    use zerocopy::IntoBytes;
 
     use super::*;
+    use crate::auth::jwk::JWKService;
+    use crate::auth::jwk::JWKServiceError;
     use crate::protocol::storage::session::MAX_CONCURRENT_SESSIONS;
     use crate::quic::QuicService;
     use crate::store::test_store_create;
+
+    /// A `JWKService` that must never be called — used to build a `JwtVerifier`
+    /// for tests that seed a session's permissions directly (bypassing
+    /// `AuthorizeStart`, and with it `verify_token`/`get_key`). Only
+    /// `require_write`'s `jwt_verifier.is_some()` check matters for those
+    /// tests, not the verifier's actual behavior.
+    #[derive(Debug)]
+    struct UnusedJwkService;
+
+    #[async_trait]
+    impl JWKService for UnusedJwkService {
+        async fn get_key(
+            &self,
+            _kid: &str,
+        ) -> Result<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm), JWKServiceError> {
+            unreachable!("test seeds the session directly; verify_token should never be called")
+        }
+    }
+
+    /// A `jwt_verifier` that is `Some(..)` — i.e. "a verifier is configured" —
+    /// without needing a real JWKS/signing setup, for tests exercising
+    /// `require_write`'s dispatch-time gate on a directly-seeded session.
+    fn verifier_present() -> Arc<Option<JwtVerifier>> {
+        Arc::new(Some(JwtVerifier {
+            jwk_service: Arc::new(UnusedJwkService),
+            jwt_issuer: None,
+            jwt_audience: None,
+        }))
+    }
+
+    /// Wire-encodes a `MutableStore` command (key + value + key_type), matching
+    /// `MutableStoreOp::parse`'s expected layout — see that type's own
+    /// `test_parse`. The specific key/value/type don't matter for the
+    /// write-permission-gate tests: a denial never reaches `handle_mutable_store`,
+    /// and an allow uses a fresh in-memory store that accepts any well-formed op.
+    fn mutable_store_payload() -> Bytes {
+        let mut bytes = BytesMut::with_capacity(2 * size_of::<lore_base::types::Hash>() + 1);
+        bytes.extend_from_slice(lore_base::types::Hash::hash_buffer(b"key").as_bytes());
+        bytes.extend_from_slice(lore_base::types::Hash::hash_buffer(b"value").as_bytes());
+        bytes.extend_from_slice(&[KeyType::Untyped as u8]);
+        bytes.freeze()
+    }
 
     /// Fill the session map to capacity then attempt one more `AuthorizeStart`,
     /// verifying the handler returns `SlowDown` and that `transform_protocol_error`
@@ -572,5 +619,145 @@ mod tests {
         assert_eq!(error_info.message_handle_label, "SessionLimitReached");
         assert!(!error_info.is_internal_error);
         assert!(!error_info.is_appropriate_for_logging);
+    }
+
+    /// CR-018: the `require_write` gate on the `StorageCommand` dispatch path
+    /// (Put/Copy/MutableStore/MutableCas/Verify(heal)). Sessions have no
+    /// per-request token, so these seed a session directly via
+    /// `session_map.start` (white-box: `tests` is a child module of the type
+    /// it's testing, so private fields/session_map are reachable — see the
+    /// testing guide's "White-box state via a same-file `#[cfg(test)] mod
+    /// tests`" finding) rather than round-tripping a minted JWT through
+    /// `AuthorizeStart`, since only the session's snapshotted `permissions`
+    /// and the service's `jwt_verifier.is_some()`/`enforce_write_permission`
+    /// flags drive the gate.
+    mod require_write_dispatch_gate {
+        use super::*;
+
+        async fn service_with(
+            jwt_verifier: Arc<Option<JwtVerifier>>,
+            enforce_write_permission: bool,
+        ) -> StorageServiceV4 {
+            let (immutable_store, mutable_store, _execution) =
+                test_store_create().await.expect("Failed to create stores");
+            StorageServiceV4::new(
+                jwt_verifier,
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                enforce_write_permission,
+            )
+        }
+
+        #[tokio::test]
+        async fn read_only_session_denied_on_mutable_store_when_enforced() {
+            let service = service_with(verifier_present(), true).await;
+            let repo = random::<lore_revision::lore::RepositoryId>();
+            let (session_id, _) = service
+                .session_map
+                .start(repo, "corr".into(), "user".into(), vec!["read".into()])
+                .expect("seed read-only session");
+
+            let err = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::StorageCommand {
+                        session_id,
+                        opcode: Command::MutableStore as u8,
+                        payload: mutable_store_payload(),
+                    },
+                )
+                .await
+                .expect_err("read-only session must be denied a write op");
+
+            assert!(
+                matches!(err, MessageHandleError::AuthorizationFailure(_)),
+                "expected AuthorizationFailure, got {err:?}"
+            );
+
+            // Wire classification: NotAuthorized, not silently downgraded.
+            let error_info = service.transform_protocol_error(&err);
+            assert_eq!(
+                error_info.response_error_code,
+                QuicServiceError::NotAuthorized as QuicErrorStatus,
+            );
+        }
+
+        #[tokio::test]
+        async fn write_session_allowed_on_mutable_store_when_enforced() {
+            let service = service_with(verifier_present(), true).await;
+            let repo = random::<lore_revision::lore::RepositoryId>();
+            let (session_id, _) = service
+                .session_map
+                .start(
+                    repo,
+                    "corr".into(),
+                    "user".into(),
+                    vec!["read".into(), "write".into()],
+                )
+                .expect("seed write session");
+
+            service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::StorageCommand {
+                        session_id,
+                        opcode: Command::MutableStore as u8,
+                        payload: mutable_store_payload(),
+                    },
+                )
+                .await
+                .expect("a session carrying write must pass the gate");
+        }
+
+        #[tokio::test]
+        async fn read_only_session_allowed_when_enforcement_disabled() {
+            // enforce_write_permission = false: the config flag itself, not
+            // just the permission set, must gate the dispatch.
+            let service = service_with(verifier_present(), false).await;
+            let repo = random::<lore_revision::lore::RepositoryId>();
+            let (session_id, _) = service
+                .session_map
+                .start(repo, "corr".into(), "user".into(), vec!["read".into()])
+                .expect("seed read-only session");
+
+            service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::StorageCommand {
+                        session_id,
+                        opcode: Command::MutableStore as u8,
+                        payload: mutable_store_payload(),
+                    },
+                )
+                .await
+                .expect("enforcement disabled must bypass the gate even for read-only");
+        }
+
+        #[tokio::test]
+        async fn read_only_session_allowed_when_auth_is_off() {
+            // jwt_verifier = None ("auth off"): has_verifier is false, so the
+            // gate is a no-op regardless of enforce_write_permission or the
+            // (here, still empty — no token to derive permissions from)
+            // session permissions.
+            let service = service_with(Arc::new(None), true).await;
+            let repo = random::<lore_revision::lore::RepositoryId>();
+            let (session_id, _) = service
+                .session_map
+                .start(repo, "corr".into(), "user".into(), vec![])
+                .expect("seed session with no permissions");
+
+            service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::StorageCommand {
+                        session_id,
+                        opcode: Command::MutableStore as u8,
+                        payload: mutable_store_payload(),
+                    },
+                )
+                .await
+                .expect("auth off must bypass the gate");
+        }
     }
 }
