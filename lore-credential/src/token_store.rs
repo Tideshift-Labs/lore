@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use base64::prelude::BASE64_STANDARD;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use base64::prelude::Engine as _;
 use lore_base::directories::project_directory;
 use lore_base::error::TokenNotFound;
@@ -27,6 +28,7 @@ use ring::aead::NonceSequence;
 use ring::aead::OpeningKey;
 use ring::aead::SealingKey;
 use ring::aead::UnboundKey;
+use ring::digest;
 use ring::error::Unspecified;
 use ring::rand::SecureRandom;
 use ring::rand::SystemRandom;
@@ -63,9 +65,8 @@ pub struct IdentityToken {
     /// The root domains this token can be given to without security concerns
     #[serde(default)]
     acceptable_root_domains: Vec<String>,
-    /// Base64 encoded (encrypted) one-time-use refresh token.
-    /// Stored separately from the auth token because it has a different
-    /// lifecycle: consumed on use and replaced atomically.
+    /// Base64 encoded (encrypted) opaque refresh credential. Stored separately
+    /// from the auth token because the backend may preserve or rotate it.
     #[serde(default)]
     refresh_token: Option<String>,
 }
@@ -299,6 +300,16 @@ async fn lock_token_map() -> Result<FSLock, TokenStoreError> {
     lock_store_file(token_map_path(true)?.as_path()).await
 }
 
+/// Cross-process guard for reserving the next AES-GCM nonce.
+///
+/// The encryption key/counter may live in an OS keyring, whose API has no
+/// compare-and-swap primitive. This stable filesystem lock therefore protects
+/// the reload -> reserve -> persist span across every Lore process.
+async fn lock_encryption_nonce() -> Result<FSLock, TokenStoreError> {
+    let path = base_path(true)?.join("encryption-nonce");
+    lock_store_file(&path).await
+}
+
 /// Refreshes the in-memory token map from disk ahead of a mutation: another
 /// process may have updated the file since it was cached. Callers hold the
 /// store lock, so the reloaded state cannot change before it is written back.
@@ -396,13 +407,11 @@ fn store_fallback_path(name: &str, create_dir: bool) -> Result<PathBuf, TokenSto
 
 static KEYRING_ENTRY: OnceLock<Option<Arc<keyring::Entry>>> = OnceLock::new();
 
-/// In-memory cache of the loaded encryption key + next-use nonce counter.
+/// In-memory cache of the loaded encryption key + last observed nonce counter.
 ///
-/// The encryption key is invariant for the lifetime of the secure-store
-/// entry; only the nonce advances on each encrypt. Caching avoids hitting
-/// the OS keyring on every encrypt/decrypt and serializes the encrypt path
-/// so two concurrent encrypts cannot reserve the same nonce (AES-GCM nonce
-/// reuse is a key-recovery vulnerability).
+/// Decrypt only needs the invariant key and may use this cache. Encrypt must
+/// reload and reserve the counter under [`lock_encryption_nonce`]; a
+/// process-local cache alone cannot prevent cross-process AES-GCM nonce reuse.
 static ENCRYPTION_CACHE: OnceLock<Mutex<Option<Encryption>>> = OnceLock::new();
 
 fn encryption_cache() -> &'static Mutex<Option<Encryption>> {
@@ -773,6 +782,181 @@ pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenSt
     Ok(identities)
 }
 
+/// Current authentication credential pair protected by an
+/// [`AuthenticationRefreshLease`].
+#[derive(Debug)]
+pub struct AuthenticationRefreshSnapshot {
+    /// Decrypted authentication token.
+    pub token: String,
+    /// Decrypted opaque refresh credential.
+    pub refresh_token: String,
+}
+
+/// Result of committing a refreshed authentication credential pair.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuthenticationRefreshCommit {
+    /// This lease stored the refreshed pair.
+    Stored,
+    /// Another login changed the pair after this lease's snapshot. The newer
+    /// authentication token won and must be used instead of overwriting it.
+    Superseded { token: String },
+}
+
+/// Cross-process, per-identity refresh lease.
+///
+/// The OS file lock is released automatically when this value drops, including
+/// after process termination. Its file name is a hash so auth endpoints and user
+/// identities do not leak into the configuration directory listing.
+pub struct AuthenticationRefreshLease {
+    auth_endpoint: String,
+    identity: String,
+    encrypted_token: String,
+    encrypted_refresh_token: String,
+    snapshot: AuthenticationRefreshSnapshot,
+    _guard: FSLock,
+}
+
+impl AuthenticationRefreshLease {
+    /// The fresh on-disk credential pair read after acquiring the lease.
+    pub fn snapshot(&self) -> &AuthenticationRefreshSnapshot {
+        &self.snapshot
+    }
+
+    /// Atomically replaces the guarded authentication token and refresh
+    /// credential in one `tokens.toml` write.
+    ///
+    /// `replacement_refresh_token = None` preserves the opaque credential that
+    /// was presented. A backend can rotate it by returning `Some`.
+    pub async fn commit(
+        self,
+        token: &str,
+        replacement_refresh_token: Option<&str>,
+        mut acceptable_root_domains: Vec<String>,
+    ) -> Result<AuthenticationRefreshCommit, TokenStoreError> {
+        let auth_domain = get_domain_or_empty(&self.auth_endpoint);
+        if !acceptable_root_domains.contains(&auth_domain) {
+            acceptable_root_domains.push(auth_domain);
+        }
+
+        let refresh_token =
+            replacement_refresh_token.unwrap_or(self.snapshot.refresh_token.as_str());
+        let encrypted_token = encrypt_token(token).await?;
+        let encrypted_refresh_token = encrypt_token(refresh_token).await?;
+
+        let superseded_token = {
+            let token_map = token_map();
+            let mut map_lock = token_map.lock().await;
+            let guard = lock_token_map().await?;
+            reload_token_map(&guard, &mut map_lock);
+
+            let Some(token_entry) = map_lock
+                .as_mut()
+                .and_then(|map| {
+                    map.remotes
+                        .iter_mut()
+                        .find(|entry| entry.remote == self.auth_endpoint)
+                })
+                .and_then(|remote| {
+                    remote
+                        .token
+                        .iter_mut()
+                        .find(|entry| entry.user_id == self.identity)
+                })
+            else {
+                return Err(TokenNotFound.into());
+            };
+
+            if token_entry.token != self.encrypted_token
+                || token_entry.refresh_token.as_deref()
+                    != Some(self.encrypted_refresh_token.as_str())
+            {
+                Some(token_entry.token.clone())
+            } else {
+                token_entry.token = encrypted_token;
+                token_entry.acceptable_root_domains = acceptable_root_domains;
+                token_entry.refresh_token = Some(encrypted_refresh_token);
+                let Some(map) = map_lock.as_ref() else {
+                    return Err(TokenStoreError::internal("Failed to store token map"));
+                };
+                store_token_map(&guard, map)?;
+                None
+            }
+        };
+
+        match superseded_token {
+            Some(token) => Ok(AuthenticationRefreshCommit::Superseded {
+                token: decrypt_token(token).await?,
+            }),
+            None => Ok(AuthenticationRefreshCommit::Stored),
+        }
+    }
+}
+
+/// Acquires the per-identity refresh lease and reloads the encrypted credential
+/// pair from disk while it is held.
+///
+/// Callers must make their refresh decision from [`AuthenticationRefreshLease::snapshot`],
+/// not from a token loaded before acquiring this lease: another process may have
+/// refreshed while this caller waited.
+pub async fn acquire_authentication_refresh(
+    auth_endpoint: &str,
+    identity: &str,
+) -> Result<AuthenticationRefreshLease, TokenStoreError> {
+    let auth_endpoint = auth_endpoint.trim_end_matches('/');
+    if auth_endpoint.is_empty() || identity.is_empty() {
+        return Err(TokenNotFound.into());
+    }
+
+    let mut scope = Vec::with_capacity(auth_endpoint.len() + identity.len() + 1);
+    scope.extend_from_slice(auth_endpoint.as_bytes());
+    scope.push(0);
+    scope.extend_from_slice(identity.as_bytes());
+    let digest = digest::digest(&digest::SHA256, &scope);
+    let lease_name = format!(
+        "authentication-refresh-{}",
+        BASE64_URL_SAFE_NO_PAD.encode(digest.as_ref())
+    );
+    let lease_path = base_path(true)?.join(lease_name);
+    let refresh_guard = lock_store_file(&lease_path).await?;
+
+    let (encrypted_token, encrypted_refresh_token) = {
+        let token_map = token_map();
+        let mut map_lock = token_map.lock().await;
+        let guard = lock_token_map().await?;
+        reload_token_map(&guard, &mut map_lock);
+
+        let Some(token_entry) = map_lock
+            .as_ref()
+            .and_then(|map| {
+                map.remotes
+                    .iter()
+                    .find(|entry| entry.remote == auth_endpoint)
+            })
+            .and_then(|remote| remote.token.iter().find(|entry| entry.user_id == identity))
+        else {
+            return Err(TokenNotFound.into());
+        };
+        let Some(encrypted_refresh_token) = token_entry.refresh_token.clone() else {
+            return Err(TokenNotFound.into());
+        };
+        (token_entry.token.clone(), encrypted_refresh_token)
+    };
+
+    let token = decrypt_token(encrypted_token.clone()).await?;
+    let refresh_token = decrypt_token(encrypted_refresh_token.clone()).await?;
+    Ok(AuthenticationRefreshLease {
+        auth_endpoint: auth_endpoint.to_string(),
+        identity: identity.to_string(),
+        encrypted_token,
+        encrypted_refresh_token,
+        snapshot: AuthenticationRefreshSnapshot {
+            token,
+            refresh_token,
+        },
+        _guard: refresh_guard,
+    })
+}
+
 /// Encrypts and stores (or replaces) the refresh token for an identity.
 ///
 /// Called by orchestration after login or successful refresh. Overwrites
@@ -861,14 +1045,16 @@ pub async fn load_refresh_token(
 async fn encrypt_token(user_token: &str) -> Result<String, TokenStoreError> {
     lore_trace!("Encrypting user token");
 
-    // Hold the cache lock across read -> reserve nonce -> persist -> update,
-    // so concurrent encrypts cannot seal two blobs with the same nonce.
+    // The OS lock is the cross-process source of serialization. Reload the
+    // persisted counter while it is held; another process may have advanced it
+    // since this process populated ENCRYPTION_CACHE.
+    let _nonce_guard = lock_encryption_nonce().await?;
     let mut guard = encryption_cache().lock().await;
-    if guard.is_none() {
-        *guard = Some(load_or_init_encryption().await?);
-    }
-    let encryption = guard.as_ref().expect("just initialized").clone();
-    let new_nonce = encryption.nonce + 1;
+    let encryption = load_or_init_encryption().await?;
+    let new_nonce = encryption
+        .nonce
+        .checked_add(1)
+        .ok_or_else(|| TokenStoreError::internal("Encryption nonce exhausted"))?;
     // Persist before updating the cache: a failed write leaves the cache at
     // the old nonce so the next attempt retries with the same value, rather
     // than skipping ahead and risking nonce reuse on a later success.
@@ -1145,7 +1331,41 @@ impl NonceSequence for CounterNonceSequence {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
     use super::*;
+
+    const REFRESH_AUTH_ENDPOINT: &str = "https://refresh.auth.example.com";
+    static REFRESH_TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    static REFRESH_TEST_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+    async fn refresh_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        REFRESH_TEST_MUTEX
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    async fn setup_refresh_test() {
+        let path = REFRESH_TEST_PATH.get_or_init(|| {
+            std::env::temp_dir().join(format!("lore-cr020-token-store-{}", std::process::id()))
+        });
+        unsafe {
+            std::env::set_var("LORE_AUTH_PATH", path);
+            std::env::set_var("LORE_AUTH_STORE", "fallback");
+        }
+        reset_tokens().await.expect("reset test token store");
+    }
+
+    async fn store_refresh_pair(identity: &str, token: &str, refresh_token: &str) {
+        store_user_token(REFRESH_AUTH_ENDPOINT, identity, token, vec![])
+            .await
+            .expect("store authentication token");
+        store_refresh_token(REFRESH_AUTH_ENDPOINT, identity, refresh_token)
+            .await
+            .expect("store refresh credential");
+    }
 
     #[test]
     fn refresh_token_serde_default_none() {
@@ -1291,5 +1511,346 @@ token = "tok-b"
             "https://auth.example.com/not-a-resource",
             "https://auth.example.com"
         ));
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_lease_snapshots_current_pair() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+
+        let lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire refresh lease");
+
+        assert_eq!(
+            (
+                lease.snapshot().token.as_str(),
+                lease.snapshot().refresh_token.as_str(),
+            ),
+            ("authn-old", "refresh-old")
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_commit_replaces_pair_atomically() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire refresh lease");
+
+        let result = lease
+            .commit(
+                "authn-new",
+                Some("refresh-new"),
+                vec!["repo.example.com".to_string()],
+            )
+            .await
+            .expect("commit refreshed pair");
+
+        assert_eq!(result, AuthenticationRefreshCommit::Stored);
+        assert_eq!(
+            load_user_token(REFRESH_AUTH_ENDPOINT, "alice", vulnerable_all_tokens())
+                .await
+                .expect("load authentication token"),
+            "authn-new"
+        );
+        assert_eq!(
+            load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("load refresh credential"),
+            "refresh-new"
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_commit_preserves_credential_when_replacement_absent() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire refresh lease");
+
+        lease
+            .commit("authn-new", None, vec![])
+            .await
+            .expect("commit refreshed token");
+
+        assert_eq!(
+            load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("load refresh credential"),
+            "refresh-old"
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_commit_does_not_overwrite_intervening_login() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire refresh lease");
+        store_user_token(REFRESH_AUTH_ENDPOINT, "alice", "authn-from-login", vec![])
+            .await
+            .expect("store intervening login");
+
+        let result = lease
+            .commit("authn-from-refresh", Some("refresh-new"), vec![])
+            .await
+            .expect("compare and commit");
+
+        assert_eq!(
+            result,
+            AuthenticationRefreshCommit::Superseded {
+                token: "authn-from-login".to_string()
+            }
+        );
+        assert_eq!(
+            load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("load refresh credential"),
+            "refresh-old"
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_lease_serializes_same_identity_and_rereads_winner() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let winner = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire winner lease");
+
+        #[allow(clippy::disallowed_methods)]
+        let waiter = tokio::spawn(async {
+            acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("acquire waiter lease")
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "same identity did not serialize");
+
+        winner
+            .commit("authn-new", Some("refresh-new"), vec![])
+            .await
+            .expect("commit winner pair");
+        let waiter = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter remained blocked")
+            .expect("waiter task failed");
+
+        assert_eq!(
+            (
+                waiter.snapshot().token.as_str(),
+                waiter.snapshot().refresh_token.as_str(),
+            ),
+            ("authn-new", "refresh-new")
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_lease_does_not_cross_identity_scope() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-a", "refresh-a").await;
+        store_refresh_pair("bob", "authn-b", "refresh-b").await;
+        let alice = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire alice lease");
+
+        let bob = tokio::time::timeout(
+            Duration::from_secs(5),
+            acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "bob"),
+        )
+        .await
+        .expect("bob blocked on alice lease")
+        .expect("acquire bob lease");
+
+        assert_eq!(bob.snapshot().token, "authn-b");
+        drop(alice);
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_lease_drop_releases_same_identity() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire first lease");
+
+        drop(lease);
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice"),
+        )
+        .await
+        .expect("lease remained held after drop")
+        .expect("acquire replacement lease");
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_lease_releases_after_process_exit() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let executable = std::env::current_exe().expect("current test executable");
+        let auth_path = REFRESH_TEST_PATH.get().expect("refresh test path").clone();
+
+        #[allow(clippy::disallowed_methods)]
+        let status = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(executable)
+                .arg("--exact")
+                .arg("token_store::tests::authentication_refresh_lease_child_process_holder")
+                .arg("--nocapture")
+                .env("LORE_AUTH_PATH", auth_path)
+                .env("LORE_AUTH_STORE", "fallback")
+                .env("CR020_REFRESH_CHILD", "1")
+                .status()
+                .expect("run child refresh holder")
+        })
+        .await
+        .expect("join child process");
+        assert!(status.success(), "child refresh holder failed: {status}");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice"),
+        )
+        .await
+        .expect("lease remained held after child process exited")
+        .expect("acquire lease after child exit");
+    }
+
+    #[tokio::test]
+    async fn concurrent_stale_process_caches_reserve_unique_encryption_nonces() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        encrypt_token("initialize encryption key")
+            .await
+            .expect("initialize encryption key");
+        let executable = std::env::current_exe().expect("current test executable");
+        let auth_path = REFRESH_TEST_PATH.get().expect("refresh test path").clone();
+        let ready_a = auth_path.join("nonce-child-a.ready");
+        let ready_b = auth_path.join("nonce-child-b.ready");
+        let output_a = auth_path.join("nonce-child-a.out");
+        let output_b = auth_path.join("nonce-child-b.out");
+        let go = auth_path.join("nonce-children.go");
+        for path in [&ready_a, &ready_b, &output_a, &output_b, &go] {
+            let _ = std::fs::remove_file(path);
+        }
+
+        let spawn_child = |id: &str, ready: &Path, output: &Path| -> std::process::Child {
+            #[allow(clippy::disallowed_methods)]
+            std::process::Command::new(&executable)
+                .arg("--exact")
+                .arg("token_store::tests::encryption_nonce_child_process_helper")
+                .arg("--nocapture")
+                .env("LORE_AUTH_PATH", &auth_path)
+                .env("LORE_AUTH_STORE", "fallback")
+                .env("CR020_NONCE_CHILD", id)
+                .env("CR020_NONCE_READY", ready)
+                .env("CR020_NONCE_OUTPUT", output)
+                .env("CR020_NONCE_GO", &go)
+                .spawn()
+                .expect("spawn nonce child")
+        };
+        let mut child_a = spawn_child("child-a", &ready_a, &output_a);
+        let mut child_b = spawn_child("child-b", &ready_b, &output_b);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready_a.exists() || !ready_b.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("children did not populate stale encryption caches");
+        std::fs::write(&go, b"go").expect("release nonce children");
+
+        #[allow(clippy::disallowed_methods)]
+        let (status_a, status_b) = tokio::task::spawn_blocking(move || {
+            (
+                child_a.wait().expect("wait for nonce child a"),
+                child_b.wait().expect("wait for nonce child b"),
+            )
+        })
+        .await
+        .expect("join nonce children");
+        assert!(status_a.success(), "nonce child a failed: {status_a}");
+        assert!(status_b.success(), "nonce child b failed: {status_b}");
+
+        let encrypted_a = std::fs::read_to_string(&output_a).expect("read nonce child a output");
+        let encrypted_b = std::fs::read_to_string(&output_b).expect("read nonce child b output");
+        let bytes_a = BASE64_STANDARD
+            .decode(&encrypted_a)
+            .expect("decode nonce child a output");
+        let bytes_b = BASE64_STANDARD
+            .decode(&encrypted_b)
+            .expect("decode nonce child b output");
+        assert_ne!(
+            &bytes_a[..NONCE_SIZE_U32],
+            &bytes_b[..NONCE_SIZE_U32],
+            "cross-process encryption reused an AES-GCM nonce"
+        );
+        assert_eq!(
+            decrypt_token(encrypted_a)
+                .await
+                .expect("decrypt nonce child a output"),
+            "child-a"
+        );
+        assert_eq!(
+            decrypt_token(encrypted_b)
+                .await
+                .expect("decrypt nonce child b output"),
+            "child-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn encryption_nonce_child_process_helper() {
+        let Ok(child_id) = std::env::var("CR020_NONCE_CHILD") else {
+            return;
+        };
+        let ready =
+            PathBuf::from(std::env::var("CR020_NONCE_READY").expect("nonce child ready path"));
+        let output =
+            PathBuf::from(std::env::var("CR020_NONCE_OUTPUT").expect("nonce child output path"));
+        let go = PathBuf::from(std::env::var("CR020_NONCE_GO").expect("nonce child go path"));
+
+        get_token_encryption_key()
+            .await
+            .expect("populate stale child encryption cache");
+        std::fs::write(ready, b"ready").expect("signal nonce child ready");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !go.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("nonce child was not released");
+        let encrypted = encrypt_token(&child_id)
+            .await
+            .expect("encrypt from stale child cache");
+        std::fs::write(output, encrypted).expect("write nonce child output");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn authentication_refresh_lease_child_process_holder() {
+        if std::env::var("CR020_REFRESH_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+
+        let _lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("child acquires refresh lease");
+        std::process::exit(0);
     }
 }
