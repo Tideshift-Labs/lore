@@ -116,6 +116,10 @@ pub struct UserToken {
     /// Display name
     #[prost(string, tag = "4")]
     pub user_name: ::prost::alloc::string::String,
+    /// Opaque backend-defined credential for renewing user_token. A backend may
+    /// return the same value or rotate it; absence means refresh is unsupported.
+    #[prost(string, optional, tag = "5")]
+    pub refresh_token: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResourcePermission {

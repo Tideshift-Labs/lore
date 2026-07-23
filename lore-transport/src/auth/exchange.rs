@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
+use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -21,6 +22,7 @@ use lore_base::types::RepositoryId;
 use lore_credential::get_domain_or_empty;
 use lore_credential::insecure_decode_token;
 use lore_credential::token_store;
+use lore_credential::token_store::AuthenticationRefreshCommit;
 use lore_credential::token_store::tokens_only_for_recipient_domain;
 use lore_credential::verify_jwt_usage_for_remote;
 use lore_error_set::prelude::*;
@@ -49,6 +51,24 @@ type AuthzCache = Mutex<HashMap<(AuthUrl, Identity, CacheResourceId, RecipientDo
 
 static AUTHZ_CACHE: std::sync::OnceLock<AuthzCache> = std::sync::OnceLock::new();
 
+/// Refresh authentication five minutes before expiry so the existing
+/// once-per-minute auth loop has multiple retry opportunities.
+pub const AUTHENTICATION_REFRESH_LEAD_MS: u64 = 5 * 60 * 1_000;
+const AUTHENTICATION_REFRESH_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTHENTICATION_REFRESH_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Copy)]
+struct AuthenticationRefreshTimeouts {
+    lock: Duration,
+    provider: Duration,
+}
+
+const AUTHENTICATION_REFRESH_TIMEOUTS: AuthenticationRefreshTimeouts =
+    AuthenticationRefreshTimeouts {
+        lock: AUTHENTICATION_REFRESH_LOCK_TIMEOUT,
+        provider: AUTHENTICATION_REFRESH_PROVIDER_TIMEOUT,
+    };
+
 fn cache() -> &'static AuthzCache {
     AUTHZ_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -66,12 +86,239 @@ pub async fn clear_authz_cache() {
 }
 
 pub fn is_expired(expires: u64) -> bool {
-    let expires = expires as u128;
-    let current_time = SystemTime::now()
+    let current_time = current_time_ms();
+    current_time >= expires
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    current_time >= expires
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+/// Pure refresh-window decision, exposed for boundary tests.
+pub fn authentication_refresh_due(expires_ms: u64, now_ms: u64) -> bool {
+    expires_ms <= now_ms.saturating_add(AUTHENTICATION_REFRESH_LEAD_MS)
+}
+
+fn token_is_unexpired(token: &str, now_ms: u64) -> bool {
+    lore_credential::user_info_from_token(token.to_string())
+        .is_none_or(|info| info.expires > now_ms)
+}
+
+fn verified_authentication_token(
+    token: &str,
+    identity: &str,
+    remote_domain: &str,
+    now_ms: u64,
+) -> Option<Vec<String>> {
+    let info = lore_credential::user_info_from_token(token.to_string())?;
+    if info.id != identity || info.expires <= now_ms {
+        lore_warn!("Authentication token has an invalid identity or expiry");
+        return None;
+    }
+    let decoded = insecure_decode_token(token).ok()?;
+    if let Err(err) = verify_jwt_usage_for_remote(&decoded.claims, remote_domain) {
+        lore_warn!("Authentication token is not suitable for its remote: {err}");
+        return None;
+    }
+    Some(decoded.claims.acceptable_root_domains())
+}
+
+fn fallback_authentication_token(
+    current_token: &str,
+    stored_token: &str,
+    identity: &str,
+    remote_domain: &str,
+    now_ms: u64,
+) -> String {
+    if verified_authentication_token(stored_token, identity, remote_domain, now_ms).is_some() {
+        stored_token.to_string()
+    } else if token_is_unexpired(current_token, now_ms) {
+        // `current_token` came through the token store's recipient-domain
+        // filter before the refresh lease was acquired.
+        current_token.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Refresh an authentication token when its JWT expiry enters the lead window.
+///
+/// The per-identity token-store lease is acquired before the final decision,
+/// then the on-disk pair is re-read. A process that waited for another refresher
+/// therefore uses the winner's token without issuing a duplicate request.
+async fn refresh_authentication_if_needed(
+    auth_url: &str,
+    remote_domain: &str,
+    identity: &str,
+    current_token: String,
+) -> String {
+    refresh_authentication_if_needed_with_timeouts(
+        auth_url,
+        remote_domain,
+        identity,
+        current_token,
+        AUTHENTICATION_REFRESH_TIMEOUTS,
+    )
+    .await
+}
+
+async fn refresh_authentication_if_needed_with_timeouts(
+    auth_url: &str,
+    remote_domain: &str,
+    identity: &str,
+    current_token: String,
+    timeouts: AuthenticationRefreshTimeouts,
+) -> String {
+    let now_ms = current_time_ms();
+    let Some(current_info) = lore_credential::user_info_from_token(current_token.clone()) else {
+        // Preserve the historical behavior for opaque/non-JWT credentials.
+        return current_token;
+    };
+    if !authentication_refresh_due(current_info.expires, now_ms) {
+        return current_token;
+    }
+
+    let Ok(Ok(lease)) = tokio::time::timeout(
+        timeouts.lock,
+        token_store::acquire_authentication_refresh(auth_url, identity),
+    )
+    .await
+    else {
+        lore_debug!("Authentication refresh lease timed out or could not be acquired");
+        return if token_is_unexpired(&current_token, now_ms) {
+            current_token
+        } else {
+            String::new()
+        };
+    };
+
+    let stored_token = lease.snapshot().token.clone();
+    let Some(stored_info) = lore_credential::user_info_from_token(stored_token.clone()) else {
+        lore_warn!("Stored authentication token is invalid while attempting refresh");
+        return if token_is_unexpired(&current_token, now_ms) {
+            current_token
+        } else {
+            String::new()
+        };
+    };
+    if stored_info.id != identity {
+        lore_warn!("Stored authentication token does not match its identity");
+        return if token_is_unexpired(&current_token, now_ms) {
+            current_token
+        } else {
+            String::new()
+        };
+    }
+    if !authentication_refresh_due(stored_info.expires, now_ms) {
+        return if verified_authentication_token(&stored_token, identity, remote_domain, now_ms)
+            .is_some()
+        {
+            stored_token
+        } else if token_is_unexpired(&current_token, now_ms) {
+            current_token
+        } else {
+            String::new()
+        };
+    }
+
+    let Ok(auth_impl) = authentication::find(auth_url) else {
+        return fallback_authentication_token(
+            &current_token,
+            &stored_token,
+            identity,
+            remote_domain,
+            now_ms,
+        );
+    };
+    let correlation_id = String::new();
+    let refresh_result = tokio::time::timeout(
+        timeouts.provider,
+        auth_impl.refresh_authentication(
+            auth_url,
+            lease.snapshot().refresh_token.as_str(),
+            &correlation_id,
+        ),
+    )
+    .await;
+    let refreshed = match refresh_result {
+        Ok(Ok(token)) => token,
+        Ok(Err(err)) => {
+            lore_debug!("Authentication refresh failed for {identity}: {err}");
+            return fallback_authentication_token(
+                &current_token,
+                &stored_token,
+                identity,
+                remote_domain,
+                now_ms,
+            );
+        }
+        Err(_) => {
+            lore_debug!("Authentication refresh timed out for {identity}");
+            return fallback_authentication_token(
+                &current_token,
+                &stored_token,
+                identity,
+                remote_domain,
+                now_ms,
+            );
+        }
+    };
+
+    if refreshed.user_id != identity {
+        lore_warn!("Refreshed authentication response changed the user identity");
+        return fallback_authentication_token(
+            &current_token,
+            &stored_token,
+            identity,
+            remote_domain,
+            now_ms,
+        );
+    }
+    let Some(acceptable_root_domains) =
+        verified_authentication_token(&refreshed.token, identity, remote_domain, now_ms)
+    else {
+        return fallback_authentication_token(
+            &current_token,
+            &stored_token,
+            identity,
+            remote_domain,
+            now_ms,
+        );
+    };
+
+    let replacement = refreshed.refresh_token.as_deref();
+    match lease
+        .commit(
+            refreshed.token.as_str(),
+            replacement,
+            acceptable_root_domains,
+        )
+        .await
+    {
+        Ok(AuthenticationRefreshCommit::Stored) => refreshed.token,
+        Ok(AuthenticationRefreshCommit::Superseded { token }) => {
+            if verified_authentication_token(&token, identity, remote_domain, now_ms).is_some() {
+                token
+            } else {
+                String::new()
+            }
+        }
+        Err(err) => {
+            lore_warn!("Failed to store refreshed authentication token: {err}");
+            fallback_authentication_token(
+                &current_token,
+                &stored_token,
+                identity,
+                remote_domain,
+                now_ms,
+            )
+        }
+    }
 }
 
 /// Exchanges an authentication token for a repository-scoped authorization
@@ -452,10 +699,10 @@ async fn auth_exchange_for_identity(
         return (String::new(), String::new(), String::new());
     };
 
-    // Reject expired authn tokens
-    if let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
-        && is_expired(info.expires)
-    {
+    let authentication_token =
+        refresh_authentication_if_needed(auth_url, remote_domain, identity, authentication_token)
+            .await;
+    if authentication_token.is_empty() {
         lore_debug!("Skipping identity {identity}, authn token is expired");
         return (String::new(), String::new(), String::new());
     }
@@ -579,9 +826,10 @@ async fn auth_exchange_custom_resource_for_identity(
         return (String::new(), String::new(), String::new());
     };
 
-    if let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
-        && is_expired(info.expires)
-    {
+    let authentication_token =
+        refresh_authentication_if_needed(auth_url, remote_domain, identity, authentication_token)
+            .await;
+    if authentication_token.is_empty() {
         lore_debug!("Skipping identity {identity}, authn token is expired");
         return (String::new(), String::new(), String::new());
     }
@@ -630,7 +878,24 @@ async fn auth_exchange_custom_resource_for_identity(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use async_trait::async_trait;
+    use lore_base::error::NotSupported;
+
     use super::*;
+    use crate::ProtocolError;
+    use crate::traits::Authentication;
+    use crate::types::AuthSession;
+    use crate::types::AuthenticationToken;
+    use crate::types::AuthorizationToken;
+    use crate::types::ResolvedUser;
+
+    static REFRESH_TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    static REFRESH_TEST_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
 
     // CR-017(a): a full transport reset must evict the authz-exchange cache --
     // it has no expiry-driven eviction of its own, so a post-logout identity
@@ -662,5 +927,646 @@ mod tests {
         // (nothing to clear, or already cleared) doesn't panic either way.
         clear_authz_cache().await;
         clear_authz_cache().await;
+    }
+
+    struct TestAuthentication {
+        refresh_result: Result<AuthenticationToken, ProtocolError>,
+        refresh_never_completes: bool,
+        authorization_token: String,
+        refresh_calls: AtomicUsize,
+        repository_calls: AtomicUsize,
+        custom_resource_calls: AtomicUsize,
+    }
+
+    impl TestAuthentication {
+        fn succeeding(refreshed: AuthenticationToken, authorization_token: String) -> Self {
+            Self {
+                refresh_result: Ok(refreshed),
+                refresh_never_completes: false,
+                authorization_token,
+                refresh_calls: AtomicUsize::new(0),
+                repository_calls: AtomicUsize::new(0),
+                custom_resource_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn failing(error: ProtocolError) -> Self {
+            Self {
+                refresh_result: Err(error),
+                refresh_never_completes: false,
+                authorization_token: String::new(),
+                refresh_calls: AtomicUsize::new(0),
+                repository_calls: AtomicUsize::new(0),
+                custom_resource_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn never_completing() -> Self {
+            Self {
+                refresh_result: Err(ProtocolError::internal("unreachable refresh result")),
+                refresh_never_completes: true,
+                authorization_token: String::new(),
+                refresh_calls: AtomicUsize::new(0),
+                repository_calls: AtomicUsize::new(0),
+                custom_resource_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Authentication for TestAuthentication {
+        async fn start_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthSession, ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "start_auth_session".to_string(),
+            }))
+        }
+
+        async fn poll_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _session_code: &str,
+            _correlation_id: &str,
+        ) -> Result<Option<AuthenticationToken>, ProtocolError> {
+            Ok(None)
+        }
+
+        async fn exchange_external_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "exchange_external_token".to_string(),
+            }))
+        }
+
+        async fn refresh_authentication(
+            &self,
+            _auth_url: &str,
+            _refresh_token: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            if self.refresh_never_completes {
+                std::future::pending::<()>().await;
+            }
+            self.refresh_result.clone()
+        }
+
+        async fn exchange_for_repository(
+            &self,
+            _auth_url: &str,
+            _authn_token: &str,
+            _repository: RepositoryId,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            self.repository_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AuthorizationToken {
+                token: self.authorization_token.clone(),
+                expires_ms: u64::MAX,
+                acceptable_root_domains: Vec::new(),
+            })
+        }
+
+        async fn exchange_for_custom_resource(
+            &self,
+            _auth_url: &str,
+            _authn_token: &str,
+            _resource_id: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            self.custom_resource_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AuthorizationToken {
+                token: self.authorization_token.clone(),
+                expires_ms: u64::MAX,
+                acceptable_root_domains: Vec::new(),
+            })
+        }
+
+        async fn get_user_info(
+            &self,
+            _auth_url: &str,
+            _authz_token: &str,
+            _repository: RepositoryId,
+            _user_ids: &[String],
+            _correlation_id: &str,
+        ) -> Result<Vec<ResolvedUser>, ProtocolError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_user_id(
+            &self,
+            _auth_url: &str,
+            _authz_token: &str,
+            _repository: RepositoryId,
+            _display_name: &str,
+            _correlation_id: &str,
+        ) -> Result<Option<ResolvedUser>, ProtocolError> {
+            Ok(None)
+        }
+    }
+
+    async fn refresh_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        REFRESH_TEST_MUTEX
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    async fn setup_refresh_test() {
+        let path = REFRESH_TEST_PATH.get_or_init(|| {
+            std::env::temp_dir().join(format!("lore-cr020-exchange-{}", std::process::id()))
+        });
+        unsafe {
+            std::env::set_var("LORE_AUTH_PATH", path);
+            std::env::set_var("LORE_AUTH_STORE", "fallback");
+        }
+        token_store::reset_tokens()
+            .await
+            .expect("reset test token store");
+        cache().lock().await.clear();
+    }
+
+    fn base64_url(input: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut encoded = String::new();
+        for chunk in input.chunks(3) {
+            let bits = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            encoded.push(ALPHABET[((bits >> 18) & 0x3f) as usize] as char);
+            encoded.push(ALPHABET[((bits >> 12) & 0x3f) as usize] as char);
+            if chunk.len() > 1 {
+                encoded.push(ALPHABET[((bits >> 6) & 0x3f) as usize] as char);
+            }
+            if chunk.len() > 2 {
+                encoded.push(ALPHABET[(bits & 0x3f) as usize] as char);
+            }
+        }
+        encoded
+    }
+
+    fn jwt(identity: &str, expires_ms: u64, audience: &str) -> String {
+        let header = base64_url(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = format!(
+            r#"{{"iss":"auth.example.com","sub":"{identity}","name":"Test User","exp":{},"aud":["{audience}"]}}"#,
+            expires_ms / 1_000
+        );
+        format!("{header}.{}.", base64_url(payload.as_bytes()))
+    }
+
+    fn authentication_token(token: String, identity: &str) -> AuthenticationToken {
+        AuthenticationToken {
+            token,
+            user_id: identity.to_string(),
+            user_name: "Test User".to_string(),
+            expires_ms: u64::MAX,
+            acceptable_root_domains: Vec::new(),
+            refresh_token: Some("refresh-new".to_string()),
+        }
+    }
+
+    async fn store_pair(auth_url: &str, identity: &str, token: &str) {
+        token_store::store_user_token(auth_url, identity, token, vec!["example.com".to_string()])
+            .await
+            .expect("store authentication token");
+        token_store::store_refresh_token(auth_url, identity, "refresh-old")
+            .await
+            .expect("store refresh credential");
+    }
+
+    async fn replace_stored_pair_with_wrong_remote(
+        auth_url: &str,
+        identity: &str,
+        current_token: &str,
+        wrong_remote_token: &str,
+    ) {
+        store_pair(auth_url, identity, current_token).await;
+        token_store::store_user_token(
+            auth_url,
+            identity,
+            wrong_remote_token,
+            vec!["attacker.example.net".to_string()],
+        )
+        .await
+        .expect("replace stored token with wrong-remote token");
+    }
+
+    #[test]
+    fn authentication_refresh_due_is_false_before_lead_window() {
+        assert!(!authentication_refresh_due(
+            AUTHENTICATION_REFRESH_LEAD_MS + 1,
+            0
+        ));
+    }
+
+    #[test]
+    fn authentication_refresh_due_is_true_at_lead_boundary() {
+        assert!(authentication_refresh_due(
+            AUTHENTICATION_REFRESH_LEAD_MS,
+            0
+        ));
+    }
+
+    #[test]
+    fn authentication_refresh_due_saturates_near_maximum_time() {
+        assert!(authentication_refresh_due(u64::MAX, u64::MAX - 1));
+    }
+
+    #[tokio::test]
+    async fn refresh_before_lead_window_keeps_token_without_calling_provider() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let now = current_time_ms();
+        let current = jwt(
+            "alice",
+            now + AUTHENTICATION_REFRESH_LEAD_MS + 60_000,
+            "example.com",
+        );
+        let auth_url = "before-lead://auth.example.com";
+        store_pair(auth_url, "alice", &current).await;
+        let provider = Arc::new(TestAuthentication::failing(ProtocolError::internal(
+            "must not refresh",
+        )));
+        authentication::add("before-lead", provider.clone()).expect("register provider");
+
+        let result = refresh_authentication_if_needed(
+            auth_url,
+            "repo.example.com",
+            "alice",
+            current.clone(),
+        )
+        .await;
+
+        assert_eq!(result, current);
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_without_stored_credential_keeps_still_valid_token() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let current = jwt("alice", current_time_ms() + 60_000, "example.com");
+        let auth_url = "no-refresh://auth.example.com";
+        token_store::store_user_token(auth_url, "alice", &current, vec!["example.com".to_string()])
+            .await
+            .expect("store authentication token");
+
+        let result = refresh_authentication_if_needed(
+            auth_url,
+            "repo.example.com",
+            "alice",
+            current.clone(),
+        )
+        .await;
+
+        assert_eq!(result, current);
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_replaces_stored_pair() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let now = current_time_ms();
+        let current = jwt("alice", now + 60_000, "example.com");
+        let refreshed = jwt("alice", now + 3_600_000, "example.com");
+        let auth_url = "refresh-success://auth.example.com";
+        store_pair(auth_url, "alice", &current).await;
+        let provider = Arc::new(TestAuthentication::succeeding(
+            authentication_token(refreshed.clone(), "alice"),
+            String::new(),
+        ));
+        authentication::add("refresh-success", provider.clone()).expect("register provider");
+
+        let result =
+            refresh_authentication_if_needed(auth_url, "repo.example.com", "alice", current).await;
+
+        assert_eq!(result, refreshed);
+        assert_eq!(
+            token_store::load_refresh_token(auth_url, "alice")
+                .await
+                .expect("load replacement refresh credential"),
+            "refresh-new"
+        );
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_refresh_failure_keeps_still_valid_token() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let current = jwt("alice", current_time_ms() + 60_000, "example.com");
+        let auth_url = "refresh-transient://auth.example.com";
+        store_pair(auth_url, "alice", &current).await;
+        let provider = Arc::new(TestAuthentication::failing(ProtocolError::from(
+            Disconnected,
+        )));
+        authentication::add("refresh-transient", provider).expect("register provider");
+
+        let result = refresh_authentication_if_needed(
+            auth_url,
+            "repo.example.com",
+            "alice",
+            current.clone(),
+        )
+        .await;
+
+        assert_eq!(result, current);
+    }
+
+    #[tokio::test]
+    async fn never_completing_provider_times_out_to_still_valid_original_token() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let current = jwt("alice", current_time_ms() + 60_000, "example.com");
+        let auth_url = "refresh-provider-timeout://auth.example.com";
+        store_pair(auth_url, "alice", &current).await;
+        let provider = Arc::new(TestAuthentication::never_completing());
+        authentication::add("refresh-provider-timeout", provider.clone())
+            .expect("register provider");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            refresh_authentication_if_needed_with_timeouts(
+                auth_url,
+                "repo.example.com",
+                "alice",
+                current.clone(),
+                AuthenticationRefreshTimeouts {
+                    lock: Duration::from_millis(100),
+                    provider: Duration::from_millis(20),
+                },
+            ),
+        )
+        .await
+        .expect("provider timeout did not bound refresh");
+
+        assert_eq!(result, current);
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn held_refresh_lease_times_out_to_still_valid_original_token() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let current = jwt("alice", current_time_ms() + 60_000, "example.com");
+        let auth_url = "refresh-lock-timeout://auth.example.com";
+        store_pair(auth_url, "alice", &current).await;
+        let held_lease = token_store::acquire_authentication_refresh(auth_url, "alice")
+            .await
+            .expect("hold refresh lease");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            refresh_authentication_if_needed_with_timeouts(
+                auth_url,
+                "repo.example.com",
+                "alice",
+                current.clone(),
+                AuthenticationRefreshTimeouts {
+                    lock: Duration::from_millis(20),
+                    provider: Duration::from_millis(100),
+                },
+            ),
+        )
+        .await
+        .expect("lease timeout did not bound refresh");
+
+        assert_eq!(result, current);
+        drop(held_lease);
+        let reacquired = tokio::time::timeout(
+            Duration::from_secs(1),
+            token_store::acquire_authentication_refresh(auth_url, "alice"),
+        )
+        .await
+        .expect("timed-out waiter ghost-locked the refresh lease")
+        .expect("reacquire refresh lease after timeout");
+        drop(reacquired);
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_keeps_still_valid_token() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let current = jwt("alice", current_time_ms() + 60_000, "example.com");
+        let auth_url = "refresh-rejected://auth.example.com";
+        store_pair(auth_url, "alice", &current).await;
+        let provider = Arc::new(TestAuthentication::failing(ProtocolError::from(
+            NotAuthenticated,
+        )));
+        authentication::add("refresh-rejected", provider).expect("register provider");
+
+        let result = refresh_authentication_if_needed(
+            auth_url,
+            "repo.example.com",
+            "alice",
+            current.clone(),
+        )
+        .await;
+
+        assert_eq!(result, current);
+    }
+
+    #[tokio::test]
+    async fn invalid_refreshed_jwt_keeps_still_valid_token() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let current = jwt("alice", current_time_ms() + 60_000, "example.com");
+        let auth_url = "refresh-invalid://auth.example.com";
+        store_pair(auth_url, "alice", &current).await;
+        let provider = Arc::new(TestAuthentication::succeeding(
+            authentication_token("not-a-jwt".to_string(), "alice"),
+            String::new(),
+        ));
+        authentication::add("refresh-invalid", provider).expect("register provider");
+
+        let result = refresh_authentication_if_needed(
+            auth_url,
+            "repo.example.com",
+            "alice",
+            current.clone(),
+        )
+        .await;
+
+        assert_eq!(result, current);
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_after_expiry_returns_login_required_empty_token() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let current = jwt(
+            "alice",
+            current_time_ms().saturating_sub(1_000),
+            "example.com",
+        );
+        let auth_url = "refresh-expired://auth.example.com";
+        store_pair(auth_url, "alice", &current).await;
+        let provider = Arc::new(TestAuthentication::failing(ProtocolError::from(
+            Disconnected,
+        )));
+        authentication::add("refresh-expired", provider).expect("register provider");
+
+        let result =
+            refresh_authentication_if_needed(auth_url, "repo.example.com", "alice", current).await;
+
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_provider_does_not_return_reloaded_wrong_remote_token() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let now = current_time_ms();
+        let current = jwt("alice", now + 60_000, "example.com");
+        let wrong_remote = jwt("alice", now + 60_000, "attacker.example.net");
+        let auth_url = "missing-provider://auth.example.com";
+        replace_stored_pair_with_wrong_remote(auth_url, "alice", &current, &wrong_remote).await;
+
+        let result = refresh_authentication_if_needed(
+            auth_url,
+            "repo.example.com",
+            "alice",
+            current.clone(),
+        )
+        .await;
+
+        assert_eq!(result, current);
+        assert_ne!(result, wrong_remote);
+    }
+
+    #[tokio::test]
+    async fn provider_failure_does_not_return_reloaded_wrong_remote_token() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let now = current_time_ms();
+        let current = jwt("alice", now + 60_000, "example.com");
+        let wrong_remote = jwt("alice", now + 60_000, "attacker.example.net");
+        let auth_url = "wrong-remote-failure://auth.example.com";
+        replace_stored_pair_with_wrong_remote(auth_url, "alice", &current, &wrong_remote).await;
+        let provider = Arc::new(TestAuthentication::failing(ProtocolError::from(
+            Disconnected,
+        )));
+        authentication::add("wrong-remote-failure", provider).expect("register provider");
+
+        let result = refresh_authentication_if_needed(
+            auth_url,
+            "repo.example.com",
+            "alice",
+            current.clone(),
+        )
+        .await;
+
+        assert_eq!(result, current);
+        assert_ne!(result, wrong_remote);
+    }
+
+    #[tokio::test]
+    async fn invalid_refresh_does_not_return_reloaded_wrong_remote_token() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let now = current_time_ms();
+        let current = jwt("alice", now + 60_000, "example.com");
+        let wrong_remote = jwt("alice", now + 60_000, "attacker.example.net");
+        let auth_url = "wrong-remote-invalid://auth.example.com";
+        replace_stored_pair_with_wrong_remote(auth_url, "alice", &current, &wrong_remote).await;
+        let provider = Arc::new(TestAuthentication::succeeding(
+            authentication_token("not-a-jwt".to_string(), "alice"),
+            String::new(),
+        ));
+        authentication::add("wrong-remote-invalid", provider).expect("register provider");
+
+        let result = refresh_authentication_if_needed(
+            auth_url,
+            "repo.example.com",
+            "alice",
+            current.clone(),
+        )
+        .await;
+
+        assert_eq!(result, current);
+        assert_ne!(result, wrong_remote);
+    }
+
+    #[tokio::test]
+    async fn expired_original_token_fails_closed_when_reloaded_token_is_wrong_remote() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let now = current_time_ms();
+        let current = jwt("alice", now.saturating_sub(1_000), "example.com");
+        let wrong_remote = jwt("alice", now + 60_000, "attacker.example.net");
+        let auth_url = "wrong-remote-expired://auth.example.com";
+        replace_stored_pair_with_wrong_remote(auth_url, "alice", &current, &wrong_remote).await;
+
+        let result =
+            refresh_authentication_if_needed(auth_url, "repo.example.com", "alice", current).await;
+
+        assert!(result.is_empty());
+        assert_ne!(result, wrong_remote);
+    }
+
+    #[tokio::test]
+    async fn repository_exchange_uses_refreshed_authentication_token() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let now = current_time_ms();
+        let current = jwt("alice", now + 60_000, "example.com");
+        let refreshed = jwt("alice", now + 3_600_000, "example.com");
+        let authz = jwt("alice", now + 3_600_000, "example.com");
+        let auth_url = "refresh-repository://auth.example.com";
+        store_pair(auth_url, "alice", &current).await;
+        let provider = Arc::new(TestAuthentication::succeeding(
+            authentication_token(refreshed.clone(), "alice"),
+            authz,
+        ));
+        authentication::add("refresh-repository", provider.clone()).expect("register provider");
+
+        let result = auth_exchange_for_identity(
+            auth_url,
+            "repo.example.com",
+            "alice",
+            RepositoryId::from([1; 16]),
+        )
+        .await;
+
+        assert_eq!(result.0, refreshed);
+        assert_eq!(provider.repository_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn custom_resource_exchange_uses_refreshed_authentication_token() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        let now = current_time_ms();
+        let current = jwt("alice", now + 60_000, "example.com");
+        let refreshed = jwt("alice", now + 3_600_000, "example.com");
+        let authz = jwt("alice", now + 3_600_000, "example.com");
+        let auth_url = "refresh-custom://auth.example.com";
+        store_pair(auth_url, "alice", &current).await;
+        let provider = Arc::new(TestAuthentication::succeeding(
+            authentication_token(refreshed.clone(), "alice"),
+            authz,
+        ));
+        authentication::add("refresh-custom", provider.clone()).expect("register provider");
+
+        let result = auth_exchange_custom_resource_for_identity(
+            auth_url,
+            "repo.example.com",
+            "alice",
+            "bespoke-urc:test",
+        )
+        .await;
+
+        assert_eq!(result.0, refreshed);
+        assert_eq!(provider.custom_resource_calls.load(Ordering::SeqCst), 1);
     }
 }
