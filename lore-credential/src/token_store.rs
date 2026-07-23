@@ -449,7 +449,29 @@ pub async fn store_user_token(
     auth_endpoint: &str,
     identity: &str,
     token: &str,
+    acceptable_root_domains: Vec<String>,
+) -> Result<(), TokenStoreError> {
+    store_authentication_token(
+        auth_endpoint,
+        identity,
+        token,
+        acceptable_root_domains,
+        None,
+    )
+    .await
+}
+
+/// Store an authentication token and optional refresh credential in one
+/// guarded token-map commit.
+///
+/// `refresh_token = None` preserves an existing refresh credential, matching
+/// [`store_user_token`]'s historical behavior.
+pub async fn store_authentication_token(
+    auth_endpoint: &str,
+    identity: &str,
+    token: &str,
     mut acceptable_root_domains: Vec<String>,
+    refresh_token: Option<&str>,
 ) -> Result<(), TokenStoreError> {
     let auth_endpoint = auth_endpoint.trim_end_matches('/');
 
@@ -461,6 +483,10 @@ pub async fn store_user_token(
     acceptable_root_domains.push(auth_domain);
 
     let encrypted_token = encrypt_token(token).await?;
+    let encrypted_refresh_token = match refresh_token {
+        Some(refresh_token) => Some(encrypt_token(refresh_token).await?),
+        None => None,
+    };
 
     lore_trace!(
         "Store user {identity} token for auth endpoint {auth_endpoint} and audiences '{acceptable_root_domains:?}'"
@@ -470,66 +496,56 @@ pub async fn store_user_token(
         user_id: identity.to_string(),
         token: encrypted_token,
         acceptable_root_domains,
-        refresh_token: None,
+        refresh_token: encrypted_refresh_token,
     };
 
     let token_map = token_map();
     let mut map_lock = token_map.lock().await;
     let guard = lock_token_map().await?;
     reload_token_map(&guard, &mut map_lock);
-    if let Some(map) = map_lock.as_mut() {
-        if let Some(remote) = map
-            .remotes
-            .iter_mut()
-            .find(|entry| entry.remote == auth_endpoint)
+    let mut candidate = map_lock.clone().unwrap_or_default();
+    if let Some(remote) = candidate
+        .remotes
+        .iter_mut()
+        .find(|entry| entry.remote == auth_endpoint)
+    {
+        if let Some(existing_index) = remote
+            .token
+            .iter()
+            .position(|entry| entry.user_id == identity_token.user_id)
         {
-            if let Some(existing_index) = remote
-                .token
-                .iter()
-                .position(|entry| entry.user_id == identity_token.user_id)
-            {
-                // Preserve existing refresh token when updating the auth token
-                let existing_refresh = remote.token[existing_index].refresh_token.take();
-                let mut new_token = identity_token;
-                new_token.refresh_token = existing_refresh;
-                remote.token[existing_index] = new_token;
-                lore_trace!(
-                    "Replace user {identity} token for auth_endpoint {auth_endpoint} in existing entry"
-                );
-            } else {
-                lore_trace!(
-                    "Store user {identity} token for auth_endpoint {auth_endpoint} in new identity entry"
-                );
-                remote.token.push(identity_token);
+            let mut new_token = identity_token;
+            // A caller that has no replacement preserves the existing
+            // provider credential; a supplied value replaces the pair.
+            if new_token.refresh_token.is_none() {
+                new_token.refresh_token = remote.token[existing_index].refresh_token.take();
             }
+            remote.token[existing_index] = new_token;
+            lore_trace!(
+                "Replace user {identity} token for auth_endpoint {auth_endpoint} in existing entry"
+            );
         } else {
             lore_trace!(
-                "Store user {identity} token for auth_endpoint {auth_endpoint} in new remote entry"
+                "Store user {identity} token for auth_endpoint {auth_endpoint} in new identity entry"
             );
-            map.remotes.push(RemoteIdentity {
-                remote: auth_endpoint.to_string(),
-                token: vec![identity_token],
-            });
+            remote.token.push(identity_token);
         }
     } else {
         lore_trace!(
-            "Store user {identity} token for auth_endpoint {auth_endpoint} in new entry in new token map"
+            "Store user {identity} token for auth_endpoint {auth_endpoint} in new remote entry"
         );
-        let map = TokenMap {
-            remotes: vec![RemoteIdentity {
-                remote: auth_endpoint.to_string(),
-                token: vec![identity_token],
-            }],
-        };
-        *map_lock = Some(map);
+        candidate.remotes.push(RemoteIdentity {
+            remote: auth_endpoint.to_string(),
+            token: vec![identity_token],
+        });
     }
 
-    if let Some(map) = map_lock.as_ref() {
-        store_token_map(&guard, map)
-    } else {
-        lore_debug!("Unexpected, no token map to store to file");
-        Err(TokenStoreError::internal("Failed to store token map"))
-    }
+    // Publish the new in-memory view only after the guarded disk write
+    // succeeds. A failed write must not expose an uncommitted candidate from
+    // this process's cache.
+    store_token_map(&guard, &candidate)?;
+    *map_lock = Some(candidate);
+    Ok(())
 }
 
 /// Load the first suitable token for the given identity from the shared store
@@ -850,16 +866,16 @@ impl AuthenticationRefreshLease {
             reload_token_map(&guard, &mut map_lock);
 
             let Some(token_entry) = map_lock
-                .as_mut()
+                .as_ref()
                 .and_then(|map| {
                     map.remotes
-                        .iter_mut()
+                        .iter()
                         .find(|entry| entry.remote == self.auth_endpoint)
                 })
                 .and_then(|remote| {
                     remote
                         .token
-                        .iter_mut()
+                        .iter()
                         .find(|entry| entry.user_id == self.identity)
                 })
             else {
@@ -872,13 +888,27 @@ impl AuthenticationRefreshLease {
             {
                 Some(token_entry.token.clone())
             } else {
-                token_entry.token = encrypted_token;
-                token_entry.acceptable_root_domains = acceptable_root_domains;
-                token_entry.refresh_token = Some(encrypted_refresh_token);
-                let Some(map) = map_lock.as_ref() else {
+                let Some(mut candidate) = map_lock.clone() else {
                     return Err(TokenStoreError::internal("Failed to store token map"));
                 };
-                store_token_map(&guard, map)?;
+                let Some(candidate_entry) = candidate
+                    .remotes
+                    .iter_mut()
+                    .find(|entry| entry.remote == self.auth_endpoint)
+                    .and_then(|remote| {
+                        remote
+                            .token
+                            .iter_mut()
+                            .find(|entry| entry.user_id == self.identity)
+                    })
+                else {
+                    return Err(TokenNotFound.into());
+                };
+                candidate_entry.token = encrypted_token;
+                candidate_entry.acceptable_root_domains = acceptable_root_domains;
+                candidate_entry.refresh_token = Some(encrypted_refresh_token);
+                store_token_map(&guard, &candidate)?;
+                *map_lock = Some(candidate);
                 None
             }
         };
@@ -1367,6 +1397,22 @@ mod tests {
             .expect("store refresh credential");
     }
 
+    fn replace_token_file_with_directory() -> PathBuf {
+        let path = token_map_path(false).expect("token map path");
+        std::fs::remove_file(&path).expect("remove token map file");
+        std::fs::create_dir(&path).expect("replace token map file with directory");
+        path
+    }
+
+    async fn restore_token_file(path: &Path) {
+        std::fs::remove_dir(path).expect("remove token map failure directory");
+        let token_map = token_map();
+        let map_lock = token_map.lock().await;
+        let guard = lock_token_map().await.expect("lock restored token map");
+        let map = map_lock.as_ref().expect("cached token map after failure");
+        store_token_map(&guard, map).expect("restore token map file");
+    }
+
     #[test]
     fn refresh_token_serde_default_none() {
         // Old tokens.toml format without refresh_token field
@@ -1511,6 +1557,177 @@ token = "tok-b"
             "https://auth.example.com/not-a-resource",
             "https://auth.example.com"
         ));
+    }
+
+    #[tokio::test]
+    async fn store_authentication_token_stores_supplied_pair() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+
+        store_authentication_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            "authn-initial",
+            vec![],
+            Some("refresh-initial"),
+        )
+        .await
+        .expect("store initial authentication pair");
+
+        assert_eq!(
+            load_user_token(REFRESH_AUTH_ENDPOINT, "alice", vulnerable_all_tokens())
+                .await
+                .expect("load initial authentication token"),
+            "authn-initial"
+        );
+        assert_eq!(
+            load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("load initial refresh credential"),
+            "refresh-initial"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_authentication_token_replaces_both_supplied_credentials() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_authentication_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            "authn-old",
+            vec![],
+            Some("refresh-old"),
+        )
+        .await
+        .expect("store old authentication pair");
+
+        store_authentication_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            "authn-new",
+            vec![],
+            Some("refresh-new"),
+        )
+        .await
+        .expect("replace authentication pair");
+
+        assert_eq!(
+            load_user_token(REFRESH_AUTH_ENDPOINT, "alice", vulnerable_all_tokens())
+                .await
+                .expect("load replaced authentication token"),
+            "authn-new"
+        );
+        assert_eq!(
+            load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("load replaced refresh credential"),
+            "refresh-new"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_authentication_token_without_refresh_preserves_existing_credential() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_authentication_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            "authn-old",
+            vec![],
+            Some("refresh-old"),
+        )
+        .await
+        .expect("store old authentication pair");
+
+        store_authentication_token(REFRESH_AUTH_ENDPOINT, "alice", "authn-new", vec![], None)
+            .await
+            .expect("replace authentication token");
+
+        assert_eq!(
+            load_user_token(REFRESH_AUTH_ENDPOINT, "alice", vulnerable_all_tokens())
+                .await
+                .expect("load replaced authentication token"),
+            "authn-new"
+        );
+        assert_eq!(
+            load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("load preserved refresh credential"),
+            "refresh-old"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_authentication_pair_write_keeps_previous_cached_pair() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_authentication_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            "authn-old",
+            vec![],
+            Some("refresh-old"),
+        )
+        .await
+        .expect("store old authentication pair");
+        let path = replace_token_file_with_directory();
+
+        let write_result = store_authentication_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            "authn-new",
+            vec![],
+            Some("refresh-new"),
+        )
+        .await;
+        let cached_authn =
+            load_user_token(REFRESH_AUTH_ENDPOINT, "alice", vulnerable_all_tokens()).await;
+        let cached_refresh = load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice").await;
+        restore_token_file(&path).await;
+
+        assert!(
+            write_result.is_err(),
+            "directory target accepted token write"
+        );
+        assert_eq!(
+            cached_authn.expect("load cached authentication token"),
+            "authn-old"
+        );
+        assert_eq!(
+            cached_refresh.expect("load cached refresh credential"),
+            "refresh-old"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_commit_keeps_previous_cached_pair() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire refresh lease");
+        let path = replace_token_file_with_directory();
+
+        let write_result = lease.commit("authn-new", Some("refresh-new"), vec![]).await;
+        let cached_authn =
+            load_user_token(REFRESH_AUTH_ENDPOINT, "alice", vulnerable_all_tokens()).await;
+        let cached_refresh = load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice").await;
+        restore_token_file(&path).await;
+
+        assert!(
+            write_result.is_err(),
+            "directory target accepted token write"
+        );
+        assert_eq!(
+            cached_authn.expect("load cached authentication token"),
+            "authn-old"
+        );
+        assert_eq!(
+            cached_refresh.expect("load cached refresh credential"),
+            "refresh-old"
+        );
     }
 
     #[tokio::test]
