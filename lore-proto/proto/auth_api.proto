@@ -95,6 +95,9 @@ message UserToken {
   int64 expires_at = 2; // Epoch
   string user_id = 3;   // URC user ID
   string user_name = 4; // Display name
+  // Opaque backend-defined credential for renewing user_token. A backend may
+  // return the same value or rotate it; absence means refresh is unsupported.
+  optional string refresh_token = 5;
 }
 
 message ResourcePermission {

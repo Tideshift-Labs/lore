@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
+use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -21,6 +22,7 @@ use lore_base::types::RepositoryId;
 use lore_credential::get_domain_or_empty;
 use lore_credential::insecure_decode_token;
 use lore_credential::token_store;
+use lore_credential::token_store::AuthenticationRefreshCommit;
 use lore_credential::token_store::tokens_only_for_recipient_domain;
 use lore_credential::verify_jwt_usage_for_remote;
 use lore_error_set::prelude::*;
@@ -61,6 +63,24 @@ type AuthzCache = Mutex<
 
 static AUTHZ_CACHE: std::sync::OnceLock<AuthzCache> = std::sync::OnceLock::new();
 
+/// Refresh authentication five minutes before expiry so the existing
+/// once-per-minute auth loop has multiple retry opportunities.
+pub const AUTHENTICATION_REFRESH_LEAD_MS: u64 = 5 * 60 * 1_000;
+const AUTHENTICATION_REFRESH_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTHENTICATION_REFRESH_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Copy)]
+struct AuthenticationRefreshTimeouts {
+    lock: Duration,
+    provider: Duration,
+}
+
+const AUTHENTICATION_REFRESH_TIMEOUTS: AuthenticationRefreshTimeouts =
+    AuthenticationRefreshTimeouts {
+        lock: AUTHENTICATION_REFRESH_LOCK_TIMEOUT,
+        provider: AUTHENTICATION_REFRESH_PROVIDER_TIMEOUT,
+    };
+
 fn cache() -> &'static AuthzCache {
     AUTHZ_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -78,12 +98,239 @@ pub async fn clear_authz_cache() {
 }
 
 pub fn is_expired(expires: u64) -> bool {
-    let expires = expires as u128;
-    let current_time = SystemTime::now()
+    let current_time = current_time_ms();
+    current_time >= expires
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    current_time >= expires
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+/// Pure refresh-window decision, exposed for boundary tests.
+pub fn authentication_refresh_due(expires_ms: u64, now_ms: u64) -> bool {
+    expires_ms <= now_ms.saturating_add(AUTHENTICATION_REFRESH_LEAD_MS)
+}
+
+fn token_is_unexpired(token: &str, now_ms: u64) -> bool {
+    lore_credential::user_info_from_token(token.to_string())
+        .is_none_or(|info| info.expires > now_ms)
+}
+
+fn verified_authentication_token(
+    token: &str,
+    identity: &str,
+    remote_domain: &str,
+    now_ms: u64,
+) -> Option<Vec<String>> {
+    let info = lore_credential::user_info_from_token(token.to_string())?;
+    if info.id != identity || info.expires <= now_ms {
+        lore_warn!("Authentication token has an invalid identity or expiry");
+        return None;
+    }
+    let decoded = insecure_decode_token(token).ok()?;
+    if let Err(err) = verify_jwt_usage_for_remote(&decoded.claims, remote_domain) {
+        lore_warn!("Authentication token is not suitable for its remote: {err}");
+        return None;
+    }
+    Some(decoded.claims.acceptable_root_domains())
+}
+
+fn fallback_authentication_token(
+    current_token: &str,
+    stored_token: &str,
+    identity: &str,
+    remote_domain: &str,
+    now_ms: u64,
+) -> String {
+    if verified_authentication_token(stored_token, identity, remote_domain, now_ms).is_some() {
+        stored_token.to_string()
+    } else if token_is_unexpired(current_token, now_ms) {
+        // `current_token` came through the token store's recipient-domain
+        // filter before the refresh lease was acquired.
+        current_token.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Refresh an authentication token when its JWT expiry enters the lead window.
+///
+/// The per-identity token-store lease is acquired before the final decision,
+/// then the on-disk pair is re-read. A process that waited for another refresher
+/// therefore uses the winner's token without issuing a duplicate request.
+async fn refresh_authentication_if_needed(
+    auth_url: &str,
+    remote_domain: &str,
+    identity: &str,
+    current_token: String,
+) -> String {
+    refresh_authentication_if_needed_with_timeouts(
+        auth_url,
+        remote_domain,
+        identity,
+        current_token,
+        AUTHENTICATION_REFRESH_TIMEOUTS,
+    )
+    .await
+}
+
+async fn refresh_authentication_if_needed_with_timeouts(
+    auth_url: &str,
+    remote_domain: &str,
+    identity: &str,
+    current_token: String,
+    timeouts: AuthenticationRefreshTimeouts,
+) -> String {
+    let now_ms = current_time_ms();
+    let Some(current_info) = lore_credential::user_info_from_token(current_token.clone()) else {
+        // Preserve the historical behavior for opaque/non-JWT credentials.
+        return current_token;
+    };
+    if !authentication_refresh_due(current_info.expires, now_ms) {
+        return current_token;
+    }
+
+    let Ok(Ok(lease)) = tokio::time::timeout(
+        timeouts.lock,
+        token_store::acquire_authentication_refresh(auth_url, identity),
+    )
+    .await
+    else {
+        lore_debug!("Authentication refresh lease timed out or could not be acquired");
+        return if token_is_unexpired(&current_token, now_ms) {
+            current_token
+        } else {
+            String::new()
+        };
+    };
+
+    let stored_token = lease.snapshot().token.clone();
+    let Some(stored_info) = lore_credential::user_info_from_token(stored_token.clone()) else {
+        lore_warn!("Stored authentication token is invalid while attempting refresh");
+        return if token_is_unexpired(&current_token, now_ms) {
+            current_token
+        } else {
+            String::new()
+        };
+    };
+    if stored_info.id != identity {
+        lore_warn!("Stored authentication token does not match its identity");
+        return if token_is_unexpired(&current_token, now_ms) {
+            current_token
+        } else {
+            String::new()
+        };
+    }
+    if !authentication_refresh_due(stored_info.expires, now_ms) {
+        return if verified_authentication_token(&stored_token, identity, remote_domain, now_ms)
+            .is_some()
+        {
+            stored_token
+        } else if token_is_unexpired(&current_token, now_ms) {
+            current_token
+        } else {
+            String::new()
+        };
+    }
+
+    let Ok(auth_impl) = authentication::find(auth_url) else {
+        return fallback_authentication_token(
+            &current_token,
+            &stored_token,
+            identity,
+            remote_domain,
+            now_ms,
+        );
+    };
+    let correlation_id = String::new();
+    let refresh_result = tokio::time::timeout(
+        timeouts.provider,
+        auth_impl.refresh_authentication(
+            auth_url,
+            lease.snapshot().refresh_token.as_str(),
+            &correlation_id,
+        ),
+    )
+    .await;
+    let refreshed = match refresh_result {
+        Ok(Ok(token)) => token,
+        Ok(Err(err)) => {
+            lore_debug!("Authentication refresh failed for {identity}: {err}");
+            return fallback_authentication_token(
+                &current_token,
+                &stored_token,
+                identity,
+                remote_domain,
+                now_ms,
+            );
+        }
+        Err(_) => {
+            lore_debug!("Authentication refresh timed out for {identity}");
+            return fallback_authentication_token(
+                &current_token,
+                &stored_token,
+                identity,
+                remote_domain,
+                now_ms,
+            );
+        }
+    };
+
+    if refreshed.user_id != identity {
+        lore_warn!("Refreshed authentication response changed the user identity");
+        return fallback_authentication_token(
+            &current_token,
+            &stored_token,
+            identity,
+            remote_domain,
+            now_ms,
+        );
+    }
+    let Some(acceptable_root_domains) =
+        verified_authentication_token(&refreshed.token, identity, remote_domain, now_ms)
+    else {
+        return fallback_authentication_token(
+            &current_token,
+            &stored_token,
+            identity,
+            remote_domain,
+            now_ms,
+        );
+    };
+
+    let replacement = refreshed.refresh_token.as_deref();
+    match lease
+        .commit(
+            refreshed.token.as_str(),
+            replacement,
+            acceptable_root_domains,
+        )
+        .await
+    {
+        Ok(AuthenticationRefreshCommit::Stored) => refreshed.token,
+        Ok(AuthenticationRefreshCommit::Superseded { token }) => {
+            if verified_authentication_token(&token, identity, remote_domain, now_ms).is_some() {
+                token
+            } else {
+                String::new()
+            }
+        }
+        Err(err) => {
+            lore_warn!("Failed to store refreshed authentication token: {err}");
+            fallback_authentication_token(
+                &current_token,
+                &stored_token,
+                identity,
+                remote_domain,
+                now_ms,
+            )
+        }
+    }
 }
 
 /// Exchanges an authentication token for a repository-scoped authorization

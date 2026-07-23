@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use async_trait::async_trait;
-use lore_base::error::NotSupported;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::ExchangeExternalTokenForUserTokenRequest;
 use lore_proto::auth::ExchangeUserTokenForMultiresourceTokenRequest;
 use lore_proto::auth::GetAuthSessionRequest;
 use lore_proto::auth::GetUserIdRequest;
 use lore_proto::auth::GetUserInfoRequest;
+use lore_proto::auth::RefreshAuthSessionRequest;
 use lore_proto::auth::StartAuthSessionRequest;
 use lore_proto::auth::urc_auth_api_client::UrcAuthApiClient;
 use tonic::transport::ClientTlsConfig;
@@ -70,6 +70,28 @@ fn set_auth_header<T>(request: &mut tonic::Request<T>, token: &str) -> Result<()
     Ok(())
 }
 
+/// Convert the UCS wire envelope into the provider-neutral transport type.
+fn authentication_token(token: lore_proto::auth::UserToken) -> AuthenticationToken {
+    AuthenticationToken {
+        token: token.user_token,
+        user_id: token.user_id,
+        user_name: token.user_name,
+        expires_ms: token.expires_at.max(0) as u64,
+        // Populated by the orchestration layer via JWT decode, not the proto response.
+        acceptable_root_domains: Vec::new(),
+        refresh_token: token.refresh_token.filter(|value| !value.is_empty()),
+    }
+}
+
+fn required_authentication_token(
+    token: Option<lore_proto::auth::UserToken>,
+    operation: &str,
+) -> Result<AuthenticationToken, ProtocolError> {
+    token
+        .map(authentication_token)
+        .ok_or_else(|| ProtocolError::internal(format!("empty user token in {operation} response")))
+}
+
 /// Authentication implementation using UCS Auth API gRPC service.
 ///
 /// Registered under the `ucs-auth` scheme (and `https` during transition).
@@ -125,18 +147,7 @@ impl Authentication for UcsAuthentication {
             .await
             .map_err(ProtocolError::from)?;
 
-        match res.into_inner().user_token {
-            Some(token) => Ok(Some(AuthenticationToken {
-                token: token.user_token,
-                user_id: token.user_id,
-                user_name: token.user_name,
-                expires_ms: token.expires_at.max(0) as u64,
-                // Populated by orchestration layer via JWT decode, not the proto response
-                acceptable_root_domains: Vec::new(),
-                refresh_token: None,
-            })),
-            None => Ok(None),
-        }
+        Ok(res.into_inner().user_token.map(authentication_token))
     }
 
     async fn exchange_external_token(
@@ -157,31 +168,25 @@ impl Authentication for UcsAuthentication {
             .await
             .map_err(ProtocolError::from)?;
 
-        let user_token = res
-            .into_inner()
-            .user_token
-            .ok_or_else(|| ProtocolError::internal("empty user token in exchange response"))?;
-
-        Ok(AuthenticationToken {
-            token: user_token.user_token,
-            user_id: user_token.user_id,
-            user_name: user_token.user_name,
-            expires_ms: user_token.expires_at.max(0) as u64,
-            // Populated by orchestration layer via JWT decode, not the proto response
-            acceptable_root_domains: Vec::new(),
-            refresh_token: None,
-        })
+        required_authentication_token(res.into_inner().user_token, "exchange")
     }
 
     async fn refresh_authentication(
         &self,
-        _auth_url: &str,
-        _refresh_token: &str,
+        auth_url: &str,
+        refresh_token: &str,
         _correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError> {
-        Err(ProtocolError::from(NotSupported {
-            operation: "refresh_authentication".to_string(),
-        }))
+        let mut client = connect_client(auth_url).await?;
+
+        let mut request = tonic::Request::new(RefreshAuthSessionRequest {});
+        set_auth_header(&mut request, refresh_token)?;
+        let res = client
+            .refresh_auth_session(request)
+            .await
+            .map_err(ProtocolError::from)?;
+
+        required_authentication_token(res.into_inner().user_token, "refresh")
     }
 
     async fn exchange_for_repository(
@@ -294,7 +299,51 @@ impl Authentication for UcsAuthentication {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+    use std::future::Ready;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::task::Context;
+    use std::task::Poll;
+
+    use lore_proto::auth::UserToken;
+
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct CaptureGrpcPath {
+        path: Arc<Mutex<Option<String>>>,
+    }
+
+    impl tower::Service<http::Request<tonic::body::Body>> for CaptureGrpcPath {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+            *self.path.lock().expect("path lock") = Some(request.uri().path().to_string());
+            std::future::ready(Ok(http::Response::builder()
+                .status(http::StatusCode::OK)
+                .header("content-type", "application/grpc")
+                .header("grpc-status", tonic::Code::Unimplemented as i32)
+                .body(tonic::body::Body::empty())
+                .expect("valid gRPC response")))
+        }
+    }
+
+    fn wire_user_token(refresh_token: Option<&str>) -> UserToken {
+        UserToken {
+            user_token: "authn-token".to_string(),
+            expires_at: 1_234,
+            user_id: "user-1".to_string(),
+            user_name: "User One".to_string(),
+            refresh_token: refresh_token.map(str::to_string),
+        }
+    }
 
     #[test]
     fn grpc_endpoint_ucs_auth() {
@@ -337,13 +386,107 @@ mod tests {
         assert_eq!(rid, "urc-00000000000000000000000000000000");
     }
 
+    #[test]
+    fn authentication_token_maps_refresh_credential() {
+        let token = authentication_token(wire_user_token(Some("refresh-1")));
+
+        assert_eq!(token.refresh_token.as_deref(), Some("refresh-1"));
+    }
+
+    #[test]
+    fn authentication_token_preserves_absent_refresh_credential() {
+        let token = authentication_token(wire_user_token(None));
+
+        assert!(token.refresh_token.is_none());
+    }
+
+    #[test]
+    fn authentication_token_treats_empty_refresh_credential_as_absent() {
+        let token = authentication_token(wire_user_token(Some("")));
+
+        assert!(token.refresh_token.is_none());
+    }
+
+    #[test]
+    fn authentication_token_maps_identity_and_expiry() {
+        let token = authentication_token(wire_user_token(Some("refresh-1")));
+
+        assert_eq!(
+            (
+                token.token.as_str(),
+                token.user_id.as_str(),
+                token.user_name.as_str(),
+                token.expires_ms,
+            ),
+            ("authn-token", "user-1", "User One", 1_234)
+        );
+    }
+
+    #[test]
+    fn authentication_token_clamps_negative_expiry_to_zero() {
+        let mut wire = wire_user_token(None);
+        wire.expires_at = -1;
+
+        assert_eq!(authentication_token(wire).expires_ms, 0);
+    }
+
+    #[test]
+    fn refresh_request_is_empty_and_bearer_is_sensitive() {
+        let mut request = tonic::Request::new(RefreshAuthSessionRequest {});
+
+        set_auth_header(&mut request, "opaque refresh").expect("valid metadata");
+
+        let header = request
+            .metadata()
+            .get("authorization")
+            .expect("authorization header");
+        assert_eq!(
+            header.to_str().expect("ASCII header"),
+            "Bearer opaque refresh"
+        );
+        assert!(header.is_sensitive());
+        assert_eq!(request.into_inner(), RefreshAuthSessionRequest {});
+    }
+
     #[tokio::test]
-    async fn refresh_returns_not_supported() {
-        let auth = UcsAuthentication;
-        let result = auth
-            .refresh_authentication("ucs-auth://auth.example.com", "refresh-tok", "corr-1")
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().is_not_supported());
+    async fn generated_refresh_client_uses_exact_rpc_path() {
+        let service = CaptureGrpcPath::default();
+        let path = Arc::clone(&service.path);
+        let mut client = UrcAuthApiClient::new(service);
+
+        let error = client
+            .refresh_auth_session(RefreshAuthSessionRequest {})
+            .await
+            .expect_err("stub returns unimplemented");
+
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert_eq!(
+            path.lock().expect("path lock").as_deref(),
+            Some("/epic_urc.UrcAuthApi/RefreshAuthSession")
+        );
+    }
+
+    #[test]
+    fn required_authentication_token_reports_empty_exchange_response() {
+        let error = required_authentication_token(None, "exchange")
+            .expect_err("missing exchange token must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("empty user token in exchange response")
+        );
+    }
+
+    #[test]
+    fn required_authentication_token_reports_empty_refresh_response() {
+        let error = required_authentication_token(None, "refresh")
+            .expect_err("missing refresh token must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("empty user token in refresh response")
+        );
     }
 }

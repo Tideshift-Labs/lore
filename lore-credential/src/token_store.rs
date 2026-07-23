@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use std::sync::RwLock;
 
 use base64::prelude::BASE64_STANDARD;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use base64::prelude::Engine as _;
 use lore_base::directories::project_directory;
 use lore_base::error::TokenNotFound;
@@ -29,6 +30,7 @@ use ring::aead::NonceSequence;
 use ring::aead::OpeningKey;
 use ring::aead::SealingKey;
 use ring::aead::UnboundKey;
+use ring::digest;
 use ring::error::Unspecified;
 use ring::rand::SecureRandom;
 use ring::rand::SystemRandom;
@@ -63,9 +65,8 @@ pub struct IdentityToken {
     /// The root domains this token can be given to without security concerns
     #[serde(default)]
     acceptable_root_domains: Vec<String>,
-    /// Base64 encoded (encrypted) one-time-use refresh token.
-    /// Stored separately from the auth token because it has a different
-    /// lifecycle: consumed on use and replaced atomically.
+    /// Base64 encoded (encrypted) opaque refresh credential. Stored separately
+    /// from the auth token because the backend may preserve or rotate it.
     #[serde(default)]
     refresh_token: Option<String>,
 }
@@ -297,6 +298,16 @@ async fn lock_store_file(path: &Path) -> Result<FSLock, TokenStoreError> {
 /// the lock sidecar can be placed next to the file.
 async fn lock_token_map() -> Result<FSLock, TokenStoreError> {
     lock_store_file(token_map_path(true)?.as_path()).await
+}
+
+/// Cross-process guard for reserving the next AES-GCM nonce.
+///
+/// The encryption key/counter may live in an OS keyring, whose API has no
+/// compare-and-swap primitive. This stable filesystem lock therefore protects
+/// the reload -> reserve -> persist span across every Lore process.
+async fn lock_encryption_nonce() -> Result<FSLock, TokenStoreError> {
+    let path = base_path(true)?.join("encryption-nonce");
+    lock_store_file(&path).await
 }
 
 /// Refreshes the in-memory token map from disk ahead of a mutation: another
@@ -808,6 +819,181 @@ pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenSt
     Ok(identities)
 }
 
+/// Current authentication credential pair protected by an
+/// [`AuthenticationRefreshLease`].
+#[derive(Debug)]
+pub struct AuthenticationRefreshSnapshot {
+    /// Decrypted authentication token.
+    pub token: String,
+    /// Decrypted opaque refresh credential.
+    pub refresh_token: String,
+}
+
+/// Result of committing a refreshed authentication credential pair.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuthenticationRefreshCommit {
+    /// This lease stored the refreshed pair.
+    Stored,
+    /// Another login changed the pair after this lease's snapshot. The newer
+    /// authentication token won and must be used instead of overwriting it.
+    Superseded { token: String },
+}
+
+/// Cross-process, per-identity refresh lease.
+///
+/// The OS file lock is released automatically when this value drops, including
+/// after process termination. Its file name is a hash so auth endpoints and user
+/// identities do not leak into the configuration directory listing.
+pub struct AuthenticationRefreshLease {
+    auth_endpoint: String,
+    identity: String,
+    encrypted_token: String,
+    encrypted_refresh_token: String,
+    snapshot: AuthenticationRefreshSnapshot,
+    _guard: FSLock,
+}
+
+impl AuthenticationRefreshLease {
+    /// The fresh on-disk credential pair read after acquiring the lease.
+    pub fn snapshot(&self) -> &AuthenticationRefreshSnapshot {
+        &self.snapshot
+    }
+
+    /// Atomically replaces the guarded authentication token and refresh
+    /// credential in one `tokens.toml` write.
+    ///
+    /// `replacement_refresh_token = None` preserves the opaque credential that
+    /// was presented. A backend can rotate it by returning `Some`.
+    pub async fn commit(
+        self,
+        token: &str,
+        replacement_refresh_token: Option<&str>,
+        mut acceptable_root_domains: Vec<String>,
+    ) -> Result<AuthenticationRefreshCommit, TokenStoreError> {
+        let auth_domain = get_domain_or_empty(&self.auth_endpoint);
+        if !acceptable_root_domains.contains(&auth_domain) {
+            acceptable_root_domains.push(auth_domain);
+        }
+
+        let refresh_token =
+            replacement_refresh_token.unwrap_or(self.snapshot.refresh_token.as_str());
+        let encrypted_token = encrypt_token(token).await?;
+        let encrypted_refresh_token = encrypt_token(refresh_token).await?;
+
+        let superseded_token = {
+            let token_map = token_map();
+            let mut map_lock = token_map.lock().await;
+            let guard = lock_token_map().await?;
+            reload_token_map(&guard, &mut map_lock);
+
+            let Some(token_entry) = map_lock
+                .as_mut()
+                .and_then(|map| {
+                    map.remotes
+                        .iter_mut()
+                        .find(|entry| entry.remote == self.auth_endpoint)
+                })
+                .and_then(|remote| {
+                    remote
+                        .token
+                        .iter_mut()
+                        .find(|entry| entry.user_id == self.identity)
+                })
+            else {
+                return Err(TokenNotFound.into());
+            };
+
+            if token_entry.token != self.encrypted_token
+                || token_entry.refresh_token.as_deref()
+                    != Some(self.encrypted_refresh_token.as_str())
+            {
+                Some(token_entry.token.clone())
+            } else {
+                token_entry.token = encrypted_token;
+                token_entry.acceptable_root_domains = acceptable_root_domains;
+                token_entry.refresh_token = Some(encrypted_refresh_token);
+                let Some(map) = map_lock.as_ref() else {
+                    return Err(TokenStoreError::internal("Failed to store token map"));
+                };
+                store_token_map(&guard, map)?;
+                None
+            }
+        };
+
+        match superseded_token {
+            Some(token) => Ok(AuthenticationRefreshCommit::Superseded {
+                token: decrypt_token(token).await?,
+            }),
+            None => Ok(AuthenticationRefreshCommit::Stored),
+        }
+    }
+}
+
+/// Acquires the per-identity refresh lease and reloads the encrypted credential
+/// pair from disk while it is held.
+///
+/// Callers must make their refresh decision from [`AuthenticationRefreshLease::snapshot`],
+/// not from a token loaded before acquiring this lease: another process may have
+/// refreshed while this caller waited.
+pub async fn acquire_authentication_refresh(
+    auth_endpoint: &str,
+    identity: &str,
+) -> Result<AuthenticationRefreshLease, TokenStoreError> {
+    let auth_endpoint = auth_endpoint.trim_end_matches('/');
+    if auth_endpoint.is_empty() || identity.is_empty() {
+        return Err(TokenNotFound.into());
+    }
+
+    let mut scope = Vec::with_capacity(auth_endpoint.len() + identity.len() + 1);
+    scope.extend_from_slice(auth_endpoint.as_bytes());
+    scope.push(0);
+    scope.extend_from_slice(identity.as_bytes());
+    let digest = digest::digest(&digest::SHA256, &scope);
+    let lease_name = format!(
+        "authentication-refresh-{}",
+        BASE64_URL_SAFE_NO_PAD.encode(digest.as_ref())
+    );
+    let lease_path = base_path(true)?.join(lease_name);
+    let refresh_guard = lock_store_file(&lease_path).await?;
+
+    let (encrypted_token, encrypted_refresh_token) = {
+        let token_map = token_map();
+        let mut map_lock = token_map.lock().await;
+        let guard = lock_token_map().await?;
+        reload_token_map(&guard, &mut map_lock);
+
+        let Some(token_entry) = map_lock
+            .as_ref()
+            .and_then(|map| {
+                map.remotes
+                    .iter()
+                    .find(|entry| entry.remote == auth_endpoint)
+            })
+            .and_then(|remote| remote.token.iter().find(|entry| entry.user_id == identity))
+        else {
+            return Err(TokenNotFound.into());
+        };
+        let Some(encrypted_refresh_token) = token_entry.refresh_token.clone() else {
+            return Err(TokenNotFound.into());
+        };
+        (token_entry.token.clone(), encrypted_refresh_token)
+    };
+
+    let token = decrypt_token(encrypted_token.clone()).await?;
+    let refresh_token = decrypt_token(encrypted_refresh_token.clone()).await?;
+    Ok(AuthenticationRefreshLease {
+        auth_endpoint: auth_endpoint.to_string(),
+        identity: identity.to_string(),
+        encrypted_token,
+        encrypted_refresh_token,
+        snapshot: AuthenticationRefreshSnapshot {
+            token,
+            refresh_token,
+        },
+        _guard: refresh_guard,
+    })
+}
+
 /// Encrypts and stores (or replaces) the refresh token for an identity.
 ///
 /// Called by orchestration after login or successful refresh. Overwrites
@@ -1200,7 +1386,41 @@ impl NonceSequence for SingleNonceSequence {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
     use super::*;
+
+    const REFRESH_AUTH_ENDPOINT: &str = "https://refresh.auth.example.com";
+    static REFRESH_TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    static REFRESH_TEST_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+    async fn refresh_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        REFRESH_TEST_MUTEX
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    async fn setup_refresh_test() {
+        let path = REFRESH_TEST_PATH.get_or_init(|| {
+            std::env::temp_dir().join(format!("lore-cr020-token-store-{}", std::process::id()))
+        });
+        unsafe {
+            std::env::set_var("LORE_AUTH_PATH", path);
+            std::env::set_var("LORE_AUTH_STORE", "fallback");
+        }
+        reset_tokens().await.expect("reset test token store");
+    }
+
+    async fn store_refresh_pair(identity: &str, token: &str, refresh_token: &str) {
+        store_user_token(REFRESH_AUTH_ENDPOINT, identity, token, vec![])
+            .await
+            .expect("store authentication token");
+        store_refresh_token(REFRESH_AUTH_ENDPOINT, identity, refresh_token)
+            .await
+            .expect("store refresh credential");
+    }
 
     #[test]
     fn refresh_token_serde_default_none() {
