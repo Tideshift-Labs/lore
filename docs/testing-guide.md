@@ -281,6 +281,51 @@ the next run starts from the map instead of rediscovering it.
     is structurally the same code path (`Err(e) if !terminal => retry.wait() then
     continue`) and would need an integration/e2e tier with a real bounce-able backend to
     add without flake risk — flag if wanted there.
+- **CR-020 (provider-neutral authentication refresh, [CLIENT])** —
+  `lore-proto::auth::UserToken.refresh_token` field 5; UCS poll/external/refresh shared
+  response mapping and empty-request sensitive bearer call; `lore-transport` five-minute
+  refresh window plus repository/custom-resource orchestration; and `lore-credential`
+  per-identity OS-file lease with guarded authn/refresh pair replacement. Coverage:
+  `cargo test -p lore-transport --lib` (47 passed) includes exact lead boundaries,
+  no-call before the window, absent credential, successful replacement, transient/rejected/
+  invalid response preservation while valid, login-required after expiry, both exchange
+  paths, empty returned `UserToken`, exact RPC path, and sensitive bearer metadata;
+  `cargo test -p lore-credential --lib` (29 passed) includes old-format serde, atomic pair
+  commit, preserve-on-no-replacement, intervening-login supersession, different-identity
+  independence, same-identity waiter reread, ordinary drop release, and real child-process
+  exit release. Neighbor gates: `cargo test -p lore-revision --test auth --test
+  auth_exchange` (7 + 8 passed), and test-target Clippy for both touched crates.
+  **Gotcha:** `UcsAuthentication::connect_client` deliberately forces HTTPS with native
+  roots, so unit tests should not weaken transport or install a machine root merely to
+  observe the RPC. Pin the generated client's exact method path with a tiny
+  `tower::Service<Request<tonic::body::Body>>`, and test the empty request, sensitive
+  metadata, operation-specific missing-response helper, and shared wire mapping separately
+  in `lore-transport/src/auth/ucs_auth.rs::tests`.
+  **Safety regression:** refresh fallback must re-check a post-lease token's identity,
+  expiry, and recipient domains. `auth::exchange::tests::*wrong_remote*` replaces the
+  on-disk pair after the caller obtained a remote-appropriate token, then proves missing
+  provider, RPC failure, and invalid refresh never return the reloaded wrong-remote token;
+  the caller token wins while valid and the result is empty after it expires.
+  **Cross-process nonce regression:** `concurrent_stale_process_caches_reserve_unique_encryption_nonces`
+  starts two child test processes, warms both AES-GCM caches before releasing them together,
+  and proves the ciphertext nonce prefixes differ and both payloads decrypt. This catches
+  process-local counter allocation that passes same-process concurrency tests.
+  **Bounded refresh regression:** `never_completing_provider_times_out_to_still_valid_original_token`
+  and `held_refresh_lease_times_out_to_still_valid_original_token` use injected 20 ms
+  provider/lease deadlines under an outer one-second timeout, proving neither a hung backend
+  nor a wedged lock blocks normal use of the caller's still-valid token. The held-lease case
+  then drops the original holder and reacquires the same identity under another one-second
+  bound, proving the timed-out detached blocking waiter does not retain a ghost file lock.
+  **Login pair-store regression:** `store_authentication_token_*` covers initial authn +
+  supplied refresh storage, replacing both supplied credentials together, and updating
+  authn with `None` while preserving the existing refresh credential. Login orchestration
+  has no focused failure-injection seam; its existing `auth` / `auth_exchange` integration
+  suites are retained as compile/dispatch regression gates (7 + 8 passed).
+  **Persist-before-publish regression:** `failed_authentication_pair_write_keeps_previous_cached_pair`
+  and `failed_refresh_commit_keeps_previous_cached_pair` seed an old pair, replace
+  `tokens.toml` with a directory to force the guarded write to fail, capture in-process
+  loads, restore the file, then assert both cached authn and refresh values remained old.
+  Restore before assertions so even a regression does not contaminate later tests.
 - **CR-017 (transport/auth reset + Unauthenticated classification, [CLIENT])** — three
   `lore-transport` files, none had a `#[cfg(test)] mod tests` before this delta:
   `src/error.rs` (new `Unauthenticated` arm on `From<tonic::Status> for ProtocolError`),
