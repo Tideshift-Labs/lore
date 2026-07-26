@@ -801,6 +801,7 @@ async fn verify_fragments(
     )
     .instrument(span!(Level::DEBUG, "collect_new_fragments"))
     .await
+    .filter_slow_down()?
     .warn_map_err(|err| {
         if let Some(converted_error) = err.as_address_not_found() {
             return Status::not_found(format!(
@@ -923,6 +924,8 @@ mod tests {
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
     use std::net::SocketAddr;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
     use rand::random;
