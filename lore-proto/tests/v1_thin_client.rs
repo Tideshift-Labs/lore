@@ -133,6 +133,7 @@ fn v1_thin_client_field_shapes() {
         parent_self: _,
         parent_other: _,
         number: _,
+        total_size_bytes: _,
     } = Revision::default();
     let RevisionParent {
         signature: _,
