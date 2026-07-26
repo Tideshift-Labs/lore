@@ -115,6 +115,7 @@ fn v1_thin_client_field_shapes() {
         path: _,
         node_type: _,
         address: _,
+        size_bytes: _,
     } = TreeNode::default();
 
     // Revision + nested Parent + Metadata
@@ -129,6 +130,7 @@ fn v1_thin_client_field_shapes() {
         parent_self: _,
         parent_other: _,
         number: _,
+        total_size_bytes: _,
     } = Revision::default();
     let RevisionParent {
         signature: _,
