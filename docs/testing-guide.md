@@ -523,6 +523,46 @@ the next run starts from the map instead of rediscovering it.
     bug (`ResourceNotFoundException`, a missing *table*, mapped to `AddressNotFound`); now asserts
     `is_internal()`. Flag this rewrite explicitly in the eventual upstream PR description — it's a
     visible behavior change to a test Epic wrote, not just new coverage.
+- **CR-021 Part 2a (SDK-level adaptive retry/backoff configuration, [SERVER])** —
+  `lore-aws/src/clients.rs`. New `RetryMode` (`Standard` default / `Adaptive` opt-in /
+  `Disabled`), `RetrySettings` (`mode`, `max_attempts`, `initial_backoff_millis`,
+  `max_backoff_seconds`, all `#[serde(default)]`, now `PartialEq, Eq`), `impl
+  From<&RetrySettings> for RetryConfig`, and `HttpClientSettings.retry: RetrySettings` (feeds
+  `with_http_settings`'s `.retry_config(...)`) — closes the previous "no `retry_config` at
+  all" gap (INV-AP: every client silently got the SDK's own 3-attempt standard retry). Part 2b
+  (application-level backoff in `lore-revision`'s `state.rs`) is deliberately deferred — that
+  crate also ships in the `lore` CLI, pending a client-risk decision; not covered here.
+  Coverage: `cargo test -p lore-aws --lib -- clients::` (16 tests, all pure
+  config-mapping/serde — no store/mock/network). Needed `toml`/`serde_json` as new `lore-aws`
+  dev-dependencies (not previously present in this crate) to exercise the serde-defaulting
+  cases; same `toml::from_str::<T>(s)` convention as `lore-server/src/plugins/aws.rs`'s
+  existing config tests, just without the `toml::Value` + `.try_into()` indirection since
+  `HttpClientSettings` already derives `Deserialize` directly.
+  - **The shipped default is `RetryMode::Standard`, not `Adaptive`** — a first draft defaulted
+    to adaptive, reversed in a reviewer pass after finding its rate limiter isn't bounded by
+    `max_backoff` (worst case ~42s inside loreserver's flat 50s request-handler timeout; see
+    the "AWS SDK adaptive retry's `ClientRateLimiter`..." Deep finding below). Pin this with a
+    real equality assertion, not per-field checks, now that `RetrySettings` derives `PartialEq,
+    Eq`: `retry_settings_default_is_standard_with_documented_defaults`,
+    `http_client_settings_default_carries_retry_defaults`. `Adaptive` stays reachable and
+    covered (`retry_mode_adaptive_maps_to_adaptive_retry_config`) — opt-in, not removed.
+  - **Serde back-compat is the load-bearing case**: an existing deployed loreserver TOML
+    config predates `[retry]` entirely. Three shapes must all land on the same
+    `RetrySettings::default()` — key absent, whole document empty, and (a gap a reviewer pass
+    flagged) `[retry]` present but empty:
+    `http_client_settings_toml_with_no_retry_key_yields_standard_defaults`,
+    `http_client_settings_empty_toml_yields_standard_defaults`,
+    `http_client_settings_empty_retry_table_matches_absent_retry_key` (asserts the empty-table
+    and absent-key results are `==` each other, not just each separately correct).
+  - **`RetryMode::Disabled` maps through `RetryConfig::disabled()`, which silently ignores
+    `RetrySettings`' `max_attempts`/backoff knobs** — see the dedicated Deep finding below;
+    `retry_mode_disabled_maps_to_disabled_retry_config` pins the exact (surprising) resulting
+    shape rather than assuming the configured overrides apply.
+  - **Asserting the `max_attempts: 0 → 1` clamp's new `tracing::warn!`**: `#[traced_test]` +
+    the macro-injected `logs_contain(...)` — `max_attempts_zero_clamp_is_logged` /
+    `..._does_not_log_a_clamp_warning`. See the dedicated Deep finding below for the general
+    pattern (first use of log-content assertions in this fork, vs. `#[traced_test]`'s prior
+    use here only to keep logs out of other tests' output).
 
 ---
 
@@ -703,3 +743,65 @@ the next run starts from the map instead of rediscovering it.
   .code("ExceptionName").build()).build()`. Applies to any AWS SDK crate's modelled service error,
   not just DynamoDB — see `lore-aws/src/aws_error.rs::tests` (CR-021 Part 1 above) for worked
   examples.
+- **AWS SDK adaptive retry's `ClientRateLimiter` is NOT bounded by `RetryConfig::max_backoff`.**
+  Symptom: assuming `RetryConfig::adaptive()` + `.with_max_backoff(N)` caps total per-request
+  delay at roughly `N`, and defaulting a server's retry mode to adaptive on that assumption —
+  wrong, and the gap is large enough to blow through a flat request-handler timeout. Cause
+  (verified in the vendored source — find the checkout path with `cargo metadata
+  --format-version=1 | uv run -- python -c "import json,sys; d=json.load(sys.stdin);
+  print([p['manifest_path'] for p in d['packages'] if p['name']=='aws-smithy-runtime'])"`, then
+  read `<that dir>/src/client/retries/`): `strategy/standard.rs`'s
+  `should_attempt_initial_request` returns `YesAfterDelay(delay)` straight from the token-bucket
+  rate limiter, never clamped against `max_backoff`; `client_rate_limiter.rs`'s
+  `INITIAL_REQUEST_COST = 1.0` over `MIN_FILL_RATE = 0.5` tokens/sec ⇒ up to ~2s stall before the
+  *first* attempt when the bucket is drained, `RETRY_COST = 5.0` over the same fill rate ⇒ up to
+  ~10s per retry. With `DEFAULT_RETRY_MAX_ATTEMPTS = 5` (`lore-aws`'s own default, CR-021 Part
+  2a), worst case is roughly 42s — more than loreserver's flat 50s `request_handler_timeout`, and
+  `max_backoff_seconds = 20` does nothing to prevent it. The limiter is also process-global per
+  service client, so one tenant's throttling throttles every other tenant sharing that client.
+  What to do: `lore-aws::clients::RetryMode` defaults to `Standard`, not `Adaptive`, because of
+  this (the `Adaptive` variant's own doc comment carries this exact hazard so it doesn't get
+  re-defaulted later); treat "adaptive implies `max_backoff` bounds worst-case latency" as false
+  until re-verified against the vendored source for whatever SDK version is in use — at review
+  time or in a test, not inferred from the `RetryConfig` builder API surface.
+- **`aws_smithy_types::retry::RetryMode` has only `Standard`/`Adaptive` — `RetryConfig::disabled()`
+  is not a third mode, it's `standard().with_max_attempts(1)`.** Symptom: a test that expects
+  `RetryConfig::from(&settings).mode()` to reflect a caller's own "disabled" concept, or expects a
+  caller's configured `max_attempts`/backoff to survive when retries are disabled, fails. Cause:
+  upstream (`aws-smithy-types-1.4.8/src/retry.rs`) only defines `Standard`/`Adaptive`;
+  `RetryConfig::disabled()` is literally `RetryConfig::standard().with_max_attempts(1)` — mode
+  `Standard`, `max_attempts` forced to 1, `initial_backoff` 1s, `max_backoff` 20s (the SDK's own
+  `standard()` builtins), regardless of what a caller's own settings say. `lore-aws`'s own
+  `RetryMode::Disabled` (a different, crate-local enum) maps via an early `return
+  RetryConfig::disabled()` in `impl From<&RetrySettings> for RetryConfig`
+  (`lore-aws/src/clients.rs`) — which is why `RetrySettings`' `max_attempts`/backoff knobs are
+  silently ignored under `mode = "disabled"`; intentional, not a bug
+  (`retry_mode_disabled_maps_to_disabled_retry_config` pins the exact shape). What to do: read the
+  vendored `RetryConfig`/`RetryMode` source before asserting on a "disabled" retry path in any
+  AWS-SDK-based crate here — the useful getters are `.mode()`, `.max_attempts()`,
+  `.initial_backoff()`, `.max_backoff()`, `.has_retry()` (`== max_attempts > 1`).
+- **Asserting a `tracing::warn!`/`info!` fired, without hand-rolling a subscriber:
+  `tracing_test::traced_test` + its macro-injected `logs_contain(&str)`.** `tracing-test` is
+  already a workspace/`lore-aws` dev-dependency (used elsewhere, e.g.
+  `lore-aws/src/store/immutable_store.rs`'s `#[traced_test]` tests and the OTel cases in
+  `lore-aws/src/telemetry/aws.rs`), but before CR-021 Part 2a nothing in this fork actually
+  asserted on captured log *content* — just used the attribute to keep logs from polluting other
+  tests' output. Pattern: `#[traced_test]` above `#[test]` (that order for a plain test; async
+  needs `#[tokio::test]` above `#[traced_test]`), then `assert!(logs_contain("substring"))` /
+  `assert!(!logs_contain(...))` inside the test body — the function is injected by the macro into
+  the test's local scope, not imported. It filters to log lines from the test's own span, so it
+  stays isolated even under the default multi-threaded test runner. See
+  `lore-aws/src/clients.rs::tests::max_attempts_zero_clamp_is_logged` /
+  `..._does_not_log_a_clamp_warning`.
+- **A CR spec naming a fork crate (e.g. `lore-postgres`) may not exist on the branch you're
+  testing from, if that branch's lineage predates the crate's own merge into `tideshift/main`.**
+  Hit during CR-021 Part 2a: its handoff named `lore-postgres` as an `HttpClientSettings`
+  consumer to `cargo check`, but the CR branch was cut from upstream `main`, and `lore-postgres`
+  (CR-007) lives only on `tideshift/main` — `cargo check -p lore-postgres` failed with "package ID
+  specification did not match any packages" until the branch merged back into `tideshift/main`,
+  where `cargo check -p lore-postgres` now passes as expected (confirmed post-merge, commit
+  `7a2bd7b`). Not a bug in either CR; a branch-lineage fact, closed for this CR specifically. What
+  to do: don't assume every crate a CR spec names exists on every branch — check the workspace
+  `members` in the root `Cargo.toml`, or `git merge-base` against `tideshift/main`, before treating
+  a missing `-p <crate>` as a real gate failure; skip it and flag the lineage gap in the report
+  instead, then re-run once merged.
