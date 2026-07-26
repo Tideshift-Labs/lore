@@ -563,6 +563,43 @@ the next run starts from the map instead of rediscovering it.
     `..._does_not_log_a_clamp_warning`. See the dedicated Deep finding below for the general
     pattern (first use of log-content assertions in this fork, vs. `#[traced_test]`'s prior
     use here only to keep logs out of other tests' output).
+- **CR-021 Part 2b (application-level `SlowDown` propagation honesty, ships in `lore-revision` —
+  not cleanly [SERVER], flag as [CLIENT]-relevant)** — `lore-revision/src/state.rs`'s
+  `collect_new_addresses` (the fn `collect_new_fragments` fans out into). Narrowed three
+  pre-existing silent error swallows to propagate only overload (`StoreError::SlowDown` /
+  `ImmutableError::SlowDown`) instead of every failure — the top-level per-fragment `query()`, a
+  fragmented payload's own `load_raw` (`get()`), and the recursive `collect_new_addresses_recurse`
+  over its children. Every non-`SlowDown` failure keeps the pre-existing conservative fallback
+  unchanged (report-as-new, or drop-the-subtree) — deliberately, that residual gap is out of scope.
+  `lore-server`'s `branch_push.rs::verify_fragments` also gained `.filter_slow_down()?`, mapping the
+  propagated `SlowDown` to `Status::ResourceExhausted` instead of `internal`. Coverage:
+  `cargo test -p lore-revision --test state` (extends the existing suite to 40 tests — adds
+  propagation-from-a-top-level-`query()` SlowDown, a non-SlowDown-preserves-conservative-fallback
+  regression guard, a genuine-absence assumption pin against `find()`'s real `Ok(MatchNone)`
+  behavior, and the recursive-child-SlowDown case for a fragmented payload);
+  `cargo test -p lore-server --lib -- grpc::handlers::branch_push::tests` (adds
+  `verify_fragments_maps_slow_down_to_resource_exhausted`, built via
+  `RepositoryContext::new_server_context` + `crate::grpc::get_write_token()` — the base pattern is
+  the "Real store fixture for a handler test" finding above; `get_write_token()` is the missing
+  piece that finding doesn't cover, needed here because this test *mutates* state
+  (`node_add`/`serialize`), not just seeds/reads one).
+  - **Cheap fragmented-payload fixture, no big state needed.** `collect_new_fragments` only reaches
+    a fragmented address via a real FILE node's content address (`collect_new_file_fragments` walks
+    `to_node.address` for new/modified file nodes), not via the state's own structural blocks unless
+    those happen to be large enough to fragment on their own. Hand-build instead of growing a state:
+    store 2+ small raw chunks via `immutable::store_raw(repo, addr, fragment, bytes, true, false)`
+    (`flags: PayloadStoredLocal`), build a `Vec<FragmentReference>` (`{ hash, offset_content }`,
+    strictly increasing offsets) and store *that* as its own fragment with `PayloadStoredLocal |
+    PayloadFragmented`, then `Node { flags: NodeFlags::File.bits(), address: <the list's address>,
+    size: total_content_size, name_hash: hash_string(name), .. }` added to `state_to` only (so it's
+    "new" relative to `state_from`). See `store_two_chunk_fragmented_payload` /
+    `with_fragmented_file_fixture` in `lore-revision/tests/state.rs` — mirrors, and could eventually
+    share code with, that same file's pre-existing `store_as_legacy_chunks` helper
+    (`is_file_modified_chunking_compat` module).
+  - **Swallow #2 (own-fragment `get()` SlowDown) has no test — genuinely unreachable via a
+    local-only fixture, not a coverage shortcut.** See the dedicated Deep finding below for the full
+    reasoning; don't re-attempt this with a bigger/different local-only fixture without reading it
+    first.
 
 ---
 
@@ -805,3 +842,77 @@ the next run starts from the map instead of rediscovering it.
   `members` in the root `Cargo.toml`, or `git merge-base` against `tideshift/main`, before treating
   a missing `-p <crate>` as a real gate failure; skip it and flag the lineage gap in the report
   instead, then re-run once merged.
+- **Three `ImmutableStore` fault-injection fixture patterns exist — pick the right one, don't
+  invent a fourth.** By call shape, not by which crate they happen to live in:
+  1. **Canned-response fake, no backing store** — `lore-revision/tests/composite_store.rs`'s
+     `TestStore`/`DelayStore`. Every method returns a fixed value (optionally after a delay /
+     after N calls, via an `AtomicU32` counter). Use when the code under test doesn't need to read
+     back anything a *real* store would actually compute (a real Merkle/state-tree walk, real
+     fragment flags) — cheapest to write, but can't back a `collect_new_fragments`-style test.
+  2. **Unconditional-failure fake, no backing store** — `lore-server/src/lib.rs:54`'s
+     `SlowDownImmutableStore`: every method returns `StoreError::from(SlowDown)`, no exceptions.
+     Good for exactly one thing: proving a retry loop eventually exhausts and returns `SlowDown`
+     (pair with `tokio::time::timeout(..)` — see the `STORE_RETRY_ATTEMPTS` finding below for why).
+  3. **Wraps a real store, intercepts selectively** — `FaultInjectingStore`
+     (`lore-revision/tests/state.rs`, CR-021 Part 2b) / `SlowDownQueryStore`
+     (`lore-server/src/grpc/handlers/branch_push.rs`, same CR). Holds an `Arc<LocalImmutableStore>`
+     and delegates every trait method straight to it (`self.inner.clone().<method>(..).await`)
+     *except* `query()`/`get()`, which check an armable flag (a plain `AtomicBool`, or a
+     `RwLock<BTreeSet<Address>>` for per-address targeting — `Address` derives `Ord` but not
+     `std::hash::Hash`, so `BTreeSet` not `HashSet`) before either returning the fault or falling
+     through to the same delegation. Use when the test needs `collect_new_fragments` (or anything
+     else that walks a real Merkle/state tree) to behave normally right up until the one call you
+     want to fail — build the fixture state fully against the store behaving normally, *then* arm
+     the fault, *then* call the code under test. This is the only one of the three that composes
+     with real `node_add`/`serialize`/`deserialize`.
+- **A `SlowDown`-injecting test can silently take ~9 minutes unless the retry count is pinned.**
+  Symptom: a test arms a store to return `StoreError::SlowDown` from `get()`/`query()`, asserts
+  correctly, but the single test dominates the whole suite's wall time (400-550s, near-identical
+  across separate runs — no meaningful jitter). Cause: `lore_storage::read::read_raw`
+  (`lore-storage/src/read.rs:34`) retries a `SlowDown` internally — default policy is 60 attempts,
+  50ms→10s exponential backoff, uncapped total wall time (~530s worst case, matching what's
+  observed almost to the second, since the schedule has no jitter). This is the deliberately
+  *patient* client policy, sized for a CLI talking to a real overloaded server — not what a
+  fault-injection unit test wants. Fix: pin the fast retry count `lore-server` itself assumes in
+  tests, at the top of the fixture, before building any state:
+  ```rust
+  let _ = lore_storage::STORE_RETRY_ATTEMPTS.set(1);
+  ```
+  `STORE_RETRY_ATTEMPTS` is a `pub static OnceLock<usize>` (`lore-storage/src/lib.rs:211`) — first
+  setter in the process wins, harmless to call redundantly, harmless to the other,
+  non-fault-injecting tests sharing the binary. `lore-server/src/lib.rs`'s
+  `#[ctor::ctor] fn init_test_policies()` already calls the equivalent
+  `lore_storage::assume_server_policies()` (sets it to 7) for the *whole* `lore-server` test binary;
+  `lore-revision`'s integration tests have no such bootstrap, so any fixture there that arms
+  `SlowDown` must set it itself or pay the ~9-minute tax. Applies to any future fault-injection test
+  in either crate, not just CR-021.
+- **`collect_new_addresses`'s "own fragment `get()` SlowDown" swallow is not reachable via a
+  local-only test fixture — real in production, but only under a specific topology.** Tried (CR-021
+  Part 2b) to test that a `SlowDown` from `get()` while loading a fragmented payload's own content
+  (to read its child `FragmentReference` list) propagates as `StateError::SlowDown` rather than
+  silently dropping every child. Building the fragmented fixture worked fine (see the CR-021 Part 2b
+  entry above), but the propagation itself could not be observed. Cause:
+  `lore_storage::read::load_fragment` (`lore-storage/src/read.rs:211`, called via
+  `lore_revision::immutable::load_raw`) discards the *specific* local error type on any local-read
+  failure (maps it to an internal `LocalFailure::Other`, losing whether it was `SlowDown` vs.
+  anything else), then — because `ReadOptions::default().remote == true` and `load_raw` always
+  passes `Some(session)` — unconditionally attempts a remote fetch as the tie-breaker. In a test
+  repository built with `Err(ProtocolError::from(NoRemote))` (the standard fixture pattern in this
+  file), that remote attempt fails with a `NoRemote`-shaped error, which *becomes* `load_raw`'s
+  final `Err`. `SlowDown` never survives to reach `collect_new_addresses`'s
+  `Err(ImmutableError::SlowDown(_))` match arm — it falls into the pre-existing, deliberately
+  unchanged `Err(_) => {}` branch instead, and the fragment gets added via the normal
+  not-durably-stored path, so the test's `collect_new_fragments` call returns `Ok` where it should
+  have returned `Err`. Net effect: **in production this propagation branch is real and reachable**,
+  but only when the *effective* answer from `load_raw` (local-with-remote-fallback) is itself
+  `SlowDown` — i.e. a working remote session is present and *it* returns `SlowDown` (the
+  durable/replica tier is what's overloaded), not simply when a purely local read hits `SlowDown`
+  with no remote configured. What to do: don't re-attempt this with a bigger/different local-only
+  fixture — it structurally cannot reach the branch, no matter how the local store is built. Testing
+  it properly needs a mock `StorageSession`/transport that returns `ProtocolError::SlowDown`, which
+  is a materially heavier lift (out of proportion for a unit-style fixture) than the pattern above;
+  flag it as a known gap rather than rebuilding this investigation. The sibling swallow (a *child*
+  fragment's own `query()`, called directly by `collect_new_addresses` with no
+  `load_fragment`/remote-fallback layer in between) has no such obstruction and is fully covered —
+  see `collect_new_fragments_propagates_slow_down_from_fragmented_payload_child` in
+  `lore-revision/tests/state.rs`.
