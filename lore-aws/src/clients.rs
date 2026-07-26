@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +13,7 @@ use aws_smithy_http_client::Connector;
 use aws_smithy_http_client::tls;
 use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
 use aws_smithy_runtime_api::client::behavior_version::BehaviorVersion;
+use aws_smithy_types::retry::RetryConfig;
 use opentelemetry::KeyValue;
 use serde::Deserialize;
 use thiserror::Error;
@@ -41,12 +43,125 @@ fn default_idle_timeout() -> u64 {
     DEFAULT_POOL_IDLE_TIMEOUT_SECONDS
 }
 
+/// Total attempts per request, including the first. Two more than the SDK's
+/// own default of three, while still costing less worst-case delay than that
+/// default does, because [`DEFAULT_RETRY_INITIAL_BACKOFF_MILLIS`] is lower.
+pub const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 5;
+/// Base of the exponential backoff. The SDK's own default is one second.
+pub const DEFAULT_RETRY_INITIAL_BACKOFF_MILLIS: u64 = 100;
+/// Ceiling on any single computed backoff. Not reached by the defaults here —
+/// five attempts from 100ms peak below one second — so it only binds when
+/// `max_attempts` is raised.
+pub const DEFAULT_RETRY_MAX_BACKOFF_SECONDS: u64 = 20;
+
+fn default_retry_max_attempts() -> u32 {
+    DEFAULT_RETRY_MAX_ATTEMPTS
+}
+
+fn default_retry_initial_backoff_millis() -> u64 {
+    DEFAULT_RETRY_INITIAL_BACKOFF_MILLIS
+}
+
+fn default_retry_max_backoff_seconds() -> u64 {
+    DEFAULT_RETRY_MAX_BACKOFF_SECONDS
+}
+
+/// How the SDK should retry a request it classifies as retryable.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RetryMode {
+    /// Exponential backoff with jitter, no rate limiter. The default.
+    #[default]
+    Standard,
+    /// Standard backoff plus a client-side rate limiter that reacts to observed
+    /// throttling by slowing the whole client down.
+    ///
+    /// Appropriate where operation counts scale with fragment count rather than
+    /// bytes and a large repository can drive a store past its request-rate
+    /// ceiling. **Enable it deliberately, and only alongside a generous request
+    /// handler timeout.** The rate limiter's delays are not bounded by
+    /// [`RetrySettings::max_backoff_seconds`]: it can hold a request for up to
+    /// two seconds before the *first* attempt, and up to ten seconds before each
+    /// retry, so the defaults below allow a single call to sleep for roughly
+    /// forty seconds before failing. The limiter is also process-global per
+    /// service, so one caller's throttling delays every other caller sharing
+    /// that client.
+    Adaptive,
+    /// A single attempt, never retried. Intended for tests that assert on the
+    /// first failure.
+    ///
+    /// [`RetrySettings::max_attempts`] and both backoff settings are ignored in
+    /// this mode.
+    Disabled,
+}
+
+/// Retry behavior for every AWS client built by [`AwsClientBuilder`].
+///
+/// The SDK applies its own retry classification underneath this; these settings
+/// only govern how hard and how long it tries.
+///
+/// Note that setting these at all takes retry configuration out of the SDK's
+/// environment-driven path: `AWS_RETRY_MODE`, `AWS_MAX_ATTEMPTS` and the
+/// equivalent profile keys no longer apply, because an explicitly supplied
+/// `RetryConfig` replaces that provider rather than merging with it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct RetrySettings {
+    #[serde(default)]
+    pub mode: RetryMode,
+    /// Total attempts, including the initial one. Must be at least 1; a value
+    /// of 0 is treated as 1 rather than rejected, so a malformed config cannot
+    /// silently disable the request entirely.
+    #[serde(default = "default_retry_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default = "default_retry_initial_backoff_millis")]
+    pub initial_backoff_millis: u64,
+    #[serde(default = "default_retry_max_backoff_seconds")]
+    pub max_backoff_seconds: u64,
+}
+
+impl Default for RetrySettings {
+    fn default() -> Self {
+        Self {
+            mode: RetryMode::default(),
+            max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
+            initial_backoff_millis: DEFAULT_RETRY_INITIAL_BACKOFF_MILLIS,
+            max_backoff_seconds: DEFAULT_RETRY_MAX_BACKOFF_SECONDS,
+        }
+    }
+}
+
+impl From<&RetrySettings> for RetryConfig {
+    fn from(settings: &RetrySettings) -> Self {
+        let config = match settings.mode {
+            RetryMode::Adaptive => RetryConfig::adaptive(),
+            RetryMode::Standard => RetryConfig::standard(),
+            RetryMode::Disabled => return RetryConfig::disabled(),
+        };
+
+        let max_attempts = settings.max_attempts.max(1);
+        if max_attempts != settings.max_attempts {
+            warn!(
+                configured = settings.max_attempts,
+                using = max_attempts,
+                "AWS retry max_attempts must be at least 1; ignoring the configured value"
+            );
+        }
+
+        config
+            .with_max_attempts(max_attempts)
+            .with_initial_backoff(Duration::from_millis(settings.initial_backoff_millis))
+            .with_max_backoff(Duration::from_secs(settings.max_backoff_seconds))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct HttpClientSettings {
     #[serde(default = "default_idle_timeout")]
     pub pool_idle_timeout_seconds: u64,
     #[serde(default)]
     pub nodelay: bool,
+    #[serde(default)]
+    pub retry: RetrySettings,
 }
 
 fn default_quota_per_second() -> u32 {
@@ -94,6 +209,7 @@ impl Default for HttpClientSettings {
         Self {
             pool_idle_timeout_seconds: DEFAULT_POOL_IDLE_TIMEOUT_SECONDS,
             nodelay: false,
+            retry: RetrySettings::default(),
         }
     }
 }
@@ -129,7 +245,8 @@ impl AwsClientBuilder<WantsHttpConfig> {
                 // we sort out whatever is causing our mysterious network latency we can remove
                 // this. Note: this is override-able in the next phase of the client builder
                 // typestate settings.
-                .timeout_config(TimeoutConfig::builder().disable_connect_timeout().build()),
+                .timeout_config(TimeoutConfig::builder().disable_connect_timeout().build())
+                .retry_config(RetryConfig::from(&settings.retry)),
         })
     }
 }
@@ -320,5 +437,282 @@ impl AwsClientBuilder<WantsBuckets> {
         }
 
         Ok(self.0.client)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_smithy_types::retry::RetryMode as SmithyRetryMode;
+    use tracing_test::traced_test;
+
+    use super::*;
+
+    /// The documented defaults, as a value so tests can lean on the new
+    /// `PartialEq` derive instead of asserting field-by-field.
+    fn expected_default_retry_settings() -> RetrySettings {
+        RetrySettings {
+            mode: RetryMode::Standard,
+            max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
+            initial_backoff_millis: DEFAULT_RETRY_INITIAL_BACKOFF_MILLIS,
+            max_backoff_seconds: DEFAULT_RETRY_MAX_BACKOFF_SECONDS,
+        }
+    }
+
+    // --- RetrySettings defaults ------------------------------------------
+
+    #[test]
+    fn retry_settings_default_is_standard_with_documented_defaults() {
+        // Standard, not adaptive: the rate limiter behind adaptive mode is
+        // unbounded by `max_backoff` and process-global, so it must be an
+        // opt-in choice, not what every caller gets silently.
+        let settings = RetrySettings::default();
+
+        assert_eq!(settings, expected_default_retry_settings());
+
+        let config = RetryConfig::from(&settings);
+        assert_eq!(config.mode(), SmithyRetryMode::Standard);
+        assert_eq!(config.max_attempts(), DEFAULT_RETRY_MAX_ATTEMPTS);
+        assert_eq!(
+            config.initial_backoff(),
+            Duration::from_millis(DEFAULT_RETRY_INITIAL_BACKOFF_MILLIS)
+        );
+        assert_eq!(
+            config.max_backoff(),
+            Duration::from_secs(DEFAULT_RETRY_MAX_BACKOFF_SECONDS)
+        );
+    }
+
+    #[test]
+    fn http_client_settings_default_carries_retry_defaults() {
+        // lore-integration-tests and lore-postgres both construct
+        // `HttpClientSettings::default()` directly; make sure it still yields
+        // the standard retry defaults, not a zeroed-out `RetrySettings`.
+        let settings = HttpClientSettings::default();
+
+        assert_eq!(settings.retry, expected_default_retry_settings());
+    }
+
+    // --- RetryMode -> RetryConfig mapping ---------------------------------
+
+    #[test]
+    fn retry_mode_adaptive_maps_to_adaptive_retry_config() {
+        let settings = RetrySettings {
+            mode: RetryMode::Adaptive,
+            ..RetrySettings::default()
+        };
+
+        let config = RetryConfig::from(&settings);
+
+        assert_eq!(config.mode(), SmithyRetryMode::Adaptive);
+        assert_eq!(config.max_attempts(), DEFAULT_RETRY_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn retry_mode_standard_maps_to_standard_retry_config() {
+        let settings = RetrySettings {
+            mode: RetryMode::Standard,
+            ..RetrySettings::default()
+        };
+
+        let config = RetryConfig::from(&settings);
+
+        assert_eq!(config.mode(), SmithyRetryMode::Standard);
+        assert_eq!(config.max_attempts(), DEFAULT_RETRY_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn retry_mode_disabled_maps_to_disabled_retry_config() {
+        // `RetryConfig::disabled()` (upstream aws-smithy-types) is
+        // `RetryConfig::standard().with_max_attempts(1)` and returns early
+        // from `From<&RetrySettings>`, so the configured attempt/backoff
+        // overrides deliberately do NOT apply to this mode -- verify that
+        // exact (surprising) shape rather than assuming our knobs win.
+        let settings = RetrySettings {
+            mode: RetryMode::Disabled,
+            max_attempts: 9,
+            initial_backoff_millis: 500,
+            max_backoff_seconds: 60,
+        };
+
+        let config = RetryConfig::from(&settings);
+
+        assert!(!config.has_retry());
+        assert_eq!(config.max_attempts(), 1);
+        assert_eq!(config.mode(), SmithyRetryMode::Standard);
+        assert_eq!(config.initial_backoff(), Duration::from_secs(1));
+        assert_eq!(config.max_backoff(), Duration::from_secs(20));
+    }
+
+    // --- max_attempts clamp -------------------------------------------------
+
+    #[test]
+    fn max_attempts_zero_clamps_to_one_not_rejected() {
+        let settings = RetrySettings {
+            max_attempts: 0,
+            ..RetrySettings::default()
+        };
+
+        let config = RetryConfig::from(&settings);
+
+        // A literal 0 would mean "never even send the request"; the `.max(1)`
+        // guard must turn it into 1, not propagate it or panic.
+        assert_eq!(config.max_attempts(), 1);
+    }
+
+    #[traced_test]
+    #[test]
+    fn max_attempts_zero_clamp_is_logged() {
+        let settings = RetrySettings {
+            max_attempts: 0,
+            ..RetrySettings::default()
+        };
+
+        let _config = RetryConfig::from(&settings);
+
+        assert!(logs_contain(
+            "AWS retry max_attempts must be at least 1; ignoring the configured value"
+        ));
+    }
+
+    #[traced_test]
+    #[test]
+    fn max_attempts_above_zero_does_not_log_a_clamp_warning() {
+        let settings = RetrySettings {
+            max_attempts: 5,
+            ..RetrySettings::default()
+        };
+
+        let _config = RetryConfig::from(&settings);
+
+        assert!(!logs_contain(
+            "AWS retry max_attempts must be at least 1; ignoring the configured value"
+        ));
+    }
+
+    // --- backoff duration conversion ---------------------------------------
+
+    #[test]
+    fn backoff_settings_convert_to_matching_durations() {
+        let settings = RetrySettings {
+            initial_backoff_millis: 250,
+            max_backoff_seconds: 45,
+            ..RetrySettings::default()
+        };
+
+        let config = RetryConfig::from(&settings);
+
+        assert_eq!(config.initial_backoff(), Duration::from_millis(250));
+        assert_eq!(config.max_backoff(), Duration::from_secs(45));
+    }
+
+    // --- serde: backward compatibility for existing deployed configs -------
+
+    #[test]
+    fn http_client_settings_toml_with_no_retry_key_yields_standard_defaults() {
+        // Every existing deployed loreserver TOML config predates the
+        // `[retry]` table entirely. It must keep deserializing, and land on
+        // the new standard-mode defaults, not fail or silently zero out.
+        let toml_str = r#"
+            pool_idle_timeout_seconds = 30
+            nodelay = true
+        "#;
+
+        let settings: HttpClientSettings = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(settings.pool_idle_timeout_seconds, 30);
+        assert!(settings.nodelay);
+        assert_eq!(settings.retry, expected_default_retry_settings());
+    }
+
+    #[test]
+    fn http_client_settings_empty_toml_yields_standard_defaults() {
+        // The degenerate case of the above: a wholly empty fragment (every
+        // field, including `pool_idle_timeout_seconds`/`nodelay`, defaulted).
+        let settings: HttpClientSettings = toml::from_str("").unwrap();
+
+        assert_eq!(
+            settings.pool_idle_timeout_seconds,
+            DEFAULT_POOL_IDLE_TIMEOUT_SECONDS
+        );
+        assert!(!settings.nodelay);
+        assert_eq!(settings.retry, expected_default_retry_settings());
+    }
+
+    #[test]
+    fn http_client_settings_empty_retry_table_matches_absent_retry_key() {
+        // A `[retry]` header with nothing under it must default identically
+        // to the key being missing altogether -- not partially defaulted,
+        // not an error. Both must equal the same `RetrySettings::default()`.
+        let with_empty_table: HttpClientSettings = toml::from_str("[retry]\n").unwrap();
+        let without_retry_key: HttpClientSettings = toml::from_str(
+            r#"
+                pool_idle_timeout_seconds = 30
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(with_empty_table.retry, expected_default_retry_settings());
+        assert_eq!(with_empty_table.retry, without_retry_key.retry);
+    }
+
+    #[test]
+    fn http_client_settings_json_with_no_retry_key_yields_standard_defaults() {
+        let json_str = r#"{ "pool_idle_timeout_seconds": 30 }"#;
+
+        let settings: HttpClientSettings = serde_json::from_str(json_str).unwrap();
+
+        assert_eq!(settings.retry, expected_default_retry_settings());
+    }
+
+    #[test]
+    fn http_client_settings_partial_retry_table_defaults_the_rest() {
+        // Only `mode` set (to a non-default value, so this is distinguishable
+        // from the all-defaults tests above); `max_attempts` /
+        // `initial_backoff_millis` / `max_backoff_seconds` must still take
+        // their individual defaults.
+        let toml_str = r#"
+            [retry]
+            mode = "adaptive"
+        "#;
+
+        let settings: HttpClientSettings = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(settings.retry.mode, RetryMode::Adaptive);
+        assert_eq!(settings.retry.max_attempts, DEFAULT_RETRY_MAX_ATTEMPTS);
+        assert_eq!(
+            settings.retry.initial_backoff_millis,
+            DEFAULT_RETRY_INITIAL_BACKOFF_MILLIS
+        );
+        assert_eq!(
+            settings.retry.max_backoff_seconds,
+            DEFAULT_RETRY_MAX_BACKOFF_SECONDS
+        );
+    }
+
+    #[test]
+    fn retry_mode_lowercase_spellings_deserialize() {
+        for (spelling, expected) in [
+            ("adaptive", RetryMode::Adaptive),
+            ("standard", RetryMode::Standard),
+            ("disabled", RetryMode::Disabled),
+        ] {
+            let toml_str = format!("[retry]\nmode = \"{spelling}\"\n");
+            let settings: HttpClientSettings = toml::from_str(&toml_str)
+                .unwrap_or_else(|e| panic!("failed to deserialize mode {spelling:?}: {e}"));
+
+            assert_eq!(
+                settings.retry.mode, expected,
+                "spelling {spelling:?} did not map to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_mode_rejects_unknown_spelling() {
+        let toml_str = "[retry]\nmode = \"aggressive\"\n";
+
+        let result: Result<HttpClientSettings, _> = toml::from_str(toml_str);
+
+        assert!(result.is_err());
     }
 }
