@@ -38,8 +38,10 @@ lore-telemetry = { workspace = true }
 [dev-dependencies]
 mockall = { workspace = true }
 rand = { workspace = true }
+serde_json = { workspace = true }
 serial_test = "3.3.1"
 temp-env = { workspace = true }
+toml = { workspace = true }
 tracing-test = { workspace = true }
 uuid = { workspace = true }
 lore-proto = { workspace = true }
