@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Smoke test verifying `lore.repository.v1` carries the 6 RPCs' request /
+//! Smoke test verifying `lore.repository.v1` carries the 7 RPCs' request /
 //! response messages.
 
 use lore_proto::lore::repository::v1::RepositoryCreateRequest;
@@ -15,6 +15,8 @@ use lore_proto::lore::repository::v1::RepositoryMetadataGetRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataGetResponse;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetResponse;
+use lore_proto::lore::repository::v1::RepositoryStorageStatsRequest;
+use lore_proto::lore::repository::v1::RepositoryStorageStatsResponse;
 use lore_proto::lore::repository::v1::repository_get_request::Query as RepositoryGetQuery;
 
 #[test]
@@ -31,6 +33,8 @@ fn v1_repository_request_response_types_default() {
     let _ = RepositoryMetadataGetResponse::default();
     let _ = RepositoryMetadataSetRequest::default();
     let _ = RepositoryMetadataSetResponse::default();
+    let _ = RepositoryStorageStatsRequest::default();
+    let _ = RepositoryStorageStatsResponse::default();
 }
 
 /// Field-shape regression net: destructuring each message + naming each
@@ -69,4 +73,11 @@ fn v1_repository_field_shapes() {
         updated: _,
     } = RepositoryMetadataSetRequest::default();
     let RepositoryMetadataSetResponse { metadata: _ } = RepositoryMetadataSetResponse::default();
+
+    let RepositoryStorageStatsRequest { id: _ } = RepositoryStorageStatsRequest::default();
+    let RepositoryStorageStatsResponse {
+        fragment_count: _,
+        payload_bytes: _,
+        content_bytes: _,
+    } = RepositoryStorageStatsResponse::default();
 }

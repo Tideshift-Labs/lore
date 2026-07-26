@@ -28,6 +28,18 @@ service RepositoryService {
   // Compare-and-swap update of a repository's metadata pointer. CAS miss is
   // signalled in-band via the response, never as a non-OK gRPC status.
   rpc RepositoryMetadataSet(RepositoryMetadataSetRequest) returns (RepositoryMetadataSetResponse);
+  // Aggregate stored-fragment accounting for one repository. Read-only.
+  // Backend-dependent: returns UNIMPLEMENTED on a store with no
+  // repository-keyed access path over its fragment index.
+  //
+  // FORK-LOCAL (Tideshift, CR-016). Additive: new RPC, new request/response
+  // messages, no existing field number or RPC touched. Nothing upstream claims
+  // these names today, so `git merge upstream/main` will not conflict on tags —
+  // but if upstream ever adds its own storage-accounting RPC here, this is the
+  // hunk to reconcile, and the on-the-wire method path
+  // `/lore.repository.v1.RepositoryService/RepositoryStorageStats` is what
+  // Lorehub's client is pinned to.
+  rpc RepositoryStorageStats(RepositoryStorageStatsRequest) returns (RepositoryStorageStatsResponse);
 }
 
 // Request to create a new repository. The caller pre-generates `id` and
@@ -144,4 +156,30 @@ message RepositoryMetadataSetRequest {
 message RepositoryMetadataSetResponse {
   // The repository's current metadata pointer after the call.
   bytes metadata = 1;
+}
+
+// Request for the aggregate stored-fragment accounting of one repository.
+message RepositoryStorageStatsRequest {
+  // Repository id.
+  bytes id = 1;
+}
+
+// Aggregate accounting over the distinct fragment hashes associated with the
+// repository, summed from the store's own fragment metadata index. An unknown
+// repository is not an error: it has no associations, so every field is zero.
+//
+// Dedup semantics: under the default global (content-addressed) dedup scope a
+// fragment's bytes are stored once and may be referenced by several
+// repositories. These figures are the repository's *referenced* footprint —
+// shared bytes are counted in full for every referencing repository, so summing
+// across repositories exceeds the bytes physically held in the object store.
+// That is the intended metering semantic, not a bug.
+message RepositoryStorageStatsResponse {
+  // Distinct fragment hashes associated with the repository.
+  uint64 fragment_count = 1;
+  // Sum of the stored (post-encoding) payload sizes of those fragments — the
+  // figure that tracks bytes paid for in object storage.
+  uint64 payload_bytes = 2;
+  // Sum of the logical (pre-encoding) content sizes of the same fragments.
+  uint64 content_bytes = 3;
 }

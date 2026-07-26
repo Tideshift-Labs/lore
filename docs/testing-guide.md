@@ -563,6 +563,127 @@ the next run starts from the map instead of rediscovering it.
     `..._does_not_log_a_clamp_warning`. See the dedicated Deep finding below for the general
     pattern (first use of log-content assertions in this fork, vs. `#[traced_test]`'s prior
     use here only to keep logs out of other tests' output).
+- **CR-016 (`RepositoryStorageStats`, per-repo stored-bytes accounting, [SERVER])** — new
+  read-only RPC on `lore.repository.v1.RepositoryService`. `lore-storage/src/store_types.rs`'s
+  `StoreRepositoryStats { fragment_count, payload_bytes, content_bytes }`;
+  `ImmutableStore::repository_stats` is a **default** trait method returning
+  `StoreError::NotSupported` (deliberate — the alternative is a hidden full-table scan on a
+  backend with no repository-keyed access path, e.g. DynamoDB); only
+  `lore-postgres::PostgresImmutableStore::repository_stats` overrides it, with one query joining
+  `SELECT DISTINCT hash FROM lore_fragments WHERE repository = $1` against
+  `lore_fragment_metadata`, backed by the new `lore_fragments_repo_hash (repository, hash)` index
+  (in both the inline `SCHEMA` const and `migrations/0001_init.sql`).
+  `lore-server/src/grpc/repository/v1/repository_storage_stats.rs`'s `handler` re-checks repo
+  authz via `check_repository_query_authorization` (CR-011's ReBAC callback) before any store
+  call, then maps `StoreError::NotSupported → Unimplemented`, `SlowDown → ResourceExhausted`,
+  anything else → `Internal`. Coverage:
+  `cargo test -p lore-server --lib -- grpc::repository::v1::repository_storage_stats` (8 tests,
+  reusing `authz_test_support::{new_test_stores, start_stub_auth_server}` from CR-011 — the deny
+  case doesn't need `seed_repository_metadata` since this handler never reads metadata) — the
+  authz-gate-runs-before-the-store deny case, own-repo-accepted (lands on `Unimplemented` since
+  `LocalImmutableStore` has no override — comment explains why that, not `PermissionDenied`, is
+  the pass signal), auth-OFF parity, missing-repository-id → `InvalidArgument`, and a **minimal
+  in-test `ImmutableStore` stub** (`StatsStubStore`, every method but `repository_stats`
+  `unimplemented!()`) proving the three response fields are copied through un-transposed plus the
+  `SlowDown`/`NotSupported`/other-error → status-code mapping. `cargo test -p lore-storage --lib
+  -- immutable_store::tests::repository_stats_default` (1 test) pins the trait default via a real
+  `LocalImmutableStore` (cheaper and more honest than a hand-rolled fake, since a future backend
+  adding its own accidental override wouldn't be caught by a fake). `cargo test -p lore-postgres
+  --test immutable_store` (14 tests, was 10) adds 4 gated on `LORE_TEST_PG_URL` /
+  `LORE_TEST_S3_ENDPOINT` / `LORE_TEST_S3_BUCKET`: unknown-repository → all-zero (not an error),
+  a multi-fragment sum, same-hash-two-contexts-in-one-repo counted once (the
+  `SELECT DISTINCT hash` assertion), and cross-repository isolation **plus** the intended
+  full-double-count of a hash shared by two repositories (CR-016 requirement 3 — asserted as
+  correct, not treated as a bug). Not run against live Postgres/MinIO here; compiles and skips
+  cleanly per the established gate pattern (see the CR-007 entry above).
+  **Gate note (same pattern as CR-015/WP-066):** `cargo +nightly fmt -p lore-postgres --
+  --check` flags one diff in **implementation** code from this same delta —
+  `lore-postgres/src/store/immutable_store.rs:887` (the `let _t = self.instruments.start(...)`
+  line in `repository_stats` wraps differently under nightly rustfmt). Reported back, not
+  reformatted (out of test-code scope); the sibling test files this pass touched
+  (`lore-postgres/tests/immutable_store.rs`, `lore-storage/src/immutable_store.rs`,
+  `lore-server/src/grpc/repository/v1/repository_storage_stats.rs`) are themselves fmt-clean.
+  **`lore-proto`'s own hand-written proto-surface tests also needed updating**, since the new
+  RPC is a 7th message pair on `lore.repository.v1`: `lore-proto/tests/v1_repository.rs`'s doc
+  comment (6→7 RPCs) plus `RepositoryStorageStatsRequest`/`Response` added to both
+  `v1_repository_request_response_types_default` and the field-shape destructuring net
+  `v1_repository_field_shapes` (`{ id: _ }` / `{ fragment_count: _, payload_bytes: _,
+  content_bytes: _ }` — this destructuring is exactly what catches a transposed/renamed field on
+  a future regeneration, the same failure mode requirement 5's handler-level swap test above
+  guards at the RPC layer). `lore-proto/tests/v1_lint.rs` needed no change (new messages carry
+  `//` doc comments, use `id` not `repository_id`, reference no `urc.` types).
+  **Unrelated pre-existing breakage found while running the crate-wide gate**: `cargo test -p
+  lore-proto` failed to even compile due to `lore-proto/tests/v1_thin_client.rs` — a stale
+  destructuring test from CR-008 (`TreeNode.size_bytes` / `Revision.total_size_bytes`, already
+  landed and documented in the CR-008 entry above) that was never updated for those two fields.
+  Confirmed via `git log` that file was last touched 2026-06-24, unrelated to CR-016 and to
+  anything either this pass or a concurrent session changed. Fixed as a 2-field stale-test patch
+  (same "test lagged the contract, ours to fix" disposition as any other stale destructuring net)
+  since it blocked the exact `cargo test -p lore-proto` gate requested, and is unrelated to any
+  implementation risk; flagged explicitly in the report back rather than folded in silently.
+  Coverage: `cargo test -p lore-proto --test v1_repository --test v1_lint` (2 + 6 passed).
+  **Live-infra run (the SQL/index gate), followed up on reviewer request:** stood up
+  `postgres:16` (`-p 5433:5432`) + `minio/minio` (host ports `9090`/`9091` — this rig's
+  `lorehub-dataplane` dev stack already owns `9000-9001`/`5432`, so the quickstart's literal
+  ports collide; any free host ports work, the env vars just have to match), created the
+  bucket with `aws --endpoint-url s3 mb` (aws-cli was on `PATH`; no `mc` binary needed), ran
+  `cargo test -p lore-postgres --test immutable_store` for real — all 15 passed (11 pre-existing
+  + 4 CR-016), not skip-green. **`EXPLAIN (ANALYZE, BUFFERS)` on the exact `repository_stats`
+  query, after seeding 50k fragments across 500 synthetic repositories**, confirmed
+  `Bitmap Index Scan on lore_fragments_repo_hash` for the association lookup and
+  `Index Scan using lore_fragment_metadata_pkey` for the join — no sequential scan anywhere;
+  closes the reviewer's index-actually-serves-the-plan question for real, not by reading the
+  `CREATE INDEX` statement. Tore both containers down after. Command for next time (adjust
+  ports to whatever's free):
+  ```
+  docker run -d --name lore-pg-test -p 5433:5432 -e POSTGRES_PASSWORD=test -e POSTGRES_DB=lore postgres:16
+  docker run -d --name lore-minio-test -p 9090:9000 -p 9091:9001 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data --console-address ":9001"
+  ```
+  **Two reviewer-named coverage gaps closed:**
+  - **Inner-join exclusion.** `repository_stats_excludes_an_association_with_no_metadata_row`
+    (`lore-postgres/tests/immutable_store.rs`) proves an association row with no matching
+    `lore_fragment_metadata` row is dropped from `fragment_count` too, not just the sums (the
+    query's `JOIN` is inner, not `LEFT JOIN`). No public store API leaves that state on its own
+    (`put` always writes both rows in one transaction) — construct it with a direct
+    `tokio_postgres::connect` + `DELETE FROM lore_fragment_metadata` against the same
+    `LORE_TEST_PG_URL`, bypassing the store entirely. **Gotcha:** the workspace root
+    `clippy.toml` (not `lore-server/clippy.toml`, which shadows it with only
+    `future-size-threshold` and has no `disallowed-methods` list) forbids raw `tokio::spawn` —
+    `lore-postgres` inherits the root list since it has no `clippy.toml` of its own, so driving
+    the raw connection's I/O future needs `lore_base::lore_spawn!(async move { ... })` (the
+    1-arg form, no `JoinSet` needed), not `tokio::spawn`. This is why
+    `authz_test_support::start_stub_auth_server`'s bare `tokio::spawn` in `lore-server` passes
+    clippy while the same pattern fails in a different crate — check which `clippy.toml` (if
+    any) actually governs the crate you're in before assuming a sibling crate's pattern is safe
+    to copy.
+  - **Wrapper-store inheritance.** Neither `ReplicatedStore` (`lore-server/src/store/replicated_store.rs`)
+    nor `GrpcReplica` (`lore-server/src/store/grpc_replica.rs`) overrides `repository_stats` —
+    both forward every other op over their own wire protocol, which has no message for this one,
+    so both silently inherit the trait default (`NotSupported`). This is the deployment-topology
+    risk the reviewer flagged: a cell wired `composite`/`replicated` reports `Unimplemented` for
+    metering even though the backend underneath could answer. Both got a one-line pinning test
+    using each file's **already-established** mock fixture (not a new one): `GrpcReplica::new(MockReplicationClientImpl::default())`
+    (`grpc_replica.rs`'s existing `mockall::automock`-generated mock, no `.expect_*()` needed
+    since the default method never touches `self.client`) and the file's own `make_store()`
+    helper for `ReplicatedStore<MockClient>` (`replicated_store.rs`, wrapped in
+    `LORE_CONTEXT.scope(...)` like every other test in that file — `lore_spawn!`'s background
+    refresh/monitor tasks need it). Neither construction was disproportionate; both files
+    already pay this fixture cost for ~10-18 other tests. Coverage:
+    `cargo test -p lore-server --lib -- store::grpc_replica::tests::repository_stats_inherits_the_trait_default`,
+    `cargo test -p lore-server --lib -- store::replicated_store::tests::repository_stats::repository_stats_inherits_the_trait_default`.
+  **Gotcha — stale incremental cache produced a bogus link error mid-session, unrelated to any
+  code change.** After running `cargo clippy` then later `cargo build --tests`/`cargo test` as
+  *separate* shell invocations (not chained in one `&&`) against the same `target/`, got `error:
+  crate lore_revision required to be available in rlib format, but was not found in this form`
+  (`lore-postgres`) immediately followed by a *different* spurious error on a clean retry:
+  `error: cannot determine resolution for the macro lore_debug` / "import resolution is stuck"
+  in `lore-server/src/quic/replication_store_service/client.rs` — a file nobody touched
+  (confirmed via `git status`/`git diff --stat`, zero changes). Both cleared with a plain
+  `cargo clean -p lore-server` (no full workspace clean needed) followed by a fresh build; this
+  is a stale/corrupted incremental-compilation artifact, not a real error — don't spend time
+  reading the named file when the error text doesn't match anything you actually edited there.
+  If a `cargo build`/`test` error names a file with zero `git` diff, suspect the cache before
+  the code.
 - **CR-021 Part 2b (application-level `SlowDown` propagation honesty, ships in `lore-revision` —
   not cleanly [SERVER], flag as [CLIENT]-relevant)** — `lore-revision/src/state.rs`'s
   `collect_new_addresses` (the fn `collect_new_fragments` fans out into). Narrowed three

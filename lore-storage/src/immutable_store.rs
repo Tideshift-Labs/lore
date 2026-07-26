@@ -30,6 +30,7 @@ use crate::errors::SlowDown;
 use crate::store_types::StoreMatch;
 use crate::store_types::StoreObliterateStats;
 use crate::store_types::StoreQueryResult;
+use crate::store_types::StoreRepositoryStats;
 
 #[error_set(clone)]
 pub enum StoreError {
@@ -388,6 +389,36 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// Get number of fragments in store, if available
     async fn fragment_count(self: Arc<Self>) -> Option<usize> {
         None
+    }
+
+    /// Aggregate stored-fragment accounting for a single repository
+    /// (partition): the distinct fragment hashes associated with it and the sum
+    /// of their stored payload / logical content sizes.
+    ///
+    /// An unknown repository is not an error — it has no associations, so the
+    /// result is all zeroes.
+    ///
+    /// Opt-in per backend. The default reports [`NotSupported`] because a store
+    /// whose fragment index has no repository-keyed access path could only
+    /// answer by scanning every fragment it holds, which is not something a
+    /// caller should get charged for implicitly. Such a backend should leave
+    /// this unimplemented rather than provide a hidden full scan.
+    ///
+    /// **A wrapping store inherits that default.** Composite, replicated and
+    /// remote stores forward the other operations but not this one — the
+    /// replicated path forwards over the store protocol, which has no message
+    /// for it — so a server configured with any of those answers `NotSupported`
+    /// even when the store underneath could compute it. Reporting is therefore
+    /// only available on a cell wired straight to a backend that implements
+    /// this, and the failure mode of getting that wrong is silent: accounting
+    /// simply stops rather than returning a wrong number.
+    async fn repository_stats(
+        self: Arc<Self>,
+        _partition: Partition,
+    ) -> Result<StoreRepositoryStats, StoreError> {
+        Err(StoreError::from(NotSupported {
+            operation: "repository_stats".to_string(),
+        }))
     }
 
     /// Verify the integrity of the store. If `heal` is true, attempt to repair any issues found.
@@ -887,6 +918,38 @@ mod tests {
             let fragment = make_fragmented(refs.len(), 1_000_000);
             let payload = make_refs_payload(&refs);
             assert!(validate_fragment_list(&fragment, &payload).is_ok());
+        }
+    }
+
+    mod repository_stats_default {
+        use super::*;
+        use crate::ImmutableStoreSettings;
+        use crate::LocalImmutableStore;
+
+        /// Only `lore-postgres`'s `PostgresImmutableStore` (CR-016) overrides
+        /// `repository_stats`. Every other backend — including this in-process
+        /// local store — must inherit the trait default rather than silently
+        /// doing something else (e.g. a hidden full scan), so a future backend
+        /// can't accidentally ship one. Exercised against a real store (not a
+        /// hand-rolled fake) so this also catches a backend that adds its own
+        /// override later without updating this pin.
+        #[tokio::test]
+        async fn default_reports_not_supported_naming_the_operation() {
+            let store = LocalImmutableStore::new(None, ImmutableStoreSettings::default())
+                .await
+                .expect("create local store");
+
+            let err = store
+                .repository_stats(Partition::default())
+                .await
+                .expect_err("trait default must not support repository_stats");
+
+            match err {
+                StoreError::NotSupported(inner) => {
+                    assert_eq!(inner.operation, "repository_stats");
+                }
+                other => panic!("expected StoreError::NotSupported, got {other:?}"),
+            }
         }
     }
 }

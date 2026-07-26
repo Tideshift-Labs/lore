@@ -1699,4 +1699,35 @@ mod tests {
                 .await;
         }
     }
+
+    mod repository_stats {
+        use lore_base::runtime::LORE_CONTEXT;
+
+        use super::*;
+
+        /// `ReplicatedStore` forwards every operation to a remote server over
+        /// its own wire protocol (`StoreClient`) and has no `repository_stats`
+        /// message on that protocol — it inherits the trait default. A cell
+        /// wired to forward through this store therefore reports
+        /// `NotSupported` for storage-stats metering even when the store it
+        /// forwards to could compute the real number; this pins that as the
+        /// intended (if silent) behavior rather than an oversight.
+        #[tokio::test]
+        async fn repository_stats_inherits_the_trait_default() {
+            let execution =
+                crate::util::setup_execution("test", String::default(), String::default());
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let store = make_store().await;
+
+                    let err = store
+                        .repository_stats(Partition::default())
+                        .await
+                        .expect_err("ReplicatedStore has no repository_stats override");
+
+                    assert!(matches!(err, StoreError::NotSupported(_)));
+                })
+                .await;
+        }
+    }
 }

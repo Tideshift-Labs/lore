@@ -128,6 +128,7 @@ pub use store_types::KeyValueStream;
 pub use store_types::StoreMatch;
 pub use store_types::StoreObliterateStats;
 pub use store_types::StoreQueryResult;
+pub use store_types::StoreRepositoryStats;
 pub use typed_bytes::TypedBytes;
 pub use typed_bytes::TypedBytesMut;
 pub use types::Address;

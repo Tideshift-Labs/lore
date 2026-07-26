@@ -16,6 +16,8 @@ use lore_proto::lore::repository::v1::RepositoryMetadataGetRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataGetResponse;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetResponse;
+use lore_proto::lore::repository::v1::RepositoryStorageStatsRequest;
+use lore_proto::lore::repository::v1::RepositoryStorageStatsResponse;
 use lore_proto::lore::repository::v1::repository_service_server::RepositoryService;
 use lore_revision::environment::EnvironmentConfig;
 use lore_telemetry::InstrumentProvider;
@@ -30,6 +32,7 @@ use super::repository_get;
 use super::repository_list;
 use super::repository_metadata_get;
 use super::repository_metadata_set;
+use super::repository_storage_stats;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
@@ -183,6 +186,21 @@ impl RepositoryService for LoreRepositoryV1Service {
                 self.auth_url(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+            ),
+        )
+        .await
+    }
+
+    async fn repository_storage_stats(
+        &self,
+        request: Request<RepositoryStorageStatsRequest>,
+    ) -> Result<Response<RepositoryStorageStatsResponse>, Status> {
+        timeout_grpc(
+            self.rpc_timeout,
+            repository_storage_stats::handler(
+                request,
+                self.auth_url(),
+                self.immutable_store.clone(),
             ),
         )
         .await

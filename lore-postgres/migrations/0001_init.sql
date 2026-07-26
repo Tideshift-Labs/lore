@@ -42,13 +42,16 @@ CREATE INDEX IF NOT EXISTS lore_locks_repo_branch_desc  ON lore_locks (repositor
 -- lore_fragments: one row per (hash, repository, context) association. The PK
 -- B-tree serves the leftmost-prefix existence reads — hash (MatchHash),
 -- (hash, repository) (MatchPartition), full (MatchFull) — and the by-hash
--- refcount, so no secondary indexes are required.
+-- refcount. The one secondary index inverts the leading column so a whole
+-- repository's fragment set is reachable without a sequential scan, which is
+-- what the per-repository storage-stats aggregate (CR-016) reads.
 CREATE TABLE IF NOT EXISTS lore_fragments (
     hash       bytea NOT NULL,
     repository bytea NOT NULL,
     context    bytea NOT NULL,
     PRIMARY KEY (hash, repository, context)
 );
+CREATE INDEX IF NOT EXISTS lore_fragments_repo_hash ON lore_fragments (repository, hash);
 
 -- lore_fragment_metadata: one row per fragment hash (global dedup,
 -- content-addressed) carrying the Fragment flags/sizes.
