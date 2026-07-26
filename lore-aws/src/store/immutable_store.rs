@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -64,6 +65,7 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::aws_error::AwsError;
+use crate::aws_error::is_retryable_sdk_error;
 use crate::default_aws_timeout_millis;
 use crate::dynamodb::ConditionParts;
 use crate::dynamodb::DynamoDb;
@@ -566,6 +568,28 @@ struct GetS3objectContentsOutput {
     /// The fragment carried on the object, recovered from its object metadata. Arrives on the same
     /// response as the bytes it describes, so the two are necessarily from the same object version.
     fragment: Result<Fragment, ObjectMetadataError>,
+}
+
+/// Classifies a DynamoDB `GetItem` failure raised while loading fragment
+/// metadata.
+///
+/// DynamoDB reports a genuinely absent item as a *successful* response carrying
+/// no item, so no SDK error on this path can mean "that address is not here".
+/// Mapping one onto `AddressNotFound` reports a capacity problem as missing
+/// content: the caller cannot tell it apart from real absence, so it cannot
+/// retry, and an operator investigating sees an integrity-shaped error for what
+/// is a throughput problem.
+///
+/// Capacity and transport failures therefore surface as `SlowDown` — the
+/// store's existing "busy, back off and retry" signal — and everything else as
+/// an internal error carrying the underlying cause.
+fn metadata_load_error(error: AwsError<SdkError<GetItemError>>) -> StoreError {
+    match &error {
+        AwsError::AwsSdkError(sdk_error) if is_retryable_sdk_error(sdk_error) => {
+            StoreError::from(SlowDown)
+        }
+        _ => StoreError::internal_with_context(error, "DynamoDB fragment metadata load failed"),
+    }
 }
 
 pub struct AwsImmutableStore {
