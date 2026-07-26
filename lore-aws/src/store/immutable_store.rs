@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -9,6 +10,7 @@ use std::sync::LazyLock;
 
 use async_trait::async_trait;
 use aws_sdk_dynamodb::error::SdkError;
+use aws_sdk_dynamodb::operation::get_item::GetItemError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -58,6 +60,7 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::aws_error::AwsError;
+use crate::aws_error::is_retryable_sdk_error;
 use crate::default_aws_timeout_millis;
 use crate::dynamodb::ConditionParts;
 use crate::dynamodb::DynamoDb;
@@ -333,6 +336,28 @@ type BatchTaskResult = Result<(usize, StoreMatch), (usize, StoreError)>;
 struct GetS3objectContentsOutput {
     read: usize,
     bytes: BytesMut,
+}
+
+/// Classifies a DynamoDB `GetItem` failure raised while loading fragment
+/// metadata.
+///
+/// DynamoDB reports a genuinely absent item as a *successful* response carrying
+/// no item, so no SDK error on this path can mean "that address is not here".
+/// Mapping one onto `AddressNotFound` reports a capacity problem as missing
+/// content: the caller cannot tell it apart from real absence, so it cannot
+/// retry, and an operator investigating sees an integrity-shaped error for what
+/// is a throughput problem.
+///
+/// Capacity and transport failures therefore surface as `SlowDown` — the
+/// store's existing "busy, back off and retry" signal — and everything else as
+/// an internal error carrying the underlying cause.
+fn metadata_load_error(error: AwsError<SdkError<GetItemError>>) -> StoreError {
+    match &error {
+        AwsError::AwsSdkError(sdk_error) if is_retryable_sdk_error(sdk_error) => {
+            StoreError::from(SlowDown)
+        }
+        _ => StoreError::internal_with_context(error, "DynamoDB fragment metadata load failed"),
+    }
 }
 
 pub struct AwsImmutableStore {
@@ -725,7 +750,18 @@ impl AwsImmutableStore {
             warn!(
                 "Load metadata failed for address: {address:?} in repository: {repository:?}: {e:?}"
             );
-            StoreError::internal_with_context(e, "Failed to load metadata after fragment lookup")
+            // Metadata missing after a positive existence check is an integrity
+            // problem, but an overloaded store is not. Let `SlowDown` through so
+            // the caller can still see that retrying is worthwhile; this is the
+            // path the push tree-walk queries once per fragment.
+            if e.is_slow_down() {
+                e
+            } else {
+                StoreError::internal_with_context(
+                    e,
+                    "Failed to load metadata after fragment lookup",
+                )
+            }
         })?;
 
         if (fragment.flags & FragmentFlags::PayloadObliteration) != 0 && hide_obliterates {
@@ -1054,13 +1090,7 @@ impl AwsImmutableStore {
             .await
             .map_err(|e| {
                 warn!(%hash, ?e, "Failed to get fragment metadata for hash");
-                if let AwsError::AwsSdkError(sdk_error) = e
-                    && let SdkError::TimeoutError(_) = sdk_error
-                {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
-                }
+                metadata_load_error(e)
             })?
             .item
         {
@@ -1653,8 +1683,10 @@ mod test {
     use aws_sdk_dynamodb::operation::query::QueryOutput;
     use aws_sdk_dynamodb::types::AttributeValue;
     use aws_sdk_dynamodb::types::error::ConditionalCheckFailedException;
+    use aws_sdk_dynamodb::types::error::InternalServerError;
     use aws_sdk_dynamodb::types::error::ProvisionedThroughputExceededException;
     use aws_sdk_dynamodb::types::error::ResourceNotFoundException;
+    use aws_sdk_dynamodb::types::error::ThrottlingException;
     use aws_sdk_s3::error::ErrorMetadata;
     use aws_sdk_s3::operation::delete_object::DeleteObjectError;
     use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
@@ -3312,8 +3344,14 @@ mod test {
         );
     }
 
+    /// Upstream previously pinned the buggy mapping here: a `ResourceNotFoundException`
+    /// (a missing *table*, not a missing item) was asserted to yield
+    /// `AddressNotFound`. Under the throttle-honesty fix that is the wrong
+    /// signal — the table lookup failing is a genuine internal/config
+    /// problem, not evidence the fragment itself is absent — so this test now
+    /// asserts the corrected classification.
     #[tokio::test]
-    async fn test_load_metadata_sdk_service_error_returns_address_not_found() {
+    async fn test_load_metadata_non_throttle_service_error_is_internal() {
         let (_fragment, address, _payload) = fragment::generate_random();
 
         let s3mock = MockS3Impl::default();
@@ -3343,12 +3381,266 @@ mod test {
 
         let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
 
+        let err = store
+            .load_metadata(address.hash)
+            .await
+            .expect_err("expected an error");
+        assert!(err.is_internal(), "expected internal error, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_load_metadata_provisioned_throughput_exceeded_returns_slow_down() {
+        let (_fragment, address, _payload) = fragment::generate_random();
+
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let metadata_entry = FragmentMetadataEntry::new(address.hash);
+        let av_map: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(metadata_entry).unwrap();
+
+        dynamodb_mock
+            .expect_get_item()
+            .with(
+                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
+                eq(av_map),
+                eq(true),
+            )
+            .return_once(move |_, _, _| {
+                // Status 400 matches DynamoDB's real throttle response, so
+                // this only passes if the error-*code* classifier fires.
+                Err(aws_error(
+                    GetItemError::ProvisionedThroughputExceededException(
+                        ProvisionedThroughputExceededException::builder()
+                            .meta(
+                                ErrorMetadata::builder()
+                                    .code("ProvisionedThroughputExceededException")
+                                    .build(),
+                            )
+                            .build(),
+                    ),
+                    400u16,
+                ))
+            });
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+
+        let err = store
+            .load_metadata(address.hash)
+            .await
+            .expect_err("expected an error");
+        assert!(err.is_slow_down(), "expected SlowDown, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_load_metadata_throttling_exception_returns_slow_down() {
+        let (_fragment, address, _payload) = fragment::generate_random();
+
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let metadata_entry = FragmentMetadataEntry::new(address.hash);
+        let av_map: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(metadata_entry).unwrap();
+
+        dynamodb_mock
+            .expect_get_item()
+            .with(
+                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
+                eq(av_map),
+                eq(true),
+            )
+            .return_once(move |_, _, _| {
+                Err(aws_error(
+                    GetItemError::ThrottlingException(
+                        ThrottlingException::builder()
+                            .meta(ErrorMetadata::builder().code("ThrottlingException").build())
+                            .build(),
+                    ),
+                    400u16,
+                ))
+            });
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+
+        let err = store
+            .load_metadata(address.hash)
+            .await
+            .expect_err("expected an error");
+        assert!(err.is_slow_down(), "expected SlowDown, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_load_metadata_5xx_service_error_returns_slow_down() {
+        let (_fragment, address, _payload) = fragment::generate_random();
+
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let metadata_entry = FragmentMetadataEntry::new(address.hash);
+        let av_map: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(metadata_entry).unwrap();
+
+        dynamodb_mock
+            .expect_get_item()
+            .with(
+                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
+                eq(av_map),
+                eq(true),
+            )
+            .return_once(move |_, _, _| {
+                // No modelled throttle code at all: only the 5xx status
+                // should classify this as retryable.
+                Err(aws_error(
+                    GetItemError::InternalServerError(InternalServerError::builder().build()),
+                    500u16,
+                ))
+            });
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+
+        let err = store
+            .load_metadata(address.hash)
+            .await
+            .expect_err("expected an error");
+        assert!(err.is_slow_down(), "expected SlowDown, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_load_metadata_no_item_returns_address_not_found() {
+        let (_fragment, address, _payload) = fragment::generate_random();
+
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let metadata_entry = FragmentMetadataEntry::new(address.hash);
+        let av_map: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(metadata_entry).unwrap();
+
+        dynamodb_mock
+            .expect_get_item()
+            .with(
+                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
+                eq(av_map),
+                eq(true),
+            )
+            .return_once(move |_, _, _| Ok(GetItemOutput::builder().set_item(None).build()));
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+
+        let err = store
+            .load_metadata(address.hash)
+            .await
+            .expect_err("expected an error");
         assert!(
-            store
-                .load_metadata(address.hash)
-                .await
-                .unwrap_err()
-                .is_address_not_found()
+            err.is_address_not_found(),
+            "expected AddressNotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_metadata_deserialize_failure_returns_address_not_found() {
+        let (_fragment, address, _payload) = fragment::generate_random();
+
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let metadata_entry = FragmentMetadataEntry::new(address.hash);
+        let av_map: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(metadata_entry).unwrap();
+
+        dynamodb_mock
+            .expect_get_item()
+            .with(
+                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
+                eq(av_map),
+                eq(true),
+            )
+            .return_once(move |_, _, _| {
+                // An item is present (distinct from "no item found"), but its
+                // shape does not deserialize into `FragmentMetadataEntry` —
+                // missing the required `hash` field entirely. Must still
+                // classify as `AddressNotFound`, not an internal error.
+                Ok(GetItemOutput::builder()
+                    .set_item(Some(HashMap::new()))
+                    .build())
+            });
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+
+        let err = store
+            .load_metadata(address.hash)
+            .await
+            .expect_err("expected an error");
+        assert!(
+            err.is_address_not_found(),
+            "expected AddressNotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_metadata_load_error_non_sdk_error_is_internal() {
+        // A non-`AwsSdkError` `AwsError` variant (e.g. a spawned-task join
+        // failure) carries no SDK error to classify at all, so it must
+        // always fall through to internal, never to `SlowDown` or
+        // `AddressNotFound`.
+        let err = metadata_load_error(AwsError::JoinError);
+        assert!(err.is_internal(), "expected internal error, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_query_metadata_load_slow_down_passes_through() {
+        let repository = random::<Context>();
+        let (_fragment, address, _payload) = fragment::generate_random();
+
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        mock_lookup_fragments(
+            &mut dynamodb_mock,
+            FragmentsEntry::new(repository, address),
+            StoreMatch::MatchFull,
+            StoreMatch::MatchFull,
+        );
+
+        let metadata_entry = FragmentMetadataEntry::new(address.hash);
+        let av_map: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(metadata_entry).unwrap();
+
+        dynamodb_mock
+            .expect_get_item()
+            .with(
+                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
+                eq(av_map),
+                eq(true),
+            )
+            .return_once(move |_, _, _| {
+                Err(aws_error(
+                    GetItemError::ProvisionedThroughputExceededException(
+                        ProvisionedThroughputExceededException::builder()
+                            .meta(
+                                ErrorMetadata::builder()
+                                    .code("ProvisionedThroughputExceededException")
+                                    .build(),
+                            )
+                            .build(),
+                    ),
+                    400u16,
+                ))
+            });
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+        let store = Arc::new(store);
+
+        let err = store
+            .clone()
+            .query(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect_err("expected query to fail");
+
+        assert!(
+            err.is_slow_down(),
+            "expected SlowDown to pass through query(), got {err:?}"
         );
     }
 
