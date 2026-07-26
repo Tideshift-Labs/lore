@@ -48,6 +48,7 @@ use lore_storage::ImmutableStore;
 use lore_storage::Partition;
 use lore_storage::StoreMatch;
 use lore_storage::StoreObliterateStats;
+use lore_storage::StoreRepositoryStats;
 use serial_test::serial;
 
 // ─── env helpers ─────────────────────────────────────────────────────────────
@@ -61,6 +62,31 @@ fn env_config() -> Option<(String, String, String, String)> {
     let s3_region =
         std::env::var("LORE_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     Some((pg_url, s3_endpoint, s3_bucket, s3_region))
+}
+
+/// Delete a fragment's `lore_fragment_metadata` row directly over a
+/// throwaway connection, bypassing `PostgresImmutableStore`'s own API (which
+/// never leaves an association without its metadata row on its own — `put`
+/// writes both in one transaction). Used to construct an "association
+/// present, metadata absent" state for the inner-join test below; that state
+/// can arise operationally (e.g. a partial/aborted cleanup) even though this
+/// store never produces it itself.
+async fn delete_metadata_row(pg_url: &str, hash: Hash) {
+    let (client, connection) = tokio_postgres::connect(pg_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect for direct metadata delete");
+    lore_base::lore_spawn!(async move {
+        if let Err(e) = connection.await {
+            eprintln!("direct postgres connection error: {e}");
+        }
+    });
+    client
+        .execute(
+            "DELETE FROM lore_fragment_metadata WHERE hash = $1",
+            &[&hash.data().as_slice()],
+        )
+        .await
+        .expect("delete metadata row");
 }
 
 // ─── shared test helpers ──────────────────────────────────────────────────────
@@ -690,5 +716,268 @@ async fn exist_batch_order_preservation() {
         full_results[1],
         StoreMatch::MatchNone,
         "addr_b (same hash, different context) → MatchNone"
+    );
+}
+
+/// 9. `repository_stats` on a repository with no fragment associations
+///    reports all-zero stats, not an error — an unknown repository has no
+///    associations, which is the intended CR-016 semantic, not a bug.
+#[tokio::test]
+#[serial]
+async fn repository_stats_unknown_repository_reports_zeroes() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let s = make_store(&pg, &ep, &bucket, &region).await;
+
+    let partition: Partition = rand::random();
+    let stats = s
+        .clone()
+        .repository_stats(partition)
+        .await
+        .expect("repository_stats on an unknown repository must not error");
+
+    assert_eq!(
+        stats,
+        StoreRepositoryStats::default(),
+        "an unknown repository must report all-zero stats"
+    );
+}
+
+/// 10. `repository_stats` sums `fragment_count` / `payload_bytes` /
+///     `content_bytes` over several distinct fragments put into one
+///     repository.
+#[tokio::test]
+#[serial]
+async fn repository_stats_sums_multiple_fragments() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let s = make_store(&pg, &ep, &bucket, &region).await;
+
+    let partition: Partition = rand::random();
+    let sizes = [512u32, 1024, 4096];
+    for &size in &sizes {
+        let address: Address = rand::random();
+        put_fragment(s.clone(), partition, address, size).await;
+    }
+
+    let stats = s
+        .clone()
+        .repository_stats(partition)
+        .await
+        .expect("repository_stats over a populated repository");
+
+    let expected_total: u64 = sizes.iter().map(|&size| size as u64).sum();
+    assert_eq!(stats.fragment_count, 3, "one distinct hash per put");
+    assert_eq!(
+        stats.payload_bytes, expected_total,
+        "payload_bytes must sum the put sizes"
+    );
+    assert_eq!(
+        stats.content_bytes, expected_total,
+        "content_bytes must sum the put sizes (uncompressed fixture: content == payload)"
+    );
+}
+
+/// 11. Deduplication WITHIN a repository: the same hash associated under two
+///     different contexts in the same repository is counted ONCE — this is
+///     what the query's `SELECT DISTINCT hash` subquery exists for, and the
+///     assertion most likely to catch a regression if that subquery is
+///     "simplified" away.
+#[tokio::test]
+#[serial]
+async fn repository_stats_deduplicates_same_hash_multiple_contexts() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let s = make_store(&pg, &ep, &bucket, &region).await;
+
+    let partition: Partition = rand::random();
+    let (frag, payload) = make_fragment_and_payload(2048);
+    let addr1: Address = rand::random();
+    let addr2 = Address {
+        hash: addr1.hash,
+        context: rand::random(),
+    };
+
+    s.clone()
+        .put(partition, addr1, frag, Some(payload.clone()), false)
+        .await
+        .expect("put addr1");
+    // Same partition, same hash, different context, WITH payload — the only
+    // reachable path for a second association to an existing hash in this
+    // implementation (see `dedup_same_partition_requires_payload` above).
+    s.clone()
+        .put(partition, addr2, frag, Some(payload), false)
+        .await
+        .expect("put addr2 (dedup within the same repository)");
+
+    let stats = s
+        .clone()
+        .repository_stats(partition)
+        .await
+        .expect("repository_stats");
+
+    assert_eq!(
+        stats.fragment_count, 1,
+        "the same hash under two contexts must count once, not twice"
+    );
+    assert_eq!(
+        stats.payload_bytes, 2048,
+        "bytes must not be double-counted for the deduped hash"
+    );
+    assert_eq!(
+        stats.content_bytes, 2048,
+        "bytes must not be double-counted for the deduped hash"
+    );
+}
+
+/// 12. Cross-repository isolation, alongside the intended global-dedup
+///     metering semantic (CR-016 requirement 3): a hash shared by two
+///     repositories is counted IN FULL for each one, so summing across
+///     repositories exceeds the bytes actually held in the bucket. That is
+///     the intended metering semantic, asserted here rather than treated as
+///     a bug.
+#[tokio::test]
+#[serial]
+async fn repository_stats_isolates_repositories_but_double_counts_a_shared_hash() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let s = make_store(&pg, &ep, &bucket, &region).await;
+
+    let partition_a: Partition = rand::random();
+    let partition_b: Partition = rand::random();
+    let (shared_frag, shared_payload) = make_fragment_and_payload(1024);
+    let addr_a: Address = rand::random();
+    let addr_b = Address {
+        hash: addr_a.hash,
+        context: rand::random(),
+    };
+
+    s.clone()
+        .put(
+            partition_a,
+            addr_a,
+            shared_frag,
+            Some(shared_payload.clone()),
+            false,
+        )
+        .await
+        .expect("put shared hash into repo A");
+    // Cross-partition, same hash, WITH payload — succeeds (idempotent
+    // re-upload to the same S3 key, plus a new association row scoped to
+    // repo B; see `dedup_cross_partition_no_payload_errors` for the
+    // no-payload counterpart that errors instead).
+    s.clone()
+        .put(
+            partition_b,
+            addr_b,
+            shared_frag,
+            Some(shared_payload),
+            false,
+        )
+        .await
+        .expect("put shared hash into repo B");
+
+    // A fragment unique to repo B, to prove it does not leak into repo A's numbers.
+    let extra_address: Address = rand::random();
+    put_fragment(s.clone(), partition_b, extra_address, 2048).await;
+
+    let stats_a = s
+        .clone()
+        .repository_stats(partition_a)
+        .await
+        .expect("repository_stats A");
+    let stats_b = s
+        .clone()
+        .repository_stats(partition_b)
+        .await
+        .expect("repository_stats B");
+
+    assert_eq!(
+        stats_a.fragment_count, 1,
+        "repo A must see only the hash it shares with repo B, not repo B's extra fragment"
+    );
+    assert_eq!(stats_a.payload_bytes, 1024);
+    assert_eq!(stats_a.content_bytes, 1024);
+
+    assert_eq!(
+        stats_b.fragment_count, 2,
+        "repo B must see the shared hash plus its own extra fragment"
+    );
+    assert_eq!(
+        stats_b.payload_bytes,
+        1024 + 2048,
+        "repo B's sum includes the shared hash in full, not half"
+    );
+    assert_eq!(stats_b.content_bytes, 1024 + 2048);
+}
+
+/// 13. Inner-join semantic: an association row (`lore_fragments`) with no
+///     matching `lore_fragment_metadata` row is excluded from the aggregate
+///     entirely — not just from the byte sums but from `fragment_count` too.
+///     The query's `JOIN … USING (hash)` (not a `LEFT JOIN`) drops the whole
+///     row rather than leaving a null-sized entry, so the three returned
+///     figures stay internally consistent (a `fragment_count` that doesn't
+///     match what its own sums account for would be worse than an
+///     under-count).
+#[tokio::test]
+#[serial]
+async fn repository_stats_excludes_an_association_with_no_metadata_row() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let s = make_store(&pg, &ep, &bucket, &region).await;
+
+    let partition: Partition = rand::random();
+    // A normal fragment, present in both tables.
+    let normal_address: Address = rand::random();
+    put_fragment(s.clone(), partition, normal_address, 1024).await;
+
+    // A second fragment, associated in `lore_fragments` but with its
+    // `lore_fragment_metadata` row removed out from under it.
+    let orphan_address: Address = rand::random();
+    put_fragment(s.clone(), partition, orphan_address, 2048).await;
+    delete_metadata_row(&pg, orphan_address.hash).await;
+
+    let stats = s
+        .clone()
+        .repository_stats(partition)
+        .await
+        .expect("repository_stats must not error on an orphaned association");
+
+    assert_eq!(
+        stats.fragment_count, 1,
+        "the orphaned association (no metadata row) must be excluded, not counted"
+    );
+    assert_eq!(
+        stats.payload_bytes, 1024,
+        "only the normal fragment's bytes may be summed"
+    );
+    assert_eq!(
+        stats.content_bytes, 1024,
+        "only the normal fragment's bytes may be summed"
     );
 }

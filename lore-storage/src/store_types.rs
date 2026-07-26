@@ -194,6 +194,27 @@ impl StoreMatchResult {
     }
 }
 
+/// Aggregate stored-fragment accounting for a single repository (partition),
+/// as reported by [`ImmutableStore::repository_stats`].
+///
+/// The figures cover the *distinct fragment hashes associated with the
+/// repository*. Under a global (content-addressed) dedup scope a fragment's
+/// bytes are stored once and may be referenced by several repositories, so
+/// these are the repository's *referenced* footprint: bytes shared with another
+/// repository are counted in full for each one, and summing across repositories
+/// exceeds the bytes physically held by the store.
+///
+/// [`ImmutableStore::repository_stats`]: crate::ImmutableStore::repository_stats
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct StoreRepositoryStats {
+    /// Number of distinct fragment hashes associated with the repository.
+    pub fragment_count: u64,
+    /// Sum of the stored (post-encoding) payload sizes of those fragments.
+    pub payload_bytes: u64,
+    /// Sum of the logical (pre-encoding) content sizes of the same fragments.
+    pub content_bytes: u64,
+}
+
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct StoreObliterateStats {

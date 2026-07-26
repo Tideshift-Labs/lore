@@ -772,6 +772,28 @@ mod tests {
 
         Ok(())
     }
+
+    /// `GrpcReplica` forwards every operation to a remote server over its own
+    /// wire protocol (`ReplicationClient`) and has no `repository_stats` RPC
+    /// on that protocol to forward through — it inherits the trait default.
+    /// A cell wired to forward through this replica therefore reports
+    /// `NotSupported` for storage-stats metering even when the store it
+    /// forwards to could compute the real number; this pins that as the
+    /// intended (if silent) behavior rather than an oversight. The mock
+    /// client needs no `.expect_*()` here — the default method never touches
+    /// `self.client`.
+    #[tokio::test]
+    async fn repository_stats_inherits_the_trait_default() {
+        let client = MockReplicationClientImpl::default();
+        let store = GrpcReplica::new(client);
+
+        let err = Arc::new(store)
+            .repository_stats(Partition::default())
+            .await
+            .expect_err("GrpcReplica has no repository_stats override");
+
+        assert!(matches!(err, StoreError::NotSupported(_)));
+    }
 }
 
 #[cfg(test)]

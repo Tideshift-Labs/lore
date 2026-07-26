@@ -50,15 +50,24 @@ use lore_storage::StoreError;
 use lore_storage::StoreMatch;
 use lore_storage::StoreObliterateStats;
 use lore_storage::StoreQueryResult;
+use lore_storage::StoreRepositoryStats;
 use lore_storage::errors::AddressNotFound;
 use lore_storage::errors::SlowDown;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
 
 /// Self-bootstrapping schema. The `(hash, repository, context)` primary key is
 /// the association identity; its B-tree also serves the leftmost-prefix
-/// existence reads (`hash`, `(hash, repository)`, full) and the by-hash refcount,
-/// so no secondary indexes are needed. Metadata is keyed by `hash` alone (global
-/// dedup). See [`crate::store::immutable_store`] for the design.
+/// existence reads (`hash`, `(hash, repository)`, full) and the by-hash refcount.
+/// The one secondary index inverts that leading column so a whole repository's
+/// fragment set is reachable without a sequential scan — the access path
+/// [`ImmutableStore::repository_stats`] needs. Metadata is keyed by `hash` alone
+/// (global dedup). See [`crate::store::immutable_store`] for the design.
+///
+/// This const is the runtime authority (applied by [`crate::pool::ensure_schema`]
+/// under an advisory lock at boot); `migrations/0001_init.sql` is the same schema
+/// as an out-of-band provisioning artifact. Keep the two in lockstep — an object
+/// added here but not there is silently missing from any cell provisioned from
+/// the migration file, and vice versa.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS lore_fragments (
     hash       bytea NOT NULL,
@@ -66,6 +75,7 @@ CREATE TABLE IF NOT EXISTS lore_fragments (
     context    bytea NOT NULL,
     PRIMARY KEY (hash, repository, context)
 );
+CREATE INDEX IF NOT EXISTS lore_fragments_repo_hash ON lore_fragments (repository, hash);
 CREATE TABLE IF NOT EXISTS lore_fragment_metadata (
     hash         bytea  NOT NULL PRIMARY KEY,
     flags        bigint NOT NULL,
@@ -870,5 +880,59 @@ impl ImmutableStore for PostgresImmutableStore {
 
     fn max_query_batch(&self) -> Option<usize> {
         None
+    }
+
+    #[tracing::instrument(level = "debug", skip_all)]
+    async fn repository_stats(
+        self: Arc<Self>,
+        partition: Partition,
+    ) -> Result<StoreRepositoryStats, StoreError> {
+        let _t = self
+            .instruments
+            .start("repository_stats", self.pool.status());
+        let repository: Context = partition.into();
+        let client = self.pool.get().await.map_err(pool_err)?;
+
+        // DISTINCT over the repository's hashes first (a fragment can be
+        // associated more than once under different contexts, and the sizes are
+        // per-hash), then join the per-hash size index. Both sides are index
+        // reads: `lore_fragments_repo_hash` for the inner set, the
+        // `lore_fragment_metadata` PK for the join.
+        //
+        // SUM() over bigint yields numeric in Postgres, which has no
+        // tokio-postgres FromSql for our types — cast back to bigint. Sizes are
+        // byte counts, so the i64 ceiling is ~9 EB and unreachable here.
+        //
+        // The join is inner on purpose: an association whose metadata row is
+        // absent has no size to account for, so it is excluded from the count as
+        // well as from the sums, keeping the three figures consistent with each
+        // other.
+        let row = client
+            .query_one(
+                "SELECT COUNT(*)::bigint AS fragment_count, \
+                        COALESCE(SUM(m.size_payload), 0)::bigint AS payload_bytes, \
+                        COALESCE(SUM(m.size_content), 0)::bigint AS content_bytes \
+                 FROM (SELECT DISTINCT hash FROM lore_fragments WHERE repository = $1) f \
+                 JOIN lore_fragment_metadata m USING (hash)",
+                &[&repository.data().as_slice()],
+            )
+            .await
+            .map_err(db_err)?;
+
+        // `try_get` rather than `get`: the latter panics on a column or type
+        // mismatch, and a panic is not an error path this crate is allowed to
+        // take. The `.max(0)` clamp is belt and braces — a COUNT and a SUM over
+        // non-negative bigints cannot go negative, but an `as u64` on a negative
+        // i64 would wrap to a colossal byte figure rather than fail.
+        let read = |column: &str| -> Result<u64, StoreError> {
+            let value: i64 = row.try_get(column).map_err(db_err)?;
+            Ok(value.max(0) as u64)
+        };
+
+        Ok(StoreRepositoryStats {
+            fragment_count: read("fragment_count")?,
+            payload_bytes: read("payload_bytes")?,
+            content_bytes: read("content_bytes")?,
+        })
     }
 }

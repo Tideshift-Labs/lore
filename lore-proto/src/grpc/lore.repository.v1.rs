@@ -262,6 +262,56 @@ impl ::prost::Name for RepositoryMetadataSetResponse {
         "/lore.repository.v1.RepositoryMetadataSetResponse".into()
     }
 }
+/// Request for the aggregate stored-fragment accounting of one repository.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryStorageStatsRequest {
+    /// Repository id.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for RepositoryStorageStatsRequest {
+    const NAME: &'static str = "RepositoryStorageStatsRequest";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.RepositoryStorageStatsRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.RepositoryStorageStatsRequest".into()
+    }
+}
+/// Aggregate accounting over the distinct fragment hashes associated with the
+/// repository, summed from the store's own fragment metadata index. An unknown
+/// repository is not an error: it has no associations, so every field is zero.
+///
+/// Dedup semantics: under the default global (content-addressed) dedup scope a
+/// fragment's bytes are stored once and may be referenced by several
+/// repositories. These figures are the repository's *referenced* footprint —
+/// shared bytes are counted in full for every referencing repository, so summing
+/// across repositories exceeds the bytes physically held in the object store.
+/// That is the intended metering semantic, not a bug.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryStorageStatsResponse {
+    /// Distinct fragment hashes associated with the repository.
+    #[prost(uint64, tag = "1")]
+    pub fragment_count: u64,
+    /// Sum of the stored (post-encoding) payload sizes of those fragments — the
+    /// figure that tracks bytes paid for in object storage.
+    #[prost(uint64, tag = "2")]
+    pub payload_bytes: u64,
+    /// Sum of the logical (pre-encoding) content sizes of the same fragments.
+    #[prost(uint64, tag = "3")]
+    pub content_bytes: u64,
+}
+impl ::prost::Name for RepositoryStorageStatsResponse {
+    const NAME: &'static str = "RepositoryStorageStatsResponse";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.RepositoryStorageStatsResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.RepositoryStorageStatsResponse".into()
+    }
+}
 /// Generated client implementations.
 pub mod repository_service_client {
     #![allow(
@@ -544,6 +594,46 @@ pub mod repository_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Aggregate stored-fragment accounting for one repository. Read-only.
+        /// Backend-dependent: returns UNIMPLEMENTED on a store with no
+        /// repository-keyed access path over its fragment index.
+        ///
+        /// FORK-LOCAL (Tideshift, CR-016). Additive: new RPC, new request/response
+        /// messages, no existing field number or RPC touched. Nothing upstream claims
+        /// these names today, so `git merge upstream/main` will not conflict on tags —
+        /// but if upstream ever adds its own storage-accounting RPC here, this is the
+        /// hunk to reconcile, and the on-the-wire method path
+        /// `/lore.repository.v1.RepositoryService/RepositoryStorageStats` is what
+        /// Lorehub's client is pinned to.
+        pub async fn repository_storage_stats(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RepositoryStorageStatsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryStorageStatsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.repository.v1.RepositoryService/RepositoryStorageStats",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.RepositoryService",
+                        "RepositoryStorageStats",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -617,6 +707,24 @@ pub mod repository_service_server {
             request: tonic::Request<super::RepositoryMetadataSetRequest>,
         ) -> std::result::Result<
             tonic::Response<super::RepositoryMetadataSetResponse>,
+            tonic::Status,
+        >;
+        /// Aggregate stored-fragment accounting for one repository. Read-only.
+        /// Backend-dependent: returns UNIMPLEMENTED on a store with no
+        /// repository-keyed access path over its fragment index.
+        ///
+        /// FORK-LOCAL (Tideshift, CR-016). Additive: new RPC, new request/response
+        /// messages, no existing field number or RPC touched. Nothing upstream claims
+        /// these names today, so `git merge upstream/main` will not conflict on tags —
+        /// but if upstream ever adds its own storage-accounting RPC here, this is the
+        /// hunk to reconcile, and the on-the-wire method path
+        /// `/lore.repository.v1.RepositoryService/RepositoryStorageStats` is what
+        /// Lorehub's client is pinned to.
+        async fn repository_storage_stats(
+            &self,
+            request: tonic::Request<super::RepositoryStorageStatsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryStorageStatsResponse>,
             tonic::Status,
         >;
     }
@@ -969,6 +1077,55 @@ pub mod repository_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RepositoryMetadataSetSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.repository.v1.RepositoryService/RepositoryStorageStats" => {
+                    #[allow(non_camel_case_types)]
+                    struct RepositoryStorageStatsSvc<T: RepositoryService>(pub Arc<T>);
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::UnaryService<super::RepositoryStorageStatsRequest>
+                    for RepositoryStorageStatsSvc<T> {
+                        type Response = super::RepositoryStorageStatsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RepositoryStorageStatsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RepositoryService>::repository_storage_stats(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RepositoryStorageStatsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
