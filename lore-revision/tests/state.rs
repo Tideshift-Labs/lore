@@ -4,24 +4,44 @@
 mod tests {
     #![allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
 
+    use std::collections::BTreeSet;
     use std::sync::Arc;
+    use std::sync::RwLock;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use lore_base::error::NoRemote;
+    use lore_base::error::SlowDown;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
     use lore_base::types::CloneHeapAlloc;
     use lore_base::types::Context;
+    use lore_base::types::Fragment;
+    use lore_base::types::FragmentFlags;
+    use lore_base::types::FragmentReference;
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
     use lore_base::types::ZeroHeapAlloc;
+    use lore_revision::immutable;
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryFormat;
+    use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::state::NodeSource;
     use lore_revision::state::State;
     use lore_revision::state::StateData;
     use lore_revision::state::collect_new_fragments;
     use lore_revision::state::determine_node_source;
+    use lore_storage::ImmutableStore;
+    use lore_storage::StoreError;
+    use lore_storage::StoreMatch;
+    use lore_storage::StoreObliterateStats;
+    use lore_storage::StoreQueryResult;
     use lore_storage::hash::hash_string;
+    use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use lore_storage::local::immutable_store::LocalImmutableStore;
     use lore_transport::ProtocolError;
     use zerocopy::IntoBytes;
@@ -206,6 +226,641 @@ mod tests {
             }))
             .await
             .expect("Test task failed");
+    }
+
+    /// Wraps a real, in-memory [`LocalImmutableStore`] and lets a test inject a
+    /// configured failure into `query()` and/or `get()` — the two calls
+    /// `collect_new_addresses` (`lore_revision::state`) makes while walking
+    /// fragments. Everything not configured to fail delegates straight through
+    /// to the real store, so state construction (`node_add`/`serialize`/
+    /// `deserialize`) behaves exactly as it would against the real thing; only
+    /// the specific calls a test arms are affected.
+    ///
+    /// All fault switches default to "off" (pure delegation) so a test can
+    /// build its fixture states first and arm the fault only once they're
+    /// ready to exercise `collect_new_fragments`.
+    struct FaultInjectingStore {
+        inner: Arc<LocalImmutableStore>,
+        slow_down_all_queries: AtomicBool,
+        generic_fail_all_queries: AtomicBool,
+        slow_down_query_addresses: RwLock<BTreeSet<Address>>,
+    }
+
+    impl FaultInjectingStore {
+        fn wrapping(inner: Arc<LocalImmutableStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                slow_down_all_queries: AtomicBool::new(false),
+                generic_fail_all_queries: AtomicBool::new(false),
+                slow_down_query_addresses: RwLock::new(BTreeSet::new()),
+            })
+        }
+
+        /// Every subsequent `query()` call returns `StoreError::SlowDown`.
+        fn arm_slow_down_all_queries(&self) {
+            self.slow_down_all_queries.store(true, Ordering::SeqCst);
+        }
+
+        /// Every subsequent `query()` call returns a generic (non-`SlowDown`)
+        /// `StoreError`, simulating an ordinary store failure.
+        fn arm_generic_fail_all_queries(&self) {
+            self.generic_fail_all_queries.store(true, Ordering::SeqCst);
+        }
+
+        /// `query()` calls for this specific address return `StoreError::SlowDown`;
+        /// every other address delegates normally.
+        fn arm_slow_down_query_for(&self, address: Address) {
+            self.slow_down_query_addresses
+                .write()
+                .unwrap()
+                .insert(address);
+        }
+    }
+
+    #[async_trait]
+    impl ImmutableStore for FaultInjectingStore {
+        async fn exist(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            match_requested: StoreMatch,
+        ) -> Result<StoreMatch, StoreError> {
+            self.inner
+                .clone()
+                .exist(partition, address, match_requested)
+                .await
+        }
+
+        async fn exist_batch(
+            self: Arc<Self>,
+            partition: Partition,
+            addresses: &[Address],
+            match_requested: StoreMatch,
+        ) -> Result<Vec<StoreMatch>, StoreError> {
+            self.inner
+                .clone()
+                .exist_batch(partition, addresses, match_requested)
+                .await
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            match_requested: StoreMatch,
+        ) -> Result<StoreQueryResult, StoreError> {
+            if self.slow_down_all_queries.load(Ordering::SeqCst)
+                || self
+                    .slow_down_query_addresses
+                    .read()
+                    .unwrap()
+                    .contains(&address)
+            {
+                return Err(StoreError::from(SlowDown));
+            }
+            if self.generic_fail_all_queries.load(Ordering::SeqCst) {
+                return Err(StoreError::internal(
+                    "Simulated generic store failure (not SlowDown)",
+                ));
+            }
+            self.inner
+                .clone()
+                .query(partition, address, match_requested)
+                .await
+        }
+
+        async fn get(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            match_required: StoreMatch,
+        ) -> Result<(Fragment, Bytes), StoreError> {
+            self.inner
+                .clone()
+                .get(partition, address, match_required)
+                .await
+        }
+
+        async fn put(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            fragment: Fragment,
+            payload: Option<Bytes>,
+            force: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .put(partition, address, fragment, payload, force)
+                .await
+        }
+
+        async fn obliterate(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            stats: Arc<StoreObliterateStats>,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .obliterate(partition, address, stats)
+                .await
+        }
+
+        async fn evict(
+            self: Arc<Self>,
+            max_capacity: usize,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<usize, StoreError> {
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
+        }
+
+        async fn compact(
+            self: Arc<Self>,
+            max_size: usize,
+            at: Option<usize>,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<Option<usize>, StoreError> {
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
+        }
+
+        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().compact_resume_at().await
+        }
+
+        async fn compact_stop(self: Arc<Self>) {
+            self.inner.clone().compact_stop().await
+        }
+
+        fn max_query_batch(&self) -> Option<usize> {
+            self.inner.max_query_batch()
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+
+        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
+            self.inner.clone().verify(heal).await
+        }
+    }
+
+    /// Builds a two-node-block diff (`state_from` has `test-node`, `state_to`
+    /// additionally has `other-test-node`) against a [`FaultInjectingStore`],
+    /// runs `body` with the fully-built repository/states/store once
+    /// construction has completed normally, and returns whatever `body`
+    /// returns. Mirrors the fixture shape of `collect_new_name_fragments`
+    /// above, factored out so each fault-injection test only has to describe
+    /// which call it arms and what it expects.
+    async fn with_slow_down_fixture<F, Fut, T>(body: F) -> T
+    where
+        F: FnOnce(Arc<RepositoryContext>, Arc<State>, Arc<State>, Arc<FaultInjectingStore>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = T> + Send,
+        T: Send + 'static,
+    {
+        // `lore_storage::read::read_raw` retries a `SlowDown` internally
+        // (default: up to 60 attempts, backoff capped at 10s) before giving
+        // up — the patient client policy, sized for a real overloaded
+        // server. A test that deliberately keeps a fault armed would
+        // otherwise wait for that full exhaustion (minutes) before observing
+        // the propagated error. Pin it to the fast policy `lore-server`
+        // itself assumes in tests (`lore-server/src/lib.rs`'s
+        // `init_test_policies`), scoped to this test binary via the shared
+        // `OnceLock` (first setter in the process wins; harmless to the
+        // other, non-fault-injecting tests in this file).
+        let _ = lore_storage::STORE_RETRY_ATTEMPTS.set(1);
+
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = Context::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+
+                let real_store = LocalImmutableStore::new(None, ImmutableStoreSettings::default())
+                    .await
+                    .expect("Failed to create store");
+                let fault_store = FaultInjectingStore::wrapping(real_store);
+
+                let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        Some(path.clone()),
+                        fault_store.clone(),
+                        mutable_store.clone(),
+                        repository_id.into(),
+                        lore_revision::instance::InstanceId::default(),
+                        Err(ProtocolError::from(NoRemote)),
+                        Arc::default(),
+                        RepositoryFormat::Lore,
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let state_from = Arc::new(State::new());
+                let name = "test-node";
+                let node = Node {
+                    name_hash: hash_string(name),
+                    ..Default::default()
+                };
+                state_from
+                    .node_add(repository.clone(), ROOT_NODE, node, name)
+                    .await
+                    .expect("Failed to add node");
+                let signature_from = state_from
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize from state");
+                let state_to = State::deserialize(repository.clone(), signature_from)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                let other_name = "other-test-node";
+                let other_node = Node {
+                    name_hash: hash_string(other_name),
+                    ..Default::default()
+                };
+                state_to
+                    .node_add(repository.clone(), ROOT_NODE, other_node, other_name)
+                    .await
+                    .expect("Failed to add node");
+                let signature_to = state_to
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+                let state_to = State::deserialize(repository.clone(), signature_to)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                // Fixture is fully built against a store behaving normally;
+                // only now does the caller arm whichever fault it wants to
+                // observe.
+                body(repository, state_from, state_to, fault_store).await
+            }))
+            .await
+            .expect("Test task failed")
+    }
+
+    #[tokio::test]
+    async fn collect_new_fragments_propagates_slow_down_from_query() {
+        with_slow_down_fixture(|repository, state_from, state_to, fault_store| async move {
+            fault_store.arm_slow_down_all_queries();
+
+            let result = collect_new_fragments(repository, state_from, state_to, true).await;
+
+            let err = result.expect_err(
+                "Expected collect_new_fragments to propagate a SlowDown rather than \
+                 silently treat every fragment as new",
+            );
+            assert!(
+                err.is_slow_down(),
+                "Expected StateError::SlowDown, got: {err:?}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn collect_new_fragments_keeps_conservative_fallback_for_non_slow_down_query_error() {
+        with_slow_down_fixture(|repository, state_from, state_to, fault_store| async move {
+            // Compute the name-table address the same way
+            // `collect_new_name_fragments` does, before arming the fault, so we
+            // can assert the specific address the conservative fallback must
+            // still report as new.
+            let name_fragment = state_to
+                .block(repository.clone(), 0)
+                .await
+                .expect("Failed to access node block")
+                .read()
+                .raw()
+                .name_table;
+            let name_address = Address::zero_context_hash(name_fragment);
+
+            fault_store.arm_generic_fail_all_queries();
+
+            let fragments = collect_new_fragments(repository, state_from, state_to, true)
+                .await
+                .expect(
+                    "A non-SlowDown query error must not fail collect_new_fragments \
+                     (the pre-existing conservative fallback must be preserved)",
+                );
+
+            assert!(
+                fragments.contains(&name_address),
+                "A fragment whose query() failed with a non-SlowDown error must \
+                 still be reported as new (fail-safe, over-report path)"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn genuinely_absent_fragment_is_reported_new_without_hitting_error_path() {
+        // Pins the assumption the SlowDown-narrowing relies on: `find()`
+        // (lore-storage/src/local/immutable_store.rs) returns `Ok` with
+        // `StoreMatch::MatchNone` for a hash it has never seen — genuine
+        // absence is not an error at all, so it can never reach either the
+        // `SlowDown` branch or the conservative-fallback branch added by this
+        // change. Uses the real store directly (no fault injection) since the
+        // behavior under test is the store's, not `collect_new_addresses`'s.
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = Context::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+
+                let real_store = LocalImmutableStore::new(None, ImmutableStoreSettings::default())
+                    .await
+                    .expect("Failed to create store");
+
+                let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        Some(path.clone()),
+                        real_store,
+                        mutable_store.clone(),
+                        repository_id.into(),
+                        lore_revision::instance::InstanceId::default(),
+                        Err(ProtocolError::from(NoRemote)),
+                        Arc::default(),
+                        RepositoryFormat::Lore,
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let state_from = Arc::new(State::new());
+                let signature_from = state_from
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize from state");
+                let state_to = State::deserialize(repository.clone(), signature_from)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                // A node whose backing fragment was never written anywhere:
+                // `query()` for it must come back `Ok(MatchNone)`, not an error.
+                let name = "brand-new-never-stored-node";
+                let node = Node {
+                    name_hash: hash_string(name),
+                    ..Default::default()
+                };
+                state_to
+                    .node_add(repository.clone(), ROOT_NODE, node, name)
+                    .await
+                    .expect("Failed to add node");
+                let signature_to = state_to
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+                let state_to = State::deserialize(repository.clone(), signature_to)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                let fragments = collect_new_fragments(repository, state_from, state_to, true)
+                    .await
+                    .expect(
+                        "Genuine absence must not surface as an error from \
+                             collect_new_fragments",
+                    );
+
+                assert!(
+                    !fragments.is_empty(),
+                    "A node added only in state_to must yield at least one new \
+                     fragment when its backing content was never stored"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Stores two raw chunks plus a `PayloadFragmented` fragment-reference list
+    /// pointing at them, returning `(root_address, chunk_two_address)`. Mirrors
+    /// `store_as_legacy_chunks` in the `is_file_modified_chunking_compat` module
+    /// below, but returns the second chunk's address too so a test can target
+    /// it specifically for fault injection.
+    async fn store_two_chunk_fragmented_payload(
+        repository: &Arc<RepositoryContext>,
+        context: Context,
+    ) -> (Address, Address, u64) {
+        let chunk_one: &[u8] = b"first-chunk-of-a-fragmented-payload------------";
+        let chunk_two: &[u8] = b"second-chunk-of-a-fragmented-payload-----------";
+
+        let mut refs = Vec::with_capacity(2);
+        let mut offset: u64 = 0;
+        let mut chunk_two_address = Address::default();
+        for (index, chunk) in [chunk_one, chunk_two].into_iter().enumerate() {
+            let chunk_bytes = Bytes::copy_from_slice(chunk);
+            let hash = Hash::hash_buffer(chunk);
+            let address = Address { hash, context };
+            let fragment = Fragment {
+                flags: FragmentFlags::PayloadStoredLocal.bits(),
+                size_payload: chunk.len() as u32,
+                size_content: chunk.len() as u64,
+            };
+            immutable::store_raw(
+                repository.clone(),
+                address,
+                fragment,
+                chunk_bytes,
+                true,
+                false,
+            )
+            .await
+            .expect("Failed to store chunk fragment");
+
+            if index == 1 {
+                chunk_two_address = address;
+            }
+
+            refs.push(FragmentReference {
+                hash,
+                offset_content: offset,
+            });
+            offset += chunk.len() as u64;
+        }
+
+        let content_size = offset;
+        let list_bytes: Vec<u8> = refs.as_slice().as_bytes().to_vec();
+        let list_bytes = Bytes::from(list_bytes);
+        let list_hash = Hash::hash_buffer(list_bytes.as_ref());
+
+        let root_address = Address {
+            hash: list_hash,
+            context,
+        };
+        let list_fragment = Fragment {
+            flags: FragmentFlags::PayloadStoredLocal.bits()
+                | FragmentFlags::PayloadFragmented.bits(),
+            size_payload: list_bytes.len() as u32,
+            size_content: content_size,
+        };
+        immutable::store_raw(
+            repository.clone(),
+            root_address,
+            list_fragment,
+            list_bytes,
+            true,
+            false,
+        )
+        .await
+        .expect("Failed to store fragment list");
+
+        (root_address, chunk_two_address, content_size)
+    }
+
+    /// Builds `state_to` with a single new file node whose content is a
+    /// two-chunk fragmented payload (`state_from` is an empty root), runs
+    /// `body` once construction has completed normally against a
+    /// [`FaultInjectingStore`], and returns whatever `body` returns.
+    async fn with_fragmented_file_fixture<F, Fut, T>(body: F) -> T
+    where
+        F: FnOnce(
+                Arc<RepositoryContext>,
+                Arc<State>,
+                Arc<State>,
+                Arc<FaultInjectingStore>,
+                Address,
+                Address,
+            ) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = T> + Send,
+        T: Send + 'static,
+    {
+        // See `with_slow_down_fixture` above: pin the fast retry policy so a
+        // fault stays cheap to observe.
+        let _ = lore_storage::STORE_RETRY_ATTEMPTS.set(1);
+
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = Context::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+
+                let real_store = LocalImmutableStore::new(None, ImmutableStoreSettings::default())
+                    .await
+                    .expect("Failed to create store");
+                let fault_store = FaultInjectingStore::wrapping(real_store);
+
+                let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        Some(path.clone()),
+                        fault_store.clone(),
+                        mutable_store.clone(),
+                        repository_id.into(),
+                        lore_revision::instance::InstanceId::default(),
+                        Err(ProtocolError::from(NoRemote)),
+                        Arc::default(),
+                        RepositoryFormat::Lore,
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let state_from = Arc::new(State::new());
+                let signature_from = state_from
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize from state");
+                let state_to = State::deserialize(repository.clone(), signature_from)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                let content_context: Context = rand::random();
+                let (root_address, chunk_two_address, content_size) =
+                    store_two_chunk_fragmented_payload(&repository, content_context).await;
+
+                let name = "fragmented-file.bin";
+                let file_node = Node {
+                    flags: NodeFlags::File.bits(),
+                    size: content_size,
+                    address: root_address,
+                    name_hash: hash_string(name),
+                    ..Default::default()
+                };
+                state_to
+                    .node_add(repository.clone(), ROOT_NODE, file_node, name)
+                    .await
+                    .expect("Failed to add file node");
+                let signature_to = state_to
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+                let state_to = State::deserialize(repository.clone(), signature_to)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                body(
+                    repository,
+                    state_from,
+                    state_to,
+                    fault_store,
+                    root_address,
+                    chunk_two_address,
+                )
+                .await
+            }))
+            .await
+            .expect("Test task failed")
+    }
+
+    // NOTE on swallow #2 (a SlowDown while loading a fragmented payload's own
+    // content, i.e. `immutable::load_raw`'s `Err(ImmutableError::SlowDown(_))`
+    // arm): this file does not carry a dedicated test for it, and the omission
+    // is deliberate — see the "swallow #2 blocked" note in the test-specialist
+    // report for why a local-only fixture cannot reach it (a `get()` SlowDown
+    // gets superseded by `lore_storage::read::load_fragment`'s remote fallback,
+    // which is enabled by default and — with this fixture's `Err(NoRemote)`
+    // repository — resolves to a `NoRemote`-shaped error before
+    // `collect_new_addresses` ever sees the original `SlowDown`). Swallow #3
+    // below (a child fragment's own `query()`, called directly with no
+    // fallback layer in between) exercises the same idiom without that
+    // obstruction.
+
+    #[tokio::test]
+    async fn collect_new_fragments_propagates_slow_down_from_fragmented_payload_child() {
+        // Swallow #3: a SlowDown while recursing into one of a fragmented
+        // payload's children must propagate rather than silently dropping
+        // that (and every sibling) child from the result.
+        with_fragmented_file_fixture(
+            |repository, state_from, state_to, fault_store, _root_address, chunk_two_address| async move {
+                fault_store.arm_slow_down_query_for(chunk_two_address);
+
+                let result =
+                    collect_new_fragments(repository, state_from, state_to, true).await;
+
+                let err = result.expect_err(
+                    "Expected collect_new_fragments to propagate a SlowDown hit on a \
+                     fragmented payload's child fragment",
+                );
+                assert!(
+                    err.is_slow_down(),
+                    "Expected StateError::SlowDown, got: {err:?}"
+                );
+            },
+        )
+        .await;
     }
 
     /// Helper to create a Node with specific flags for testing

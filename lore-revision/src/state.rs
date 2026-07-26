@@ -75,6 +75,7 @@ use crate::state::diff::NodeSearchResult;
 use crate::state::diff::get_filtered_node_and_path;
 use crate::state::diff::get_node_and_path;
 use crate::store::KeyType;
+use crate::store::StoreError;
 use crate::store::StoreMatch;
 use crate::util;
 use crate::util::path::RelativePath;
@@ -7572,6 +7573,23 @@ async fn collect_new_node_metadata_fragments(
     Ok(addresses)
 }
 
+/// Collects the addresses among `addresses` that are not already stored,
+/// descending into fragmented payloads.
+///
+/// An overloaded store tells us nothing about an address, so a `SlowDown` is
+/// reported rather than absorbed. Absorbing it would either inflate the result
+/// with addresses that merely look new — adding load to a tier already shedding
+/// it — or, worse, omit a fragmented payload's children from the set the caller
+/// goes on to transfer or verify, which on the push path means those children
+/// are never existence-checked at all. Every concurrent task is hitting the same
+/// condition, so the useful answer to the caller is "back off", not a quietly
+/// incomplete set.
+///
+/// Failures that are not overload keep the long-standing conservative behavior:
+/// an unreadable address is reported as new, and an unreadable subtree is
+/// skipped. That narrows this to the one condition a caller can act on.
+/// `StoreError::Maintenance` is deliberately not included — it is back-off
+/// shaped, but it is not what the storage tier raises under load.
 async fn collect_new_addresses(
     repository: Arc<RepositoryContext>,
     addresses: &[Address],
@@ -7590,61 +7608,77 @@ async fn collect_new_addresses(
         let repository = repository.clone();
         lore_spawn!(task, {
             async move {
-                if let Ok(query) = repository
+                let query = match repository
                     .immutable_store()
                     .query(repository.id, address, StoreMatch::MatchFull)
                     .await
                 {
-                    let mut addresses = vec![];
-                    if query.fragment.flags & FragmentFlags::PayloadFragmented != 0
-                        && let Ok((_fragment, buffer)) = immutable::load_raw(
-                            repository.clone(),
-                            address,
-                            immutable::read_options_from_repository(&repository),
-                        )
-                        .await
-                    {
-                        let buffer = buffer.to_aligned::<FragmentReference>();
-                        let mut subaddress =
-                            Vec::with_capacity(buffer.count::<FragmentReference>());
-                        for reference in buffer.as_type_slice::<FragmentReference>().iter() {
-                            subaddress.push(Address {
-                                context: address.context,
-                                hash: reference.hash,
-                            });
-                        }
-                        if let Ok(mut subaddress) = collect_new_addresses_recurse(
-                            repository.clone(),
-                            subaddress.as_slice(),
-                            ignore_durably_stored,
-                        )
-                        .await
-                        {
-                            addresses.append(&mut subaddress);
-                        }
+                    Ok(query) => query,
+                    Err(StoreError::SlowDown(traced)) => {
+                        return Err(StateError::SlowDown(traced));
                     }
+                    Err(_) => return Ok(Some(vec![address])),
+                };
 
-                    if !ignore_durably_stored
-                        || query.match_made != StoreMatch::MatchFull
-                        || (query.fragment.flags & FragmentFlags::PayloadStoredDurable) == 0
+                let mut addresses = vec![];
+                if query.fragment.flags & FragmentFlags::PayloadFragmented != 0 {
+                    match immutable::load_raw(
+                        repository.clone(),
+                        address,
+                        immutable::read_options_from_repository(&repository),
+                    )
+                    .await
                     {
-                        addresses.push(address);
-                    }
+                        Ok((_fragment, buffer)) => {
+                            let buffer = buffer.to_aligned::<FragmentReference>();
+                            let mut subaddress =
+                                Vec::with_capacity(buffer.count::<FragmentReference>());
+                            for reference in buffer.as_type_slice::<FragmentReference>().iter() {
+                                subaddress.push(Address {
+                                    context: address.context,
+                                    hash: reference.hash,
+                                });
+                            }
 
-                    if !addresses.is_empty() {
-                        Some(addresses)
-                    } else {
-                        None
+                            match collect_new_addresses_recurse(
+                                repository.clone(),
+                                subaddress.as_slice(),
+                                ignore_durably_stored,
+                            )
+                            .await
+                            {
+                                Ok(mut subaddress) => addresses.append(&mut subaddress),
+                                Err(StateError::SlowDown(traced)) => {
+                                    return Err(StateError::SlowDown(traced));
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                        Err(ImmutableError::SlowDown(traced)) => {
+                            return Err(StateError::SlowDown(traced));
+                        }
+                        Err(_) => {}
                     }
+                }
+
+                if !ignore_durably_stored
+                    || query.match_made != StoreMatch::MatchFull
+                    || (query.fragment.flags & FragmentFlags::PayloadStoredDurable) == 0
+                {
+                    addresses.push(address);
+                }
+
+                if !addresses.is_empty() {
+                    Ok(Some(addresses))
                 } else {
-                    Some(vec![address])
+                    Ok(None)
                 }
             }
         });
 
         while task.len() > MAX_TASKS {
             if let Some(result) = task.join_next().await
-                && let Some(mut address) = result.internal("Task failure")?
+                && let Some(mut address) = result.internal("Task failure")??
             {
                 new_addresses.append(&mut address);
             }
@@ -7652,7 +7686,7 @@ async fn collect_new_addresses(
     }
 
     while let Some(result) = task.join_next().await {
-        if let Some(mut address) = result.internal("Task failure")? {
+        if let Some(mut address) = result.internal("Task failure")?? {
             new_addresses.append(&mut address);
         }
     }
