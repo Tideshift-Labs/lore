@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 008 | 2026-07-25 | [Configurable AWS client retry (CR-021 Part 2a)](008-configurable-aws-client-retry-cr021-part2a.md) |
 | 007 | 2026-07-25 | [Throttle honesty in `load_metadata` (CR-021 Part 1)](007-throttle-honesty-load-metadata-cr021-part1.md) |
 | 006 | 2026-07-23 | [Provider-neutral authentication refresh (CR-020)](006-provider-neutral-authentication-refresh-cr020.md) |
 | 005 | 2026-07-08 | [Bounded retry on the lorehub_notify post-commit hook (WP-066 Chunk 2)](005-lorehub-notify-bounded-retry-wp066.md) |
