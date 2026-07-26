@@ -473,6 +473,56 @@ the next run starts from the map instead of rediscovering it.
   The per-file field is verified with a real value; the aggregate asserts only `Some(0)`/`Some(_)` at
   the unit tier — see the tree-root aggregation gotcha below. Regenerating the proto bindings needs
   `protoc` on `PATH` (or `PROTOC=`); the crate otherwise builds off the committed `src/grpc/*.rs`.
+- **CR-021 Part 1 (DynamoDB throttle/error-classification honesty, [SERVER])** —
+  `lore-aws/src/aws_error.rs` (new `is_retryable_sdk_error<E: ProvideErrorMetadata>(&SdkError<E,
+  HttpResponse>) -> bool`, `RETRYABLE_STATUS_CODES` explicit allow-list, `is_throttle_code`) and
+  `lore-aws/src/store/immutable_store.rs` (`metadata_load_error`, `do_query`'s `SlowDown`
+  passthrough). Fixes a metadata-load throttle previously misclassified as `AddressNotFound`
+  (masking a capacity problem as missing content, defeating `lore-revision/src/branch/push.rs`'s
+  10-attempt retry-on-`SlowDown` schedule). Coverage: `cargo test -p lore-aws --lib -- aws_error::`
+  (13 tests, direct `SdkError` construction, no store/mock needed) plus
+  `cargo test -p lore-aws --lib -- store::immutable_store::test::test_load_metadata` /
+  `test_query_metadata_load_slow_down_passes_through` /
+  `test_metadata_load_error_non_sdk_error_is_internal` (store-level, mocked `MockDynamoDb`).
+  - **`RETRYABLE_STATUS_CODES` is an explicit allow-list (`[429, 500, 502, 503, 504]`), not
+    `status.is_server_error()`** — a permanent 5xx (501, 505) will never succeed on retry, and
+    `push.rs`'s 10-attempt backoff means misclassifying one costs ~30-60s of pointless stalling
+    before it's finally reported. Pair any "5xx is retryable" test with a sibling asserting a code
+    **outside** the list (501 is the natural choice) is not — that's the actual regression this
+    shape guards against. See `aws_error::tests::service_error_status_501_is_not_retryable`.
+  - **`is_throttle_code` strips a leading Smithy shape-id namespace** before matching
+    (`com.amazonaws.dynamodb#ThrottlingException` matches the same as bare `ThrottlingException`)
+    — needed because this fork's deployment target (DigitalOcean Spaces, S3-compatible but
+    non-AWS) may report the qualified form where AWS itself reports the bare name. Cover both
+    spellings, not just AWS's bare one.
+  - **`SdkError::ResponseError => true` is unconditional by design**, even at a 2xx status — a body
+    truncated mid-transfer arrives with a successful status, and the SDK's own
+    `TransientErrorClassifier` treats `is_response_error()` as transient regardless of status.
+    Don't "fix" a test that asserts this at status 200; that's intended, not a bug.
+  - **Real DynamoDB throttle responses arrive as HTTP 400** with the code identifying the exception
+    (not HTTP 429) — pair a coded-error test with status `400u16` so it actually exercises the
+    code-based classifier rather than accidentally passing via the 429/5xx status shortcut.
+  - **Two distinct `Ok`-path absence routes both still yield `AddressNotFound`** (only the `Err`
+    path changed by this delta): `item: None` (genuinely missing) vs. `item:
+    Some(shape-that-doesn't-deserialize)` (present but malformed — e.g. missing the required `hash`
+    field; `serde_dynamo::from_item(HashMap::new())` forces this branch without hand-crafting a
+    type-mismatched `AttributeValue`). Cover both — easy to conflate into one test.
+  - **`load_metadata` takes `(repository: Context, hash: Hash)` on this fork, not upstream's
+    `(hash)`** — `tideshift/main`'s own `DedupScope`/per-repository metadata partitioning,
+    unrelated to this CR. A CR branch based on upstream `main` merges with `E0061` at every direct
+    `store.load_metadata(hash)` call; fix by adding `random::<Context>()` (or the repository under
+    test) as the first arg, matching the established `test_load_metadata_sdk_timeout_returns_slow_down`
+    pattern. Under the default `initialize_immutable_store` (`DedupScope::Global`),
+    `metadata_repository()` returns `None`, so `FragmentMetadataEntry::new(hash)` (no
+    `.with_repository(...)`) still serializes identically for a `MockDynamoDb` `.with(eq(av_map),
+    ..)` expectation — no need to thread the repository into the mock's key construction unless
+    the test is specifically about `DedupScope::Partition` (`initialize_immutable_store_scoped` /
+    `initialize_immutable_store_with_resolver`).
+  - Rewrote the upstream-authored `test_load_metadata_sdk_service_error_returns_address_not_found`
+    (renamed `test_load_metadata_non_throttle_service_error_is_internal`) — it pinned the pre-fix
+    bug (`ResourceNotFoundException`, a missing *table*, mapped to `AddressNotFound`); now asserts
+    `is_internal()`. Flag this rewrite explicitly in the eventual upstream PR description — it's a
+    visible behavior change to a test Epic wrote, not just new coverage.
 
 ---
 
@@ -644,3 +694,12 @@ the next run starts from the map instead of rediscovering it.
   scope the real gate to `-- hooks::lorehub_notify` (unaffected, always green) rather
   than treating the whole `hooks` module run as the pass/fail signal for a delta that
   doesn't touch `dispatch.rs`.
+- **AWS SDK exception builders don't populate `.code()` unless `.meta()` is set explicitly.**
+  Symptom: a service-error test built via `SomeException::builder().build()` doesn't exercise
+  error-**code**-based classification even though the exception "is" that variant. Cause:
+  smithy-codegen's builder defaults `meta: ErrorMetadata::default()` (code = `None`) — the real
+  value is only populated when the SDK deserializes an actual wire response, not when a test
+  constructs the exception directly. Fix: `SomeException::builder().meta(ErrorMetadata::builder()
+  .code("ExceptionName").build()).build()`. Applies to any AWS SDK crate's modelled service error,
+  not just DynamoDB — see `lore-aws/src/aws_error.rs::tests` (CR-021 Part 1 above) for worked
+  examples.
