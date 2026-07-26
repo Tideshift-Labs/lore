@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 009 | 2026-07-25 | [Report an overloaded store from the fragment walk (CR-021 Part 2b)](009-fragment-walk-overload-honesty-cr021-part2b.md) |
 | 008 | 2026-07-25 | [Configurable AWS client retry (CR-021 Part 2a)](008-configurable-aws-client-retry-cr021-part2a.md) |
 | 007 | 2026-07-25 | [Throttle honesty in `load_metadata` (CR-021 Part 1)](007-throttle-honesty-load-metadata-cr021-part1.md) |
 | 006 | 2026-07-23 | [Provider-neutral authentication refresh (CR-020)](006-provider-neutral-authentication-refresh-cr020.md) |
