@@ -407,6 +407,7 @@ mod tests {
         slow_down_all_queries: AtomicBool,
         generic_fail_all_queries: AtomicBool,
         slow_down_query_addresses: RwLock<BTreeSet<Address>>,
+        slow_down_get_addresses: RwLock<BTreeSet<Address>>,
     }
 
     impl FaultInjectingStore {
@@ -416,6 +417,7 @@ mod tests {
                 slow_down_all_queries: AtomicBool::new(false),
                 generic_fail_all_queries: AtomicBool::new(false),
                 slow_down_query_addresses: RwLock::new(BTreeSet::new()),
+                slow_down_get_addresses: RwLock::new(BTreeSet::new()),
             })
         }
 
@@ -434,6 +436,19 @@ mod tests {
         /// every other address delegates normally.
         fn arm_slow_down_query_for(&self, address: Address) {
             self.slow_down_query_addresses
+                .write()
+                .unwrap()
+                .insert(address);
+        }
+
+        /// `get()` calls for this specific address return `StoreError::SlowDown`;
+        /// every other address delegates normally. This is the call
+        /// `lore_storage::read::read_raw` makes (via `immutable::load_raw`) when
+        /// loading a fragmented payload's own content to read its child
+        /// `FragmentReference` list — distinct from `query()`, which is what
+        /// `collect_new_addresses` calls directly on each address it walks.
+        fn arm_slow_down_get_for(&self, address: Address) {
+            self.slow_down_get_addresses
                 .write()
                 .unwrap()
                 .insert(address);
@@ -498,6 +513,14 @@ mod tests {
             address: Address,
             match_required: StoreMatch,
         ) -> Result<(Fragment, Bytes), StoreError> {
+            if self
+                .slow_down_get_addresses
+                .read()
+                .unwrap()
+                .contains(&address)
+            {
+                return Err(StoreError::from(SlowDown));
+            }
             self.inner
                 .clone()
                 .get(partition, address, match_required)
@@ -814,19 +837,21 @@ mod tests {
     }
 
     /// Stores two raw chunks plus a `PayloadFragmented` fragment-reference list
-    /// pointing at them, returning `(root_address, chunk_two_address)`. Mirrors
-    /// `store_as_legacy_chunks` in the `is_file_modified_chunking_compat` module
-    /// below, but returns the second chunk's address too so a test can target
-    /// it specifically for fault injection.
+    /// pointing at them, returning `(root_address, chunk_one_address,
+    /// chunk_two_address, content_size)`. Mirrors `store_as_legacy_chunks` in
+    /// the `is_file_modified_chunking_compat` module below, but returns both
+    /// chunk addresses too so a test can target either specifically for fault
+    /// injection.
     async fn store_two_chunk_fragmented_payload(
         repository: &Arc<RepositoryContext>,
         context: Context,
-    ) -> (Address, Address, u64) {
+    ) -> (Address, Address, Address, u64) {
         let chunk_one: &[u8] = b"first-chunk-of-a-fragmented-payload------------";
         let chunk_two: &[u8] = b"second-chunk-of-a-fragmented-payload-----------";
 
         let mut refs = Vec::with_capacity(2);
         let mut offset: u64 = 0;
+        let mut chunk_one_address = Address::default();
         let mut chunk_two_address = Address::default();
         for (index, chunk) in [chunk_one, chunk_two].into_iter().enumerate() {
             let chunk_bytes = Bytes::copy_from_slice(chunk);
@@ -848,7 +873,9 @@ mod tests {
             .await
             .expect("Failed to store chunk fragment");
 
-            if index == 1 {
+            if index == 0 {
+                chunk_one_address = address;
+            } else {
                 chunk_two_address = address;
             }
 
@@ -885,7 +912,12 @@ mod tests {
         .await
         .expect("Failed to store fragment list");
 
-        (root_address, chunk_two_address, content_size)
+        (
+            root_address,
+            chunk_one_address,
+            chunk_two_address,
+            content_size,
+        )
     }
 
     /// Builds `state_to` with a single new file node whose content is a
@@ -899,6 +931,7 @@ mod tests {
                 Arc<State>,
                 Arc<State>,
                 Arc<FaultInjectingStore>,
+                Address,
                 Address,
                 Address,
             ) -> Fut
@@ -951,7 +984,7 @@ mod tests {
                     .expect("Failed to deserialize state");
 
                 let content_context: Context = rand::random();
-                let (root_address, chunk_two_address, content_size) =
+                let (root_address, chunk_one_address, chunk_two_address, content_size) =
                     store_two_chunk_fragmented_payload(&repository, content_context).await;
 
                 let name = "fragmented-file.bin";
@@ -980,6 +1013,7 @@ mod tests {
                     state_to,
                     fault_store,
                     root_address,
+                    chunk_one_address,
                     chunk_two_address,
                 )
                 .await
@@ -988,30 +1022,22 @@ mod tests {
             .expect("Test task failed")
     }
 
-    // NOTE on swallow #2 (a SlowDown while loading a fragmented payload's own
-    // content, i.e. `immutable::load_raw`'s `Err(ImmutableError::SlowDown(_))`
-    // arm): this file does not carry a dedicated test for it, and the omission
-    // is deliberate — see the "swallow #2 blocked" note in the test-specialist
-    // report for why a local-only fixture cannot reach it (a `get()` SlowDown
-    // gets superseded by `lore_storage::read::load_fragment`'s remote fallback,
-    // which is enabled by default and — with this fixture's `Err(NoRemote)`
-    // repository — resolves to a `NoRemote`-shaped error before
-    // `collect_new_addresses` ever sees the original `SlowDown`). Swallow #3
-    // below (a child fragment's own `query()`, called directly with no
-    // fallback layer in between) exercises the same idiom without that
-    // obstruction.
-
     #[tokio::test]
     async fn collect_new_fragments_propagates_slow_down_from_fragmented_payload_child() {
         // Swallow #3: a SlowDown while recursing into one of a fragmented
         // payload's children must propagate rather than silently dropping
         // that (and every sibling) child from the result.
         with_fragmented_file_fixture(
-            |repository, state_from, state_to, fault_store, _root_address, chunk_two_address| async move {
+            |repository,
+             state_from,
+             state_to,
+             fault_store,
+             _root_address,
+             _chunk_one_address,
+             chunk_two_address| async move {
                 fault_store.arm_slow_down_query_for(chunk_two_address);
 
-                let result =
-                    collect_new_fragments(repository, state_from, state_to, true).await;
+                let result = collect_new_fragments(repository, state_from, state_to, true).await;
 
                 let err = result.expect_err(
                     "Expected collect_new_fragments to propagate a SlowDown hit on a \
@@ -1020,6 +1046,121 @@ mod tests {
                 assert!(
                     err.is_slow_down(),
                     "Expected StateError::SlowDown, got: {err:?}"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn collect_new_fragments_fragmented_walk_yields_child_addresses_when_unarmed() {
+        // Positive control for the fragmented-payload fixture itself: with no
+        // fault armed at all, `collect_new_fragments` must walk into the
+        // `PayloadFragmented` root and report both of its children as new,
+        // plus the root address itself. Without this, a regression that
+        // stopped the fixture from producing a real `PayloadFragmented` root
+        // (or that stopped `collect_new_addresses` from recursing into one at
+        // all) would let the neighboring SlowDown-propagation tests pass
+        // vacuously -- they only assert on the `Err` path, which a walk that
+        // never reaches the fragmented root would also (trivially) satisfy by
+        // never hitting the armed fault in the first place.
+        with_fragmented_file_fixture(
+            |repository,
+             state_from,
+             state_to,
+             _fault_store,
+             root_address,
+             chunk_one_address,
+             chunk_two_address| async move {
+                let fragments = collect_new_fragments(repository, state_from, state_to, true)
+                    .await
+                    .expect("Unarmed fragmented-payload walk must not itself return an error");
+
+                assert!(
+                    fragments.contains(&root_address),
+                    "Expected the fragmented payload's own root address in the result, got: \
+                     {fragments:?}"
+                );
+                assert!(
+                    fragments.contains(&chunk_one_address),
+                    "Expected the fragmented payload's first child address in the result \
+                     (proves the walk actually recursed into the fragment-reference list), \
+                     got: {fragments:?}"
+                );
+                assert!(
+                    fragments.contains(&chunk_two_address),
+                    "Expected the fragmented payload's second child address in the result, \
+                     got: {fragments:?}"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn collect_new_fragments_swallows_slow_down_from_own_fragmented_payload_load() {
+        // Discriminating test for swallow #2 (CR-021 part 2b's own correction
+        // note, `state.rs:7663`'s `Err(ImmutableError::SlowDown(traced))` arm
+        // reached while loading a fragmented payload's own content via
+        // `immutable::load_raw`, to read its child `FragmentReference` list).
+        //
+        // On the SERVER path -- no remote session, `RepositoryContext` built
+        // with `Err(ProtocolError::from(NoRemote))` exactly like every fixture
+        // in this file, which is exactly what `RemoteState::Offline` collapses
+        // to (see `lore-revision/src/repository.rs`'s `RemoteState::from_result`
+        // and `RepositoryContext::remote()`) -- a throttled local `get()` on
+        // the root's own content does NOT propagate as `SlowDown`. Read
+        // path: `lore_storage::read::read_raw` retries then gives up with
+        // `StorageError::SlowDown`; `load_fragment` (`lore-storage/src/read.rs`)
+        // collapses that into an untyped `LocalFailure::Other` (losing the
+        // `SlowDown` classification), then -- because `ReadOptions::remote`
+        // defaults `true` and `immutable::load_raw` always supplies
+        // `Some(session)` -- unconditionally tries the remote fallback, which
+        // resolves the pending session against `RemoteState::Offline` and
+        // fails as `NoRemote`, not `SlowDown`. That final, non-`SlowDown`
+        // error is what `collect_new_addresses` actually observes, so it
+        // falls into the pre-existing, deliberately-unchanged `Err(_) => {}`
+        // branch at `state.rs:7666` rather than the `SlowDown` arm at
+        // `state.rs:7663`.
+        //
+        // The assertion that matters is not "an error came back" -- none
+        // does, `collect_new_fragments` returns `Ok` -- but that the root's
+        // children are silently missing from the result: exactly the gap
+        // that lets `verify_fragments` skip confirming them, and a push land
+        // referencing content the server never actually confirmed it holds.
+        with_fragmented_file_fixture(
+            |repository,
+             state_from,
+             state_to,
+             fault_store,
+             root_address,
+             chunk_one_address,
+             chunk_two_address| async move {
+                fault_store.arm_slow_down_get_for(root_address);
+
+                let fragments = collect_new_fragments(repository, state_from, state_to, true)
+                    .await
+                    .expect(
+                        "This pins the CURRENT (buggy) behavior: a SlowDown on the \
+                         fragmented payload's own load is swallowed, not propagated, so \
+                         collect_new_fragments returns Ok rather than Err. If this starts \
+                         returning Err(SlowDown), the underlying gap has been fixed --  \
+                         update this test to assert propagation instead of deleting it.",
+                    );
+
+                assert!(
+                    fragments.contains(&root_address),
+                    "The fragmented payload's own address is still pushed unconditionally \
+                     (state.rs's push to `addresses` after the load_raw match is not gated \
+                     on load_raw's outcome) -- got: {fragments:?}"
+                );
+                assert!(
+                    !fragments.contains(&chunk_one_address)
+                        && !fragments.contains(&chunk_two_address),
+                    "INTEGRITY GAP (CR-021 part 2b swallow #2 is dead code on the server \
+                     path): expected both child addresses to be silently missing from the \
+                     result after a SlowDown on the root's own load, proving they never \
+                     reached verify_fragments -- got: {fragments:?}"
                 );
             },
         )
