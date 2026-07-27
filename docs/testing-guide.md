@@ -694,10 +694,12 @@ the next run starts from the map instead of rediscovering it.
   unchanged (report-as-new, or drop-the-subtree) — deliberately, that residual gap is out of scope.
   `lore-server`'s `branch_push.rs::verify_fragments` also gained `.filter_slow_down()?`, mapping the
   propagated `SlowDown` to `Status::ResourceExhausted` instead of `internal`. Coverage:
-  `cargo test -p lore-revision --test state` (extends the existing suite to 40 tests — adds
+  `cargo test -p lore-revision --test state` (42 tests — adds
   propagation-from-a-top-level-`query()` SlowDown, a non-SlowDown-preserves-conservative-fallback
   regression guard, a genuine-absence assumption pin against `find()`'s real `Ok(MatchNone)`
-  behavior, and the recursive-child-SlowDown case for a fragmented payload);
+  behavior, the recursive-child-SlowDown case for a fragmented payload (swallow #3), a positive
+  control that the fragmented walk yields real child addresses when unarmed, and swallow #2's
+  actual outcome on the server path (see below));
   `cargo test -p lore-server --lib -- grpc::handlers::branch_push::tests` (adds
   `verify_fragments_maps_slow_down_to_resource_exhausted`, built via
   `RepositoryContext::new_server_context` + `crate::grpc::get_write_token()` — the base pattern is
@@ -716,11 +718,38 @@ the next run starts from the map instead of rediscovering it.
     "new" relative to `state_from`). See `store_two_chunk_fragmented_payload` /
     `with_fragmented_file_fixture` in `lore-revision/tests/state.rs` — mirrors, and could eventually
     share code with, that same file's pre-existing `store_as_legacy_chunks` helper
-    (`is_file_modified_chunking_compat` module).
-  - **Swallow #2 (own-fragment `get()` SlowDown) has no test — genuinely unreachable via a
-    local-only fixture, not a coverage shortcut.** See the dedicated Deep finding below for the full
-    reasoning; don't re-attempt this with a bigger/different local-only fixture without reading it
-    first.
+    (`is_file_modified_chunking_compat` module). `store_two_chunk_fragmented_payload` now returns
+    all three relevant addresses (`root_address, chunk_one_address, chunk_two_address,
+    content_size`) so a test can arm a fault against either the fragmented root's own `get()` or
+    either child's `query()` independently.
+  - **Swallow #2 (own-fragment `get()` SlowDown) IS testable — the earlier "genuinely unreachable"
+    call was solving the wrong problem.** A prior pass concluded no local-only fixture could observe
+    *propagation* (see the "not reachable via a local-only test fixture" Deep finding, corrected
+    below) and left it untested. True for propagation, but the actual question — does the SlowDown
+    get **swallowed**, with the fragmented payload's children silently missing from the result —
+    needs no remote/session mock at all: `FaultInjectingStore::arm_slow_down_get_for(root_address)`
+    (new method, mirrors `arm_slow_down_query_for`) plus asserting on which addresses are **absent**
+    from `collect_new_fragments`'s `Ok(_)` result, not on the `Err` path.
+    `collect_new_fragments_swallows_slow_down_from_own_fragmented_payload_load` — green, and it
+    **pins the current, buggy swallow**: the call returns `Ok`, contains the root address, and is
+    missing both children. It's a discriminating regression guard, not a "this is fine" test — if
+    the underlying gap is ever fixed, its `Err`-vs-`Ok` and contains/absent assertions flip and need
+    updating, not deleting.
+  - **Verdict on the lore-reviewer-vs-testing-guide disagreement (resolved 2026-07-26, executable
+    check not a source read): the reviewer was right, this file's prior source-read note was
+    correct too but incomplete — same underlying fact, viewed from "can I test propagation" instead
+    of "what actually happens on this path."** On the server path (no remote session,
+    `RepositoryContext` built the same way every fixture in this file builds one —
+    `Err(ProtocolError::from(NoRemote))`, exactly what `RemoteState::Offline` collapses to per
+    `repository.rs`'s `RemoteState::from_result`/`RepositoryContext::remote()`), a throttled local
+    `get()` while loading a fragmented payload's own content does **not** propagate as `SlowDown` —
+    it is silently swallowed and the subtree's addresses go missing from `collect_new_fragments`'s
+    result, exactly as traced from `read.rs:272-298` / `state.rs:7663,7666`. Swallow #2's fix (the
+    `Err(ImmutableError::SlowDown(traced))` arm at `state.rs:7663`) is real code but unreachable on
+    this path — dead code for the server's own purpose (a push can be accepted without every
+    referenced address actually confirmed durable). Swallow #3 (a *child* fragment's own `query()`,
+    no `load_fragment`/remote-fallback layer in the way) is unaffected and does propagate correctly
+    — see `collect_new_fragments_propagates_slow_down_from_fragmented_payload_child`.
 
 ---
 
@@ -1037,3 +1066,18 @@ the next run starts from the map instead of rediscovering it.
   `load_fragment`/remote-fallback layer in between) has no such obstruction and is fully covered —
   see `collect_new_fragments_propagates_slow_down_from_fragmented_payload_child` in
   `lore-revision/tests/state.rs`.
+  - **Correction (2026-07-26): the "known gap, flag it" disposition above was too pessimistic —
+    the *propagation* path is genuinely untestable locally (as analyzed), but that's not the
+    question that matters for integrity.** The question that matters is whether the SlowDown gets
+    **swallowed** with children going missing from the result, and that half needs nothing more than
+    the local-only fixture already built here: arm `get()` to fail with `SlowDown` on the fragmented
+    root's own address (`FaultInjectingStore::arm_slow_down_get_for`, new method) and assert the
+    child addresses are **absent** from `collect_new_fragments`'s `Ok(_)` result instead of asserting
+    on `Err`. See `collect_new_fragments_swallows_slow_down_from_own_fragmented_payload_load` — this
+    is the discriminating test that settled the lore-reviewer disagreement in the CR-021 Part 2b
+    entry above (reviewer was right: swallow #2 is dead code on the server/no-remote-session path).
+    Lesson for next time: when a propagation path is unreachable in a fixture, don't stop at "can't
+    test the fix" — check whether the *swallow* (the thing the fix was meant to prevent) is
+    independently observable via the `Ok` result's contents. It usually is; that's the assertion
+    that actually matters to a reader anyway (see this file's own CR-021 Part 2b write-up: "the
+    assertion that matters is not 'an error came back' but whether addresses go missing").
