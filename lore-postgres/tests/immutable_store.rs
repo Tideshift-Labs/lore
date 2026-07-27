@@ -27,12 +27,25 @@
 //! LORE_TEST_S3_REGION=us-east-1 \
 //! AWS_ACCESS_KEY_ID=minioadmin \
 //! AWS_SECRET_ACCESS_KEY=minioadmin \
-//! cargo test -p lore-postgres --test immutable_store
+//! cargo test -p lore-postgres --test immutable_store -- --ignored
 //! ```
 //!
-//! Gated on `LORE_TEST_PG_URL`, `LORE_TEST_S3_ENDPOINT`, and
-//! `LORE_TEST_S3_BUCKET`. If any is unset, each test prints a skip line and
-//! returns immediately so plain `cargo test` needs no running infra.
+//! Every test here is `#[ignore]`d, so plain `cargo test` needs no running
+//! infra — and, more importantly, never claims to have covered this code when it
+//! hasn't. Run them with `-- --ignored` once the env below is set.
+//!
+//! That attribute is doing real work. These were previously plain `#[test]`s
+//! that printed a notice and returned when the env was unset — which Rust's
+//! harness reports as `test result: ok. 15 passed`, with the notice swallowed by
+//! output capture. A suite that asserts coverage it does not have is worse than
+//! no suite: CR-016's SQL reached staging unexecuted precisely because this file
+//! said it was green, and two real defects (a `now()`-vs-`clock_timestamp()`
+//! age and a `greatest(0, NULL)` that ate a null) were then found by hand rather
+//! than here. `ignored` and `passed` must not look alike.
+//!
+//! Env gate: `LORE_TEST_PG_URL`, `LORE_TEST_S3_ENDPOINT`, `LORE_TEST_S3_BUCKET`
+//! (+ optional `LORE_TEST_S3_REGION`). Still checked at runtime, so a run with
+//! `--ignored` but no env exits early rather than failing confusingly.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -161,6 +174,7 @@ async fn put_fragment(
 /// Uses a 200 KB payload to exercise the S3 streaming read path while staying
 /// under the 256 KB `FRAGMENT_SIZE_THRESHOLD`.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn round_trip_byte_perfect() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -202,6 +216,7 @@ async fn round_trip_byte_perfect() {
 /// - `exist(MatchFull)` for a random never-put hash → `MatchNone`.
 /// - `query` returns the stored `Fragment` with `match_made == MatchFull`.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn existence_levels() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -285,6 +300,7 @@ async fn existence_levels() {
 /// This finding is reported to the main session; the spec's "MatchPartition
 /// path" description does not match the current implementation.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn dedup_same_partition_requires_payload() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -341,6 +357,7 @@ async fn dedup_same_partition_requires_payload() {
 /// The hash exists globally (MatchHash level) but `lookup(MatchFull)` returns
 /// `MatchNone` on a full-miss, so `put` with `payload = None` errors.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn dedup_cross_partition_no_payload_errors() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -374,6 +391,7 @@ async fn dedup_cross_partition_no_payload_errors() {
 /// 4. `exist_batch` over a mix of present and absent addresses returns the
 ///    per-index matches in the correct order.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn exist_batch_mixed() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -414,6 +432,7 @@ async fn exist_batch_mixed() {
 /// the shared bucket and Postgres keyed by hash; only the `lore_fragments`
 /// row for the destination is added.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn copy_fragment() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -456,6 +475,7 @@ async fn copy_fragment() {
 ///     and `query` returns `MatchNone`. Stats record one fragment and one payload
 ///     deleted.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn obliterate_single_association() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -515,6 +535,7 @@ async fn obliterate_single_association() {
 ///     obliterating one leaves the other's bytes intact and still gettable.
 ///     The payload is NOT deleted because the refcount > 0.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn obliterate_refcount_keeps_other_association() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -593,6 +614,7 @@ async fn obliterate_refcount_keeps_other_association() {
 /// 7. `get` on a never-put address returns an error (AddressNotFound-style),
 ///    not a panic.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn get_never_put_address_errors() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -625,6 +647,7 @@ async fn get_never_put_address_errors() {
 /// even when present and absent addresses are interleaved, and that the empty
 /// input short-circuit works.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn exist_batch_order_preservation() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -723,6 +746,7 @@ async fn exist_batch_order_preservation() {
 ///    reports all-zero stats, not an error — an unknown repository has no
 ///    associations, which is the intended CR-016 semantic, not a bug.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn repository_stats_unknown_repository_reports_zeroes() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -752,6 +776,7 @@ async fn repository_stats_unknown_repository_reports_zeroes() {
 ///     `content_bytes` over several distinct fragments put into one
 ///     repository.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn repository_stats_sums_multiple_fragments() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -794,6 +819,7 @@ async fn repository_stats_sums_multiple_fragments() {
 ///     assertion most likely to catch a regression if that subquery is
 ///     "simplified" away.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn repository_stats_deduplicates_same_hash_multiple_contexts() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -852,6 +878,7 @@ async fn repository_stats_deduplicates_same_hash_multiple_contexts() {
 ///     the intended metering semantic, asserted here rather than treated as
 ///     a bug.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn repository_stats_isolates_repositories_but_double_counts_a_shared_hash() {
     let Some((pg, ep, bucket, region)) = env_config() else {
@@ -940,6 +967,7 @@ async fn repository_stats_isolates_repositories_but_double_counts_a_shared_hash(
 ///     match what its own sums account for would be worse than an
 ///     under-count).
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn repository_stats_excludes_an_association_with_no_metadata_row() {
     let Some((pg, ep, bucket, region)) = env_config() else {

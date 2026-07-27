@@ -26,6 +26,7 @@ fn resource(desc: &str) -> LockResource {
 }
 
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 async fn lock_lifecycle() {
     let Some(url) = pg_url() else {
         eprintln!("LORE_TEST_PG_URL unset; skipping Postgres lock-store test");
