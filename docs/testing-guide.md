@@ -50,12 +50,16 @@ the next run starts from the map instead of rediscovering it.
   `branch_get_implementation`) so they also exercise the forwarding seam.
   `cargo test -p lore-server --lib -- grpc::revision::v1::branch_get`.
 - **CR-007 (Postgres stores)** — `lore-postgres/`. Only 2 real unit tests in `src/` (`pool::tests::*`);
-  the meat is in `tests/{lock_store,mutable_store,immutable_store,concurrency}.rs`, gated on
-  `LORE_TEST_PG_URL` — each test does `let Some(url) = pg_url() else { eprintln!(...); return; }`
-  when unset, so `cargo test -p lore-postgres --tests` reports **green with zero real assertions run**
-  when no Postgres is reachable. Don't read a bare pass as coverage; check for the "skipping" eprintln
-  or set `LORE_TEST_PG_URL` (see `integration-harness` skill for a local Postgres, e.g.
-  `postgres-cell-pg` compose profile) to actually exercise CR-007.
+  the meat is in `tests/{lock_store,mutable_store,immutable_store,concurrency}.rs` (18 tests total),
+  gated on `LORE_TEST_PG_URL`/`LORE_TEST_S3_ENDPOINT`/`LORE_TEST_S3_BUCKET`. **As of 2026-07-26
+  (commit `758e340`) these are `#[ignore]`d**, so `cargo test -p lore-postgres --tests` correctly
+  reports `18 ignored` with no infra running; run `cargo test -p lore-postgres --tests -- --ignored`
+  with the env set to actually exercise CR-007. (Before that commit they were plain `#[test]`s that
+  printed a notice and returned when unset, which Rust's harness reported as **passed** — a bare
+  green run proved nothing, which is how CR-016's two SQL defects reached staging unexecuted; see
+  `lorehub/docs/learnings/prefer-an-executable-check-over-a-source-read-verdict.md`.) A local
+  Postgres for this is `integration-harness`'s `postgres-cell-pg` compose profile, or an ad hoc
+  `docker run` (see the CR-016 entry below for the exact commands).
 - **lore-aws (DynamoBucketResolver / per-tenant isolation)** — `lore-aws/src/store/`. Unit tests run
   fully offline (mocked SDK clients), `cargo test -p lore-aws --lib`: 86 passed, 2 `#[ignore]`d
   (`test_put_immutable_partial*`, need real S3 multipart) — pre-existing ignores, not ours.

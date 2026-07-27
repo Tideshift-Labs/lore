@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 011 | 2026-07-26 | [lore-postgres: report infra-gated tests as ignored, not passed](011-lore-postgres-ignore-infra-gated-tests.md) |
 | 010 | 2026-07-26 | [Add RepositoryStorageStats, a per-repo stored-bytes RPC (CR-016)](010-repository-storage-stats-cr016.md) |
 | 009 | 2026-07-25 | [Report an overloaded store from the fragment walk (CR-021 Part 2b)](009-fragment-walk-overload-honesty-cr021-part2b.md) |
 | 008 | 2026-07-25 | [Configurable AWS client retry (CR-021 Part 2a)](008-configurable-aws-client-retry-cr021-part2a.md) |
