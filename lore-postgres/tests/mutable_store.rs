@@ -18,6 +18,7 @@ fn pg_url() -> Option<String> {
 }
 
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 async fn mutable_cas_lifecycle() {
     let Some(url) = pg_url() else {
         eprintln!("LORE_TEST_PG_URL unset; skipping Postgres mutable-store test");

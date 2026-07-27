@@ -122,6 +122,7 @@ async fn racing_cas_no_lost_update() {
 /// transaction must roll back entirely — r2 must NOT be left locked by a
 /// partial insert.
 #[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
 async fn batch_lock_all_or_nothing() {
     let Some(url) = pg_url() else {
