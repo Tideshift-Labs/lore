@@ -66,6 +66,17 @@ the next run starts from the map instead of rediscovering it.
   `store::bucket_resolver::test::*` covers the tenant-routing/fail-closed behavior.
 - **CR-005 (lorehub_notify post-commit hook)** — `lore-server/src/hooks/`. Fully unit-tested, no
   external service needed: `cargo test -p lore-server --lib -- hooks` (98 passed).
+- **No-op branch-push side-effect suppression ([SERVER])** —
+  `lore-server/src/grpc/handlers/branch_push.rs` and
+  `lore-server/src/grpc/revision/v1/branch_push.rs`. Shared `PushResult.advanced` is false when the
+  incoming revision already equals the branch head; both handlers gate `branch_pushed` and
+  `HookPoint::BranchPush` post-hooks on it. Handler-level regressions first await the advancing
+  push's detached notification/hook through `mpsc::unbounded_channel`, then use a bounded 100 ms
+  receive to prove the no-op re-push emits neither. They also override `InstrumentProvider::meter`
+  with a per-test `SdkMeterProvider` + `InMemoryMetricExporter`, avoiding the process-global meter
+  provider, and assert `num_branches_pushed == 1` after both calls. Coverage:
+  `cargo test -p lore-server --lib -- grpc::handlers::branch_push::tests` (6 passed) and
+  `cargo test -p lore-server --lib -- grpc::revision::v1::branch_push::test` (11 passed).
 - **lore-transport native TLS roots (CLIENT, commit 2176c74)** — `lore-transport/src/auth/ucs_auth.rs`
   `connect_client`. No dedicated unit test (the commit was verified end-to-end manually, per its
   message); existing `auth::ucs_auth::tests::*` cover URL/scheme parsing, not the TLS config itself.

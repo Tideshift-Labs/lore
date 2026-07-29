@@ -149,7 +149,7 @@ Hooks allow custom logic to be executed at specific points in the server's lifec
 
 | Hook Point | Triggered When |
 |------------|----------------|
-| `BranchPush` | Before a branch push is committed |
+| `BranchPush` | Before each push attempt; post-push hooks and notifications fire only when the branch head advances |
 | `BranchCreate` | Before a new branch is created |
 | `BranchDelete` | Before a branch is deleted |
 | `RepositoryCreate` | Before a new repository is created |

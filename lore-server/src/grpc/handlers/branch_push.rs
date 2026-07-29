@@ -163,6 +163,7 @@ pub async fn handler(
 
             let PushResult {
                 success,
+                advanced,
                 fast_forward_merged,
                 revision,
                 revision_number,
@@ -178,7 +179,7 @@ pub async fn handler(
             )
             .await?;
 
-            if success {
+            if advanced {
                 lore_spawn!({
                     let user_id = user_id.clone();
                     async move {
@@ -201,8 +202,10 @@ pub async fn handler(
                 hook_dispatcher.spawn_post(HookPoint::BranchPush, hook_ctx);
             }
 
-            let num_branches_pushed = instrument_provider.counter("num_branches_pushed");
-            num_branches_pushed.add(1, &[]);
+            if advanced {
+                let num_branches_pushed = instrument_provider.counter("num_branches_pushed");
+                num_branches_pushed.add(1, &[]);
+            }
 
             let message = if success {
                 dispatch_response_message(
@@ -287,6 +290,9 @@ pub(crate) async fn dispatch_response_message(
 
 pub struct PushResult {
     pub success: bool,
+    /// Whether this call moved the branch head. A successful push of the
+    /// current head is an idempotent no-op and must not emit push side effects.
+    pub advanced: bool,
     pub fast_forward_merged: bool,
     pub revision: Hash,
     pub revision_number: u64,
@@ -358,6 +364,7 @@ pub async fn push(
     if current_head == latest {
         return Ok(PushResult {
             success: true,
+            advanced: false,
             fast_forward_merged: false,
             revision: current_head,
             revision_number: state.revision_number(),
@@ -376,6 +383,7 @@ pub async fn push(
             if !fast_forward_merge {
                 return Ok(PushResult {
                     success: false,
+                    advanced: false,
                     fast_forward_merged: false,
                     revision: current_head,
                     revision_number: 0,
@@ -466,6 +474,7 @@ pub async fn push(
 
     Ok(PushResult {
         success: true,
+        advanced: true,
         fast_forward_merged: false,
         revision: current_head,
         revision_number: state.revision_number(),
@@ -548,6 +557,7 @@ async fn try_fast_forward_merge(
             );
             return Ok(PushResult {
                 success: false,
+                advanced: false,
                 fast_forward_merged: false,
                 revision: current_head,
                 revision_number: 0,
@@ -671,6 +681,7 @@ async fn try_fast_forward_merge(
 
             return Ok(PushResult {
                 success: true,
+                advanced: true,
                 fast_forward_merged: true,
                 revision: new_revision,
                 revision_number,
@@ -926,6 +937,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
     use rand::random;
