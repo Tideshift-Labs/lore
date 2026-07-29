@@ -431,6 +431,23 @@ fn metadata_load_error(error: AwsError<SdkError<GetItemError>>) -> StoreError {
     }
 }
 
+fn s3_payload_load_error(error: AwsError<SdkError<GetObjectError>>, hash: Hash) -> StoreError {
+    match &error {
+        AwsError::AwsSdkError(sdk_error)
+            if matches!(
+                sdk_error.as_service_error(),
+                Some(GetObjectError::NoSuchKey(_))
+            ) =>
+        {
+            StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
+        }
+        AwsError::AwsSdkError(sdk_error) if is_retryable_sdk_error(sdk_error) => {
+            StoreError::from(SlowDown)
+        }
+        _ => StoreError::internal_with_context(error, "S3 get object failed"),
+    }
+}
+
 pub struct AwsImmutableStore {
     s3: S3,
     dynamodb: DynamoDb,
@@ -1332,18 +1349,8 @@ impl AwsImmutableStore {
             )
             .await
             .map_err(|e| {
-                if let AwsError::AwsSdkError(sdk_error) = e {
-                    debug!(hash = %hash, error = ?sdk_error, "get_s3_payload SDK error getting object");
-                    match sdk_error.into_service_error() {
-                        GetObjectError::NoSuchKey(_) => StoreError::from(AddressNotFound::from(
-                            Address::zero_context_hash(hash),
-                        )),
-                        _ => StoreError::from(SlowDown),
-                    }
-                } else {
-                    debug!(hash = %hash, error = ?e, "get_s3_payload failed to get object");
-                    StoreError::internal_with_context(e, "S3 get object failed")
-                }
+                debug!(hash = %hash, error = ?e, "get_s3_payload failed to get object");
+                s3_payload_load_error(e, hash)
             })?;
 
         let mut buffer = BytesMut::with_capacity(FRAGMENT_SIZE_THRESHOLD);
@@ -1943,12 +1950,14 @@ mod test {
     use aws_sdk_s3::error::ErrorMetadata;
     use aws_sdk_s3::operation::delete_object::DeleteObjectError;
     use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
+    use aws_sdk_s3::operation::get_object::GetObjectError;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError;
     use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::primitives::SdkBody;
     use aws_sdk_s3::types::ObjectVersion;
+    use aws_sdk_s3::types::error::NoSuchKey;
     use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
     use aws_smithy_runtime_api::client::result::SdkError;
     use aws_smithy_runtime_api::client::result::ServiceError;
@@ -3261,6 +3270,63 @@ mod test {
                 ))
                 .build(),
         ))
+    }
+
+    #[test]
+    fn test_s3_payload_load_error_no_such_key_is_address_not_found() {
+        let hash = random::<Hash>();
+        let error = aws_error(
+            GetObjectError::NoSuchKey(
+                NoSuchKey::builder()
+                    .meta(ErrorMetadata::builder().code("NoSuchKey").build())
+                    .build(),
+            ),
+            404,
+        );
+
+        let error = s3_payload_load_error(error, hash);
+
+        assert!(
+            error.is_address_not_found(),
+            "expected AddressNotFound, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_s3_payload_load_error_retryable_sdk_error_is_slow_down() {
+        let error = AwsError::AwsSdkError(SdkError::TimeoutError(
+            TimeoutError::builder()
+                .source(Box::new(std::io::Error::other("injected timeout")))
+                .build(),
+        ));
+
+        let error = s3_payload_load_error(error, random::<Hash>());
+
+        assert!(error.is_slow_down(), "expected SlowDown, got {error:?}");
+    }
+
+    #[test]
+    fn test_s3_payload_load_error_permanent_service_errors_are_internal() {
+        for (code, status) in [("AccessDenied", 403), ("NoSuchBucket", 404)] {
+            let error = aws_error(
+                GetObjectError::generic(ErrorMetadata::builder().code(code).build()),
+                status,
+            );
+
+            let error = s3_payload_load_error(error, random::<Hash>());
+
+            assert!(
+                error.is_internal(),
+                "expected {code} ({status}) to map to Internal, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_s3_payload_load_error_non_sdk_error_is_internal() {
+        let error = s3_payload_load_error(AwsError::JoinError, random::<Hash>());
+
+        assert!(error.is_internal(), "expected Internal, got {error:?}");
     }
 
     fn mock_acquire_obliterate_lock(

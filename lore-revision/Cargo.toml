@@ -65,6 +65,7 @@ zerocopy = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
 
 [dev-dependencies]
+ctor = { workspace = true }
 lore-storage = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }

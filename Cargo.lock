@@ -2852,6 +2852,7 @@ dependencies = [
  "bytes",
  "chrono",
  "crossbeam",
+ "ctor",
  "dashmap",
  "diffy",
  "fastcdc",

@@ -841,6 +841,8 @@ pub async fn write_all_to_file(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -861,20 +863,26 @@ mod tests {
     #[derive(Clone, Copy)]
     enum InjectedGetFailure {
         SlowDown,
-        Deserialize,
+        Internal,
     }
 
     struct GetFailingStore {
         inner: Arc<dyn ImmutableStore>,
         failure: InjectedGetFailure,
+        get_calls: AtomicUsize,
     }
 
     impl GetFailingStore {
-        fn wrapping(
-            inner: Arc<dyn ImmutableStore>,
-            failure: InjectedGetFailure,
-        ) -> Arc<dyn ImmutableStore> {
-            Arc::new(Self { inner, failure })
+        fn wrapping(inner: Arc<dyn ImmutableStore>, failure: InjectedGetFailure) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                failure,
+                get_calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -922,10 +930,11 @@ mod tests {
             _address: Address,
             _match_required: StoreMatch,
         ) -> Result<(Fragment, Bytes), StoreError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
             match self.failure {
                 InjectedGetFailure::SlowDown => Err(StoreError::from(crate::errors::SlowDown)),
-                InjectedGetFailure::Deserialize => {
-                    Err(StoreError::internal("injected local deserialize failure"))
+                InjectedGetFailure::Internal => {
+                    Err(StoreError::internal("injected local internal failure"))
                 }
             }
         }
@@ -1042,7 +1051,7 @@ mod tests {
         let store = GetFailingStore::wrapping(store, InjectedGetFailure::SlowDown);
 
         let err = load_fragment(
-            store,
+            store.clone(),
             partition,
             address,
             ReadOptions::default(),
@@ -1055,6 +1064,11 @@ mod tests {
             matches!(err, StorageError::SlowDown(_)),
             "expected StorageError::SlowDown, got {err:?}"
         );
+        assert!(
+            store.get_calls() >= 2,
+            "expected local SlowDown to be retried, got {} get() call(s)",
+            store.get_calls()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1063,13 +1077,18 @@ mod tests {
         let (partition, address, _fragment, _payload) = make_input(0x52);
         let store = GetFailingStore::wrapping(store, InjectedGetFailure::SlowDown);
 
-        let err = load_raw_local(store, partition, address, ReadOptions::default())
+        let err = load_raw_local(store.clone(), partition, address, ReadOptions::default())
             .await
             .expect_err("local-only read must preserve StoreError::SlowDown");
 
         assert!(
             matches!(err, StorageError::SlowDown(_)),
             "expected StorageError::SlowDown, got {err:?}"
+        );
+        assert!(
+            store.get_calls() >= 2,
+            "expected local SlowDown to be retried, got {} get() call(s)",
+            store.get_calls()
         );
     }
 
@@ -1107,10 +1126,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_deserialize_failure_keeps_existing_offline_fallback_behavior() {
+    async fn local_internal_failure_keeps_existing_offline_fallback_behavior() {
         let (_dir, store) = make_test_store().await;
         let (partition, address, _fragment, _payload) = make_input(0x54);
-        let store = GetFailingStore::wrapping(store, InjectedGetFailure::Deserialize);
+        let store = GetFailingStore::wrapping(store, InjectedGetFailure::Internal);
 
         let err = load_fragment(
             store,
@@ -1124,7 +1143,7 @@ mod tests {
 
         assert!(
             matches!(err, StorageError::AddressNotFound(_)),
-            "expected deserialize failure to retain AddressNotFound fallback, got {err:?}"
+            "expected internal failure to retain AddressNotFound fallback, got {err:?}"
         );
     }
 
