@@ -936,68 +936,30 @@ mod tests {
 
     #[tokio::test]
     async fn collect_new_fragments_swallows_slow_down_from_own_fragmented_payload_load() {
-        // Discriminating test for swallow #2 (CR-021 part 2b's own correction
-        // note, `state.rs:7663`'s `Err(ImmutableError::SlowDown(traced))` arm
-        // reached while loading a fragmented payload's own content via
-        // `immutable::load_raw`, to read its child `FragmentReference` list).
-        //
-        // On the SERVER path -- no remote session, `RepositoryContext` built
-        // with `Err(ProtocolError::from(NoRemote))` exactly like every fixture
-        // in this file, which is exactly what `RemoteState::Offline` collapses
-        // to (see `lore-revision/src/repository.rs`'s `RemoteState::from_result`
-        // and `RepositoryContext::remote()`) -- a throttled local `get()` on
-        // the root's own content does NOT propagate as `SlowDown`. Read
-        // path: `lore_storage::read::read_raw` retries then gives up with
-        // `StorageError::SlowDown`; `load_fragment` (`lore-storage/src/read.rs`)
-        // collapses that into an untyped `LocalFailure::Other` (losing the
-        // `SlowDown` classification), then -- because `ReadOptions::remote`
-        // defaults `true` and `immutable::load_raw` always supplies
-        // `Some(session)` -- unconditionally tries the remote fallback, which
-        // resolves the pending session against `RemoteState::Offline` and
-        // fails as `NoRemote`, not `SlowDown`. That final, non-`SlowDown`
-        // error is what `collect_new_addresses` actually observes, so it
-        // falls into the pre-existing, deliberately-unchanged `Err(_) => {}`
-        // branch at `state.rs:7666` rather than the `SlowDown` arm at
-        // `state.rs:7663`.
-        //
-        // The assertion that matters is not "an error came back" -- none
-        // does, `collect_new_fragments` returns `Ok` -- but that the root's
-        // children are silently missing from the result: exactly the gap
-        // that lets `verify_fragments` skip confirming them, and a push land
-        // referencing content the server never actually confirmed it holds.
+        // This keeps the Part 2b characterization pin but flips its assertion
+        // to the corrected Part 2c behavior. A persistent local SlowDown must
+        // reach the existing fragment-walk overload arm before an offline
+        // remote fallback can replace its classification.
         with_fragmented_file_fixture(
             |repository,
              state_from,
              state_to,
              fault_store,
              root_address,
-             chunk_one_address,
-             chunk_two_address| async move {
+             _chunk_one_address,
+             _chunk_two_address| async move {
                 fault_store.arm_slow_down_get_for(root_address);
 
-                let fragments = collect_new_fragments(repository, state_from, state_to, true)
+                let err = collect_new_fragments(repository, state_from, state_to, true)
                     .await
-                    .expect(
-                        "This pins the CURRENT (buggy) behavior: a SlowDown on the \
-                         fragmented payload's own load is swallowed, not propagated, so \
-                         collect_new_fragments returns Ok rather than Err. If this starts \
-                         returning Err(SlowDown), the underlying gap has been fixed --  \
-                         update this test to assert propagation instead of deleting it.",
+                    .expect_err(
+                        "A SlowDown while loading a fragmented payload's own content must \
+                         propagate instead of silently dropping its child addresses",
                     );
 
                 assert!(
-                    fragments.contains(&root_address),
-                    "The fragmented payload's own address is still pushed unconditionally \
-                     (state.rs's push to `addresses` after the load_raw match is not gated \
-                     on load_raw's outcome) -- got: {fragments:?}"
-                );
-                assert!(
-                    !fragments.contains(&chunk_one_address)
-                        && !fragments.contains(&chunk_two_address),
-                    "INTEGRITY GAP (CR-021 part 2b swallow #2 is dead code on the server \
-                     path): expected both child addresses to be silently missing from the \
-                     result after a SlowDown on the root's own load, proving they never \
-                     reached verify_fragments -- got: {fragments:?}"
+                    err.is_slow_down(),
+                    "Expected StateError::SlowDown, got: {err:?}"
                 );
             },
         )
