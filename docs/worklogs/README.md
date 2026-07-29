@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 015 | 2026-07-29 | [Run upstream revision-tree integration suite after merge](015-run-upstream-revision-tree-integration-suite.md) |
 | 014 | 2026-07-29 | [Merge upstream (33 commits) into `tideshift/main`](014-merge-upstream-33-commits-into-tideshift-main.md) |
 | 013 | 2026-07-29 | [Preserve local-read overload classification (CR-021 Part 2c)](013-preserve-local-read-overload-cr021-part2c.md) |
 | 012 | 2026-07-29 | [Branch-push metadata and no-op side-effect suppression](012-branch-push-metadata-and-noop-suppression.md) |
