@@ -75,11 +75,17 @@ everything else auto-merged clean.
 
 `cargo test` at default `-j` in this workspace produces bogus `E0786 invalid metadata files` errors
 and rustc ICEs — a parallel-build race, not a code fault: the same targets build and pass
-one-at-a-time, and the failure reproduced even in a cold, fully isolated `CARGO_TARGET_DIR`. `-j 4`
-runs green. Two wrong diagnoses were burned before landing on this (a full C: drive, then
-target-dir contention with a concurrent session); the second wrong turn cost a `cargo clean -p` of
-five packages that discarded 57 GB of shared build artifacts. Worth remembering before re-diagnosing
-this from scratch next time it shows up.
+one-at-a-time, and the failure reproduced even in a cold, fully isolated `CARGO_TARGET_DIR` on a
+volume with room to spare. `-j 4` makes it much rarer but is not a cure — it recurred once at `-j 4`
+and then built clean on an immediate rerun, so rerun before believing a red run.
+
+Two causes were named before either was tested. C: really was at ~270 MB free, which is a plausible
+source of the truncated artifacts that started this and was worth clearing on its own merits; a
+concurrent session's `cargo` really was running. Neither survived the isolated-target-dir rerun as
+*the* explanation. The trap is that a contributing cause is the most convincing kind of wrong
+answer, because the evidence for it is real. The cheap discriminating experiment should have come
+before the expensive remediation: the second wrong turn cost a `cargo clean -p` of five packages
+that discarded 57 GB of shared build artifacts.
 
 ## Follow-ups created
 
