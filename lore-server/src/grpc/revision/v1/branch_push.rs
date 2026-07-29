@@ -143,6 +143,7 @@ pub async fn handler(
 
             let PushResult {
                 success,
+                advanced,
                 fast_forward_merged,
                 revision: resulting_revision,
                 revision_number,
@@ -158,9 +159,11 @@ pub async fn handler(
             )
             .await?;
 
-            instrument_provider
-                .counter("num_branches_pushed")
-                .add(1, &[]);
+            if advanced {
+                instrument_provider
+                    .counter("num_branches_pushed")
+                    .add(1, &[]);
+            }
 
             if !success {
                 let detail = if fast_forward_merge {
@@ -179,25 +182,27 @@ pub async fn handler(
                 return Err(Status::failed_precondition(detail));
             }
 
-            lore_spawn!({
-                let user_id = user_id.clone();
-                async move {
-                    notification
-                        .branch_pushed(
-                            repository_id,
-                            branch_id,
-                            &user_id,
-                            resulting_revision,
-                            revision_number,
-                        )
-                        .instrument(span!(Level::DEBUG, "publish_notification"))
-                        .await;
-                }
-                .in_current_span()
-            });
+            if advanced {
+                lore_spawn!({
+                    let user_id = user_id.clone();
+                    async move {
+                        notification
+                            .branch_pushed(
+                                repository_id,
+                                branch_id,
+                                &user_id,
+                                resulting_revision,
+                                revision_number,
+                            )
+                            .instrument(span!(Level::DEBUG, "publish_notification"))
+                            .await;
+                    }
+                    .in_current_span()
+                });
 
-            hook_ctx.set_revision_number(revision_number);
-            hook_dispatcher.spawn_post(HookPoint::BranchPush, hook_ctx);
+                hook_ctx.set_revision_number(revision_number);
+                hook_dispatcher.spawn_post(HookPoint::BranchPush, hook_ctx);
+            }
 
             let message = dispatch_response_message(
                 hook_dispatcher,
@@ -313,7 +318,9 @@ async fn other_branch_still_claims_name(
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
+    use std::time::Duration;
 
+    use async_trait::async_trait;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Hash;
     use lore_revision::branch;
@@ -323,12 +330,21 @@ mod test {
     use lore_revision::state;
     use lore_transport::grpc::REPOSITORY_ID_KEY;
     use opentelemetry::KeyValue;
+    use opentelemetry::metrics::Meter;
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
     use rand::random;
+    use tokio::sync::mpsc;
     use tonic::Request;
 
     use super::*;
     use crate::grpc::get_write_token;
+    use crate::hooks::Hook;
     use crate::hooks::HookDispatcher;
+    use crate::hooks::HookError;
     use crate::notification::testing::MockNotificationSender;
     use crate::store::test_store_create;
 
@@ -340,6 +356,84 @@ mod test {
         }
         fn labels(&self) -> &[KeyValue] {
             &[]
+        }
+    }
+
+    struct RecordingInstrumentProvider {
+        meter_provider: SdkMeterProvider,
+        exporter: InMemoryMetricExporter,
+    }
+
+    impl RecordingInstrumentProvider {
+        fn new() -> Self {
+            let exporter = InMemoryMetricExporter::default();
+            let meter_provider = SdkMeterProvider::builder()
+                .with_periodic_exporter(exporter.clone())
+                .build();
+            Self {
+                meter_provider,
+                exporter,
+            }
+        }
+
+        fn counter_value(&self, name: &str) -> u64 {
+            self.meter_provider
+                .force_flush()
+                .expect("metric flush should succeed");
+            let expected_name = format!("{}.{}", self.namespace(), name);
+            let values: Vec<u64> = self
+                .exporter
+                .get_finished_metrics()
+                .expect("metrics should be exported")
+                .iter()
+                .flat_map(|resource| resource.scope_metrics())
+                .flat_map(|scope| scope.metrics())
+                .filter(|metric| metric.name() == expected_name)
+                .map(|metric| match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                        sum.data_points().map(|point| point.value()).sum()
+                    }
+                    data => panic!("expected u64 sum metric, got {data:?}"),
+                })
+                .collect();
+            assert_eq!(
+                values.len(),
+                1,
+                "expected exactly one exported {expected_name} metric"
+            );
+            values[0]
+        }
+    }
+
+    impl InstrumentProvider for RecordingInstrumentProvider {
+        fn namespace(&self) -> &'static str {
+            "test"
+        }
+
+        fn meter(&self) -> Meter {
+            self.meter_provider.meter(self.namespace())
+        }
+    }
+
+    struct RecordingPostHook {
+        sender: mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait]
+    impl Hook for RecordingPostHook {
+        fn name(&self) -> &'static str {
+            "recording-post"
+        }
+
+        fn hook_points(&self) -> &'static [HookPoint] {
+            &[HookPoint::BranchPush]
+        }
+
+        async fn post_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
+            self.sender
+                .send(())
+                .expect("post-hook observation receiver dropped");
+            Ok(())
         }
     }
 
@@ -692,17 +786,19 @@ mod test {
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
 
-        // Notification fires once on the actual push; the no-op repush
-        // hits the early-return path inside `push()` (branch latest == incoming)
-        // which still reports success but doesn't re-publish the
-        // notification — see push() body.
+        let (notification_tx, mut notification_rx) = mpsc::unbounded_channel();
+        let notification_observer = notification_tx.clone();
         let mut notification_sender = MockNotificationSender::new();
         notification_sender
             .expect_branch_pushed()
-            .times(2)
-            .returning(|_, _, _, _, _| ());
+            .times(1)
+            .returning(move |_, _, _, _, _| {
+                notification_observer
+                    .send(())
+                    .expect("notification observation receiver dropped");
+            });
         let notification_sender = Arc::new(notification_sender);
-        let instrument_provider = TestInstrumentProvider {};
+        let instrument_provider = RecordingInstrumentProvider::new();
 
         Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
             let repository_context = Arc::new(RepositoryContext::new_server_context(
@@ -713,7 +809,11 @@ mod test {
             let main = create_root_branch(&repository_context, "main").await;
             let revision = build_revision(&repository_context, Hash::default(), 1).await;
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let (hook_tx, mut hook_rx) = mpsc::unbounded_channel();
+            let hook_dispatcher = HookDispatcher::from_hooks_default(vec![(
+                "recording-post".to_string(),
+                Box::new(RecordingPostHook { sender: hook_tx }),
+            )]);
             handler(
                 make_request(repository, main, revision, false, false),
                 immutable_store.clone(),
@@ -727,6 +827,14 @@ mod test {
             )
             .await
             .expect("first push should succeed");
+            notification_rx
+                .recv()
+                .await
+                .expect("advancing push should publish a notification");
+            hook_rx
+                .recv()
+                .await
+                .expect("advancing push should dispatch a post-hook");
 
             // Re-pushing the same revision returns success with the same latest.
             let response = handler(
@@ -745,6 +853,24 @@ mod test {
             let inner = response.into_inner();
             assert_eq!(inner.revision_signature, bytes::Bytes::from(revision));
             assert!(!inner.fast_forward_merged);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), notification_rx.recv())
+                    .await
+                    .is_err(),
+                "no-op re-push published a notification"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), hook_rx.recv())
+                    .await
+                    .is_err(),
+                "no-op re-push dispatched a post-hook"
+            );
+            assert_eq!(
+                instrument_provider.counter_value("num_branches_pushed"),
+                1,
+                "only the advancing push should increment num_branches_pushed"
+            );
+            drop(notification_tx);
         }))
         .await;
     }

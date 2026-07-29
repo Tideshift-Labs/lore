@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 012 | 2026-07-29 | [Branch-push metadata and no-op side-effect suppression](012-branch-push-metadata-and-noop-suppression.md) |
 | 011 | 2026-07-26 | [lore-postgres: report infra-gated tests as ignored, not passed](011-lore-postgres-ignore-infra-gated-tests.md) |
 | 010 | 2026-07-26 | [Add RepositoryStorageStats, a per-repo stored-bytes RPC (CR-016)](010-repository-storage-stats-cr016.md) |
 | 009 | 2026-07-25 | [Report an overloaded store from the fragment walk (CR-021 Part 2b)](009-fragment-walk-overload-honesty-cr021-part2b.md) |

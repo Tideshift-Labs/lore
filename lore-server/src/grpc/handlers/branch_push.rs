@@ -162,6 +162,7 @@ pub async fn handler(
 
             let PushResult {
                 success,
+                advanced,
                 fast_forward_merged,
                 revision,
                 revision_number,
@@ -177,7 +178,7 @@ pub async fn handler(
             )
             .await?;
 
-            if success {
+            if advanced {
                 lore_spawn!({
                     let user_id = user_id.clone();
                     async move {
@@ -200,8 +201,10 @@ pub async fn handler(
                 hook_dispatcher.spawn_post(HookPoint::BranchPush, hook_ctx);
             }
 
-            let num_branches_pushed = instrument_provider.counter("num_branches_pushed");
-            num_branches_pushed.add(1, &[]);
+            if advanced {
+                let num_branches_pushed = instrument_provider.counter("num_branches_pushed");
+                num_branches_pushed.add(1, &[]);
+            }
 
             let message = if success {
                 dispatch_response_message(
@@ -286,6 +289,9 @@ pub(crate) async fn dispatch_response_message(
 
 pub struct PushResult {
     pub success: bool,
+    /// Whether this call moved the branch head. A successful push of the
+    /// current head is an idempotent no-op and must not emit push side effects.
+    pub advanced: bool,
     pub fast_forward_merged: bool,
     pub revision: Hash,
     pub revision_number: u64,
@@ -351,6 +357,7 @@ pub async fn push(
     if current_head == latest {
         return Ok(PushResult {
             success: true,
+            advanced: false,
             fast_forward_merged: false,
             revision: current_head,
             revision_number: state.revision_number(),
@@ -369,6 +376,7 @@ pub async fn push(
             if !fast_forward_merge {
                 return Ok(PushResult {
                     success: false,
+                    advanced: false,
                     fast_forward_merged: false,
                     revision: current_head,
                     revision_number: 0,
@@ -459,6 +467,7 @@ pub async fn push(
 
     Ok(PushResult {
         success: true,
+        advanced: true,
         fast_forward_merged: false,
         revision: current_head,
         revision_number: state.revision_number(),
@@ -541,6 +550,7 @@ async fn try_fast_forward_merge(
             );
             return Ok(PushResult {
                 success: false,
+                advanced: false,
                 fast_forward_merged: false,
                 revision: current_head,
                 revision_number: 0,
@@ -664,6 +674,7 @@ async fn try_fast_forward_merge(
 
             return Ok(PushResult {
                 success: true,
+                advanced: true,
                 fast_forward_merged: true,
                 revision: new_revision,
                 revision_number,
@@ -917,6 +928,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -925,6 +937,7 @@ mod tests {
     use lore_base::types::Context;
     use lore_base::types::Fragment;
     use lore_base::types::Partition;
+    use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
     use lore_revision::node::Node;
     use lore_revision::node::ROOT_NODE;
     use lore_storage::ImmutableStore;
@@ -933,12 +946,151 @@ mod tests {
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use lore_storage::local::immutable_store::LocalImmutableStore;
+    use lore_transport::grpc::REPOSITORY_ID_KEY;
+    use opentelemetry::metrics::Meter;
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
+    use rand::random;
+    use tokio::sync::mpsc;
     use tonic::Request;
     use tonic::metadata::MetadataValue;
     use tonic::transport::server::TcpConnectInfo;
 
     use super::*;
     use crate::grpc::get_write_token;
+    use crate::hooks::Hook;
+    use crate::hooks::HookError;
+    use crate::notification::testing::MockNotificationSender;
+    use crate::store::test_store_create;
+
+    struct RecordingInstrumentProvider {
+        meter_provider: SdkMeterProvider,
+        exporter: InMemoryMetricExporter,
+    }
+
+    impl RecordingInstrumentProvider {
+        fn new() -> Self {
+            let exporter = InMemoryMetricExporter::default();
+            let meter_provider = SdkMeterProvider::builder()
+                .with_periodic_exporter(exporter.clone())
+                .build();
+            Self {
+                meter_provider,
+                exporter,
+            }
+        }
+
+        fn counter_value(&self, name: &str) -> u64 {
+            self.meter_provider
+                .force_flush()
+                .expect("metric flush should succeed");
+            let expected_name = format!("{}.{}", self.namespace(), name);
+            let values: Vec<u64> = self
+                .exporter
+                .get_finished_metrics()
+                .expect("metrics should be exported")
+                .iter()
+                .flat_map(|resource| resource.scope_metrics())
+                .flat_map(|scope| scope.metrics())
+                .filter(|metric| metric.name() == expected_name)
+                .map(|metric| match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                        sum.data_points().map(|point| point.value()).sum()
+                    }
+                    data => panic!("expected u64 sum metric, got {data:?}"),
+                })
+                .collect();
+            assert_eq!(
+                values.len(),
+                1,
+                "expected exactly one exported {expected_name} metric"
+            );
+            values[0]
+        }
+    }
+
+    impl InstrumentProvider for RecordingInstrumentProvider {
+        fn namespace(&self) -> &'static str {
+            "test"
+        }
+
+        fn meter(&self) -> Meter {
+            self.meter_provider.meter(self.namespace())
+        }
+    }
+
+    struct RecordingPostHook {
+        sender: mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait]
+    impl Hook for RecordingPostHook {
+        fn name(&self) -> &'static str {
+            "recording-post"
+        }
+
+        fn hook_points(&self) -> &'static [HookPoint] {
+            &[HookPoint::BranchPush]
+        }
+
+        async fn post_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
+            self.sender
+                .send(())
+                .expect("post-hook observation receiver dropped");
+            Ok(())
+        }
+    }
+
+    async fn create_root_branch(
+        repository_context: &Arc<RepositoryContext>,
+        name: &str,
+    ) -> BranchId {
+        let write_token = get_write_token();
+        lore_revision::branch::create(
+            repository_context.clone(),
+            &write_token,
+            BranchId::from(uuid::Uuid::now_v7()),
+            name,
+            branch::default_category(),
+            "test-creator",
+            1,
+            vec![],
+            false,
+            false,
+        )
+        .await
+        .expect("Could not create root branch")
+    }
+
+    async fn build_revision(repository_context: &Arc<RepositoryContext>) -> Hash {
+        let state = State::new();
+        state.set_revision_number(1);
+        state
+            .serialize(repository_context.clone(), &get_write_token())
+            .await
+            .expect("Failed to serialize state")
+    }
+
+    fn make_request(
+        repository: RepositoryId,
+        branch: BranchId,
+        revision: Hash,
+    ) -> Request<BranchPushRequest> {
+        let mut request = Request::new(BranchPushRequest {
+            branch: branch.into(),
+            revision: revision.into(),
+            force: false,
+            fast_forward_merge: false,
+        });
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+        request
+    }
 
     #[test]
     fn use_x_forwarded_when_available() {
@@ -1016,6 +1168,100 @@ mod tests {
             extract_client_ip(&req),
             Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)))
         );
+    }
+
+    #[tokio::test]
+    async fn no_op_push_does_not_repeat_notification_or_post_hook() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let (notification_tx, mut notification_rx) = mpsc::unbounded_channel();
+        let notification_observer = notification_tx.clone();
+        let mut notification_sender = MockNotificationSender::new();
+        notification_sender
+            .expect_branch_pushed()
+            .times(1)
+            .returning(move |_, _, _, _, _| {
+                notification_observer
+                    .send(())
+                    .expect("notification observation receiver dropped");
+            });
+        let notification_sender = Arc::new(notification_sender);
+        let instrument_provider = RecordingInstrumentProvider::new();
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main").await;
+            let revision = build_revision(&repository_context).await;
+
+            let (hook_tx, mut hook_rx) = mpsc::unbounded_channel();
+            let hook_dispatcher = HookDispatcher::from_hooks_default(vec![(
+                "recording-post".to_string(),
+                Box::new(RecordingPostHook { sender: hook_tx }),
+            )]);
+
+            let first = handler(
+                make_request(repository, main, revision),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &instrument_provider,
+                None,
+            )
+            .await
+            .expect("first push should succeed");
+            assert!(first.into_inner().success);
+            notification_rx
+                .recv()
+                .await
+                .expect("advancing push should publish a notification");
+            hook_rx
+                .recv()
+                .await
+                .expect("advancing push should dispatch a post-hook");
+
+            let repeated = handler(
+                make_request(repository, main, revision),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &instrument_provider,
+                None,
+            )
+            .await
+            .expect("no-op re-push should succeed");
+            assert!(repeated.into_inner().success);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), notification_rx.recv())
+                    .await
+                    .is_err(),
+                "no-op re-push published a notification"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), hook_rx.recv())
+                    .await
+                    .is_err(),
+                "no-op re-push dispatched a post-hook"
+            );
+            assert_eq!(
+                instrument_provider.counter_value("num_branches_pushed"),
+                1,
+                "only the advancing push should increment num_branches_pushed"
+            );
+            drop(notification_tx);
+        }))
+        .await;
     }
 
     /// Wraps a real, in-memory `LocalImmutableStore` and, once armed, returns
