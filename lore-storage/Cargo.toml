@@ -44,5 +44,8 @@ failure_generator = []
 oodle = []
 trace_log = []
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [target.'cfg(target_family = "windows")'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }

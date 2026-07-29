@@ -244,6 +244,7 @@ mod tests {
         slow_down_all_queries: AtomicBool,
         generic_fail_all_queries: AtomicBool,
         slow_down_query_addresses: RwLock<BTreeSet<Address>>,
+        slow_down_get_addresses: RwLock<BTreeSet<Address>>,
     }
 
     impl FaultInjectingStore {
@@ -253,6 +254,7 @@ mod tests {
                 slow_down_all_queries: AtomicBool::new(false),
                 generic_fail_all_queries: AtomicBool::new(false),
                 slow_down_query_addresses: RwLock::new(BTreeSet::new()),
+                slow_down_get_addresses: RwLock::new(BTreeSet::new()),
             })
         }
 
@@ -271,6 +273,15 @@ mod tests {
         /// every other address delegates normally.
         fn arm_slow_down_query_for(&self, address: Address) {
             self.slow_down_query_addresses
+                .write()
+                .unwrap()
+                .insert(address);
+        }
+
+        /// `get()` calls for this specific address return `StoreError::SlowDown`;
+        /// every other address delegates normally.
+        fn arm_slow_down_get_for(&self, address: Address) {
+            self.slow_down_get_addresses
                 .write()
                 .unwrap()
                 .insert(address);
@@ -335,6 +346,14 @@ mod tests {
             address: Address,
             match_required: StoreMatch,
         ) -> Result<(Fragment, Bytes), StoreError> {
+            if self
+                .slow_down_get_addresses
+                .read()
+                .unwrap()
+                .contains(&address)
+            {
+                return Err(StoreError::from(SlowDown));
+            }
             self.inner
                 .clone()
                 .get(partition, address, match_required)
@@ -650,20 +669,18 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// Stores two raw chunks plus a `PayloadFragmented` fragment-reference list
-    /// pointing at them, returning `(root_address, chunk_two_address)`. Mirrors
-    /// `store_as_legacy_chunks` in the `is_file_modified_chunking_compat` module
-    /// below, but returns the second chunk's address too so a test can target
-    /// it specifically for fault injection.
+    /// Stores two raw chunks plus a `PayloadFragmented` fragment-reference list,
+    /// returning both child addresses for targeted fault injection.
     async fn store_two_chunk_fragmented_payload(
         repository: &Arc<RepositoryContext>,
         context: Context,
-    ) -> (Address, Address, u64) {
+    ) -> (Address, Address, Address, u64) {
         let chunk_one: &[u8] = b"first-chunk-of-a-fragmented-payload------------";
         let chunk_two: &[u8] = b"second-chunk-of-a-fragmented-payload-----------";
 
         let mut refs = Vec::with_capacity(2);
         let mut offset: u64 = 0;
+        let mut chunk_one_address = Address::default();
         let mut chunk_two_address = Address::default();
         for (index, chunk) in [chunk_one, chunk_two].into_iter().enumerate() {
             let chunk_bytes = Bytes::copy_from_slice(chunk);
@@ -685,7 +702,9 @@ mod tests {
             .await
             .expect("Failed to store chunk fragment");
 
-            if index == 1 {
+            if index == 0 {
+                chunk_one_address = address;
+            } else {
                 chunk_two_address = address;
             }
 
@@ -722,7 +741,12 @@ mod tests {
         .await
         .expect("Failed to store fragment list");
 
-        (root_address, chunk_two_address, content_size)
+        (
+            root_address,
+            chunk_one_address,
+            chunk_two_address,
+            content_size,
+        )
     }
 
     /// Builds `state_to` with a single new file node whose content is a
@@ -736,6 +760,7 @@ mod tests {
                 Arc<State>,
                 Arc<State>,
                 Arc<FaultInjectingStore>,
+                Address,
                 Address,
                 Address,
             ) -> Fut
@@ -788,7 +813,7 @@ mod tests {
                     .expect("Failed to deserialize state");
 
                 let content_context: Context = rand::random();
-                let (root_address, chunk_two_address, content_size) =
+                let (root_address, chunk_one_address, chunk_two_address, content_size) =
                     store_two_chunk_fragmented_payload(&repository, content_context).await;
 
                 let name = "fragmented-file.bin";
@@ -817,6 +842,7 @@ mod tests {
                     state_to,
                     fault_store,
                     root_address,
+                    chunk_one_address,
                     chunk_two_address,
                 )
                 .await
@@ -825,35 +851,77 @@ mod tests {
             .expect("Test task failed")
     }
 
-    // NOTE on swallow #2 (a SlowDown while loading a fragmented payload's own
-    // content, i.e. `immutable::load_raw`'s `Err(ImmutableError::SlowDown(_))`
-    // arm): this file does not carry a dedicated test for it, and the omission
-    // is deliberate — see the "swallow #2 blocked" note in the test-specialist
-    // report for why a local-only fixture cannot reach it (a `get()` SlowDown
-    // gets superseded by `lore_storage::read::load_fragment`'s remote fallback,
-    // which is enabled by default and — with this fixture's `Err(NoRemote)`
-    // repository — resolves to a `NoRemote`-shaped error before
-    // `collect_new_addresses` ever sees the original `SlowDown`). Swallow #3
-    // below (a child fragment's own `query()`, called directly with no
-    // fallback layer in between) exercises the same idiom without that
-    // obstruction.
-
     #[tokio::test]
     async fn collect_new_fragments_propagates_slow_down_from_fragmented_payload_child() {
         // Swallow #3: a SlowDown while recursing into one of a fragmented
         // payload's children must propagate rather than silently dropping
         // that (and every sibling) child from the result.
         with_fragmented_file_fixture(
-            |repository, state_from, state_to, fault_store, _root_address, chunk_two_address| async move {
+            |repository,
+             state_from,
+             state_to,
+             fault_store,
+             _root_address,
+             _chunk_one_address,
+             chunk_two_address| async move {
                 fault_store.arm_slow_down_query_for(chunk_two_address);
 
-                let result =
-                    collect_new_fragments(repository, state_from, state_to, true).await;
+                let result = collect_new_fragments(repository, state_from, state_to, true).await;
 
                 let err = result.expect_err(
                     "Expected collect_new_fragments to propagate a SlowDown hit on a \
                      fragmented payload's child fragment",
                 );
+                assert!(
+                    err.is_slow_down(),
+                    "Expected StateError::SlowDown, got: {err:?}"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn collect_new_fragments_fragmented_walk_yields_child_addresses_when_unarmed() {
+        with_fragmented_file_fixture(
+            |repository,
+             state_from,
+             state_to,
+             _fault_store,
+             root_address,
+             chunk_one_address,
+             chunk_two_address| async move {
+                let fragments = collect_new_fragments(repository, state_from, state_to, true)
+                    .await
+                    .expect("Unarmed fragmented-payload walk must not itself return an error");
+
+                assert!(fragments.contains(&root_address));
+                assert!(fragments.contains(&chunk_one_address));
+                assert!(fragments.contains(&chunk_two_address));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn collect_new_fragments_swallows_slow_down_from_own_fragmented_payload_load() {
+        with_fragmented_file_fixture(
+            |repository,
+             state_from,
+             state_to,
+             fault_store,
+             root_address,
+             _chunk_one_address,
+             _chunk_two_address| async move {
+                fault_store.arm_slow_down_get_for(root_address);
+
+                let err = collect_new_fragments(repository, state_from, state_to, true)
+                    .await
+                    .expect_err(
+                        "A SlowDown while loading a fragmented payload's own content must \
+                         propagate instead of silently dropping its child addresses",
+                    );
+
                 assert!(
                     err.is_slow_down(),
                     "Expected StateError::SlowDown, got: {err:?}"
