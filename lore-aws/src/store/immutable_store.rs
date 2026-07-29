@@ -592,6 +592,23 @@ fn metadata_load_error(error: AwsError<SdkError<GetItemError>>) -> StoreError {
     }
 }
 
+fn s3_payload_load_error(error: AwsError<SdkError<GetObjectError>>, hash: Hash) -> StoreError {
+    match &error {
+        AwsError::AwsSdkError(sdk_error)
+            if matches!(
+                sdk_error.as_service_error(),
+                Some(GetObjectError::NoSuchKey(_))
+            ) =>
+        {
+            StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
+        }
+        AwsError::AwsSdkError(sdk_error) if is_retryable_sdk_error(sdk_error) => {
+            StoreError::from(SlowDown)
+        }
+        _ => StoreError::internal_with_context(error, "S3 get object failed"),
+    }
+}
+
 pub struct AwsImmutableStore {
     s3: S3,
     dynamodb: DynamoDb,
@@ -1630,18 +1647,8 @@ impl AwsImmutableStore {
             )
             .await
             .map_err(|e| {
-                if let AwsError::AwsSdkError(sdk_error) = e {
-                    debug!(hash = %hash, error = ?sdk_error, "get_s3_payload SDK error getting object");
-                    match sdk_error.into_service_error() {
-                        GetObjectError::NoSuchKey(_) => StoreError::from(AddressNotFound::from(
-                            Address::zero_context_hash(hash),
-                        )),
-                        _ => StoreError::from(SlowDown),
-                    }
-                } else {
-                    debug!(hash = %hash, error = ?e, "get_s3_payload failed to get object");
-                    StoreError::internal_with_context(e, "S3 get object failed")
-                }
+                debug!(hash = %hash, error = ?e, "get_s3_payload failed to get object");
+                s3_payload_load_error(e, hash)
             })?;
 
         // The Content-Length header arrives with the response before the body is streamed.
