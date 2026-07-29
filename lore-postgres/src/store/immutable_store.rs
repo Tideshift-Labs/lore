@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! Postgres-backed immutable store (CR-007) — fragment **metadata** in Postgres,
 //! fragment **bytes** in S3-compatible object storage (e.g. DO Spaces, MinIO).
@@ -27,11 +28,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::operation::get_object::GetObjectError;
 use bytes::Bytes;
 use bytes::BytesMut;
 use deadpool_postgres::Pool;
 use deadpool_postgres::PoolError;
 use lore_aws::aws_error::AwsError;
+use lore_aws::aws_error::is_retryable_sdk_error;
 use lore_aws::clients::AwsClientBuilder;
 use lore_aws::clients::HttpClientSettings;
 use lore_aws::clients::TimeoutConfig;
@@ -466,19 +470,11 @@ impl PostgresImmutableStore {
     /// `AddressNotFound` so a missing payload reads as a self-healing miss.
     async fn get_payload_bytes(&self, hash: Hash) -> Result<Bytes, StoreError> {
         let key = Self::hash_key(hash);
-        let mut output =
-            self.s3
-                .get_object(&self.bucket, &key, None)
-                .await
-                .map_err(|e| match e {
-                    AwsError::AwsSdkError(sdk_error) => match sdk_error.into_service_error() {
-                        aws_sdk_s3::operation::get_object::GetObjectError::NoSuchKey(_) => {
-                            Self::not_found(hash)
-                        }
-                        _ => StoreError::from(SlowDown),
-                    },
-                    other => StoreError::internal(format!("S3 get object failed: {other:?}")),
-                })?;
+        let mut output = self
+            .s3
+            .get_object(&self.bucket, &key, None)
+            .await
+            .map_err(|e| s3_payload_load_error(e, hash))?;
 
         let mut buffer = BytesMut::with_capacity(FRAGMENT_SIZE_THRESHOLD);
         while let Some(chunk) = output.body.next().await {
@@ -531,6 +527,23 @@ fn pool_err(e: PoolError) -> StoreError {
         StoreError::from(SlowDown)
     } else {
         StoreError::internal(format!("postgres immutable store pool: {e}"))
+    }
+}
+
+fn s3_payload_load_error(error: AwsError<SdkError<GetObjectError>>, hash: Hash) -> StoreError {
+    match &error {
+        AwsError::AwsSdkError(sdk_error)
+            if matches!(
+                sdk_error.as_service_error(),
+                Some(GetObjectError::NoSuchKey(_))
+            ) =>
+        {
+            PostgresImmutableStore::not_found(hash)
+        }
+        AwsError::AwsSdkError(sdk_error) if is_retryable_sdk_error(sdk_error) => {
+            StoreError::from(SlowDown)
+        }
+        _ => StoreError::internal_with_context(error, "S3 get object failed"),
     }
 }
 
@@ -934,5 +947,78 @@ impl ImmutableStore for PostgresImmutableStore {
             payload_bytes: read("payload_bytes")?,
             content_bytes: read("content_bytes")?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_sdk_s3::config::http::HttpResponse;
+    use aws_sdk_s3::error::ErrorMetadata;
+    use aws_sdk_s3::operation::get_object::GetObjectError;
+    use aws_sdk_s3::primitives::SdkBody;
+    use aws_sdk_s3::types::error::NoSuchKey;
+    use rand::random;
+
+    use super::*;
+
+    fn service_error(error: GetObjectError, status: u16) -> AwsError<SdkError<GetObjectError>> {
+        AwsError::AwsSdkError(SdkError::service_error(
+            error,
+            HttpResponse::new(status.try_into().unwrap(), SdkBody::empty()),
+        ))
+    }
+
+    #[test]
+    fn s3_payload_load_error_no_such_key_is_address_not_found() {
+        let error = service_error(
+            GetObjectError::NoSuchKey(
+                NoSuchKey::builder()
+                    .meta(ErrorMetadata::builder().code("NoSuchKey").build())
+                    .build(),
+            ),
+            404,
+        );
+
+        let error = s3_payload_load_error(error, random::<Hash>());
+
+        assert!(
+            error.is_address_not_found(),
+            "expected AddressNotFound, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn s3_payload_load_error_retryable_timeout_is_slow_down() {
+        let error = AwsError::AwsSdkError(SdkError::timeout_error(std::io::Error::other(
+            "injected timeout",
+        )));
+
+        let error = s3_payload_load_error(error, random::<Hash>());
+
+        assert!(error.is_slow_down(), "expected SlowDown, got {error:?}");
+    }
+
+    #[test]
+    fn s3_payload_load_error_permanent_service_errors_are_internal() {
+        for (code, status) in [("AccessDenied", 403), ("NoSuchBucket", 404)] {
+            let error = service_error(
+                GetObjectError::generic(ErrorMetadata::builder().code(code).build()),
+                status,
+            );
+
+            let error = s3_payload_load_error(error, random::<Hash>());
+
+            assert!(
+                error.is_internal(),
+                "expected {code} ({status}) to map to Internal, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn s3_payload_load_error_non_sdk_error_is_internal() {
+        let error = s3_payload_load_error(AwsError::JoinError, random::<Hash>());
+
+        assert!(error.is_internal(), "expected Internal, got {error:?}");
     }
 }

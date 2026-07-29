@@ -54,8 +54,9 @@ the next run starts from the map instead of rediscovering it.
   `get_by_id_*_protected_*` tests near the bottom of the file, calling `handler(...)` directly (not
   `branch_get_implementation`) so they also exercise the forwarding seam.
   `cargo test -p lore-server --lib -- grpc::revision::v1::branch_get`.
-- **CR-007 (Postgres stores)** — `lore-postgres/`. Only 2 real unit tests in `src/` (`pool::tests::*`);
-  the meat is in `tests/{lock_store,mutable_store,immutable_store,concurrency}.rs` (18 tests total),
+- **CR-007 (Postgres stores)** — `lore-postgres/`. Six offline unit tests live in `src/`
+  (`pool::tests::*` plus the four S3 classification controls); the live-service tier is in
+  `tests/{lock_store,mutable_store,immutable_store,concurrency}.rs`,
   gated on `LORE_TEST_PG_URL`/`LORE_TEST_S3_ENDPOINT`/`LORE_TEST_S3_BUCKET`. **As of 2026-07-26
   (commit `758e340`) these are `#[ignore]`d**, so `cargo test -p lore-postgres --tests` correctly
   reports `18 ignored` with no infra running; run `cargo test -p lore-postgres --tests -- --ignored`
@@ -65,6 +66,11 @@ the next run starts from the map instead of rediscovering it.
   `lorehub/docs/learnings/prefer-an-executable-check-over-a-source-read-verdict.md`.) A local
   Postgres for this is `integration-harness`'s `postgres-cell-pg` compose profile, or an ad hoc
   `docker run` (see the CR-016 entry below for the exact commands).
+  S3 read-error classification is a separate offline unit tier in
+  `store::immutable_store::tests::s3_payload_load_error_*`: modeled `NoSuchKey` stays
+  `AddressNotFound`, retryable SDK failures become `SlowDown`, and permanent/non-SDK failures become
+  `Internal`. Run `cargo test -p lore-postgres --lib s3_payload_load_error`; no Postgres or S3
+  endpoint is required.
 - **lore-aws (DynamoBucketResolver / per-tenant isolation)** — `lore-aws/src/store/`. Unit tests run
   fully offline (mocked SDK clients), `cargo test -p lore-aws --lib`: 86 passed, 2 `#[ignore]`d
   (`test_put_immutable_partial*`, need real S3 multipart) — pre-existing ignores, not ours.
