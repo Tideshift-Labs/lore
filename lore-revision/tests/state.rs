@@ -1,5 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
+#[ctor::ctor]
+fn init_test_policies() {
+    let _ = lore_storage::STORE_RETRY_ATTEMPTS.set(1);
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
@@ -447,18 +453,6 @@ mod tests {
         Fut: std::future::Future<Output = T> + Send,
         T: Send + 'static,
     {
-        // `lore_storage::read::read_raw` retries a `SlowDown` internally
-        // (default: up to 60 attempts, backoff capped at 10s) before giving
-        // up — the patient client policy, sized for a real overloaded
-        // server. A test that deliberately keeps a fault armed would
-        // otherwise wait for that full exhaustion (minutes) before observing
-        // the propagated error. Pin it to the fast policy `lore-server`
-        // itself assumes in tests (`lore-server/src/lib.rs`'s
-        // `init_test_policies`), scoped to this test binary via the shared
-        // `OnceLock` (first setter in the process wins; harmless to the
-        // other, non-fault-injecting tests in this file).
-        let _ = lore_storage::STORE_RETRY_ATTEMPTS.set(1);
-
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
         let repository_id = Context::from(uuid::Uuid::now_v7());
@@ -769,10 +763,6 @@ mod tests {
         Fut: std::future::Future<Output = T> + Send,
         T: Send + 'static,
     {
-        // See `with_slow_down_fixture` above: pin the fast retry policy so a
-        // fault stays cheap to observe.
-        let _ = lore_storage::STORE_RETRY_ATTEMPTS.set(1);
-
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
         let repository_id = Context::from(uuid::Uuid::now_v7());
@@ -904,7 +894,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_new_fragments_swallows_slow_down_from_own_fragmented_payload_load() {
+    async fn collect_new_fragments_propagates_slow_down_from_own_fragmented_payload_load() {
         with_fragmented_file_fixture(
             |repository,
              state_from,
