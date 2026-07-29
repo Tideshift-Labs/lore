@@ -783,6 +783,27 @@ the next run starts from the map instead of rediscovering it.
     referenced address actually confirmed durable). Swallow #3 (a *child* fragment's own `query()`,
     no `load_fragment`/remote-fallback layer in the way) is unaffected and does propagate correctly
     — see `collect_new_fragments_propagates_slow_down_from_fragmented_payload_child`.
+- **2026-07-29 upstream-sync ITEM 2 integration evidence (docs-only, mixed classification).**
+  Upstream commit `fe9a1c7` added `lore-integration-tests/src/revision_tree_test.rs`; this sync
+  evidence entry records post-merge execution and adds no runtime delta. Related fork evidence
+  remains classified as CR-008 **[SERVER]**, CR-021 Part 2b **[CLIENT]-relevant**, and CR-021
+  Part 2c **[CLIENT]**.
+  Symptom: the crate name suggests a live loreserver/cloud tier. Cause: this suite opens
+  `LoreStorageOpenArgs { in_memory: 1, .. }` and drives the merged public revision-tree API directly.
+  What to do: run `cargo test -p lore-integration-tests revision_tree_test -j 4`; it needs no
+  loreserver, MinIO, DynamoDB, or Consul and passes 14/14 (0 failed/ignored, 113 filtered).
+  `cargo test -p lore-integration-tests -j 4` passes 126, with one honest benchmark
+  `#[ignore]` (`put_batch_api_within_overhead_budget_of_direct_write_content`) and 0 doc tests;
+  the full suite also passed after Clippy. `cargo +nightly fmt --all` exits 0 with no diff, and
+  `cargo clippy -p lore-integration-tests -j 4 -- -D warnings --no-deps` exits 0 with only benign
+  Cargo build-script warnings about the missing installed Lore binary. Honesty audit: AWS/gRPC
+  suites are compile-time feature-gated, Consul cases are explicit `#[ignore]`, and the only
+  `return Ok(())` sites are idempotent bucket/table-exists setup, not silent infra skips. The
+  14-test revision-tree suite covers batch fan-out, event ordering, multi-level and mixed-parent
+  batches, concurrent batches, atomic rejection/error cases, entry-field round-trip including
+  `size = 4096`, and a batch larger than one node block. The size assertion stops below CR-008's
+  server proto/handler and aggregate-size paths, and the suite does **not** inject `SlowDown`;
+  established CR-specific tests own those direct assertions.
 
 ---
 
