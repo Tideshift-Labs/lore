@@ -745,11 +745,23 @@ the next run starts from the map instead of rediscovering it.
     needs no remote/session mock at all: `FaultInjectingStore::arm_slow_down_get_for(root_address)`
     (new method, mirrors `arm_slow_down_query_for`) plus asserting on which addresses are **absent**
     from `collect_new_fragments`'s `Ok(_)` result, not on the `Err` path.
-    `collect_new_fragments_swallows_slow_down_from_own_fragmented_payload_load` — green, and it
-    **pins the current, buggy swallow**: the call returns `Ok`, contains the root address, and is
-    missing both children. It's a discriminating regression guard, not a "this is fine" test — if
-    the underlying gap is ever fixed, its `Err`-vs-`Ok` and contains/absent assertions flip and need
-    updating, not deleting.
+    `collect_new_fragments_swallows_slow_down_from_own_fragmented_payload_load` originally pinned
+    the buggy `Ok` result with both children missing. CR-021 Part 2c keeps the test and flips it to
+    require `Err` + `StateError::SlowDown` after `lore-storage::read::load_fragment` preserves a
+    primary/local `StorageError::SlowDown` before remote fallback.
+  - **CR-021 Part 2c read-layer controls ([CLIENT])** — `lore-storage/src/read.rs::tests` wraps a
+    real `LocalImmutableStore` and injects `StoreError::SlowDown` or a generic deserialize-shaped
+    failure from `get()`. Coverage:
+    `cargo test -p lore-storage --lib -- read::tests::` and
+    `cargo test -p lore-revision --test state
+    tests::collect_new_fragments_swallows_slow_down_from_own_fragmented_payload_load -- --exact`.
+    Symptom: expecting an offline pending `StorageSession` to expose `NoRemote` after a genuine
+    local miss or generic local read failure makes both controls fail. Cause: the existing fallback
+    normalizes those cases to `StorageError::AddressNotFound`. What to do: pin `SlowDown` only for
+    the overload injection; pin `AddressNotFound` for genuine absence and generic deserialize
+    failure, including the offline-session shape. Genuine Postgres not-found remains
+    `AddressNotFound`; transient Postgres DB/pool/S3 `SlowDown` is now preserved by the same shared
+    read boundary.
   - **Verdict on the lore-reviewer-vs-testing-guide disagreement (resolved 2026-07-26, executable
     check not a source read): the reviewer was right, this file's prior source-read note was
     correct too but incomplete — same underlying fact, viewed from "can I test propagation" instead
@@ -1030,7 +1042,7 @@ the next run starts from the map instead of rediscovering it.
      want to fail — build the fixture state fully against the store behaving normally, *then* arm
      the fault, *then* call the code under test. This is the only one of the three that composes
      with real `node_add`/`serialize`/`deserialize`.
-- **A `SlowDown`-injecting test can silently take ~9 minutes unless the retry count is pinned.**
+- **A `SlowDown`-injecting test can silently take ~9 minutes unless backoff time is controlled.**
   Symptom: a test arms a store to return `StoreError::SlowDown` from `get()`/`query()`, asserts
   correctly, but the single test dominates the whole suite's wall time (400-550s, near-identical
   across separate runs — no meaningful jitter). Cause: `lore_storage::read::read_raw`
@@ -1038,19 +1050,22 @@ the next run starts from the map instead of rediscovering it.
   50ms→10s exponential backoff, uncapped total wall time (~530s worst case, matching what's
   observed almost to the second, since the schedule has no jitter). This is the deliberately
   *patient* client policy, sized for a CLI talking to a real overloaded server — not what a
-  fault-injection unit test wants. Fix: pin the fast retry count `lore-server` itself assumes in
-  tests, at the top of the fixture, before building any state:
+  fault-injection unit test wants. In a unit-test binary that has other storage reads, do **not**
+  try to win the global retry-count race from inside the test:
   ```rust
-  let _ = lore_storage::STORE_RETRY_ATTEMPTS.set(1);
+  #[tokio::test(start_paused = true)]
+  async fn persistent_slow_down_is_fast() { /* ... */ }
   ```
-  `STORE_RETRY_ATTEMPTS` is a `pub static OnceLock<usize>` (`lore-storage/src/lib.rs:211`) — first
-  setter in the process wins, harmless to call redundantly, harmless to the other,
-  non-fault-injecting tests sharing the binary. `lore-server/src/lib.rs`'s
+  Enable Tokio's `test-util` feature under the crate's `[dev-dependencies]`. Paused time lets the
+  full production retry schedule advance virtually and is deterministic under the parallel
+  harness. Proven by CR-021 Part 2c: `cargo test -p lore-storage` fell from 538.74s (both new tests
+  reported running over 60s) to 2.18s of test time. `STORE_RETRY_ATTEMPTS` is a process-wide,
+  first-writer-wins `OnceLock<usize>` (`lore-storage/src/lib.rs:211`); an in-test `.set(1)` can lose
+  to any other parallel test that initializes the default first. `lore-server/src/lib.rs`'s
   `#[ctor::ctor] fn init_test_policies()` already calls the equivalent
   `lore_storage::assume_server_policies()` (sets it to 7) for the *whole* `lore-server` test binary;
-  `lore-revision`'s integration tests have no such bootstrap, so any fixture there that arms
-  `SlowDown` must set it itself or pay the ~9-minute tax. Applies to any future fault-injection test
-  in either crate, not just CR-021.
+  that crate-level pre-harness bootstrap remains safe. Applies to any future persistent-overload
+  fault-injection test, not just CR-021.
 - **`collect_new_addresses`'s "own fragment `get()` SlowDown" swallow is not reachable via a
   local-only test fixture — real in production, but only under a specific topology.** Tried (CR-021
   Part 2b) to test that a `SlowDown` from `get()` while loading a fragmented payload's own content
