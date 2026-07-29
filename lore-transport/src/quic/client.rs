@@ -70,6 +70,7 @@ pub struct EndpointConfig {
 
 const IDLE_TIMEOUT_MS: u32 = 30000;
 const KEEP_ALIVE_MS: u64 = 500;
+const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 pub const DEFAULT_EXPECTED_RTT_MS: u64 = 100;
 
 #[derive(Clone, Debug)]
@@ -772,13 +773,21 @@ pub async fn connect(
             Ok(mut endpoint) => {
                 endpoint.set_default_client_config(client_config.clone());
                 match endpoint.connect(remote_addr, server_name) {
-                    Ok(connecting) => match connecting.await {
-                        Ok(connection) => {
+                    Ok(connecting) => match tokio::time::timeout(
+                        Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+                        connecting,
+                    )
+                    .await
+                    {
+                        Ok(Ok(connection)) => {
                             lore_debug!("Success QUIC connecting to {remote_addr}");
                             return Ok(connection);
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             lore_debug!("Failed QUIC connecting to {remote_addr}: {err}");
+                        }
+                        Err(_) => {
+                            lore_debug!("QUIC handshake timeout to {remote_addr}");
                         }
                     },
                     Err(err) => {
@@ -792,9 +801,10 @@ pub async fn connect(
         }
     }
 
-    // Silent propagation of connection errors
+    // Every candidate address failed; the server is unreachable. Classify as
+    // `Disconnected`. Per-attempt details are logged above.
     lore_debug!("QUIC connect failed {remote_url}");
-    Err(ProtocolError::internal(format!("connect: {remote_url}")))
+    Err(ProtocolError::from(Disconnected))
 }
 
 pub async fn reconnect<AuthErrorType>(
