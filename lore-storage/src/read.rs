@@ -1305,6 +1305,8 @@ async fn read_resolved_content(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -1325,20 +1327,26 @@ mod tests {
     #[derive(Clone, Copy)]
     enum InjectedGetFailure {
         SlowDown,
-        Deserialize,
+        Internal,
     }
 
     struct GetFailingStore {
         inner: Arc<dyn ImmutableStore>,
         failure: InjectedGetFailure,
+        get_calls: AtomicUsize,
     }
 
     impl GetFailingStore {
-        fn wrapping(
-            inner: Arc<dyn ImmutableStore>,
-            failure: InjectedGetFailure,
-        ) -> Arc<dyn ImmutableStore> {
-            Arc::new(Self { inner, failure })
+        fn wrapping(inner: Arc<dyn ImmutableStore>, failure: InjectedGetFailure) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                failure,
+                get_calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -1386,10 +1394,11 @@ mod tests {
             _address: Address,
             _match_required: StoreMatch,
         ) -> Result<(Fragment, Bytes), StoreError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
             match self.failure {
                 InjectedGetFailure::SlowDown => Err(StoreError::from(crate::errors::SlowDown)),
-                InjectedGetFailure::Deserialize => {
-                    Err(StoreError::internal("injected local deserialize failure"))
+                InjectedGetFailure::Internal => {
+                    Err(StoreError::internal("injected local internal failure"))
                 }
             }
         }
