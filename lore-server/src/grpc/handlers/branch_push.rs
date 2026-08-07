@@ -1328,6 +1328,14 @@ mod tests {
                 .await
         }
 
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreQueryResult, StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
+        }
+
         async fn get(
             self: Arc<Self>,
             partition: Partition,

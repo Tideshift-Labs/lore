@@ -12,9 +12,11 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
-use crate::grpc::handlers::repository_query::check_repository_query_authorization;
+use crate::grpc::no_repository_access_status;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryMetadataGet` handler.
@@ -25,30 +27,18 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RepositoryMetadataGet::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryMetadataGetRequest>,
-    auth_url: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryMetadataGetResponse>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let authorization = request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|s| s.to_string());
+    let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
 
     let repository_id: Context = req.id.into();
     if repository_id == Context::default() {
         return Err(Status::invalid_argument("Missing repository id"));
-    }
-
-    // Scope the read to the caller's repository. RepositoryService rides the
-    // authn-only interceptor (UCS-13506), so the body repository id is not
-    // authorized upstream; re-check it via the same ReBAC callback the sibling
-    // read RPCs use. Auth-OFF (no auth_url) leaves behavior unchanged.
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, repository_id.into()).await?;
     }
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
@@ -60,6 +50,11 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            authorizer
+                .check_repository_access(authorization, repository_id.into())
+                .await
+                .map_err(|_err| no_repository_access_status())?;
+
             let metadata_hash = repository::metadata_hash(repository)
                 .await
                 .map_err(|err| Status::not_found(err.to_string()))?;
@@ -73,90 +68,111 @@ pub async fn handler(
 
 #[cfg(test)]
 mod tests {
-    use lore_base::types::Hash;
-    use lore_proto::lore::repository::v1::RepositoryMetadataGetRequest;
-    use lore_revision::lore::RepositoryId;
-    use tonic::Request;
+    use lore_base::types::RepositoryId;
+    use lore_revision::repository::RepositoryMetadata;
+    use tonic::Code;
 
-    use super::handler;
-    use crate::grpc::handlers::repository_query::authz_test_support::new_test_stores;
-    use crate::grpc::handlers::repository_query::authz_test_support::seed_repository_metadata;
-    use crate::grpc::handlers::repository_query::authz_test_support::start_stub_auth_server;
+    use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::store::test_store_create;
 
-    fn request_for(repository_id: RepositoryId) -> Request<RepositoryMetadataGetRequest> {
-        let mut request = Request::new(RepositoryMetadataGetRequest {
-            id: repository_id.into(),
-        });
-        request
-            .metadata_mut()
-            .insert("authorization", "Bearer test-token".parse().unwrap());
-        request
+    const REPOSITORY_ID: [u8; 16] = [1u8; 16];
+
+    mockall::mock! {
+        pub Authorizer {}
+
+        #[async_trait::async_trait]
+        impl RepositoryAuthorizer for Authorizer {
+            async fn check_repository_access(
+                &self,
+                authorization: Option<String>,
+                repository_id: RepositoryId,
+            ) -> Result<(), Status>;
+        }
     }
 
-    #[tokio::test]
-    async fn denies_metadata_get_for_a_repository_the_caller_is_not_authorized_for() {
-        let caller_authorized_repo = RepositoryId::from([11u8; 16]);
-        let target_repo = RepositoryId::from([12u8; 16]);
-        let (immutable, mutable) = new_test_stores().await;
-        seed_repository_metadata(
-            immutable.clone(),
-            mutable.clone(),
-            target_repo,
-            "victim",
-            "",
-        )
-        .await;
-        let auth_url = start_stub_auth_server(caller_authorized_repo).await;
-
-        let result = handler(request_for(target_repo), Some(auth_url), immutable, mutable).await;
-
-        let err = result.expect_err("caller is not authorized for the target repository");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-    }
-
-    #[tokio::test]
-    async fn accepts_metadata_get_for_the_callers_own_repository() {
-        let repository_id = RepositoryId::from([13u8; 16]);
-        let (immutable, mutable) = new_test_stores().await;
-        let seeded_hash = seed_repository_metadata(
-            immutable.clone(),
-            mutable.clone(),
-            repository_id,
-            "acme",
-            "",
-        )
-        .await;
-        let auth_url = start_stub_auth_server(repository_id).await;
-
-        let response = handler(
-            request_for(repository_id),
-            Some(auth_url),
+    /// Writes a metadata blob to both the immutable and mutable stores so
+    /// that `metadata_get` can return it successfully.
+    async fn seed_metadata(
+        immutable: Arc<dyn lore_storage::ImmutableStore>,
+        mutable: Arc<dyn lore_storage::MutableStore>,
+    ) {
+        let repo_ctx = Arc::new(RepositoryContext::new_server_context(
             immutable,
             mutable,
+            Context::from(REPOSITORY_ID).into(),
+        ));
+        let hash = lore_revision::repository::metadata_store(
+            repo_ctx.clone(),
+            RepositoryMetadata {
+                name: "test".to_string(),
+                ..Default::default()
+            },
         )
         .await
-        .expect("a legitimate client reading its own repository must be unaffected");
-
-        assert_eq!(Hash::from(response.into_inner().metadata), seeded_hash);
+        .unwrap();
+        lore_revision::repository::metadata_store_hash(repo_ctx, hash)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn auth_off_serves_metadata_without_an_authorization_check() {
-        let repository_id = RepositoryId::from([14u8; 16]);
-        let (immutable, mutable) = new_test_stores().await;
-        let seeded_hash = seed_repository_metadata(
-            immutable.clone(),
-            mutable.clone(),
-            repository_id,
-            "acme",
-            "",
-        )
-        .await;
+    async fn no_auth_configured_allows_operation() {
+        let (immutable, mutable, execution) = test_store_create().await.unwrap();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                seed_metadata(immutable.clone(), mutable.clone()).await;
+                let request = Request::new(RepositoryMetadataGetRequest {
+                    id: REPOSITORY_ID.to_vec().into(),
+                });
+                handler(
+                    request,
+                    Arc::new(AllowAllRepositoryAuthorizer),
+                    immutable,
+                    mutable,
+                )
+                .await
+                .unwrap();
+            })
+            .await;
+    }
 
-        let response = handler(request_for(repository_id), None, immutable, mutable)
+    #[tokio::test]
+    async fn auth_configured_no_access_returns_permission_denied() {
+        let (immutable, mutable, _) = test_store_create().await.unwrap();
+        let mut mock = MockAuthorizer::new();
+        mock.expect_check_repository_access()
+            .withf(|authorization, repository_id| {
+                authorization.is_none() && repository_id == &RepositoryId::from(REPOSITORY_ID)
+            })
+            .times(1)
+            .returning(|_, _| Err(Status::permission_denied("denied")));
+        let request = Request::new(RepositoryMetadataGetRequest {
+            id: REPOSITORY_ID.to_vec().into(),
+        });
+        let err = handler(request, Arc::new(mock), immutable, mutable)
             .await
-            .expect("auth-off must leave behavior unchanged");
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(err.message(), "Unauthorized");
+    }
 
-        assert_eq!(Hash::from(response.into_inner().metadata), seeded_hash);
+    #[tokio::test]
+    async fn auth_configured_with_access_allows_operation() {
+        let (immutable, mutable, execution) = test_store_create().await.unwrap();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                seed_metadata(immutable.clone(), mutable.clone()).await;
+                let mut mock = MockAuthorizer::new();
+                mock.expect_check_repository_access()
+                    .returning(|_, _| Ok(()));
+                let request = Request::new(RepositoryMetadataGetRequest {
+                    id: REPOSITORY_ID.to_vec().into(),
+                });
+                handler(request, Arc::new(mock), immutable, mutable)
+                    .await
+                    .unwrap();
+            })
+            .await;
     }
 }

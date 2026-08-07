@@ -4,8 +4,9 @@
 //!
 //! Adapts the `lore-postgres` co-located, off-AWS backend to loreserver's plugin
 //! registry, mirroring `plugins/aws.rs`:
-//! - [`PostgresImmutableStorePluginFactory`] — fragment metadata in Postgres,
-//!   fragment bytes in S3-compatible object storage.
+//! - [`PostgresImmutableStorePluginFactory`] — fragment representations and
+//!   bytes in S3-compatible object storage, with lifecycle, associations, and
+//!   an exact rebuildable metering projection in Postgres.
 //! - [`PostgresMutableStorePluginFactory`] — branch-tip CAS in Postgres.
 //! - [`PostgresLockStorePluginFactory`] — advisory locks in Postgres.
 //!
@@ -64,16 +65,17 @@ pub struct PostgresStoreConfig {
     /// otherwise, so `sslmode=require` behaves like `verify-ca`.
     #[serde(default)]
     pub tls_insecure_skip_verify: bool,
-    /// S3-compatible object storage for fragment **bytes**. Required by the
-    /// immutable-store factory; unused (and typically absent) for the
-    /// mutable/lock stores, which keep everything in Postgres.
+    /// S3-compatible object storage for fragment bytes and authoritative
+    /// representation metadata. Required by the immutable-store factory;
+    /// unused (and typically absent) for the mutable/lock stores, which keep
+    /// everything in Postgres.
     #[serde(default)]
     pub object_store: Option<ObjectStoreConfig>,
 }
 
-/// S3-compatible object-storage sub-config for the immutable store's fragment
-/// bytes. Keys mirror the endpoint/region/bucket/path-style that `lore-aws`
-/// exposes so the same backend can point at DO Spaces, MinIO, or LocalStack.
+/// S3-compatible object-storage sub-config for immutable fragment objects.
+/// Keys mirror the endpoint/region/bucket/path-style that `lore-aws` exposes so
+/// the same backend can point at DO Spaces, MinIO, or LocalStack.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ObjectStoreConfig {
     /// Bucket holding fragment payloads.
@@ -142,7 +144,50 @@ fn build_tls(name: &str, cfg: &PostgresStoreConfig) -> Result<TlsConfig, PluginE
     })
 }
 
-/// Factory for the Postgres-backed immutable store (metadata in PG, bytes in S3).
+/// Build the concrete Postgres immutable store from the plugin configuration.
+///
+/// Both normal server startup and offline maintenance use this path so config
+/// fallback, TLS, object-store settings, and the standard AWS credential chain
+/// cannot drift between them.
+pub(crate) async fn connect_immutable_store(
+    config: &toml::Value,
+) -> Result<PostgresImmutableStore, PluginError> {
+    let plugin_name = PLUGIN_NAME;
+    let cfg = parse_config(plugin_name, config)?;
+    let tls = build_tls(plugin_name, &cfg)?;
+    let object = cfg.object_store.ok_or_else(|| {
+        PluginError::from(PluginConfigError {
+            plugin_name: plugin_name.to_string(),
+            message: "Postgres immutable store requires an [object_store] section \
+                      (bucket + endpoint/region/path-style)"
+                .to_string(),
+        })
+    })?;
+    let object = ObjectStoreSettings {
+        bucket: object.bucket,
+        endpoint_url: object.endpoint_url,
+        region: object.region,
+        force_path_style: object.force_path_style,
+        slow_operation_threshold_millis: object.slow_operation_threshold_millis,
+        timeout_millis: object.timeout_millis,
+        validate_bucket_on_startup: object.validate_bucket_on_startup,
+    };
+
+    PostgresImmutableStore::connect(&cfg.url, cfg.pool_max, &tls, object)
+        .await
+        .map_err(|e| {
+            PluginError::from(PluginInitError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("Failed to create Postgres immutable store: {e}"),
+            })
+        })
+}
+
+/// Factory for the Postgres-backed immutable store.
+///
+/// S3 object metadata is the representation authority. Postgres retains
+/// lifecycle state, repository associations, and an exact rebuildable metering
+/// projection.
 pub struct PostgresImmutableStorePluginFactory;
 
 impl ImmutableStorePluginFactory for PostgresImmutableStorePluginFactory {
@@ -166,27 +211,6 @@ impl ImmutableStorePluginFactory for PostgresImmutableStorePluginFactory {
     }
 
     fn create(&self, config: &toml::Value) -> Result<Arc<dyn ImmutableStore>, PluginError> {
-        let plugin_name = self.name();
-        let cfg = parse_config(plugin_name, config)?;
-        let tls = build_tls(plugin_name, &cfg)?;
-        let object = cfg.object_store.ok_or_else(|| {
-            PluginError::from(PluginConfigError {
-                plugin_name: plugin_name.to_string(),
-                message: "Postgres immutable store requires an [object_store] section \
-                          (bucket + endpoint/region/path-style)"
-                    .to_string(),
-            })
-        })?;
-        let object = ObjectStoreSettings {
-            bucket: object.bucket,
-            endpoint_url: object.endpoint_url,
-            region: object.region,
-            force_path_style: object.force_path_style,
-            slow_operation_threshold_millis: object.slow_operation_threshold_millis,
-            timeout_millis: object.timeout_millis,
-            validate_bucket_on_startup: object.validate_bucket_on_startup,
-        };
-
         // `create` is synchronous, but building the pool + S3 client and ensuring
         // the schema is async — drive it to completion like the AWS plugin does.
         // The future is `Box::pin`ned: building the AWS S3 client holds a large
@@ -194,18 +218,7 @@ impl ImmutableStorePluginFactory for PostgresImmutableStorePluginFactory {
         // polled inline by `block_on` (aws.rs boxes its builder block for the
         // same reason).
         let store = tokio::task::block_in_place(|| {
-            runtime().block_on(Box::pin(PostgresImmutableStore::connect(
-                &cfg.url,
-                cfg.pool_max,
-                &tls,
-                object,
-            )))
-        })
-        .map_err(|e| {
-            PluginError::from(PluginInitError {
-                plugin_name: plugin_name.to_string(),
-                message: format!("Failed to create Postgres immutable store: {e}"),
-            })
+            runtime().block_on(Box::pin(connect_immutable_store(config)))
         })?;
 
         Ok(Arc::new(store))

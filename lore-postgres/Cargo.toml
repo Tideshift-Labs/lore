@@ -6,10 +6,10 @@ edition = "2024"
 version.workspace = true
 publish = false
 
-# Co-located, off-AWS metadata/lock backend for loreserver (CR-007).
-# Mutable (branch-tip CAS), lock, and immutable-metadata stores on one Postgres
-# DB; immutable fragment bytes live in S3-compatible object storage. Store impls
-# are landed incrementally — deps grow as each store is implemented.
+# Co-located, off-AWS coordination/lock backend for loreserver (CR-007).
+# Mutable (branch-tip CAS), lock, immutable associations/lifecycle, and a rebuildable metering
+# projection live in one Postgres DB. Immutable fragment bytes and authoritative representation
+# metadata live together in S3-compatible object storage.
 [dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }
@@ -17,11 +17,10 @@ tokio = { workspace = true }
 tokio-postgres = "0.7"
 deadpool-postgres = "0.14"
 tracing = { workspace = true }
-# The immutable store keeps fragment BYTES in S3-compatible object storage and
-# reuses lore-aws's S3 client (aws-sdk-s3 is the standard S3-compatible client);
-# only fragment METADATA moves to Postgres. This is an "off-AWS" backend in the
-# sense of off-DynamoDB — the S3 client points at DO Spaces / MinIO, not AWS.
+# The immutable store reuses lore-aws's S3 client and object-metadata encoding. This is an
+# "off-AWS" backend in the sense of off-DynamoDB; the S3 client points at DO Spaces / MinIO.
 aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["rt-tokio"] }
+aws-smithy-types = { version = "1.4.3", default-features = false }
 # Postgres TLS: DO Managed Postgres (the deployment target) mandates SSL. We use
 # rustls (ring, no aws-lc) to match the rest of the workspace.
 # No crypto feature: we supply the rustls ClientConfig (ring provider) ourselves,

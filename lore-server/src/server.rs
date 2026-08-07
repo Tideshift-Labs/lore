@@ -150,6 +150,40 @@ pub struct Cli {
     /// Defaults to `local` when neither the flag nor `LORE_ENV` is set.
     #[arg(long, value_name = "ENV", env = "LORE_ENV")]
     pub env: Option<String>,
+
+    /// Rebuild the Postgres immutable store's exact metering projection, then
+    /// exit without binding any server endpoint.
+    ///
+    /// This maintenance operation refuses to run unless the effective
+    /// immutable-store mode is `postgres`.
+    #[arg(long)]
+    pub rebuild_postgres_metering: bool,
+}
+
+fn ensure_postgres_rebuild_mode(mode: &str) -> Result<()> {
+    if mode != "postgres" {
+        return Err(anyhow!(
+            "--rebuild-postgres-metering requires immutable_store.mode = postgres; effective mode is '{mode}'"
+        ));
+    }
+    Ok(())
+}
+
+async fn rebuild_postgres_metering(settings: &Settings) -> Result<u64> {
+    let mode = settings.immutable_store.mode.as_str();
+    ensure_postgres_rebuild_mode(mode)?;
+
+    let plugin_config =
+        resolve_plugin_config_with_fallback(&settings.plugins, mode, "immutable_store")
+            .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+    let store = plugins::postgres::connect_immutable_store(&plugin_config)
+        .await
+        .map_err(|e| anyhow!("Failed to create Postgres immutable store: {e}"))?;
+
+    store
+        .rebuild_metering_projection()
+        .await
+        .map_err(|e| anyhow!("Failed to rebuild Postgres metering projection: {e}"))
 }
 
 /// Entry point for the Lore server.
@@ -180,22 +214,40 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
     let cli = Cli::parse();
     let (settings, settings_hash) = Settings::load(cli.config.as_deref(), cli.env.as_deref())?;
     let runtime_shutdown_timeout = settings.server.runtime_shutdown_timeout_seconds;
+    let rebuild_metering = cli.rebuild_postgres_metering;
 
     lore_base::log::set_log_callback(Some(server_log_dispatch));
 
-    let result = match settings.tokio.as_ref() {
+    // Server default: one net-runtime thread per processor — serving
+    // thousands of concurrent client connections is its normal case. An
+    // explicit `tokio.net_threads` config (seeded first inside
+    // runtime_with_settings) wins over this default.
+    let runtime_handle = match settings.tokio.as_ref() {
         Some(tokio) => runtime_with_settings(Some(tokio.clone())),
         None => runtime(),
-    }
-    .block_on({
+    };
+    let _ = lore_base::runtime::set_net_threads_default(
+        std::thread::available_parallelism().map_or(2, |count| count.get()),
+    );
+    let result = runtime_handle.block_on({
         let execution = setup_execution(module_path!(), String::default(), String::default());
         #[allow(clippy::large_futures)]
         LORE_CONTEXT.scope(execution, async move {
-            async_main((settings, settings_hash), config).await
+            if rebuild_metering {
+                let associated_hash_count = rebuild_postgres_metering(&settings).await?;
+                // Maintenance CLI contract: stdout contains only the raw rebuilt-hash count so
+                // deployment scripts can parse it without depending on the tracing format.
+                println!("{associated_hash_count}");
+                Ok(())
+            } else {
+                async_main((settings, settings_hash), config).await
+            }
         })
     });
 
-    info!("Wait up to {runtime_shutdown_timeout} seconds for runtime shutdown");
+    if !rebuild_metering {
+        info!("Wait up to {runtime_shutdown_timeout} seconds for runtime shutdown");
+    }
     lore_base::runtime::runtime_shutdown_timeout(Duration::from_secs(
         runtime_shutdown_timeout as u64,
     ));
@@ -1177,6 +1229,7 @@ async fn configure_local_mutable_store(
             flush_delay_seconds: settings.flush_delay_seconds as u64,
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
+            authoritative: true, /* Server local store is the source of truth, not a cache */
         },
         immutable_store,
     )
@@ -1700,16 +1753,26 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     lore_storage::concurrency::LOCAL_ISOLATION.store(true, std::sync::atomic::Ordering::Release);
 
     let execution = execution_context();
-    let runtime_monitor = tokio_metrics::RuntimeMonitor::new(&runtime);
-
-    let metrics_bridge = OtelTokioRuntimeMetrics::new(&lore_telemetry::meter("tokio_runtime"));
     let frequency = Duration::from_millis(metrics_config.export_interval_millis);
-    runtime.spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-        for metrics in runtime_monitor.intervals() {
-            metrics_bridge.record(metrics);
-            tokio::time::sleep(frequency).await;
-        }
-    }));
+    let meter = lore_telemetry::meter("tokio_runtime");
+
+    // Both recorders run on core so monitoring never competes with net's
+    // transport work; each bridge holds its own handle, so that does not skew
+    // what it reports.
+    for (label, handle) in [
+        ("core", lore_base::runtime::core_runtime()),
+        ("net", lore_base::runtime::net_runtime()),
+    ] {
+        let runtime_monitor = tokio_metrics::RuntimeMonitor::new(&handle);
+        let metrics_bridge =
+            OtelTokioRuntimeMetrics::new(&meter, handle, vec![KeyValue::new("runtime", label)]);
+        lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+            for metrics in runtime_monitor.intervals() {
+                metrics_bridge.record(metrics);
+                tokio::time::sleep(frequency).await;
+            }
+        }));
+    }
 
     if let Some(mode) = settings
         .environment
@@ -2244,6 +2307,42 @@ fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, mess
 
 #[cfg(test)]
 mod tests {
+    mod maintenance_cli {
+        use clap::Parser;
+
+        use super::super::Cli;
+        use super::super::ensure_postgres_rebuild_mode;
+
+        #[test]
+        fn parses_rebuild_postgres_metering_flag() {
+            let cli = Cli::try_parse_from(["loreserver", "--rebuild-postgres-metering"])
+                .expect("maintenance flag should parse");
+
+            assert!(cli.rebuild_postgres_metering);
+        }
+
+        #[test]
+        fn rebuild_postgres_metering_defaults_off() {
+            let cli = Cli::try_parse_from(["loreserver"]).expect("default CLI should parse");
+
+            assert!(!cli.rebuild_postgres_metering);
+        }
+
+        #[test]
+        fn rebuild_refuses_non_postgres_immutable_mode() {
+            let error = ensure_postgres_rebuild_mode("local")
+                .expect_err("maintenance must fail closed for non-Postgres modes");
+
+            assert!(error.to_string().contains("effective mode is 'local'"));
+        }
+
+        #[test]
+        fn rebuild_accepts_postgres_immutable_mode() {
+            ensure_postgres_rebuild_mode("postgres")
+                .expect("Postgres immutable mode should be accepted");
+        }
+    }
+
     mod validate_endpoint_security {
         use std::path::PathBuf;
 
@@ -2340,7 +2439,7 @@ mod tests {
         async fn bounded_timeout_force_aborts_a_stuck_endpoint() {
             let (shutdown_tx, _rx) = watch::channel(false);
             let mut endpoints: JoinSet<anyhow::Result<()>> = JoinSet::new();
-            endpoints.spawn(async {
+            lore_base::lore_spawn!(endpoints, async {
                 std::future::pending::<()>().await;
                 #[allow(unreachable_code)]
                 Ok(())
@@ -2363,7 +2462,7 @@ mod tests {
         async fn bounded_timeout_returns_early_once_endpoint_finishes_on_its_own() {
             let (shutdown_tx, _rx) = watch::channel(false);
             let mut endpoints: JoinSet<anyhow::Result<()>> = JoinSet::new();
-            endpoints.spawn(async {
+            lore_base::lore_spawn!(endpoints, async {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 Ok(())
             });
@@ -2389,7 +2488,7 @@ mod tests {
         async fn unbounded_none_timeout_waits_for_a_slow_endpoint_instead_of_force_aborting() {
             let (shutdown_tx, _rx) = watch::channel(false);
             let mut endpoints: JoinSet<anyhow::Result<()>> = JoinSet::new();
-            endpoints.spawn(async {
+            lore_base::lore_spawn!(endpoints, async {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 Ok(())
             });

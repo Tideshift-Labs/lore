@@ -6,8 +6,9 @@
 //! (b) Batch lock atomicity: a batch that conflicts on any resource rolls back entirely,
 //!     leaving no partial lock state.
 //!
-//! Gated on `LORE_TEST_PG_URL`; skipped when unset. Uses `#[serial]` to avoid
-//! cross-test interference on the shared tables.
+//! Gated on `LORE_TEST_PG_URL` and honestly `#[ignore]`d when the live service
+//! tier is not requested. Uses `#[serial]` to avoid cross-test interference on
+//! the shared tables.
 
 use std::sync::Arc;
 
@@ -47,6 +48,7 @@ fn resource(desc: &str) -> LockResource {
 /// Exactly one task must receive `v0` back (the winner). The other must receive
 /// a value ≠ `v0`. The final `load` must equal the winner's proposed value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs live Postgres env; run with -- --ignored"]
 #[serial]
 async fn racing_cas_no_lost_update() {
     let Some(url) = pg_url() else {

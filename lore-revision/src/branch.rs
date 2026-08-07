@@ -904,7 +904,7 @@ pub async fn store_latest_history(
         previous: old_history_latest,
     };
 
-    let (address, _) = entry
+    let address = entry
         .write_to_immutable(
             repository.clone(),
             Context::default(),
@@ -2506,6 +2506,7 @@ pub async fn diff3(
     path: Option<RelativePath>,
     include_same: bool,
     auto_resolve: bool,
+    graft_view: Option<Arc<crate::filter::Filter>>,
     tx: mpsc::Sender<Result<DiffItem, BranchError>>,
 ) -> Result<Diff3Summary, BranchError> {
     Box::pin(diff3_with_source_cap(
@@ -2519,6 +2520,7 @@ pub async fn diff3(
         auto_resolve,
         None,
         None,
+        graft_view,
         tx,
     ))
     .await
@@ -2536,6 +2538,7 @@ pub async fn diff3_with_source_cap(
     auto_resolve: bool,
     source_cap: Option<usize>,
     history_walk_concurrency: Option<usize>,
+    graft_view: Option<Arc<crate::filter::Filter>>,
     tx: mpsc::Sender<Result<DiffItem, BranchError>>,
 ) -> Result<Diff3Summary, BranchError> {
     lore_info!(
@@ -2571,6 +2574,7 @@ pub async fn diff3_with_source_cap(
         include_same,
         source_cap,
         history_walk_concurrency,
+        graft_view,
         inner_tx,
     ));
     loop {
@@ -3057,6 +3061,36 @@ pub async fn diff3_collect(
     include_same: bool,
     auto_resolve: bool,
 ) -> Result<DiffResult, BranchError> {
+    diff3_collect_with_graft(
+        repository,
+        source_branch,
+        source_revision,
+        target_branch,
+        target_revision,
+        path,
+        include_same,
+        auto_resolve,
+        None,
+    )
+    .await
+}
+
+/// `diff3_collect` that may adopt whole out-of-view subtrees.
+///
+/// `graft_view` decides which subtrees the view excludes. `None` disables
+/// adoption and gives the unmodified walk.
+#[allow(clippy::too_many_arguments)]
+pub async fn diff3_collect_with_graft(
+    repository: Arc<RepositoryContext>,
+    source_branch: BranchId,
+    source_revision: Hash,
+    target_branch: BranchId,
+    target_revision: Hash,
+    path: Option<RelativePath>,
+    include_same: bool,
+    auto_resolve: bool,
+    graft_view: Option<Arc<crate::filter::Filter>>,
+) -> Result<DiffResult, BranchError> {
     let (summary, items) = crate::util::collect_stream::collect_stream_with_summary(|tx| {
         diff3(
             repository,
@@ -3067,6 +3101,7 @@ pub async fn diff3_collect(
             path,
             include_same,
             auto_resolve,
+            graft_view,
             tx,
         )
     })
@@ -3293,6 +3328,10 @@ async fn find_ancestor_walker(
     while revision != Hash::default() {
         if let Ok(state) = state::State::deserialize(repository.clone(), revision).await {
             // Update bookkeeping on revision visits.
+            //
+            // Guard scope is this statement and no arm awaits, so the concurrent
+            // sibling walkers sharing `visited` cannot build a wait cycle.
+            #[allow(clippy::disallowed_methods)]
             let both_visited = match visited.entry(revision) {
                 Entry::Occupied(mut visited) => {
                     let visited = visited.get_mut();

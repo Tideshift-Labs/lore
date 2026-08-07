@@ -911,7 +911,7 @@ mod tests {
                 }
             }),
         );
-        tokio::spawn(async move {
+        lore_base::lore_spawn!(async move {
             let _ = axum::serve(listener, app).await;
         });
 
@@ -1183,7 +1183,7 @@ mod tests {
             .await
             .expect("bind ephemeral port");
         let hung_addr = listener.local_addr().expect("read local_addr");
-        tokio::spawn(async move {
+        lore_base::lore_spawn!(async move {
             let mut held = Vec::new();
             while let Ok((socket, _)) = listener.accept().await {
                 held.push(socket); // keep the connection open; never respond

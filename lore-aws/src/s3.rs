@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::ops::Range;
 use std::time::Duration;
 
@@ -9,8 +10,6 @@ pub use MockS3Impl as S3;
 pub use S3Impl as S3;
 use aws_sdk_s3 as s3;
 use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::operation::copy_object::CopyObjectError;
-use aws_sdk_s3::operation::copy_object::CopyObjectOutput;
 use aws_sdk_s3::operation::delete_object::DeleteObjectError;
 use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
 use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -192,12 +191,18 @@ impl S3Impl {
             .map_err(AwsError::AwsSdkError)
     }
 
+    /// Store an object, optionally attaching object metadata carried as `x-amz-meta-*` headers.
+    ///
+    /// Object metadata is part of the object version rather than a separate record, so a reader
+    /// always observes the metadata that was written with the bytes it is reading. Writing the
+    /// two together is what makes them impossible to tear apart.
     #[tracing::instrument(name = "S3Impl::put_object", skip_all)]
     pub async fn put_object<T>(
         &self,
         bucket: &str,
         key: &str,
         body: T,
+        metadata: Option<HashMap<String, String>>,
     ) -> Result<PutObjectOutput, AwsError<SdkError<PutObjectError>>>
     where
         T: Into<Vec<u8>> + 'static,
@@ -206,6 +211,7 @@ impl S3Impl {
             .put_object()
             .bucket(bucket)
             .key(key)
+            .set_metadata(metadata)
             .body(ByteStream::from(Into::<Vec<u8>>::into(body)))
             .send()
             .observe(
@@ -213,40 +219,6 @@ impl S3Impl {
                 self.instruments
                     .instrument_provider
                     .get_labels_for_operation_context("put_object"),
-                observe_aws_operation_callback(self.slow_operation_duration),
-            )
-            .await
-            .output
-            .map_err(AwsError::AwsSdkError)
-    }
-
-    /// Server-side copy of a single object between two buckets (or within one
-    /// bucket). Used when per-repository bucket routing resolves the source and
-    /// destination of a fragment copy to different buckets, so the bytes remain
-    /// reachable from the destination bucket rather than only the source.
-    ///
-    /// `source_key` and `destination_key` are the bare object keys; the source
-    /// is addressed as `"{source_bucket}/{source_key}"`. Callers must ensure the
-    /// keys are URL-safe (fragment keys are BLAKE3 hex, which always are).
-    #[tracing::instrument(name = "S3Impl::copy_object", skip_all)]
-    pub async fn copy_object(
-        &self,
-        source_bucket: &str,
-        source_key: &str,
-        destination_bucket: &str,
-        destination_key: &str,
-    ) -> Result<CopyObjectOutput, AwsError<SdkError<CopyObjectError>>> {
-        self.client
-            .copy_object()
-            .copy_source(format!("{source_bucket}/{source_key}"))
-            .bucket(destination_bucket)
-            .key(destination_key)
-            .send()
-            .observe(
-                self.instruments.operation_latency_histogram.clone(),
-                self.instruments
-                    .instrument_provider
-                    .get_labels_for_operation_context("copy_object"),
                 observe_aws_operation_callback(self.slow_operation_duration),
             )
             .await

@@ -211,6 +211,14 @@ mod tests {
             unimplemented!("not exercised by repository_storage_stats tests")
         }
 
+        async fn get_metadata(
+            self: Arc<Self>,
+            _partition: lore_storage::Partition,
+            _address: lore_storage::Address,
+        ) -> Result<StoreQueryResult, lore_storage::StoreError> {
+            unimplemented!("not exercised by repository_storage_stats tests")
+        }
+
         async fn get(
             self: Arc<Self>,
             _partition: lore_storage::Partition,

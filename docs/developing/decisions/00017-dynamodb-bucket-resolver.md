@@ -1,10 +1,15 @@
 ---
-status: proposed
+status: superseded by [ADR-00018](00018-fragment-metadata-on-s3-objects.md)
 date: 2026-06-20
 deciders: Khurram Virani
 ---
 
 # ADR-00017: DynamoDB-backed bucket resolution for the AWS store
+
+> **Fork note (2026-08-07): retired.** `DynamoBucketResolver`, `BucketResolver`, and
+> partition-scoped dedup were removed while merging upstream 0.8.7. Lorehub's deployed
+> Postgres-mode cells use one configured regional object bucket shared by all repositories. This
+> document is retained as history and must not be read as the current hosting topology.
 
 ## Context and Problem Statement
 
