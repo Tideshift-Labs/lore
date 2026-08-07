@@ -415,7 +415,7 @@ impl PostgresImmutableStore {
         }
         let key = Self::hash_key(address.hash);
         self.s3
-            .put_object(&self.bucket, &key, payload.to_vec())
+            .put_object(&self.bucket, &key, payload.to_vec(), None)
             .await
             .map_err(|e| s3_err(e, "S3 put object failed"))?;
 
@@ -673,6 +673,18 @@ impl ImmutableStore for PostgresImmutableStore {
         let _t = self.instruments.start("query", self.pool.status());
         let repository: Context = partition.into();
         self.do_query(repository, address, match_requested, true)
+            .await
+    }
+
+    #[tracing::instrument(level = "debug", skip_all)]
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<StoreQueryResult, StoreError> {
+        let _t = self.instruments.start("get_metadata", self.pool.status());
+        let repository: Context = partition.into();
+        self.do_query(repository, address, StoreMatch::MatchFull, true)
             .await
     }
 

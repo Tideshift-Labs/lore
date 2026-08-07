@@ -12,7 +12,6 @@ use serde::Serialize;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use tokio::task::spawn_blocking;
 
 use crate::util;
 use crate::util::url::normalize_remote_url;
@@ -189,13 +188,9 @@ pub enum LoadConfigError {}
 pub async fn load_config_with_lock<ConfigType: Default + Serialize + for<'a> Deserialize<'a>>(
     path: impl AsRef<Path> + Copy,
 ) -> Result<(ConfigType, FSLock), LoadConfigError> {
-    let path_buf = path.as_ref().to_owned();
-    let lock = spawn_blocking(|| {
-        FSLock::acquire_file_lock(path_buf)
-            .map_err(|err| LoadConfigError::internal(format!("Failed acquiring lock {err}")))
-    })
-    .await
-    .internal("Failed to acquire file lock")??;
+    let lock = FSLock::acquire_file_lock(path)
+        .await
+        .map_err(|err| LoadConfigError::internal(format!("Failed acquiring lock {err}")))?;
     let config = load_config(path).await?;
     Ok((config, lock))
 }

@@ -32,14 +32,20 @@ mode = "aws"
 
 # Immutable store settings (S3 + DynamoDB)
 [plugins.aws.immutable_store]
-s3_bucket = "urc-fragments"
+s3_bucket = "lore-fragments"
 # s3_endpoint_url = "http://localhost:4566"
 # s3_region = "us-east-1"
 s3_slow_operation_threshold_millis = 5000
 s3_timeout_millis = 30000
 
-dynamodb_fragments_table = "urc-fragments"
-dynamodb_metadata_table = "urc-metadata"
+dynamodb_fragments_table = "lore-fragments"
+# Holds fragment state; a row's presence means the hash exists. Its own table, distinct from the
+# one that held fragment metadata. Required, with no alias.
+dynamodb_fragment_state_table = "lore-fragment-state"
+# Read only where objects stored before the fragment moved onto the S3 object may still exist.
+# Accepts the older dynamodb_metadata_table spelling. Leave unset on a deployment created after
+# that change, as here.
+# dynamodb_fragment_metadata_table = "lore-fragment-metadata"
 # dynamodb_endpoint_url = "http://localhost:4566"
 # dynamodb_region = "us-east-1"
 dynamodb_slow_operation_threshold_millis = 2000
@@ -48,38 +54,9 @@ dynamodb_timeout_millis = 15000
 # Force write mode for debugging/profiling purposes, always overwrites data already present
 # force_write = false
 
-# --- Per-repository storage isolation (optional; defaults preserve the
-# --- historical single-bucket, global-dedup behaviour). See ADR-00011 and
-# --- ADR-00017.
-#
-# Deduplication/isolation scope: "global" (default) deduplicates across all
-# repositories and keys the metadata table by hash alone; "partition" scopes
-# dedup/existence/metadata to each repository (requires a metadata table keyed
-# by (hash, repository) — see ADR-00011's migration notes).
-# dedup_scope = "partition"
-#
-# Bucket resolver: "static" (default) routes every repository to `s3_bucket`;
-# "dynamo" resolves each repository's bucket from a DynamoDB routing table,
-# read-through cached, failing closed for unrouted repositories.
-# bucket_resolver = "dynamo"
-#
-# Validate `s3_bucket` exists at startup. Default true; ignored when
-# `bucket_resolver = "dynamo"` (per-repository buckets are provisioned by the
-# host after boot and validated on demand).
-# validate_bucket_on_startup = false
-#
-# Routing table for `bucket_resolver = "dynamo"`. The host provisions it: one
-# row per repository, partition key `repository` (the canonical Context string,
-# e.g. "0123456789abcdef0123456789abcdef") and a string `bucket` attribute. The
-# resolver needs only dynamodb:GetItem on it. endpoint_url/region default to the
-# store's dynamodb_* values when unset.
-# [plugins.aws.immutable_store.dynamo_bucket_resolver]
-# routing_table = "urc-repository-bucket-routing"
-# region = "us-east-1"
-
 # Mutable store settings (DynamoDB)
 [plugins.aws.mutable_store]
-dynamodb_table = "urc-mutable"
+dynamodb_table = "lore-mutable"
 # dynamodb_endpoint_url = "http://localhost:4566"
 # dynamodb_region = "us-east-1"
 slow_operation_threshold_millis = 2000
@@ -87,7 +64,7 @@ timeout_millis = 15000
 
 # Lock store settings (DynamoDB)
 [plugins.aws.lock_store]
-dynamodb_table = "urc-locks"
+dynamodb_table = "lore-locks"
 # dynamodb_endpoint_url = "http://localhost:4566"
 # dynamodb_region = "us-east-1"
 dynamodb_slow_operation_threshold_millis = 1000

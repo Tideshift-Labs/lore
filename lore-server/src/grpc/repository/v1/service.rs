@@ -33,6 +33,7 @@ use super::repository_list;
 use super::repository_metadata_get;
 use super::repository_metadata_set;
 use super::repository_storage_stats;
+use crate::authnz::repository_authorizer::repository_authorizer;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
@@ -173,7 +174,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_metadata_get::handler(
                 request,
-                self.auth_url(),
+                repository_authorizer(self.auth_url()),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -189,7 +190,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_metadata_set::handler(
                 request,
-                self.auth_url(),
+                repository_authorizer(self.auth_url()),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),

@@ -303,7 +303,6 @@ mod store_config_tests {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileConfig {
     direct_write: Option<bool>,
-    direct_io: Option<bool>,
     flush_write: Option<bool>,
 }
 
@@ -311,7 +310,6 @@ impl Default for FileConfig {
     fn default() -> Self {
         FileConfig {
             direct_write: Some(false),
-            direct_io: Some(false),
             flush_write: Some(false),
         }
     }
@@ -357,8 +355,6 @@ pub struct RepositoryRuntimeSettings {
     pub disable_cache: AtomicBool,
     /// Write directly to target file instead of write to temporary file + move
     pub direct_file_write: AtomicBool,
-    /// Use direct file I/O instead of memory mapping files
-    pub direct_file_io: AtomicBool,
 }
 
 impl Default for RepositoryRuntimeSettings {
@@ -367,7 +363,6 @@ impl Default for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(true),
             disable_cache: AtomicBool::new(true),
             direct_file_write: AtomicBool::new(false),
-            direct_file_io: AtomicBool::new(false),
         }
     }
 }
@@ -378,7 +373,6 @@ impl Clone for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(self.disable_upload.load(Ordering::Relaxed)),
             disable_cache: AtomicBool::new(self.disable_cache.load(Ordering::Relaxed)),
             direct_file_write: AtomicBool::new(self.direct_file_write.load(Ordering::Relaxed)),
-            direct_file_io: AtomicBool::new(self.direct_file_io.load(Ordering::Relaxed)),
         }
     }
 
@@ -393,10 +387,6 @@ impl Clone for RepositoryRuntimeSettings {
         );
         self.direct_file_write.store(
             source.direct_file_write.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        self.direct_file_io.store(
-            source.direct_file_io.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
     }
@@ -1002,16 +992,6 @@ impl RepositoryContext {
             .store(disable, Ordering::Relaxed);
     }
 
-    pub fn direct_file_io(&self) -> bool {
-        self.settings.direct_file_io.load(Ordering::Relaxed)
-    }
-
-    pub fn set_direct_file_io(&self, direct: bool) {
-        self.settings
-            .direct_file_io
-            .store(direct, Ordering::Relaxed);
-    }
-
     pub fn direct_file_write(&self) -> bool {
         self.settings.direct_file_write.load(Ordering::Relaxed)
     }
@@ -1368,13 +1348,10 @@ pub(crate) async fn get_or_create_repository_lock(
         return Ok(holder);
     }
 
-    // Acquire the OS flock on the blocking pool so a slow flock doesn't stall
-    // the runtime.
-    let path_for_lock = dot_path.clone();
-    let lock = lore_base::runtime::runtime()
-        .spawn_blocking(move || FSLock::acquire_directory_lock(path_for_lock))
+    // The OS flock is taken with non-blocking attempts and async retries,
+    // so a contended lock never stalls a runtime thread.
+    let lock = Box::pin(FSLock::acquire_directory_lock(dot_path.clone()))
         .await
-        .internal("Failed to get exclusive access to repository")?
         .internal("Failed to get exclusive access to repository")?;
 
     let holder = Arc::new(RepositoryLock { _lock: lock });
@@ -2075,7 +2052,6 @@ pub async fn load_and_connect_with_token(
 
     let config_file = config.file.unwrap_or_default();
     repository.set_direct_file_write(config_file.direct_write.unwrap_or_default());
-    repository.set_direct_file_io(config_file.direct_io.unwrap_or_default());
     repository.set_disable_cache(!global.cache());
 
     if global.local() {

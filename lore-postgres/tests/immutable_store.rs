@@ -207,6 +207,34 @@ async fn round_trip_byte_perfect() {
     );
 }
 
+/// `get_metadata` delegates to the full Postgres metadata query, returning the
+/// stored representation and an exact partition/context match without reading
+/// payload bytes from S3.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn get_metadata_returns_the_stored_fragment_and_full_match() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let partition: Partition = rand::random();
+    let address: Address = rand::random();
+    let (fragment, _) = put_fragment(store.clone(), partition, address, 1024).await;
+
+    let result = store
+        .get_metadata(partition, address)
+        .await
+        .expect("get_metadata after put");
+
+    assert_eq!(result.fragment, fragment);
+    assert_eq!(result.match_made, StoreMatch::MatchFull);
+}
+
 /// 2. Existence levels.
 ///
 /// After a full put:

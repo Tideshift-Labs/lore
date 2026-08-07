@@ -46,14 +46,14 @@ async fn connect_client(
     ProtocolError,
 > {
     let endpoint = grpc_endpoint(auth_url);
-    let mut ep = tonic::transport::Endpoint::new(endpoint.clone())
+    let mut endpoint_config = tonic::transport::Endpoint::new(endpoint.clone())
         .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?;
     // Trust the OS/native root store for TLS, matching the data channel
     // (`grpc::connect_to_endpoint`) and loreserver's own auth client
     // (`lore-server/src/authnz/auth.rs`). Without this, tonic establishes no
     // TLS for an `https://` endpoint and the exchange handshake fails.
     if endpoint.starts_with("https://") {
-        ep = ep
+        endpoint_config = endpoint_config
             .tls_config(
                 ClientTlsConfig::new()
                     .assume_http2(true)
@@ -61,9 +61,11 @@ async fn connect_client(
             )
             .map_err(|e| ProtocolError::internal(format!("auth endpoint TLS config: {e}")))?;
     }
-    let channel = ep
-        .connect()
+    // Connect from a net-runtime task so the channel's driver tasks are
+    // bound to the net runtime.
+    let channel = lore_base::lore_spawn_net!(async move { endpoint_config.connect().await })
         .await
+        .map_err(|e| ProtocolError::internal(format!("auth endpoint connect task: {e}")))?
         .map_err(|e| ProtocolError::internal(format!("failed to connect to auth endpoint: {e}")))?;
     Ok(UrcAuthApiClient::with_interceptor(
         channel,

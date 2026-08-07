@@ -14,6 +14,14 @@ enum NodeType {
   LINK = 2;
 }
 
+// File mode for a file-system entry.
+enum FileMode {
+  // No special file mode.
+  NONE = 0;
+  // File is executable.
+  EXECUTABLE = 1;
+}
+
 // Per-path action describing what happened between two states (or relative
 // to the common ancestor in 3-way merges).
 enum Action {
@@ -113,11 +121,13 @@ message TreeNode {
   NodeType node_type = 2;
   // Content address for FILE / LINK entries; unused for DIRECTORY.
   lore.model.v1.Address address = 3;
-  // Content length in bytes of a FILE entry. Set only for FILE nodes;
-  // unset (treated as unknown) for DIRECTORY and LINK entries. A present
-  // value of 0 is a genuinely empty file, distinct from "unknown". Older
-  // servers never set this, so consumers must treat unset as unknown.
-  optional uint64 size_bytes = 4;
+  // Original file content size in bytes. Lorehub servers leave this unset for
+  // DIRECTORY and LINK entries so tag 4 retains the fork's file-byte contract.
+  // Older servers never set this, so consumers must treat unset as unknown; a
+  // present value of 0 is a real zero-byte file.
+  optional uint64 size = 4;
+  // File mode for this entry. For possible flags and values, see enum FileMode.
+  uint64 mode = 5;
 }
 
 // Self-describing revision record. Carries the resolved RevisionIdentifier
@@ -132,7 +142,7 @@ message Revision {
   lore.model.v1.RevisionIdentifier identifier = 2;
   // Free-form commit message.
   string commit_message = 3;
-  // Commit timestamp (Unix epoch seconds). Always commit time, never
+  // Commit timestamp (Unix epoch milliseconds). Always commit time, never
   // authorship time.
   uint64 timestamp = 4;
   // Identity that originally created the revision.
@@ -148,7 +158,7 @@ message Revision {
   optional Parent parent_other = 9;
   // Per-branch revision number.
   uint64 number = 10;
-  // Total content length in bytes of every FILE in this revision's tree
+  // FORK-LOCAL (Lorehub): total content length in bytes of every FILE in this revision's tree
   // (the recursive sum carried on the root node). Lets callers show a
   // repository "size" stat without walking the tree. Unset on older
   // servers that do not compute it; treat unset as unknown.

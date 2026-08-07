@@ -70,11 +70,19 @@ the next run starts from the map instead of rediscovering it.
   `store::immutable_store::tests::s3_payload_load_error_*`: modeled `NoSuchKey` stays
   `AddressNotFound`, retryable SDK failures become `SlowDown`, and permanent/non-SDK failures become
   `Internal`. Run `cargo test -p lore-postgres --lib s3_payload_load_error`; no Postgres or S3
-  endpoint is required.
-- **lore-aws (DynamoBucketResolver / per-tenant isolation)** — `lore-aws/src/store/`. Unit tests run
-  fully offline (mocked SDK clients), `cargo test -p lore-aws --lib`: 86 passed, 2 `#[ignore]`d
-  (`test_put_immutable_partial*`, need real S3 multipart) — pre-existing ignores, not ours.
-  `store::bucket_resolver::test::*` covers the tenant-routing/fail-closed behavior.
+  endpoint is required. The required `ImmutableStore::get_metadata` implementation delegates to the
+  same full metadata query as `query(..., MatchFull)`; the live
+  `get_metadata_returns_the_stored_fragment_and_full_match` integration test pins the stored
+  fragment and `MatchFull` result and remains honestly `#[ignore]`d without Postgres + S3.
+- **lore-aws (S3-authoritative fragment metadata + global state)** — `lore-aws/src/store/`.
+  Upstream 0.8.7 retired the fork's unused `DynamoBucketResolver` and
+  `DedupScope::Partition`; fragment representation now travels in S3 object metadata and DynamoDB
+  keeps only global lifecycle state plus repository/context associations. Unit tests run fully
+  offline against the stateful `Fake` + mocked SDK clients. The direct
+  `head_fragment_error_permanent_service_error_is_internal` and
+  `get_payload_error_permanent_service_error_is_internal` controls pin that permanent S3 service
+  errors are `Internal`, never missing or retryable; run
+  `cargo test -p lore-aws --lib permanent_service_error -j 4`.
 - **CR-005 (lorehub_notify post-commit hook)** — `lore-server/src/hooks/`. Fully unit-tested, no
   external service needed: `cargo test -p lore-server --lib -- hooks` (98 passed).
 - **No-op branch-push side-effect suppression ([SERVER])** —
@@ -480,31 +488,30 @@ the next run starts from the map instead of rediscovering it.
     scope (test `collect_push_lock_conflicts` directly, the "pure core" the fn's own doc
     comment calls out); flagged here as a real remaining gap if a future pass wants the
     full-handler-level proof too.
-- **CR-008 (per-entry byte size on tree reads, [SERVER])** — additive proto3 optional
-  `TreeNode.size_bytes` (FILE only, unset for DIRECTORY/LINK) + `Revision.total_size_bytes` on
-  `lore.thin_client.v1`; `lore-revision/src/state.rs` `TreePath.size` (<- `node.size`, populated in
-  `gather_tree_paths_node`); handlers `thinclient/v1/revision_tree.rs` (File-gates the field) and
-  `revision_info.rs` (`total_size_bytes` <- `state.tree(repo).await?.size`, non-fatal → `None` on
-  error). Tests in the existing `#[cfg(test)] mod test` blocks:
-  `revision_tree.rs` — `file_size_bytes_reflects_node_content_size` (asserts `Some(123)` + a 0-byte
-  file `Some(0)`, distinct from unknown `None`), `directory_size_bytes_is_unset`,
-  `link_size_bytes_is_unset` (new fixture `push_branch_with_sized_files`, sets `node.size` directly);
+- **CR-008 (per-file byte size on tree reads, [SERVER])** — upstream 0.8.7's thin proto now carries
+  proto3 optional `TreeNode.size` at tag 4 (including present zero), `TreeNode.mode` at tag 5, and
+  retains fork-local optional `Revision.total_size_bytes` at tag 11 on `lore.thin_client.v1`.
+  Lorehub preserves its existing tag-4 product contract by emitting size only for FILE nodes;
+  DIRECTORY and LINK nodes remain unset even though Lore tracks their raw/aggregate sizes internally.
+  `lore-proto/tests/v1_thin_client.rs` pins the generated field shape and exact wire bytes for all
+  three tags; run `cargo test -p lore-proto --test v1_thin_client -j 4`. The handler tests remain in
+  the existing `#[cfg(test)] mod test` blocks:
+  `revision_tree.rs` — size reflection including a 0-byte file distinct from unknown, plus
+  directory/link behavior; fixture `push_branch_with_sized_files` sets `node.size` directly.
   `revision_info.rs` — `total_size_bytes_is_present_for_revision_with_files`,
   `empty_revision_has_zero_total_size_bytes`. `cargo test -p lore-server --lib -- thinclient::v1::revision_`.
   The per-file field is verified with a real value; the aggregate asserts only `Some(0)`/`Some(_)` at
   the unit tier — see the tree-root aggregation gotcha below. Regenerating the proto bindings needs
   `protoc` on `PATH` (or `PROTOC=`); the crate otherwise builds off the committed `src/grpc/*.rs`.
-- **CR-021 Part 1 (DynamoDB throttle/error-classification honesty, [SERVER])** —
-  `lore-aws/src/aws_error.rs` (new `is_retryable_sdk_error<E: ProvideErrorMetadata>(&SdkError<E,
-  HttpResponse>) -> bool`, `RETRYABLE_STATUS_CODES` explicit allow-list, `is_throttle_code`) and
-  `lore-aws/src/store/immutable_store.rs` (`metadata_load_error`, `do_query`'s `SlowDown`
-  passthrough). Fixes a metadata-load throttle previously misclassified as `AddressNotFound`
-  (masking a capacity problem as missing content, defeating `lore-revision/src/branch/push.rs`'s
-  10-attempt retry-on-`SlowDown` schedule). Coverage: `cargo test -p lore-aws --lib -- aws_error::`
-  (13 tests, direct `SdkError` construction, no store/mock needed) plus
-  `cargo test -p lore-aws --lib -- store::immutable_store::test::test_load_metadata` /
-  `test_query_metadata_load_slow_down_passes_through` /
-  `test_metadata_load_error_non_sdk_error_is_internal` (store-level, mocked `MockDynamoDb`).
+- **CR-021 Part 1 (AWS SDK error-classification honesty, [SERVER])** —
+  `lore-aws/src/aws_error.rs` owns the shared
+  `is_retryable_sdk_error<E: ProvideErrorMetadata>(&SdkError<E, HttpResponse>) -> bool`, explicit
+  `RETRYABLE_STATUS_CODES`, and `is_throttle_code`. Upstream 0.8.7's S3-authoritative redesign
+  removed the old DynamoDB `metadata_load_error`; the shared classifier now feeds DynamoDB state
+  reads plus the S3 `HeadObject`/`GetObject` mappers. The contract remains: retryable failures become
+  `SlowDown`, modeled object absence alone becomes `AddressNotFound`, and permanent/non-SDK failures
+  become source-preserving `Internal`. Coverage is `cargo test -p lore-aws --lib aws_error:: -j 4`
+  plus `cargo test -p lore-aws --lib permanent_service_error -j 4`.
   - **`RETRYABLE_STATUS_CODES` is an explicit allow-list (`[429, 500, 502, 503, 504]`), not
     `status.is_server_error()`** — a permanent 5xx (501, 505) will never succeed on retry, and
     `push.rs`'s 10-attempt backoff means misclassifying one costs ~30-60s of pointless stalling
@@ -523,27 +530,11 @@ the next run starts from the map instead of rediscovering it.
   - **Real DynamoDB throttle responses arrive as HTTP 400** with the code identifying the exception
     (not HTTP 429) — pair a coded-error test with status `400u16` so it actually exercises the
     code-based classifier rather than accidentally passing via the 429/5xx status shortcut.
-  - **Two distinct `Ok`-path absence routes both still yield `AddressNotFound`** (only the `Err`
-    path changed by this delta): `item: None` (genuinely missing) vs. `item:
-    Some(shape-that-doesn't-deserialize)` (present but malformed — e.g. missing the required `hash`
-    field; `serde_dynamo::from_item(HashMap::new())` forces this branch without hand-crafting a
-    type-mismatched `AttributeValue`). Cover both — easy to conflate into one test.
-  - **`load_metadata` takes `(repository: Context, hash: Hash)` on this fork, not upstream's
-    `(hash)`** — `tideshift/main`'s own `DedupScope`/per-repository metadata partitioning,
-    unrelated to this CR. A CR branch based on upstream `main` merges with `E0061` at every direct
-    `store.load_metadata(hash)` call; fix by adding `random::<Context>()` (or the repository under
-    test) as the first arg, matching the established `test_load_metadata_sdk_timeout_returns_slow_down`
-    pattern. Under the default `initialize_immutable_store` (`DedupScope::Global`),
-    `metadata_repository()` returns `None`, so `FragmentMetadataEntry::new(hash)` (no
-    `.with_repository(...)`) still serializes identically for a `MockDynamoDb` `.with(eq(av_map),
-    ..)` expectation — no need to thread the repository into the mock's key construction unless
-    the test is specifically about `DedupScope::Partition` (`initialize_immutable_store_scoped` /
-    `initialize_immutable_store_with_resolver`).
-  - Rewrote the upstream-authored `test_load_metadata_sdk_service_error_returns_address_not_found`
-    (renamed `test_load_metadata_non_throttle_service_error_is_internal`) — it pinned the pre-fix
-    bug (`ResourceNotFoundException`, a missing *table*, mapped to `AddressNotFound`); now asserts
-    `is_internal()`. Flag this rewrite explicitly in the eventual upstream PR description — it's a
-    visible behavior change to a test Epic wrote, not just new coverage.
+  - **Permanent S3 service errors need negative assertions as well as `is_internal()`.** A mapper
+    test that only asserts `Internal` does not explicitly pin that the same error cannot be mistaken
+    for missing or retryable after an error-enum refactor. For both `HeadObject` and `GetObject`,
+    assert `is_internal() && !is_address_not_found() && !is_slow_down()`; the two
+    `permanent_service_error` controls in `lore-aws/src/store/immutable_store.rs` are the pattern.
 - **CR-021 Part 2a (SDK-level adaptive retry/backoff configuration, [SERVER])** —
   `lore-aws/src/clients.rs`. New `RetryMode` (`Standard` default / `Adaptive` opt-in /
   `Disabled`), `RetrySettings` (`mode`, `max_attempts`, `initial_backoff_millis`,

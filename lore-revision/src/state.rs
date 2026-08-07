@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 
 use bitflags::bitflags;
 use bytes::Bytes;
+pub use diff::GraftOracle;
 use lore_base::error::InvalidPath;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
@@ -452,6 +453,12 @@ impl LinkReference {
             self.branch
         }
     }
+
+    /// Whether the link tracks its parent's branch (zero branch) rather than
+    /// being pinned to an explicit one.
+    pub fn is_tracking(&self) -> bool {
+        self.branch.is_zero()
+    }
 }
 
 /// Tracks a single link's merge state for rollback.
@@ -727,7 +734,7 @@ impl State {
                         if block.is_nametable_deserialized() {
                             lore_trace!("Serializing dirty node block {} name table", block_index);
                             let name_table = block.read().clone_name_table();
-                            let (name_table, _) = if !name_table.is_empty() {
+                            let name_table = if !name_table.is_empty() {
                                 immutable::write(
                                     repository.clone(),
                                     Context::default(),
@@ -739,7 +746,7 @@ impl State {
                                 .await
                                 .internal("Failed to serialize node block")?
                             } else {
-                                (Address::default(), Fragment::default())
+                                Address::default()
                             };
                             {
                                 let mut writer = block.write();
@@ -751,7 +758,7 @@ impl State {
                     node_block.flags &= !NodeBlockFlags::Dirty;
                     node_block.flags &= !NodeBlockFlags::UpgradeGeneratedNametable;
                     node_block.flags &= !NodeBlockFlags::FirstUnusedNode;
-                    let (address, _) = node_block
+                    let address = node_block
                         .write_to_immutable(
                             repository.clone(),
                             Context::default(),
@@ -796,7 +803,7 @@ impl State {
 
             // Write out the block address list
             let block_hash_bytes = block_hash_bytes.freeze();
-            let (list_address, _) = immutable::write(
+            let list_address = immutable::write(
                 repository.clone(),
                 Context::default(),
                 block_hash_bytes.clone(),
@@ -846,7 +853,7 @@ impl State {
                     // write makes the lock held of an await point
                     let mut node_block = { *block.read().node_block() };
                     node_block.flags &= !NodeBlockFlags::Dirty;
-                    let (address, _) = node_block
+                    let address = node_block
                         .write_to_immutable(
                             repository.clone(),
                             Context::default(),
@@ -891,7 +898,7 @@ impl State {
 
             // Write out the block address list
             let block_hash_bytes = block_hash_bytes.freeze();
-            let (list_address, _) = immutable::write(
+            let list_address = immutable::write(
                 repository.clone(),
                 Context::default(),
                 block_hash_bytes.clone(),
@@ -928,7 +935,7 @@ impl State {
                     Hash::default()
                 } else {
                     let bytes = Bytes::copy_from_slice(link_list.as_bytes());
-                    let (address, _fragment) = immutable::write(
+                    let address = immutable::write(
                         repository.clone(),
                         Context::default(),
                         bytes,
@@ -953,7 +960,7 @@ impl State {
         let tree = { self.runtime.read().tree.unwrap_or_default() };
         if tree.flags & TreeFlags::Dirty != 0 {
             lore_trace!("Serializing dirty tree");
-            let (address, _fragment) = tree
+            let address = tree
                 .write_to_immutable(
                     repository.clone(),
                     Context::default(),
@@ -974,7 +981,7 @@ impl State {
         }
 
         // Serialize the state
-        let (address, fragment) = {
+        let address = {
             let buffer = {
                 let mut data = self.data.write();
                 data.flags &= !StateFlags::Dirty;
@@ -1003,11 +1010,9 @@ impl State {
         }
 
         lore_trace!(
-            "Serialized state to {} in repository {}, {} -> {} bytes",
+            "Serialized state to {} in repository {}",
             address.hash,
-            repository.id,
-            fragment.size_content,
-            fragment.size_payload
+            repository.id
         );
 
         Ok(address.hash)
@@ -3025,7 +3030,7 @@ impl State {
             bytes.extend_from_slice(entry.as_bytes());
         }
 
-        let (address, _fragment) = immutable::write(
+        let address = immutable::write(
             repository.clone(),
             Context::default(),
             Bytes::from(bytes),
@@ -3084,34 +3089,73 @@ impl State {
         Ok(entries)
     }
 
-    pub async fn link_list(
+    /// The link registry as the state was last serialized with, ignoring the runtime copy.
+    async fn serialized_link_list(
         &self,
         repository: Arc<RepositoryContext>,
     ) -> Result<Vec<LinkReference>, StateError> {
         let list_hash = { self.data.read().hash_link };
+        if list_hash.is_zero() {
+            return Ok(vec![]);
+        }
 
-        let link_list = if !list_hash.is_zero() {
-            let data = immutable::read(
-                repository.clone(),
-                Address::zero_context_hash(list_hash),
-                None,
-                immutable::read_options_from_repository(&repository)
-                    .with_cache()
-                    .with_priority(),
-            )
-            .await
-            .internal("Failed to read state data")?
-            .to_aligned::<LinkReference>();
+        let data = immutable::read(
+            repository.clone(),
+            Address::zero_context_hash(list_hash),
+            None,
+            immutable::read_options_from_repository(&repository)
+                .with_cache()
+                .with_priority(),
+        )
+        .await
+        .internal("Failed to read state data")?
+        .to_aligned::<LinkReference>();
 
-            data.as_type_slice::<LinkReference>().to_vec()
-        } else {
+        Ok(data.as_type_slice::<LinkReference>().to_vec())
+    }
+
+    /// The link registry: the runtime copy once anything has edited it, and what the state was
+    /// serialized with until then.
+    ///
+    /// Callers get a copy. The runtime copy stays where it is: it is the working set the mutators
+    /// below edit in place, and [`State::serialize`] writes a new link list only while it is
+    /// present, so it has to outlive every reader for the edits to reach the serialized state.
+    pub async fn link_list(
+        &self,
+        repository: Arc<RepositoryContext>,
+    ) -> Result<Vec<LinkReference>, StateError> {
+        {
+            let runtime = self.runtime.read();
+            if let Some(link_list) = runtime.link_list.as_ref() {
+                return Ok(link_list.clone());
+            }
+        }
+
+        self.serialized_link_list(repository).await
+    }
+
+    /// Applies `edit` to the runtime link registry, holding the lock across the whole
+    /// read-modify-write.
+    ///
+    /// A commit edits one link per task against one shared state, so an edit that released the
+    /// lock between finding its entry and storing the result would lose whatever another edit
+    /// stored in the meantime. The serialized list is loaded before the lock is taken, because
+    /// reading it awaits; an edit that then finds the registry already populated discards what it
+    /// loaded, since the populated copy is the one carrying edits.
+    async fn edit_link_list(
+        &self,
+        repository: Arc<RepositoryContext>,
+        edit: impl FnOnce(&mut Vec<LinkReference>) -> Result<(), StateError>,
+    ) -> Result<(), StateError> {
+        let populated = self.runtime.read().link_list.is_some();
+        let loaded = if populated {
             vec![]
+        } else {
+            self.serialized_link_list(repository).await?
         };
 
         let mut runtime = self.runtime.write();
-        let link_list = runtime.link_list.take().unwrap_or(link_list);
-
-        Ok(link_list)
+        edit(runtime.link_list.get_or_insert(loaded))
     }
 
     pub async fn link_find(
@@ -3166,33 +3210,31 @@ impl State {
         local_node: NodeID,
         link_flags: LinkFlags,
     ) -> Result<(), StateError> {
-        let mut link_list = self.link_list(repository.clone()).await?;
-
-        let mut runtime = self.runtime.write();
-
-        // Ensure link is not referenced by other revision anywhere
-        for link in link_list.iter_mut() {
-            if link.repository == link_id && link.signature != signature {
-                // TODO(vri): Link revision divergence
-                return Err(StateError::internal("Link divergence"));
+        self.edit_link_list(repository, |link_list| {
+            // Ensure link is not referenced by other revision anywhere
+            for link in link_list.iter_mut() {
+                if link.repository == link_id && link.signature != signature {
+                    // TODO(vri): Link revision divergence
+                    return Err(StateError::internal("Link divergence"));
+                }
+                if link.repository == link_id && link.local_node == local_node {
+                    link.signature = signature;
+                    return Ok(());
+                }
             }
-            if link.repository == link_id && link.local_node == local_node {
-                link.signature = signature;
-                return Ok(());
-            }
-        }
 
-        link_list.push(LinkReference {
-            repository: link_id,
-            branch,
-            signature,
-            local_node,
-            flags: link_flags.into(),
-            ..Default::default()
-        });
-        runtime.link_list = Some(link_list);
+            link_list.push(LinkReference {
+                repository: link_id,
+                branch,
+                signature,
+                local_node,
+                flags: link_flags.into(),
+                ..Default::default()
+            });
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     pub async fn link_update(
@@ -3207,20 +3249,18 @@ impl State {
             "Update link with ID {link_id}, local node {local_node}, new signature {signature}, new branch {branch}"
         );
 
-        let mut link_list = self.link_list(repository.clone()).await?;
-
-        let mut runtime = self.runtime.write();
-
-        for link in link_list.iter_mut() {
-            if link.repository == link_id && link.local_node == local_node {
-                link.branch = branch;
-                link.signature = signature;
-                runtime.link_list = Some(link_list);
-                return Ok(());
+        self.edit_link_list(repository, |link_list| {
+            for link in link_list.iter_mut() {
+                if link.repository == link_id && link.local_node == local_node {
+                    link.branch = branch;
+                    link.signature = signature;
+                    return Ok(());
+                }
             }
-        }
 
-        Err(LinkNotFound.into())
+            Err(LinkNotFound.into())
+        })
+        .await
     }
 
     pub async fn link_remove(
@@ -3230,20 +3270,19 @@ impl State {
         local_node: NodeID,
     ) -> Result<(), StateError> {
         lore_debug!("Remove link with ID {link_id}, local node {local_node}");
-        let mut link_list = self.link_list(repository.clone()).await?;
 
-        let mut runtime = self.runtime.write();
+        self.edit_link_list(repository, |link_list| {
+            if let Some(index) = link_list
+                .iter()
+                .position(|link| link.repository == link_id && link.local_node == local_node)
+            {
+                link_list.remove(index);
+                return Ok(());
+            }
 
-        if let Some(index) = link_list
-            .iter()
-            .position(|link| link.repository == link_id && link.local_node == local_node)
-        {
-            link_list.remove(index);
-            runtime.link_list = Some(link_list.clone());
-            return Ok(());
-        }
-
-        Err(LinkNotFound.into())
+            Err(LinkNotFound.into())
+        })
+        .await
     }
 
     pub fn force_rehash_names(&self) {
@@ -3309,6 +3348,8 @@ impl State {
 /// - Anchor's tree has dirty descendants: drop the anchor, then re-apply
 ///   each dirty path against the new current via [`crate::file::dirty::dirty`].
 ///   Only dirty nodes carry over; the prior staged merkle tree is discarded.
+///
+/// Wraps [`rebase_staged_state`] with the instance anchor I/O.
 pub async fn rebase_staged_anchor(
     repository: Arc<RepositoryContext>,
     new_current_signature: Hash,
@@ -3325,15 +3366,41 @@ pub async fn rebase_staged_anchor(
         return Ok(());
     }
 
+    let _ = crate::instance::delete_staged_anchor(&repository).await;
+
+    let Some(rebased_signature) = rebase_staged_state(
+        repository.clone(),
+        old_staged_signature,
+        new_current_signature,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    crate::instance::store_staged_anchor(&repository, rebased_signature)
+        .await
+        .forward::<StateError>("Failed to serialize staged anchor")?;
+
+    Ok(())
+}
+
+/// Rebase a staged state onto a new current revision, touching no anchors.
+///
+/// Returns the signature of the rebased state, leaving persistence to the
+/// caller, or `None` when nothing needs staging on top of the new current.
+pub async fn rebase_staged_state(
+    repository: Arc<RepositoryContext>,
+    old_staged_signature: Hash,
+    new_current_signature: Hash,
+) -> Result<Option<Hash>, StateError> {
     let old_staged_state = State::deserialize(repository.clone(), old_staged_signature).await?;
     let has_dirty = old_staged_state
         .node_has_dirty_children(repository.clone(), crate::node::ROOT_NODE)
         .await?;
 
-    let _ = crate::instance::delete_staged_anchor(&repository).await;
-
     if !has_dirty {
-        return Ok(());
+        return Ok(None);
     }
 
     let mut dirty_paths: Vec<RelativePath> = Vec::new();
@@ -3347,14 +3414,20 @@ pub async fn rebase_staged_anchor(
     .await?;
 
     if dirty_paths.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
-    crate::file::dirty::dirty_relative_paths(repository, dirty_paths)
-        .await
-        .forward::<StateError>("Failed to apply dirty paths during staged rebase")?;
+    let state_current = State::deserialize(repository.clone(), new_current_signature).await?;
+    let signature = crate::file::dirty::dirty_relative_paths_in(
+        repository,
+        state_current.clone(),
+        state_current,
+        dirty_paths,
+    )
+    .await
+    .forward::<StateError>("Failed to apply dirty paths during staged rebase")?;
 
-    Ok(())
+    Ok((signature != new_current_signature).then_some(signature))
 }
 
 /// Walk a staged state and collect paths of nodes carrying an explicit dirty
@@ -3464,10 +3537,13 @@ pub struct TreePath {
     pub address: Option<Address>,
     pub flags: NodeFlags,
     /// Raw `node.size` for this entry. Meaningful for files (its content
-    /// length). For directories `node.size` is the recursive subtree
-    /// aggregate and for links it is unset/0 — callers should read this
-    /// only for FILE entries and ignore it otherwise.
+    /// length) and directories (the recursive subtree aggregate). Links
+    /// currently carry their raw node value, normally 0.
     pub size: u64,
+    pub mode: u64,
+    /// True when a link node tracks its parent's branch; false for pinned
+    /// links and all non-link nodes.
+    pub tracking: bool,
 }
 
 pub type CanReadRepository = Arc<dyn Fn(RepositoryId) -> bool + Send + Sync>;
@@ -3627,11 +3703,23 @@ async fn gather_tree_paths_node(
     } else {
         NodeFlags::NoFlags
     };
+    // An unresolvable link reference falls back to pinned.
+    let tracking = if node.is_link() {
+        let link = node.linked_node();
+        state
+            .link_find(repository.clone(), link.repository, node_id)
+            .await
+            .is_ok_and(|link_ref| link_ref.is_tracking())
+    } else {
+        false
+    };
     result.push(TreePath {
         path: node_path.clone(),
         address,
         flags,
         size: node.size,
+        mode: node.mode as u64,
+        tracking,
     });
 
     let depth_remaining = max_depth == 0 || depth + 1 < max_depth;
@@ -4143,19 +4231,6 @@ pub enum NodeSource {
     Invalid,
 }
 
-/// Determine which node source to use based on action and node validity.
-pub fn determine_node_source(_action: FileAction, from_valid: bool, to_valid: bool) -> NodeSource {
-    if !to_valid {
-        if from_valid {
-            NodeSource::From
-        } else {
-            NodeSource::Invalid
-        }
-    } else {
-        NodeSource::To
-    }
-}
-
 /// Load a node based on the determined source.
 async fn load_node_for_change(
     source: NodeSource,
@@ -4197,11 +4272,17 @@ async fn add_change(
     // Avoid adding repository root node in case it was to/from an empty repository
     if from.node != ROOT_NODE || to.node != ROOT_NODE {
         // Determine which node to use and load it
-        let source = determine_node_source(
-            action,
-            from.node.is_valid_node_id(),
-            to.node.is_valid_node_id(),
-        );
+        let source = match (from.node.is_valid_node_id(), to.node.is_valid_node_id()) {
+            (_, true) => NodeSource::To,
+            (true, false) => NodeSource::From,
+            (false, false) => NodeSource::Invalid,
+        };
+        // Determine if a different node should be used for early checking recursion.
+        let recursion_source = if action == change::FileAction::Delete {
+            Some(NodeSource::From)
+        } else {
+            None
+        };
 
         // Only add (file system path not in merkle tree) should end up here for Invalid source
         debug_assert!(source != NodeSource::Invalid || action == FileAction::Add);
@@ -4209,6 +4290,12 @@ async fn add_change(
         let Some(node) = load_node_for_change(source, &from, &to).await else {
             return Ok(());
         };
+        let recursion_node_storage = if let Some(recursion_source) = recursion_source {
+            load_node_for_change(recursion_source, &from, &to).await
+        } else {
+            None
+        };
+        let recursion_node = recursion_node_storage.as_ref().unwrap_or(&node);
 
         // Compute flags and create change record
         let flags = compute_change_flags(&node, action, to.node.is_valid_node_id());
@@ -4223,8 +4310,7 @@ async fn add_change(
         })
         .await?;
 
-        // Recursion happens in caller for directories and links
-        if node.is_file() {
+        if recursion_node.is_file() {
             return Ok(());
         }
     }
@@ -4494,12 +4580,14 @@ pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
 /// — does **not** run the post-walk move-coalescing or path-sort fixup that
 /// the legacy `Vec`-returning version applied. Callers that want the
 /// historical buffered-and-coalesced shape use `diff_collect` instead.
+#[allow(clippy::too_many_arguments)]
 pub async fn diff(
     repository_from: Arc<RepositoryContext>,
     state_from: Arc<State>,
     repository_to: Arc<RepositoryContext>,
     state_to: Arc<State>,
     path: Option<RelativePath>,
+    graft: Option<Arc<GraftOracle>>,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
@@ -4552,7 +4640,7 @@ pub async fn diff(
         let from = make_node_change_state(&repository_from, &state_from, from_link.node).await;
         let to = make_node_change_state(&repository_to, &state_to, to_link.node).await;
 
-        diff::diff_subtree(from, to, path, 0, sink, filter_mode).await?;
+        diff::diff_subtree(from, to, path, 0, graft, sink, filter_mode).await?;
     } else {
         diff::diff_subtree(
             NodeChangeState {
@@ -4571,6 +4659,7 @@ pub async fn diff(
             },
             RelativePath::new(),
             0,
+            graft,
             sink,
             filter_mode,
         )
@@ -4601,6 +4690,7 @@ pub async fn diff_collect(
             repository_to,
             state_to,
             path,
+            None,
             &mut sink,
             filter_mode,
         )
@@ -7967,5 +8057,98 @@ mod tests {
         };
         let parent = BranchId::from([1u8; 16]);
         assert_eq!(link_ref.resolve_branch(parent), own_branch);
+    }
+
+    /// A state with no serialized link list, so the registry lives only in the runtime copy and
+    /// every read has to come from there.
+    async fn null_repository() -> Arc<RepositoryContext> {
+        let immutable_store = lore_storage::local::immutable_store::create(
+            None::<&str>,
+            lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
+            false,
+            lore_storage::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("in-memory immutable store");
+        let mutable_store = lore_storage::local::mutable_store::create(
+            None::<&str>,
+            lore_storage::MutableStoreSettings::default(),
+            immutable_store.clone(),
+        )
+        .await
+        .expect("in-memory mutable store");
+
+        Arc::new(RepositoryContext::new_null_context(
+            immutable_store,
+            mutable_store,
+        ))
+    }
+
+    fn link_id(byte: u8) -> RepositoryId {
+        RepositoryId::from([byte; 16])
+    }
+
+    /// An update made after the registry was read applies to the entry it names and leaves the
+    /// other entries as they were.
+    #[tokio::test]
+    async fn reading_the_link_list_leaves_it_editable() {
+        let repository = null_repository().await;
+        let state = State::new();
+
+        state
+            .link_add(
+                repository.clone(),
+                link_id(1),
+                BranchId::default(),
+                Hash::from([1u8; 32]),
+                2,
+                LinkFlags::NoFlags,
+            )
+            .await
+            .expect("adding the first link");
+        state
+            .link_add(
+                repository.clone(),
+                link_id(2),
+                BranchId::default(),
+                Hash::from([2u8; 32]),
+                3,
+                LinkFlags::NoFlags,
+            )
+            .await
+            .expect("adding the second link");
+
+        let read = state
+            .link_list(repository.clone())
+            .await
+            .expect("reading the registry");
+        assert_eq!(read.len(), 2, "both links must be registered");
+
+        state
+            .link_update(
+                repository.clone(),
+                link_id(1),
+                BranchId::default(),
+                Hash::from([9u8; 32]),
+                2,
+            )
+            .await
+            .expect("updating a link after the registry was read");
+
+        let updated = state
+            .link_list(repository)
+            .await
+            .expect("re-reading the registry");
+        assert_eq!(updated.len(), 2, "the update must not drop the other link");
+        assert_eq!(
+            updated[0].signature,
+            Hash::from([9u8; 32]),
+            "the update must be visible"
+        );
+        assert_eq!(
+            updated[1].signature,
+            Hash::from([2u8; 32]),
+            "the untouched link must keep its signature"
+        );
     }
 }
