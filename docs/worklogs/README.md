@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 016 | 2026-08-06 | [Remote-proven sync repairs named-branch bookkeeping](016-remote-proven-sync-branch-bookkeeping.md) |
 | 015 | 2026-07-29 | [Run upstream revision-tree integration suite after merge](015-run-upstream-revision-tree-integration-suite.md) |
 | 014 | 2026-07-29 | [Merge upstream (33 commits) into `tideshift/main`](014-merge-upstream-33-commits-into-tideshift-main.md) |
 | 013 | 2026-07-29 | [Preserve local-read overload classification (CR-021 Part 2c)](013-preserve-local-read-overload-cr021-part2c.md) |
