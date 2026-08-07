@@ -1,21 +1,21 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
-//! Postgres-backed immutable store (CR-007) — fragment **metadata** in Postgres,
-//! fragment **bytes** in S3-compatible object storage (e.g. DO Spaces, MinIO).
+//! Postgres-backed immutable store (CR-007): fragment bytes and their authoritative
+//! representation metadata live together in S3-compatible object storage (for example DO
+//! Spaces or MinIO). Postgres holds associations, mutable lifecycle state, and a rebuildable
+//! metering projection.
 //!
-//! This mirrors `lore-aws`'s immutable store, which couples fragment bytes in S3
-//! with fragment metadata + associations in DynamoDB. Here the two DynamoDB
-//! tables become two Postgres tables and the byte path reuses `lore-aws`'s S3
-//! client (the `aws-sdk-s3` client is the standard S3-compatible client; we do
-//! not reimplement object I/O or FastCDC):
+//! The byte path and object-metadata encoding reuse `lore-aws`; Postgres replaces only the
+//! coordination records that the AWS backend keeps in DynamoDB:
 //!
 //! - `lore_fragments` — one row per `(hash, repository, context)` *association*.
 //!   Existence is a primary-key/prefix lookup (the three [`StoreMatch`] levels
 //!   are leftmost-prefix reads of the `(hash, repository, context)` PK) and the
 //!   global refcount is `EXISTS … WHERE hash = …`.
-//! - `lore_fragment_metadata` — one row per `hash` carrying the [`Fragment`]
-//!   flags/sizes (`INSERT … ON CONFLICT (hash) DO UPDATE`; consistent reads).
+//! - `lore_fragment_state` — one mutable lifecycle row per hash.
+//! - `lore_fragment_metering` — an exact, synchronized, but explicitly non-authoritative
+//!   projection used for repository storage statistics.
 //!
 //! Deduplication scope is **global** (content-addressed by hash), matching the
 //! `lore-aws` default (`DedupScope::Global`) and a single shared object-storage
@@ -30,6 +30,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
 use bytes::BytesMut;
 use deadpool_postgres::Pool;
@@ -40,9 +42,12 @@ use lore_aws::clients::AwsClientBuilder;
 use lore_aws::clients::HttpClientSettings;
 use lore_aws::clients::TimeoutConfig;
 use lore_aws::s3::S3Impl;
+use lore_aws::store::object_metadata::ObjectMetadataError;
+use lore_aws::store::object_metadata::PAYLOAD_FLAGS;
+use lore_aws::store::object_metadata::from_object_metadata;
+use lore_aws::store::object_metadata::to_object_metadata;
 use lore_base::types::Address;
 use lore_base::types::Context;
-use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use lore_base::types::Fragment;
 use lore_base::types::FragmentFlags;
 use lore_base::types::FragmentReference;
@@ -58,14 +63,15 @@ use lore_storage::StoreRepositoryStats;
 use lore_storage::errors::AddressNotFound;
 use lore_storage::errors::SlowDown;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
+use tokio_postgres::Transaction;
 
 /// Self-bootstrapping schema. The `(hash, repository, context)` primary key is
 /// the association identity; its B-tree also serves the leftmost-prefix
 /// existence reads (`hash`, `(hash, repository)`, full) and the by-hash refcount.
 /// The one secondary index inverts that leading column so a whole repository's
 /// fragment set is reachable without a sequential scan — the access path
-/// [`ImmutableStore::repository_stats`] needs. Metadata is keyed by `hash` alone
-/// (global dedup). See [`crate::store::immutable_store`] for the design.
+/// [`ImmutableStore::repository_stats`] needs. Lifecycle and metering rows are keyed by `hash`
+/// alone because object identity and deduplication are global within the shared regional bucket.
 ///
 /// This const is the runtime authority (applied by [`crate::pool::ensure_schema`]
 /// under an advisory lock at boot); `migrations/0001_init.sql` is the same schema
@@ -80,11 +86,15 @@ CREATE TABLE IF NOT EXISTS lore_fragments (
     PRIMARY KEY (hash, repository, context)
 );
 CREATE INDEX IF NOT EXISTS lore_fragments_repo_hash ON lore_fragments (repository, hash);
-CREATE TABLE IF NOT EXISTS lore_fragment_metadata (
-    hash         bytea  NOT NULL PRIMARY KEY,
-    flags        bigint NOT NULL,
-    size_payload bigint NOT NULL,
-    size_content bigint NOT NULL
+CREATE TABLE IF NOT EXISTS lore_fragment_state (
+    hash  bytea  NOT NULL PRIMARY KEY,
+    state bigint NOT NULL CHECK (state IN (0, 1, 256, 512))
+);
+CREATE TABLE IF NOT EXISTS lore_fragment_metering (
+    hash          bytea  NOT NULL PRIMARY KEY,
+    payload_flags bigint NOT NULL CHECK (payload_flags >= 0 AND payload_flags <= 4294967295),
+    size_payload bigint NOT NULL CHECK (size_payload >= 0),
+    size_content bigint NOT NULL CHECK (size_content >= 0)
 );
 ";
 
@@ -110,12 +120,49 @@ pub struct ObjectStoreSettings {
     pub validate_bucket_on_startup: bool,
 }
 
-/// Postgres-backed immutable store (metadata in Postgres, bytes in S3).
+/// Postgres-backed immutable store with authoritative fragment representations on S3 objects.
 pub struct PostgresImmutableStore {
     pool: Pool,
     s3: S3Impl,
     bucket: String,
     instruments: crate::metrics::Instruments,
+}
+
+/// Mutable lifecycle state. Representation flags and sizes never live here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FragmentState {
+    Stored,
+    Obliterating,
+    /// Child traversal completed; object-version deletion may be retried idempotently.
+    PayloadDeleting,
+    Obliterated,
+}
+
+impl FragmentState {
+    fn bits(self) -> i64 {
+        match self {
+            Self::Stored => 0,
+            Self::Obliterating => i64::from(FragmentFlags::PayloadObliterating.bits()),
+            Self::PayloadDeleting => 1,
+            Self::Obliterated => i64::from(FragmentFlags::PayloadObliterated.bits()),
+        }
+    }
+
+    fn from_bits(bits: i64) -> Result<Self, StoreError> {
+        match bits {
+            0 => Ok(Self::Stored),
+            bits if bits == i64::from(FragmentFlags::PayloadObliterating.bits()) => {
+                Ok(Self::Obliterating)
+            }
+            1 => Ok(Self::PayloadDeleting),
+            bits if bits == i64::from(FragmentFlags::PayloadObliterated.bits()) => {
+                Ok(Self::Obliterated)
+            }
+            _ => Err(StoreError::internal(format!(
+                "invalid fragment lifecycle state {bits}"
+            ))),
+        }
+    }
 }
 
 impl PostgresImmutableStore {
@@ -226,19 +273,6 @@ impl PostgresImmutableStore {
         Ok(row.is_some())
     }
 
-    async fn ensure_exists(
-        &self,
-        repository: Context,
-        address: Address,
-        match_required: StoreMatch,
-    ) -> Result<(), StoreError> {
-        if self.exists(repository, address, match_required).await? {
-            Ok(())
-        } else {
-            Err(Self::not_found(address.hash))
-        }
-    }
-
     /// Best match at or below the requested level, walking down the hierarchy —
     /// mirrors `AwsImmutableStore::lookup`.
     async fn lookup(
@@ -255,8 +289,11 @@ impl PostgresImmutableStore {
         if !exists && level == StoreMatch::MatchFull {
             return Ok(StoreMatch::MatchNone);
         }
-        while !exists && level.prev().is_some() {
-            level = level.prev().unwrap();
+        while !exists {
+            let Some(previous) = level.prev() else {
+                break;
+            };
+            level = previous;
             exists = self.exists(repository, address, level).await?;
         }
         Ok(if exists { level } else { StoreMatch::MatchNone })
@@ -267,181 +304,139 @@ impl PostgresImmutableStore {
         repository: Context,
         address: Address,
         match_requested: StoreMatch,
-        hide_obliterates: bool,
     ) -> Result<StoreQueryResult, StoreError> {
-        let match_made = self.lookup(repository, address, match_requested).await?;
+        let (match_made, state) = tokio::join!(
+            self.lookup(repository, address, match_requested),
+            self.load_state(address.hash)
+        );
+        let match_made = match_made?;
         if match_made == StoreMatch::MatchNone {
             return Ok(StoreQueryResult {
                 fragment: Fragment::default(),
                 match_made,
             });
         }
-        let fragment = self.load_metadata(address.hash).await?;
-        if fragment.flags & FragmentFlags::PayloadObliteration.bits() != 0 && hide_obliterates {
-            Ok(StoreQueryResult {
+
+        match state? {
+            Some(FragmentState::Stored) => Ok(StoreQueryResult {
+                fragment: stored_durable(Fragment::default()),
+                match_made,
+            }),
+            Some(
+                FragmentState::Obliterating
+                | FragmentState::PayloadDeleting
+                | FragmentState::Obliterated,
+            )
+            | None => Ok(StoreQueryResult {
                 fragment: Fragment::default(),
                 match_made: StoreMatch::MatchNone,
-            })
-        } else {
-            Ok(StoreQueryResult {
-                fragment,
-                match_made,
-            })
-        }
-    }
-
-    async fn load_metadata(&self, hash: Hash) -> Result<Fragment, StoreError> {
-        let client = self.pool.get().await.map_err(pool_err)?;
-        let row = client
-            .query_opt(
-                "SELECT flags, size_payload, size_content FROM lore_fragment_metadata \
-                 WHERE hash = $1",
-                &[&hash.data().as_slice()],
-            )
-            .await
-            .map_err(db_err)?;
-        match row {
-            Some(row) => Ok(Fragment {
-                flags: row.get::<_, i64>("flags") as u32,
-                size_payload: row.get::<_, i64>("size_payload") as u32,
-                size_content: row.get::<_, i64>("size_content") as u64,
             }),
-            None => Err(Self::not_found(hash)),
         }
     }
 
-    /// Conditional metadata update — applies `updated` only if the row still
-    /// equals `expected` (the DynamoDB conditional-put used for the obliteration
-    /// state machine). A zero rowcount means another writer raced us.
-    async fn update_metadata(
-        &self,
-        hash: Hash,
-        updated: Fragment,
-        expected: Fragment,
-    ) -> Result<(), StoreError> {
-        let client = self.pool.get().await.map_err(pool_err)?;
-        let affected = client
-            .execute(
-                "UPDATE lore_fragment_metadata \
-                 SET flags = $1, size_payload = $2, size_content = $3 \
-                 WHERE hash = $4 AND flags = $5 AND size_payload = $6 AND size_content = $7",
-                &[
-                    &(updated.flags as i64),
-                    &(updated.size_payload as i64),
-                    &(updated.size_content as i64),
-                    &hash.data().as_slice(),
-                    &(expected.flags as i64),
-                    &(expected.size_payload as i64),
-                    &(expected.size_content as i64),
-                ],
-            )
-            .await
-            .map_err(db_err)?;
-        if affected == 0 {
-            return Err(StoreError::internal(
-                "Failed to update metadata due to conflict",
-            ));
-        }
-        Ok(())
-    }
-
-    async fn associate_fragment(
-        &self,
-        repository: Context,
-        address: Address,
-    ) -> Result<(), StoreError> {
-        let client = self.pool.get().await.map_err(pool_err)?;
-        client
-            .execute(
-                "INSERT INTO lore_fragments (hash, repository, context) \
-                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                &[
-                    &address.hash.data().as_slice(),
-                    &repository.data().as_slice(),
-                    &address.context.data().as_slice(),
-                ],
-            )
-            .await
-            .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn delete_association(
-        &self,
-        repository: Context,
-        address: Address,
-    ) -> Result<(), StoreError> {
-        let client = self.pool.get().await.map_err(pool_err)?;
-        client
-            .execute(
-                "DELETE FROM lore_fragments \
-                 WHERE hash = $1 AND repository = $2 AND context = $3",
-                &[
-                    &address.hash.data().as_slice(),
-                    &repository.data().as_slice(),
-                    &address.context.data().as_slice(),
-                ],
-            )
-            .await
-            .map_err(db_err)?;
-        Ok(())
-    }
-
-    /// Whether any association still references `hash` (global refcount).
-    async fn has_associations(&self, hash: Hash) -> Result<bool, StoreError> {
+    async fn load_state(&self, hash: Hash) -> Result<Option<FragmentState>, StoreError> {
         let client = self.pool.get().await.map_err(pool_err)?;
         let row = client
             .query_opt(
-                "SELECT 1 FROM lore_fragments WHERE hash = $1 LIMIT 1",
+                "SELECT state FROM lore_fragment_state WHERE hash = $1",
                 &[&hash.data().as_slice()],
             )
             .await
             .map_err(db_err)?;
-        Ok(row.is_some())
+        row.map(|row| {
+            row.try_get::<_, i64>("state")
+                .map_err(row_decode_err)
+                .and_then(FragmentState::from_bits)
+        })
+        .transpose()
     }
 
-    async fn write_payload(
-        &self,
-        repository: Context,
-        address: Address,
-        fragment: Fragment,
-        payload: Bytes,
-    ) -> Result<(), StoreError> {
-        if payload.len() != fragment.size_payload as usize {
-            return Err(StoreError::internal(format!(
-                "Failed to store in immutable store for put {}",
-                address.hash
-            )));
-        }
-        let key = Self::hash_key(address.hash);
-        self.s3
-            .put_object(&self.bucket, &key, payload.to_vec(), None)
-            .await
-            .map_err(|e| s3_err(e, "S3 put object failed"))?;
+    fn advisory_key(hash: Hash) -> i64 {
+        let mut key = [0_u8; 8];
+        key.copy_from_slice(&hash.data()[..8]);
+        i64::from_be_bytes(key)
+    }
 
-        // Metadata upsert + association insert run in ONE transaction (B4): the
-        // fragment is either fully indexed or not at all, never metadata without
-        // its association (or vice versa). Bytes are written first (above); a
-        // crash before commit leaves recoverable state — a later query/get treats
-        // the fragment as absent and the client re-sends it, as in the AWS store.
-        let mut client = self.pool.get().await.map_err(pool_err)?;
-        let tx = client.transaction().await.map_err(db_err)?;
+    async fn lock_hash(tx: &Transaction<'_>, hash: Hash) -> Result<(), StoreError> {
         tx.execute(
-            "INSERT INTO lore_fragment_metadata (hash, flags, size_payload, size_content) \
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&Self::advisory_key(hash)],
+        )
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn load_state_tx(
+        tx: &Transaction<'_>,
+        hash: Hash,
+    ) -> Result<Option<FragmentState>, StoreError> {
+        let row = tx
+            .query_opt(
+                "SELECT state FROM lore_fragment_state WHERE hash = $1",
+                &[&hash.data().as_slice()],
+            )
+            .await
+            .map_err(db_err)?;
+        row.map(|row| {
+            row.try_get::<_, i64>("state")
+                .map_err(row_decode_err)
+                .and_then(FragmentState::from_bits)
+        })
+        .transpose()
+    }
+
+    async fn set_state_tx(
+        tx: &Transaction<'_>,
+        hash: Hash,
+        state: FragmentState,
+    ) -> Result<(), StoreError> {
+        tx.execute(
+            "INSERT INTO lore_fragment_state (hash, state) VALUES ($1, $2) \
+             ON CONFLICT (hash) DO UPDATE SET state = EXCLUDED.state",
+            &[&hash.data().as_slice(), &state.bits()],
+        )
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn upsert_metering_tx(
+        tx: &Transaction<'_>,
+        hash: Hash,
+        fragment: Fragment,
+    ) -> Result<(), StoreError> {
+        let size_content = i64::try_from(fragment.size_content).map_err(|error| {
+            StoreError::internal_with_context(
+                error,
+                "fragment size_content exceeds Postgres metering range",
+            )
+        })?;
+        tx.execute(
+            "INSERT INTO lore_fragment_metering \
+                 (hash, payload_flags, size_payload, size_content) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (hash) DO UPDATE SET \
-                 flags = EXCLUDED.flags, \
+                 payload_flags = EXCLUDED.payload_flags, \
                  size_payload = EXCLUDED.size_payload, \
                  size_content = EXCLUDED.size_content",
             &[
-                &address.hash.data().as_slice(),
-                &(fragment.flags as i64),
-                &(fragment.size_payload as i64),
-                &(fragment.size_content as i64),
+                &hash.data().as_slice(),
+                &i64::from(fragment.flags & PAYLOAD_FLAGS),
+                &i64::from(fragment.size_payload),
+                &size_content,
             ],
         )
         .await
         .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn associate_fragment_tx(
+        tx: &Transaction<'_>,
+        repository: Context,
+        address: Address,
+    ) -> Result<(), StoreError> {
         tx.execute(
             "INSERT INTO lore_fragments (hash, repository, context) \
              VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
@@ -453,61 +448,306 @@ impl PostgresImmutableStore {
         )
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
-    async fn delete_payload(&self, hash: Hash) -> Result<(), StoreError> {
+    async fn association_exists_tx(
+        tx: &Transaction<'_>,
+        repository: Context,
+        address: Address,
+    ) -> Result<bool, StoreError> {
+        tx.query_opt(
+            "SELECT 1 FROM lore_fragments \
+             WHERE hash = $1 AND repository = $2 AND context = $3 LIMIT 1",
+            &[
+                &address.hash.data().as_slice(),
+                &repository.data().as_slice(),
+                &address.context.data().as_slice(),
+            ],
+        )
+        .await
+        .map(|row| row.is_some())
+        .map_err(db_err)
+    }
+
+    async fn has_associations_tx(tx: &Transaction<'_>, hash: Hash) -> Result<bool, StoreError> {
+        tx.query_opt(
+            "SELECT 1 FROM lore_fragments WHERE hash = $1 LIMIT 1",
+            &[&hash.data().as_slice()],
+        )
+        .await
+        .map(|row| row.is_some())
+        .map_err(db_err)
+    }
+
+    async fn delete_association_tx(
+        tx: &Transaction<'_>,
+        repository: Context,
+        address: Address,
+    ) -> Result<u64, StoreError> {
+        tx.execute(
+            "DELETE FROM lore_fragments \
+             WHERE hash = $1 AND repository = $2 AND context = $3",
+            &[
+                &address.hash.data().as_slice(),
+                &repository.data().as_slice(),
+                &address.context.data().as_slice(),
+            ],
+        )
+        .await
+        .map_err(db_err)
+    }
+
+    fn decode_object_fragment(
+        hash: Hash,
+        metadata: Option<&std::collections::HashMap<String, String>>,
+    ) -> Result<Fragment, StoreError> {
+        from_object_metadata(metadata).map_err(|error| match error {
+            ObjectMetadataError::Absent => {
+                StoreError::internal(format!("S3 object {hash} carries no fragment metadata"))
+            }
+            ObjectMetadataError::Malformed(_) => {
+                StoreError::internal_with_context(error, "S3 object fragment metadata unusable")
+            }
+        })
+    }
+
+    async fn head_fragment(&self, hash: Hash) -> Result<Fragment, StoreError> {
         let key = Self::hash_key(hash);
-        self.s3
-            .delete_object(&self.bucket, &key, None)
+        let output = self
+            .s3
+            .head_object(&self.bucket, &key)
             .await
-            .map_err(|e| s3_err(e, "S3 delete object failed"))?;
-        Ok(())
+            .map_err(|error| s3_head_error(error, hash))?;
+        let fragment = Self::decode_object_fragment(hash, output.metadata())?;
+        lore_storage::validate_fragment_metadata(&fragment)?;
+
+        let content_length = output.content_length().ok_or_else(|| {
+            StoreError::internal(format!("S3 object {hash} has no content length"))
+        })?;
+        if content_length < 0 || content_length as u64 != u64::from(fragment.size_payload) {
+            return Err(StoreError::internal(format!(
+                "S3 object {hash} content length {content_length} does not match fragment size_payload {}",
+                fragment.size_payload
+            )));
+        }
+
+        Ok(stored_durable(fragment))
     }
 
-    /// Fetch the full payload bytes for `hash`. `NoSuchKey` becomes
-    /// `AddressNotFound` so a missing payload reads as a self-healing miss.
-    async fn get_payload_bytes(&self, hash: Hash) -> Result<Bytes, StoreError> {
+    /// Recheck under the same per-hash lock used by writers before clearing a stale Stored claim.
+    async fn repair_missing_payload(&self, hash: Hash) -> Result<(), StoreError> {
+        let mut client = self.pool.get().await.map_err(pool_err)?;
+        let tx = client.transaction().await.map_err(db_err)?;
+        Self::lock_hash(&tx, hash).await?;
+
+        match self.head_fragment(hash).await {
+            Ok(_) => {}
+            Err(error) if error.is_address_not_found() => {
+                if Self::load_state_tx(&tx, hash).await? == Some(FragmentState::Stored) {
+                    tx.execute(
+                        "DELETE FROM lore_fragment_state WHERE hash = $1",
+                        &[&hash.data().as_slice()],
+                    )
+                    .await
+                    .map_err(db_err)?;
+                    tx.execute(
+                        "DELETE FROM lore_fragment_metering WHERE hash = $1",
+                        &[&hash.data().as_slice()],
+                    )
+                    .await
+                    .map_err(db_err)?;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+
+        tx.commit().await.map_err(db_err)
+    }
+
+    /// Fetch the payload and its authoritative fragment from one `GetObject` response.
+    async fn load(&self, hash: Hash) -> Result<(Fragment, Bytes), StoreError> {
         let key = Self::hash_key(hash);
         let mut output = self
             .s3
             .get_object(&self.bucket, &key, None)
             .await
-            .map_err(|e| s3_payload_load_error(e, hash))?;
+            .map_err(|error| s3_payload_load_error(error, hash))?;
+        let fragment = Self::decode_object_fragment(hash, output.metadata())?;
+        lore_storage::validate_fragment_metadata(&fragment)?;
 
-        let mut buffer = BytesMut::with_capacity(FRAGMENT_SIZE_THRESHOLD);
+        let mut buffer = BytesMut::with_capacity(fragment.size_payload as usize);
         while let Some(chunk) = output.body.next().await {
-            let chunk = chunk.map_err(|e| {
-                StoreError::internal(format!("S3 response stream read failed: {e}"))
+            let chunk = chunk.map_err(|error| {
+                StoreError::internal_with_context(error, "S3 response stream read failed")
             })?;
             buffer.extend_from_slice(chunk.as_ref());
         }
-        Ok(buffer.freeze())
+        let payload = buffer.freeze();
+        lore_storage::validate_fragment_payload(&fragment, payload.len())?;
+        Ok((stored_durable(fragment), payload))
     }
 
-    async fn load(&self, hash: Hash) -> Result<(Fragment, Bytes), StoreError> {
-        // Fetch metadata (Postgres) and bytes (S3) concurrently — on the hot
-        // read/clone path this makes per-fragment latency max(meta, bytes)
-        // instead of the sum, mirroring the AWS store. Metadata is authoritative:
-        // its error/obliteration verdict takes priority over the byte fetch.
-        let (meta_res, bytes_res) =
-            tokio::join!(self.load_metadata(hash), self.get_payload_bytes(hash));
+    /// Remove every object version, including any current delete-marker-visible history.
+    async fn delete_payload(&self, hash: Hash) -> Result<(), StoreError> {
+        let key = Self::hash_key(hash);
 
-        let fragment = meta_res?;
-        lore_storage::validate_fragment_size(&fragment)?;
-        if fragment.flags & FragmentFlags::PayloadObliteration.bits() != 0 {
-            return Err(Self::not_found(hash));
+        // `S3Impl::list_versions` exposes no continuation-token arguments. Repeatedly deleting the
+        // first page makes the next page become the first, which exhausts arbitrarily long version
+        // histories without widening lore-aws's API. Deleting an exact version id is idempotent,
+        // so repeating the loop after a crash is harmless.
+        loop {
+            let listed = self
+                .s3
+                .list_versions(&self.bucket, &key)
+                .await
+                .map_err(|error| s3_operation_error(error, "S3 list object versions failed"))?;
+
+            let object_versions = listed.versions.unwrap_or_default();
+            let delete_markers = listed.delete_markers.unwrap_or_default();
+            let page_entries = object_versions.len() + delete_markers.len();
+            if page_entries == 0 {
+                // A versioning-off endpoint may not return an entry here. HEAD before the ordinary
+                // delete: after a versioned purge (including a resumed one) HEAD is absent, and an
+                // unconditional delete would create a fresh marker that this operation just
+                // promised to remove.
+                match self.s3.head_object(&self.bucket, &key).await {
+                    Ok(_) => {
+                        self.s3
+                            .delete_object(&self.bucket, &key, None)
+                            .await
+                            .map_err(|error| {
+                                s3_operation_error(error, "S3 delete object failed")
+                            })?;
+                    }
+                    Err(error) => {
+                        let error = s3_head_error(error, hash);
+                        if !error.is_address_not_found() {
+                            return Err(error);
+                        }
+                    }
+                }
+                break;
+            }
+
+            for version in object_versions {
+                self.s3
+                    .delete_object(&self.bucket, &key, version.version_id)
+                    .await
+                    .map_err(|error| {
+                        s3_operation_error(error, "S3 delete object version failed")
+                    })?;
+            }
+            for marker in delete_markers {
+                self.s3
+                    .delete_object(&self.bucket, &key, marker.version_id)
+                    .await
+                    .map_err(|error| s3_operation_error(error, "S3 delete object marker failed"))?;
+            }
         }
-        let payload = bytes_res?;
-        if payload.len() != fragment.size_payload as usize {
-            return Err(StoreError::internal(format!(
-                "Failed to load from immutable store, size mismatch (load {}, expected {}) for get {hash}",
-                payload.len(),
-                fragment.size_payload
-            )));
+        Ok(())
+    }
+
+    async fn obliterate_sub_fragments(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        fragment: Fragment,
+        payload: Bytes,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        if fragment.flags & FragmentFlags::PayloadFragmented.bits() == 0 {
+            return Ok(());
         }
-        Ok((fragment, payload))
+
+        let aligned = payload.to_aligned::<FragmentReference>();
+        let references = aligned.as_type_slice::<FragmentReference>().to_vec();
+        for reference in references {
+            self.clone()
+                .obliterate(
+                    partition,
+                    Address {
+                        hash: reference.hash,
+                        context: address.context,
+                    },
+                    stats.clone(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild the non-authoritative metering projection from every associated S3 object.
+    ///
+    /// Both tables are locked for the transaction. Writers may finish their object upload while
+    /// waiting, but cannot publish an association until this complete reconciliation commits. A
+    /// missing or malformed object aborts the whole transaction, so a successful count never
+    /// describes a partially repaired projection.
+    pub async fn rebuild_metering_projection(&self) -> Result<u64, StoreError> {
+        let mut client = self.pool.get().await.map_err(pool_err)?;
+        let tx = client.transaction().await.map_err(db_err)?;
+        tx.batch_execute(
+            "LOCK TABLE lore_fragments IN SHARE MODE; \
+             LOCK TABLE lore_fragment_state IN SHARE MODE; \
+             LOCK TABLE lore_fragment_metering IN SHARE ROW EXCLUSIVE MODE;",
+        )
+        .await
+        .map_err(db_err)?;
+
+        let rows = tx
+            .query(
+                "SELECT DISTINCT f.hash, s.state \
+                 FROM lore_fragments f \
+                 LEFT JOIN lore_fragment_state s USING (hash) \
+                 ORDER BY f.hash",
+                &[],
+            )
+            .await
+            .map_err(db_err)?;
+        for row in &rows {
+            let bytes: Vec<u8> = row.try_get("hash").map_err(row_decode_err)?;
+            if bytes.len() != std::mem::size_of::<Hash>() {
+                return Err(StoreError::internal(format!(
+                    "invalid fragment hash length {} in Postgres",
+                    bytes.len()
+                )));
+            }
+            let hash = Hash::from(bytes.as_slice());
+            let state = row
+                .try_get::<_, Option<i64>>("state")
+                .map_err(row_decode_err)?
+                .map(FragmentState::from_bits)
+                .transpose()?;
+            match state {
+                Some(FragmentState::Stored) => {}
+                Some(FragmentState::Obliterating | FragmentState::PayloadDeleting) => {
+                    return Err(StoreError::from(SlowDown));
+                }
+                Some(FragmentState::Obliterated) | None => {
+                    return Err(StoreError::internal(format!(
+                        "associated fragment {hash} is not in Stored lifecycle state"
+                    )));
+                }
+            }
+            let fragment = self.head_fragment(hash).await?;
+            Self::upsert_metering_tx(&tx, hash, fragment).await?;
+        }
+        tx.execute(
+            "DELETE FROM lore_fragment_metering m \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM lore_fragments f \
+                 JOIN lore_fragment_state s USING (hash) \
+                 WHERE f.hash = m.hash AND s.state = 0 \
+             )",
+            &[],
+        )
+        .await
+        .map_err(db_err)?;
+
+        let count = u64::try_from(rows.len())
+            .map_err(|error| StoreError::internal_with_context(error, "fragment count overflow"))?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(count)
     }
 }
 
@@ -519,6 +759,11 @@ fn db_err(e: tokio_postgres::Error) -> StoreError {
     } else {
         StoreError::internal(format!("postgres immutable store: {e}"))
     }
+}
+
+/// Row/column shape failures are permanent schema or query-contract bugs, never overload.
+fn row_decode_err(error: tokio_postgres::Error) -> StoreError {
+    StoreError::internal_with_context(error, "postgres immutable-store row decode failed")
 }
 
 /// Map a pool-checkout error (transient ⇒ `SlowDown`).
@@ -547,11 +792,38 @@ fn s3_payload_load_error(error: AwsError<SdkError<GetObjectError>>, hash: Hash) 
     }
 }
 
-fn s3_err<E: std::fmt::Debug>(e: AwsError<E>, context: &str) -> StoreError {
-    match e {
-        AwsError::AwsSdkError(_) => StoreError::from(SlowDown),
-        other => StoreError::internal(format!("{context}: {other:?}")),
+fn s3_head_error(error: AwsError<SdkError<HeadObjectError>>, hash: Hash) -> StoreError {
+    match &error {
+        AwsError::AwsSdkError(sdk_error)
+            if matches!(
+                sdk_error.as_service_error(),
+                Some(HeadObjectError::NotFound(_))
+            ) =>
+        {
+            PostgresImmutableStore::not_found(hash)
+        }
+        AwsError::AwsSdkError(sdk_error) if is_retryable_sdk_error(sdk_error) => {
+            StoreError::from(SlowDown)
+        }
+        _ => StoreError::internal_with_context(error, "S3 head object failed"),
     }
+}
+
+fn s3_operation_error<E>(error: AwsError<SdkError<E>>, context: &str) -> StoreError
+where
+    E: ProvideErrorMetadata + std::fmt::Debug + Send + Sync + 'static,
+{
+    match &error {
+        AwsError::AwsSdkError(sdk_error) if is_retryable_sdk_error(sdk_error) => {
+            StoreError::from(SlowDown)
+        }
+        _ => StoreError::internal_with_context(error, context),
+    }
+}
+
+fn stored_durable(mut fragment: Fragment) -> Fragment {
+    fragment.flags |= FragmentFlags::PayloadStoredDurable.bits();
+    fragment
 }
 
 #[async_trait]
@@ -672,8 +944,7 @@ impl ImmutableStore for PostgresImmutableStore {
     ) -> Result<StoreQueryResult, StoreError> {
         let _t = self.instruments.start("query", self.pool.status());
         let repository: Context = partition.into();
-        self.do_query(repository, address, match_requested, true)
-            .await
+        self.do_query(repository, address, match_requested).await
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -684,8 +955,29 @@ impl ImmutableStore for PostgresImmutableStore {
     ) -> Result<StoreQueryResult, StoreError> {
         let _t = self.instruments.start("get_metadata", self.pool.status());
         let repository: Context = partition.into();
-        self.do_query(repository, address, StoreMatch::MatchFull, true)
-            .await
+        let query = self
+            .do_query(repository, address, StoreMatch::MatchFull)
+            .await?;
+        if query.match_made == StoreMatch::MatchNone {
+            return Ok(query);
+        }
+
+        match self.head_fragment(address.hash).await {
+            Ok(fragment) => Ok(StoreQueryResult {
+                fragment,
+                match_made: query.match_made,
+            }),
+            Err(error) if error.is_address_not_found() => {
+                if let Err(repair_error) = self.repair_missing_payload(address.hash).await {
+                    tracing::warn!(%address, ?repair_error, "failed to repair missing payload state");
+                }
+                Ok(StoreQueryResult {
+                    fragment: Fragment::default(),
+                    match_made: StoreMatch::MatchNone,
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -697,9 +989,20 @@ impl ImmutableStore for PostgresImmutableStore {
     ) -> Result<(Fragment, Bytes), StoreError> {
         let _t = self.instruments.start("get", self.pool.status());
         let repository: Context = partition.into();
-        self.ensure_exists(repository, address, match_required)
-            .await?;
-        let (fragment, payload) = self.load(address.hash).await?;
+        let query = self.do_query(repository, address, match_required).await?;
+        if query.match_made == StoreMatch::MatchNone {
+            return Err(Self::not_found(address.hash));
+        }
+        let loaded = self.load(address.hash).await;
+        if loaded
+            .as_ref()
+            .err()
+            .is_some_and(StoreError::is_address_not_found)
+            && let Err(repair_error) = self.repair_missing_payload(address.hash).await
+        {
+            tracing::warn!(%address, ?repair_error, "failed to repair missing payload state");
+        }
+        let (fragment, payload) = loaded?;
         lore_storage::validate_fragment_payload(&fragment, payload.len())?;
         Ok((fragment, payload))
     }
@@ -715,57 +1018,83 @@ impl ImmutableStore for PostgresImmutableStore {
     ) -> Result<(), StoreError> {
         let _t = self.instruments.start("put", self.pool.status());
         sanitise_fragment_behavior_flags(&mut fragment);
+        lore_storage::validate_fragment_metadata(&fragment)?;
         if let Some(payload) = payload.as_ref() {
             lore_storage::validate_fragment_payload(&fragment, payload.len())?;
         } else {
             lore_storage::validate_fragment_size(&fragment)?;
         }
+        i64::try_from(fragment.size_content).map_err(|error| {
+            StoreError::internal_with_context(
+                error,
+                "fragment size_content exceeds Postgres metering range",
+            )
+        })?;
         let repository: Context = partition.into();
+        let mut client = self.pool.get().await.map_err(pool_err)?;
+        let tx = client.transaction().await.map_err(db_err)?;
+        Self::lock_hash(&tx, address.hash).await?;
 
-        let query = self
-            .do_query(repository, address, StoreMatch::MatchFull, false)
-            .await;
-
-        let match_made = if let Ok(query) = &query {
-            if query.fragment.flags & FragmentFlags::PayloadObliterating.bits()
-                == FragmentFlags::PayloadObliterating.bits()
-                && query.match_made != StoreMatch::MatchNone
-            {
-                return Err(StoreError::internal(format!(
-                    "Failed to obliterate immutable {address}"
-                )));
+        let state = Self::load_state_tx(&tx, address.hash).await?;
+        let associated = Self::association_exists_tx(&tx, repository, address).await?;
+        match state {
+            Some(FragmentState::Obliterating | FragmentState::PayloadDeleting) => {
+                return Err(StoreError::from(SlowDown));
             }
-            if query.match_made != StoreMatch::MatchNone
-                && fragment.size_content != query.fragment.size_content
-                && query.fragment.flags & FragmentFlags::PayloadObliterated.bits()
-                    != FragmentFlags::PayloadObliterated.bits()
-            {
-                return Err(StoreError::internal("Hash collision"));
+            Some(FragmentState::Stored) if associated => {
+                return tx.commit().await.map_err(db_err);
             }
-            query.match_made
-        } else {
-            StoreMatch::MatchNone
-        };
-
-        match match_made {
-            // Already present with this exact context — nothing to do.
-            StoreMatch::MatchFull => Ok(()),
-            // Bytes already present for this repository (or globally); just record
-            // the new association for this context.
-            StoreMatch::MatchPartition => self.associate_fragment(repository, address).await,
-            // Hash exists globally and the client proved the payload — associate.
-            StoreMatch::MatchHash if payload.is_some() => {
-                self.associate_fragment(repository, address).await
+            Some(FragmentState::Stored) => {
+                if payload.is_none() {
+                    return Err(StoreError::internal("Payload buffer required"));
+                }
+                match self.head_fragment(address.hash).await {
+                    Ok(authoritative) => {
+                        if authoritative.size_content != fragment.size_content {
+                            return Err(StoreError::internal("Hash collision"));
+                        }
+                        Self::upsert_metering_tx(&tx, address.hash, authoritative).await?;
+                        Self::associate_fragment_tx(&tx, repository, address).await?;
+                        return tx.commit().await.map_err(db_err);
+                    }
+                    Err(error) if error.is_address_not_found() => {
+                        tx.execute(
+                            "DELETE FROM lore_fragment_state WHERE hash = $1",
+                            &[&address.hash.data().as_slice()],
+                        )
+                        .await
+                        .map_err(db_err)?;
+                        tx.execute(
+                            "DELETE FROM lore_fragment_metering WHERE hash = $1",
+                            &[&address.hash.data().as_slice()],
+                        )
+                        .await
+                        .map_err(db_err)?;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            // No match — the payload must have been provided; store it.
-            StoreMatch::MatchNone if payload.is_some() => {
-                self.write_payload(repository, address, fragment, payload.unwrap())
-                    .await
-            }
-            StoreMatch::MatchHash | StoreMatch::MatchNone => {
-                Err(StoreError::internal("Payload buffer required"))
-            }
+            Some(FragmentState::Obliterated) | None => {}
         }
+
+        let Some(payload) = payload else {
+            return Err(StoreError::internal("Payload buffer required"));
+        };
+        let key = Self::hash_key(address.hash);
+        self.s3
+            .put_object(
+                &self.bucket,
+                &key,
+                payload.to_vec(),
+                Some(to_object_metadata(&fragment)),
+            )
+            .await
+            .map_err(|error| s3_operation_error(error, "S3 put object failed"))?;
+
+        Self::set_state_tx(&tx, address.hash, FragmentState::Stored).await?;
+        Self::upsert_metering_tx(&tx, address.hash, fragment).await?;
+        Self::associate_fragment_tx(&tx, repository, address).await?;
+        tx.commit().await.map_err(db_err)
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -778,60 +1107,130 @@ impl ImmutableStore for PostgresImmutableStore {
         let _t = self.instruments.start("obliterate", self.pool.status());
         let repository: Context = partition.into();
 
-        let original = self.load_metadata(address.hash).await?;
-        lore_storage::validate_fragment_size(&original)?;
+        // Phase 1: remove this association and durably publish the child-traversal mark. No object
+        // request occurs while a Postgres connection is held. A retry that finds either transient
+        // state resumes below instead of treating the half-finished operation as complete.
+        let phase = {
+            let mut client = self.pool.get().await.map_err(pool_err)?;
+            let tx = client.transaction().await.map_err(db_err)?;
+            Self::lock_hash(&tx, address.hash).await?;
 
-        // Acquire the obliteration lock by flagging the metadata; if it is
-        // already flagged, another obliteration is in flight / completed.
-        if original.flags & FragmentFlags::PayloadObliteration.bits() != 0 {
-            return Ok(());
-        }
-        let mut obliterating = original;
-        obliterating.flags |= FragmentFlags::PayloadObliterating.bits();
-        self.update_metadata(address.hash, obliterating, original)
-            .await?;
+            match Self::load_state_tx(&tx, address.hash).await? {
+                Some(FragmentState::Stored) => {
+                    if !Self::association_exists_tx(&tx, repository, address).await? {
+                        tx.commit().await.map_err(db_err)?;
+                        return Ok(());
+                    }
 
-        // A fragmented fragment's payload is a list of child references; obliterate
-        // each child first.
-        if obliterating.flags & FragmentFlags::PayloadFragmented.bits() != 0 {
-            let payload = self.get_payload_bytes(address.hash).await?;
-            let aligned = payload.to_aligned::<FragmentReference>();
-            let references = aligned.as_type_slice::<FragmentReference>().to_vec();
-            for reference in references {
-                let child = Address {
-                    hash: reference.hash,
-                    context: address.context,
-                };
-                self.clone()
-                    .obliterate(partition, child, stats.clone())
-                    .await?;
+                    let deleted = Self::delete_association_tx(&tx, repository, address).await?;
+                    if Self::has_associations_tx(&tx, address.hash).await? {
+                        tx.commit().await.map_err(db_err)?;
+                        if deleted > 0 {
+                            stats
+                                .num_fragments
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        return Ok(());
+                    }
+
+                    Self::set_state_tx(&tx, address.hash, FragmentState::Obliterating).await?;
+                    tx.commit().await.map_err(db_err)?;
+                    if deleted > 0 {
+                        stats
+                            .num_fragments
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    FragmentState::Obliterating
+                }
+                Some(FragmentState::Obliterating) => {
+                    tx.commit().await.map_err(db_err)?;
+                    FragmentState::Obliterating
+                }
+                Some(FragmentState::PayloadDeleting) => {
+                    tx.commit().await.map_err(db_err)?;
+                    FragmentState::PayloadDeleting
+                }
+                Some(FragmentState::Obliterated) | None => {
+                    tx.commit().await.map_err(db_err)?;
+                    return Ok(());
+                }
+            }
+        };
+
+        // Phase 2: read the still-present parent object and recursively finish its children. This
+        // is deliberately resumable: an error leaves Obliterating committed, so the next call
+        // repeats the idempotent child traversal. Once complete, publish PayloadDeleting.
+        if phase == FragmentState::Obliterating {
+            let (fragment, payload) = self.load(address.hash).await?;
+            self.clone()
+                .obliterate_sub_fragments(partition, address, fragment, payload, stats.clone())
+                .await?;
+
+            let mut client = self.pool.get().await.map_err(pool_err)?;
+            let tx = client.transaction().await.map_err(db_err)?;
+            Self::lock_hash(&tx, address.hash).await?;
+            if Self::has_associations_tx(&tx, address.hash).await? {
+                return Err(StoreError::internal(
+                    "fragment gained an association during obliteration",
+                ));
+            }
+            match Self::load_state_tx(&tx, address.hash).await? {
+                Some(FragmentState::Obliterating) => {
+                    Self::set_state_tx(&tx, address.hash, FragmentState::PayloadDeleting).await?;
+                    tx.commit().await.map_err(db_err)?;
+                }
+                Some(FragmentState::PayloadDeleting) => {
+                    tx.commit().await.map_err(db_err)?;
+                }
+                Some(FragmentState::Obliterated) => {
+                    tx.commit().await.map_err(db_err)?;
+                    return Ok(());
+                }
+                Some(FragmentState::Stored) | None => {
+                    return Err(StoreError::internal(
+                        "fragment lifecycle regressed during obliteration",
+                    ));
+                }
             }
         }
 
-        self.delete_association(repository, address).await?;
-        stats
-            .num_fragments
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // If other associations remain, leave the shared payload in place and
-        // restore the metadata to its pre-obliteration state.
-        if self.has_associations(address.hash).await? {
-            return self
-                .update_metadata(address.hash, original, obliterating)
-                .await;
-        }
-
+        // Phase 3: version deletion is idempotent and runs without a database checkout. A crash
+        // after this call leaves PayloadDeleting committed; retrying lists/deletes again and then
+        // performs the final state/projection transaction.
         self.delete_payload(address.hash).await?;
-        stats
-            .num_payloads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let mut obliterated = obliterating;
-        obliterated.flags = FragmentFlags::PayloadObliterated.bits();
-        obliterated.size_payload = 0;
-        obliterated.size_content = 0;
-        self.update_metadata(address.hash, obliterated, obliterating)
-            .await
+        let mut client = self.pool.get().await.map_err(pool_err)?;
+        let tx = client.transaction().await.map_err(db_err)?;
+        Self::lock_hash(&tx, address.hash).await?;
+        match Self::load_state_tx(&tx, address.hash).await? {
+            Some(FragmentState::PayloadDeleting) => {
+                if Self::has_associations_tx(&tx, address.hash).await? {
+                    return Err(StoreError::internal(
+                        "fragment gained an association while deleting its payload",
+                    ));
+                }
+                tx.execute(
+                    "DELETE FROM lore_fragment_metering WHERE hash = $1",
+                    &[&address.hash.data().as_slice()],
+                )
+                .await
+                .map_err(db_err)?;
+                Self::set_state_tx(&tx, address.hash, FragmentState::Obliterated).await?;
+                tx.commit().await.map_err(db_err)?;
+                stats
+                    .num_payloads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Some(FragmentState::Obliterated) => {
+                tx.commit().await.map_err(db_err)?;
+                Ok(())
+            }
+            Some(FragmentState::Obliterating) => Err(StoreError::from(SlowDown)),
+            Some(FragmentState::Stored) | None => Err(StoreError::internal(
+                "fragment lifecycle changed while deleting its payload",
+            )),
+        }
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -851,23 +1250,40 @@ impl ImmutableStore for PostgresImmutableStore {
             context: destination_context,
         };
 
-        let query = self
-            .do_query(
-                source_repository,
-                source_address,
-                StoreMatch::MatchFull,
-                false,
-            )
-            .await?;
-        if query.match_made != StoreMatch::MatchFull {
+        let mut client = self.pool.get().await.map_err(pool_err)?;
+        let tx = client.transaction().await.map_err(db_err)?;
+        Self::lock_hash(&tx, source_address.hash).await?;
+        if Self::load_state_tx(&tx, source_address.hash).await? != Some(FragmentState::Stored)
+            || !Self::association_exists_tx(&tx, source_repository, source_address).await?
+        {
             return Err(StoreError::from(AddressNotFound::from(source_address)));
         }
 
-        // Single shared bucket + global hash-keyed metadata: the bytes and the
-        // metadata are already reachable for the destination, so a copy is a pure
-        // association write.
-        self.associate_fragment(destination_repository, destination_address)
-            .await
+        match self.head_fragment(source_address.hash).await {
+            Ok(fragment) => {
+                Self::upsert_metering_tx(&tx, source_address.hash, fragment).await?;
+                Self::associate_fragment_tx(&tx, destination_repository, destination_address)
+                    .await?;
+                tx.commit().await.map_err(db_err)
+            }
+            Err(error) if error.is_address_not_found() => {
+                tx.execute(
+                    "DELETE FROM lore_fragment_state WHERE hash = $1",
+                    &[&source_address.hash.data().as_slice()],
+                )
+                .await
+                .map_err(db_err)?;
+                tx.execute(
+                    "DELETE FROM lore_fragment_metering WHERE hash = $1",
+                    &[&source_address.hash.data().as_slice()],
+                )
+                .await
+                .map_err(db_err)?;
+                tx.commit().await.map_err(db_err)?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn evict(
@@ -916,49 +1332,108 @@ impl ImmutableStore for PostgresImmutableStore {
             .instruments
             .start("repository_stats", self.pool.status());
         let repository: Context = partition.into();
-        let client = self.pool.get().await.map_err(pool_err)?;
+        let mut client = self.pool.get().await.map_err(pool_err)?;
+        let tx = client.transaction().await.map_err(db_err)?;
 
-        // DISTINCT over the repository's hashes first (a fragment can be
-        // associated more than once under different contexts, and the sizes are
-        // per-hash), then join the per-hash size index. Both sides are index
-        // reads: `lore_fragments_repo_hash` for the inner set, the
-        // `lore_fragment_metadata` PK for the join.
-        //
-        // SUM() over bigint yields numeric in Postgres, which has no
-        // tokio-postgres FromSql for our types — cast back to bigint. Sizes are
-        // byte counts, so the i64 ceiling is ~9 EB and unreachable here.
-        //
-        // The join is inner on purpose: an association whose metadata row is
-        // absent has no size to account for, so it is excluded from the count as
-        // well as from the sums, keeping the three figures consistent with each
-        // other.
-        let row = client
+        // An inner join could return an exact-looking undercount after projection loss. Find every
+        // missing row first, acquire hash locks in a stable order, and synchronously reconstruct it
+        // from authoritative object metadata. Any failed HEAD rolls the whole repair transaction
+        // back and fails this stats call rather than publishing a partial result.
+        let incomplete = tx
+            .query(
+                "SELECT DISTINCT f.hash, s.state \
+                 FROM lore_fragments f \
+                 LEFT JOIN lore_fragment_state s USING (hash) \
+                 LEFT JOIN lore_fragment_metering m USING (hash) \
+                 WHERE f.repository = $1 \
+                   AND (m.hash IS NULL OR s.hash IS NULL OR s.state <> 0) \
+                 ORDER BY f.hash",
+                &[&repository.data().as_slice()],
+            )
+            .await
+            .map_err(db_err)?;
+        for row in incomplete {
+            let bytes: Vec<u8> = row.try_get("hash").map_err(row_decode_err)?;
+            if bytes.len() != std::mem::size_of::<Hash>() {
+                return Err(StoreError::internal(format!(
+                    "invalid fragment hash length {} in Postgres",
+                    bytes.len()
+                )));
+            }
+            let hash = Hash::from(bytes.as_slice());
+            Self::lock_hash(&tx, hash).await?;
+
+            // The association may have been removed while this transaction waited for its hash.
+            // Skip it if so; the aggregate below observes the current committed association set.
+            if tx
+                .query_opt(
+                    "SELECT 1 FROM lore_fragments WHERE repository = $1 AND hash = $2 LIMIT 1",
+                    &[&repository.data().as_slice(), &hash.data().as_slice()],
+                )
+                .await
+                .map_err(db_err)?
+                .is_none()
+            {
+                continue;
+            }
+
+            match Self::load_state_tx(&tx, hash).await? {
+                Some(FragmentState::Stored) => {
+                    let fragment = self.head_fragment(hash).await?;
+                    Self::upsert_metering_tx(&tx, hash, fragment).await?;
+                }
+                Some(FragmentState::Obliterating | FragmentState::PayloadDeleting) => {
+                    return Err(StoreError::from(SlowDown));
+                }
+                Some(FragmentState::Obliterated) | None => {
+                    return Err(StoreError::internal(format!(
+                        "associated fragment {hash} is not in Stored lifecycle state"
+                    )));
+                }
+            }
+        }
+
+        // DISTINCT deduplicates contexts within the repository. LEFT JOIN keeps incomplete rows
+        // visible so the count comparison can fail closed instead of returning an undercount.
+        // `SUM(bigint)` yields numeric, so cast back to bigint.
+        let row = tx
             .query_one(
-                "SELECT COUNT(*)::bigint AS fragment_count, \
+                "SELECT COUNT(*)::bigint AS referenced_count, \
+                        COUNT(m.hash)::bigint AS projected_count, \
+                        COUNT(s.hash) FILTER (WHERE s.state = 0)::bigint AS stored_count, \
                         COALESCE(SUM(m.size_payload), 0)::bigint AS payload_bytes, \
                         COALESCE(SUM(m.size_content), 0)::bigint AS content_bytes \
                  FROM (SELECT DISTINCT hash FROM lore_fragments WHERE repository = $1) f \
-                 JOIN lore_fragment_metadata m USING (hash)",
+                 LEFT JOIN lore_fragment_metering m USING (hash) \
+                 LEFT JOIN lore_fragment_state s USING (hash)",
                 &[&repository.data().as_slice()],
             )
             .await
             .map_err(db_err)?;
 
-        // `try_get` rather than `get`: the latter panics on a column or type
-        // mismatch, and a panic is not an error path this crate is allowed to
-        // take. The `.max(0)` clamp is belt and braces — a COUNT and a SUM over
-        // non-negative bigints cannot go negative, but an `as u64` on a negative
-        // i64 would wrap to a colossal byte figure rather than fail.
+        // `try_get` rather than `get`: the latter panics on a column or type mismatch.
         let read = |column: &str| -> Result<u64, StoreError> {
-            let value: i64 = row.try_get(column).map_err(db_err)?;
-            Ok(value.max(0) as u64)
+            let value: i64 = row.try_get(column).map_err(row_decode_err)?;
+            u64::try_from(value).map_err(|error| {
+                StoreError::internal_with_context(error, "negative repository storage statistic")
+            })
         };
 
-        Ok(StoreRepositoryStats {
-            fragment_count: read("fragment_count")?,
+        let referenced_count = read("referenced_count")?;
+        if read("projected_count")? != referenced_count || read("stored_count")? != referenced_count
+        {
+            return Err(StoreError::internal(
+                "repository storage projection is incomplete after repair",
+            ));
+        }
+
+        let result = StoreRepositoryStats {
+            fragment_count: referenced_count,
             payload_bytes: read("payload_bytes")?,
             content_bytes: read("content_bytes")?,
-        })
+        };
+        tx.commit().await.map_err(db_err)?;
+        Ok(result)
     }
 }
 

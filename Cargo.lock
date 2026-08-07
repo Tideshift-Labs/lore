@@ -2824,6 +2824,7 @@ version = "0.8.7-nightly"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",
+ "aws-smithy-types",
  "bytes",
  "deadpool-postgres",
  "lore-aws",

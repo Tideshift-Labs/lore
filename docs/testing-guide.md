@@ -581,10 +581,13 @@ the next run starts from the map instead of rediscovering it.
   `ImmutableStore::repository_stats` is a **default** trait method returning
   `StoreError::NotSupported` (deliberate — the alternative is a hidden full-table scan on a
   backend with no repository-keyed access path, e.g. DynamoDB); only
-  `lore-postgres::PostgresImmutableStore::repository_stats` overrides it, with one query joining
-  `SELECT DISTINCT hash FROM lore_fragments WHERE repository = $1` against
-  `lore_fragment_metadata`, backed by the new `lore_fragments_repo_hash (repository, hash)` index
-  (in both the inline `SCHEMA` const and `migrations/0001_init.sql`).
+  `lore-postgres::PostgresImmutableStore::repository_stats` overrides it. The current
+  implementation joins distinct repository associations to `lore_fragment_state` and the
+  non-authoritative `lore_fragment_metering` projection, backed by the
+  `lore_fragments_repo_hash (repository, hash)` index (in both the inline `SCHEMA` const and
+  `migrations/0001_init.sql`). Fragment representation metadata is authoritative on the S3
+  object; stats repair missing projection rows from S3 and fail closed rather than returning an
+  exact-looking undercount. `loreserver --rebuild-postgres-metering` rebuilds the full projection.
   `lore-server/src/grpc/repository/v1/repository_storage_stats.rs`'s `handler` re-checks repo
   authz via `check_repository_query_authorization` (CR-011's ReBAC callback) before any store
   call, then maps `StoreError::NotSupported → Unimplemented`, `SlowDown → ResourceExhausted`,
@@ -642,23 +645,23 @@ the next run starts from the map instead of rediscovering it.
   `cargo test -p lore-postgres --test immutable_store` for real — all 15 passed (11 pre-existing
   + 4 CR-016), not skip-green. **`EXPLAIN (ANALYZE, BUFFERS)` on the exact `repository_stats`
   query, after seeding 50k fragments across 500 synthetic repositories**, confirmed
-  `Bitmap Index Scan on lore_fragments_repo_hash` for the association lookup and
-  `Index Scan using lore_fragment_metadata_pkey` for the join — no sequential scan anywhere;
-  closes the reviewer's index-actually-serves-the-plan question for real, not by reading the
-  `CREATE INDEX` statement. Tore both containers down after. Command for next time (adjust
-  ports to whatever's free):
+  `Bitmap Index Scan on lore_fragments_repo_hash` for the association lookup and an indexed
+  hash lookup for the then-current metadata join, with no sequential scan. The metadata table
+  cited by that historical run has since been replaced by `lore_fragment_state` plus the
+  rebuildable `lore_fragment_metering` projection; rerun `EXPLAIN` against those current tables
+  when validating future query-plan changes. Tore both containers down after. Command for next
+  time (adjust ports to whatever's free):
   ```
   docker run -d --name lore-pg-test -p 5433:5432 -e POSTGRES_PASSWORD=test -e POSTGRES_DB=lore postgres:16
   docker run -d --name lore-minio-test -p 9090:9000 -p 9091:9001 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data --console-address ":9001"
   ```
   **Two reviewer-named coverage gaps closed:**
-  - **Inner-join exclusion.** `repository_stats_excludes_an_association_with_no_metadata_row`
-    (`lore-postgres/tests/immutable_store.rs`) proves an association row with no matching
-    `lore_fragment_metadata` row is dropped from `fragment_count` too, not just the sums (the
-    query's `JOIN` is inner, not `LEFT JOIN`). No public store API leaves that state on its own
-    (`put` always writes both rows in one transaction) — construct it with a direct
-    `tokio_postgres::connect` + `DELETE FROM lore_fragment_metadata` against the same
-    `LORE_TEST_PG_URL`, bypassing the store entirely. **Gotcha:** the workspace root
+  - **Projection-loss handling (supersedes the old inner-join exclusion behavior).** Current
+    `repository_stats` uses completeness counts and repairs a missing
+    `lore_fragment_metering` row from authoritative S3 object metadata. It fails the call if the
+    object metadata or Stored lifecycle state is unavailable, so an association is never silently
+    dropped from `fragment_count` or the byte sums. Coverage directly deletes the projection row,
+    calls stats, and verifies exact repair. **Gotcha:** the workspace root
     `clippy.toml` (not `lore-server/clippy.toml`, which shadows it with only
     `future-size-threshold` and has no `disallowed-methods` list) forbids raw `tokio::spawn` —
     `lore-postgres` inherits the root list since it has no `clippy.toml` of its own, so driving

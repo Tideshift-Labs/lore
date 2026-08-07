@@ -3,8 +3,9 @@
 --
 -- CR-007 — canonical schema for the off-AWS (off-DynamoDB) loreserver data-plane
 -- backend. One Postgres database per region cell backs all three coordination
--- stores: mutable (branch-tip CAS), immutable METADATA (fragment index), and
--- lock. Immutable fragment BYTES live in S3-compatible object storage, not here.
+-- stores: mutable (branch-tip CAS), immutable coordination, and lock. Immutable
+-- fragment bytes and their authoritative representation metadata live together
+-- on S3-compatible objects, not here.
 --
 -- The store implementations also self-bootstrap these exact tables via
 -- `CREATE TABLE IF NOT EXISTS` at startup (see each `*_store.rs`), so this file
@@ -36,8 +37,9 @@ CREATE INDEX IF NOT EXISTS lore_locks_owner_repo_branch ON lore_locks (owner, re
 CREATE INDEX IF NOT EXISTS lore_locks_repo_branch       ON lore_locks (repository, branch);
 CREATE INDEX IF NOT EXISTS lore_locks_repo_branch_desc  ON lore_locks (repository, branch, description);
 
--- Immutable store metadata. Fragment BYTES live in S3-compatible object storage;
--- only the index lives here.
+-- Immutable store coordination. Fragment bytes and representation metadata live
+-- in S3-compatible object storage. Postgres keeps associations, mutable lifecycle
+-- state, and an exact but rebuildable metering projection.
 --
 -- lore_fragments: one row per (hash, repository, context) association. The PK
 -- B-tree serves the leftmost-prefix existence reads — hash (MatchHash),
@@ -53,11 +55,19 @@ CREATE TABLE IF NOT EXISTS lore_fragments (
 );
 CREATE INDEX IF NOT EXISTS lore_fragments_repo_hash ON lore_fragments (repository, hash);
 
--- lore_fragment_metadata: one row per fragment hash (global dedup,
--- content-addressed) carrying the Fragment flags/sizes.
-CREATE TABLE IF NOT EXISTS lore_fragment_metadata (
-    hash         bytea  NOT NULL PRIMARY KEY,
-    flags        bigint NOT NULL,
-    size_payload bigint NOT NULL,
-    size_content bigint NOT NULL
+-- lore_fragment_state: mutable readability/obliteration lifecycle only.
+CREATE TABLE IF NOT EXISTS lore_fragment_state (
+    hash  bytea  NOT NULL PRIMARY KEY,
+    -- 0 Stored; 512 Obliterating children; 1 deleting payload versions; 256 tombstone.
+    state bigint NOT NULL CHECK (state IN (0, 1, 256, 512))
+);
+
+-- lore_fragment_metering: non-authoritative projection of the representation
+-- carried on the corresponding S3 object, synchronized on writes/copies and
+-- rebuildable from object metadata. It exists only for exact set-based stats.
+CREATE TABLE IF NOT EXISTS lore_fragment_metering (
+    hash          bytea  NOT NULL PRIMARY KEY,
+    payload_flags bigint NOT NULL CHECK (payload_flags >= 0 AND payload_flags <= 4294967295),
+    size_payload bigint NOT NULL CHECK (size_payload >= 0),
+    size_content bigint NOT NULL CHECK (size_content >= 0)
 );
