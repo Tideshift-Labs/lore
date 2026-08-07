@@ -33,14 +33,13 @@ docs before adding one.
 - Engine code standards: **no `unwrap`/`expect` in non-test code**, layered `thiserror`→`LoreError`,
   `lore_spawn!`-only task spawning, SPDX headers, DCO `Signed-off-by` on anything intended to upstream.
 
-## Our deltas (keep current — which crates we've touched + how they're tested)
+## Our deltas — inventory (keep current)
 
-Per the `lore-fork-patches-inventory`: our `tideshift/main` commits are mostly SERVER-side
-(loreserver / lore-aws / v1 gRPC), with one client-path change (native TLS roots in `lore-transport`,
-not the CLI itself). As you test a delta, record here **which crate it's in and how it's covered**, so
-the next run starts from the map instead of rediscovering it.
+Per `lore-fork-patches-inventory`: `tideshift/main` commits are mostly SERVER-side
+(loreserver / lore-aws / v1 gRPC), with a few client-path deltas. Each entry: what changed, where, how
+it's tested. Test everything with `cargo test -p <crate> --lib -- <module path>` unless noted.
 
-- **CR-004 (write-permission enforcement)** — `lore-server/src/grpc/revision/v1/service.rs`. Gate is
+- **CR-004 write-permission enforcement [SERVER]** — `lore-server/src/grpc/revision/v1/service.rs`,
   `require_permission(...)` inline in `branch_create`/`branch_delete`/`branch_push` (NOT
   `branch_metadata_set`, which instead threads `enforce_write_permission` down into its own handler).
   Tests: `grpc::revision::v1::service::tests` (`read_only_token_push_is_denied`,
@@ -90,11 +89,31 @@ the next run starts from the map instead of rediscovering it.
 
 ---
 
-## Deep findings / gotchas (append as discovered)
+## Durable gotchas & patterns
 
-> Add an entry whenever something cost a real debugging/churn cycle. Format **symptom → cause → what to
-> do**, with a `cargo` command or `file:line`. Terse. If a finding generalizes beyond testing, flag it
-> for a close-out learning/skill (or a `lorehub/docs/lore-change-requests/` note).
+### Build & merge hygiene
+- **An upstream merge that changes a signature our tests call directly compiles-fails silently until
+  you build.** `git diff --stat` on the merge commit won't show it. Always `cargo build -p <crate>
+  --tests` before `cargo test` after any merge touching a patched file — a stale call site is a
+  compile error, and `cargo test`'s output on a broken build can misleadingly read as "no tests ran"
+  instead of surfacing the real rustc diagnostic.
+- **Honest skips, not silent passes, for infra-gated tests.** `#[ignore]` a Postgres/S3-gated test
+  (run with `-- --ignored`) rather than writing a plain `#[test]` that prints a notice and returns
+  when the env var is unset — Rust's harness reports the latter as **passed**, which is how real
+  bugs (e.g. two SQL defects, CR-016 lineage) can reach staging with a fully green suite proving
+  nothing. See `lorehub/docs/learnings/prefer-an-executable-check-over-a-source-read-verdict.md`.
+- **A `cargo build`/`test` error naming a file with zero `git diff` is probably a stale incremental
+  cache, not a real error.** Running `cargo clippy` then a separate `cargo build --tests`/`cargo
+  test` invocation against the same `target/` can produce a bogus "crate required in rlib format but
+  not found" or "cannot determine resolution for macro" error in an untouched file. Fix: `cargo clean
+  -p <the-crate-that-actually-errored>` (not a full workspace clean) + rebuild. Check `git status`
+  before spending time reading the named file.
+- **A CR spec may name a crate that doesn't exist on the branch you're testing from**, if that
+  crate was merged into `tideshift/main` after the branch's lineage point (e.g. `lore-postgres`/
+  CR-007 on a branch cut from upstream `main`). `cargo check -p <crate>` fails with "package ID
+  specification did not match any packages" — not a bug in either delta. Check workspace `members`
+  or `git merge-base` against `tideshift/main` before treating a missing `-p <crate>` as a real gate
+  failure; flag the lineage gap and re-run after merge.
 
 - **Upstream merge that adds a handler param breaks our tests silently until you build.** Merging
   `upstream/main` (v0.8.5, commit eab1984) added a `forwarded_requests: Option<Arc<dyn
