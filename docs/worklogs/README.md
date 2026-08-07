@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 017 | 2026-08-07 | [Merge upstream 0.8.7 and make S3 fragment metadata authoritative](017-upstream-0-8-7-s3-authoritative-postgres-store.md) |
 | 015 | 2026-07-29 | [Run upstream revision-tree integration suite after merge](015-run-upstream-revision-tree-integration-suite.md) |
 | 014 | 2026-07-29 | [Merge upstream (33 commits) into `tideshift/main`](014-merge-upstream-33-commits-into-tideshift-main.md) |
 | 013 | 2026-07-29 | [Preserve local-read overload classification (CR-021 Part 2c)](013-preserve-local-read-overload-cr021-part2c.md) |
