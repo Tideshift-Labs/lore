@@ -801,10 +801,34 @@ pub async fn sync(
     dispatch_call(globals, args, callback, sync_local).await
 }
 
+/// Synchronizes to an explicit revision that the in-process caller has already
+/// verified as a safe remote target on the current branch. Rust-only companion to
+/// [`sync`]: keeping provenance out of [`LoreRevisionSyncArgs`] preserves its public
+/// C ABI and prevents generic CLI `--remote` resolution from becoming trusted proof.
+pub async fn sync_verified_remote(
+    globals: LoreGlobalArgs,
+    args: LoreRevisionSyncArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    // This entry point is deliberately in-process only. Delegating through
+    // LORE_USE_SERVICE would serialize the unchanged public args and lose the
+    // provenance bit at the process boundary.
+    sync_local_with_provenance(globals, args, callback, true).await
+}
+
 async fn sync_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionSyncArgs,
     callback: LoreEventCallback,
+) -> i32 {
+    sync_local_with_provenance(globals, args, callback, false).await
+}
+
+async fn sync_local_with_provenance(
+    globals: LoreGlobalArgs,
+    args: LoreRevisionSyncArgs,
+    callback: LoreEventCallback,
+    revision_is_remote: bool,
 ) -> i32 {
     repository_call_write(
         globals,
@@ -826,6 +850,7 @@ async fn sync_local(
                 .collect();
             let options = SyncOptions {
                 revision: args.revision.into(),
+                revision_is_remote,
                 forward_changes: args.forward_changes != 0,
                 reset: args.reset != 0,
                 force_hash_check: false,

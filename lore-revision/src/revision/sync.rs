@@ -211,6 +211,10 @@ pub struct LoreRevisionSyncFileEventData {
 pub struct SyncOptions {
     /// Optional partial revision signature to sync to
     pub revision: Option<String>,
+    /// True only when the caller independently proved that an explicit revision
+    /// is a safe remote target on the current branch. This updates branch
+    /// bookkeeping without changing explicit sync's local-target merge semantics.
+    pub revision_is_remote: bool,
     /// Keep local changes
     pub forward_changes: bool,
     /// Reset local modified files to match incoming revision
@@ -234,6 +238,7 @@ impl Default for SyncOptions {
     fn default() -> Self {
         Self {
             revision: None,
+            revision_is_remote: false,
             forward_changes: false,
             reset: false,
             force_hash_check: false,
@@ -479,6 +484,23 @@ pub async fn sync(
 
     let revision = state_target.revision();
     let revision_number = state_target.revision_number();
+    let target_branch = state_target
+        .revision_metadata(repository.clone())
+        .await
+        .ok()
+        .map(|metadata| metadata.branch);
+    let should_store_remote_latest = if location == LoreBranchLocation::Remote {
+        // Preserve Lore's existing head-sync behavior. The normal target-selection
+        // path already resolved local/remote divergence before choosing Remote.
+        true
+    } else if options.revision_is_remote
+        && target_branch == Some(branch_id)
+        && state_target.parent_other().is_zero()
+    {
+        remote_target_advances_branch(repository.clone(), local_latest, revision).await?
+    } else {
+        false
+    };
 
     LoreEvent::RevisionSyncTarget(LoreRevisionSyncTargetEventData {
         remote: remote_url.into(),
@@ -494,7 +516,28 @@ pub async fn sync(
     })
     .send();
 
+    // An explicit remote-tip sync can be a working-tree no-op while still having
+    // branch metadata to reconcile. Auto-sync deliberately pins the exact remote
+    // revision it proved safe; before target provenance was carried here, that
+    // advanced the current anchor but left the named branch LATEST behind. A later
+    // head sync then returned at this point forever, so named-branch divergence and
+    // current-working-copy divergence disagreed.
+    //
+    // Only a proven remote target may repair the branch pointer. Explicit local
+    // revision syncs must retain the old behavior so moving backwards cannot discard
+    // newer local history.
     if revision == current_revision && !force && !options.reset {
+        if !execution_context().globals().dry_run() && should_store_remote_latest {
+            branch::store_latest(
+                repository.clone(),
+                branch_id,
+                revision,
+                BranchLatestStatus::Convergent,
+            )
+            .await
+            .internal("Failed to store revision as current branch latest")?;
+            branch::store_last_sync(repository, branch_id, revision).await;
+        }
         return Ok(());
     }
 
@@ -662,6 +705,37 @@ pub async fn sync(
     .send();
 
     Ok(())
+}
+
+/// A remote-proven explicit target may advance a stale named branch pointer, but
+/// must never move it backwards over newer local history. This distinction matters
+/// for pinned auto-sync targets: the server can advance again after preflight, so the
+/// pinned target may be an ancestor of the newest remote tip while still being a safe
+/// descendant of the local branch tip. Callers separately require the target's
+/// revision metadata to name the current branch and reject merge targets before
+/// reaching this first-parent ancestry check.
+async fn remote_target_advances_branch(
+    repository: Arc<RepositoryContext>,
+    local_latest: Hash,
+    target: Hash,
+) -> Result<bool, SyncError> {
+    if local_latest.is_zero() || local_latest == target {
+        return Ok(true);
+    }
+
+    let (_branch_point, target_history, local_history) =
+        history::find_branch_point(repository, target, local_latest)
+            .await
+            .forward::<SyncError>(
+                "Unable to verify the remote sync target against local history",
+            )?;
+    let advances = local_history.is_empty() && !target_history.is_empty();
+    if !advances {
+        lore_debug!(
+            "Remote sync target {target} does not advance local branch latest {local_latest}; preserving local latest"
+        );
+    }
+    Ok(advances)
 }
 
 async fn sync_load_layer_list(
