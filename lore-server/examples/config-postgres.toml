@@ -1,14 +1,16 @@
 # Lore Server Configuration Example: Postgres + S3-compatible object storage
 # =====================================================================
 # CR-007 off-AWS (off-DynamoDB) data-plane backend. All three coordination
-# stores run on ONE Postgres database per region cell; immutable fragment BYTES
-# live in S3-compatible object storage (DO Spaces / MinIO / LocalStack). This is
-# the single-vendor "DO cell" backend (ADR-00008 option B2 / ADR-00009 §2).
+# stores run on ONE Postgres database per region cell. Immutable fragment bytes
+# and authoritative representation metadata live on S3-compatible objects (DO
+# Spaces / MinIO / LocalStack). Postgres retains lifecycle state, repository
+# associations, and an exact rebuildable metering projection. This is the
+# single-vendor "DO cell" backend (ADR-00008 option B2 / ADR-00009 §2).
 #
 # Required services:
 # - A Postgres database (the three stores self-bootstrap their tables; or apply
 #   lore-postgres/migrations/0001_init.sql out-of-band).
-# - An S3-compatible bucket for immutable fragment payloads.
+# - An S3-compatible bucket for immutable fragment objects.
 #
 # Postgres-specific settings are under [plugins.postgres.*]. Each store group
 # carries its own connection (they may point at the same database).
@@ -26,7 +28,10 @@ mode = "postgres"
 # Postgres Plugin Configuration
 # ---------------------------------------------------------------------
 
-# Immutable store: fragment METADATA in Postgres, fragment BYTES in object storage.
+# Immutable store: fragment representations and bytes are authoritative in
+# object storage. Postgres holds lifecycle/associations and the exact metering
+# projection, which operators can reconcile offline with:
+#   loreserver --config <DIR> --env <ENV> --rebuild-postgres-metering
 #
 # Postgres TLS. The URL's sslmode controls whether TLS is ATTEMPTED (libpq
 # semantics): default `prefer` tries TLS and falls back to plaintext (fine for
@@ -42,7 +47,7 @@ url = "postgres://postgres:postgres@localhost:5432/lore?sslmode=require"
 # ca_cert_path = "/etc/lore/do-ca-certificate.crt"
 # tls_insecure_skip_verify = false
 
-# S3-compatible object storage for the fragment bytes. Keys mirror lore-aws's
+# S3-compatible object storage for fragment objects. Keys mirror lore-aws's
 # endpoint/region/bucket/path-style so the same backend points at DO Spaces.
 # Credentials come from the standard AWS env chain (AWS_ACCESS_KEY_ID /
 # AWS_SECRET_ACCESS_KEY) or instance role.

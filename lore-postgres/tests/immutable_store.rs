@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT
 //! Integration tests for the Postgres-backed immutable store (CR-007).
 //!
-//! Fragment **metadata** lives in Postgres (`lore_fragments` +
-//! `lore_fragment_metadata`); fragment **bytes** live in an S3-compatible
-//! object store (MinIO / LocalStack / DO Spaces).
+//! Fragment payload metadata and bytes live atomically on the S3-compatible
+//! object (MinIO / LocalStack / DO Spaces). Postgres keeps repository/context
+//! associations, mutable obliteration state, and a rebuildable metering
+//! projection.
 //!
 //! # Running
 //!
@@ -49,19 +50,32 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
+use aws_sdk_s3::types::BucketVersioningStatus;
+use aws_sdk_s3::types::VersioningConfiguration;
 use bytes::Bytes;
+use bytes::BytesMut;
+use lore_aws::clients::AwsClientBuilder;
+use lore_aws::clients::HttpClientSettings;
+use lore_aws::clients::TimeoutConfig;
+use lore_aws::s3::S3Impl;
+use lore_aws::store::object_metadata::from_object_metadata;
+use lore_aws::store::object_metadata::to_object_metadata;
 use lore_postgres::store::immutable_store::ObjectStoreSettings;
 use lore_postgres::store::immutable_store::PostgresImmutableStore;
 use lore_storage::Address;
 use lore_storage::Context;
 use lore_storage::Fragment;
+use lore_storage::FragmentFlags;
+use lore_storage::FragmentReference;
 use lore_storage::Hash;
 use lore_storage::ImmutableStore;
 use lore_storage::Partition;
 use lore_storage::StoreMatch;
 use lore_storage::StoreObliterateStats;
 use lore_storage::StoreRepositoryStats;
+use lore_storage::TypedBytesMut;
 use serial_test::serial;
 
 // ─── env helpers ─────────────────────────────────────────────────────────────
@@ -77,29 +91,95 @@ fn env_config() -> Option<(String, String, String, String)> {
     Some((pg_url, s3_endpoint, s3_bucket, s3_region))
 }
 
-/// Delete a fragment's `lore_fragment_metadata` row directly over a
-/// throwaway connection, bypassing `PostgresImmutableStore`'s own API (which
-/// never leaves an association without its metadata row on its own — `put`
-/// writes both in one transaction). Used to construct an "association
-/// present, metadata absent" state for the inner-join test below; that state
-/// can arise operationally (e.g. a partial/aborted cleanup) even though this
-/// store never produces it itself.
-async fn delete_metadata_row(pg_url: &str, hash: Hash) {
+async fn pg_client(pg_url: &str) -> tokio_postgres::Client {
     let (client, connection) = tokio_postgres::connect(pg_url, tokio_postgres::NoTls)
         .await
-        .expect("connect for direct metadata delete");
+        .expect("connect for direct test setup");
     lore_base::lore_spawn!(async move {
         if let Err(e) = connection.await {
             eprintln!("direct postgres connection error: {e}");
         }
     });
     client
+}
+
+/// Delete one rebuildable metering row while leaving its association and S3
+/// object intact. This simulates projection loss without corrupting the
+/// authoritative representation.
+async fn delete_metering_row(pg_url: &str, hash: Hash) {
+    let client = pg_client(pg_url).await;
+    client
         .execute(
-            "DELETE FROM lore_fragment_metadata WHERE hash = $1",
+            "DELETE FROM lore_fragment_metering WHERE hash = $1",
             &[&hash.data().as_slice()],
         )
         .await
-        .expect("delete metadata row");
+        .expect("delete metering row");
+}
+
+/// Remove every Postgres row for a deliberately corrupted object fixture so
+/// global reconciliation tests remain independent of test execution order.
+async fn delete_hash_rows(pg_url: &str, hash: Hash) {
+    let mut client = pg_client(pg_url).await;
+    let transaction = client.transaction().await.expect("begin fixture cleanup");
+    for table in [
+        "lore_fragments",
+        "lore_fragment_state",
+        "lore_fragment_metering",
+    ] {
+        transaction
+            .execute(
+                &format!("DELETE FROM {table} WHERE hash = $1"),
+                &[&hash.data().as_slice()],
+            )
+            .await
+            .expect("delete corrupted fixture rows");
+    }
+    transaction.commit().await.expect("commit fixture cleanup");
+}
+
+async fn metering_fragment(pg_url: &str, hash: Hash) -> Option<Fragment> {
+    let client = pg_client(pg_url).await;
+    client
+        .query_opt(
+            "SELECT payload_flags, size_payload, size_content \
+             FROM lore_fragment_metering WHERE hash = $1",
+            &[&hash.data().as_slice()],
+        )
+        .await
+        .expect("query metering row")
+        .map(|row| Fragment {
+            flags: row.get::<_, i64>("payload_flags") as u32,
+            size_payload: row.get::<_, i64>("size_payload") as u32,
+            size_content: row.get::<_, i64>("size_content") as u64,
+        })
+}
+
+async fn make_s3(s3_endpoint: &str, s3_region: &str) -> S3Impl {
+    let builder = Box::pin(
+        AwsClientBuilder::builder()
+            .with_http_settings(&HttpClientSettings::default())
+            .maybe_endpoint(Some(s3_endpoint.to_string()))
+            .maybe_region(Some(s3_region.to_string()))
+            .with_timeout_config(
+                TimeoutConfig::builder()
+                    .operation_timeout(Duration::from_secs(30))
+                    .build(),
+            )
+            .build_config(),
+    )
+    .await
+    .with_slow_operation_threshold(u64::MAX)
+    .s3_with_path_style(true);
+
+    Box::pin(builder.build())
+        .await
+        .expect("build direct test S3 client")
+}
+
+fn object_key(hash: Hash) -> String {
+    let mut destination = [0u8; 64];
+    lore_revision::util::to_hex_str(hash.data(), &mut destination).to_string()
 }
 
 // ─── shared test helpers ──────────────────────────────────────────────────────
@@ -110,6 +190,16 @@ async fn make_store(
     s3_endpoint: &str,
     s3_bucket: &str,
     s3_region: &str,
+) -> Arc<PostgresImmutableStore> {
+    make_store_with_pool_max(pg_url, s3_endpoint, s3_bucket, s3_region, 5).await
+}
+
+async fn make_store_with_pool_max(
+    pg_url: &str,
+    s3_endpoint: &str,
+    s3_bucket: &str,
+    s3_region: &str,
+    pool_max_size: u32,
 ) -> Arc<PostgresImmutableStore> {
     let settings = ObjectStoreSettings {
         bucket: s3_bucket.to_string(),
@@ -125,13 +215,92 @@ async fn make_store(
     Arc::new(
         PostgresImmutableStore::connect(
             pg_url,
-            5,
+            pool_max_size,
             &lore_postgres::pool::TlsConfig::default(),
             settings,
         )
         .await
         .expect("connect + schema + S3 client"),
     )
+}
+
+async fn seed_fragment_state(pg_url: &str, partition: Partition, address: Address, state: i64) {
+    let repository: Context = partition.into();
+    let mut client = pg_client(pg_url).await;
+    let transaction = client.transaction().await.expect("begin lifecycle fixture");
+    transaction
+        .execute(
+            "DELETE FROM lore_fragments WHERE repository = $1 AND context = $2 AND hash = $3",
+            &[
+                &repository.data().as_slice(),
+                &address.context.data().as_slice(),
+                &address.hash.data().as_slice(),
+            ],
+        )
+        .await
+        .expect("remove target association");
+    transaction
+        .execute(
+            "INSERT INTO lore_fragment_state (hash, state) VALUES ($1, $2) \
+             ON CONFLICT (hash) DO UPDATE SET state = EXCLUDED.state",
+            &[&address.hash.data().as_slice(), &state],
+        )
+        .await
+        .expect("seed lifecycle state");
+    transaction
+        .commit()
+        .await
+        .expect("commit lifecycle fixture");
+}
+
+async fn fragment_state(pg_url: &str, hash: Hash) -> Option<i64> {
+    pg_client(pg_url)
+        .await
+        .query_opt(
+            "SELECT state FROM lore_fragment_state WHERE hash = $1",
+            &[&hash.data().as_slice()],
+        )
+        .await
+        .expect("query lifecycle state")
+        .map(|row| row.get("state"))
+}
+
+async fn put_fragment_chain(
+    store: Arc<PostgresImmutableStore>,
+    partition: Partition,
+    depth: usize,
+) -> Vec<Address> {
+    let leaf: Address = rand::random();
+    put_fragment(store.clone(), partition, leaf, 1024).await;
+    let mut addresses = vec![leaf];
+    let mut child = leaf;
+
+    for _ in 0..depth {
+        let parent = Address {
+            hash: rand::random(),
+            context: leaf.context,
+        };
+        let reference = FragmentReference {
+            hash: child.hash,
+            offset_content: 0,
+        };
+        let mut payload = BytesMut::zeroed(std::mem::size_of::<FragmentReference>());
+        payload.as_type_slice_mut::<FragmentReference>()[0] = reference;
+        let payload = payload.freeze();
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadFragmented.bits(),
+            size_payload: payload.len() as u32,
+            size_content: 1024,
+        };
+        store
+            .clone()
+            .put(partition, parent, fragment, Some(payload), false)
+            .await
+            .expect("put fragmented parent");
+        addresses.push(parent);
+        child = parent;
+    }
+    addresses
 }
 
 /// Build an uncompressed `Fragment` + payload for the given byte size.
@@ -147,6 +316,11 @@ fn make_fragment_and_payload(size_payload: u32) -> (Fragment, Bytes) {
     };
     let payload = Bytes::from(vec![0xABu8; size_payload as usize]);
     (fragment, payload)
+}
+
+fn stored_durable(mut fragment: Fragment) -> Fragment {
+    fragment.flags |= FragmentFlags::PayloadStoredDurable.bits();
+    fragment
 }
 
 /// Put `size_payload` bytes under `(partition, address)` and return the stored
@@ -191,6 +365,17 @@ async fn round_trip_byte_perfect() {
     // 200 KB: exercises the streaming read path, stays under 256 KB threshold.
     let (frag_in, payload_in) = put_fragment(s.clone(), partition, address, 200 * 1024).await;
 
+    let object = make_s3(&ep, &region)
+        .await
+        .head_object(&bucket, &object_key(address.hash))
+        .await
+        .expect("head object written by put");
+    assert_eq!(
+        from_object_metadata(object.metadata()),
+        Ok(frag_in),
+        "the S3 object must carry the authoritative fragment metadata"
+    );
+
     let (frag_out, payload_out) = s
         .clone()
         .get(partition, address, StoreMatch::MatchFull)
@@ -198,7 +383,8 @@ async fn round_trip_byte_perfect() {
         .expect("get after put");
 
     assert_eq!(
-        frag_in, frag_out,
+        stored_durable(frag_in),
+        frag_out,
         "Fragment metadata must round-trip unchanged"
     );
     assert_eq!(
@@ -276,29 +462,20 @@ async fn existence_levels() {
         .await
         .expect("query");
     assert_eq!(q.match_made, StoreMatch::MatchFull, "query match_made");
-    assert_eq!(q.fragment.size_payload, 1024, "query fragment size_payload");
-    assert_eq!(q.fragment.size_content, 1024, "query fragment size_content");
-    assert_eq!(q.fragment.flags, 0, "query fragment flags");
+    assert_eq!(
+        q.fragment,
+        stored_durable(Fragment::default()),
+        "query must not spend an S3 request for representation metadata"
+    );
 }
 
 /// 3. Dedup behavior — same partition, same hash, different context.
 ///
-/// IMPLEMENTATION FINDING: The `lookup` in this Postgres implementation calls
-/// `do_query` with `MatchFull` and short-circuits a `MatchFull` miss to
-/// `MatchNone` (the comment reads: "there is no partial-upload support, so
-/// there is no benefit to probing coarser granularities"). This means the
-/// `MatchPartition` arm of `put`'s match is unreachable: even if the hash
-/// exists in the same partition under a different context, `lookup` returns
-/// `MatchNone`, which with `payload = None` hits the `Err("Payload buffer
-/// required")` arm.
-///
-/// The test below documents the actual behavior:
+/// A new association to an existing global hash still requires the caller to
+/// supply a payload as proof of the logical content it is associating:
 /// - Same partition, same hash, different context, NO payload → error.
 /// - Same partition, same hash, different context, WITH payload → succeeds
-///   (re-uploads to S3 idempotently, records the new association).
-///
-/// This finding is reported to the main session; the spec's "MatchPartition
-/// path" description does not match the current implementation.
+///   after validating the authoritative object, without rewriting it.
 #[tokio::test]
 #[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
@@ -316,8 +493,7 @@ async fn dedup_same_partition_requires_payload() {
     let addr1: Address = rand::random();
     let (frag, payload) = put_fragment(s.clone(), partition, addr1, 1024).await;
 
-    // Same partition, same hash, new context — WITHOUT payload. The MatchPartition
-    // arm is unreachable so this must error with "Payload buffer required".
+    // Same partition, same hash, new context — WITHOUT payload proof.
     let addr2 = Address {
         hash: addr1.hash,
         context: rand::random(),
@@ -333,8 +509,8 @@ async fn dedup_same_partition_requires_payload() {
         "expected 'Payload buffer required' in error, got: {err_str}"
     );
 
-    // Same partition, same hash, new context WITH payload → succeeds
-    // (re-uploads the same S3 key idempotently, adds the new association row).
+    // Same partition, same hash, new context WITH payload proof → succeeds
+    // after validating the existing self-describing object.
     s.clone()
         .put(partition, addr2, frag, Some(payload.clone()), false)
         .await
@@ -354,8 +530,8 @@ async fn dedup_same_partition_requires_payload() {
 /// 3 (continued). Cross-partition put without payload errors with
 /// "Payload buffer required".
 ///
-/// The hash exists globally (MatchHash level) but `lookup(MatchFull)` returns
-/// `MatchNone` on a full-miss, so `put` with `payload = None` errors.
+/// The hash exists globally, but a new repository/context association still
+/// requires payload proof.
 #[tokio::test]
 #[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
@@ -385,6 +561,203 @@ async fn dedup_cross_partition_no_payload_errors() {
     assert!(
         err_str.contains("Payload buffer required"),
         "expected 'Payload buffer required', got: {err_str}"
+    );
+}
+
+/// Two valid physical representations of the same logical hash may race. Both
+/// associations succeed and converge on whichever complete S3 object version
+/// wins; both repositories are metered from that actual representation.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn concurrent_same_hash_first_writes_converge_object_and_projection() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let hash: Hash = rand::random();
+    let partition_a: Partition = rand::random();
+    let partition_b: Partition = rand::random();
+    let address_a = Address {
+        hash,
+        context: rand::random(),
+    };
+    let address_b = Address {
+        hash,
+        context: rand::random(),
+    };
+    let fragment_a = Fragment {
+        flags: FragmentFlags::PayloadCompressedZstd.bits(),
+        size_payload: 1024,
+        size_content: 8192,
+    };
+    let fragment_b = Fragment {
+        flags: FragmentFlags::PayloadCompressedLZ4.bits(),
+        size_payload: 1536,
+        size_content: 8192,
+    };
+    let payload_a = Bytes::from(vec![0xA1; fragment_a.size_payload as usize]);
+    let payload_b = Bytes::from(vec![0xB2; fragment_b.size_payload as usize]);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let write_a = {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            store
+                .put(partition_a, address_a, fragment_a, Some(payload_a), false)
+                .await
+        }
+    };
+    let write_b = {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            store
+                .put(partition_b, address_b, fragment_b, Some(payload_b), false)
+                .await
+        }
+    };
+    let (result_a, result_b) = tokio::join!(write_a, write_b);
+
+    assert!(
+        result_a.is_ok() && result_b.is_ok(),
+        "both valid representations must associate: A={result_a:?}, B={result_b:?}"
+    );
+    let object = make_s3(&ep, &region)
+        .await
+        .head_object(&bucket, &object_key(hash))
+        .await
+        .expect("head winning object");
+    let winner_fragment = from_object_metadata(object.metadata())
+        .expect("winning object must carry valid fragment metadata");
+    assert!(
+        winner_fragment == fragment_a || winner_fragment == fragment_b,
+        "object must contain one complete submitted representation: {winner_fragment:?}"
+    );
+
+    let metadata_a = store
+        .clone()
+        .get_metadata(partition_a, address_a)
+        .await
+        .expect("read representation through association A");
+    let metadata_b = store
+        .clone()
+        .get_metadata(partition_b, address_b)
+        .await
+        .expect("read representation through association B");
+    assert_eq!(metadata_a.fragment, stored_durable(winner_fragment));
+    assert_eq!(metadata_b.fragment, stored_durable(winner_fragment));
+    assert_eq!(
+        metering_fragment(&pg, hash).await,
+        Some(winner_fragment),
+        "projection must describe the winning S3 object version"
+    );
+    assert_eq!(
+        store
+            .clone()
+            .repository_stats(partition_a)
+            .await
+            .expect("repository A stats"),
+        StoreRepositoryStats {
+            fragment_count: 1,
+            payload_bytes: u64::from(winner_fragment.size_payload),
+            content_bytes: winner_fragment.size_content,
+        },
+        "repository A must be metered from the winning representation"
+    );
+    assert_eq!(
+        store
+            .clone()
+            .repository_stats(partition_b)
+            .await
+            .expect("repository B stats"),
+        StoreRepositoryStats {
+            fragment_count: 1,
+            payload_bytes: u64::from(winner_fragment.size_payload),
+            content_bytes: winner_fragment.size_content,
+        },
+        "repository B must be metered from the winning representation"
+    );
+}
+
+/// Reusing a hash for different logical content remains a collision: the
+/// second association is rejected and cannot disturb the existing object or
+/// projection.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn same_hash_with_different_logical_size_is_rejected() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let hash: Hash = rand::random();
+    let partition_a: Partition = rand::random();
+    let partition_b: Partition = rand::random();
+    let address_a = Address {
+        hash,
+        context: rand::random(),
+    };
+    let address_b = Address {
+        hash,
+        context: rand::random(),
+    };
+    let fragment_a = Fragment {
+        flags: FragmentFlags::PayloadCompressedZstd.bits(),
+        size_payload: 512,
+        size_content: 4096,
+    };
+    let fragment_b = Fragment {
+        flags: FragmentFlags::PayloadCompressedLZ4.bits(),
+        size_payload: 768,
+        size_content: 8192,
+    };
+    store
+        .clone()
+        .put(
+            partition_a,
+            address_a,
+            fragment_a,
+            Some(Bytes::from(vec![0xA1; 512])),
+            false,
+        )
+        .await
+        .expect("put original logical content");
+
+    let error = store
+        .clone()
+        .put(
+            partition_b,
+            address_b,
+            fragment_b,
+            Some(Bytes::from(vec![0xB2; 768])),
+            false,
+        )
+        .await
+        .expect_err("different logical size for one hash must be rejected");
+
+    assert!(
+        error.is_internal(),
+        "expected collision Internal, got {error:?}"
+    );
+    assert_eq!(metering_fragment(&pg, hash).await, Some(fragment_a));
+    assert_eq!(
+        store
+            .exist(partition_b, address_b, StoreMatch::MatchFull)
+            .await
+            .expect("check rejected association"),
+        StoreMatch::MatchNone
     );
 }
 
@@ -469,6 +842,18 @@ async fn copy_fragment() {
         payload, payload_out,
         "copied fragment bytes must be identical to the original"
     );
+    assert_eq!(
+        s.clone()
+            .repository_stats(dst_partition)
+            .await
+            .expect("destination repository stats after copy"),
+        StoreRepositoryStats {
+            fragment_count: 1,
+            payload_bytes: 2048,
+            content_bytes: 2048,
+        },
+        "copy must associate the existing projection with the destination repository"
+    );
 }
 
 /// 6a. `obliterate` with a single association: after obliteration, `get` errors
@@ -529,6 +914,11 @@ async fn obliterate_single_association() {
         1,
         "obliterate must record 1 payload deleted (sole association)"
     );
+    assert_eq!(
+        metering_fragment(&pg, address.hash).await,
+        None,
+        "last-association obliteration must remove the metering projection"
+    );
 }
 
 /// 6b. `obliterate` with refcount: two associations to the same hash —
@@ -559,8 +949,8 @@ async fn obliterate_refcount_keeps_other_association() {
         context: rand::random(),
     };
 
-    // Both puts require payload (MatchPartition path unreachable).
-    // The second S3 upload is idempotent — same key, same bytes.
+    // Both puts supply payload proof. The second validates the existing object
+    // and adds only the new association.
     let (frag, payload) = make_fragment_and_payload(1024);
     s.clone()
         .put(partition, addr1, frag, Some(payload.clone()), false)
@@ -609,6 +999,392 @@ async fn obliterate_refcount_keeps_other_association() {
         0,
         "payload must NOT be deleted when other associations remain"
     );
+    assert_eq!(
+        metering_fragment(&pg, hash).await,
+        Some(frag),
+        "shared payloads retain their metering projection"
+    );
+}
+
+/// Recursive obliteration must not retain a Postgres checkout while descending.
+/// A chain much deeper than a one-connection pool completes instead of waiting
+/// forever for its own connection.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn obliterate_deep_fragment_chain_with_one_connection_does_not_deadlock() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        return;
+    };
+    let store = make_store_with_pool_max(&pg, &ep, &bucket, &region, 1).await;
+    let partition: Partition = rand::random();
+    let addresses = put_fragment_chain(store.clone(), partition, 3).await;
+    let root = *addresses.last().expect("chain has a root");
+    let stats = Arc::new(StoreObliterateStats::default());
+
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        store.clone().obliterate(partition, root, stats.clone()),
+    )
+    .await
+    .expect("recursive obliteration self-deadlocked with a one-connection pool")
+    .expect("obliterate deep fragment chain");
+
+    assert_eq!(stats.num_fragments.load(Ordering::Relaxed), addresses.len());
+    assert_eq!(stats.num_payloads.load(Ordering::Relaxed), addresses.len());
+    for address in addresses {
+        assert_eq!(fragment_state(&pg, address.hash).await, Some(256));
+        assert_eq!(metering_fragment(&pg, address.hash).await, None);
+    }
+}
+
+/// A process restart after publishing `Obliterating` must resume child
+/// traversal from the still-present parent object and finish both payloads.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn obliterate_retry_from_obliterating_resumes_child_traversal() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let partition: Partition = rand::random();
+    let addresses = put_fragment_chain(store.clone(), partition, 1).await;
+    let child = addresses[0];
+    let parent = addresses[1];
+    seed_fragment_state(&pg, partition, parent, 512).await;
+    let stats = Arc::new(StoreObliterateStats::default());
+
+    store
+        .clone()
+        .obliterate(partition, parent, stats.clone())
+        .await
+        .expect("retry from Obliterating");
+
+    assert_eq!(fragment_state(&pg, parent.hash).await, Some(256));
+    assert_eq!(fragment_state(&pg, child.hash).await, Some(256));
+    assert_eq!(metering_fragment(&pg, parent.hash).await, None);
+    assert_eq!(metering_fragment(&pg, child.hash).await, None);
+    assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 2);
+}
+
+/// A process restart after child traversal must skip that traversal, resume
+/// payload deletion, remove the projection, and publish `Obliterated`.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn obliterate_retry_from_payload_deleting_finishes_finalization() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let partition: Partition = rand::random();
+    let address: Address = rand::random();
+    put_fragment(store.clone(), partition, address, 1024).await;
+    seed_fragment_state(&pg, partition, address, 1).await;
+    let stats = Arc::new(StoreObliterateStats::default());
+
+    store
+        .clone()
+        .obliterate(partition, address, stats.clone())
+        .await
+        .expect("retry from PayloadDeleting");
+
+    assert_eq!(fragment_state(&pg, address.hash).await, Some(256));
+    assert_eq!(metering_fragment(&pg, address.hash).await, None);
+    assert!(
+        make_s3(&ep, &region)
+            .await
+            .head_object(&bucket, &object_key(address.hash))
+            .await
+            .is_err(),
+        "payload must be absent after finalization"
+    );
+    assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 1);
+}
+
+/// Version deletion must drain more than one `ListObjectVersions` page and
+/// leave neither historical versions nor delete markers behind.
+#[tokio::test]
+#[ignore = "needs live Postgres + version-capable S3 env; run with -- --ignored"]
+#[serial]
+async fn obliterate_deletes_more_than_one_thousand_object_versions() {
+    let Some((pg, ep, _shared_bucket, region)) = env_config() else {
+        return;
+    };
+    let s3 = make_s3(&ep, &region).await;
+    let isolated_bucket = format!(
+        "lore-versions-{}",
+        &object_key(rand::random::<Hash>())[..20]
+    );
+    s3.sdk_client()
+        .create_bucket()
+        .bucket(&isolated_bucket)
+        .send()
+        .await
+        .expect("create isolated versioning bucket");
+    let versioning_enabled = VersioningConfiguration::builder()
+        .status(BucketVersioningStatus::Enabled)
+        .build();
+    s3.sdk_client()
+        .put_bucket_versioning()
+        .bucket(&isolated_bucket)
+        .versioning_configuration(versioning_enabled)
+        .send()
+        .await
+        .expect("enable bucket versioning");
+    let store = make_store(&pg, &ep, &isolated_bucket, &region).await;
+
+    let partition: Partition = rand::random();
+    let address: Address = rand::random();
+    let (fragment, payload) = put_fragment(store.clone(), partition, address, 64).await;
+    let key = object_key(address.hash);
+    for _ in 0..1000 {
+        s3.put_object(
+            &isolated_bucket,
+            &key,
+            payload.to_vec(),
+            Some(to_object_metadata(&fragment)),
+        )
+        .await
+        .expect("append object version");
+    }
+
+    let before = s3
+        .sdk_client()
+        .list_object_versions()
+        .bucket(&isolated_bucket)
+        .prefix(&key)
+        .send()
+        .await
+        .expect("list first version page");
+    assert_eq!(before.versions().len(), 1000, "first page must be full");
+    assert!(before.is_truncated().unwrap_or(false));
+
+    let result = store
+        .clone()
+        .obliterate(
+            partition,
+            address,
+            Arc::new(StoreObliterateStats::default()),
+        )
+        .await;
+    let after = s3
+        .sdk_client()
+        .list_object_versions()
+        .bucket(&isolated_bucket)
+        .prefix(&key)
+        .send()
+        .await
+        .expect("list versions after obliteration");
+    let cleanup = s3
+        .sdk_client()
+        .delete_bucket()
+        .bucket(&isolated_bucket)
+        .send()
+        .await;
+
+    result.expect("obliterate versioned payload");
+    assert!(after.versions().is_empty(), "historical versions remain");
+    assert!(after.delete_markers().is_empty(), "delete markers remain");
+    if let Err(error) = cleanup {
+        eprintln!("best-effort isolated bucket cleanup failed: {error}");
+    }
+}
+
+/// A new association racing the old association's obliteration must either
+/// preserve or resurrect the shared object atomically. The new association is
+/// never allowed to point at deleted bytes.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn put_racing_last_association_obliterate_preserves_a_complete_payload() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let source_partition: Partition = rand::random();
+    let destination_partition: Partition = rand::random();
+    let source_address: Address = rand::random();
+    let destination_address = Address {
+        hash: source_address.hash,
+        context: rand::random(),
+    };
+    let (fragment, payload) =
+        put_fragment(store.clone(), source_partition, source_address, 1024).await;
+    let expected_payload = payload.clone();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let put = {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            store
+                .put(
+                    destination_partition,
+                    destination_address,
+                    fragment,
+                    Some(payload),
+                    false,
+                )
+                .await
+        }
+    };
+    let obliterate = {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            store
+                .obliterate(
+                    source_partition,
+                    source_address,
+                    Arc::new(StoreObliterateStats::default()),
+                )
+                .await
+        }
+    };
+    let (put_result, obliterate_result) = tokio::join!(put, obliterate);
+
+    obliterate_result.expect("source obliteration");
+    if let Err(error) = put_result {
+        assert!(
+            error.is_slow_down(),
+            "racing put may only fail transiently, got {error:?}"
+        );
+        store
+            .clone()
+            .put(
+                destination_partition,
+                destination_address,
+                fragment,
+                Some(expected_payload.clone()),
+                false,
+            )
+            .await
+            .expect("put retry after obliteration must resurrect the payload");
+    }
+    assert_eq!(
+        store
+            .clone()
+            .exist(source_partition, source_address, StoreMatch::MatchFull,)
+            .await
+            .expect("check source association"),
+        StoreMatch::MatchNone
+    );
+    let (stored_fragment, stored_payload) = store
+        .clone()
+        .get(
+            destination_partition,
+            destination_address,
+            StoreMatch::MatchFull,
+        )
+        .await
+        .expect("new association must have complete bytes");
+    assert_eq!(stored_fragment, stored_durable(fragment));
+    assert_eq!(stored_payload, expected_payload);
+    assert_eq!(
+        metering_fragment(&pg, source_address.hash).await,
+        Some(fragment)
+    );
+}
+
+/// Copy racing the source's last-association obliteration has two valid
+/// serializations: copy wins and preserves the object, or obliterate wins and
+/// copy reports absence. Neither may leave a destination association to
+/// deleted bytes.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn copy_racing_last_association_obliterate_never_dangles() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let source_partition: Partition = rand::random();
+    let destination_partition: Partition = rand::random();
+    let source_address: Address = rand::random();
+    let destination_context: Context = rand::random();
+    let destination_address = Address {
+        hash: source_address.hash,
+        context: destination_context,
+    };
+    let (fragment, _) = put_fragment(store.clone(), source_partition, source_address, 1024).await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let copy = {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            store
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    false,
+                )
+                .await
+        }
+    };
+    let obliterate = {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            store
+                .obliterate(
+                    source_partition,
+                    source_address,
+                    Arc::new(StoreObliterateStats::default()),
+                )
+                .await
+        }
+    };
+    let (copy_result, obliterate_result) = tokio::join!(copy, obliterate);
+    obliterate_result.expect("source obliteration");
+
+    let destination_match = store
+        .clone()
+        .exist(
+            destination_partition,
+            destination_address,
+            StoreMatch::MatchFull,
+        )
+        .await
+        .expect("check destination association");
+    if copy_result.is_ok() {
+        assert_eq!(destination_match, StoreMatch::MatchFull);
+        let (stored_fragment, _) = store
+            .clone()
+            .get(
+                destination_partition,
+                destination_address,
+                StoreMatch::MatchFull,
+            )
+            .await
+            .expect("successful copy must retain bytes");
+        assert_eq!(stored_fragment, stored_durable(fragment));
+        assert_eq!(
+            metering_fragment(&pg, source_address.hash).await,
+            Some(fragment)
+        );
+    } else {
+        assert_eq!(destination_match, StoreMatch::MatchNone);
+        assert_eq!(metering_fragment(&pg, source_address.hash).await, None);
+    }
 }
 
 /// 7. `get` on a never-put address returns an error (AddressNotFound-style),
@@ -909,10 +1685,9 @@ async fn repository_stats_isolates_repositories_but_double_counts_a_shared_hash(
         )
         .await
         .expect("put shared hash into repo A");
-    // Cross-partition, same hash, WITH payload — succeeds (idempotent
-    // re-upload to the same S3 key, plus a new association row scoped to
-    // repo B; see `dedup_cross_partition_no_payload_errors` for the
-    // no-payload counterpart that errors instead).
+    // Cross-partition, same hash, WITH payload proof — validates the existing
+    // object and adds a new association scoped to repo B. See
+    // `dedup_cross_partition_no_payload_errors` for the no-payload counterpart.
     s.clone()
         .put(
             partition_b,
@@ -958,18 +1733,12 @@ async fn repository_stats_isolates_repositories_but_double_counts_a_shared_hash(
     assert_eq!(stats_b.content_bytes, 1024 + 2048);
 }
 
-/// 13. Inner-join semantic: an association row (`lore_fragments`) with no
-///     matching `lore_fragment_metadata` row is excluded from the aggregate
-///     entirely — not just from the byte sums but from `fragment_count` too.
-///     The query's `JOIN … USING (hash)` (not a `LEFT JOIN`) drops the whole
-///     row rather than leaving a null-sized entry, so the three returned
-///     figures stay internally consistent (a `fragment_count` that doesn't
-///     match what its own sums account for would be worse than an
-///     under-count).
+/// 13. A missing metering projection row is repaired from authoritative S3
+///     metadata before repository statistics are aggregated.
 #[tokio::test]
 #[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
-async fn repository_stats_excludes_an_association_with_no_metadata_row() {
+async fn repository_stats_repairs_a_missing_metering_row_from_s3() {
     let Some((pg, ep, bucket, region)) = env_config() else {
         eprintln!(
             "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
@@ -980,32 +1749,191 @@ async fn repository_stats_excludes_an_association_with_no_metadata_row() {
     let s = make_store(&pg, &ep, &bucket, &region).await;
 
     let partition: Partition = rand::random();
-    // A normal fragment, present in both tables.
-    let normal_address: Address = rand::random();
-    put_fragment(s.clone(), partition, normal_address, 1024).await;
-
-    // A second fragment, associated in `lore_fragments` but with its
-    // `lore_fragment_metadata` row removed out from under it.
-    let orphan_address: Address = rand::random();
-    put_fragment(s.clone(), partition, orphan_address, 2048).await;
-    delete_metadata_row(&pg, orphan_address.hash).await;
+    let address: Address = rand::random();
+    let (fragment, _) = put_fragment(s.clone(), partition, address, 2048).await;
+    delete_metering_row(&pg, address.hash).await;
+    assert_eq!(
+        metering_fragment(&pg, address.hash).await,
+        None,
+        "test setup must remove only the projection row"
+    );
 
     let stats = s
         .clone()
         .repository_stats(partition)
         .await
-        .expect("repository_stats must not error on an orphaned association");
+        .expect("repository_stats must repair projection loss");
 
     assert_eq!(
-        stats.fragment_count, 1,
-        "the orphaned association (no metadata row) must be excluded, not counted"
+        stats,
+        StoreRepositoryStats {
+            fragment_count: 1,
+            payload_bytes: 2048,
+            content_bytes: 2048,
+        },
+        "stats must be exact after self-healing"
     );
     assert_eq!(
-        stats.payload_bytes, 1024,
-        "only the normal fragment's bytes may be summed"
+        metering_fragment(&pg, address.hash).await,
+        Some(fragment),
+        "the repaired projection must match authoritative object metadata"
+    );
+}
+
+/// A full rebuild reconciles every distinct associated hash and removes
+/// projection rows that no repository/context association references.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn rebuild_metering_projection_repairs_missing_and_removes_orphans() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let partition: Partition = rand::random();
+    let address_a: Address = rand::random();
+    let address_b: Address = rand::random();
+    let (fragment_a, _) = put_fragment(store.clone(), partition, address_a, 1024).await;
+    let (fragment_b, _) = put_fragment(store.clone(), partition, address_b, 4096).await;
+    delete_metering_row(&pg, address_a.hash).await;
+
+    let orphan_hash: Hash = rand::random();
+    let client = pg_client(&pg).await;
+    client
+        .execute(
+            "INSERT INTO lore_fragment_metering (hash, payload_flags, size_payload, size_content) \
+             VALUES ($1, 0, 9, 9)",
+            &[&orphan_hash.data().as_slice()],
+        )
+        .await
+        .expect("insert orphan metering row");
+    let expected_reconciled: i64 = client
+        .query_one("SELECT COUNT(DISTINCT hash) FROM lore_fragments", &[])
+        .await
+        .expect("count associated hashes before rebuild")
+        .get(0);
+
+    let reconciled = store
+        .rebuild_metering_projection()
+        .await
+        .expect("rebuild metering projection");
+
+    assert_eq!(
+        reconciled, expected_reconciled as u64,
+        "the rebuild result must equal all distinct currently associated hashes"
     );
     assert_eq!(
-        stats.content_bytes, 1024,
-        "only the normal fragment's bytes may be summed"
+        metering_fragment(&pg, address_a.hash).await,
+        Some(fragment_a)
     );
+    assert_eq!(
+        metering_fragment(&pg, address_b.hash).await,
+        Some(fragment_b)
+    );
+    assert_eq!(
+        metering_fragment(&pg, orphan_hash).await,
+        None,
+        "unassociated projection rows must be removed"
+    );
+}
+
+/// Rebuild is one transaction: if a later authoritative object is malformed,
+/// projection rows repaired earlier in hash order must roll back too.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn rebuild_metering_projection_rolls_back_on_malformed_object() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let partition: Partition = rand::random();
+    let address_a: Address = rand::random();
+    let address_b: Address = rand::random();
+    let (_, payload_a) = put_fragment(store.clone(), partition, address_a, 1024).await;
+    let (_, payload_b) = put_fragment(store.clone(), partition, address_b, 1024).await;
+    let (valid_address, corrupt_address, corrupt_payload) =
+        if address_a.hash.data() < address_b.hash.data() {
+            (address_a, address_b, payload_b)
+        } else {
+            (address_b, address_a, payload_a)
+        };
+    delete_metering_row(&pg, valid_address.hash).await;
+    delete_metering_row(&pg, corrupt_address.hash).await;
+    let malformed = std::collections::HashMap::from([(
+        "lore-fragment".to_string(),
+        "not:a:fragment".to_string(),
+    )]);
+    make_s3(&ep, &region)
+        .await
+        .put_object(
+            &bucket,
+            &object_key(corrupt_address.hash),
+            corrupt_payload,
+            Some(malformed),
+        )
+        .await
+        .expect("corrupt later authoritative object");
+
+    let rebuild = store.rebuild_metering_projection().await;
+    let valid_projection = metering_fragment(&pg, valid_address.hash).await;
+    let corrupt_projection = metering_fragment(&pg, corrupt_address.hash).await;
+    delete_hash_rows(&pg, valid_address.hash).await;
+    delete_hash_rows(&pg, corrupt_address.hash).await;
+
+    let error = rebuild.expect_err("malformed object must fail rebuild");
+    assert!(error.is_internal(), "expected Internal, got {error:?}");
+    assert_eq!(
+        valid_projection, None,
+        "earlier projection repair must roll back"
+    );
+    assert_eq!(corrupt_projection, None);
+}
+
+/// Fresh schema carries only association, lifecycle, and metering tables. The
+/// former authoritative Postgres metadata table must not be recreated.
+#[tokio::test]
+#[ignore = "needs a fresh live Postgres schema (see module docs); run with -- --ignored"]
+#[serial]
+async fn fresh_schema_does_not_create_the_old_fragment_metadata_table() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let client = pg_client(&pg).await;
+    client
+        .execute("DROP TABLE IF EXISTS lore_fragment_metadata", &[])
+        .await
+        .expect("remove legacy table before fresh-schema bootstrap");
+    let _store = make_store(&pg, &ep, &bucket, &region).await;
+    let row = client
+        .query_one(
+            "SELECT to_regclass('public.lore_fragment_metadata')::text AS old_table, \
+                    to_regclass('public.lore_fragment_state')::text AS state_table, \
+                    to_regclass('public.lore_fragment_metering')::text AS metering_table",
+            &[],
+        )
+        .await
+        .expect("inspect fresh immutable schema");
+
+    let old_table: Option<String> = row.get("old_table");
+    let state_table: Option<String> = row.get("state_table");
+    let metering_table: Option<String> = row.get("metering_table");
+    assert_eq!(
+        old_table, None,
+        "old authoritative PG metadata table remains"
+    );
+    assert_eq!(state_table.as_deref(), Some("lore_fragment_state"));
+    assert_eq!(metering_table.as_deref(), Some("lore_fragment_metering"));
 }
