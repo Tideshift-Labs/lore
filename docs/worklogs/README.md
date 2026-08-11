@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 020 | 2026-08-11 | [Add a regression guard for offline-readability of a fresh clone (WP-105 follow-on)](020-offline-clone-read-pytest-regression-guard.md) |
 | 019 | 2026-08-11 | [Report a delta-block read failure from `revision info` instead of swallowing it](019-report-delta-block-read-failure-revision-info.md) |
 | 018 | 2026-08-10 | [Fix offline-clone state-fragment retention lost in the 0.8.7 merge (WP-105)](018-offline-clone-state-retention-wp105.md) |
 | 017 | 2026-08-07 | [Merge upstream 0.8.7 and make S3 fragment metadata authoritative](017-upstream-0-8-7-s3-authoritative-postgres-store.md) |
