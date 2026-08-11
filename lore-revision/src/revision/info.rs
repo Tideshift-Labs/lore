@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -199,11 +200,40 @@ pub async fn info(
     if options.delta || options.metadata {
         let mut parent_state: Option<Arc<State>> = None;
 
-        if let Ok(delta_buffer) = state
+        let delta_buffer = state
             .delta_block(repository.clone())
             .await
-            .forward::<InfoError>("deserializing delta block")
-        {
+            .forward::<InfoError>("deserializing delta block");
+
+        // A failed delta read is NOT "this revision changed nothing". A revision
+        // that genuinely changed nothing carries a zero `hash_delta`, which
+        // short-circuits to an empty buffer with no error at all
+        // (`lore_storage::read::load_fragment`), so every `Err` arriving here is a
+        // real read failure. Reporting it as an empty file list made a storage
+        // failure indistinguishable from an empty revision and sent two WP-105
+        // investigations down the wrong path.
+        //
+        // Report it, but do not fail the operation. The delta rows are one part of
+        // `revision info`; the revision identity and metadata above them are
+        // already emitted and still correct, and a sparse clone legitimately does
+        // not hold an ancestor's delta block locally when read offline. Turning
+        // that into a hard error would trade a mildly-wrong file list for a broken
+        // view. `send_error` logs at Error level and emits a mid-stream, NON-terminal
+        // `LoreEvent::Error`; the terminal status stays successful.
+        //
+        // The message deliberately does not name which block failed: `delta_block`
+        // awaits `State::tree` first, so a tree-block read failure surfaces here
+        // too. The underlying error already carries the exact address.
+        if let Err(error) = &delta_buffer {
+            execution_context()
+                .dispatcher
+                .send_error(InfoError::internal(format!(
+                    "no file changes are being reported for revision {}: the revision delta could not be read: {error}",
+                    state.revision()
+                )));
+        }
+
+        if let Ok(delta_buffer) = delta_buffer {
             let delta_buffer = delta_buffer.to_aligned::<NodeDelta>();
             for delta in delta_buffer.as_type_slice::<NodeDelta>().iter() {
                 let is_delete = delta.action == FileAction::Delete as u16;
