@@ -158,10 +158,18 @@ will update an older check constraint or state schema.
   an offline session resolver (`Err(NoRemote)`), and `StorageSession::resolved` (the only
   constructor that can serve a real `get()`) is `pub(crate)` to `lore-transport`, unreachable
   without standing up a real server. So a full remote-fetch-then-cache regression for `State::tree`
-  is not cheaply testable at this layer — don't invent a live-server fixture here; that plumbing
-  belongs in `lore-integration-tests` (see the entry above) if it's ever needed at this layer, and
-  even then `lore-integration-tests` only reaches the raw `lore::storage` C-ABI, not
-  `RepositoryContext`/`State`. What's pinned instead, in `lore-revision/tests/state.rs`
+  is not cheaply testable at this layer — don't invent a live-server fixture here.
+  **Checked whether `lore-integration-tests` changes that answer: it doesn't, today.** That crate's
+  real-server harness (`storage_remote_test.rs`'s `start_test_server`) wires only
+  `immutable_store`/`mutable_store` into `GrpcServerBuilder` — no revision service, no
+  resolve-by-name — and only ever drives the raw `lore::storage` C-ABI (`lore::storage::open`/`get`/
+  `put`), never a `RepositoryContext`. Getting a `RemoteState::Connected` `RepositoryContext` at all
+  means going through `lore_revision::repository::clone::clone`, which does a real
+  `protocol::connect` handshake plus `repository::resolve_by_name` against the server and needs an
+  actual committed revision already present there to clone — a full clone/repository fixture that
+  does not exist in either crate's harness today. Building it is a real feature addition to the
+  test infrastructure, not a cheap extension of `start_test_server`; deferred rather than built here.
+  What's pinned instead, in `lore-revision/tests/state.rs`
   (`tree_read_options_request_cache_and_priority_despite_disable_cache_default`): the literal
   `read_options_from_repository(&repository).with_cache().with_priority()` expression `tree()`
   uses yields `cache: true, priority: true` even though a freshly constructed repository's
@@ -169,6 +177,14 @@ will update an older check constraint or state schema.
   leaves this test green) — record plainly that this test cannot catch a regression that drops the
   override from `tree()`'s own body without touching the expression elsewhere; that gap is open by
   design, not an oversight.
+  **This half is not left unguarded, though** — its real automated regression guard is
+  `webdriver_fullstack_history.rs` in `lorehub-desktop`'s full-stack WebDriver tier (a different
+  repo, a slower tier), which asserts the History view renders the full chain plus expanded
+  ancestor deltas on a real sparse clone and fails if the tree block is not retained, because the
+  delta read is swallowed and the file list comes back empty otherwise. Ran green (1 passed / 0
+  failed) against this fix. Fork-side coverage of the tree-retention half is deliberately deferred
+  to that tier, not absent by oversight — a future reader of this guide should draw that conclusion,
+  not "unguarded."
 
 ## Durable test patterns and gotchas
 
