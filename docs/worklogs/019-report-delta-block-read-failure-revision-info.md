@@ -1,8 +1,8 @@
 # Report a delta-block read failure from `revision info` instead of swallowing it
 
 **Date:** 2026-08-11
-**Status:** Done; fork gates green, live before/after proof green. `lorehub-desktop` full-stack
-WebDriver tier **not run** (see Deferred).
+**Status:** Done; fork gates green, live before/after proof green, `lorehub-desktop` full-stack
+WebDriver tier re-run clean on 2026-08-11 (all four targets green — see Deferred item 1).
 **Classification:** [CLIENT] (`lore-revision` ships in the CLI and links in-process into
 `lorehub-desktop`).
 
@@ -106,11 +106,19 @@ revert-checked RED against the pre-change code:
 
 ## Deferred / follow-ups
 
-1. **`lorehub-desktop`'s full-stack WebDriver tier was not run — required-deferred, not skipped, not
-   passed.** `bun run test:webdriver:fullstack:managed` died in bring-up (`tsc && vite build`) on
+1. ~~**`lorehub-desktop`'s full-stack WebDriver tier was not run — required-deferred, not skipped, not
+   passed.**~~ **RESOLVED 2026-08-11: run clean, all four targets green.**
+   `bun run test:webdriver:fullstack:managed` originally died in bring-up (`tsc && vite build`) on
    type errors in another agent's uncommitted WIP under
-   `lorehub-desktop/src/components/shell/views/audit/`. Zero of the four targets ran. To be re-run
-   once that tree is clean, result reported back into this worklog.
+   `lorehub-desktop/src/components/shell/views/audit/`, so zero of the four targets ran. Once that
+   work landed (`lorehub-desktop` `4903062`, `tsc --noEmit` clean) the main session re-ran the tier
+   unmodified: `webdriver_fullstack`, `webdriver_fullstack_history`, `webdriver_fullstack_reviews`
+   and `webdriver_fullstack_story` each **1 passed / 0 failed / 0 ignored**, runner banner
+   `✓ PASS — all targets green`. This was the gate on the one real risk in this change — that
+   reporting the failure could flip the desktop's History from a mildly wrong file list to an error
+   state — and `webdriver_fullstack_history` explicitly reported "History rendered the full chain
+   (tip + oldest ancestor) + expanded ancestor deltas, no read failure". The risk is closed by
+   execution, not by the `code != 0` argument alone.
 2. General lesson: a shared repo's uncommitted WIP can block an unrelated change's gate entirely. The
    correct response is to report the gate as not-run and defer it — never modify, stash, or revert
    someone else's working tree to green your own gate, and never quietly drop the gate.
