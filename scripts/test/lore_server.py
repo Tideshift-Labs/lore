@@ -4,6 +4,7 @@ import http.client
 import json
 import logging
 import os
+import random
 import signal
 import shutil
 import socket
@@ -71,29 +72,62 @@ def allocate_free_port(host: str = "127.0.0.1") -> int:
 
     gRPC (TCP) and QUIC (UDP) share one port number, so a TCP-only probe is
     not enough: on Windows a TCP-free port can be reserved for UDP, failing
-    the QUIC bind with WSAEACCES. We pick a TCP port and confirm the same
-    number is UDP-bindable, retrying otherwise.
+    the QUIC bind with WSAEACCES (WinError 10013). Windows keeps SEPARATE
+    exclusion lists per protocol (`netsh interface ipv4 show excludedportrange
+    protocol=udp` vs `protocol=tcp`), and on a machine running Hyper-V, WSL or
+    Docker they are large and disjoint. Measured 2026-08-11 on a dev box:
+    ~1,860 of the 16,384-port dynamic range UDP-excluded, in bands of 60-500
+    consecutive ports, none of which overlapped the TCP exclusions.
+
+    Candidates are drawn at RANDOM rather than from `bind(0)`, and that is
+    load-bearing. Windows hands out `bind(0)` ports strictly sequentially
+    (+1 per call, from a machine-global cursor: 20 consecutive binds measured
+    as a 19-port span). A retry loop built on `bind(0)` therefore probes 20
+    ADJACENT numbers, so if the cursor sits inside a UDP exclusion band (every
+    one of which is wider than that span) all attempts fail together,
+    persistently, and each failure advances the cursor by only 1. Raising the
+    retry count is the fix that looks right and is not: escaping a 100-port
+    band would take ~100 attempts. Random draws make each attempt independent,
+    so ~11% exclusion costs ~1.1 attempts on average instead of guaranteeing a
+    total failure whenever the cursor is unlucky.
+
+    Both sockets are held at once, so the number is proven free for both
+    protocols simultaneously rather than in sequence. It is still released
+    before returning (the caller passes the number to a server process that
+    binds it itself) so a racing process can in principle take it first. That
+    window is inherent to handing a port to a subprocess and is not fixed here.
     """
     assert host == "127.0.0.1", (
         f"allocate_free_port only supports 127.0.0.1, got {host!r}"
     )
+    # The IANA dynamic/private range, valid on every platform this suite runs
+    # on. Sampling it uniformly (rather than walking it) is what keeps the
+    # attempts independent; see the docstring.
+    low, high = 49152, 65535
+    attempts = 40
     last_err: OSError | None = None
-    for _ in range(20):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
-            tcp.bind((host, 0))
-            port = tcp.getsockname()[1]
-            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                udp.bind((host, port))
-            except OSError as e:
-                last_err = e
-                continue
-            finally:
-                udp.close()
-            return port
+    for _ in range(attempts):
+        port = random.randint(low, high)
+        tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # No SO_REUSEADDR: we want a truthful "is this actually free"
+            # answer, not one that succeeds over a lingering socket.
+            tcp.bind((host, port))
+            udp.bind((host, port))
+        except OSError as e:
+            last_err = e
+            continue
+        finally:
+            tcp.close()
+            udp.close()
+        return port
     raise ServerException(
         f"Could not find a port free for both TCP and UDP on {host} "
-        f"after 20 attempts; last UDP bind error: {last_err}"
+        f"after {attempts} attempts in [{low}, {high}]; last bind error: "
+        f"{last_err}. On Windows check `netsh interface ipv4 show "
+        f"excludedportrange protocol=udp`. A very large exclusion set can "
+        f"make this genuinely hard rather than merely unlucky."
     )
 
 

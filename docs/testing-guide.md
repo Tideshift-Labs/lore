@@ -314,6 +314,21 @@ covers a gap they don't.
   result.
 - Runtime-specific I/O backends and real QUIC drain behavior remain platform/live tiers; record the
   omission rather than representing a portable unit run as full coverage.
+- **Never source a candidate port from `bind(0)` when the port must be free for BOTH TCP and UDP,
+  and never "fix" the resulting failure by raising the retry count.** `scripts/test`'s
+  `allocate_free_port` (gRPC and QUIC share one number) did exactly that and hard-failed all 20
+  attempts on Windows with `WSAEACCES`/`WinError 10013`, persistently rather than flakily. Windows
+  keeps SEPARATE per-protocol exclusion lists (`netsh interface ipv4 show excludedportrange
+  protocol=udp` vs `protocol=tcp`), so a port can be TCP-free and UDP-reserved; measured on a dev
+  box 2026-08-11, ~1,860 of the 16,384-port dynamic range was UDP-excluded in bands of 60-500
+  consecutive ports, disjoint from the TCP exclusions. `bind(0)` hands out ports strictly
+  sequentially from a machine-global cursor (+1 per call, measured: 20 binds spanned 19 ports), so
+  the retry loop probed 20 ADJACENT numbers. Every band being wider than that span means landing in
+  one fails all attempts, and each failure advances the cursor by only 1, so escaping a 100-port
+  band would need ~100 retries. Fixed by sampling candidates at random from 49152-65535 and probing
+  both protocols with both sockets held at once. Guard:
+  `scripts/test/test_allocate_free_port.py` asserts the candidates are not sequential (revert-checked
+  RED against the old `bind(0)` source, failing with `span 11 across 12 calls`).
 
 ## Appending new findings
 
