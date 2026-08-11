@@ -323,19 +323,42 @@ pub async fn load_fragment(
         match decompress_and_verify(fragment, buffer, address, options).await {
             Ok((fragment, buffer)) => {
                 // Cache the fragment locally. Skip the put entirely when
-                // caching is disabled and data is not corrupt and has no
-                // local cache priority flag -- matching the original two-level
-                // gate in urc-core's load_raw.
-                let should_store = options.cache
-                    || local_corrupt
-                    || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0;
+                // caching is disabled and data is not corrupt and the payload
+                // is in neither always-retained class -- matching the original
+                // two-level gate in urc-core's load_raw.
+                //
+                // A revision state block is always retained, independent of the
+                // caller's caching choice: every offline read of a workspace
+                // (`status`, `revision info`, branch resolution) deserializes
+                // state, so a workspace that discarded one can only be read
+                // while connected. `LoreGlobalArgs::cache` and
+                // `RepositoryRuntimeSettings::disable_cache` both document this
+                // exemption.
+                //
+                // `PayloadRevisionState` is the bit to key it on, not
+                // `PayloadLocalCachePriority`. A producer sets both on a state
+                // block (`State::serialize`), but cache priority is a
+                // per-machine hint that a store is free to drop rather than
+                // carry as content metadata -- `lore-aws`'s `PAYLOAD_FLAGS`
+                // allowlist does exactly that -- so it does not survive a
+                // round trip through the server. `PayloadRevisionState`
+                // describes what the payload *is* and does.
+                let always_retained = (fragment.flags
+                    & (FragmentFlags::PayloadLocalCachePriority
+                        | FragmentFlags::PayloadRevisionState))
+                    != 0;
+                let should_store = options.cache || local_corrupt || always_retained;
 
                 if should_store {
-                    let local_payload = if options.cache
-                        || local_corrupt
-                        || (fragment.flags & FragmentFlags::PayloadLocalCachePriority)
-                            == FragmentFlags::PayloadLocalCachePriority
-                    {
+                    // The two predicates are currently identical, so this arm
+                    // always yields `Some` and the `None` below is unreachable.
+                    // That was already true before `always_retained` was
+                    // factored out (the pre-existing pair spelled the same
+                    // single-bit test as `& F != 0` and `& F == F`). The
+                    // two-level seam is kept deliberately: it is upstream's
+                    // shape, and it is where a metadata-only put (store the
+                    // fragment header, drop the payload) would go.
+                    let local_payload = if options.cache || local_corrupt || always_retained {
                         Some(payload)
                     } else {
                         None
