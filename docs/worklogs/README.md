@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 018 | 2026-08-10 | [Fix offline-clone state-fragment retention lost in the 0.8.7 merge (WP-105)](018-offline-clone-state-retention-wp105.md) |
 | 017 | 2026-08-07 | [Merge upstream 0.8.7 and make S3 fragment metadata authoritative](017-upstream-0-8-7-s3-authoritative-postgres-store.md) |
 | 016 | 2026-08-06 | [Remote-proven sync repairs named-branch bookkeeping](016-remote-proven-sync-branch-bookkeeping.md) |
 | 015 | 2026-07-29 | [Run upstream revision-tree integration suite after merge](015-run-upstream-revision-tree-integration-suite.md) |

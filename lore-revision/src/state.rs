@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 mod diff;
 pub mod dump;
@@ -2901,7 +2902,15 @@ impl State {
                 tree
             } else {
                 let tree_address = Address::zero_context_hash(hash_tree);
-                let options = read_options_from_repository(&repository);
+                // Retain the tree block like every other revision-metadata read
+                // in this file (`delta_block`, the node/file-metadata block
+                // lists, the link list). It gates all of them -- a delta, node
+                // or path read starts by resolving the tree -- so a workspace
+                // that holds those blocks but not this one still cannot answer
+                // any of them offline.
+                let options = read_options_from_repository(&repository)
+                    .with_cache()
+                    .with_priority();
                 let mut tree = Tree::read_from_immutable(repository, tree_address, options)
                     .await
                     .forward::<StateError>("Failed to deserialize tree")?;

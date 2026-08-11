@@ -351,7 +351,13 @@ impl SharedStoreToUseConfig {
 pub struct RepositoryRuntimeSettings {
     /// Disable store fragments on remote
     pub disable_upload: AtomicBool,
-    /// Disable caching fragments locally on get from remote (except state fragments which are always cached)
+    /// Disable caching fragments locally on get from remote. Revision state
+    /// fragments are exempt and always cached (keyed on `PayloadRevisionState`
+    /// in `lore_storage::read::load_fragment`). Individual revision-metadata
+    /// reads (the tree block, the delta block, the node and file-metadata
+    /// block lists, the name table, the link list) additionally opt in per
+    /// call site via `ReadOptions::with_cache`, so this flag does not govern
+    /// them either.
     pub disable_cache: AtomicBool,
     /// Write directly to target file instead of write to temporary file + move
     pub direct_file_write: AtomicBool,

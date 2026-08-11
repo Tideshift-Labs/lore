@@ -75,6 +75,90 @@ mod tests {
         assert_eq!(cloned.as_bytes(), block.as_bytes());
     }
 
+    /// Regression for `State::tree`'s local-retention half of the offline-clone fix (the
+    /// `lore-storage` half is covered by `lore-integration-tests`'s `storage_remote_tests`; see
+    /// that crate's `get_caches_locally_when_payload_has_revision_state_flag`).
+    ///
+    /// `State::tree` reads the tree block with
+    /// `read_options_from_repository(&repository).with_cache().with_priority()` -- the exact
+    /// expression under test here -- specifically so the tree survives a remote fetch even
+    /// though `RepositoryRuntimeSettings::disable_cache` defaults to `true` (asserted below).
+    /// Without the `.with_cache()` override the tree block, which does not carry
+    /// `PayloadRevisionState`, would be discarded after every remote read by default, leaving a
+    /// workspace that has the revision-state block (retained by the `lore-storage` fix) but not
+    /// its tree still unable to answer `revision info --delta`/`status` offline -- the tree read
+    /// gates every delta, node and path read, all of which resolve it first.
+    ///
+    /// This is the narrower property the fix's author asked for in place of a full remote-fetch
+    /// regression: `lore-revision`'s test harness (`tests/*.rs`, `helper.rs`) has no fixture for
+    /// a live-connected `RepositoryContext` (`RemoteState::Connected` needs a real
+    /// `lore_transport::Connection`, and `StorageSession::resolved` that would serve a fetch is
+    /// `pub(crate)` to `lore-transport` -- not constructible from here without standing up a real
+    /// server, which is exactly the plumbing `lore-integration-tests`'s `storage_remote_test.rs`
+    /// exists for and `lore-revision`'s suites deliberately don't duplicate). So this test cannot
+    /// exercise `State::tree`'s actual remote-fetch-then-cache behavior end-to-end; it pins that
+    /// the read-options expression `tree()` uses does what the fix's comment says it does. A
+    /// regression that dropped `.with_cache().with_priority()` from `tree()`'s own body without
+    /// touching this expression elsewhere would NOT be caught here -- that gap is open and is
+    /// reported as such rather than papered over.
+    #[tokio::test]
+    async fn tree_read_options_request_cache_and_priority_despite_disable_cache_default() {
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = Context::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create store");
+
+                // Freshly constructed, default settings -- `disable_cache` is never touched, so
+                // it stays at its documented default.
+                let repository = Arc::new(RepositoryContext::new(
+                    Some(path.clone()),
+                    immutable_store,
+                    mutable_store,
+                    repository_id.into(),
+                    lore_revision::instance::InstanceId::default(),
+                    Err(ProtocolError::from(NoRemote)),
+                    Arc::default(),
+                    RepositoryFormat::Lore,
+                ));
+
+                assert!(
+                    repository.disable_cache(),
+                    "disable_cache must default to true -- this is the premise the fix works \
+                     around; if this default ever flips, `tree()`'s explicit `.with_cache()` \
+                     override becomes redundant but should stay, and this test should be revisited"
+                );
+
+                let options = immutable::read_options_from_repository(&repository)
+                    .with_cache()
+                    .with_priority();
+
+                assert!(
+                    options.cache,
+                    "State::tree's read-options expression must request caching even though \
+                     the repository's disable_cache default is true"
+                );
+                assert!(
+                    options.priority,
+                    "State::tree's read-options expression must request priority fetch, \
+                     matching every sibling revision-metadata read in state.rs"
+                );
+            }))
+            .await
+            .expect("test task panicked");
+    }
+
     #[tokio::test]
     async fn collect_new_name_fragments() {
         let (_immutable_store, mutable_store, execution) =

@@ -103,7 +103,9 @@ mod storage_remote_tests {
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(None)
+                // Auth-OFF harness: no verifier, so `enforce_write_permission` no-ops
+                // regardless (see `with_jwt_verifier`'s doc comment) -- `false` for clarity.
+                .with_jwt_verifier(None, false)
                 .unwrap()
                 .serve(addr, signal)
                 .await
@@ -605,6 +607,154 @@ mod storage_remote_tests {
                     local_match,
                     StoreMatch::MatchFull,
                     "priority-flagged remote-fetched payload must be cached locally",
+                );
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Regression: a fragment flagged `PayloadRevisionState` must be cached locally on a
+    /// remote fetch even with neither `PayloadLocalCachePriority` nor a `local_cache` opt-in.
+    /// `PayloadLocalCachePriority` is a per-machine hint that `lore-aws`'s `PAYLOAD_FLAGS`
+    /// allowlist deliberately drops from the S3 object (see
+    /// `lore-aws/src/store/object_metadata.rs`'s `drops_state_store_location_and_per_machine_flags`),
+    /// so a state block produced before this fix relied on that bit surviving a round trip
+    /// through the server and silently stopped being retained once it no longer did. This is
+    /// the exact shape that broke offline reads (`revision info`, `status`) after a fresh
+    /// clone: `State::serialize` sets both flags, but only `PayloadRevisionState` reaches the
+    /// client's `load_fragment` gate. Companion to
+    /// `get_caches_locally_when_payload_has_local_cache_priority_flag` above and
+    /// `get_falls_back_to_remote_on_local_miss` (neither flag, no cache).
+    #[tokio::test]
+    async fn get_caches_locally_when_payload_has_revision_state_flag() -> TestResult {
+        use bytes::Bytes;
+        use lore::storage::get;
+        use lore::storage::get::LoreStorageGetArgs;
+        use lore::storage::get::LoreStorageGetItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Fragment;
+        use lore_base::types::Partition;
+        use lore_base::types::fragment_flags::FragmentFlags;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+        use lore_storage::store_types::StoreMatch;
+
+        let execution = setup_execution("storage-remote-revision-state".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+
+                // Seed the server with a fragment flagged as a revision-state block, with NO
+                // `PayloadLocalCachePriority` bit -- this is what the S3-authoritative
+                // `PAYLOAD_FLAGS` allowlist actually hands back to a client after a round trip.
+                let payload_bytes = b"revision-state payload".to_vec();
+                let payload = Bytes::from(payload_bytes.clone());
+                let partition = Partition::from([0xd4u8; 16]);
+                let hash = lore_storage::hash_slice(payload.as_ref());
+                let address = Address {
+                    hash,
+                    context: Context::default(),
+                };
+                let fragment = Fragment {
+                    flags: FragmentFlags::PayloadRevisionState.bits(),
+                    size_payload: payload.len() as u32,
+                    size_content: payload.len() as u64,
+                };
+                server
+                    .backend_immutable
+                    .clone()
+                    .put(partition, address, fragment, Some(payload.clone()), false)
+                    .await
+                    .expect("seed server with revision-state-flagged payload");
+
+                let handle_id = open_remote_handle(&server).await;
+
+                let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+                let received_for_cb = received.clone();
+                let outcomes: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
+                    Arc::new(Mutex::new(Vec::new()));
+                let outcomes_for_cb = outcomes.clone();
+                let callback: LoreEventCallback =
+                    Some(Box::new(move |event: &LoreEvent| match event {
+                        LoreEvent::StorageGetData(data) => {
+                            let slice = unsafe {
+                                std::slice::from_raw_parts(
+                                    data.bytes.ptr.cast::<u8>(),
+                                    data.bytes.len,
+                                )
+                            };
+                            received_for_cb.lock().unwrap().extend_from_slice(slice);
+                        }
+                        LoreEvent::StorageGetItemComplete(data) => {
+                            outcomes_for_cb
+                                .lock()
+                                .unwrap()
+                                .push((data.id, data.error_code));
+                        }
+                        _ => {}
+                    }));
+
+                let status = get::get(
+                    LoreGlobalArgs::default(),
+                    LoreStorageGetArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        // `local_cache: 0` -- caching must come from the flag alone, not a
+                        // per-item opt-in, matching how an offline state read actually calls in.
+                        items: LoreArray::from_vec(vec![LoreStorageGetItem {
+                            id: 71,
+                            partition,
+                            address,
+                            streaming: 0,
+                            local_cache: 0,
+                        }]),
+                    },
+                    callback,
+                )
+                .await;
+                assert_eq!(status, 0, "get must succeed against remote-only address");
+
+                let outcomes = outcomes.lock().unwrap().clone();
+                assert_eq!(outcomes.len(), 1);
+                assert_eq!(outcomes[0], (71, LoreErrorCode::None));
+
+                let received = received.lock().unwrap().clone();
+                assert_eq!(received, payload_bytes, "fetched bytes must match remote");
+
+                // The regression itself: a subsequent LOCAL-ONLY read (no remote session) must
+                // see the state block and return the same bytes -- this is what
+                // `lore --offline revision info --delta` / `lore --offline status` do.
+                let local =
+                    lore::storage::handle::immutable_for_test(lore::storage::handle::LoreStore {
+                        handle_id,
+                    })
+                    .expect("handle still registered");
+                let local_match = local
+                    .clone()
+                    .exist(partition, address, StoreMatch::MatchFull)
+                    .await
+                    .expect("local exist call");
+                assert_eq!(
+                    local_match,
+                    StoreMatch::MatchFull,
+                    "revision-state-flagged remote-fetched payload must be cached locally, \
+                     independent of PayloadLocalCachePriority or a local_cache opt-in",
+                );
+
+                let (_, offline_payload) = lore_storage::read::load_raw_local(
+                    local,
+                    partition,
+                    address,
+                    lore_storage::options::ReadOptions::default(),
+                )
+                .await
+                .expect("offline read of the cached state fragment must succeed");
+                assert_eq!(
+                    offline_payload.as_ref(),
+                    payload_bytes.as_slice(),
+                    "offline-read bytes must match what was fetched from remote",
                 );
 
                 close_handle(handle_id).await;

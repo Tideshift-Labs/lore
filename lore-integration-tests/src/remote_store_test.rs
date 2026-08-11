@@ -94,7 +94,9 @@ mod remote_store_tests {
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(None)
+                // Auth-OFF harness: no verifier, so `enforce_write_permission` no-ops
+                // regardless (see `with_jwt_verifier`'s doc comment) -- `false` for clarity.
+                .with_jwt_verifier(None, false)
                 .unwrap()
                 .serve(addr, signal)
                 .await

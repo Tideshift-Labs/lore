@@ -130,13 +130,59 @@ will update an older check constraint or state schema.
 - **Upstream revision-tree integration suite [mixed]**: the in-memory suite exercises batch fan-out,
   event ordering, multi-level/mixed-parent batches, concurrency, atomic rejection, and entry fields.
   Gate: `cargo test -p lore-integration-tests revision_tree_test -j 4`.
+- **State-block local retention on remote fetch [CLIENT]**: `load_fragment`'s remote-fetch cache
+  gate (`lore-storage/src/read.rs`) must key the always-retained exemption on
+  `FragmentFlags::PayloadRevisionState`, not `PayloadLocalCachePriority`. The latter is a
+  per-machine hint `lore-aws`'s `PAYLOAD_FLAGS` allowlist deliberately drops from the S3 object
+  (`lore-aws/src/store/object_metadata.rs`'s `drops_state_store_location_and_per_machine_flags`),
+  so a state block that relied on it surviving a round trip through the server silently stopped
+  being retained after that allowlist landed, breaking every offline read (`revision info`,
+  `status`) of a fresh clone. `PayloadRevisionState` is already pinned as surviving the round trip
+  by `keeps_every_flag_that_describes_the_payload` in the same file — don't add a second pin for
+  it. Regression + companion negative/positive cases:
+  `cargo test -p lore-integration-tests --features integration_tests storage_remote_tests -j 4`
+  (`get_caches_locally_when_payload_has_revision_state_flag` alongside the pre-existing
+  `..._local_cache_priority_flag` and `get_falls_back_to_remote_on_local_miss`). Reuse this
+  harness (`storage_remote_test.rs`'s `start_test_server`/`open_remote_handle`) for any future
+  `load_fragment` gate case — it is the only place that exercises the gate against a real gRPC
+  round trip rather than a wrapped local store.
+- **Tree-block local retention [CLIENT], companion to the entry above**: the `lore-storage` fix
+  alone was insufficient — `State::tree` (`lore-revision/src/state.rs`) reads the tree block
+  through the same `load_fragment` gate, but the tree block does not carry
+  `PayloadRevisionState`, so it needed an explicit `.with_cache().with_priority()` on its
+  `ReadOptions` to survive a remote fetch, independent of `RepositoryRuntimeSettings::disable_cache`
+  (defaults `true`). The tree read gates every delta/node/path read in the file (they all resolve
+  it first), so this half is what actually made `revision info --delta` return file rows instead
+  of a silently-empty list on a fresh clone. `lore-revision`'s test harness (`tests/*.rs`,
+  `helper.rs`) has **no live-connected `RepositoryContext` fixture** — every test builds one with
+  an offline session resolver (`Err(NoRemote)`), and `StorageSession::resolved` (the only
+  constructor that can serve a real `get()`) is `pub(crate)` to `lore-transport`, unreachable
+  without standing up a real server. So a full remote-fetch-then-cache regression for `State::tree`
+  is not cheaply testable at this layer — don't invent a live-server fixture here; that plumbing
+  belongs in `lore-integration-tests` (see the entry above) if it's ever needed at this layer, and
+  even then `lore-integration-tests` only reaches the raw `lore::storage` C-ABI, not
+  `RepositoryContext`/`State`. What's pinned instead, in `lore-revision/tests/state.rs`
+  (`tree_read_options_request_cache_and_priority_despite_disable_cache_default`): the literal
+  `read_options_from_repository(&repository).with_cache().with_priority()` expression `tree()`
+  uses yields `cache: true, priority: true` even though a freshly constructed repository's
+  `disable_cache()` defaults to `true`. Revert-checked (reverting `tree()`'s override in isolation
+  leaves this test green) — record plainly that this test cannot catch a regression that drops the
+  override from `tree()`'s own body without touching the expression elsewhere; that gap is open by
+  design, not an oversight.
 
 ## Durable test patterns and gotchas
 
 ### Build and merge hygiene
 
 - A signature change in production code can leave direct handler tests stale. Build test targets
-  after a merge, even when production targets compile.
+  after a merge, even when production targets compile. Concrete case: `lore-integration-tests`'s
+  `remote_store_test.rs`/`storage_remote_test.rs` both called the pre-CR-018
+  `GrpcServerBuilder::with_jwt_verifier(None)` (one arg) after `with_jwt_verifier` gained an
+  `enforce_write_permission: bool` parameter — a plain `cargo build` never caught it because
+  neither file is reached by the default (non-`integration_tests`-feature) build; only
+  `cargo test -p lore-integration-tests --features integration_tests` does. Both are auth-OFF
+  harnesses (`jwt_verifier: None`), so the bool is a no-op per the method's own doc comment — pass
+  `false` for clarity.
 - If an untouched file reports an impossible macro/import/rlib error after alternating Clippy and
   test builds, suspect stale incremental state. Clean only the affected crate before escalating.
 - Regenerate protobuf output and `Cargo.lock` from their sources; do not hand-splice generated files.
