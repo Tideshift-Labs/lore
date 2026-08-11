@@ -1188,6 +1188,50 @@ mod tests {
         );
     }
 
+    /// Pins the premise `revision::info::info` (in `lore-revision`) relies on
+    /// to treat every `delta_block()` `Err` as a genuine read failure: a
+    /// revision that changed nothing carries a zero `hash_delta`, and a zero
+    /// hash must short-circuit to `Ok(empty)` here -- before ever reaching
+    /// the store -- rather than surface as an error. Wraps the store in
+    /// `GetFailingStore` (configured to fail every `get()`) and asserts
+    /// `get_calls() == 0`, proving the short circuit at the top of
+    /// `load_fragment` is what produced the empty result, not a lucky
+    /// success against a store that happens to work.
+    #[tokio::test]
+    async fn zero_hash_address_short_circuits_to_empty_without_touching_store() {
+        use crate::types::Hash;
+
+        let (_dir, store) = make_test_store().await;
+        let store = GetFailingStore::wrapping(store, InjectedGetFailure::Internal);
+        let partition = Partition::from([0x56; 16]);
+        let address = Address {
+            hash: Hash::default(),
+            context: Context::from([0x56; 16]),
+        };
+
+        let bytes = read(
+            store.clone(),
+            partition,
+            address,
+            None,
+            ReadOptions::default(),
+            Some(offline_session()),
+        )
+        .await
+        .expect("a zero-hash address must short-circuit to Ok(empty), never touching the store");
+
+        assert!(
+            bytes.is_empty(),
+            "expected empty bytes for a zero-hash address, got {} byte(s)",
+            bytes.len()
+        );
+        assert_eq!(
+            store.get_calls(),
+            0,
+            "zero-hash short circuit must never call the underlying store's get()"
+        );
+    }
+
     /// A defragment that fails part-way must not leave its temporary behind. The temporary is
     /// sized to the whole content before any of it arrives and is excluded from staging, so an
     /// orphan is a full-size file that no `status` will ever mention.

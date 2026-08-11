@@ -186,6 +186,19 @@ will update an older check constraint or state schema.
   to that tier, not absent by oversight — a future reader of this guide should draw that conclusion,
   not "unguarded."
 
+- **`revision info --delta`'s delta-read-failure surfacing [CLIENT]**: a failed
+  `State::delta_block` read (`revision/info.rs`) now sends a mid-stream, non-terminal
+  `LoreEvent::Error` naming the revision instead of silently emitting zero
+  `RevisionInfoDelta` rows; `info()` still returns `Ok(())`/status 0 (deliberate -- a sparse
+  clone legitimately lacks an ancestor's delta block offline, and lorehub-desktop's History
+  view must not flip to an error state on it). A genuinely empty revision (zero `hash_delta`)
+  must still emit neither delta rows nor an error event -- `lore_storage::read::load_fragment`
+  short-circuits a zero-hash address to `Ok(empty)` before ever touching the store
+  (`lore-storage/src/read.rs`'s `zero_hash_address_short_circuits_to_empty_without_touching_store`
+  pins this, proven with a store wrapper that fails every `get()` and asserting zero calls).
+  Gates: `cargo test -p lore-revision --test info -j 4` and
+  `cargo test -p lore-storage --lib read::tests::zero_hash_address_short_circuits_to_empty_without_touching_store -j 4`.
+
 ## Durable test patterns and gotchas
 
 ### Build and merge hygiene
@@ -222,6 +235,57 @@ will update an older check constraint or state schema.
   serialization and fragment walks.
 - Shared mock state must use `Arc`-backed counters/maps so the test and code-under-test observe the
   same clone.
+
+### Poisoning a persisted `State`/`Tree` field for a fault-injection test
+
+`State::set_delta_block(hash, count)` is `pub` and the cheapest lever to make a *persisted*
+revision's `delta_block()` read fail deterministically: point `hash_delta` at an address
+nothing has ever written. Two ordering gotchas, both silent (no compile error, no panic --
+the poisoned value just never reaches the store):
+
+- `set_delta_block` calls `tree_readonly()`, which errors on a state whose tree has never been
+  loaded. Call `state.tree(repository.clone()).await?` first — on a fresh `State::new()` with a
+  zero `hash_tree` this installs an in-memory zeroed tree with no I/O, cheap to call before
+  poisoning it.
+- `set_delta_block` only sets `TreeFlags::Dirty` on the tree, not `StateFlags::Dirty` on the
+  state itself, and `State::serialize` gates entirely on the latter (an early return before the
+  tree is ever inspected). Call the public `state.mark_dirty()` too, or the poisoned tree is
+  silently never written.
+
+Same shape generalizes: any `set_*` that mutates only the in-memory `Tree`/block runtime cache
+needs a companion `mark_dirty()` before `serialize()` will actually persist it.
+
+### Capturing `LoreEvent`s from a real dispatcher in a test
+
+`EventDispatcher::no_dispatch()` (`tests/helper.rs`'s `setup_test_execution`) makes
+`send`/`send_error` silent no-ops (`weak_sender: None`) -- fine for tests that don't assert on
+events, useless for ones that do. To observe what an operation actually sends: build
+`EventDispatcher::new(Some(callback))` with a callback pushing into an `Arc<Mutex<Vec<LoreEvent>>>`
+(or just each event's `.discriminant(): u32` if you only need to prove an event kind occurred --
+`LoreEvent` does not implement `Debug`, so don't put a whole captured `Vec<LoreEvent>` in a
+`{:?}`/`.expect()` message), wrap it in a fresh `ExecutionContext::new_client_with_user_id(...)`,
+and scope the whole operation under `LORE_CONTEXT.scope(execution.clone(), ...)`. The forwarder
+task drains the channel asynchronously, so after the operation completes, `drop(execution)`
+(closing the sender) and poll until `events` contains `LoreEvent::End` -- the terminal event the
+forwarder loop (`relay.rs`) sends unconditionally once the channel closes and every buffered item
+has been forwarded -- before asserting. **Don't break on "any event arrived"** (an earlier version
+of `tests/commit.rs`'s drain loop does this): most `info`/`commit`-style operations send a
+non-terminal event first, so breaking on the first arrival can race ahead of a later event you
+actually care about -- silently flaky for a positive assertion, and close to vacuous for a negative
+one ("no Error event" then only proves the *first* event wasn't one). If you copy that drain
+pattern into a new test, drain to `End`, not to first-non-empty.
+
+### A negative control alone doesn't prove the positive path
+
+Two tests that both assert "zero rows / no error event" (a failure case and a genuinely-empty
+case) can both stay green under an implementation that emits the error unconditionally and never
+runs the success loop at all -- neither one ever exercises a delta/row-producing path for real.
+Any error/no-op-shaped regression suite needs a companion positive control built through the
+real production pipeline (e.g. `repository::create_local` + `file::stage::stage` + `commit::commit`,
+not a hand-poked `State`), asserting the expected non-empty result AND the absence of the error
+event. Revert-check it the same way as the negative guards -- narrowing the success gate (or
+dropping the loop body) should turn it red while the negative controls stay green, proving it
+covers a gap they don't.
 
 ### Process-global state
 
