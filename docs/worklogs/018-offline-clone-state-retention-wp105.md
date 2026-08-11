@@ -84,10 +84,15 @@ fix would leave existing repos broken on clone.
   `lore-integration-tests -- storage_remote_tests`: 36 passed, 0 failed.
   `lore-aws --lib object_metadata`: 12 passed, 0 failed.
 - `cargo +nightly fmt` clean; `cargo build --release --bin lore` green.
-- Scope note: `cargo test` was run `-p`-scoped, not workspace-wide — a workspace run is red on 44
-  pre-existing `lore-integration-tests` failures (`aws_store_test`/`dynamodb_test`/`locks_test`)
-  that hard-fail with `ConnectionRefused` against absent MinIO/DynamoDB instead of being
-  `#[ignore]`d. Unrelated to this change; flagged as a follow-up rather than fixed here.
+- Scope note: `cargo test` was run `-p`-scoped, not workspace-wide. A run that passes
+  `--features integration_tests` is red on 44 `lore-integration-tests` failures
+  (`aws_store_test`/`dynamodb_test`/`locks_test`) that hard-fail with `ConnectionRefused` against
+  absent MinIO/DynamoDB. **Corrected 2026-08-11: this is correct behaviour, not a defect, and the
+  follow-up originally raised here is withdrawn.** The `integration_tests` feature is itself the
+  opt-in gate — a default `cargo test -p lore-integration-tests` is 126 passed / 0 failed /
+  1 ignored and never runs them — so passing the flag is asserting the infra is up, and
+  `ConnectionRefused` is the honest answer. `#[ignore]`-ing them would convert an explicit
+  opt-in-without-the-infra into a silent non-run.
 
 ## Follow-ups created
 
