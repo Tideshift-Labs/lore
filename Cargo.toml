@@ -180,6 +180,10 @@ zerocopy = { version = "0.8.26", features = [
 [profile.dev]
 debug = "line-tables-only"
 
+# Full workspace test runs create many short-lived targets whose incremental state is costly.
+[profile.test]
+incremental = false
+
 # Fast build suitable for local development
 [profile.release]
 debug = "line-tables-only"
