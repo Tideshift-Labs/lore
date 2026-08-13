@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -68,6 +69,10 @@ pub async fn find_branch_point(
     left_latest: Hash,
     right_latest: Hash,
 ) -> Result<(Hash, Vec<Hash>, Vec<Hash>), HistoryError> {
+    if left_latest.is_zero() && right_latest.is_zero() {
+        return Ok((Hash::default(), Vec::new(), Vec::new()));
+    }
+
     // Find the common ancestor of left branch and right branch, in case it has diverged
     // TODO(mjansson): Accelerate by storing last synced hash for each remote and branch
     let mut local_left = true;

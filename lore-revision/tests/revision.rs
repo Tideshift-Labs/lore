@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 #[cfg(test)]
 mod tests {
@@ -7,6 +8,8 @@ mod tests {
     use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_revision::history;
     use lore_revision::lore::RepositoryId;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryFormat;
@@ -32,6 +35,25 @@ mod tests {
             Arc::default(),
             RepositoryFormat::Lore,
         ))
+    }
+
+    #[tokio::test]
+    async fn find_branch_point_returns_empty_histories_when_both_heads_are_zero() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution, async {
+                let repository = make_repo_context().await;
+
+                let (branch_point, left_history, right_history) =
+                    history::find_branch_point(repository, Hash::default(), Hash::default())
+                        .await
+                        .expect("two empty histories should have the zero branch point");
+
+                assert!(branch_point.is_zero());
+                assert!(left_history.is_empty());
+                assert!(right_history.is_empty());
+            })
+            .await;
     }
 
     // Exercises the BranchError::NotExist arm of branch::resolve.
