@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 022 | 2026-08-16 | [Preserve topology during parallel multi-path stage](022-preserve-parallel-stage-topology.md) |
 | 021 | 2026-08-13 | [Treat empty histories as a shared root](021-empty-histories-shared-root.md) |
 | 020 | 2026-08-11 | [Add a regression guard for offline-readability of a fresh clone (WP-105 follow-on)](020-offline-clone-read-pytest-regression-guard.md) |
 | 019 | 2026-08-11 | [Report a delta-block read failure from `revision info` instead of swallowing it](019-report-delta-block-read-failure-revision-info.md) |
