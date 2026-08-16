@@ -287,6 +287,15 @@ event. Revert-check it the same way as the negative guards -- narrowing the succ
 dropping the loop body) should turn it red while the negative controls stay green, proving it
 covers a gap they don't.
 
+### Public multi-path stage concurrency needs a real multi-worker lifecycle test
+
+Parallel nested-sibling stage can report every walker successful while stale ancestor-node writes
+make selected files unreachable. A discriminating `lore-revision` regression must call public
+`file::stage::stage` on a Tokio multi-thread runtime, deserialize the returned staged hash, verify
+every selected path and staged flag, then commit and deserialize the exact commit to compare its
+complete file set. Include `force = true` with both committed and staged-add ancestor directories;
+current-thread/one-worker runs and event or stage-end counts do not prove topology retention.
+
 ### Process-global state
 
 - OTel providers, connection maps, auth caches, and panic hooks are shared by the whole test binary.
