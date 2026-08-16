@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::future::Future;
 use std::ops::BitAnd;
@@ -1913,18 +1914,22 @@ pub(crate) async fn stage_node_from_metadata(
                 .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))?
                 .map_err(StageError::internal)?;
 
-                // Set updated node name
-                node.name_hash = name_hash;
-
                 from_path = Some(relative_path.join(&node_name).to_string());
                 event_action = Some(LoreFileAction::Move);
 
                 let dirtied = {
                     let mut block_writer = block.write();
-                    (node.name_offset, node.name_length) = block_writer
-                        .node_name_store(name.as_str(), node.name_offset, node.name_length)
+                    let (current_name_offset, current_name_length) = {
+                        let current_node = block_writer.node(node_index);
+                        (current_node.name_offset, current_node.name_length)
+                    };
+                    let (name_offset, name_length) = block_writer
+                        .node_name_store(name.as_str(), current_name_offset, current_name_length)
                         .forward::<StageError>("storing node name on stage move")?;
-                    *block_writer.node(node_index) = node;
+                    let write_node = block_writer.node(node_index);
+                    write_node.name_hash = name_hash;
+                    write_node.name_offset = name_offset;
+                    write_node.name_length = name_length;
                     block_writer.mark_dirty()
                 };
                 if dirtied {
@@ -1961,6 +1966,7 @@ pub(crate) async fn stage_node_from_metadata(
         || node.is_staged_merge_unresolved()
     {
         let mut maybe_content_modified = false;
+        let mut content_or_type_fields_modified = false;
         // An unstaged-add node is a previously-staged add that the user
         // unstaged; re-staging must promote it back to a staged add even when
         // the filesystem content compares equal to the node's stored hash.
@@ -1994,6 +2000,7 @@ pub(crate) async fn stage_node_from_metadata(
                 node.mode = util::fs::metadata_to_mode(&metadata, node.mode);
                 node.size = util::fs::file_size(&metadata);
                 maybe_content_modified = true;
+                content_or_type_fields_modified = true;
             } else if was_dirty_add {
                 maybe_content_modified = true;
             }
@@ -2001,6 +2008,7 @@ pub(crate) async fn stage_node_from_metadata(
             node.flags &= !NodeFlags::File;
             node.mode = 0;
             maybe_content_modified = true;
+            content_or_type_fields_modified = true;
         } else if node.is_dirty_add() {
             // A new directory has no content change to detect but must still be
             // staged.
@@ -2012,16 +2020,26 @@ pub(crate) async fn stage_node_from_metadata(
             || options.node_flags.contains(NodeFlags::StagedMerge)
             || node.is_staged_merge_unresolved()
         {
-            let dirtied = {
-                let mut block_writer = block.write();
-                let write_node = block_writer.node(node_index);
-                *write_node = node;
-                block_writer.mark_dirty()
-            };
+            if content_or_type_fields_modified {
+                let dirtied = {
+                    let mut block_writer = block.write();
+                    let write_node = block_writer.node(node_index);
+                    if metadata.is_dir() {
+                        write_node.flags &= !NodeFlags::File;
+                        write_node.mode = 0;
+                    } else {
+                        write_node.flags |= NodeFlags::File;
+                        write_node.child = 0;
+                        write_node.mode = node.mode;
+                        write_node.size = node.size;
+                    }
+                    block_writer.mark_dirty()
+                };
 
-            if dirtied {
-                state.block_modified(block, block_index);
-                state.mark_dirty();
+                if dirtied {
+                    state.block_modified(block, block_index);
+                    state.mark_dirty();
+                }
             }
 
             let (staged_flag, dirty_flag) = if was_dirty_add {
