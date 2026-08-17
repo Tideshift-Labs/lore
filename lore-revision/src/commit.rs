@@ -480,6 +480,7 @@ pub async fn commit_impl(
             link_messages.clone(),
             current_branch,
             stats,
+            None,
         )
         .await?;
 
@@ -563,6 +564,7 @@ pub async fn commit_impl(
             Arc::new(HashMap::new()),
             current_branch,
             stats,
+            None,
         )
         .await?;
         let layer_branch = layer_state
@@ -699,6 +701,7 @@ async fn commit_layer_only(
         Arc::new(HashMap::new()),
         parent_current_branch,
         stats,
+        None,
     )
     .await?;
 
@@ -885,6 +888,7 @@ async fn commit_link_only(
         Arc::new(HashMap::new()),
         link_branch,
         stats,
+        None,
     )
     .await?;
 
@@ -931,7 +935,7 @@ async fn commit_link_only(
 }
 
 /// Converts interface metadata args and prepares the commit metadata object.
-async fn build_commit_metadata(
+pub(crate) async fn build_commit_metadata(
     repository: Arc<RepositoryContext>,
     state_staged: &Arc<State>,
     branch: BranchId,
@@ -983,7 +987,7 @@ async fn build_commit_metadata(
 
 /// Stores branch latest, deletes staged anchor, updates last sync if merge,
 /// and emits the revision commit event.
-async fn finalize_commit(
+pub(crate) async fn finalize_commit(
     repository: Arc<RepositoryContext>,
     state_current: &Arc<State>,
     state_staged: &Arc<State>,
@@ -1041,8 +1045,164 @@ async fn finalize_commit(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExactAnchorSnapshot {
+    pub branch_latest: Hash,
+    pub current: Hash,
+    pub staged: Hash,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactAnchorKind {
+    BranchLatest,
+    Current,
+    Staged,
+}
+
+async fn write_exact_anchor_snapshot<F, Fut>(
+    snapshot: ExactAnchorSnapshot,
+    writer: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(ExactAnchorKind, Hash) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    writer(ExactAnchorKind::BranchLatest, snapshot.branch_latest).await?;
+    writer(ExactAnchorKind::Current, snapshot.current).await?;
+    writer(ExactAnchorKind::Staged, snapshot.staged).await?;
+    Ok(())
+}
+
+async fn restore_exact_anchor_snapshot<F, Fut>(
+    snapshot: ExactAnchorSnapshot,
+    writer: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(ExactAnchorKind, Hash) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let mut failures = Vec::new();
+    for (kind, value) in [
+        (ExactAnchorKind::BranchLatest, snapshot.branch_latest),
+        (ExactAnchorKind::Current, snapshot.current),
+        (ExactAnchorKind::Staged, snapshot.staged),
+    ] {
+        let mut last_error = None;
+        for _ in 0..3 {
+            match writer(kind, value).await {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(err) => last_error = Some(err),
+            }
+        }
+        if let Some(err) = last_error {
+            failures.push(format!("{kind:?}: {err}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Publishes the three authoritative exact-selection anchors as one
+/// failure-safe group. If a later mutable-store write fails, every anchor is
+/// restored to its pre-transaction value before the error is returned.
 #[allow(clippy::too_many_arguments)]
-async fn commit_staged_revision(
+pub(crate) async fn finalize_exact_commit(
+    repository: Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    signature: Hash,
+    branch: BranchId,
+    original: ExactAnchorSnapshot,
+) -> Result<(), CommitError> {
+    let dry_run = execution_context().globals().dry_run();
+
+    if !dry_run {
+        let has_dirty = state_staged
+            .node_has_dirty_children(repository.clone(), crate::node::ROOT_NODE)
+            .await
+            .forward::<CommitError>("Failed deserializing exact staged state node block")?;
+        if has_dirty {
+            return Err(CommitError::internal(
+                "Exact-selection admission left dirty-only staged nodes",
+            ));
+        }
+
+        let published = ExactAnchorSnapshot {
+            branch_latest: signature,
+            current: signature,
+            staged: Hash::default(),
+        };
+        let mut writer = |kind, value| {
+            let repository = repository.clone();
+            async move {
+                match kind {
+                    ExactAnchorKind::BranchLatest => {
+                        branch::store_latest_anchor(repository, branch, value)
+                            .await
+                            .map_err(|err| err.to_string())
+                    }
+                    ExactAnchorKind::Current => {
+                        crate::instance::store_current_anchor(&repository, value)
+                            .await
+                            .map_err(|err| err.to_string())
+                    }
+                    ExactAnchorKind::Staged => {
+                        crate::instance::store_staged_anchor(&repository, value)
+                            .await
+                            .map_err(|err| err.to_string())
+                    }
+                }
+            }
+        };
+        if let Err(publish_error) = write_exact_anchor_snapshot(published, &mut writer).await {
+            if let Err(restore_error) = restore_exact_anchor_snapshot(original, &mut writer).await {
+                return Err(CommitError::internal(format!(
+                    "Exact-selection anchor publication failed ({publish_error}); restoring the original anchors also failed ({restore_error})"
+                )));
+            }
+            return Err(CommitError::internal(format!(
+                "Exact-selection anchor publication failed; original anchors restored: {publish_error}"
+            )));
+        }
+
+        // These derived branch indexes follow authoritative anchor publication.
+        // They cannot turn a published revision into a rejected transaction.
+        if let Err(err) = branch::store_latest_status(
+            repository.clone(),
+            branch,
+            signature,
+            BranchLatestStatus::Divergent,
+        )
+        .await
+        {
+            lore_warn!("Failed to store exact-selection branch latest status: {err}");
+        }
+        if let Err(err) = branch::store_latest_history(repository.clone(), branch, signature).await
+        {
+            lore_warn!("Failed to store exact-selection branch latest history: {err}");
+        }
+    }
+
+    event::LoreEvent::RevisionCommitRevision(LoreRevisionCommitRevisionEventData {
+        repository: repository.id,
+        branch,
+        revision: signature,
+        revision_number: state_staged.revision_number(),
+        parent: state_staged.parent_self(),
+        parent_other: state_staged.parent_other(),
+    })
+    .send();
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn commit_staged_revision(
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
     state_current: Arc<State>,
@@ -1052,6 +1212,7 @@ async fn commit_staged_revision(
     link_messages: Arc<HashMap<String, String>>,
     parent_branch: BranchId,
     stats: bool,
+    exact_admission: Option<crate::exact_selection::ExactSelectionAdmission>,
 ) -> Result<Hash, CommitError> {
     let context = execution_context();
     let globals = context.globals();
@@ -1075,6 +1236,26 @@ async fn commit_staged_revision(
 
     prune_dirty_for_commit(state_staged.clone(), repository.clone()).await?;
 
+    let exact_node_paths = if exact_admission.is_some() {
+        match crate::exact_selection::admission_node_paths(
+            repository.clone(),
+            state_current.clone(),
+            state_staged.clone(),
+        )
+        .await
+        {
+            Ok(paths) => Some(paths),
+            Err(err) => {
+                if let Some(admission) = &exact_admission {
+                    admission.store(Err(err));
+                }
+                return Err(CommitError::internal("Exact-selection preparation failed"));
+            }
+        }
+    } else {
+        None
+    };
+
     // Per-operation tracker for background fragment uploads. Write-producing
     // calls below dispatch leader tasks into it; await_all drains every
     // outstanding task before returning — on success AND on any error path.
@@ -1089,7 +1270,7 @@ async fn commit_staged_revision(
         // For each file in repository, create fragments if they don't already
         // exist. Also rehash directories affected by change and generate new
         // root hash.
-        commit_files_and_rehash(
+        commit_files_and_rehash_with_admission(
             repository.clone(),
             token.share(),
             state_staged.clone(),
@@ -1099,8 +1280,23 @@ async fn commit_staged_revision(
             link_messages,
             parent_branch,
             work_tracker.clone(),
+            exact_admission.clone(),
         )
         .await?;
+
+        if let (Some(admission), Some(node_paths)) = (&exact_admission, &exact_node_paths)
+            && let Err(err) = admission
+                .validate(
+                    repository.clone(),
+                    state_current.clone(),
+                    state_staged.clone(),
+                    node_paths,
+                )
+                .await
+        {
+            admission.store(Err(err));
+            return Err(CommitError::internal("Exact-selection admission rejected"));
+        }
 
         let metadata_hash = metadata
             .serialize_with_tracker(repository.clone(), Some(work_tracker.clone()))
@@ -1199,6 +1395,34 @@ pub(crate) async fn commit_files_and_rehash(
     link_messages: Arc<HashMap<String, String>>,
     parent_branch: BranchId,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+) -> Result<(), CommitError> {
+    commit_files_and_rehash_with_admission(
+        repository,
+        token,
+        state,
+        repository_root_path,
+        metadata,
+        path_remap,
+        link_messages,
+        parent_branch,
+        tracker,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_files_and_rehash_with_admission(
+    repository: Arc<RepositoryContext>,
+    token: RepositoryWriteToken,
+    state: Arc<State>,
+    repository_root_path: &Path,
+    metadata: Arc<Metadata>,
+    path_remap: Option<(String, String)>,
+    link_messages: Arc<HashMap<String, String>>,
+    parent_branch: BranchId,
+    tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    exact_admission: Option<crate::exact_selection::ExactSelectionAdmission>,
 ) -> Result<(), CommitError> {
     lore_info!("Fragmenting files and updating tree hashes");
 
@@ -1305,8 +1529,18 @@ pub(crate) async fn commit_files_and_rehash(
         let delta = delta.clone();
         let stats = stats.clone();
         let tracker = tracker.clone();
+        let exact_admission = exact_admission.clone();
         lore_spawn!(async move {
-            commit_execute(file_rx, repository, state, delta, stats, tracker).await
+            commit_execute(
+                file_rx,
+                repository,
+                state,
+                delta,
+                stats,
+                tracker,
+                exact_admission,
+            )
+            .await
         })
     };
 
@@ -1846,6 +2080,7 @@ async fn commit_execute(
     delta: Arc<parking_lot::RwLock<BytesMut>>,
     stats: Arc<CommitStats>,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    exact_admission: Option<crate::exact_selection::ExactSelectionAdmission>,
 ) -> Result<(), CommitError> {
     const MAX_CONCURRENT_TASKS: usize = 10000;
     let mut tasks = JoinSet::new();
@@ -1864,6 +2099,7 @@ async fn commit_execute(
             let delta = delta.clone();
             let stats = stats.clone();
             let tracker = tracker.clone();
+            let exact_admission = exact_admission.clone();
             async move {
                 commit_file(
                     repository,
@@ -1877,6 +2113,7 @@ async fn commit_execute(
                     delta,
                     stats,
                     tracker,
+                    exact_admission,
                 )
                 .await
             }
@@ -1932,6 +2169,7 @@ async fn commit_file(
     delta: Arc<parking_lot::RwLock<BytesMut>>,
     stats: Arc<CommitStats>,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    exact_admission: Option<crate::exact_selection::ExactSelectionAdmission>,
 ) -> Result<(), CommitError> {
     let mut node = { *block.read().node(node_index) };
 
@@ -1990,6 +2228,17 @@ async fn commit_file(
                     relative_path.as_str(),
                     node.address.context
                 );
+            }
+
+            if let Some(admission) = &exact_admission
+                && admission.requires_content(relative_path.as_str())
+                && let Err(err) = tokio::fs::read(absolute_path.as_path()).await
+            {
+                admission.store_pre_fragmentation_read_failure(relative_path.as_str(), &err);
+                return Err(CommitError::internal(format!(
+                    "Failed pre-fragmentation read for file {}: {err}",
+                    relative_path.as_str()
+                )));
             }
 
             let (address, size_content) = immutable::write_from_file_with_tracker(
@@ -2332,7 +2581,7 @@ async fn commit_link(
                 let stats = stats.clone();
                 let tracker = work_tracker.clone();
                 lore_spawn!(async move {
-                    commit_execute(file_rx, repository, state, delta, stats, tracker).await
+                    commit_execute(file_rx, repository, state, delta, stats, tracker, None).await
                 })
             };
 
@@ -3212,8 +3461,21 @@ fn prune_dirty_recurse(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use crate::errors::NotALayer;
+
+    fn anchor_index(kind: ExactAnchorKind) -> usize {
+        match kind {
+            ExactAnchorKind::BranchLatest => 0,
+            ExactAnchorKind::Current => 1,
+            ExactAnchorKind::Staged => 2,
+        }
+    }
 
     #[test]
     fn commit_options_new_has_empty_layer_defaults() {
@@ -3232,5 +3494,70 @@ mod tests {
         .into();
         assert!(matches!(err, CommitError::NotALayer { .. }));
         assert!(err.to_string().contains("external/lib"));
+    }
+
+    #[tokio::test]
+    async fn exact_anchor_publication_failure_restores_every_original_anchor() {
+        let original = ExactAnchorSnapshot {
+            branch_latest: Hash::from([1_u8; 32]),
+            current: Hash::from([2_u8; 32]),
+            staged: Hash::from([3_u8; 32]),
+        };
+        let published = ExactAnchorSnapshot {
+            branch_latest: Hash::from([4_u8; 32]),
+            current: Hash::from([5_u8; 32]),
+            staged: Hash::default(),
+        };
+
+        for (fail_on, partially_published) in [
+            (
+                ExactAnchorKind::BranchLatest,
+                [original.branch_latest, original.current, original.staged],
+            ),
+            (
+                ExactAnchorKind::Current,
+                [published.branch_latest, original.current, original.staged],
+            ),
+            (
+                ExactAnchorKind::Staged,
+                [published.branch_latest, published.current, original.staged],
+            ),
+        ] {
+            let anchors = Arc::new(Mutex::new([
+                original.branch_latest,
+                original.current,
+                original.staged,
+            ]));
+            let injected = Arc::new(AtomicBool::new(false));
+            let mut writer = |kind, value| {
+                let anchors = anchors.clone();
+                let injected = injected.clone();
+                async move {
+                    if kind == fail_on && !injected.swap(true, Ordering::SeqCst) {
+                        return Err(format!("injected {kind:?} publication failure"));
+                    }
+                    anchors.lock().expect("lock anchor fixture")[anchor_index(kind)] = value;
+                    Ok(())
+                }
+            };
+
+            write_exact_anchor_snapshot(published, &mut writer)
+                .await
+                .expect_err("injected publication step must reject");
+            assert_eq!(
+                *anchors.lock().expect("read partially published anchors"),
+                partially_published,
+                "publication must stop exactly at {fail_on:?}"
+            );
+
+            restore_exact_anchor_snapshot(original, &mut writer)
+                .await
+                .expect("original anchors must restore after publication rejection");
+            assert_eq!(
+                *anchors.lock().expect("read restored anchors"),
+                [original.branch_latest, original.current, original.staged],
+                "all original anchors must be exact after {fail_on:?} rejection"
+            );
+        }
     }
 }

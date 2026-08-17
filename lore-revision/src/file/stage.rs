@@ -145,6 +145,35 @@ pub async fn stage(
     let current_revision = state_current.revision();
     let state = state_staged.unwrap_or_else(|| state_current.clone());
 
+    stage_state(
+        repository,
+        token,
+        paths,
+        options,
+        state_current,
+        state,
+        current_revision,
+        true,
+    )
+    .await
+}
+
+/// Stages paths into caller-owned state, optionally publishing the staged anchor.
+///
+/// The exact-selection transaction uses the unpublished form so mutation, admission,
+/// and revision publication share one client write-token boundary without exposing an
+/// intermediate staged anchor. Ordinary stage keeps the historical publishing behavior.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stage_state(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: LoreArray<LoreString>,
+    options: StageOptions,
+    state_current: Arc<State>,
+    state: Arc<State>,
+    current_revision: Hash,
+    publish_anchor: bool,
+) -> Result<Hash, StageError> {
     let layers = {
         let mut layers = vec![];
         let list = layer::list(repository.clone()).await.unwrap_or_default();
@@ -410,23 +439,25 @@ pub async fn stage(
             state.set_metadata_hash(Hash::default());
         }
 
-        let signature = state
-            .serialize(repository.clone(), token)
-            .await
-            .forward::<StageError>("Failed to serialize staged revision state")?;
-
-        if signature != current_revision {
-            staged_revision = signature;
-            crate::instance::store_staged_anchor(&repository, signature)
+        if publish_anchor {
+            let signature = state
+                .serialize(repository.clone(), token)
                 .await
-                .forward::<StageError>("Failed to serialize staged anchor")?;
-        }
+                .forward::<StageError>("Failed to serialize staged revision state")?;
 
-        event::LoreEvent::FileStageRevision(LoreFileStageRevisionEventData {
-            repository: repository.id,
-            revision: signature,
-        })
-        .send();
+            if signature != current_revision {
+                staged_revision = signature;
+                crate::instance::store_staged_anchor(&repository, signature)
+                    .await
+                    .forward::<StageError>("Failed to serialize staged anchor")?;
+            }
+
+            event::LoreEvent::FileStageRevision(LoreFileStageRevisionEventData {
+                repository: repository.id,
+                revision: signature,
+            })
+            .send();
+        }
     }
 
     for (layer, layer_state) in layer_staged {
