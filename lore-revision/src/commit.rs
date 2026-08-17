@@ -1221,6 +1221,44 @@ pub(crate) struct ExactAnchorSnapshot {
     pub staged: Hash,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ExactFinalizeError {
+    #[error("exact-selection failed before anchor publication: {source}")]
+    BeforePublication {
+        #[source]
+        source: CommitError,
+    },
+    #[error(
+        "exact-selection anchor publication failed (anchors restored: {anchors_restored}): {reason}"
+    )]
+    Publication {
+        anchors_restored: bool,
+        reason: String,
+    },
+}
+
+impl PartialEq for ExactFinalizeError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::BeforePublication { source: left },
+                Self::BeforePublication { source: right },
+            ) => left.to_string() == right.to_string(),
+            (
+                Self::Publication {
+                    anchors_restored: left_restored,
+                    reason: left_reason,
+                },
+                Self::Publication {
+                    anchors_restored: right_restored,
+                    reason: right_reason,
+                },
+            ) => left_restored == right_restored && left_reason == right_reason,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExactAnchorKind {
     BranchLatest,
@@ -1277,6 +1315,32 @@ where
     }
 }
 
+async fn publish_exact_anchor_snapshot_with_compensation<F, Fut>(
+    original: ExactAnchorSnapshot,
+    published: ExactAnchorSnapshot,
+    writer: &mut F,
+) -> Result<(), ExactFinalizeError>
+where
+    F: FnMut(ExactAnchorKind, Hash) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    if let Err(publish_error) = write_exact_anchor_snapshot(published, writer).await {
+        if let Err(restore_error) = restore_exact_anchor_snapshot(original, writer).await {
+            return Err(ExactFinalizeError::Publication {
+                anchors_restored: false,
+                reason: format!(
+                    "publishing anchors failed ({publish_error}); restoring the original anchors failed ({restore_error})"
+                ),
+            });
+        }
+        return Err(ExactFinalizeError::Publication {
+            anchors_restored: true,
+            reason: format!("publishing anchors failed: {publish_error}"),
+        });
+    }
+    Ok(())
+}
+
 /// Publishes the three authoritative exact-selection anchors as one
 /// failure-safe group. If a later mutable-store write fails, every anchor is
 /// restored to its pre-transaction value before the error is returned.
@@ -1287,18 +1351,21 @@ pub(crate) async fn finalize_exact_commit(
     signature: Hash,
     branch: BranchId,
     original: ExactAnchorSnapshot,
-) -> Result<(), CommitError> {
+) -> Result<(), ExactFinalizeError> {
     let dry_run = execution_context().globals().dry_run();
 
     if !dry_run {
         let has_dirty = state_staged
             .node_has_dirty_children(repository.clone(), crate::node::ROOT_NODE)
             .await
-            .forward::<CommitError>("Failed deserializing exact staged state node block")?;
+            .forward::<CommitError>("Failed deserializing exact staged state node block")
+            .map_err(|source| ExactFinalizeError::BeforePublication { source })?;
         if has_dirty {
-            return Err(CommitError::internal(
-                "Exact-selection admission left dirty-only staged nodes",
-            ));
+            return Err(ExactFinalizeError::BeforePublication {
+                source: CommitError::internal(
+                    "Exact-selection admission left dirty-only staged nodes",
+                ),
+            });
         }
 
         let published = ExactAnchorSnapshot {
@@ -1328,16 +1395,7 @@ pub(crate) async fn finalize_exact_commit(
                 }
             }
         };
-        if let Err(publish_error) = write_exact_anchor_snapshot(published, &mut writer).await {
-            if let Err(restore_error) = restore_exact_anchor_snapshot(original, &mut writer).await {
-                return Err(CommitError::internal(format!(
-                    "Exact-selection anchor publication failed ({publish_error}); restoring the original anchors also failed ({restore_error})"
-                )));
-            }
-            return Err(CommitError::internal(format!(
-                "Exact-selection anchor publication failed; original anchors restored: {publish_error}"
-            )));
-        }
+        publish_exact_anchor_snapshot_with_compensation(original, published, &mut writer).await?;
 
         // These derived branch indexes follow authoritative anchor publication.
         // They cannot turn a published revision into a rejected transaction.
@@ -2409,7 +2467,7 @@ async fn commit_file(
 
             if let Some(admission) = &exact_admission
                 && admission.requires_content(relative_path.as_str())
-                && let Err(err) = tokio::fs::read(absolute_path.as_path()).await
+                && let Err(err) = tokio::fs::File::open(absolute_path.as_path()).await
             {
                 admission.store_pre_fragmentation_read_failure(relative_path.as_str(), &err);
                 return Err(CommitError::internal(format!(
@@ -4268,19 +4326,10 @@ mod tests {
             staged: Hash::default(),
         };
 
-        for (fail_on, partially_published) in [
-            (
-                ExactAnchorKind::BranchLatest,
-                [original.branch_latest, original.current, original.staged],
-            ),
-            (
-                ExactAnchorKind::Current,
-                [published.branch_latest, original.current, original.staged],
-            ),
-            (
-                ExactAnchorKind::Staged,
-                [published.branch_latest, published.current, original.staged],
-            ),
+        for fail_on in [
+            ExactAnchorKind::BranchLatest,
+            ExactAnchorKind::Current,
+            ExactAnchorKind::Staged,
         ] {
             let anchors = Arc::new(Mutex::new([
                 original.branch_latest,
@@ -4300,23 +4349,74 @@ mod tests {
                 }
             };
 
-            write_exact_anchor_snapshot(published, &mut writer)
-                .await
-                .expect_err("injected publication step must reject");
+            let error =
+                publish_exact_anchor_snapshot_with_compensation(original, published, &mut writer)
+                    .await
+                    .expect_err("injected publication step must reject");
             assert_eq!(
-                *anchors.lock().expect("read partially published anchors"),
-                partially_published,
-                "publication must stop exactly at {fail_on:?}"
+                error,
+                ExactFinalizeError::Publication {
+                    anchors_restored: true,
+                    reason: format!(
+                        "publishing anchors failed: injected {fail_on:?} publication failure"
+                    ),
+                }
             );
-
-            restore_exact_anchor_snapshot(original, &mut writer)
-                .await
-                .expect("original anchors must restore after publication rejection");
             assert_eq!(
                 *anchors.lock().expect("read restored anchors"),
                 [original.branch_latest, original.current, original.staged],
                 "all original anchors must be exact after {fail_on:?} rejection"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn exact_anchor_publication_reports_when_original_anchor_restoration_fails() {
+        let original = ExactAnchorSnapshot {
+            branch_latest: Hash::from([1_u8; 32]),
+            current: Hash::from([2_u8; 32]),
+            staged: Hash::from([3_u8; 32]),
+        };
+        let published = ExactAnchorSnapshot {
+            branch_latest: Hash::from([4_u8; 32]),
+            current: Hash::from([5_u8; 32]),
+            staged: Hash::default(),
+        };
+        let anchors = Arc::new(Mutex::new([
+            original.branch_latest,
+            original.current,
+            original.staged,
+        ]));
+        let mut writer = |kind, value| {
+            let anchors = anchors.clone();
+            async move {
+                if kind == ExactAnchorKind::Current && value == published.current {
+                    return Err("injected current publication failure".to_string());
+                }
+                if kind == ExactAnchorKind::BranchLatest && value == original.branch_latest {
+                    return Err("injected branch restoration failure".to_string());
+                }
+                anchors.lock().expect("lock anchor fixture")[anchor_index(kind)] = value;
+                Ok(())
+            }
+        };
+
+        let error =
+            publish_exact_anchor_snapshot_with_compensation(original, published, &mut writer)
+                .await
+                .expect_err("publication and restoration failures must reject");
+
+        assert_eq!(
+            error,
+            ExactFinalizeError::Publication {
+                anchors_restored: false,
+                reason: "publishing anchors failed (injected current publication failure); restoring the original anchors failed (BranchLatest: injected branch restoration failure)".to_string(),
+            }
+        );
+        assert_eq!(
+            *anchors.lock().expect("read unrestored anchors"),
+            [published.branch_latest, original.current, original.staged],
+            "failed restoration must leave the partial publication observable"
+        );
     }
 }

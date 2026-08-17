@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -252,6 +253,10 @@ pub enum ExactSelectionErrorKind {
     UnsupportedTopology {
         reason: String,
     },
+    PublicationFailure {
+        anchors_restored: bool,
+        reason: String,
+    },
     Internal {
         operation: String,
         reason: String,
@@ -294,6 +299,22 @@ impl fmt::Display for ExactSelectionErrorKind {
                 write!(f, "pre-fragmentation file read failed for {path}")
             }
             Self::UnsupportedTopology { reason } => write!(f, "unsupported topology: {reason}"),
+            Self::PublicationFailure {
+                anchors_restored,
+                reason,
+            } => {
+                if *anchors_restored {
+                    write!(
+                        f,
+                        "exact-selection publication failed; original anchors restored: {reason}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "exact-selection publication and anchor restoration failed: {reason}"
+                    )
+                }
+            }
             Self::Internal { operation, reason } => write!(f, "{operation}: {reason}"),
         }
     }
@@ -336,6 +357,21 @@ impl ExactSelectionError {
     }
 }
 
+fn map_exact_finalize_error(err: commit::ExactFinalizeError) -> ExactSelectionError {
+    match err {
+        commit::ExactFinalizeError::BeforePublication { source } => {
+            ExactSelectionError::internal("publishing exact selection", source)
+        }
+        commit::ExactFinalizeError::Publication {
+            anchors_restored,
+            reason,
+        } => ExactSelectionError::new(ExactSelectionErrorKind::PublicationFailure {
+            anchors_restored,
+            reason,
+        }),
+    }
+}
+
 impl From<RepositoryError> for ExactSelectionError {
     fn from(err: RepositoryError) -> Self {
         Self::internal("opening repository", err)
@@ -347,9 +383,14 @@ impl FfiError for ExactSelectionError {
         match self.kind() {
             ExactSelectionErrorKind::InvalidInput { .. }
             | ExactSelectionErrorKind::PathNormalization { .. }
+            | ExactSelectionErrorKind::GeneratedSelectionMismatch { .. }
+            | ExactSelectionErrorKind::SemanticSelectionMismatch { .. }
+            | ExactSelectionErrorKind::UnselectedFileMetadata { .. }
             | ExactSelectionErrorKind::DuplicateMetadataKey { .. }
+            | ExactSelectionErrorKind::StagedMetadataHashMismatch { .. }
             | ExactSelectionErrorKind::MalformedSourceHash { .. }
             | ExactSelectionErrorKind::UnexpectedContentDigest { .. }
+            | ExactSelectionErrorKind::SourceHashMismatch { .. }
             | ExactSelectionErrorKind::UnsupportedTopology { .. } => {
                 LoreError::InvalidArguments as i32
             }
@@ -369,9 +410,14 @@ impl EventError for ExactSelectionError {
         match self.kind() {
             ExactSelectionErrorKind::InvalidInput { .. }
             | ExactSelectionErrorKind::PathNormalization { .. }
+            | ExactSelectionErrorKind::GeneratedSelectionMismatch { .. }
+            | ExactSelectionErrorKind::SemanticSelectionMismatch { .. }
+            | ExactSelectionErrorKind::UnselectedFileMetadata { .. }
             | ExactSelectionErrorKind::DuplicateMetadataKey { .. }
+            | ExactSelectionErrorKind::StagedMetadataHashMismatch { .. }
             | ExactSelectionErrorKind::MalformedSourceHash { .. }
             | ExactSelectionErrorKind::UnexpectedContentDigest { .. }
+            | ExactSelectionErrorKind::SourceHashMismatch { .. }
             | ExactSelectionErrorKind::UnsupportedTopology { .. } => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
@@ -525,11 +571,14 @@ async fn normalize_selected_files(
         ));
     }
 
-    let mut normalized = BTreeMap::<String, NormalizedSelectedFile>::new();
-    let mut binary_metadata_bytes = 0u64;
+    let mut normalized_paths = BTreeSet::new();
+    let mut candidates = Vec::with_capacity(files.len());
     for file in files {
         let input_path = PathBuf::from(&file.path);
-        if input_path.is_absolute() {
+        if input_path
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+        {
             return Err(ExactSelectionError::new(
                 ExactSelectionErrorKind::PathNormalization {
                     path: file.path,
@@ -555,7 +604,20 @@ async fn normalize_selected_files(
             ));
         }
         let path = relative.as_str().to_string();
+        if !normalized_paths.insert(path.clone()) {
+            return Err(ExactSelectionError::new(
+                ExactSelectionErrorKind::InvalidInput {
+                    reason: "duplicate selected path".into(),
+                    paths: vec![path],
+                },
+            ));
+        }
+        candidates.push((path, file));
+    }
 
+    let mut normalized = BTreeMap::<String, NormalizedSelectedFile>::new();
+    let mut binary_metadata_bytes = 0u64;
+    for (path, file) in candidates {
         match file.expected_effective_action {
             ExpectedFileAction::Add | ExpectedFileAction::Modify => {
                 let Some(source_hash) = file.source_hash.as_ref() else {
@@ -699,20 +761,6 @@ async fn normalize_selected_files(
             file_metadata: file.file_metadata,
             prepared_metadata,
         };
-        if let Some(previous) = normalized.get(&path) {
-            let equivalent = previous.row == candidate.row
-                && previous.source_hash == candidate.source_hash
-                && previous.file_metadata == candidate.file_metadata;
-            if equivalent {
-                continue;
-            }
-            return Err(ExactSelectionError::new(
-                ExactSelectionErrorKind::InvalidInput {
-                    reason: "conflicting duplicate selected path".into(),
-                    paths: vec![path],
-                },
-            ));
-        }
         normalized.insert(path, candidate);
     }
     Ok(normalized.into_values().collect())
@@ -1060,8 +1108,8 @@ fn validate_metadata_membership(
     let mut committed = Vec::new();
     for (path, expected_hash) in expected_metadata {
         let is_delete = selected
-            .iter()
-            .any(|file| file.row.path == *path && file.row.action == ExpectedFileAction::Delete);
+            .binary_search_by(|file| file.row.path.as_str().cmp(path.as_str()))
+            .is_ok_and(|index| selected[index].row.action == ExpectedFileAction::Delete);
         let actual = if is_delete {
             current_metadata.get(path)
         } else {
@@ -1101,6 +1149,12 @@ impl ExactSelectionAdmission {
         selected: Vec<NormalizedSelectedFile>,
         expected_metadata: BTreeMap<String, Hash>,
     ) -> Self {
+        debug_assert!(
+            selected
+                .windows(2)
+                .all(|pair| pair[0].row.path < pair[1].row.path),
+            "normalized exact selection must remain sorted by path"
+        );
         Self {
             selected: Arc::new(selected),
             expected_metadata: Arc::new(expected_metadata),
@@ -1114,8 +1168,8 @@ impl ExactSelectionAdmission {
 
     pub(crate) fn requires_content(&self, path: &str) -> bool {
         self.selected
-            .iter()
-            .any(|file| file.row.path == path && file.row.action != ExpectedFileAction::Delete)
+            .binary_search_by(|file| file.row.path.as_str().cmp(path))
+            .is_ok_and(|index| self.selected[index].row.action != ExpectedFileAction::Delete)
     }
 
     pub(crate) fn store_pre_fragmentation_read_failure(
@@ -1289,7 +1343,7 @@ impl ExactSelectionAdmission {
                 .map_err(|err| err.to_string())
             })
             .await?;
-            let actual = format!("{:x}", Md5::digest(&payload));
+            let actual = hex::encode(Md5::digest(&payload));
             let expected_hash = selected.source_hash.as_deref().unwrap_or_default();
             if actual != expected_hash {
                 source_mismatches.push(ExactSourceHashMismatch {
@@ -1436,7 +1490,7 @@ pub async fn commit_exact_selection(
 
     let mut inherited_metadata = BTreeMap::new();
     for file in &selected {
-        let hash = file_metadata_hash(repository.clone(), state_original.clone(), &file.row.path)
+        let hash = file_metadata_hash(repository.clone(), state_current.clone(), &file.row.path)
             .await?
             .unwrap_or_default();
         inherited_metadata.insert(file.row.path.clone(), hash);
@@ -1596,7 +1650,7 @@ pub async fn commit_exact_selection(
         },
     )
     .await
-    .map_err(|err| ExactSelectionError::internal("publishing exact selection", err))?;
+    .map_err(map_exact_finalize_error)?;
     let _ = crate::event::metadata::send(&metadata);
     Ok(result)
 }
@@ -1646,6 +1700,34 @@ mod tests {
             source_hash: None,
             file_metadata: FileMetadataSelection::Unchanged,
             prepared_metadata: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn finalize_publication_failure_maps_public_kind_json_and_internal_code() {
+        for anchors_restored in [true, false] {
+            let reason = format!("injected anchors_restored={anchors_restored}");
+            let error = map_exact_finalize_error(commit::ExactFinalizeError::Publication {
+                anchors_restored,
+                reason: reason.clone(),
+            });
+
+            assert_eq!(
+                error.kind(),
+                &ExactSelectionErrorKind::PublicationFailure {
+                    anchors_restored,
+                    reason: reason.clone(),
+                }
+            );
+            assert_eq!(error.code(), LoreError::Internal as i32);
+            assert_eq!(
+                serde_json::to_value(error.kind()).expect("serialize public exact error kind"),
+                serde_json::json!({
+                    "kind": "publicationFailure",
+                    "anchorsRestored": anchors_restored,
+                    "reason": reason,
+                })
+            );
         }
     }
 
