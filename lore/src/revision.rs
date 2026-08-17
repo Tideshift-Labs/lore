@@ -8,6 +8,9 @@ use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::branch::merge::MergeError;
 use lore_revision::commit::CommitOptions;
+use lore_revision::exact_selection::ExactSelectionError;
+use lore_revision::exact_selection::ExactSelectionOptions;
+use lore_revision::exact_selection::ExactSelectionResult;
 use lore_revision::find::FindError;
 use lore_revision::find::FindOptions;
 use lore_revision::interface::LoreArray;
@@ -36,6 +39,7 @@ use serde::Serialize;
 
 use crate::call::repository_call_read;
 use crate::call::repository_call_write;
+use crate::call::repository_call_write_result;
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreMetadataType;
 use crate::interface::LoreString;
@@ -101,6 +105,35 @@ pub async fn commit(
     callback: LoreEventCallback,
 ) -> i32 {
     dispatch_call(globals, args, callback, commit_local).await
+}
+
+/// Commits exactly the normalized content/action and file-metadata selection.
+///
+/// This Rust-only CLIENT facade returns the structured admission result or
+/// error while preserving the ordinary Lore callback lifecycle. One shared
+/// write token and token-bearing repository context span the complete
+/// transaction and are released only after cleanup.
+pub async fn commit_exact_selection(
+    globals: LoreGlobalArgs,
+    options: ExactSelectionOptions,
+    callback: LoreEventCallback,
+) -> Result<ExactSelectionResult, ExactSelectionError> {
+    repository_call_write_result(
+        globals,
+        callback,
+        options,
+        commit_exact_selection,
+        move |repository, token, options| async move {
+            let ctx = lore_revision::lore::execution_context();
+            if !ctx.globals().local() && !ctx.globals().offline() {
+                repository.set_disable_upload(false);
+            }
+
+            lore_revision::exact_selection::commit_exact_selection(repository, &token, options)
+                .await
+        },
+    )
+    .await
 }
 
 async fn commit_local(
