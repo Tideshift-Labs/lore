@@ -34,6 +34,7 @@ mod tests {
     use lore_revision::file;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreError;
     use lore_revision::interface::LoreEvent;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::BranchId;
@@ -207,7 +208,7 @@ mod tests {
     }
 
     fn digest(bytes: &[u8]) -> String {
-        format!("{:x}", Md5::digest(bytes))
+        hex::encode(Md5::digest(bytes))
     }
 
     fn selected(path: &str, action: ExpectedFileAction, bytes: Option<&[u8]>) -> SelectedFile {
@@ -331,6 +332,87 @@ mod tests {
             .expect_err("exact-selection case must reject");
         assert!(expected(error.kind()), "unexpected exact error: {error:?}");
         assert_eq!(fixture.anchors().await, before);
+    }
+
+    #[test]
+    fn validation_mismatch_errors_use_invalid_arguments_code() {
+        let errors = [
+            ExactSelectionError::new(ExactSelectionErrorKind::GeneratedSelectionMismatch {
+                expected: Vec::new(),
+                actual: Vec::new(),
+                missing: Vec::new(),
+                extras: Vec::new(),
+                action_mismatches: Vec::new(),
+            }),
+            ExactSelectionError::new(ExactSelectionErrorKind::SemanticSelectionMismatch {
+                expected: Vec::new(),
+                actual: Vec::new(),
+                missing: Vec::new(),
+                extras: Vec::new(),
+                action_mismatches: Vec::new(),
+            }),
+            ExactSelectionError::new(ExactSelectionErrorKind::UnselectedFileMetadata {
+                paths: vec!["unselected.bin".to_string()],
+            }),
+            ExactSelectionError::new(ExactSelectionErrorKind::StagedMetadataHashMismatch {
+                mismatches: Vec::new(),
+            }),
+            ExactSelectionError::new(ExactSelectionErrorKind::SourceHashMismatch {
+                mismatches: Vec::new(),
+            }),
+        ];
+
+        for error in errors {
+            assert_eq!(error.code(), LoreError::InvalidArguments as i32);
+        }
+    }
+
+    #[test]
+    fn publication_failure_carries_restoration_state_and_uses_internal_code() {
+        for anchors_restored in [true, false] {
+            let error = ExactSelectionError::new(ExactSelectionErrorKind::PublicationFailure {
+                anchors_restored,
+                reason: "injected publication failure".to_string(),
+            });
+
+            assert!(
+                matches!(
+                    error.kind(),
+                    ExactSelectionErrorKind::PublicationFailure {
+                        anchors_restored: actual,
+                        reason,
+                    } if *actual == anchors_restored && reason == "injected publication failure"
+                ),
+                "publication failure lost anchors_restored={anchors_restored}: {error:?}"
+            );
+            assert_eq!(error.code(), LoreError::Internal as i32);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drive_relative_path_rejects_as_path_normalization() {
+        LORE_CONTEXT
+            .scope(execution(), async {
+                let fixture = Fixture::new().await;
+                let error = fixture
+                    .exact(
+                        "drive-relative path",
+                        vec![selected("C:x", ExpectedFileAction::Add, Some(b"x"))],
+                    )
+                    .await
+                    .expect_err("drive-relative Windows path must reject");
+
+                assert!(
+                    matches!(
+                        error.kind(),
+                        ExactSelectionErrorKind::PathNormalization { path, .. } if path == "C:x"
+                    ),
+                    "unexpected drive-relative path error: {error:?}"
+                );
+                assert_eq!(error.code(), LoreError::InvalidArguments as i32);
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
@@ -608,6 +690,101 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn unchanged_modify_metadata_inherits_committed_not_abandoned_staged_state() {
+        LORE_CONTEXT
+            .scope(execution(), async {
+                let fixture = Fixture::new().await;
+                fixture.write("tracked.bin", b"baseline\n");
+                fixture.stage_all().await;
+                let tracked_path = fixture.absolute("tracked.bin");
+                metadata::set::set_file(
+                    fixture.repository.clone(),
+                    &fixture.write_token,
+                    &[tracked_path.to_string_lossy().as_ref()],
+                    &[b"owner"],
+                    &[b"committed"],
+                    &[MetadataType::String],
+                    &[1],
+                )
+                .await
+                .expect("seed committed file metadata");
+                let baseline = Box::pin(commit::commit(
+                    fixture.repository.clone(),
+                    &fixture.write_token,
+                    CommitOptions::new("metadata baseline".to_string()),
+                ))
+                .await
+                .expect("commit metadata baseline");
+                let (committed_hash, committed_metadata) =
+                    file_metadata_at(&fixture, baseline, "tracked.bin")
+                        .await
+                        .expect("load committed metadata");
+                assert_eq!(
+                    committed_metadata
+                        .get_string("owner")
+                        .expect("committed owner metadata"),
+                    "committed"
+                );
+
+                metadata::set::set_file(
+                    fixture.repository.clone(),
+                    &fixture.write_token,
+                    &[tracked_path.to_string_lossy().as_ref()],
+                    &[b"owner"],
+                    &[b"abandoned-staged"],
+                    &[MetadataType::String],
+                    &[1],
+                )
+                .await
+                .expect("stage abandoned file metadata");
+                let abandoned_revision = fixture
+                    .anchors()
+                    .await
+                    .staged
+                    .expect("abandoned metadata must publish a staged anchor");
+                let (abandoned_hash, abandoned_metadata) =
+                    file_metadata_at(&fixture, abandoned_revision, "tracked.bin")
+                        .await
+                        .expect("load abandoned staged metadata");
+                assert_ne!(abandoned_hash, committed_hash);
+                assert_eq!(
+                    abandoned_metadata
+                        .get_string("owner")
+                        .expect("abandoned owner metadata"),
+                    "abandoned-staged"
+                );
+
+                let modified = b"modified\n";
+                fixture.write("tracked.bin", modified);
+                let result = fixture
+                    .exact(
+                        "inherit committed metadata",
+                        vec![selected(
+                            "tracked.bin",
+                            ExpectedFileAction::Modify,
+                            Some(modified),
+                        )],
+                    )
+                    .await
+                    .expect("commit Modify with unchanged metadata");
+
+                let (published_hash, published_metadata) =
+                    file_metadata_at(&fixture, result.revision, "tracked.bin")
+                        .await
+                        .expect("load published inherited metadata");
+                assert_eq!(published_hash, committed_hash);
+                assert_eq!(
+                    published_metadata
+                        .get_string("owner")
+                        .expect("published owner metadata"),
+                    "committed"
+                );
+                assert_eq!(fixture.anchors().await.staged, None);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn admits_exact_add_modify_clear_mixed_metadata_and_preserves_delete_inheritance() {
         LORE_CONTEXT
             .scope(execution(), async {
@@ -801,6 +978,53 @@ mod tests {
                     |kind| matches!(kind, ExactSelectionErrorKind::MetadataInputRead { path, key, .. } if path == "tracked.bin" && key == "audit"),
                 )
                 .await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn equivalent_duplicate_normalized_path_rejects_before_binary_metadata_source_io() {
+        LORE_CONTEXT
+            .scope(execution(), async {
+                let fixture = Fixture::new().await;
+                let modified = b"modified\n";
+                fixture.write("tracked.bin", b"baseline\n");
+                fixture.seed_commit("baseline").await;
+                fixture.write("tracked.bin", modified);
+                let with_missing_binary = |path: &str| SelectedFile {
+                    path: path.to_string(),
+                    expected_effective_action: ExpectedFileAction::Modify,
+                    source_hash: Some(digest(modified)),
+                    file_metadata: FileMetadataSelection::Exact(vec![FileMetadataEntry {
+                        key: "audit".to_string(),
+                        value: "missing-duplicate-audit.bin".to_string(),
+                        value_type: ExactMetadataType::Binary,
+                    }]),
+                };
+                let before = fixture.anchors().await;
+
+                let error = fixture
+                    .exact(
+                        "duplicate normalized path",
+                        vec![
+                            with_missing_binary("tracked.bin"),
+                            with_missing_binary("./tracked.bin"),
+                        ],
+                    )
+                    .await
+                    .expect_err("equivalent duplicate normalized path must reject");
+
+                assert!(
+                    matches!(
+                        error.kind(),
+                        ExactSelectionErrorKind::InvalidInput { reason, paths }
+                            if reason == "duplicate selected path"
+                                && paths == &vec!["tracked.bin".to_string()]
+                    ),
+                    "duplicate detection must precede binary metadata source I/O: {error:?}"
+                );
+                assert_eq!(error.code(), LoreError::InvalidArguments as i32);
+                assert_eq!(fixture.anchors().await, before);
             })
             .await;
     }

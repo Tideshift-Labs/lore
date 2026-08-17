@@ -132,8 +132,10 @@ will update an older check constraint or state schema.
   semantic admission failures, anchor preservation, immutable capture, token lifetime, staged-state
   repair, input limits before metadata reads, and committed-state deserialization. Private
   unreachable authority/map, exact byte-boundary, capped binary-read, and admission-before-publication
-  branches are pinned by `exact_selection::tests`;
-  `commit::tests` injects failure at each authoritative anchor write and proves exact rollback.
+  branches are pinned by `exact_selection::tests`, including the production finalize-error mapping
+  to the serialized public kind and stable code. `commit::tests` drives the production compensation
+  helper, injecting failure at each authoritative anchor write and pinning both successful rollback
+  and a failed restoration's `anchors_restored: false` outcome.
   The Rust facade's independently acquired CLIENT token/context lifetime is pinned in
   `lore/tests/exact_selection_transaction.rs`. Gates:
   `cargo test -p lore-revision --test exact_selection_transaction -j 4 -- --test-threads=1` and

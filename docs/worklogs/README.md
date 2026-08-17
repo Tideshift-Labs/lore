@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 025 | 2026-08-17 | [Exact-selection review hardening](025-exact-selection-review-hardening.md) |
 | 024 | 2026-08-16 | [Atomic exact-selection CLIENT transaction](024-atomic-exact-selection-client-transaction.md) |
 | 023 | 2026-08-16 | [Propagate file-metadata task errors](023-propagate-file-metadata-task-errors.md) |
 | 022 | 2026-08-16 | [Preserve topology during parallel multi-path stage](022-preserve-parallel-stage-topology.md) |
