@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -326,6 +327,30 @@ async fn set_file_task(
     Ok(())
 }
 
+fn record_set_file_task_result(
+    result: Result<(usize, Result<(), SetError>), tokio::task::JoinError>,
+    join_failure: &mut Option<SetError>,
+    inner_failure: &mut Option<(usize, SetError)>,
+) {
+    match result {
+        Ok((_, Ok(()))) => {}
+        Ok((index, Err(err))) => {
+            let replace = match inner_failure.as_ref() {
+                Some((failure_index, _)) => index < *failure_index,
+                None => true,
+            };
+            if replace {
+                *inner_failure = Some((index, err));
+            }
+        }
+        Err(err) => {
+            if join_failure.is_none() {
+                *join_failure = Some(SetError::internal_with_context(err, "task failed"));
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn set_file(
     repository: Arc<RepositoryContext>,
@@ -379,7 +404,8 @@ pub async fn set_file(
 
     let mut offset = 0;
     let mut tasks = JoinSet::new();
-    let mut failure = None;
+    let mut join_failure = None;
+    let mut inner_failure = None;
     for (index, path) in paths.iter().enumerate() {
         let count = entries[index] as usize;
 
@@ -397,7 +423,7 @@ pub async fn set_file(
 
         lore_spawn!(tasks, {
             async move {
-                set_file_task(
+                let result = set_file_task(
                     repository,
                     state,
                     &path,
@@ -406,17 +432,18 @@ pub async fn set_file(
                     &formats,
                     events,
                 )
-                .await
+                .await;
+                (index, result)
             }
         });
 
         while tasks.len() > MAX_TASK_COUNT {
             if let Some(result) = tasks.join_next().await {
-                failure = failure.or(result.internal("task failed").err());
+                record_set_file_task_result(result, &mut join_failure, &mut inner_failure);
             }
         }
 
-        if failure.is_some() {
+        if join_failure.is_some() || inner_failure.is_some() {
             break;
         }
 
@@ -424,11 +451,14 @@ pub async fn set_file(
     }
 
     while let Some(result) = tasks.join_next().await {
-        failure = failure.or(result.internal("task failed").err());
+        record_set_file_task_result(result, &mut join_failure, &mut inner_failure);
     }
 
-    if let Some(err) = failure {
-        return Err(err.into());
+    if let Some(err) = join_failure {
+        return Err(err);
+    }
+    if let Some((_, err)) = inner_failure {
+        return Err(err);
     }
 
     // Serialize the new current state
