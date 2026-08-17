@@ -127,6 +127,21 @@ will update an older check constraint or state schema.
   serialization, and the C ABI are unchanged. Gate:
   `cargo test -p lore-revision --test sync -j 4` (backward, no-op, older-target, cross-branch, and
   forward-advance controls).
+- **Exact-selection commit transaction [CLIENT]**: `lore-revision/tests/exact_selection_transaction.rs`
+  pins the public transaction across mixed Add/Modify/Delete, metadata policy, source-digest and
+  semantic admission failures, anchor preservation, immutable capture, token lifetime, staged-state
+  repair, input limits before metadata reads, and committed-state deserialization. Private
+  unreachable authority/map, exact byte-boundary, capped binary-read, and admission-before-publication
+  branches are pinned by `exact_selection::tests`;
+  `commit::tests` injects failure at each authoritative anchor write and proves exact rollback.
+  The Rust facade's independently acquired CLIENT token/context lifetime is pinned in
+  `lore/tests/exact_selection_transaction.rs`. Gates:
+  `cargo test -p lore-revision --test exact_selection_transaction -j 4 -- --test-threads=1` and
+  `cargo test -p lore-revision --lib exact_selection::tests -j 4`,
+  `cargo test -p lore-revision --lib commit::tests -j 4`, and
+  `cargo test -p lore --test exact_selection_transaction -j 4 -- --test-threads=1`. Its actor-sized validation-only
+  reread+MD5 measurement is deliberately `#[ignore]`; run the fully qualified test with
+  `-- --ignored --exact --nocapture` and report environment/cache posture with descriptive timings.
 - **Upstream revision-tree integration suite [mixed]**: the in-memory suite exercises batch fan-out,
   event ordering, multi-level/mixed-parent batches, concurrency, atomic rejection, and entry fields.
   Gate: `cargo test -p lore-integration-tests revision_tree_test -j 4`.
@@ -223,6 +238,23 @@ will update an older check constraint or state schema.
 - Use `#[tokio::test(start_paused = true)]` and `tokio::time::advance` for timer-driven behavior.
 - Use near-zero retry policies for behavioral tests; keep one explicit real-default test when the
   default delay itself is part of the contract.
+- Exact-selection lifecycle callbacks provide deterministic filesystem fault points without a
+  production-only test hook: `FileStageEnd` is immediately before the selected-file pre-capture
+  read, while `FragmentWrite` is after immutable capture and before admission. Use the former to
+  remove an Add and assert `PreFragmentationFileRead`; use the latter to mutate working bytes and
+  assert the committed immutable payload remains the captured version.
+- A rejected exact-selection attempt must be followed by another attempt in the same fixture.
+  Symptom: the second call reports a stale parent instead of its typed validation error. Cause: the
+  rejected staging pass left unpublished parent/revision metadata in memory. What to do: assert all
+  current/staged/branch anchors after every rejection and retain at least one sequential-retry case.
+- An Add has no prior file node. Symptom: inherited metadata lookup returns an internal node-not-found
+  error. Cause: treating absence as a metadata read failure. What to do: include an Add with
+  `FileMetadataSelection::Unchanged` and require zero inherited metadata.
+- Exact-selection path, metadata, and aggregate limits are UTF-8 byte limits. Pin both the exact
+  accepted boundary and one byte over with multibyte strings, including the commit message in the
+  aggregate. A public case should put a missing binary source before a later oversized value and
+  still receive `InvalidInput`, proving bounds run before filesystem metadata/read work. Exercise a
+  sparse binary source at `MAX_BINARY_METADATA_PAYLOAD_BYTES + 1` to pin the open-once capped read.
 - Wrap stream-delivery assertions in `tokio::time::timeout` so a lost event fails rather than hangs.
 - Bind an ephemeral port once and serve on that listener. Avoid drop-and-rebind readiness races.
 
