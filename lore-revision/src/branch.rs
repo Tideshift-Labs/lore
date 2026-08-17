@@ -825,7 +825,7 @@ pub async fn store_latest(
     latest: Hash,
     status: BranchLatestStatus,
 ) -> Result<(), BranchError> {
-    mutable_store(repository.clone(), LATEST, branch, latest).await?;
+    store_latest_anchor(repository.clone(), branch, latest).await?;
 
     // Server does not store latest status or history
     if execution_context().is_server() {
@@ -844,6 +844,39 @@ pub async fn store_latest(
     )
     .await;
     store_latest_history(repository, branch, latest).await
+}
+
+/// Stores only the mutable branch-latest anchor.
+///
+/// Exact-selection publication uses this narrower primitive so current,
+/// staged, and branch-latest can be restored together if a later anchor write
+/// fails. Latest-status and latest-history are updated only after all three
+/// authoritative anchors have been published.
+pub(crate) async fn store_latest_anchor(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+) -> Result<(), BranchError> {
+    mutable_store(repository, LATEST, branch, latest).await
+}
+
+pub(crate) async fn store_latest_status(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+    status: BranchLatestStatus,
+) -> Result<(), BranchError> {
+    mutable_store(
+        repository,
+        LATEST_STATUS,
+        branch,
+        if status == BranchLatestStatus::Divergent {
+            latest
+        } else {
+            Hash::default()
+        },
+    )
+    .await
 }
 
 pub async fn store_last_sync(repository: Arc<RepositoryContext>, branch: BranchId, revision: Hash) {

@@ -165,6 +165,68 @@ where
         .await
 }
 
+/// Typed write repository call for Rust callers that need the command value or
+/// structured error in addition to the standard Lore event stream.
+///
+/// The same CLIENT write token is shared with the repository context and held
+/// until command cleanup completes. The callback still receives exactly one
+/// `Complete` event followed by `End`.
+pub async fn repository_call_write_result<Arg, T, F, Fut, ResT, ErrT>(
+    globals: LoreGlobalArgs,
+    callback: LoreEventCallback,
+    args: Arg,
+    caller: T,
+    command: F,
+) -> Result<ResT, ErrT>
+where
+    ErrT: EventError + FfiError + HasTrace + From<RepositoryError>,
+    Arg: std::fmt::Debug,
+    F: FnOnce(Arc<RepositoryContext>, RepositoryWriteToken, Arg) -> Fut,
+    Fut: Future<Output = Result<ResT, ErrT>> + 'static,
+{
+    let (repository_path, execution) =
+        match prepare_repository_call_result::<ErrT>(globals, callback).await {
+            Ok(value) => value,
+            Err(err) => return Err(err),
+        };
+
+    let token = RepositoryWriteToken::acquire(&repository_path).await;
+    let context_token = token.share();
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            log_command_info(&caller, &args);
+            let time_start = Instant::now();
+
+            let mut weak_repository = None;
+            let result = match repository::load_and_connect_with_token(
+                &repository_path,
+                RepositoryAccess::ReadWrite,
+                Some(context_token),
+            )
+            .await
+            {
+                Ok(repository) => {
+                    let result = command(repository.clone(), token, args).await;
+                    weak_repository = Some(post_command_cleanup(repository).await);
+                    result
+                }
+                Err(err) => Err(ErrT::from(err)),
+            };
+
+            check_no_lingering_repository(weak_repository);
+            log_command_done(&caller, time_start);
+
+            let detail = match &result {
+                Ok(_) => LoreErrorDetail::default(),
+                Err(err) => LoreErrorDetail::from_error(err),
+            };
+            let _ = execution_context().dispatcher.complete(detail).await;
+            result
+        })
+        .await
+}
+
 /// Repository call that doesn't open stores. For notification /
 /// config-introspection commands that need a `RepositoryContext` but neither
 /// read nor write stores; skips the `FSLock` and never mints a write token.
@@ -252,6 +314,44 @@ async fn prepare_repository_call(
             })
             .await;
         return Err(status);
+    }
+
+    Ok((repository_path, execution))
+}
+
+/// Typed counterpart to [`prepare_repository_call`]. On failure it dispatches
+/// the normal terminal events before returning the structured repository error.
+async fn prepare_repository_call_result<ErrT>(
+    mut globals: LoreGlobalArgs,
+    callback: LoreEventCallback,
+) -> Result<(PathBuf, Arc<ExecutionContext>), ErrT>
+where
+    ErrT: EventError + FfiError + HasTrace + From<RepositoryError>,
+{
+    let repository_path = if let Ok(path) = util::path::make_absolute_from(
+        globals.repository_path.as_str(),
+        globals.working_directory().map(Path::new),
+    ) {
+        globals.repository_path = path.display().to_string().into();
+        path
+    } else {
+        PathBuf::from(globals.repository_path.as_str())
+    };
+
+    let execution = setup_execution(globals, callback);
+    let format = RepositoryFormat::detect(&repository_path);
+    let dot_dir = format.dot_dir();
+    if !repository_path.join(dot_dir).is_dir() {
+        let err = ErrT::from(RepositoryError::from(RepositoryNotFound {
+            repository: repository_path.display().to_string(),
+        }));
+        let detail = LoreErrorDetail::from_error(&err);
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let _ = execution_context().dispatcher.complete(detail).await;
+            })
+            .await;
+        return Err(err);
     }
 
     Ok((repository_path, execution))

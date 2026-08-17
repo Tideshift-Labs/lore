@@ -12,6 +12,7 @@ pub mod environment;
 pub mod error;
 pub mod errors;
 pub mod event;
+pub mod exact_selection;
 pub mod file;
 pub mod filter;
 pub mod find;
