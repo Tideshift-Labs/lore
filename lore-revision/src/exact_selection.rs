@@ -1657,7 +1657,302 @@ pub async fn commit_exact_selection(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use lore_base::error::NoRemote;
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::Partition;
+    use lore_storage::LocalMutableStore;
+    use lore_storage::MutableStore;
+    use lore_storage::MutableStoreSettings;
+    use lore_storage::StoreError;
+    use lore_storage::store_types::KeyType;
+    use lore_storage::store_types::KeyValueStream;
+    use lore_transport::ProtocolError;
+
     use super::*;
+    use crate::branch;
+    use crate::interface::ExecutionContext;
+    use crate::interface::LoreGlobalArgs;
+    use crate::lore::BranchId;
+    use crate::lore::RepositoryId;
+    use crate::relay::EventDispatcher;
+    use crate::repository::RepositoryFormat;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct StoreCall {
+        partition: Partition,
+        key: Hash,
+        value: Hash,
+        key_type: KeyType,
+        injected_failure: bool,
+    }
+
+    #[derive(Default)]
+    struct FaultState {
+        fail_calls: BTreeSet<usize>,
+        calls: Vec<StoreCall>,
+    }
+
+    #[derive(Clone, Default)]
+    struct StoreFaultControl {
+        state: Arc<Mutex<FaultState>>,
+    }
+
+    impl StoreFaultControl {
+        fn arm(&self, fail_calls: impl IntoIterator<Item = usize>) {
+            let mut state = self.state.lock().expect("lock mutable-store fault state");
+            state.fail_calls = fail_calls.into_iter().collect();
+            state.calls.clear();
+        }
+
+        fn observe_store(
+            &self,
+            partition: Partition,
+            key: Hash,
+            value: Hash,
+            key_type: KeyType,
+        ) -> bool {
+            let mut state = self.state.lock().expect("lock mutable-store fault state");
+            let call_number = state.calls.len() + 1;
+            let injected_failure = state.fail_calls.contains(&call_number);
+            state.calls.push(StoreCall {
+                partition,
+                key,
+                value,
+                key_type,
+                injected_failure,
+            });
+            injected_failure
+        }
+
+        fn calls(&self) -> Vec<StoreCall> {
+            self.state
+                .lock()
+                .expect("read mutable-store fault calls")
+                .calls
+                .clone()
+        }
+    }
+
+    struct FaultInjectingMutableStore {
+        inner: Arc<LocalMutableStore>,
+        control: StoreFaultControl,
+    }
+
+    #[async_trait]
+    impl MutableStore for FaultInjectingMutableStore {
+        async fn load(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            key_type: KeyType,
+        ) -> Result<Hash, StoreError> {
+            self.inner.clone().load(partition, key, key_type).await
+        }
+
+        async fn store(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            value: Hash,
+            key_type: KeyType,
+        ) -> Result<(), StoreError> {
+            if self.control.observe_store(partition, key, value, key_type) {
+                return Err(StoreError::internal(format!(
+                    "injected real mutable-store call {}",
+                    self.control.calls().len()
+                )));
+            }
+            self.inner
+                .clone()
+                .store(partition, key, value, key_type)
+                .await
+        }
+
+        async fn compare_and_swap(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            expected: Hash,
+            value: Hash,
+            key_type: KeyType,
+        ) -> Result<Hash, StoreError> {
+            self.inner
+                .clone()
+                .compare_and_swap(partition, key, expected, value, key_type)
+                .await
+        }
+
+        async fn list(
+            self: Arc<Self>,
+            partition: Partition,
+            key_type: KeyType,
+        ) -> Result<KeyValueStream, StoreError> {
+            self.inner.clone().list(partition, key_type).await
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct DurableAnchorEvidence {
+        original: commit::ExactAnchorSnapshot,
+        published: commit::ExactAnchorSnapshot,
+        reopened: commit::ExactAnchorSnapshot,
+        calls: Vec<StoreCall>,
+        public_error: ExactSelectionError,
+    }
+
+    async fn exercise_real_store_publication_failure(
+        fail_calls: impl IntoIterator<Item = usize>,
+    ) -> DurableAnchorEvidence {
+        let tempdir = tempfile::tempdir().expect("create real mutable-store fixture");
+        let store_path = tempdir.path().join("store");
+        let repository_path = tempdir.path().join("repository");
+        std::fs::create_dir_all(&repository_path).expect("create repository fixture path");
+
+        let immutable = lore_storage::LocalImmutableStore::new(
+            Some(store_path.clone()),
+            lore_storage::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create disk-backed immutable store");
+        let real_mutable = Arc::new(
+            LocalMutableStore::new(
+                Some(&store_path),
+                MutableStoreSettings::default(),
+                immutable.clone(),
+            )
+            .await
+            .expect("create disk-backed mutable store"),
+        );
+        let control = StoreFaultControl::default();
+        let faulting_mutable = Arc::new(FaultInjectingMutableStore {
+            inner: real_mutable,
+            control: control.clone(),
+        });
+
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+        let instance_id = crate::instance::InstanceId::generate();
+        let branch = BranchId::from(uuid::Uuid::now_v7());
+        let token = RepositoryWriteToken::acquire(&repository_path).await;
+        let repository = Arc::new(
+            RepositoryContext::new(
+                Some(repository_path.clone()),
+                immutable.clone(),
+                faulting_mutable.clone(),
+                repository_id,
+                instance_id,
+                Err(ProtocolError::from(NoRemote)),
+                Arc::default(),
+                RepositoryFormat::Lore,
+            )
+            .with_write_token(token),
+        );
+
+        let original = commit::ExactAnchorSnapshot {
+            branch_latest: Hash::from([1_u8; 32]),
+            current: Hash::from([2_u8; 32]),
+            staged: Hash::from([3_u8; 32]),
+        };
+        let published = commit::ExactAnchorSnapshot {
+            branch_latest: Hash::from([4_u8; 32]),
+            current: Hash::from([4_u8; 32]),
+            staged: Hash::default(),
+        };
+
+        branch::store_latest_anchor(repository.clone(), branch, original.branch_latest)
+            .await
+            .expect("seed branch-latest anchor");
+        crate::instance::store_current_anchor(&repository, original.current)
+            .await
+            .expect("seed current anchor");
+        crate::instance::store_current_anchor_branch(&repository, branch)
+            .await
+            .expect("seed current branch anchor");
+        crate::instance::store_staged_anchor(&repository, original.staged)
+            .await
+            .expect("seed staged anchor");
+        faulting_mutable
+            .clone()
+            .flush(true)
+            .await
+            .expect("persist original anchors");
+
+        let staged_state = Arc::new(State::new());
+        staged_state
+            .tree(repository.clone())
+            .await
+            .expect("initialize empty staged tree");
+        control.arm(fail_calls);
+
+        let internal_error = commit::finalize_exact_commit(
+            repository.clone(),
+            &staged_state,
+            published.current,
+            branch,
+            original,
+        )
+        .await
+        .expect_err("injected authoritative publication must reject");
+        let public_error = map_exact_finalize_error(internal_error);
+        let calls = control.calls();
+
+        faulting_mutable
+            .clone()
+            .flush(true)
+            .await
+            .expect("persist post-compensation anchors");
+        drop(staged_state);
+        drop(repository);
+        drop(faulting_mutable);
+
+        let reopened_mutable = Arc::new(
+            LocalMutableStore::new(
+                Some(&store_path),
+                MutableStoreSettings::default(),
+                immutable.clone(),
+            )
+            .await
+            .expect("reopen disk-backed mutable store"),
+        );
+        let reopened_repository = Arc::new(RepositoryContext::new(
+            Some(repository_path),
+            immutable,
+            reopened_mutable,
+            repository_id,
+            instance_id,
+            Err(ProtocolError::from(NoRemote)),
+            Arc::default(),
+            RepositoryFormat::Lore,
+        ));
+        let reopened = commit::ExactAnchorSnapshot {
+            branch_latest: branch::load_latest(reopened_repository.clone(), branch)
+                .await
+                .expect("reload durable branch-latest anchor"),
+            current: crate::instance::load_current_anchor(&reopened_repository)
+                .await
+                .expect("reload durable current anchor")
+                .0,
+            staged: crate::instance::load_staged_revision(&reopened_repository)
+                .await
+                .expect("reload durable staged anchor")
+                .unwrap_or_default(),
+        };
+
+        DurableAnchorEvidence {
+            original,
+            published,
+            reopened,
+            calls,
+            public_error,
+        }
+    }
 
     fn selected_input(path: String) -> SelectedFile {
         SelectedFile {
@@ -1729,6 +2024,113 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[tokio::test]
+    async fn real_store_one_shot_publication_failure_restores_durable_anchors() {
+        LORE_CONTEXT
+            .scope(
+                Arc::new(ExecutionContext::new_client_with_user_id(
+                    LoreGlobalArgs::default().set_offline(),
+                    EventDispatcher::no_dispatch(),
+                    "exact-real-store-restore-test".to_string(),
+                )),
+                async {
+                    let evidence = exercise_real_store_publication_failure([2]).await;
+
+                    assert!(
+                        matches!(
+                            evidence.public_error.kind(),
+                            ExactSelectionErrorKind::PublicationFailure {
+                                anchors_restored: true,
+                                reason,
+                            } if reason.contains("injected real mutable-store call 2")
+                        ),
+                        "one-shot real-store failure must report truthful recovery: {:?}",
+                        evidence.public_error
+                    );
+                    assert_eq!(evidence.reopened, evidence.original);
+                    assert_eq!(
+                        evidence
+                            .calls
+                            .iter()
+                            .map(|call| (call.value, call.injected_failure))
+                            .collect::<Vec<_>>(),
+                        vec![
+                            (evidence.published.branch_latest, false),
+                            (evidence.published.current, true),
+                            (evidence.original.branch_latest, false),
+                            (evidence.original.current, false),
+                            (evidence.original.staged, false),
+                        ]
+                    );
+                    assert_eq!(evidence.calls[0].key, evidence.calls[2].key);
+                    assert_eq!(evidence.calls[1].key, evidence.calls[3].key);
+                    assert_ne!(evidence.calls[0].key, evidence.calls[1].key);
+                    assert_ne!(evidence.calls[0].key, evidence.calls[4].key);
+                    assert_ne!(evidence.calls[1].key, evidence.calls[4].key);
+                },
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn real_store_persistent_restoration_failure_reports_durable_partial_state() {
+        LORE_CONTEXT
+            .scope(
+                Arc::new(ExecutionContext::new_client_with_user_id(
+                    LoreGlobalArgs::default().set_offline(),
+                    EventDispatcher::no_dispatch(),
+                    "exact-real-store-failed-restore-test".to_string(),
+                )),
+                async {
+                    let evidence = exercise_real_store_publication_failure([2, 3, 4, 5]).await;
+
+                    assert!(
+                        matches!(
+                            evidence.public_error.kind(),
+                            ExactSelectionErrorKind::PublicationFailure {
+                                anchors_restored: false,
+                                reason,
+                            } if reason.contains("injected real mutable-store call 5")
+                        ),
+                        "persistent real-store failure must report failed recovery: {:?}",
+                        evidence.public_error
+                    );
+                    assert_eq!(
+                        evidence.reopened,
+                        commit::ExactAnchorSnapshot {
+                            branch_latest: evidence.published.branch_latest,
+                            current: evidence.original.current,
+                            staged: evidence.original.staged,
+                        }
+                    );
+                    assert_eq!(
+                        evidence
+                            .calls
+                            .iter()
+                            .map(|call| (call.value, call.injected_failure))
+                            .collect::<Vec<_>>(),
+                        vec![
+                            (evidence.published.branch_latest, false),
+                            (evidence.published.current, true),
+                            (evidence.original.branch_latest, true),
+                            (evidence.original.branch_latest, true),
+                            (evidence.original.branch_latest, true),
+                            (evidence.original.current, false),
+                            (evidence.original.staged, false),
+                        ]
+                    );
+                    assert_eq!(evidence.calls[0].key, evidence.calls[2].key);
+                    assert_eq!(evidence.calls[2].key, evidence.calls[3].key);
+                    assert_eq!(evidence.calls[3].key, evidence.calls[4].key);
+                    assert_eq!(evidence.calls[1].key, evidence.calls[5].key);
+                    assert_ne!(evidence.calls[0].key, evidence.calls[1].key);
+                    assert_ne!(evidence.calls[0].key, evidence.calls[6].key);
+                    assert_ne!(evidence.calls[1].key, evidence.calls[6].key);
+                },
+            )
+            .await;
     }
 
     #[test]
