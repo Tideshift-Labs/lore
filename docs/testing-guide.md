@@ -133,9 +133,12 @@ will update an older check constraint or state schema.
   repair, input limits before metadata reads, and committed-state deserialization. Private
   unreachable authority/map, exact byte-boundary, capped binary-read, and admission-before-publication
   branches are pinned by `exact_selection::tests`, including the production finalize-error mapping
-  to the serialized public kind and stable code. `commit::tests` drives the production compensation
-  helper, injecting failure at each authoritative anchor write and pinning both successful rollback
-  and a failed restoration's `anchors_restored: false` outcome.
+  to the serialized public kind and stable code. Its real-store restoration cases wrap a
+  tempdir-backed `LocalMutableStore`, inject failures at the production `store()` boundary, flush,
+  drop and reopen the store, then reload branch/current/staged through their production loaders.
+  A one-shot publication failure proves the durable originals and `anchors_restored: true`; a
+  repeated restoration failure proves `false` and the durable partial state. `commit::tests` drives
+  the narrower compensation helper, injecting failure at each authoritative anchor write.
   The Rust facade's independently acquired CLIENT token/context lifetime is pinned in
   `lore/tests/exact_selection_transaction.rs`. Gates:
   `cargo test -p lore-revision --test exact_selection_transaction -j 4 -- --test-threads=1` and

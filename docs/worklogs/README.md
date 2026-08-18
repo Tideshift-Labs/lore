@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 026 | 2026-08-17 | [Exact-selection real-store restoration proof](026-exact-selection-real-store-restoration-proof.md) |
 | 025 | 2026-08-17 | [Exact-selection review hardening](025-exact-selection-review-hardening.md) |
 | 024 | 2026-08-16 | [Atomic exact-selection CLIENT transaction](024-atomic-exact-selection-client-transaction.md) |
 | 023 | 2026-08-16 | [Propagate file-metadata task errors](023-propagate-file-metadata-task-errors.md) |
