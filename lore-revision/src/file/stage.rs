@@ -1006,6 +1006,7 @@ pub async fn stage_move(
     }
 
     let dirtied = {
+        // INVARIANT: stage_move is sequential; no writer may mutate this node after the snapshot.
         let mut block_writer = block.write();
         *block_writer.node(node_index) = node;
         block_writer.mark_dirty()
