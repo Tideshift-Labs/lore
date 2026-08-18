@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 #![allow(non_camel_case_types)]
 
 use std::sync::Arc;
 
+use lore_base::error::Conflict;
+use lore_base::error::InvalidArguments;
+use lore_base::error::NothingStaged;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::branch::merge::MergeError;
@@ -19,10 +23,10 @@ use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::execution_context;
 use lore_revision::lore_warn;
 use lore_revision::metadata;
+use lore_revision::metadata::set::SetError;
 use lore_revision::metadata::Metadata;
 use lore_revision::metadata::MetadataErrors;
 use lore_revision::metadata::MetadataType;
-use lore_revision::metadata::set::SetError;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::revision;
@@ -131,6 +135,133 @@ pub async fn commit_exact_selection(
 
             lore_revision::exact_selection::commit_exact_selection(repository, &token, options)
                 .await
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Default)]
+struct MergeFinalizeFacts {
+    has_staged_anchor: bool,
+    is_active_merge: bool,
+    has_merge_parent: bool,
+    saw_merge_change: bool,
+    saw_resolved_conflict: bool,
+    unresolved_conflicts: Vec<String>,
+    staged_non_merge: Vec<String>,
+}
+
+fn assess_merge_finalize(facts: &MergeFinalizeFacts) -> Result<(), MergeError> {
+    if !facts.has_staged_anchor {
+        return Err(NothingStaged.into());
+    }
+    if !facts.is_active_merge || !facts.has_merge_parent || !facts.saw_merge_change {
+        return Err(InvalidArguments {
+            reason: "merge finalize rejected: no fully-resolved branch merge is staged".into(),
+        }
+        .into());
+    }
+    if !facts.unresolved_conflicts.is_empty() {
+        return Err(Conflict {
+            path: facts.unresolved_conflicts.join(", "),
+        }
+        .into());
+    }
+    if !facts.staged_non_merge.is_empty() {
+        return Err(InvalidArguments {
+            reason: format!(
+                "merge finalize rejected: staged state contains changes outside the merge: {}",
+                facts.staged_non_merge.join(", ")
+            ),
+        }
+        .into());
+    }
+    if !facts.saw_resolved_conflict {
+        return Err(InvalidArguments {
+            reason: "merge finalize rejected: no fully-resolved branch merge is staged".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Commit a conflicted branch merge only after its staged topology proves that every
+/// conflict is resolved and no independently-staged change can ride along.
+///
+/// This Rust-only CLIENT facade holds the repository write token across both admission
+/// and commit, so the staged anchor cannot change after it is validated. Branch merges
+/// are distinguished from ordinary staged work, cherry-picks, and reverts by the staged
+/// state's authoritative merge flag, nonzero second parent, and merge/conflict diff flags.
+pub async fn finalize_resolved_merge(
+    globals: LoreGlobalArgs,
+    message: String,
+    callback: LoreEventCallback,
+) -> i32 {
+    repository_call_write(
+        globals,
+        callback,
+        message,
+        finalize_resolved_merge,
+        move |repository, token, message| async move {
+            let (state_current, state_staged, _branch) =
+                lore_revision::state::State::deserialize_current_and_staged(repository.clone())
+                    .await
+                    .forward::<MergeError>("reading merge-finalize staged state")?;
+
+            let mut facts = MergeFinalizeFacts::default();
+            let Some(state_staged) = state_staged else {
+                return Err(MergeError::from(NothingStaged));
+            };
+            facts.has_staged_anchor = true;
+            facts.is_active_merge = state_staged.is_merge();
+            facts.has_merge_parent = !state_staged.parent_other().is_zero();
+
+            let changes = lore_revision::state::diff_collect(
+                repository.clone(),
+                state_current,
+                repository.clone(),
+                state_staged,
+                None,
+                lore_revision::filter::FilterMode::Full,
+            )
+            .await
+            .forward::<MergeError>("diffing merge-finalize staged state")?;
+
+            for change in changes {
+                let path = change.path.as_str().to_string();
+                if change.flags.is_merge() {
+                    facts.saw_merge_change = true;
+                }
+                if change.flags.is_conflict() && !change.flags.is_conflict_unresolved() {
+                    facts.saw_resolved_conflict = true;
+                }
+                if change.flags.is_conflict_unresolved() {
+                    facts.unresolved_conflicts.push(path.clone());
+                }
+                if change.flags.is_stage() && !change.flags.is_merge() {
+                    facts.staged_non_merge.push(path);
+                }
+            }
+
+            let layers = lore_revision::layer::list(repository.clone())
+                .await
+                .forward::<MergeError>("reading merge-finalize layers")?;
+            for layer in layers {
+                if !layer.staged.is_zero() && layer.staged != layer.current {
+                    facts.staged_non_merge.push(layer.target_path);
+                }
+            }
+
+            assess_merge_finalize(&facts)?;
+
+            let ctx = lore_revision::lore::execution_context();
+            if !ctx.globals().local() && !ctx.globals().offline() {
+                repository.set_disable_upload(false);
+            }
+
+            lore_revision::commit::commit(repository, &token, CommitOptions::new(message))
+                .await
+                .forward::<MergeError>("committing resolved merge")
         },
     )
     .await
