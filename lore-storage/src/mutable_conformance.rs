@@ -81,6 +81,9 @@ pub enum Check {
     /// When the key does not exist and `expected` is non-zero, compare-and-swap does nothing and
     /// returns `Hash::default()` (not equal to `expected`).
     CasDoesNothingWhenMissingAndExpectedIsNonZero,
+    /// A zero-valued row remains a valid CAS predecessor even though `load` exposes it as absent.
+    /// CAS from zero to zero followed by CAS from zero to non-zero installs the non-zero value.
+    CasUpdatesExistingZeroValue,
     /// `list` with [`KeyType::Untyped`] returns an empty stream regardless of what is stored.
     ListUntypedIsEmpty,
     /// Entries stored with a typed key type appear in a subsequent `list` for that type.
@@ -211,6 +214,11 @@ pub async fn verify_mutable_store(store: Arc<dyn MutableStore>, caps: Capabiliti
         &caps,
         Check::CasDoesNothingWhenMissingAndExpectedIsNonZero,
         cas_does_nothing_when_missing_and_expected_is_nonzero(&store).await,
+    );
+    settle(
+        &caps,
+        Check::CasUpdatesExistingZeroValue,
+        cas_updates_existing_zero_value(&store).await,
     );
     settle(
         &caps,
@@ -644,6 +652,56 @@ async fn cas_does_nothing_when_missing_and_expected_is_nonzero(
     require!(
         is_not_found(&err),
         "load after no-op CAS must return AddressNotFound, got {err:?}"
+    );
+    Ok(())
+}
+
+/// Clause 5, stored-zero branch: an implementation may retain a zero-valued row even though
+/// `load` exposes zero as absence. A later zero-expected CAS must still update that row.
+async fn cas_updates_existing_zero_value(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+    let (partition, key, value) = unique_fixture();
+    let returned = store
+        .clone()
+        .compare_and_swap(
+            partition,
+            key,
+            Hash::default(),
+            Hash::default(),
+            KeyType::BranchMetadata,
+        )
+        .await
+        .map_err(|e| format!("zero-to-zero compare_and_swap failed: {e:?}"))?;
+    require_eq!(
+        returned,
+        Hash::default(),
+        "zero-to-zero compare_and_swap must report the previous zero value"
+    );
+
+    let returned = store
+        .clone()
+        .compare_and_swap(
+            partition,
+            key,
+            Hash::default(),
+            value,
+            KeyType::BranchMetadata,
+        )
+        .await
+        .map_err(|e| format!("zero-to-nonzero compare_and_swap failed: {e:?}"))?;
+    require_eq!(
+        returned,
+        Hash::default(),
+        "zero-to-nonzero compare_and_swap must report the previous zero value"
+    );
+    let loaded = store
+        .clone()
+        .load(partition, key, KeyType::BranchMetadata)
+        .await
+        .map_err(|e| format!("load after zero-to-nonzero CAS failed: {e:?}"))?;
+    require_eq!(
+        loaded,
+        value,
+        "zero-to-nonzero compare_and_swap must install the non-zero value"
     );
     Ok(())
 }

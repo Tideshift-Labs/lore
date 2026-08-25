@@ -1116,6 +1116,23 @@ async fn copy_fragment() {
     // this hash in the source partition is sufficient.
     let wildcard_dst_partition: Partition = rand::random();
     let wildcard_dst_context: Context = rand::random();
+    let unassociated_partition: Partition = rand::random();
+    let cross_partition_error = s
+        .clone()
+        .copy(
+            unassociated_partition,
+            Address {
+                hash: src_addr.hash,
+                context: Context::default(),
+            },
+            wildcard_dst_partition,
+            wildcard_dst_context,
+            false,
+        )
+        .await
+        .expect_err("partition-match copy must not cross source partitions");
+    assert!(cross_partition_error.is_address_not_found());
+
     s.clone()
         .copy(
             src_partition,

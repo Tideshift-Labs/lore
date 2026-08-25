@@ -174,9 +174,17 @@ impl MutableStore for PostgresMutableStore {
                 .query_opt(
                     "INSERT INTO lore_mutable (partition, key_type, key, value) \
                      VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (partition, key_type, key) DO NOTHING \
+                     ON CONFLICT (partition, key_type, key) \
+                     DO UPDATE SET value = EXCLUDED.value \
+                     WHERE lore_mutable.value = $5 \
                      RETURNING value",
-                    &[&part, &kt, &k, &value.data().as_slice()],
+                    &[
+                        &part,
+                        &kt,
+                        &k,
+                        &value.data().as_slice(),
+                        &expected.data().as_slice(),
+                    ],
                 )
                 .await
         } else {
