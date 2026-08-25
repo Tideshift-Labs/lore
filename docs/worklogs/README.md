@@ -57,6 +57,7 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 028 | 2026-08-24 | [Refresh upstream storage and transport contracts](028-refresh-upstream-storage-transport-contracts.md) |
 | 027 | 2026-08-17 | [Atomic resolved-merge finalization](027-atomic-resolved-merge-finalization.md) |
 | 026 | 2026-08-17 | [Exact-selection real-store restoration proof](026-exact-selection-real-store-restoration-proof.md) |
 | 025 | 2026-08-17 | [Exact-selection review hardening](025-exact-selection-review-hardening.md) |
