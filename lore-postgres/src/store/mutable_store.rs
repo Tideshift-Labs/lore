@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT
 //! Postgres-backed mutable store (CR-007) — the branch-tip compare-and-swap.
 //!
-//! Strongly-consistent single-key CAS on a single-primary Postgres: the swap is
-//! a single `INSERT … ON CONFLICT … DO UPDATE … WHERE existing.value = expected`
-//! statement (atomic), mirroring the DynamoDB conditional-put semantics (INV-H §3).
+//! Strongly-consistent single-key CAS on a single-primary Postgres. Store and
+//! compare-and-swap share one per-key transactional advisory lock, so the
+//! observed prior value, conditional mutation, and returned outcome have one
+//! linearization point, mirroring DynamoDB conditional-put semantics (INV-H §3).
 //! `(partition, key_type, key)` is the primary key; the fragment **bytes** are not
 //! here — this store holds only the mutable key→value (e.g. branch tip) mapping.
 
@@ -22,6 +23,7 @@ use lore_storage::errors::AddressNotFound;
 use lore_storage::errors::SlowDown;
 use lore_storage::immutable_store::StoreError;
 use lore_storage::store_types::KeyValueStream;
+use tokio_postgres::Transaction;
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS lore_mutable (
@@ -80,6 +82,29 @@ fn not_found(key: Hash) -> StoreError {
     StoreError::from(AddressNotFound::from(Address::zero_context_hash(key)))
 }
 
+/// Serialize every mutable writer for one `(partition, key_type, key)` tuple.
+/// The database derives the 64-bit lock ID from the complete tuple, avoiding a
+/// process-local lock that would not coordinate active-active loreservers.
+async fn lock_key(
+    tx: &Transaction<'_>,
+    partition: &[u8],
+    key_type: i16,
+    key: &[u8],
+) -> Result<(), StoreError> {
+    tx.execute(
+        "SELECT pg_advisory_xact_lock( \
+             hashtextextended( \
+                 encode($1, 'hex') || ':' || $2::text || ':' || encode($3, 'hex'), \
+                 0 \
+             ) \
+         )",
+        &[&partition, &key_type, &key],
+    )
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 #[async_trait]
 impl MutableStore for PostgresMutableStore {
     #[tracing::instrument(level = "debug", skip_all)]
@@ -121,32 +146,32 @@ impl MutableStore for PostgresMutableStore {
         key_type: KeyType,
     ) -> Result<(), StoreError> {
         let _t = self.instruments.start("store", self.pool.status());
-        let client = self.pool.get().await.map_err(pool_err)?;
+        let mut client = self.pool.get().await.map_err(pool_err)?;
         let part = partition.data().as_slice();
         let kt = key_type as i16;
         let k = key.data().as_slice();
+        let tx = client.transaction().await.map_err(db_err)?;
+        lock_key(&tx, part, kt, k).await?;
         if value.is_zero() {
             // Storing the null hash removes the key (trait contract).
-            client
-                .execute(
-                    "DELETE FROM lore_mutable \
+            tx.execute(
+                "DELETE FROM lore_mutable \
                      WHERE partition = $1 AND key_type = $2 AND key = $3",
-                    &[&part, &kt, &k],
-                )
-                .await
-                .map_err(db_err)?;
+                &[&part, &kt, &k],
+            )
+            .await
+            .map_err(db_err)?;
         } else {
-            client
-                .execute(
-                    "INSERT INTO lore_mutable (partition, key_type, key, value) \
+            tx.execute(
+                "INSERT INTO lore_mutable (partition, key_type, key, value) \
                      VALUES ($1, $2, $3, $4) \
                      ON CONFLICT (partition, key_type, key) DO UPDATE SET value = EXCLUDED.value",
-                    &[&part, &kt, &k, &value.data().as_slice()],
-                )
-                .await
-                .map_err(db_err)?;
+                &[&part, &kt, &k, &value.data().as_slice()],
+            )
+            .await
+            .map_err(db_err)?;
         }
-        Ok(())
+        tx.commit().await.map_err(db_err)
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -161,71 +186,49 @@ impl MutableStore for PostgresMutableStore {
         let _t = self
             .instruments
             .start("compare_and_swap", self.pool.status());
-        let client = self.pool.get().await.map_err(pool_err)?;
+        let mut client = self.pool.get().await.map_err(pool_err)?;
         let part = partition.data().as_slice();
         let kt = key_type as i16;
         let k = key.data().as_slice();
+        let tx = client.transaction().await.map_err(db_err)?;
+        lock_key(&tx, part, kt, k).await?;
 
-        // A missing key is the zero value. It may therefore be inserted only
-        // when the caller also observed zero; a non-zero expected value on a
-        // missing key is a failed CAS, not permission to create the key.
-        let swapped = if expected.is_zero() {
-            client
-                .query_opt(
-                    "INSERT INTO lore_mutable (partition, key_type, key, value) \
-                     VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (partition, key_type, key) \
-                     DO UPDATE SET value = EXCLUDED.value \
-                     WHERE lore_mutable.value = $5 \
-                     RETURNING value",
-                    &[
-                        &part,
-                        &kt,
-                        &k,
-                        &value.data().as_slice(),
-                        &expected.data().as_slice(),
-                    ],
-                )
-                .await
-        } else {
-            client
-                .query_opt(
-                    "UPDATE lore_mutable SET value = $4 \
-                     WHERE partition = $1 AND key_type = $2 AND key = $3 AND value = $5 \
-                     RETURNING value",
-                    &[
-                        &part,
-                        &kt,
-                        &k,
-                        &value.data().as_slice(),
-                        &expected.data().as_slice(),
-                    ],
-                )
-                .await
-        }
-        .map_err(db_err)?;
-
-        if swapped.is_some() {
-            return Ok(expected);
-        }
-
-        // Conflict with a different current value, or a missing key with a
-        // non-zero expectation. Return the actual current value so the caller
-        // sees `current != expected` and can retry.
-        let current = client
+        // Read and decide while holding the same database lock used by every
+        // mutable writer. A missing key is the zero value.
+        let current = tx
             .query_opt(
                 "SELECT value FROM lore_mutable \
-                 WHERE partition = $1 AND key_type = $2 AND key = $3",
+                 WHERE partition = $1 AND key_type = $2 AND key = $3 \
+                 FOR UPDATE",
                 &[&part, &kt, &k],
             )
             .await
             .map_err(db_err)?;
-        Ok(current
+        let current = current
             .map(|row| {
                 let current: Vec<u8> = row.get("value");
                 Hash::from(current.as_slice())
             })
-            .unwrap_or_default())
+            .unwrap_or_default();
+
+        if current != expected {
+            tx.commit().await.map_err(db_err)?;
+            return Ok(current);
+        }
+
+        // CAS retains a zero-valued row, matching LocalMutableStore. `load`
+        // exposes zero as absence, but a later zero-expected CAS can still use
+        // the row as its predecessor.
+        tx.execute(
+            "INSERT INTO lore_mutable (partition, key_type, key, value) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (partition, key_type, key) DO UPDATE SET value = EXCLUDED.value",
+            &[&part, &kt, &k, &value.data().as_slice()],
+        )
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(current)
     }
 
     #[tracing::instrument(level = "debug", skip_all)]

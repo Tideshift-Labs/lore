@@ -3,7 +3,8 @@
 //! Concurrency integration tests for the Postgres stores (CR-007).
 //!
 //! (a) Racing CAS: exactly one concurrent `compare_and_swap` wins; no lost updates.
-//! (b) Batch lock atomicity: a batch that conflicts on any resource rolls back entirely,
+//! (b) CAS outcome selection shares the per-key writer lock; no false success after a miss.
+//! (c) Batch lock atomicity: a batch that conflicts on any resource rolls back entirely,
 //!     leaving no partial lock state.
 //!
 //! Gated on `LORE_TEST_PG_URL` and honestly `#[ignore]`d when the live service
@@ -11,10 +12,12 @@
 //! the shared tables.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use lore_base::types::KeyType;
 use lore_base::types::LockResource;
 use lore_postgres::pool::TlsConfig;
+use lore_postgres::pool::build_pool;
 use lore_postgres::store::lock_store::PostgresLockStore;
 use lore_postgres::store::mutable_store::PostgresMutableStore;
 use lore_revision::lock::LockError;
@@ -77,7 +80,7 @@ async fn racing_cas_no_lost_update() {
         .expect("seed v0");
 
     // Both tasks call CAS concurrently against v0; exactly one can succeed at
-    // the DB level (atomic INSERT … ON CONFLICT … WHERE existing.value = expected).
+    // the DB level under the per-key transactional advisory lock.
     let store1 = store.clone();
     let store2 = store.clone();
     let (r1, r2) = tokio::join!(
@@ -118,7 +121,113 @@ async fn racing_cas_no_lost_update() {
     );
 }
 
-/// (b) Batch lock is all-or-nothing.
+/// (b) A failed CAS cannot report success after an interleaving writer.
+///
+/// Hold the exact advisory lock used by mutable writers, queue a CAS behind it,
+/// then install a value different from the CAS expectation before releasing the
+/// lock. The CAS must remain blocked, then return the intervening value without
+/// installing its proposal. The old two-statement CAS did not take this lock
+/// and could report `expected` after an outcome-select race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs live Postgres env; run with -- --ignored"]
+#[serial]
+async fn cas_outcome_is_serialized_with_interleaving_writer() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping CAS outcome serialization test");
+        return;
+    };
+
+    let tls = TlsConfig::default();
+    let store = Arc::new(
+        PostgresMutableStore::connect(&url, 5, &tls)
+            .await
+            .expect("connect + schema"),
+    );
+    let pool = build_pool(&url, 2, &tls).expect("build coordination pool");
+
+    let partition: Partition = rand::random();
+    let key: Hash = rand::random();
+    let key_type = KeyType::RepositoryId;
+    let expected: Hash = rand::random();
+    let proposed: Hash = rand::random();
+    let intervening: Hash = rand::random();
+    store
+        .clone()
+        .store(partition, key, expected, key_type)
+        .await
+        .expect("seed expected value");
+
+    let mut client = pool.get().await.expect("checkout coordination client");
+    let tx = client.transaction().await.expect("start coordination tx");
+    let partition_bytes = partition.data();
+    let key_bytes = key.data();
+    let key_type_id = key_type as i16;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock( \
+             hashtextextended( \
+                 encode($1, 'hex') || ':' || $2::text || ':' || encode($3, 'hex'), \
+                 0 \
+             ) \
+         )",
+        &[
+            &partition_bytes.as_slice(),
+            &key_type_id,
+            &key_bytes.as_slice(),
+        ],
+    )
+    .await
+    .expect("hold mutable writer lock");
+
+    let mut cas = lore_base::lore_spawn!({
+        let store = store.clone();
+        async move {
+            store
+                .compare_and_swap(partition, key, expected, proposed, key_type)
+                .await
+        }
+    });
+
+    tx.execute(
+        "UPDATE lore_mutable SET value = $4 \
+         WHERE partition = $1 AND key_type = $2 AND key = $3",
+        &[
+            &partition_bytes.as_slice(),
+            &key_type_id,
+            &key_bytes.as_slice(),
+            &intervening.data().as_slice(),
+        ],
+    )
+    .await
+    .expect("install intervening value");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut cas)
+            .await
+            .is_err(),
+        "CAS must wait for the per-key writer transaction to release its lock"
+    );
+    tx.commit().await.expect("release mutable writer lock");
+
+    let returned = tokio::time::timeout(Duration::from_secs(5), cas)
+        .await
+        .expect("CAS must finish after lock release")
+        .expect("CAS task must not panic")
+        .expect("CAS must not fail");
+    assert_eq!(
+        returned, intervening,
+        "failed CAS must return the value observed at its locked linearization point"
+    );
+    assert_eq!(
+        store
+            .clone()
+            .load(partition, key, key_type)
+            .await
+            .expect("load after failed CAS"),
+        intervening,
+        "failed CAS must not install its proposed value"
+    );
+}
+
+/// (c) Batch lock is all-or-nothing.
 ///
 /// Alice holds r1. Bob's batch `[r2, r1]` must fail because r1 is held. The
 /// transaction must roll back entirely — r2 must NOT be left locked by a
