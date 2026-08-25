@@ -36,6 +36,7 @@ mod tests {
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreError;
     use lore_revision::interface::LoreEvent;
+    use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::BranchId;
     use lore_revision::lore::RepositoryId;

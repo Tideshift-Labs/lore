@@ -20,6 +20,7 @@ mod tests {
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreEventCallback;
+    use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::BranchId;
     use lore_revision::lore::RepositoryId;
@@ -27,6 +28,7 @@ mod tests {
     use lore_revision::relay::EventDispatcher;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::RepositoryContextCreationArgs;
     use lore_revision::repository::RepositoryFormat;
     use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::revision::info::InfoOptions;
@@ -68,16 +70,17 @@ mod tests {
 
         let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
         let repository = Arc::new(
-            RepositoryContext::new(
-                Some(path.clone()),
+            RepositoryContext::new(RepositoryContextCreationArgs {
+                path: Some(path.clone()),
                 immutable_store,
                 mutable_store,
-                repository_id.into(),
-                lore_revision::instance::InstanceId::default(),
-                Err(ProtocolError::from(NoRemote)),
-                Arc::default(),
-                RepositoryFormat::Lore,
-            )
+                id: repository_id.into(),
+                instance_id: lore_revision::instance::InstanceId::default(),
+                remote: Err(ProtocolError::from(NoRemote)),
+                filter: Arc::default(),
+                format: RepositoryFormat::Lore,
+                filesystem_provider: None,
+            })
             .with_write_token(write_token.share()),
         );
 
@@ -327,16 +330,17 @@ mod tests {
                 .expect("Failed to initialize repository");
 
                 let repository = Arc::new(
-                    RepositoryContext::new(
-                        Some(path.clone()),
+                    RepositoryContext::new(RepositoryContextCreationArgs {
+                        path: Some(path.clone()),
                         immutable_store,
                         mutable_store,
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
-                    )
+                        id: repository_id,
+                        instance_id: created_repo.instance_id,
+                        remote: Err(ProtocolError::from(NoRemote)),
+                        filter: Arc::default(),
+                        format: RepositoryFormat::Lore,
+                        filesystem_provider: None,
+                    })
                     .with_write_token(write_token.share()),
                 );
                 lore_revision::instance::store_current_anchor_branch(

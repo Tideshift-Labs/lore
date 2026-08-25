@@ -91,8 +91,12 @@ mod tests {
         let key = random::<Hash>();
 
         lore_spawn!(LORE_CONTEXT.scope(execution, async move {
-            let service =
-                LoreStorageService::new(immutable_store.clone(), immutable_store, mutable_store);
+            let service = LoreStorageService::new(
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                false,
+            );
 
             let load_request = storage_v1::MutableLoadRequest {
                 key: bytes::Bytes::copy_from_slice(key.as_bytes()),

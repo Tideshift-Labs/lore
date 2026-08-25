@@ -203,12 +203,21 @@ pub fn remove_connection(connection: Arc<Connection>) {
 const DROP_CONNECTIONS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub fn drop_connections() {
-    if let Some(map) = CONNECTION_MAP.lock().take() {
-        // Called from library shutdown, which is synchronous and may be on any runtime or
-        // none, so `shutdown_block_on` picks how to drive this and bounds it. Calling
-        // `block_in_place` here would panic on a `current_thread` runtime.
-        let completed = shutdown_block_on(
-            async move {
+    let map = CONNECTION_MAP.lock().take();
+    // Called from library shutdown, which is synchronous and may be on any runtime or
+    // none, so `shutdown_block_on` picks how to drive this and bounds it. Calling
+    // `block_in_place` here would panic on a `current_thread` runtime.
+    let completed = shutdown_block_on(
+        async move {
+            // A full transport reset also has to cover the other process-global
+            // auth-bearing caches, even when the QUIC pool is already empty: the
+            // gRPC connection cache can resurrect a stale connection (and its
+            // token cache) via a surviving strong reference, and the exchanged
+            // authz-token cache has no expiry-driven eviction of its own.
+            crate::grpc::drop_grpc_connections().await;
+            crate::auth::exchange::clear_authz_cache().await;
+
+            if let Some(map) = map {
                 for connection in map {
                     let _ = connection.1.cancel_connect().await;
                     // Drain in-flight streams and flush transport close frames to the peer
@@ -216,15 +225,15 @@ pub fn drop_connections() {
                     // outstanding stream read as a transport error on client exit.
                     connection.1.close_transport().await;
                 }
-            },
-            DROP_CONNECTIONS_WAIT,
+            }
+        },
+        DROP_CONNECTIONS_WAIT,
+    );
+    if !completed {
+        lore_base::lore_warn!(
+            "Timed out closing connections during shutdown; peers may log outstanding \
+             streams as transport errors"
         );
-        if !completed {
-            lore_base::lore_warn!(
-                "Timed out closing connections during shutdown; peers may log outstanding \
-                 streams as transport errors"
-            );
-        }
     }
 }
 

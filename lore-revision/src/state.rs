@@ -4670,6 +4670,9 @@ pub struct TreePath {
     pub path: RelativePath,
     pub address: Option<Address>,
     pub flags: NodeFlags,
+    /// Raw `node.size` for this entry. Meaningful for files (its content
+    /// length) and directories (the recursive subtree aggregate). Links
+    /// currently carry their raw node value, normally 0.
     pub size: u64,
     pub mode: u64,
     /// True when a link node tracks its parent's branch; false for pinned
@@ -6212,7 +6215,7 @@ async fn diff_filesystem_subtree_impl(
                 .await?;
                 ctx.from.root_node = entry_node;
             }
-            diff_filesystem_directory(ctx, listing).await
+            diff_filesystem_directory(ctx, *listing).await
         }
         util::fs::PathListingResult::File { item } => {
             // A path-filtered scan of a new file: ensure its parent directory

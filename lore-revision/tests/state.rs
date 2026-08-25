@@ -16,6 +16,9 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
 
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
@@ -24,12 +27,28 @@ mod tests {
     use lore_revision::immutable;
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::RepositoryContextCreationArgs;
+    use lore_revision::repository::RepositoryFormat;
+    use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::state::State;
     use lore_revision::state::StateData;
     use lore_revision::state::collect_new_fragments;
+    use lore_storage::Context;
+    use lore_storage::Fragment;
+    use lore_storage::FragmentFlags;
+    use lore_storage::FragmentReference;
+    use lore_storage::Hash;
+    use lore_storage::ImmutableStore;
+    use lore_storage::Partition;
+    use lore_storage::StoreError;
+    use lore_storage::StoreGetData;
+    use lore_storage::StoreMatchResult;
+    use lore_storage::StoreObliterateStats;
+    use lore_storage::errors::SlowDown;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use lore_storage::local::immutable_store::LocalImmutableStore;
+    use lore_transport::ProtocolError;
     use zerocopy::IntoBytes;
 
     include!("helper.rs");
@@ -398,7 +417,7 @@ mod tests {
     }
 
     /// Wraps a real, in-memory [`LocalImmutableStore`] and lets a test inject a
-    /// configured failure into `query()` and/or `get()` — the two calls
+    /// configured failure into `get_metadata()` and/or `get()` — the two calls
     /// `collect_new_addresses` (`lore_revision::state`) makes while walking
     /// fragments. Everything not configured to fail delegates straight through
     /// to the real store, so state construction (`node_add`/`serialize`/
@@ -410,9 +429,9 @@ mod tests {
     /// ready to exercise `collect_new_fragments`.
     struct FaultInjectingStore {
         inner: Arc<LocalImmutableStore>,
-        slow_down_all_queries: AtomicBool,
-        generic_fail_all_queries: AtomicBool,
-        slow_down_query_addresses: RwLock<BTreeSet<Address>>,
+        slow_down_all_metadata_reads: AtomicBool,
+        generic_fail_all_metadata_reads: AtomicBool,
+        slow_down_metadata_addresses: RwLock<BTreeSet<Address>>,
         slow_down_get_addresses: RwLock<BTreeSet<Address>>,
     }
 
@@ -420,28 +439,30 @@ mod tests {
         fn wrapping(inner: Arc<LocalImmutableStore>) -> Arc<Self> {
             Arc::new(Self {
                 inner,
-                slow_down_all_queries: AtomicBool::new(false),
-                generic_fail_all_queries: AtomicBool::new(false),
-                slow_down_query_addresses: RwLock::new(BTreeSet::new()),
+                slow_down_all_metadata_reads: AtomicBool::new(false),
+                generic_fail_all_metadata_reads: AtomicBool::new(false),
+                slow_down_metadata_addresses: RwLock::new(BTreeSet::new()),
                 slow_down_get_addresses: RwLock::new(BTreeSet::new()),
             })
         }
 
-        /// Every subsequent `query()` call returns `StoreError::SlowDown`.
-        fn arm_slow_down_all_queries(&self) {
-            self.slow_down_all_queries.store(true, Ordering::SeqCst);
+        /// Every subsequent `get_metadata()` call returns `StoreError::SlowDown`.
+        fn arm_slow_down_all_metadata_reads(&self) {
+            self.slow_down_all_metadata_reads
+                .store(true, Ordering::SeqCst);
         }
 
-        /// Every subsequent `query()` call returns a generic (non-`SlowDown`)
+        /// Every subsequent `get_metadata()` call returns a generic (non-`SlowDown`)
         /// `StoreError`, simulating an ordinary store failure.
-        fn arm_generic_fail_all_queries(&self) {
-            self.generic_fail_all_queries.store(true, Ordering::SeqCst);
+        fn arm_generic_fail_all_metadata_reads(&self) {
+            self.generic_fail_all_metadata_reads
+                .store(true, Ordering::SeqCst);
         }
 
-        /// `query()` calls for this specific address return `StoreError::SlowDown`;
+        /// `get_metadata()` calls for this specific address return `StoreError::SlowDown`;
         /// every other address delegates normally.
-        fn arm_slow_down_query_for(&self, address: Address) {
-            self.slow_down_query_addresses
+        fn arm_slow_down_metadata_for(&self, address: Address) {
+            self.slow_down_metadata_addresses
                 .write()
                 .unwrap()
                 .insert(address);
@@ -451,7 +472,7 @@ mod tests {
         /// every other address delegates normally. This is the call
         /// `lore_storage::read::read_raw` makes (via `immutable::load_raw`) when
         /// loading a fragmented payload's own content to read its child
-        /// `FragmentReference` list — distinct from `query()`, which is what
+        /// `FragmentReference` list — distinct from `get_metadata()`, which is what
         /// `collect_new_addresses` calls directly on each address it walks.
         fn arm_slow_down_get_for(&self, address: Address) {
             self.slow_down_get_addresses
@@ -463,62 +484,45 @@ mod tests {
 
     #[async_trait]
     impl ImmutableStore for FaultInjectingStore {
-        async fn exist(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-            match_requested: StoreMatch,
-        ) -> Result<StoreMatch, StoreError> {
-            self.inner
-                .clone()
-                .exist(partition, address, match_requested)
-                .await
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            partition: Partition,
-            addresses: &[Address],
-            match_requested: StoreMatch,
-        ) -> Result<Vec<StoreMatch>, StoreError> {
-            self.inner
-                .clone()
-                .exist_batch(partition, addresses, match_requested)
-                .await
-        }
-
         async fn query(
             self: Arc<Self>,
             partition: Partition,
+            addresses: &[Address],
+            results: &mut [StoreMatchResult],
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .query(partition, addresses, results)
+                .await
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
             address: Address,
-            match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
-            if self.slow_down_all_queries.load(Ordering::SeqCst)
+        ) -> Result<StoreGetData, StoreError> {
+            if self.slow_down_all_metadata_reads.load(Ordering::SeqCst)
                 || self
-                    .slow_down_query_addresses
+                    .slow_down_metadata_addresses
                     .read()
                     .unwrap()
                     .contains(&address)
             {
                 return Err(StoreError::from(SlowDown));
             }
-            if self.generic_fail_all_queries.load(Ordering::SeqCst) {
+            if self.generic_fail_all_metadata_reads.load(Ordering::SeqCst) {
                 return Err(StoreError::internal(
                     "Simulated generic store failure (not SlowDown)",
                 ));
             }
-            self.inner
-                .clone()
-                .query(partition, address, match_requested)
-                .await
+            self.inner.clone().get_metadata(partition, address).await
         }
 
         async fn get(
             self: Arc<Self>,
             partition: Partition,
             address: Address,
-            match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
+        ) -> Result<StoreGetData, StoreError> {
             if self
                 .slow_down_get_addresses
                 .read()
@@ -527,10 +531,7 @@ mod tests {
             {
                 return Err(StoreError::from(SlowDown));
             }
-            self.inner
-                .clone()
-                .get(partition, address, match_required)
-                .await
+            self.inner.clone().get(partition, address).await
         }
 
         async fn put(
@@ -603,6 +604,26 @@ mod tests {
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
             self.inner.clone().verify(heal).await
         }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: Partition,
+            source_address: Address,
+            destination_partition: Partition,
+            destination_context: Context,
+            durable: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
+                )
+                .await
+        }
     }
 
     /// Builds a two-node-block diff (`state_from` has `test-node`, `state_to`
@@ -637,16 +658,17 @@ mod tests {
 
                 let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
                 let repository = Arc::new(
-                    RepositoryContext::new(
-                        Some(path.clone()),
-                        fault_store.clone(),
-                        mutable_store.clone(),
-                        repository_id.into(),
-                        lore_revision::instance::InstanceId::default(),
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
-                    )
+                    RepositoryContext::new(RepositoryContextCreationArgs {
+                        path: Some(path.clone()),
+                        immutable_store: fault_store.clone(),
+                        mutable_store: mutable_store.clone(),
+                        id: repository_id.into(),
+                        instance_id: lore_revision::instance::InstanceId::default(),
+                        remote: Err(ProtocolError::from(NoRemote)),
+                        filter: Arc::default(),
+                        format: RepositoryFormat::Lore,
+                        filesystem_provider: None,
+                    })
                     .with_write_token(write_token.share()),
                 );
 
@@ -695,9 +717,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_new_fragments_propagates_slow_down_from_query() {
+    async fn collect_new_fragments_propagates_slow_down_from_metadata_read() {
         with_slow_down_fixture(|repository, state_from, state_to, fault_store| async move {
-            fault_store.arm_slow_down_all_queries();
+            fault_store.arm_slow_down_all_metadata_reads();
 
             let result = collect_new_fragments(repository, state_from, state_to, true).await;
 
@@ -714,7 +736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_new_fragments_keeps_conservative_fallback_for_non_slow_down_query_error() {
+    async fn collect_new_fragments_keeps_conservative_fallback_for_non_slow_down_metadata_error() {
         with_slow_down_fixture(|repository, state_from, state_to, fault_store| async move {
             // Compute the name-table address the same way
             // `collect_new_name_fragments` does, before arming the fault, so we
@@ -729,18 +751,18 @@ mod tests {
                 .name_table;
             let name_address = Address::zero_context_hash(name_fragment);
 
-            fault_store.arm_generic_fail_all_queries();
+            fault_store.arm_generic_fail_all_metadata_reads();
 
             let fragments = collect_new_fragments(repository, state_from, state_to, true)
                 .await
                 .expect(
-                    "A non-SlowDown query error must not fail collect_new_fragments \
+                    "A non-SlowDown metadata error must not fail collect_new_fragments \
                      (the pre-existing conservative fallback must be preserved)",
                 );
 
             assert!(
                 fragments.contains(&name_address),
-                "A fragment whose query() failed with a non-SlowDown error must \
+                "A fragment whose get_metadata() failed with a non-SlowDown error must \
                  still be reported as new (fail-safe, over-report path)"
             );
         })
@@ -749,9 +771,8 @@ mod tests {
 
     #[tokio::test]
     async fn genuinely_absent_fragment_is_reported_new_without_hitting_error_path() {
-        // Pins the assumption the SlowDown-narrowing relies on: `find()`
-        // (lore-storage/src/local/immutable_store.rs) returns `Ok` with
-        // `StoreMatch::MatchNone` for a hash it has never seen — genuine
+        // Pins the assumption the SlowDown-narrowing relies on: `get_metadata()`
+        // returns `Ok` with `StoreMatch::MatchNone` for a hash it has never seen — genuine
         // absence is not an error at all, so it can never reach either the
         // `SlowDown` branch or the conservative-fallback branch added by this
         // change. Uses the real store directly (no fault injection) since the
@@ -772,16 +793,17 @@ mod tests {
 
                 let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
                 let repository = Arc::new(
-                    RepositoryContext::new(
-                        Some(path.clone()),
-                        real_store,
-                        mutable_store.clone(),
-                        repository_id.into(),
-                        lore_revision::instance::InstanceId::default(),
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
-                    )
+                    RepositoryContext::new(RepositoryContextCreationArgs {
+                        path: Some(path.clone()),
+                        immutable_store: real_store,
+                        mutable_store: mutable_store.clone(),
+                        id: repository_id.into(),
+                        instance_id: lore_revision::instance::InstanceId::default(),
+                        remote: Err(ProtocolError::from(NoRemote)),
+                        filter: Arc::default(),
+                        format: RepositoryFormat::Lore,
+                        filesystem_provider: None,
+                    })
                     .with_write_token(write_token.share()),
                 );
 
@@ -795,7 +817,7 @@ mod tests {
                     .expect("Failed to deserialize state");
 
                 // A node whose backing fragment was never written anywhere:
-                // `query()` for it must come back `Ok(MatchNone)`, not an error.
+                // `get_metadata()` for it must come back `Ok(MatchNone)`, not an error.
                 let name = "brand-new-never-stored-node";
                 let node = Node {
                     name_hash: hash_string(name),
@@ -951,16 +973,17 @@ mod tests {
 
                 let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
                 let repository = Arc::new(
-                    RepositoryContext::new(
-                        Some(path.clone()),
-                        fault_store.clone(),
-                        mutable_store.clone(),
-                        repository_id.into(),
-                        lore_revision::instance::InstanceId::default(),
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
-                    )
+                    RepositoryContext::new(RepositoryContextCreationArgs {
+                        path: Some(path.clone()),
+                        immutable_store: fault_store.clone(),
+                        mutable_store: mutable_store.clone(),
+                        id: repository_id.into(),
+                        instance_id: lore_revision::instance::InstanceId::default(),
+                        remote: Err(ProtocolError::from(NoRemote)),
+                        filter: Arc::default(),
+                        format: RepositoryFormat::Lore,
+                        filesystem_provider: None,
+                    })
                     .with_write_token(write_token.share()),
                 );
 
@@ -1025,7 +1048,7 @@ mod tests {
              _root_address,
              _chunk_one_address,
              chunk_two_address| async move {
-                fault_store.arm_slow_down_query_for(chunk_two_address);
+                fault_store.arm_slow_down_metadata_for(chunk_two_address);
 
                 let result = collect_new_fragments(repository, state_from, state_to, true).await;
 
@@ -1088,69 +1111,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_new_fragments_swallows_slow_down_from_own_fragmented_payload_load() {
-        // Discriminating test for swallow #2 (CR-021 part 2b's own correction
-        // note, `state.rs:7663`'s `Err(ImmutableError::SlowDown(traced))` arm
-        // reached while loading a fragmented payload's own content via
-        // `immutable::load_raw`, to read its child `FragmentReference` list).
-        //
-        // On the SERVER path -- no remote session, `RepositoryContext` built
-        // with `Err(ProtocolError::from(NoRemote))` exactly like every fixture
-        // in this file, which is exactly what `RemoteState::Offline` collapses
-        // to (see `lore-revision/src/repository.rs`'s `RemoteState::from_result`
-        // and `RepositoryContext::remote()`) -- a throttled local `get()` on
-        // the root's own content does NOT propagate as `SlowDown`. Read
-        // path: `lore_storage::read::read_raw` retries then gives up with
-        // `StorageError::SlowDown`; `load_fragment` (`lore-storage/src/read.rs`)
-        // collapses that into an untyped `LocalFailure::Other` (losing the
-        // `SlowDown` classification), then -- because `ReadOptions::remote`
-        // defaults `true` and `immutable::load_raw` always supplies
-        // `Some(session)` -- unconditionally tries the remote fallback, which
-        // resolves the pending session against `RemoteState::Offline` and
-        // fails as `NoRemote`, not `SlowDown`. That final, non-`SlowDown`
-        // error is what `collect_new_addresses` actually observes, so it
-        // falls into the pre-existing, deliberately-unchanged `Err(_) => {}`
-        // branch at `state.rs:7666` rather than the `SlowDown` arm at
-        // `state.rs:7663`.
-        //
-        // The assertion that matters is not "an error came back" -- none
-        // does, `collect_new_fragments` returns `Ok` -- but that the root's
-        // children are silently missing from the result: exactly the gap
-        // that lets `verify_fragments` skip confirming them, and a push land
-        // referencing content the server never actually confirmed it holds.
+    async fn collect_new_fragments_propagates_slow_down_from_own_fragmented_payload_load() {
+        // This keeps the Part 2b characterization pin but flips its assertion
+        // to the corrected Part 2c behavior. A persistent local SlowDown must
+        // reach the existing fragment-walk overload arm before an offline
+        // remote fallback can replace its classification.
         with_fragmented_file_fixture(
             |repository,
              state_from,
              state_to,
              fault_store,
              root_address,
-             chunk_one_address,
-             chunk_two_address| async move {
+             _chunk_one_address,
+             _chunk_two_address| async move {
                 fault_store.arm_slow_down_get_for(root_address);
 
-                let fragments = collect_new_fragments(repository, state_from, state_to, true)
+                let err = collect_new_fragments(repository, state_from, state_to, true)
                     .await
-                    .expect(
-                        "This pins the CURRENT (buggy) behavior: a SlowDown on the \
-                         fragmented payload's own load is swallowed, not propagated, so \
-                         collect_new_fragments returns Ok rather than Err. If this starts \
-                         returning Err(SlowDown), the underlying gap has been fixed --  \
-                         update this test to assert propagation instead of deleting it.",
+                    .expect_err(
+                        "A SlowDown while loading a fragmented payload's own content must \
+                         propagate instead of silently dropping its child addresses",
                     );
 
                 assert!(
-                    fragments.contains(&root_address),
-                    "The fragmented payload's own address is still pushed unconditionally \
-                     (state.rs's push to `addresses` after the load_raw match is not gated \
-                     on load_raw's outcome) -- got: {fragments:?}"
-                );
-                assert!(
-                    !fragments.contains(&chunk_one_address)
-                        && !fragments.contains(&chunk_two_address),
-                    "INTEGRITY GAP (CR-021 part 2b swallow #2 is dead code on the server \
-                     path): expected both child addresses to be silently missing from the \
-                     result after a SlowDown on the root's own load, proving they never \
-                     reached verify_fragments -- got: {fragments:?}"
+                    err.is_slow_down(),
+                    "Expected StateError::SlowDown, got: {err:?}"
                 );
             },
         )

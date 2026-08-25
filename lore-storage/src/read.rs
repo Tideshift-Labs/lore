@@ -1341,8 +1341,9 @@ mod tests {
     use crate::gc_event::GcEventSinkRef;
     use crate::local::immutable_store::ImmutableStoreSettings;
     use crate::local::immutable_store::LocalImmutableStore;
+    use crate::store_types::StoreGetData;
+    use crate::store_types::StoreMatchResult;
     use crate::store_types::StoreObliterateStats;
-    use crate::store_types::StoreQueryResult;
     use crate::test_util::TempDir;
     use crate::types::Context;
     use crate::write::try_acquire_in_flight;
@@ -1375,48 +1376,39 @@ mod tests {
 
     #[async_trait]
     impl ImmutableStore for GetFailingStore {
-        async fn exist(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-            match_requested: StoreMatch,
-        ) -> Result<StoreMatch, StoreError> {
-            self.inner
-                .clone()
-                .exist(partition, address, match_requested)
-                .await
+        fn is_local(&self) -> bool {
+            self.inner.is_local()
         }
 
-        async fn exist_batch(
-            self: Arc<Self>,
-            partition: Partition,
-            addresses: &[Address],
-            match_requested: StoreMatch,
-        ) -> Result<Vec<StoreMatch>, StoreError> {
-            self.inner
-                .clone()
-                .exist_batch(partition, addresses, match_requested)
-                .await
+        fn isolates_partitions(&self) -> bool {
+            self.inner.isolates_partitions()
         }
 
         async fn query(
             self: Arc<Self>,
             partition: Partition,
-            address: Address,
-            match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
+            addresses: &[Address],
+            results: &mut [StoreMatchResult],
+        ) -> Result<(), StoreError> {
             self.inner
                 .clone()
-                .query(partition, address, match_requested)
+                .query(partition, addresses, results)
                 .await
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
         }
 
         async fn get(
             self: Arc<Self>,
             _partition: Partition,
             _address: Address,
-            _match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
+        ) -> Result<StoreGetData, StoreError> {
             self.get_calls.fetch_add(1, Ordering::SeqCst);
             match self.failure {
                 InjectedGetFailure::SlowDown => Err(StoreError::from(crate::errors::SlowDown)),
@@ -1495,6 +1487,26 @@ mod tests {
 
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
             self.inner.clone().verify(heal).await
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: Partition,
+            source_address: Address,
+            destination_partition: Partition,
+            destination_context: Context,
+            durable: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
+                )
+                .await
         }
     }
 
@@ -1593,6 +1605,115 @@ mod tests {
         }
     }
 
+    fn offline_session() -> Arc<StorageSession> {
+        Arc::new(StorageSession::pending(|| async {
+            Err(ProtocolError::from(NoRemote))
+        }))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn load_fragment_preserves_local_slow_down_with_offline_remote_session() {
+        let (_dir, store) = make_test_store().await;
+        let (partition, address, _fragment, _payload) = make_input(0x51);
+        let store = GetFailingStore::wrapping(store, InjectedGetFailure::SlowDown);
+
+        let err = load_fragment(
+            store.clone(),
+            partition,
+            address,
+            ReadOptions::default(),
+            Some(offline_session()),
+        )
+        .await
+        .expect_err("local SlowDown must win over offline remote fallback");
+
+        assert!(
+            matches!(err, StorageError::SlowDown(_)),
+            "expected StorageError::SlowDown, got {err:?}"
+        );
+        assert!(
+            store.get_calls() >= 2,
+            "expected local SlowDown to be retried, got {} get() call(s)",
+            store.get_calls()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn load_raw_local_preserves_local_slow_down() {
+        let (_dir, store) = make_test_store().await;
+        let (partition, address, _fragment, _payload) = make_input(0x52);
+        let store = GetFailingStore::wrapping(store, InjectedGetFailure::SlowDown);
+
+        let err = load_raw_local(store.clone(), partition, address, ReadOptions::default())
+            .await
+            .expect_err("local-only read must preserve StoreError::SlowDown");
+
+        assert!(
+            matches!(err, StorageError::SlowDown(_)),
+            "expected StorageError::SlowDown, got {err:?}"
+        );
+        assert!(
+            store.get_calls() >= 2,
+            "expected local SlowDown to be retried, got {} get() call(s)",
+            store.get_calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn genuinely_absent_local_fragment_keeps_not_found_and_offline_fallback_behavior() {
+        let (_dir, store) = make_test_store().await;
+        let (partition, address, _fragment, _payload) = make_input(0x53);
+
+        let local_err = load_raw_local(
+            store.clone(),
+            partition,
+            address,
+            ReadOptions::default().no_remote(),
+        )
+        .await
+        .expect_err("a genuinely absent local fragment must remain not found");
+        assert!(
+            matches!(local_err, StorageError::AddressNotFound(_)),
+            "expected AddressNotFound, got {local_err:?}"
+        );
+
+        let fallback_err = load_fragment(
+            store,
+            partition,
+            address,
+            ReadOptions::default(),
+            Some(offline_session()),
+        )
+        .await
+        .expect_err("an absent local fragment must retain the existing remote fallback");
+        assert!(
+            matches!(fallback_err, StorageError::AddressNotFound(_)),
+            "expected offline fallback to remain AddressNotFound, got {fallback_err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_internal_failure_keeps_existing_offline_fallback_behavior() {
+        let (_dir, store) = make_test_store().await;
+        let (partition, address, _fragment, _payload) = make_input(0x54);
+        let store = GetFailingStore::wrapping(store, InjectedGetFailure::Internal);
+
+        let err = load_fragment(
+            store,
+            partition,
+            address,
+            ReadOptions::default(),
+            Some(offline_session()),
+        )
+        .await
+        .expect_err("a non-SlowDown local failure must retain remote fallback");
+
+        assert!(
+            matches!(err, StorageError::AddressNotFound(_)),
+            "expected internal failure to retain AddressNotFound fallback, got {err:?}"
+        );
+    }
+
     /// Pins the premise `revision::info::info` (in `lore-revision`) relies on
     /// to treat every `delta_block()` `Err` as a genuine read failure: a
     /// revision that changed nothing carries a zero `hash_delta`, and a zero
@@ -1614,7 +1735,7 @@ mod tests {
             context: Context::from([0x56; 16]),
         };
 
-        let bytes = read(
+        let (_fragment, bytes) = read(
             store.clone(),
             partition,
             address,

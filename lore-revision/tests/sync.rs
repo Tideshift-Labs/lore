@@ -172,6 +172,7 @@ mod tests {
                 branch::store_latest(
                     fixture.repository.clone(),
                     fixture.branch_id,
+                    fixture.second_revision,
                     fixture.first_revision,
                     BranchLatestStatus::Convergent,
                 )
@@ -308,6 +309,7 @@ mod tests {
                 branch::store_latest(
                     fixture.repository.clone(),
                     fixture.branch_id,
+                    fixture.second_revision,
                     fixture.first_revision,
                     BranchLatestStatus::Convergent,
                 )

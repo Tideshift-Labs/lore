@@ -56,14 +56,6 @@ pub async fn handler(
         return Err(Status::invalid_argument("Missing repository id"));
     }
 
-    // Scope the CAS to the caller's repository — see RepositoryMetadataGet.
-    // RepositoryService rides the authn-only interceptor (UCS-13506), so the
-    // body repository id carries no upstream authorization; re-check it before
-    // any mutation. Auth-OFF (no auth_url) leaves behavior unchanged.
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, repository_id.into()).await?;
-    }
-
     let expected: Hash = req.expected.into();
     let updated: Hash = req.updated.into();
 
@@ -275,6 +267,10 @@ mod tests {
             let (immutable, mutable, _) = test_store_create().await.unwrap();
             let mut mock = MockAuthorizer::new();
             mock.expect_check_repository_access()
+                .withf(|authorization, repository_id| {
+                    authorization.is_none() && repository_id == &RepositoryId::from(REPOSITORY_ID)
+                })
+                .times(1)
                 .returning(|_, _| Err(Status::permission_denied("denied")));
             let request = Request::new(RepositoryMetadataSetRequest {
                 id: REPOSITORY_ID.to_vec().into(),
@@ -465,6 +461,7 @@ mod tests {
         use tonic::Request;
 
         use super::super::handler;
+        use crate::authnz::repository_authorizer::repository_authorizer;
         use crate::grpc::handlers::repository_query::authz_test_support::new_test_stores;
         use crate::grpc::handlers::repository_query::authz_test_support::seed_repository_metadata;
         use crate::grpc::handlers::repository_query::authz_test_support::start_stub_auth_server;
@@ -535,7 +532,7 @@ mod tests {
 
             let result = handler(
                 request_for(target_repo, original_hash, updated),
-                Some(auth_url),
+                repository_authorizer(Some(auth_url)),
                 immutable.clone(),
                 mutable.clone(),
             )
@@ -579,7 +576,7 @@ mod tests {
 
             let response = handler(
                 request_for(repository_id, expected, updated),
-                Some(auth_url),
+                repository_authorizer(Some(auth_url)),
                 immutable,
                 mutable,
             )
@@ -608,7 +605,7 @@ mod tests {
 
             let response = handler(
                 request_for(repository_id, expected, updated),
-                None,
+                repository_authorizer(None),
                 immutable,
                 mutable,
             )

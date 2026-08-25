@@ -33,6 +33,8 @@ global object state are coherent.
   releases Postgres before S3/recursive work, and exhaustively removes versioned payloads.
 - `loreserver --rebuild-postgres-metering` transactionally rebuilds the projection from S3 and
   prints the rebuilt row count before exiting without starting endpoints.
+- The unused cross-bucket `S3Impl::copy_object` helper was removed with the bucket resolver so no
+  live API or comment continues to imply per-repository bucket routing.
 
 ## Why now
 
@@ -66,4 +68,6 @@ safer than preserving an unused capability.
 - Staging `loreserver:554e937`: fresh schema, health/drain 200, zero restarts. A real authenticated
   push produced 11 objects with S3 metadata and 11 association/state/metering rows; a non-empty
   rebuild returned 11 and reproduced 11 rows.
-
+- Canonical `tideshift/main` composition: nightly formatting, workspace all-targets check, the five
+  remote-proven sync regressions, and warnings-as-errors Clippy for `lore-revision` plus `lore` all
+  passed after merging the client bookkeeping fix.

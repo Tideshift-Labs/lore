@@ -32,6 +32,7 @@ use super::repository_get;
 use super::repository_list;
 use super::repository_metadata_get;
 use super::repository_metadata_set;
+use super::repository_storage_stats;
 use crate::authnz::repository_authorizer::repository_authorizer;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;

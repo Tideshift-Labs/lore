@@ -1781,7 +1781,7 @@ impl Environment for GRPCEnvironment {
 }
 
 #[cfg(test)]
-mod tests {
+mod reconnect_tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
@@ -1894,7 +1894,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod auth_tests {
     use super::*;
 
     fn seeded_auth(authn: &str, authz: &str) -> parking_lot::RwLock<GRPCAuth> {

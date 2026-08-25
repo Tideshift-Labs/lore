@@ -282,6 +282,7 @@ impl QuicService for StorageServiceV4 {
                 use crate::quic::storage_service::ParsedStorageRequest as Req;
                 match &parsed {
                     Req::Put(_) => self.require_write(&permissions, "Put")?,
+                    Req::PutResolved(_) => self.require_write(&permissions, "PutResolved")?,
                     Req::Copy(_) => self.require_write(&permissions, "Copy")?,
                     Req::MutableStoreOp(_) => self.require_write(&permissions, "MutableStore")?,
                     Req::MutableCas(_) => self.require_write(&permissions, "MutableCas")?,
@@ -291,6 +292,7 @@ impl QuicService for StorageServiceV4 {
                     // Reads (and Verify without heal) are ungated.
                     Req::Verify(_)
                     | Req::Get(_)
+                    | Req::GetResolved(_)
                     | Req::GetMetadata(_)
                     | Req::Query(_)
                     | Req::MutableLoad(_)
@@ -556,6 +558,21 @@ mod tests {
             _kid: &str,
         ) -> Result<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm), JWKServiceError> {
             unreachable!("test seeds the session directly; verify_token should never be called")
+        }
+
+        fn get_cached_key(
+            &self,
+            _kid: &str,
+        ) -> Option<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm)> {
+            unreachable!("test seeds the session directly; cache lookup should never be called")
+        }
+
+        async fn refresh_key(
+            &self,
+            _kid: &str,
+        ) -> Result<Option<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>
+        {
+            unreachable!("test seeds the session directly; refresh should never be called")
         }
     }
 

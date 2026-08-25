@@ -300,16 +300,6 @@ async fn lock_token_map() -> Result<FSLock, TokenStoreError> {
     lock_store_file(token_map_path(true)?.as_path()).await
 }
 
-/// Cross-process guard for reserving the next AES-GCM nonce.
-///
-/// The encryption key/counter may live in an OS keyring, whose API has no
-/// compare-and-swap primitive. This stable filesystem lock therefore protects
-/// the reload -> reserve -> persist span across every Lore process.
-async fn lock_encryption_nonce() -> Result<FSLock, TokenStoreError> {
-    let path = base_path(true)?.join("encryption-nonce");
-    lock_store_file(&path).await
-}
-
 /// Refreshes the in-memory token map from disk ahead of a mutation: another
 /// process may have updated the file since it was cached. Callers hold the
 /// store lock, so the reloaded state cannot change before it is written back.
@@ -1440,6 +1430,7 @@ mod tests {
             std::env::set_var("LORE_AUTH_PATH", path);
             std::env::set_var("LORE_AUTH_STORE", "fallback");
         }
+        *encryption_cache().lock().await = None;
         reset_tokens().await.expect("reset test token store");
     }
 
@@ -1705,6 +1696,68 @@ token = "tok-b"
         assert_eq!(token, SUPPLIED_TOKEN);
     }
 
+    /// The caller is working from tokens they supplied, so the store is off
+    /// limits: an access token with no identity token beside it reports
+    /// `TokenNotFound` rather than reading whichever identity happens to be
+    /// stored. Proven against a store that does hold a matching token, so a
+    /// regression to the fallback would be visible here.
+    ///
+    /// Redirects the store to a temp directory and takes the file fallback for
+    /// the encryption key, so the developer's real keyring and tokens are never
+    /// touched.
+    #[tokio::test]
+    async fn access_token_alone_does_not_fall_back_to_the_store() {
+        let _guard = refresh_test_guard().await;
+        const AUTH_URL: &str = "ucs-auth://store-fallback.test.invalid";
+        let store_dir = std::env::temp_dir().join("lore-token-store-fallback-test");
+        fs::create_dir_all(&store_dir).expect("a temp store directory");
+        // SAFETY: single-threaded setup for this test; no other test in this
+        // binary reads the token store.
+        unsafe {
+            std::env::set_var("LORE_AUTH_PATH", store_dir.display().to_string());
+            std::env::set_var("LORE_AUTH_STORE", "fallback");
+        }
+        *encryption_cache().lock().await = None;
+
+        store_user_token(
+            AUTH_URL,
+            "alice",
+            "stored-token",
+            vec!["test.invalid".to_string()],
+        )
+        .await
+        .expect("storing a token");
+
+        // Nothing supplied: the stored token is found, so the store really does
+        // answer for this identity.
+        let stored = load_user_token(
+            AUTH_URL,
+            "alice",
+            tokens_only_for_recipient_domain("test.invalid".to_string()),
+            "",
+            "",
+        )
+        .await
+        .expect("the stored token is found");
+        assert_eq!(stored, "stored-token");
+
+        // An access token supplied instead: the same lookup now refuses.
+        let refused = load_user_token(
+            AUTH_URL,
+            "alice",
+            tokens_only_for_recipient_domain("test.invalid".to_string()),
+            "",
+            "supplied-access-token",
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "an access token must not fall back to the stored identity"
+        );
+
+        let _ = fs::remove_dir_all(&store_dir);
+    }
+
     #[tokio::test]
     async fn no_supplied_token_reads_the_store() {
         // Nothing supplied, so this is a plain store read, which has no entry
@@ -1718,5 +1771,441 @@ token = "tok-b"
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn store_authentication_token_stores_supplied_pair() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+
+        store_authentication_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            "authn-initial",
+            vec![],
+            Some("refresh-initial"),
+        )
+        .await
+        .expect("store initial authentication pair");
+
+        assert_eq!(
+            load_user_token(
+                REFRESH_AUTH_ENDPOINT,
+                "alice",
+                vulnerable_all_tokens(),
+                "",
+                "",
+            )
+            .await
+            .expect("load initial authentication token"),
+            "authn-initial"
+        );
+        assert_eq!(
+            load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("load initial refresh credential"),
+            "refresh-initial"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_authentication_token_replaces_both_supplied_credentials() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_authentication_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            "authn-old",
+            vec![],
+            Some("refresh-old"),
+        )
+        .await
+        .expect("store old authentication pair");
+
+        store_authentication_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            "authn-new",
+            vec![],
+            Some("refresh-new"),
+        )
+        .await
+        .expect("replace authentication pair");
+
+        assert_eq!(
+            load_user_token(
+                REFRESH_AUTH_ENDPOINT,
+                "alice",
+                vulnerable_all_tokens(),
+                "",
+                "",
+            )
+            .await
+            .expect("load replaced authentication token"),
+            "authn-new"
+        );
+        assert_eq!(
+            load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("load replaced refresh credential"),
+            "refresh-new"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_authentication_token_without_refresh_preserves_existing_credential() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_authentication_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            "authn-old",
+            vec![],
+            Some("refresh-old"),
+        )
+        .await
+        .expect("store old authentication pair");
+
+        store_authentication_token(REFRESH_AUTH_ENDPOINT, "alice", "authn-new", vec![], None)
+            .await
+            .expect("replace authentication token");
+
+        assert_eq!(
+            load_user_token(
+                REFRESH_AUTH_ENDPOINT,
+                "alice",
+                vulnerable_all_tokens(),
+                "",
+                "",
+            )
+            .await
+            .expect("load replaced authentication token"),
+            "authn-new"
+        );
+        assert_eq!(
+            load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("load preserved refresh credential"),
+            "refresh-old"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_authentication_pair_write_keeps_previous_cached_pair() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_authentication_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            "authn-old",
+            vec![],
+            Some("refresh-old"),
+        )
+        .await
+        .expect("store old authentication pair");
+        let path = replace_token_file_with_directory();
+
+        let write_result = store_authentication_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            "authn-new",
+            vec![],
+            Some("refresh-new"),
+        )
+        .await;
+        let cached_authn = load_user_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            vulnerable_all_tokens(),
+            "",
+            "",
+        )
+        .await;
+        let cached_refresh = load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice").await;
+        restore_token_file(&path).await;
+
+        assert!(
+            write_result.is_err(),
+            "directory target accepted token write"
+        );
+        assert_eq!(
+            cached_authn.expect("load cached authentication token"),
+            "authn-old"
+        );
+        assert_eq!(
+            cached_refresh.expect("load cached refresh credential"),
+            "refresh-old"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_commit_keeps_previous_cached_pair() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire refresh lease");
+        let path = replace_token_file_with_directory();
+
+        let write_result = lease.commit("authn-new", Some("refresh-new"), vec![]).await;
+        let cached_authn = load_user_token(
+            REFRESH_AUTH_ENDPOINT,
+            "alice",
+            vulnerable_all_tokens(),
+            "",
+            "",
+        )
+        .await;
+        let cached_refresh = load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice").await;
+        restore_token_file(&path).await;
+
+        assert!(
+            write_result.is_err(),
+            "directory target accepted token write"
+        );
+        assert_eq!(
+            cached_authn.expect("load cached authentication token"),
+            "authn-old"
+        );
+        assert_eq!(
+            cached_refresh.expect("load cached refresh credential"),
+            "refresh-old"
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_lease_snapshots_current_pair() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+
+        let lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire refresh lease");
+
+        assert_eq!(
+            (
+                lease.snapshot().token.as_str(),
+                lease.snapshot().refresh_token.as_str(),
+            ),
+            ("authn-old", "refresh-old")
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_commit_replaces_pair_atomically() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire refresh lease");
+
+        let result = lease
+            .commit(
+                "authn-new",
+                Some("refresh-new"),
+                vec!["repo.example.com".to_string()],
+            )
+            .await
+            .expect("commit refreshed pair");
+
+        assert_eq!(result, AuthenticationRefreshCommit::Stored);
+        assert_eq!(
+            load_user_token(
+                REFRESH_AUTH_ENDPOINT,
+                "alice",
+                vulnerable_all_tokens(),
+                "",
+                "",
+            )
+            .await
+            .expect("load authentication token"),
+            "authn-new"
+        );
+        assert_eq!(
+            load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("load refresh credential"),
+            "refresh-new"
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_commit_preserves_credential_when_replacement_absent() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire refresh lease");
+
+        lease
+            .commit("authn-new", None, vec![])
+            .await
+            .expect("commit refreshed token");
+
+        assert_eq!(
+            load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("load refresh credential"),
+            "refresh-old"
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_commit_does_not_overwrite_intervening_login() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire refresh lease");
+        store_user_token(REFRESH_AUTH_ENDPOINT, "alice", "authn-from-login", vec![])
+            .await
+            .expect("store intervening login");
+
+        let result = lease
+            .commit("authn-from-refresh", Some("refresh-new"), vec![])
+            .await
+            .expect("compare and commit");
+
+        assert_eq!(
+            result,
+            AuthenticationRefreshCommit::Superseded {
+                token: "authn-from-login".to_string()
+            }
+        );
+        assert_eq!(
+            load_refresh_token(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("load refresh credential"),
+            "refresh-old"
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_lease_serializes_same_identity_and_rereads_winner() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let winner = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire winner lease");
+
+        #[allow(clippy::disallowed_methods)]
+        let waiter = tokio::spawn(async {
+            acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+                .await
+                .expect("acquire waiter lease")
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "same identity did not serialize");
+
+        winner
+            .commit("authn-new", Some("refresh-new"), vec![])
+            .await
+            .expect("commit winner pair");
+        let waiter = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter remained blocked")
+            .expect("waiter task failed");
+
+        assert_eq!(
+            (
+                waiter.snapshot().token.as_str(),
+                waiter.snapshot().refresh_token.as_str(),
+            ),
+            ("authn-new", "refresh-new")
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_lease_does_not_cross_identity_scope() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-a", "refresh-a").await;
+        store_refresh_pair("bob", "authn-b", "refresh-b").await;
+        let alice = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire alice lease");
+
+        let bob = tokio::time::timeout(
+            Duration::from_secs(5),
+            acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "bob"),
+        )
+        .await
+        .expect("bob blocked on alice lease")
+        .expect("acquire bob lease");
+
+        assert_eq!(bob.snapshot().token, "authn-b");
+        drop(alice);
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_lease_drop_releases_same_identity() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("acquire first lease");
+
+        drop(lease);
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice"),
+        )
+        .await
+        .expect("lease remained held after drop")
+        .expect("acquire replacement lease");
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_lease_releases_after_process_exit() {
+        let _guard = refresh_test_guard().await;
+        setup_refresh_test().await;
+        store_refresh_pair("alice", "authn-old", "refresh-old").await;
+        let executable = std::env::current_exe().expect("current test executable");
+        let auth_path = REFRESH_TEST_PATH.get().expect("refresh test path").clone();
+
+        #[allow(clippy::disallowed_methods)]
+        let status = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(executable)
+                .arg("--exact")
+                .arg("token_store::tests::authentication_refresh_lease_child_process_holder")
+                .arg("--nocapture")
+                .env("LORE_AUTH_PATH", auth_path)
+                .env("LORE_AUTH_STORE", "fallback")
+                .env("CR020_REFRESH_CHILD", "1")
+                .status()
+                .expect("run child refresh holder")
+        })
+        .await
+        .expect("join child process");
+        assert!(status.success(), "child refresh holder failed: {status}");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice"),
+        )
+        .await
+        .expect("lease remained held after child process exited")
+        .expect("acquire lease after child exit");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn authentication_refresh_lease_child_process_holder() {
+        if std::env::var("CR020_REFRESH_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+
+        let _lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
+            .await
+            .expect("child acquires refresh lease");
+        std::process::exit(0);
     }
 }

@@ -42,6 +42,7 @@ mod tests {
     use lore_revision::layer::Layer;
     use lore_revision::relay::EventDispatcher;
     use lore_revision::repository;
+    use lore_revision::repository::LoreSharedStoreMode;
     use lore_revision::repository::RepositoryAccess;
     use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::repository::status::LoreRepositoryStatusFileEventData;
@@ -70,7 +71,7 @@ mod tests {
                 repository_url: format!("lore://localhost/{}", uuid::Uuid::now_v7()).into(),
                 id: LoreString::default(),
                 description: LoreString::default(),
-                use_shared_store: 0,
+                use_shared_store: LoreSharedStoreMode::Disabled,
                 shared_store_path: LoreString::default(),
             };
             assert_eq!(

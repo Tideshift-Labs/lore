@@ -217,6 +217,9 @@ impl ImmutableStorePluginFactory for PostgresImmutableStorePluginFactory {
         // `SdkConfig`/builder state that overflows the main thread's stack if
         // polled inline by `block_on` (aws.rs boxes its builder block for the
         // same reason).
+        // Plugin construction runs once at startup, one plugin at a time, so
+        // at most one runtime core is handed off at a time.
+        #[allow(clippy::disallowed_methods)]
         let store = tokio::task::block_in_place(|| {
             runtime().block_on(Box::pin(connect_immutable_store(config)))
         })?;
@@ -248,6 +251,9 @@ impl MutableStorePluginFactory for PostgresMutableStorePluginFactory {
         let cfg = parse_config(plugin_name, config)?;
         let tls = build_tls(plugin_name, &cfg)?;
 
+        // Plugin construction is a synchronous trait method. It runs once at
+        // startup, one plugin at a time, so at most one core is handed off.
+        #[allow(clippy::disallowed_methods)]
         let store = tokio::task::block_in_place(|| {
             runtime().block_on(PostgresMutableStore::connect(&cfg.url, cfg.pool_max, &tls))
         })
@@ -281,6 +287,9 @@ impl LockStorePluginFactory for PostgresLockStorePluginFactory {
 
         // Plugin `create` is synchronous, but building the pool + ensuring the
         // schema is async — drive it to completion like the AWS plugin does.
+        // Construction runs once at startup, one plugin at a time, so at most
+        // one runtime core is handed off at a time.
+        #[allow(clippy::disallowed_methods)]
         let store = tokio::task::block_in_place(|| {
             runtime().block_on(PostgresLockStore::connect(&cfg.url, cfg.pool_max, &tls))
         })

@@ -28,6 +28,7 @@ mod tests {
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreEvent;
+    use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::BranchId;
     use lore_revision::lore::RepositoryId;
@@ -41,6 +42,7 @@ mod tests {
     use lore_revision::relay::EventDispatcher;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::RepositoryContextCreationArgs;
     use lore_revision::repository::RepositoryFormat;
     use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::stage;
@@ -87,16 +89,17 @@ mod tests {
             .await
             .expect("Failed to initialize repository");
             let repository = Arc::new(
-                RepositoryContext::new(
-                    Some(root.clone()),
+                RepositoryContext::new(RepositoryContextCreationArgs {
+                    path: Some(root.clone()),
                     immutable_store,
                     mutable_store,
-                    repository_id,
-                    created_repo.instance_id,
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
-                )
+                    id: repository_id,
+                    instance_id: created_repo.instance_id,
+                    remote: Err(ProtocolError::from(NoRemote)),
+                    filter: Arc::default(),
+                    format: RepositoryFormat::Lore,
+                    filesystem_provider: None,
+                })
                 .with_write_token(write_token.share()),
             );
             lore_revision::instance::store_current_anchor_branch(&repository, branch)

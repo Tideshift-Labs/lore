@@ -20,6 +20,7 @@ mod tests {
     use lore_revision::file;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::BranchId;
     use lore_revision::lore::RepositoryId;

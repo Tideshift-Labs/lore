@@ -56,9 +56,10 @@ use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
+use lore_storage::StoreGetData;
 use lore_storage::StoreMatch;
+use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
-use lore_storage::StoreQueryResult;
 use lore_storage::StoreRepositoryStats;
 use lore_storage::errors::AddressNotFound;
 use lore_storage::errors::SlowDown;
@@ -223,115 +224,27 @@ impl PostgresImmutableStore {
         StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
     }
 
-    /// Existence at the requested match level (global dedup). The three levels
-    /// are leftmost-prefix reads of the `(hash, repository, context)` PK.
-    async fn exists(
+    /// Whether the exact repository/context association exists.
+    async fn association_exists(
         &self,
         repository: Context,
         address: Address,
-        match_requested: StoreMatch,
     ) -> Result<bool, StoreError> {
-        if match_requested == StoreMatch::MatchNone {
-            return Ok(false);
-        }
         let client = self.pool.get().await.map_err(pool_err)?;
         let hash = address.hash.data().as_slice();
-        let row = match match_requested {
-            StoreMatch::MatchFull => {
-                client
-                    .query_opt(
-                        "SELECT 1 FROM lore_fragments \
-                         WHERE hash = $1 AND repository = $2 AND context = $3 LIMIT 1",
-                        &[
-                            &hash,
-                            &repository.data().as_slice(),
-                            &address.context.data().as_slice(),
-                        ],
-                    )
-                    .await
-            }
-            StoreMatch::MatchPartition => {
-                client
-                    .query_opt(
-                        "SELECT 1 FROM lore_fragments \
-                         WHERE hash = $1 AND repository = $2 LIMIT 1",
-                        &[&hash, &repository.data().as_slice()],
-                    )
-                    .await
-            }
-            StoreMatch::MatchHash => {
-                client
-                    .query_opt(
-                        "SELECT 1 FROM lore_fragments WHERE hash = $1 LIMIT 1",
-                        &[&hash],
-                    )
-                    .await
-            }
-            StoreMatch::MatchNone => return Ok(false),
-        }
-        .map_err(db_err)?;
-        Ok(row.is_some())
-    }
-
-    /// Best match at or below the requested level, walking down the hierarchy —
-    /// mirrors `AwsImmutableStore::lookup`.
-    async fn lookup(
-        &self,
-        repository: Context,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreMatch, StoreError> {
-        let mut level = match_requested;
-        let mut exists = self.exists(repository, address, level).await?;
-
-        // A full-match miss short-circuits: there is no partial-upload support, so
-        // there is no benefit to probing coarser granularities.
-        if !exists && level == StoreMatch::MatchFull {
-            return Ok(StoreMatch::MatchNone);
-        }
-        while !exists {
-            let Some(previous) = level.prev() else {
-                break;
-            };
-            level = previous;
-            exists = self.exists(repository, address, level).await?;
-        }
-        Ok(if exists { level } else { StoreMatch::MatchNone })
-    }
-
-    async fn do_query(
-        &self,
-        repository: Context,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreQueryResult, StoreError> {
-        let (match_made, state) = tokio::join!(
-            self.lookup(repository, address, match_requested),
-            self.load_state(address.hash)
-        );
-        let match_made = match_made?;
-        if match_made == StoreMatch::MatchNone {
-            return Ok(StoreQueryResult {
-                fragment: Fragment::default(),
-                match_made,
-            });
-        }
-
-        match state? {
-            Some(FragmentState::Stored) => Ok(StoreQueryResult {
-                fragment: stored_durable(Fragment::default()),
-                match_made,
-            }),
-            Some(
-                FragmentState::Obliterating
-                | FragmentState::PayloadDeleting
-                | FragmentState::Obliterated,
+        client
+            .query_opt(
+                "SELECT 1 FROM lore_fragments \
+                 WHERE hash = $1 AND repository = $2 AND context = $3 LIMIT 1",
+                &[
+                    &hash,
+                    &repository.data().as_slice(),
+                    &address.context.data().as_slice(),
+                ],
             )
-            | None => Ok(StoreQueryResult {
-                fragment: Fragment::default(),
-                match_made: StoreMatch::MatchNone,
-            }),
-        }
+            .await
+            .map(|row| row.is_some())
+            .map_err(db_err)
     }
 
     async fn load_state(&self, hash: Hash) -> Result<Option<FragmentState>, StoreError> {
@@ -351,24 +264,11 @@ impl PostgresImmutableStore {
         .transpose()
     }
 
-    async fn write_payload(
-        &self,
-        repository: Context,
-        address: Address,
-        fragment: Fragment,
-        payload: Bytes,
-    ) -> Result<(), StoreError> {
-        if payload.len() != fragment.size_payload as usize {
-            return Err(StoreError::internal(format!(
-                "Failed to store in immutable store for put {}",
-                address.hash
-            )));
-        }
-        let key = Self::hash_key(address.hash);
-        self.s3
-            .put_object(&self.bucket, &key, payload.to_vec())
-            .await
-            .map_err(|e| s3_err(e, "S3 put object failed"))?;
+    fn advisory_key(hash: Hash) -> i64 {
+        let mut key = [0_u8; 8];
+        key.copy_from_slice(&hash.data()[..8]);
+        i64::from_be_bytes(key)
+    }
 
     async fn lock_hash(tx: &Transaction<'_>, hash: Hash) -> Result<(), StoreError> {
         tx.execute(
@@ -841,123 +741,115 @@ fn stored_durable(mut fragment: Fragment) -> Fragment {
 
 #[async_trait]
 impl ImmutableStore for PostgresImmutableStore {
-    #[tracing::instrument(level = "debug", skip_all)]
-    async fn exist(
-        self: Arc<Self>,
-        partition: Partition,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreMatch, StoreError> {
-        let _t = self.instruments.start("exist", self.pool.status());
-        let repository: Context = partition.into();
-        if self.exists(repository, address, match_requested).await? {
-            Ok(match_requested)
-        } else {
-            Ok(StoreMatch::MatchNone)
-        }
-    }
-
-    #[tracing::instrument(level = "debug", skip_all)]
-    async fn exist_batch(
-        self: Arc<Self>,
-        partition: Partition,
-        addresses: &[Address],
-        match_requested: StoreMatch,
-    ) -> Result<Vec<StoreMatch>, StoreError> {
-        if addresses.is_empty() || match_requested == StoreMatch::MatchNone {
-            return Ok(vec![StoreMatch::MatchNone; addresses.len()]);
-        }
-        let _t = self.instruments.start("exist_batch", self.pool.status());
-        let repository: Context = partition.into();
-        let client = self.pool.get().await.map_err(pool_err)?;
-        // One query for the whole batch via `hash = ANY($n)` (B3) — a fragment
-        // push existence-checks thousands of hashes, so we collapse N round-trips
-        // into a single statement instead of probing each address individually.
-        let hashes: Vec<&[u8]> = addresses.iter().map(|a| a.hash.data().as_slice()).collect();
-
-        match match_requested {
-            StoreMatch::MatchHash => {
-                let rows = client
-                    .query(
-                        "SELECT DISTINCT hash FROM lore_fragments WHERE hash = ANY($1)",
-                        &[&hashes],
-                    )
-                    .await
-                    .map_err(db_err)?;
-                let present: HashSet<Vec<u8>> =
-                    rows.iter().map(|r| r.get::<_, Vec<u8>>("hash")).collect();
-                Ok(addresses
-                    .iter()
-                    .map(|a| {
-                        if present.contains(a.hash.data().as_slice()) {
-                            StoreMatch::MatchHash
-                        } else {
-                            StoreMatch::MatchNone
-                        }
-                    })
-                    .collect())
-            }
-            StoreMatch::MatchPartition => {
-                let rows = client
-                    .query(
-                        "SELECT DISTINCT hash FROM lore_fragments \
-                         WHERE repository = $1 AND hash = ANY($2)",
-                        &[&repository.data().as_slice(), &hashes],
-                    )
-                    .await
-                    .map_err(db_err)?;
-                let present: HashSet<Vec<u8>> =
-                    rows.iter().map(|r| r.get::<_, Vec<u8>>("hash")).collect();
-                Ok(addresses
-                    .iter()
-                    .map(|a| {
-                        if present.contains(a.hash.data().as_slice()) {
-                            StoreMatch::MatchPartition
-                        } else {
-                            StoreMatch::MatchNone
-                        }
-                    })
-                    .collect())
-            }
-            StoreMatch::MatchFull => {
-                let rows = client
-                    .query(
-                        "SELECT hash, context FROM lore_fragments \
-                         WHERE repository = $1 AND hash = ANY($2)",
-                        &[&repository.data().as_slice(), &hashes],
-                    )
-                    .await
-                    .map_err(db_err)?;
-                let present: HashSet<(Vec<u8>, Vec<u8>)> = rows
-                    .iter()
-                    .map(|r| (r.get::<_, Vec<u8>>("hash"), r.get::<_, Vec<u8>>("context")))
-                    .collect();
-                Ok(addresses
-                    .iter()
-                    .map(|a| {
-                        let key = (a.hash.data().to_vec(), a.context.data().to_vec());
-                        if present.contains(&key) {
-                            StoreMatch::MatchFull
-                        } else {
-                            StoreMatch::MatchNone
-                        }
-                    })
-                    .collect())
-            }
-            StoreMatch::MatchNone => Ok(vec![StoreMatch::MatchNone; addresses.len()]),
-        }
+    /// This process serves every tenant in the cell. Reads therefore require the exact
+    /// repository/context association even though the object bytes are globally deduplicated.
+    fn isolates_partitions(&self) -> bool {
+        true
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
     async fn query(
         self: Arc<Self>,
         partition: Partition,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreQueryResult, StoreError> {
+        addresses: &[Address],
+        results: &mut [StoreMatchResult],
+    ) -> Result<(), StoreError> {
+        debug_assert_eq!(addresses.len(), results.len());
+        if addresses.is_empty() {
+            return Ok(());
+        }
         let _t = self.instruments.start("query", self.pool.status());
         let repository: Context = partition.into();
-        self.do_query(repository, address, match_requested).await
+        let client = self.pool.get().await.map_err(pool_err)?;
+
+        // A fragment push resolves thousands of hashes at once. Join lifecycle state to the
+        // associations so an obliterating/obliterated hash can never be reported as usable.
+        let hashes: Vec<&[u8]> = addresses.iter().map(|a| a.hash.data().as_slice()).collect();
+        let rows = client
+            .query(
+                "SELECT f.hash, f.context \
+                 FROM lore_fragments f \
+                 JOIN lore_fragment_state s USING (hash) \
+                 WHERE f.repository = $1 AND f.hash = ANY($2) AND s.state = 0",
+                &[&repository.data().as_slice(), &hashes],
+            )
+            .await
+            .map_err(db_err)?;
+        let present_hashes: HashSet<Vec<u8>> = rows
+            .iter()
+            .map(|row| row.get::<_, Vec<u8>>("hash"))
+            .collect();
+        let present_full: HashSet<(Vec<u8>, Vec<u8>)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<_, Vec<u8>>("hash"),
+                    row.get::<_, Vec<u8>>("context"),
+                )
+            })
+            .collect();
+
+        for (address, result) in addresses.iter().zip(results.iter_mut()) {
+            let full_key = (
+                address.hash.data().to_vec(),
+                address.context.data().to_vec(),
+            );
+            let match_made = if present_full.contains(&full_key) {
+                StoreMatch::MatchFull
+            } else if present_hashes.contains(address.hash.data().as_slice()) {
+                StoreMatch::MatchPartition
+            } else {
+                StoreMatch::MatchNone
+            };
+            *result = if match_made == StoreMatch::MatchNone {
+                StoreMatchResult::default()
+            } else {
+                StoreMatchResult {
+                    match_made,
+                    partition,
+                    context: if match_made == StoreMatch::MatchFull {
+                        address.context
+                    } else {
+                        Context::default()
+                    },
+                    stored_local: false,
+                    stored_durable: true,
+                }
+            };
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "debug", skip_all)]
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<StoreGetData, StoreError> {
+        let _t = self.instruments.start("get_metadata", self.pool.status());
+        let repository: Context = partition.into();
+        let (associated, state) = tokio::join!(
+            self.association_exists(repository, address),
+            self.load_state(address.hash)
+        );
+        if !associated? || state? != Some(FragmentState::Stored) {
+            return Ok(StoreGetData::default());
+        }
+
+        match self.head_fragment(address.hash).await {
+            Ok(fragment) => Ok(StoreGetData::metadata(
+                fragment,
+                StoreMatch::MatchFull,
+                partition,
+            )),
+            Err(error) if error.is_address_not_found() => {
+                if let Err(repair_error) = self.repair_missing_payload(address.hash).await {
+                    tracing::warn!(%address, ?repair_error, "failed to repair missing payload state");
+                }
+                Ok(StoreGetData::default())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -965,12 +857,14 @@ impl ImmutableStore for PostgresImmutableStore {
         self: Arc<Self>,
         partition: Partition,
         address: Address,
-        match_required: StoreMatch,
-    ) -> Result<(Fragment, Bytes), StoreError> {
+    ) -> Result<StoreGetData, StoreError> {
         let _t = self.instruments.start("get", self.pool.status());
         let repository: Context = partition.into();
-        let query = self.do_query(repository, address, match_required).await?;
-        if query.match_made == StoreMatch::MatchNone {
+        let (associated, state) = tokio::join!(
+            self.association_exists(repository, address),
+            self.load_state(address.hash)
+        );
+        if !associated? || state? != Some(FragmentState::Stored) {
             return Err(Self::not_found(address.hash));
         }
         let loaded = self.load(address.hash).await;
@@ -984,7 +878,12 @@ impl ImmutableStore for PostgresImmutableStore {
         }
         let (fragment, payload) = loaded?;
         lore_storage::validate_fragment_payload(&fragment, payload.len())?;
-        Ok((fragment, payload))
+        Ok(StoreGetData {
+            fragment,
+            match_made: StoreMatch::MatchFull,
+            partition,
+            payload: Some(payload),
+        })
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -1065,7 +964,7 @@ impl ImmutableStore for PostgresImmutableStore {
             .put_object(
                 &self.bucket,
                 &key,
-                payload.to_vec(),
+                payload,
                 Some(to_object_metadata(&fragment)),
             )
             .await
@@ -1429,10 +1328,10 @@ mod tests {
     use super::*;
 
     fn service_error(error: GetObjectError, status: u16) -> AwsError<SdkError<GetObjectError>> {
-        AwsError::AwsSdkError(SdkError::service_error(
+        AwsError::AwsSdkError(Box::new(SdkError::service_error(
             error,
             HttpResponse::new(status.try_into().unwrap(), SdkBody::empty()),
-        ))
+        )))
     }
 
     #[test]
@@ -1456,8 +1355,8 @@ mod tests {
 
     #[test]
     fn s3_payload_load_error_retryable_timeout_is_slow_down() {
-        let error = AwsError::AwsSdkError(SdkError::timeout_error(std::io::Error::other(
-            "injected timeout",
+        let error = AwsError::AwsSdkError(Box::new(SdkError::timeout_error(
+            std::io::Error::other("injected timeout"),
         )));
 
         let error = s3_payload_load_error(error, random::<Hash>());

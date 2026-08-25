@@ -3625,13 +3625,11 @@ mod interop_tests {
         let outcome: Arc<Mutex<Option<LoreErrorCode>>> = Arc::new(Mutex::new(None));
         let outcome_sink = outcome.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::StorageGetData(data) => {
-                if data.bytes.len > 0 {
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(data.bytes.ptr.cast::<u8>(), data.bytes.len)
-                    };
-                    sink.lock().unwrap().extend_from_slice(bytes);
-                }
+            LoreEvent::StorageGetData(data) if data.bytes.len > 0 => {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(data.bytes.ptr.cast::<u8>(), data.bytes.len)
+                };
+                sink.lock().unwrap().extend_from_slice(bytes);
             }
             LoreEvent::StorageGetItemComplete(data) => {
                 *outcome_sink.lock().unwrap() = Some(data.error_code);

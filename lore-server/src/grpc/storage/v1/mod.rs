@@ -94,6 +94,21 @@ pub(crate) fn log_and_code<T: ItemOutcome>(outcome: &Result<T, tonic::Status>) -
     }
 }
 
+/// Max concurrent fragment PUT tasks (each an S3 `put_object`) processed per Put
+/// stream. Defaults to [`STREAM_PROCESS_LIMIT`], but is overridable via the
+/// `LORE_STORAGE_PUT_CONCURRENCY` env var (positive integer). A slow S3-compatible
+/// backend — e.g. LocalStack in the Lorehub dev/CI harness — is saturated by a
+/// 4000-connection upload fan-out (every stream stalls at 0 B/s and the AWS SDK's
+/// StalledStreamProtection aborts it, livelocking a large import); capping the
+/// concurrency lets the gateway service each PUT. Real S3 scales, so prod leaves the
+/// var unset and keeps the 4000 default. Tideshift fork change CR-013. Read once.
+pub(crate) fn put_task_concurrency() -> usize {
+    static LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        parse_put_concurrency(std::env::var("LORE_STORAGE_PUT_CONCURRENCY").ok())
+    });
+    *LIMIT
+}
+
 /// Parse the `LORE_STORAGE_PUT_CONCURRENCY` override, falling back to
 /// [`STREAM_PROCESS_LIMIT`]. A value that is PRESENT but invalid (non-numeric or
 /// zero) is warned about and falls back — otherwise a dev misconfig would silently

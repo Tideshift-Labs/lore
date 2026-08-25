@@ -31,6 +31,7 @@ use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
 use crate::store_types::StoreMatchResult;
 use crate::store_types::StoreObliterateStats;
+use crate::store_types::StoreRepositoryStats;
 
 #[error_set(clone)]
 pub enum StoreError {

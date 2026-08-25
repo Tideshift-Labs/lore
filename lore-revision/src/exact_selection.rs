@@ -31,7 +31,6 @@ use md5::Md5;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
 
 use crate::change::FileAction;
 use crate::commit;
@@ -688,19 +687,23 @@ async fn normalize_selected_files(
                         } else {
                             repository_root.join(source)
                         };
-                        let file = tokio::fs::File::open(&source).await.map_err(|err| {
-                            ExactSelectionError::new(ExactSelectionErrorKind::MetadataInputRead {
-                                path: path.clone(),
-                                key: entry.key.clone(),
-                                input: source.display().to_string(),
-                                reason: err.to_string(),
-                            })
-                        })?;
+                        let file = lore_io::IoDriver::global()
+                            .open(&source, &lore_io::OpenOptions::new().read(true))
+                            .await
+                            .map_err(|err| {
+                                ExactSelectionError::new(
+                                    ExactSelectionErrorKind::MetadataInputRead {
+                                        path: path.clone(),
+                                        key: entry.key.clone(),
+                                        input: source.display().to_string(),
+                                        reason: err.to_string(),
+                                    },
+                                )
+                            })?;
                         let remaining =
                             MAX_BINARY_METADATA_PAYLOAD_BYTES.saturating_sub(binary_metadata_bytes);
-                        let mut payload = Vec::new();
-                        file.take(remaining.saturating_add(1))
-                            .read_to_end(&mut payload)
+                        let payload = file
+                            .read_at(remaining.saturating_add(1) as usize, 0)
                             .await
                             .map_err(|err| {
                                 ExactSelectionError::new(
@@ -742,7 +745,7 @@ async fn normalize_selected_files(
                                 },
                             ));
                         }
-                        PreparedMetadataValue::Binary(Bytes::from(payload))
+                        PreparedMetadataValue::Binary(payload)
                     }
                 };
                 prepared_metadata.push(PreparedMetadataEntry {
@@ -1651,7 +1654,7 @@ pub async fn commit_exact_selection(
     )
     .await
     .map_err(map_exact_finalize_error)?;
-    let _ = crate::event::metadata::send(&metadata);
+    crate::event::metadata::send(&metadata);
     Ok(result)
 }
 
@@ -1679,6 +1682,7 @@ mod tests {
     use crate::lore::BranchId;
     use crate::lore::RepositoryId;
     use crate::relay::EventDispatcher;
+    use crate::repository::RepositoryContextCreationArgs;
     use crate::repository::RepositoryFormat;
 
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1842,16 +1846,17 @@ mod tests {
         let branch = BranchId::from(uuid::Uuid::now_v7());
         let token = RepositoryWriteToken::acquire(&repository_path).await;
         let repository = Arc::new(
-            RepositoryContext::new(
-                Some(repository_path.clone()),
-                immutable.clone(),
-                faulting_mutable.clone(),
-                repository_id,
+            RepositoryContext::new(RepositoryContextCreationArgs {
+                path: Some(repository_path.clone()),
+                immutable_store: immutable.clone(),
+                mutable_store: faulting_mutable.clone(),
+                id: repository_id,
                 instance_id,
-                Err(ProtocolError::from(NoRemote)),
-                Arc::default(),
-                RepositoryFormat::Lore,
-            )
+                remote: Err(ProtocolError::from(NoRemote)),
+                filter: Arc::default(),
+                format: RepositoryFormat::Lore,
+                filesystem_provider: None,
+            })
             .with_write_token(token),
         );
 
@@ -1921,16 +1926,17 @@ mod tests {
             .await
             .expect("reopen disk-backed mutable store"),
         );
-        let reopened_repository = Arc::new(RepositoryContext::new(
-            Some(repository_path),
-            immutable,
-            reopened_mutable,
-            repository_id,
+        let reopened_repository = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
+            path: Some(repository_path),
+            immutable_store: immutable,
+            mutable_store: reopened_mutable,
+            id: repository_id,
             instance_id,
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            RepositoryFormat::Lore,
-        ));
+            remote: Err(ProtocolError::from(NoRemote)),
+            filter: Arc::default(),
+            format: RepositoryFormat::Lore,
+            filesystem_provider: None,
+        }));
         let reopened = commit::ExactAnchorSnapshot {
             branch_latest: branch::load_latest(reopened_repository.clone(), branch)
                 .await

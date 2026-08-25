@@ -1,10 +1,15 @@
 ---
-status: proposed
+status: superseded by [ADR-00018](00018-fragment-metadata-on-s3-objects.md)
 date: 2026-06-20
 deciders: Khurram Virani
 ---
 
 # ADR-00011: Per-repository storage isolation in the AWS store
+
+> **Fork note (2026-08-07): retired.** The unused bucket-resolver and partition-scoped dedup
+> implementation was removed while merging upstream 0.8.7. Lorehub's deployed Postgres-mode cells
+> use one configured regional object bucket shared by all repositories, with global byte dedup in
+> that cell. This document remains only as the historical rationale for an option we did not adopt.
 
 ## Context and Problem Statement
 

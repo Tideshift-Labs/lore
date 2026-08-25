@@ -125,8 +125,11 @@ message TreeNode {
   NodeType node_type = 2;
   // Content address for FILE / LINK entries; unused for DIRECTORY.
   lore.model.v1.Address address = 3;
-  // Original size in bytes. For DIRECTORY entries, this is the cumulative size of its descendant files.
-  uint64 size = 4;
+  // Original file content size in bytes. Lorehub servers leave this unset for
+  // DIRECTORY and LINK entries so tag 4 retains the fork's file-byte contract.
+  // Older servers never set this, so consumers must treat unset as unknown; a
+  // present value of 0 is a real zero-byte file.
+  optional uint64 size = 4;
   // File mode for this entry. For possible flags and values, see enum FileMode.
   uint64 mode = 5;
   // True when a link entry tracks its parent's branch; false for pinned links
@@ -162,7 +165,7 @@ message Revision {
   optional Parent parent_other = 9;
   // Per-branch revision number.
   uint64 number = 10;
-  // Total content length in bytes of every FILE in this revision's tree
+  // FORK-LOCAL (Lorehub): total content length in bytes of every FILE in this revision's tree
   // (the recursive sum carried on the root node). Lets callers show a
   // repository "size" stat without walking the tree. Unset on older
   // servers that do not compute it; treat unset as unknown.

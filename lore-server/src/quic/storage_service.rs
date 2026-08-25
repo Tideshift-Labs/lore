@@ -488,6 +488,7 @@ impl QuicService for StorageService {
         // rather than silently fall through to "ungated".
         match &request {
             ParsedStorageRequest::Put(_) => self.require_write(&context, "Put")?,
+            ParsedStorageRequest::PutResolved(_) => self.require_write(&context, "PutResolved")?,
             ParsedStorageRequest::Copy(_) => self.require_write(&context, "Copy")?,
             ParsedStorageRequest::MutableStoreOp(_) => {
                 self.require_write(&context, "MutableStore")?
@@ -499,6 +500,7 @@ impl QuicService for StorageService {
             // Reads (and Verify without heal) are ungated.
             ParsedStorageRequest::Verify(_)
             | ParsedStorageRequest::Get(_)
+            | ParsedStorageRequest::GetResolved(_)
             | ParsedStorageRequest::GetMetadata(_)
             | ParsedStorageRequest::Query(_)
             | ParsedStorageRequest::MutableLoad(_)
@@ -602,6 +604,21 @@ mod tests {
             _kid: &str,
         ) -> Result<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm), JWKServiceError> {
             unreachable!("require_write's fail-closed path never verifies a token")
+        }
+
+        fn get_cached_key(
+            &self,
+            _kid: &str,
+        ) -> Option<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm)> {
+            unreachable!("require_write's fail-closed path never reads a cached key")
+        }
+
+        async fn refresh_key(
+            &self,
+            _kid: &str,
+        ) -> Result<Option<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>
+        {
+            unreachable!("require_write's fail-closed path never refreshes a key")
         }
     }
 

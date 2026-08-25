@@ -103,14 +103,6 @@ pub async fn handler(
         return Err(Status::invalid_argument("Missing repository ID"));
     }
 
-    // Scope the CAS to the caller's repository — see RepositoryMetadataGet.
-    // RepositoryService rides the authn-only interceptor (UCS-13506), so the
-    // body repository id carries no upstream authorization; re-check it before
-    // any mutation. Auth-OFF (no auth_url) leaves behavior unchanged.
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, repository_id.into()).await?;
-    }
-
     let expected_hash: Hash = req.expected_hash.into();
     let new_hash: Hash = req.new_hash.into();
 
@@ -270,6 +262,10 @@ mod tests {
         let (immutable, mutable, _) = test_store_create().await.unwrap();
         let mut mock = MockAuthorizer::new();
         mock.expect_check_repository_access()
+            .withf(|authorization, repository_id| {
+                authorization.is_none() && repository_id == &RepositoryId::from(REPOSITORY_ID)
+            })
+            .times(1)
             .returning(|_, _| Err(Status::permission_denied("denied")));
         let request = Request::new(RepositoryMetadataSetRequest {
             repository_id: REPOSITORY_ID.to_vec().into(),

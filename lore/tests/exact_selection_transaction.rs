@@ -20,6 +20,7 @@ mod tests {
     use lore_revision::interface::LoreEvent;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
+    use lore_revision::repository::LoreSharedStoreMode;
     use lore_revision::repository::RepositoryWriteToken;
 
     use super::test_util::TempDir;
@@ -38,7 +39,7 @@ mod tests {
             repository_url: format!("lore://localhost/{}", uuid::Uuid::now_v7()).into(),
             id: LoreString::default(),
             description: LoreString::default(),
-            use_shared_store: 0,
+            use_shared_store: LoreSharedStoreMode::Disabled,
             shared_store_path: LoreString::default(),
         };
         assert_eq!(

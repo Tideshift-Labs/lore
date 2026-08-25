@@ -1044,6 +1044,7 @@ async fn commit_link_only(
             Arc::new(HashMap::new()),
             level.branch,
             stats,
+            None,
         )
         .await?;
 
@@ -1149,7 +1150,7 @@ pub(crate) async fn build_commit_metadata(
 /// the tip observed for `branch`, not the revision the caller built on: a prior
 /// link commit can advance the branch without committing the parent, which
 /// leaves that pin stale.
-async fn finalize_commit(
+pub(crate) async fn finalize_commit(
     repository: Arc<RepositoryContext>,
     state_current: &Arc<State>,
     state_staged: &Arc<State>,
@@ -2467,7 +2468,12 @@ async fn commit_file(
 
             if let Some(admission) = &exact_admission
                 && admission.requires_content(relative_path.as_str())
-                && let Err(err) = tokio::fs::File::open(absolute_path.as_path()).await
+                && let Err(err) = lore_io::IoDriver::global()
+                    .open(
+                        absolute_path.as_path(),
+                        &lore_io::OpenOptions::new().read(true),
+                    )
+                    .await
             {
                 admission.store_pre_fragmentation_read_failure(relative_path.as_str(), &err);
                 return Err(CommitError::internal(format!(

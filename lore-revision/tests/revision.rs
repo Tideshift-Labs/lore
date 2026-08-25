@@ -7,9 +7,11 @@ mod tests {
 
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Address;
+    use lore_base::types::Hash;
     use lore_revision::change;
     use lore_revision::change::NodeChange;
     use lore_revision::change::NodeChangeState;
+    use lore_revision::history;
     use lore_revision::lore::RepositoryId;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;

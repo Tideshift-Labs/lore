@@ -38,6 +38,8 @@ use super::branch_metadata_set;
 use super::branch_push;
 use super::revision_list;
 use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::get_repository;
+use crate::grpc::require_permission;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 

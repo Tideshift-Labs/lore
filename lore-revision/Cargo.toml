@@ -69,6 +69,7 @@ windows-sys = { workspace = true, features = ["Win32_Storage_ProjectedFileSystem
 [dev-dependencies]
 # The non-self-describing format an event crosses the service boundary in.
 bitcode = { workspace = true }
+ctor = { workspace = true }
 lore-storage = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }

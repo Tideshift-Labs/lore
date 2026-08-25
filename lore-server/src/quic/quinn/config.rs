@@ -211,6 +211,9 @@ impl QuinnConfigBuilder {
             Some(socket) => socket.local_addr()?,
             None => self.address.ok_or(anyhow!("Address was not set"))?,
         };
+        let connection_registry = self
+            .connection_registry
+            .unwrap_or_else(|| ConnectionRegistry::new(&self.server_metrics_name));
 
         Ok(QuinnConfig {
             server_metrics_name: self.server_metrics_name,

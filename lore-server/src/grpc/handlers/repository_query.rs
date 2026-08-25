@@ -366,7 +366,7 @@ pub(crate) mod authz_test_support {
             .expect("bind ephemeral port");
         let addr = listener.local_addr().expect("read local_addr");
 
-        tokio::spawn(async move {
+        lore_base::lore_spawn!(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
             let _ = tonic::transport::Server::builder()
                 .add_service(StubAuthService {

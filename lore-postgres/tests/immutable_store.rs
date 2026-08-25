@@ -72,7 +72,9 @@ use lore_storage::FragmentReference;
 use lore_storage::Hash;
 use lore_storage::ImmutableStore;
 use lore_storage::Partition;
+use lore_storage::StoreError;
 use lore_storage::StoreMatch;
+use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
 use lore_storage::StoreRepositoryStats;
 use lore_storage::TypedBytesMut;
@@ -340,6 +342,33 @@ async fn put_fragment(
     (frag, payload)
 }
 
+async fn get_payload(
+    store: Arc<PostgresImmutableStore>,
+    partition: Partition,
+    address: Address,
+) -> Result<(Fragment, Bytes), StoreError> {
+    store.get(partition, address).await?.into_payload()
+}
+
+async fn query_addresses(
+    store: Arc<PostgresImmutableStore>,
+    partition: Partition,
+    addresses: &[Address],
+) -> Result<Vec<StoreMatchResult>, StoreError> {
+    let mut results = vec![StoreMatchResult::default(); addresses.len()];
+    store.query(partition, addresses, &mut results).await?;
+    Ok(results)
+}
+
+async fn query_one(
+    store: Arc<PostgresImmutableStore>,
+    partition: Partition,
+    address: Address,
+) -> Result<StoreMatchResult, StoreError> {
+    let mut results = query_addresses(store, partition, &[address]).await?;
+    Ok(results.remove(0))
+}
+
 // ─── tests ────────────────────────────────────────────────────────────────────
 
 /// 1. Round-trip / byte-perfect: `put` then `get` returns an identical
@@ -376,9 +405,7 @@ async fn round_trip_byte_perfect() {
         "the S3 object must carry the authoritative fragment metadata"
     );
 
-    let (frag_out, payload_out) = s
-        .clone()
-        .get(partition, address, StoreMatch::MatchFull)
+    let (frag_out, payload_out) = get_payload(s.clone(), partition, address)
         .await
         .expect("get after put");
 
@@ -393,14 +420,252 @@ async fn round_trip_byte_perfect() {
     );
 }
 
-/// 2. Existence levels.
+/// `get_metadata` spends a `HeadObject` to return the authoritative stored
+/// representation and an exact partition/context match without reading bytes.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn get_metadata_returns_the_stored_fragment_and_full_match() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let partition: Partition = rand::random();
+    let address: Address = rand::random();
+    let (fragment, _) = put_fragment(store.clone(), partition, address, 1024).await;
+
+    let result = store
+        .get_metadata(partition, address)
+        .await
+        .expect("get_metadata after put");
+
+    assert_eq!(result.fragment, stored_durable(fragment));
+    assert_eq!(result.match_made, StoreMatch::MatchFull);
+}
+
+/// Query stays S3-free and reports only lifecycle/durability state, while
+/// metadata-only and full reads recover representation from the object. None
+/// of the three trusts the rebuildable Postgres metering projection.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn reads_ignore_a_corrupted_metering_projection() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let partition: Partition = rand::random();
+    let address: Address = rand::random();
+    let (fragment, payload) = put_fragment(store.clone(), partition, address, 1536).await;
+
+    let client = pg_client(&pg).await;
+    client
+        .execute(
+            "UPDATE lore_fragment_metering \
+             SET payload_flags = $1, size_payload = $2, size_content = $3 WHERE hash = $4",
+            &[&7_i64, &1_i64, &2_i64, &address.hash.data().as_slice()],
+        )
+        .await
+        .expect("corrupt metering projection");
+
+    let query = query_one(store.clone(), partition, address)
+        .await
+        .expect("query with corrupted projection");
+    let metadata = store
+        .clone()
+        .get_metadata(partition, address)
+        .await
+        .expect("get_metadata with corrupted projection");
+    let (read_fragment, read_payload) = get_payload(store.clone(), partition, address)
+        .await
+        .expect("get with corrupted projection");
+
+    assert_eq!(
+        query.match_made,
+        StoreMatch::MatchFull,
+        "query must remain S3-free and report the exact association"
+    );
+    assert!(query.stored_durable, "query must report durable storage");
+    assert_eq!(
+        metadata.fragment,
+        stored_durable(fragment),
+        "get_metadata must use S3 metadata"
+    );
+    assert_eq!(
+        read_fragment,
+        stored_durable(fragment),
+        "get must use S3 metadata"
+    );
+    assert_eq!(
+        read_payload, payload,
+        "get must still return the object bytes"
+    );
+}
+
+/// An associated object without Lore metadata cannot fall back to Postgres.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn object_without_fragment_metadata_is_an_error() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let partition: Partition = rand::random();
+    let address: Address = rand::random();
+    let (_, payload) = put_fragment(store.clone(), partition, address, 384).await;
+
+    make_s3(&ep, &region)
+        .await
+        .put_object(&bucket, &object_key(address.hash), payload, None)
+        .await
+        .expect("replace object without metadata");
+
+    let error = store
+        .get_metadata(partition, address)
+        .await
+        .expect_err("missing object metadata must not fall back to Postgres");
+    delete_hash_rows(&pg, address.hash).await;
+    assert!(error.is_internal(), "expected Internal, got {error:?}");
+}
+
+/// Malformed Lore metadata is a corrupt authoritative object, not absence and
+/// not a signal to consult the metering projection.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn malformed_object_fragment_metadata_is_an_error() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let partition: Partition = rand::random();
+    let address: Address = rand::random();
+    let (_, payload) = put_fragment(store.clone(), partition, address, 384).await;
+    let malformed = std::collections::HashMap::from([(
+        "lore-fragment".to_string(),
+        "not:a:fragment".to_string(),
+    )]);
+
+    make_s3(&ep, &region)
+        .await
+        .put_object(&bucket, &object_key(address.hash), payload, Some(malformed))
+        .await
+        .expect("replace object with malformed metadata");
+
+    let error = store
+        .get_metadata(partition, address)
+        .await
+        .expect_err("malformed object metadata must not fall back to Postgres");
+    delete_hash_rows(&pg, address.hash).await;
+    assert!(error.is_internal(), "expected Internal, got {error:?}");
+}
+
+/// An exact already-associated Stored put is a pure idempotent hot path. It
+/// succeeds without payload proof and without consulting an object that has
+/// disappeared after the original write.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn exact_associated_put_without_payload_is_s3_free() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let partition: Partition = rand::random();
+    let address: Address = rand::random();
+    let (fragment, _) = put_fragment(store.clone(), partition, address, 512).await;
+    make_s3(&ep, &region)
+        .await
+        .delete_object(&bucket, &object_key(address.hash), None)
+        .await
+        .expect("remove object after initial put");
+
+    let result = store.put(partition, address, fragment, None, false).await;
+    delete_hash_rows(&pg, address.hash).await;
+
+    result.expect("exact associated put must not consult S3");
+}
+
+/// A payload-bearing first association overwrites any row-less orphan object,
+/// even if that orphan predates object metadata or carries malformed metadata.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn payload_put_overwrites_untrusted_rowless_orphan_objects() {
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let store = make_store(&pg, &ep, &bucket, &region).await;
+    let s3 = make_s3(&ep, &region).await;
+    let malformed = std::collections::HashMap::from([(
+        "lore-fragment".to_string(),
+        "not:a:fragment".to_string(),
+    )]);
+
+    for orphan_metadata in [None, Some(malformed)] {
+        let partition: Partition = rand::random();
+        let address: Address = rand::random();
+        let (fragment, payload) = make_fragment_and_payload(640);
+        s3.put_object(
+            &bucket,
+            &object_key(address.hash),
+            Bytes::from(vec![0xEE; 17]),
+            orphan_metadata,
+        )
+        .await
+        .expect("seed row-less orphan object");
+
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload.clone()), false)
+            .await
+            .expect("payload put must overwrite untrusted orphan");
+        let (read_fragment, read_payload) = get_payload(store.clone(), partition, address)
+            .await
+            .expect("read overwritten orphan");
+
+        assert_eq!(read_fragment, stored_durable(fragment));
+        assert_eq!(read_payload, payload);
+        assert_eq!(metering_fragment(&pg, address.hash).await, Some(fragment));
+        delete_hash_rows(&pg, address.hash).await;
+        s3.delete_object(&bucket, &object_key(address.hash), None)
+            .await
+            .expect("remove overwritten orphan fixture");
+    }
+}
+
+/// 2. Query match levels.
 ///
 /// After a full put:
-/// - `exist(MatchFull)` on the exact address → `MatchFull`.
-/// - `exist(MatchHash)` for the same hash under a DIFFERENT partition → `MatchHash`
+/// - `query` on the exact address reports `MatchFull`.
+/// - `query` for the same hash under a DIFFERENT partition reports `MatchHash`
 ///   (global dedup: hash is visible across partitions via the index on `hash` alone).
-/// - `exist(MatchFull)` for a random never-put hash → `MatchNone`.
-/// - `query` returns the stored `Fragment` with `match_made == MatchFull`.
+/// - `query` for a random never-put hash reports `MatchNone`.
 #[tokio::test]
 #[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
@@ -419,22 +684,22 @@ async fn existence_levels() {
     put_fragment(s.clone(), partition, address, 1024).await;
 
     // Full match on the exact address.
-    let m = s
-        .clone()
-        .exist(partition, address, StoreMatch::MatchFull)
+    let m = query_one(s.clone(), partition, address)
         .await
-        .expect("exist MatchFull");
-    assert_eq!(m, StoreMatch::MatchFull, "exact address must be MatchFull");
+        .expect("query exact association");
+    assert_eq!(
+        m.match_made,
+        StoreMatch::MatchFull,
+        "exact address must be MatchFull"
+    );
 
     // The hash is globally visible — a different partition with MatchHash finds it.
     let other_partition: Partition = rand::random();
-    let m_hash = s
-        .clone()
-        .exist(other_partition, address, StoreMatch::MatchHash)
+    let m_hash = query_one(s.clone(), other_partition, address)
         .await
-        .expect("exist MatchHash cross-partition");
+        .expect("query cross-partition hash");
     assert_eq!(
-        m_hash,
+        m_hash.match_made,
         StoreMatch::MatchHash,
         "same hash under different partition must be MatchHash (global dedup)"
     );
@@ -444,29 +709,15 @@ async fn existence_levels() {
         hash: rand::random(),
         context: rand::random(),
     };
-    let m_absent = s
-        .clone()
-        .exist(partition, absent, StoreMatch::MatchFull)
+    let m_absent = query_one(s.clone(), partition, absent)
         .await
-        .expect("exist absent MatchFull");
+        .expect("query absent address");
     assert_eq!(
-        m_absent,
+        m_absent.match_made,
         StoreMatch::MatchNone,
         "never-put hash must be MatchNone"
     );
-
-    // query returns the correct fragment with the right match_made.
-    let q = s
-        .clone()
-        .query(partition, address, StoreMatch::MatchFull)
-        .await
-        .expect("query");
-    assert_eq!(q.match_made, StoreMatch::MatchFull, "query match_made");
-    assert_eq!(
-        q.fragment,
-        stored_durable(Fragment::default()),
-        "query must not spend an S3 request for representation metadata"
-    );
+    assert!(m.stored_durable, "query must report durable storage");
 }
 
 /// 3. Dedup behavior — same partition, same hash, different context.
@@ -516,9 +767,7 @@ async fn dedup_same_partition_requires_payload() {
         .await
         .expect("same-partition same-hash different-context put WITH payload must succeed");
 
-    let (_, payload_out) = s
-        .clone()
-        .get(partition, addr2, StoreMatch::MatchFull)
+    let (_, payload_out) = get_payload(s.clone(), partition, addr2)
         .await
         .expect("get addr2 after dedup-with-payload put");
     assert_eq!(
@@ -753,20 +1002,20 @@ async fn same_hash_with_different_logical_size_is_rejected() {
     );
     assert_eq!(metering_fragment(&pg, hash).await, Some(fragment_a));
     assert_eq!(
-        store
-            .exist(partition_b, address_b, StoreMatch::MatchFull)
+        query_one(store, partition_b, address_b)
             .await
-            .expect("check rejected association"),
+            .expect("check rejected association")
+            .match_made,
         StoreMatch::MatchNone
     );
 }
 
-/// 4. `exist_batch` over a mix of present and absent addresses returns the
+/// 4. `query` over a mix of present and absent addresses returns the
 ///    per-index matches in the correct order.
 #[tokio::test]
 #[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
-async fn exist_batch_mixed() {
+async fn query_batch_mixed() {
     let Some((pg, ep, bucket, region)) = env_config() else {
         eprintln!(
             "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
@@ -786,16 +1035,26 @@ async fn exist_batch_mixed() {
 
     // Order: [present, absent, present] — confirms index ordering is preserved.
     let addresses = [present1, absent, present2];
-    let results = s
-        .clone()
-        .exist_batch(partition, &addresses, StoreMatch::MatchFull)
+    let results = query_addresses(s.clone(), partition, &addresses)
         .await
-        .expect("exist_batch");
+        .expect("batch query");
 
     assert_eq!(results.len(), 3, "result count must match address count");
-    assert_eq!(results[0], StoreMatch::MatchFull, "present1 → MatchFull");
-    assert_eq!(results[1], StoreMatch::MatchNone, "absent → MatchNone");
-    assert_eq!(results[2], StoreMatch::MatchFull, "present2 → MatchFull");
+    assert_eq!(
+        results[0].match_made,
+        StoreMatch::MatchFull,
+        "present1 → MatchFull"
+    );
+    assert_eq!(
+        results[1].match_made,
+        StoreMatch::MatchNone,
+        "absent → MatchNone"
+    );
+    assert_eq!(
+        results[2].match_made,
+        StoreMatch::MatchFull,
+        "present2 → MatchFull"
+    );
 }
 
 /// 5. `copy`: put a fragment, copy it to a new (partition, context), then
@@ -833,9 +1092,7 @@ async fn copy_fragment() {
         hash: src_addr.hash,
         context: dst_context,
     };
-    let (_, payload_out) = s
-        .clone()
-        .get(dst_partition, dst_addr, StoreMatch::MatchFull)
+    let (_, payload_out) = get_payload(s.clone(), dst_partition, dst_addr)
         .await
         .expect("get after copy");
     assert_eq!(
@@ -884,17 +1141,12 @@ async fn obliterate_single_association() {
 
     // Association row deleted → get must error.
     assert!(
-        s.clone()
-            .get(partition, address, StoreMatch::MatchFull)
-            .await
-            .is_err(),
+        get_payload(s.clone(), partition, address).await.is_err(),
         "get after obliterate must error"
     );
 
     // query must return MatchNone (association gone).
-    let q = s
-        .clone()
-        .query(partition, address, StoreMatch::MatchFull)
+    let q = query_one(s.clone(), partition, address)
         .await
         .expect("query after obliterate must not panic");
     assert_eq!(
@@ -970,17 +1222,12 @@ async fn obliterate_refcount_keeps_other_association() {
 
     // addr1 gone.
     assert!(
-        s.clone()
-            .get(partition, addr1, StoreMatch::MatchFull)
-            .await
-            .is_err(),
+        get_payload(s.clone(), partition, addr1).await.is_err(),
         "get addr1 after obliterate must error"
     );
 
     // addr2 still has its bytes intact.
-    let (_, payload_out) = s
-        .clone()
-        .get(partition, addr2, StoreMatch::MatchFull)
+    let (_, payload_out) = get_payload(s.clone(), partition, addr2)
         .await
         .expect("get addr2 after partial obliterate must succeed");
     assert_eq!(
@@ -1145,7 +1392,7 @@ async fn obliterate_deletes_more_than_one_thousand_object_versions() {
         s3.put_object(
             &isolated_bucket,
             &key,
-            payload.to_vec(),
+            payload.clone(),
             Some(to_object_metadata(&fragment)),
         )
         .await
@@ -1272,22 +1519,16 @@ async fn put_racing_last_association_obliterate_preserves_a_complete_payload() {
             .expect("put retry after obliteration must resurrect the payload");
     }
     assert_eq!(
-        store
-            .clone()
-            .exist(source_partition, source_address, StoreMatch::MatchFull,)
+        query_one(store.clone(), source_partition, source_address)
             .await
-            .expect("check source association"),
+            .expect("check source association")
+            .match_made,
         StoreMatch::MatchNone
     );
-    let (stored_fragment, stored_payload) = store
-        .clone()
-        .get(
-            destination_partition,
-            destination_address,
-            StoreMatch::MatchFull,
-        )
-        .await
-        .expect("new association must have complete bytes");
+    let (stored_fragment, stored_payload) =
+        get_payload(store.clone(), destination_partition, destination_address)
+            .await
+            .expect("new association must have complete bytes");
     assert_eq!(stored_fragment, stored_durable(fragment));
     assert_eq!(stored_payload, expected_payload);
     assert_eq!(
@@ -1356,33 +1597,22 @@ async fn copy_racing_last_association_obliterate_never_dangles() {
     let (copy_result, obliterate_result) = tokio::join!(copy, obliterate);
     obliterate_result.expect("source obliteration");
 
-    let destination_match = store
-        .clone()
-        .exist(
-            destination_partition,
-            destination_address,
-            StoreMatch::MatchFull,
-        )
+    let destination_match = query_one(store.clone(), destination_partition, destination_address)
         .await
         .expect("check destination association");
     if copy_result.is_ok() {
-        assert_eq!(destination_match, StoreMatch::MatchFull);
-        let (stored_fragment, _) = store
-            .clone()
-            .get(
-                destination_partition,
-                destination_address,
-                StoreMatch::MatchFull,
-            )
-            .await
-            .expect("successful copy must retain bytes");
+        assert_eq!(destination_match.match_made, StoreMatch::MatchFull);
+        let (stored_fragment, _) =
+            get_payload(store.clone(), destination_partition, destination_address)
+                .await
+                .expect("successful copy must retain bytes");
         assert_eq!(stored_fragment, stored_durable(fragment));
         assert_eq!(
             metering_fragment(&pg, source_address.hash).await,
             Some(fragment)
         );
     } else {
-        assert_eq!(destination_match, StoreMatch::MatchNone);
+        assert_eq!(destination_match.match_made, StoreMatch::MatchNone);
         assert_eq!(metering_fragment(&pg, source_address.hash).await, None);
     }
 }
@@ -1405,17 +1635,14 @@ async fn get_never_put_address_errors() {
     let partition: Partition = rand::random();
     let address: Address = rand::random();
 
-    let result = s
-        .clone()
-        .get(partition, address, StoreMatch::MatchFull)
-        .await;
+    let result = get_payload(s, partition, address).await;
     assert!(
         result.is_err(),
         "get on a never-put address must return an error, not Ok"
     );
 }
 
-/// 8. `exist_batch` (B3 batched query) — order preservation and correctness.
+/// 8. Batched `query` (B3) — order preservation and correctness.
 ///
 /// The B3 rewrite collapses N per-address probes into a single
 /// `hash = ANY($1)` query and reconstructs the per-index result from a
@@ -1425,7 +1652,7 @@ async fn get_never_put_address_errors() {
 #[tokio::test]
 #[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 #[serial]
-async fn exist_batch_order_preservation() {
+async fn query_batch_order_preservation() {
     let Some((pg, ep, bucket, region)) = env_config() else {
         eprintln!(
             "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
@@ -1452,39 +1679,53 @@ async fn exist_batch_order_preservation() {
     // Interleaved slice: [present0, absent0, present1, absent1, present2].
     let addresses = [present0, absent0, present1, absent1, present2];
 
-    // --- MatchHash batch ---
-    // MatchHash is global (no partition filter) so any put hash in the DB
-    // returns MatchHash regardless of which partition it was stored under.
-    let results = s
-        .clone()
-        .exist_batch(partition, &addresses, StoreMatch::MatchHash)
+    // Exact associations report the best match rather than confirming a requested level.
+    let results = query_addresses(s.clone(), partition, &addresses)
         .await
-        .expect("exist_batch MatchHash");
+        .expect("batch query");
 
     assert_eq!(
         results.len(),
         5,
         "result length must equal address slice length"
     );
-    assert_eq!(results[0], StoreMatch::MatchHash, "present0 → MatchHash");
-    assert_eq!(results[1], StoreMatch::MatchNone, "absent0 → MatchNone");
-    assert_eq!(results[2], StoreMatch::MatchHash, "present1 → MatchHash");
-    assert_eq!(results[3], StoreMatch::MatchNone, "absent1 → MatchNone");
-    assert_eq!(results[4], StoreMatch::MatchHash, "present2 → MatchHash");
+    assert_eq!(
+        results[0].match_made,
+        StoreMatch::MatchFull,
+        "present0 → MatchFull"
+    );
+    assert_eq!(
+        results[1].match_made,
+        StoreMatch::MatchNone,
+        "absent0 → MatchNone"
+    );
+    assert_eq!(
+        results[2].match_made,
+        StoreMatch::MatchFull,
+        "present1 → MatchFull"
+    );
+    assert_eq!(
+        results[3].match_made,
+        StoreMatch::MatchNone,
+        "absent1 → MatchNone"
+    );
+    assert_eq!(
+        results[4].match_made,
+        StoreMatch::MatchFull,
+        "present2 → MatchFull"
+    );
 
     // --- empty input short-circuit ---
-    let empty_results = s
-        .clone()
-        .exist_batch(partition, &[], StoreMatch::MatchHash)
+    let empty_results = query_addresses(s.clone(), partition, &[])
         .await
-        .expect("exist_batch empty MatchHash");
+        .expect("empty batch query");
     assert!(
         empty_results.is_empty(),
         "empty address slice must return empty Vec"
     );
 
     // --- MatchFull batch: same hash, different context ---
-    // put at (hash, ctxA); exist_batch MatchFull over [(hash,ctxA), (hash,ctxB)].
+    // put at (hash, ctxA); query over [(hash,ctxA), (hash,ctxB)].
     // Only the exact (hash, context) pair matches; the other context returns MatchNone.
     let hash: Hash = rand::random();
     let ctx_a: Context = rand::random();
@@ -1499,20 +1740,18 @@ async fn exist_batch_order_preservation() {
     };
     put_fragment(s.clone(), partition, addr_a, 256).await;
 
-    let full_results = s
-        .clone()
-        .exist_batch(partition, &[addr_a, addr_b], StoreMatch::MatchFull)
+    let full_results = query_addresses(s.clone(), partition, &[addr_a, addr_b])
         .await
-        .expect("exist_batch MatchFull");
+        .expect("exact batch query");
 
     assert_eq!(full_results.len(), 2, "MatchFull result length must be 2");
     assert_eq!(
-        full_results[0],
+        full_results[0].match_made,
         StoreMatch::MatchFull,
         "addr_a (exact match) → MatchFull"
     );
     assert_eq!(
-        full_results[1],
+        full_results[1].match_made,
         StoreMatch::MatchNone,
         "addr_b (same hash, different context) → MatchNone"
     );

@@ -2214,6 +2214,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         // certificate is the authentication, and a generated one would be
         // worthless, so that path keeps demanding a configured triple.
         let generate_ephemeral_cert = security == EndpointSecurity::Untrusted;
+        let internal_registry = ConnectionRegistry::new("internal");
+        drain_state.add_registry(internal_registry.clone());
+
         lore_spawn!(endpoints, {
             let immutable_store = immutable_store.clone();
             let settings = settings.clone();
@@ -2432,6 +2435,42 @@ mod tests {
         }
     }
 
+    mod maintenance_cli {
+        use clap::Parser;
+
+        use super::super::Cli;
+        use super::super::ensure_postgres_rebuild_mode;
+
+        #[test]
+        fn parses_rebuild_postgres_metering_flag() {
+            let cli = Cli::try_parse_from(["loreserver", "--rebuild-postgres-metering"])
+                .expect("maintenance flag should parse");
+
+            assert!(cli.rebuild_postgres_metering);
+        }
+
+        #[test]
+        fn rebuild_postgres_metering_defaults_off() {
+            let cli = Cli::try_parse_from(["loreserver"]).expect("default CLI should parse");
+
+            assert!(!cli.rebuild_postgres_metering);
+        }
+
+        #[test]
+        fn rebuild_refuses_non_postgres_immutable_mode() {
+            let error = ensure_postgres_rebuild_mode("local")
+                .expect_err("maintenance must fail closed for non-Postgres modes");
+
+            assert!(error.to_string().contains("effective mode is 'local'"));
+        }
+
+        #[test]
+        fn rebuild_accepts_postgres_immutable_mode() {
+            ensure_postgres_rebuild_mode("postgres")
+                .expect("Postgres immutable mode should be accepted");
+        }
+    }
+
     mod validate_endpoint_security {
         use std::path::PathBuf;
 
@@ -2528,7 +2567,7 @@ mod tests {
         async fn bounded_timeout_force_aborts_a_stuck_endpoint() {
             let (shutdown_tx, _rx) = watch::channel(false);
             let mut endpoints: JoinSet<anyhow::Result<()>> = JoinSet::new();
-            endpoints.spawn(async {
+            lore_base::lore_spawn!(endpoints, async {
                 std::future::pending::<()>().await;
                 #[allow(unreachable_code)]
                 Ok(())
@@ -2551,7 +2590,7 @@ mod tests {
         async fn bounded_timeout_returns_early_once_endpoint_finishes_on_its_own() {
             let (shutdown_tx, _rx) = watch::channel(false);
             let mut endpoints: JoinSet<anyhow::Result<()>> = JoinSet::new();
-            endpoints.spawn(async {
+            lore_base::lore_spawn!(endpoints, async {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 Ok(())
             });
@@ -2577,7 +2616,7 @@ mod tests {
         async fn unbounded_none_timeout_waits_for_a_slow_endpoint_instead_of_force_aborting() {
             let (shutdown_tx, _rx) = watch::channel(false);
             let mut endpoints: JoinSet<anyhow::Result<()>> = JoinSet::new();
-            endpoints.spawn(async {
+            lore_base::lore_spawn!(endpoints, async {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 Ok(())
             });

@@ -57,6 +57,17 @@ script here (unlike `lorehub`) — the table below is maintained by hand; keep i
 
 | # | Date | Title |
 |---|---|---|
+| 027 | 2026-08-17 | [Atomic resolved-merge finalization](027-atomic-resolved-merge-finalization.md) |
+| 026 | 2026-08-17 | [Exact-selection real-store restoration proof](026-exact-selection-real-store-restoration-proof.md) |
+| 025 | 2026-08-17 | [Exact-selection review hardening](025-exact-selection-review-hardening.md) |
+| 024 | 2026-08-16 | [Atomic exact-selection CLIENT transaction](024-atomic-exact-selection-client-transaction.md) |
+| 023 | 2026-08-16 | [Propagate file-metadata task errors](023-propagate-file-metadata-task-errors.md) |
+| 022 | 2026-08-16 | [Preserve topology during parallel multi-path stage](022-preserve-parallel-stage-topology.md) |
+| 021 | 2026-08-13 | [Treat empty histories as a shared root](021-empty-histories-shared-root.md) |
+| 020 | 2026-08-11 | [Add a regression guard for offline-readability of a fresh clone (WP-105 follow-on)](020-offline-clone-read-pytest-regression-guard.md) |
+| 019 | 2026-08-11 | [Report a delta-block read failure from `revision info` instead of swallowing it](019-report-delta-block-read-failure-revision-info.md) |
+| 018 | 2026-08-10 | [Fix offline-clone state-fragment retention lost in the 0.8.7 merge (WP-105)](018-offline-clone-state-retention-wp105.md) |
+| 017 | 2026-08-07 | [Merge upstream 0.8.7 and make S3 fragment metadata authoritative](017-upstream-0-8-7-s3-authoritative-postgres-store.md) |
 | 016 | 2026-08-06 | [Remote-proven sync repairs named-branch bookkeeping](016-remote-proven-sync-branch-bookkeeping.md) |
 | 015 | 2026-07-29 | [Run upstream revision-tree integration suite after merge](015-run-upstream-revision-tree-integration-suite.md) |
 | 014 | 2026-07-29 | [Merge upstream (33 commits) into `tideshift/main`](014-merge-upstream-33-commits-into-tideshift-main.md) |

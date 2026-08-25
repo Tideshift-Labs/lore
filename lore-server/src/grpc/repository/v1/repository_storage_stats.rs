@@ -81,9 +81,9 @@ mod tests {
     use lore_proto::lore::repository::v1::RepositoryStorageStatsRequest;
     use lore_revision::lore::RepositoryId;
     use lore_storage::ImmutableStore;
-    use lore_storage::StoreMatch;
+    use lore_storage::StoreGetData;
+    use lore_storage::StoreMatchResult;
     use lore_storage::StoreObliterateStats;
-    use lore_storage::StoreQueryResult;
     use lore_storage::errors::NotFound;
     use lore_storage::errors::NotSupported;
     use lore_storage::errors::SlowDown;
@@ -184,30 +184,20 @@ mod tests {
 
     #[async_trait]
     impl ImmutableStore for StatsStubStore {
-        async fn exist(
-            self: Arc<Self>,
-            _partition: lore_storage::Partition,
-            _address: lore_storage::Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreMatch, lore_storage::StoreError> {
-            unimplemented!("not exercised by repository_storage_stats tests")
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            _partition: lore_storage::Partition,
-            _addresses: &[lore_storage::Address],
-            _match_requested: StoreMatch,
-        ) -> Result<Vec<StoreMatch>, lore_storage::StoreError> {
-            unimplemented!("not exercised by repository_storage_stats tests")
-        }
-
         async fn query(
             self: Arc<Self>,
             _partition: lore_storage::Partition,
+            _addresses: &[lore_storage::Address],
+            _results: &mut [StoreMatchResult],
+        ) -> Result<(), lore_storage::StoreError> {
+            unimplemented!("not exercised by repository_storage_stats tests")
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            _partition: lore_storage::Partition,
             _address: lore_storage::Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, lore_storage::StoreError> {
+        ) -> Result<StoreGetData, lore_storage::StoreError> {
             unimplemented!("not exercised by repository_storage_stats tests")
         }
 
@@ -215,8 +205,7 @@ mod tests {
             self: Arc<Self>,
             _partition: lore_storage::Partition,
             _address: lore_storage::Address,
-            _match_required: StoreMatch,
-        ) -> Result<(lore_storage::Fragment, Bytes), lore_storage::StoreError> {
+        ) -> Result<StoreGetData, lore_storage::StoreError> {
             unimplemented!("not exercised by repository_storage_stats tests")
         }
 
@@ -284,6 +273,17 @@ mod tests {
             _partition: lore_storage::Partition,
         ) -> Result<lore_storage::StoreRepositoryStats, lore_storage::StoreError> {
             self.result.clone()
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            _source_partition: lore_storage::Partition,
+            _source_address: lore_storage::Address,
+            _destination_partition: lore_storage::Partition,
+            _destination_context: lore_storage::Context,
+            _durable: bool,
+        ) -> Result<(), lore_storage::StoreError> {
+            unimplemented!("not exercised by repository_storage_stats tests")
         }
     }
 

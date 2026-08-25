@@ -131,6 +131,7 @@ pub use store_types::StoreGetData;
 pub use store_types::StoreMatch;
 pub use store_types::StoreMatchResult;
 pub use store_types::StoreObliterateStats;
+pub use store_types::StoreRepositoryStats;
 pub use typed_bytes::TypedBytes;
 pub use typed_bytes::TypedBytesMut;
 pub use types::Address;

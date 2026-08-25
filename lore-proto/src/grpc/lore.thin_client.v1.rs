@@ -116,9 +116,12 @@ pub struct TreeNode {
     /// Content address for FILE / LINK entries; unused for DIRECTORY.
     #[prost(message, optional, tag = "3")]
     pub address: ::core::option::Option<crate::lore::model::v1::Address>,
-    /// Original size in bytes. For DIRECTORY entries, this is the cumulative size of its descendant files.
-    #[prost(uint64, tag = "4")]
-    pub size: u64,
+    /// Original file content size in bytes. Lorehub servers leave this unset for
+    /// DIRECTORY and LINK entries so tag 4 retains the fork's file-byte contract.
+    /// Older servers never set this, so consumers must treat unset as unknown; a
+    /// present value of 0 is a real zero-byte file.
+    #[prost(uint64, optional, tag = "4")]
+    pub size: ::core::option::Option<u64>,
     /// File mode for this entry. For possible flags and values, see enum FileMode.
     #[prost(uint64, tag = "5")]
     pub mode: u64,
@@ -176,7 +179,7 @@ pub struct Revision {
     /// Per-branch revision number.
     #[prost(uint64, tag = "10")]
     pub number: u64,
-    /// Total content length in bytes of every FILE in this revision's tree
+    /// FORK-LOCAL (Lorehub): total content length in bytes of every FILE in this revision's tree
     /// (the recursive sum carried on the root node). Lets callers show a
     /// repository "size" stat without walking the tree. Unset on older
     /// servers that do not compute it; treat unset as unknown.

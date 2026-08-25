@@ -610,7 +610,7 @@ pub enum PathListingResult {
     ///
     /// The listing yields an entry per child, named relative to the directory (just the
     /// filename, not the full path). [`file_list_item`] turns one into a [`FileListItem`].
-    Directory { listing: lore_io::DirStream },
+    Directory { listing: Box<lore_io::DirStream> },
 
     /// The path was a regular file.
     ///
@@ -676,7 +676,9 @@ pub async fn list_path(path: PathBuf) -> PathListingResult {
     let driver = lore_io::IoDriver::global();
 
     if let Ok(listing) = driver.read_dir(path.as_path()).await {
-        return PathListingResult::Directory { listing };
+        return PathListingResult::Directory {
+            listing: Box::new(listing),
+        };
     }
 
     let Ok(metadata) = driver.metadata(path.as_path()).await else {

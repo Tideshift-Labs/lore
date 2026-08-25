@@ -939,16 +939,170 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use lore_base::error::SlowDown;
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::Context;
+    use lore_base::types::Fragment;
+    use lore_base::types::Partition;
     use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
+    use lore_revision::node::Node;
+    use lore_revision::node::ROOT_NODE;
+    use lore_storage::ImmutableStore;
+    use lore_storage::StoreGetData;
+    use lore_storage::StoreMatchResult;
+    use lore_storage::StoreObliterateStats;
+    use lore_storage::hash::hash_string;
+    use lore_storage::local::immutable_store::ImmutableStoreSettings;
+    use lore_storage::local::immutable_store::LocalImmutableStore;
+    use lore_transport::grpc::REPOSITORY_ID_KEY;
+    use opentelemetry::metrics::Meter;
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
     use rand::random;
+    use tokio::sync::mpsc;
     use tonic::Code;
     use tonic::Request;
     use tonic::metadata::MetadataValue;
     use tonic::transport::server::TcpConnectInfo;
 
     use super::*;
+    use crate::grpc::get_write_token;
     use crate::grpc::server::RevisionListAcceleration;
+    use crate::hooks::Hook;
+    use crate::hooks::HookError;
+    use crate::notification::testing::MockNotificationSender;
     use crate::store::test_store_create;
+
+    struct RecordingInstrumentProvider {
+        meter_provider: SdkMeterProvider,
+        exporter: InMemoryMetricExporter,
+    }
+
+    impl RecordingInstrumentProvider {
+        fn new() -> Self {
+            let exporter = InMemoryMetricExporter::default();
+            let meter_provider = SdkMeterProvider::builder()
+                .with_periodic_exporter(exporter.clone())
+                .build();
+            Self {
+                meter_provider,
+                exporter,
+            }
+        }
+
+        fn counter_value(&self, name: &str) -> u64 {
+            self.meter_provider
+                .force_flush()
+                .expect("metric flush should succeed");
+            let expected_name = format!("{}.{}", self.namespace(), name);
+            let values: Vec<u64> = self
+                .exporter
+                .get_finished_metrics()
+                .expect("metrics should be exported")
+                .iter()
+                .flat_map(|resource| resource.scope_metrics())
+                .flat_map(|scope| scope.metrics())
+                .filter(|metric| metric.name() == expected_name)
+                .map(|metric| match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                        sum.data_points().map(|point| point.value()).sum()
+                    }
+                    data => panic!("expected u64 sum metric, got {data:?}"),
+                })
+                .collect();
+            assert_eq!(
+                values.len(),
+                1,
+                "expected exactly one exported {expected_name} metric"
+            );
+            values[0]
+        }
+    }
+
+    impl InstrumentProvider for RecordingInstrumentProvider {
+        fn namespace(&self) -> &'static str {
+            "test"
+        }
+
+        fn meter(&self) -> Meter {
+            self.meter_provider.meter(self.namespace())
+        }
+    }
+
+    struct RecordingPostHook {
+        sender: mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait]
+    impl Hook for RecordingPostHook {
+        fn name(&self) -> &'static str {
+            "recording-post"
+        }
+
+        fn hook_points(&self) -> &'static [HookPoint] {
+            &[HookPoint::BranchPush]
+        }
+
+        async fn post_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
+            self.sender
+                .send(())
+                .expect("post-hook observation receiver dropped");
+            Ok(())
+        }
+    }
+
+    async fn create_root_branch(
+        repository_context: &Arc<RepositoryContext>,
+        name: &str,
+    ) -> BranchId {
+        let write_token = get_write_token();
+        lore_revision::branch::create(
+            repository_context.clone(),
+            &write_token,
+            BranchId::from(uuid::Uuid::now_v7()),
+            name,
+            branch::default_category(),
+            "test-creator",
+            1,
+            vec![],
+            false,
+            false,
+        )
+        .await
+        .expect("Could not create root branch")
+    }
+
+    async fn build_revision(repository_context: &Arc<RepositoryContext>) -> Hash {
+        let state = State::new();
+        state.set_revision_number(1);
+        state
+            .serialize(repository_context.clone(), &get_write_token())
+            .await
+            .expect("Failed to serialize state")
+    }
+
+    fn make_request(
+        repository: RepositoryId,
+        branch: BranchId,
+        revision: Hash,
+    ) -> Request<BranchPushRequest> {
+        let mut request = Request::new(BranchPushRequest {
+            branch: branch.into(),
+            revision: revision.into(),
+            force: false,
+            fast_forward_merge: false,
+        });
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+        request
+    }
 
     #[test]
     fn use_x_forwarded_when_available() {
@@ -1078,5 +1232,332 @@ mod tests {
             assert_eq!(result.err().unwrap().code(), Code::NotFound);
         }))
         .await;
+    }
+
+    #[tokio::test]
+    async fn no_op_push_does_not_repeat_notification_or_post_hook() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let (notification_tx, mut notification_rx) = mpsc::unbounded_channel();
+        let notification_observer = notification_tx.clone();
+        let mut notification_sender = MockNotificationSender::new();
+        notification_sender
+            .expect_branch_pushed()
+            .times(1)
+            .returning(move |_, _, _, _, _| {
+                notification_observer
+                    .send(())
+                    .expect("notification observation receiver dropped");
+            });
+        let notification_sender = Arc::new(notification_sender);
+        let instrument_provider = RecordingInstrumentProvider::new();
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main").await;
+            let revision = build_revision(&repository_context).await;
+
+            let (hook_tx, mut hook_rx) = mpsc::unbounded_channel();
+            let hook_dispatcher = HookDispatcher::from_hooks_default(vec![(
+                "recording-post".to_string(),
+                Box::new(RecordingPostHook { sender: hook_tx }),
+            )]);
+
+            let first = handler(
+                make_request(repository, main, revision),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &instrument_provider,
+                None,
+            )
+            .await
+            .expect("first push should succeed");
+            assert!(first.into_inner().success);
+            notification_rx
+                .recv()
+                .await
+                .expect("advancing push should publish a notification");
+            hook_rx
+                .recv()
+                .await
+                .expect("advancing push should dispatch a post-hook");
+
+            let repeated = handler(
+                make_request(repository, main, revision),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &instrument_provider,
+                None,
+            )
+            .await
+            .expect("no-op re-push should succeed");
+            assert!(repeated.into_inner().success);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), notification_rx.recv())
+                    .await
+                    .is_err(),
+                "no-op re-push published a notification"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), hook_rx.recv())
+                    .await
+                    .is_err(),
+                "no-op re-push dispatched a post-hook"
+            );
+            assert_eq!(
+                instrument_provider.counter_value("num_branches_pushed"),
+                1,
+                "only the advancing push should increment num_branches_pushed"
+            );
+            drop(notification_tx);
+        }))
+        .await;
+    }
+
+    /// Wraps a real, in-memory `LocalImmutableStore` and, once armed, returns
+    /// `StoreError::SlowDown` from every `query()` call. Delegates everything
+    /// else straight through, so a repository's states can be built normally
+    /// before the fault is armed. Mirrors the fixture pattern in
+    /// `lore-revision/tests/state.rs`.
+    struct SlowDownQueryStore {
+        inner: Arc<LocalImmutableStore>,
+        armed: AtomicBool,
+    }
+
+    impl SlowDownQueryStore {
+        fn wrapping(inner: Arc<LocalImmutableStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                armed: AtomicBool::new(false),
+            })
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ImmutableStore for SlowDownQueryStore {
+        async fn query(
+            self: Arc<Self>,
+            partition: Partition,
+            addresses: &[Address],
+            results: &mut [StoreMatchResult],
+        ) -> Result<(), StoreError> {
+            if self.armed.load(Ordering::SeqCst) {
+                return Err(StoreError::from(SlowDown));
+            }
+            self.inner
+                .clone()
+                .query(partition, addresses, results)
+                .await
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
+        }
+
+        async fn get(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get(partition, address).await
+        }
+
+        async fn put(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            fragment: Fragment,
+            payload: Option<Bytes>,
+            force: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .put(partition, address, fragment, payload, force)
+                .await
+        }
+
+        async fn obliterate(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            stats: Arc<StoreObliterateStats>,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .obliterate(partition, address, stats)
+                .await
+        }
+
+        async fn evict(
+            self: Arc<Self>,
+            max_capacity: usize,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<usize, StoreError> {
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
+        }
+
+        async fn compact(
+            self: Arc<Self>,
+            max_size: usize,
+            at: Option<usize>,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<Option<usize>, StoreError> {
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
+        }
+
+        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().compact_resume_at().await
+        }
+
+        async fn compact_stop(self: Arc<Self>) {
+            self.inner.clone().compact_stop().await
+        }
+
+        fn max_query_batch(&self) -> Option<usize> {
+            self.inner.max_query_batch()
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+
+        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
+            self.inner.clone().verify(heal).await
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: Partition,
+            source_address: Address,
+            destination_partition: Partition,
+            destination_context: Context,
+            durable: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
+                )
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_fragments_maps_slow_down_to_resource_exhausted() {
+        // Reproduces the mismatch this CR fixed: without `.filter_slow_down()?`
+        // on the `collect_new_fragments` call inside `verify_fragments`, a
+        // `StateError::SlowDown` fell through to the generic `warn_map_err`
+        // below it and surfaced as `Status::internal(..)` — the wrong gRPC
+        // code for a condition the client should back off and retry on, and
+        // inconsistent with the `exist_batch` verification loop a few dozen
+        // lines below, which already maps its own SlowDown to
+        // `Status::resource_exhausted(..)`.
+        let (_immutable_store, mutable_store, execution) = crate::store::test_store_create()
+            .await
+            .expect("Failed to create stores");
+        let repository_id: Context = rand::random();
+
+        let status = LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let real_store = LocalImmutableStore::new(None, ImmutableStoreSettings::default())
+                    .await
+                    .expect("Failed to create store");
+                let fault_store = SlowDownQueryStore::wrapping(real_store);
+
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    fault_store.clone(),
+                    mutable_store.clone(),
+                    repository_id.into(),
+                ));
+
+                let write_token = get_write_token();
+
+                let parent_state = Arc::new(State::new());
+                let name = "test-node";
+                let node = Node {
+                    name_hash: hash_string(name),
+                    ..Default::default()
+                };
+                parent_state
+                    .node_add(repository.clone(), ROOT_NODE, node, name)
+                    .await
+                    .expect("Failed to add node");
+                let parent_signature = parent_state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize parent state");
+                let parent_state = State::deserialize(repository.clone(), parent_signature)
+                    .await
+                    .expect("Failed to deserialize parent state");
+
+                // A second, differing state so `verify_fragments` actually has
+                // something to query (an unmodified diff never reaches the
+                // store).
+                let other_name = "other-test-node";
+                let other_node = Node {
+                    name_hash: hash_string(other_name),
+                    ..Default::default()
+                };
+                let state = Arc::new(State::new());
+                state
+                    .node_add(repository.clone(), ROOT_NODE, other_node, other_name)
+                    .await
+                    .expect("Failed to add node");
+                let signature = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize state");
+                let state = State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                fault_store.arm();
+
+                verify_fragments(repository, parent_state, state).await
+            })
+            .await
+            .expect_err("Expected verify_fragments to surface a SlowDown as an error status");
+
+        assert_eq!(
+            status.code(),
+            tonic::Code::ResourceExhausted,
+            "Expected a SlowDown out of collect_new_fragments to map to \
+             resource_exhausted (matching the exist_batch verification loop), \
+             got: {status:?}"
+        );
     }
 }

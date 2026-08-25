@@ -11,6 +11,7 @@ use lore_proto::lore::thin_client::v1::ContentDiffResponse;
 use lore_proto::lore::thin_client::v1::DiffChange;
 use lore_proto::lore::thin_client::v1::DiffConflict;
 use lore_proto::lore::thin_client::v1::DiffPartition;
+use lore_proto::lore::thin_client::v1::FileMode;
 use lore_proto::lore::thin_client::v1::Metadata;
 use lore_proto::lore::thin_client::v1::MetadataType;
 use lore_proto::lore::thin_client::v1::NodeType;
@@ -32,6 +33,7 @@ use lore_proto::lore::thin_client::v1::revision_diff_response::Payload as Revisi
 use lore_proto::lore::thin_client::v1::revision_info_request::Query as RevisionInfoQuery;
 use lore_proto::lore::thin_client::v1::revision_tree_request::Query as RevisionTreeQuery;
 use lore_proto::lore::thin_client::v1::revision_tree_response::Payload as RevisionTreePayload;
+use prost::Message;
 
 #[test]
 fn v1_thin_client_model_types_default() {
@@ -61,6 +63,44 @@ fn v1_thin_client_service_types_default() {
     let _ = RevisionTreeRequest::default();
     let _ = RevisionTreeResponse::default();
     let _ = RevisionTreeHeader::default();
+}
+
+#[test]
+fn tree_node_present_zero_size_uses_optional_tag_four() {
+    let node = TreeNode {
+        size: Some(0),
+        ..Default::default()
+    };
+
+    let encoded = node.encode_to_vec();
+    let decoded = TreeNode::decode(encoded.as_slice()).expect("decode TreeNode");
+
+    assert_eq!(encoded, [0x20, 0x00]);
+    assert_eq!(decoded.size, Some(0));
+}
+
+#[test]
+fn tree_node_executable_mode_uses_tag_five() {
+    let node = TreeNode {
+        mode: FileMode::Executable as u64,
+        ..Default::default()
+    };
+
+    assert_eq!(node.encode_to_vec(), [0x28, 0x01]);
+}
+
+#[test]
+fn revision_present_zero_total_size_uses_optional_tag_eleven() {
+    let revision = Revision {
+        total_size_bytes: Some(0),
+        ..Default::default()
+    };
+
+    let encoded = revision.encode_to_vec();
+    let decoded = Revision::decode(encoded.as_slice()).expect("decode Revision");
+
+    assert_eq!(encoded, [0x58, 0x00]);
+    assert_eq!(decoded.total_size_bytes, Some(0));
 }
 
 /// Field-shape regression net: destructuring each message + naming each

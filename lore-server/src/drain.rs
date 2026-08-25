@@ -602,7 +602,7 @@ mod tests {
         state.add_registry(registry.clone());
 
         let state_for_task = state.clone();
-        let handle = tokio::spawn(async move { state_for_task.wait_idle().await });
+        let handle = lore_base::lore_spawn!(async move { state_for_task.wait_idle().await });
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(
@@ -637,7 +637,7 @@ mod tests {
         let guard = registry.register(MockConn::new(1));
 
         let registry_for_task = registry.clone();
-        let handle = tokio::spawn(async move {
+        let handle = lore_base::lore_spawn!(async move {
             run_drain(&registry_for_task, None, None).await;
         });
 
@@ -687,7 +687,7 @@ mod tests {
         // Keep the healthy connection's frame count moving faster than the
         // stall window so it never looks wedged.
         let progressing_for_bumper = progressing.clone();
-        let bumper = tokio::spawn(async move {
+        let bumper = lore_base::lore_spawn!(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(500));
             loop {
                 ticker.tick().await;
@@ -783,7 +783,7 @@ mod tests {
         assert_eq!(registry.pending(), 1);
 
         let registry_for_task = registry.clone();
-        let handle = tokio::spawn(async move {
+        let handle = lore_base::lore_spawn!(async move {
             run_drain(&registry_for_task, None, None).await;
         });
 
@@ -832,7 +832,7 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let state = DrainState::new();
 
-        let handle = tokio::spawn(shutdown_signal(rx, state, true));
+        let handle = lore_base::lore_spawn!(shutdown_signal(rx, state, true));
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(
@@ -885,7 +885,7 @@ mod tests {
 
         tx.send(true).expect("receiver still alive");
 
-        let handle = tokio::spawn(shutdown_signal(rx, state, true));
+        let handle = lore_base::lore_spawn!(shutdown_signal(rx, state, true));
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(

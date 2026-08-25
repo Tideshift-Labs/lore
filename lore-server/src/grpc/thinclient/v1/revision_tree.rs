@@ -154,20 +154,18 @@ async fn stream_tree(
 
     let mut emitted: u64 = 0;
     for tree_path in result.paths {
-        // Size is only meaningful for files; leave directories and links
-        // unset so consumers can tell "unknown" from a real 0-byte file.
-        let size_bytes = tree_path
-            .flags
-            .contains(lore_revision::node::NodeFlags::File)
-            .then_some(tree_path.size);
+        let node_type = node_flags_to_node_type(tree_path.flags);
         let node = thin_client_v1::TreeNode {
             path: tree_path.path.to_string(),
-            node_type: node_flags_to_node_type(tree_path.flags) as i32,
+            node_type: node_type as i32,
             address: tree_path.address.map(|address| model_v1::Address {
                 hash: address.hash.into(),
                 context: address.context.into(),
             }),
-            size: tree_path.size,
+            // Lorehub's tag-4 contract is file content bytes. Directory subtree
+            // sizes remain available internally, but exposing them here would
+            // make older clients display aggregate bytes as a file size.
+            size: (node_type == thin_client_v1::NodeType::File).then_some(tree_path.size),
             mode: tree_path.mode,
             tracking: tree_path.tracking,
         };
@@ -503,7 +501,7 @@ mod test {
     /// `node.size` up from `fragment.size_content` — see
     /// `commit.rs::commit_nodes` / `stage.rs`), but exercises exactly
     /// the plumbing CR-008 adds: `TreePath.size` <- `node.size` <-
-    /// `TreeNode.size_bytes`.
+    /// `TreeNode.size`.
     async fn push_branch_with_sized_files(
         repository: &Arc<RepositoryContext>,
         files: &[(&str, u64)],
@@ -1628,7 +1626,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn file_size_bytes_reflects_node_content_size() {
+    async fn file_size_reflects_node_content_size() {
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("test stores");
@@ -1665,9 +1663,9 @@ mod test {
 
             let a = nodes.iter().find(|n| n.path == "a.txt").expect("a.txt");
             assert_eq!(
-                a.size_bytes,
+                a.size,
                 Some(123),
-                "FILE size_bytes should reflect the node's content size",
+                "FILE size should reflect the node's content size",
             );
 
             // A genuinely empty file must be `Some(0)`, distinct from
@@ -1677,7 +1675,7 @@ mod test {
                 .find(|n| n.path == "empty.txt")
                 .expect("empty.txt");
             assert_eq!(
-                empty.size_bytes,
+                empty.size,
                 Some(0),
                 "a 0-byte FILE must report Some(0), not None (unknown)",
             );
@@ -1686,7 +1684,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn directory_size_bytes_is_unset() {
+    async fn directory_size_is_unset_for_lorehub_clients() {
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("test stores");
@@ -1719,23 +1717,18 @@ mod test {
 
             let subdir = nodes.iter().find(|n| n.path == "subdir").expect("subdir");
             assert_eq!(subdir.node_type, thin_client_v1::NodeType::Directory as i32);
-            assert_eq!(
-                subdir.size_bytes, None,
-                "DIRECTORY entries must leave size_bytes unset",
-            );
+            assert_eq!(subdir.size, None);
 
-            // Sanity: the files alongside it are still FILE entries (the
-            // push helper doesn't set a content size, so they default to
-            // Some(0) — still distinct from the directory's None).
+            // Sanity: the files alongside it still carry their content size.
             let top = nodes.iter().find(|n| n.path == "top.txt").expect("top.txt");
             assert_eq!(top.node_type, thin_client_v1::NodeType::File as i32);
-            assert_eq!(top.size_bytes, Some(0));
+            assert_eq!(top.size, Some(0));
         }))
         .await;
     }
 
     #[tokio::test]
-    async fn link_size_bytes_is_unset() {
+    async fn link_size_is_unset_for_lorehub_clients() {
         let repository = random::<RepositoryId>();
         let target_repo = random::<RepositoryId>();
         let target_revision = Hash::from(random::<[u8; 32]>());
@@ -1754,6 +1747,7 @@ mod test {
                 target_repo,
                 target_revision,
                 ROOT_NODE,
+                None,
             )
             .await;
 
@@ -1777,10 +1771,7 @@ mod test {
 
             assert_eq!(nodes.len(), 1, "expected exactly the link entry");
             assert_eq!(nodes[0].node_type, thin_client_v1::NodeType::Link as i32);
-            assert_eq!(
-                nodes[0].size_bytes, None,
-                "LINK entries must leave size_bytes unset",
-            );
+            assert_eq!(nodes[0].size, None);
         }))
         .await;
     }
