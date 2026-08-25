@@ -166,45 +166,58 @@ impl MutableStore for PostgresMutableStore {
         let kt = key_type as i16;
         let k = key.data().as_slice();
 
-        // Swap iff the key is absent (no conflict → INSERT proceeds) OR the
-        // existing value equals `expected` (conflict → DO UPDATE WHERE passes).
-        // A returned row ⇒ the swap happened ⇒ return `expected` (matches the
-        // DynamoDB store, which returns `expected` on success).
-        let swapped = client
-            .query_opt(
-                "INSERT INTO lore_mutable (partition, key_type, key, value) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (partition, key_type, key) \
-                 DO UPDATE SET value = EXCLUDED.value \
-                 WHERE lore_mutable.value = $5 \
-                 RETURNING value",
-                &[
-                    &part,
-                    &kt,
-                    &k,
-                    &value.data().as_slice(),
-                    &expected.data().as_slice(),
-                ],
-            )
-            .await
-            .map_err(db_err)?;
+        // A missing key is the zero value. It may therefore be inserted only
+        // when the caller also observed zero; a non-zero expected value on a
+        // missing key is a failed CAS, not permission to create the key.
+        let swapped = if expected.is_zero() {
+            client
+                .query_opt(
+                    "INSERT INTO lore_mutable (partition, key_type, key, value) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (partition, key_type, key) DO NOTHING \
+                     RETURNING value",
+                    &[&part, &kt, &k, &value.data().as_slice()],
+                )
+                .await
+        } else {
+            client
+                .query_opt(
+                    "UPDATE lore_mutable SET value = $4 \
+                     WHERE partition = $1 AND key_type = $2 AND key = $3 AND value = $5 \
+                     RETURNING value",
+                    &[
+                        &part,
+                        &kt,
+                        &k,
+                        &value.data().as_slice(),
+                        &expected.data().as_slice(),
+                    ],
+                )
+                .await
+        }
+        .map_err(db_err)?;
 
         if swapped.is_some() {
             return Ok(expected);
         }
 
-        // Conflict with a different current value — return the actual current so
-        // the caller sees `current != expected` and can retry.
+        // Conflict with a different current value, or a missing key with a
+        // non-zero expectation. Return the actual current value so the caller
+        // sees `current != expected` and can retry.
         let current = client
-            .query_one(
+            .query_opt(
                 "SELECT value FROM lore_mutable \
                  WHERE partition = $1 AND key_type = $2 AND key = $3",
                 &[&part, &kt, &k],
             )
             .await
             .map_err(db_err)?;
-        let current: Vec<u8> = current.get("value");
-        Ok(Hash::from(current.as_slice()))
+        Ok(current
+            .map(|row| {
+                let current: Vec<u8> = row.get("value");
+                Hash::from(current.as_slice())
+            })
+            .unwrap_or_default())
     }
 
     #[tracing::instrument(level = "debug", skip_all)]

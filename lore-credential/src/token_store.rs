@@ -1180,7 +1180,10 @@ async fn get_token_encryption_key() -> Result<Vec<u8>, TokenStoreError> {
     if guard.is_none() {
         *guard = Some(load_or_init_encryption_key().await?);
     }
-    Ok(guard.as_ref().expect("just initialized").clone())
+    guard
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| TokenStoreError::internal("Token encryption key cache was not initialized"))
 }
 
 /// Loads the encryption key from the secure store.

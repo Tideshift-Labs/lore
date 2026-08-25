@@ -1111,6 +1111,32 @@ async fn copy_fragment() {
         },
         "copy must associate the existing projection with the destination repository"
     );
+
+    // A zero source context is the partition-match form: any association of
+    // this hash in the source partition is sufficient.
+    let wildcard_dst_partition: Partition = rand::random();
+    let wildcard_dst_context: Context = rand::random();
+    s.clone()
+        .copy(
+            src_partition,
+            Address {
+                hash: src_addr.hash,
+                context: Context::default(),
+            },
+            wildcard_dst_partition,
+            wildcard_dst_context,
+            false,
+        )
+        .await
+        .expect("copy from partition match");
+    let wildcard_dst_addr = Address {
+        hash: src_addr.hash,
+        context: wildcard_dst_context,
+    };
+    let (_, wildcard_payload) = get_payload(s, wildcard_dst_partition, wildcard_dst_addr)
+        .await
+        .expect("get after partition-match copy");
+    assert_eq!(payload, wildcard_payload);
 }
 
 /// 6a. `obliterate` with a single association: after obliteration, `get` errors

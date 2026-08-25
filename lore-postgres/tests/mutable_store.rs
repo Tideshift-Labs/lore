@@ -88,7 +88,8 @@ async fn mutable_cas_lifecycle() {
         .expect("store null removes");
     assert!(store.clone().load(part, key, kt).await.is_err());
 
-    // CAS on an absent key inserts and reports success (returns expected).
+    // CAS on an absent key with a non-zero expectation does not insert and
+    // reports the actual current value (zero).
     let v4: Hash = rand::random();
     let exp_absent: Hash = rand::random();
     let r = store
@@ -96,7 +97,20 @@ async fn mutable_cas_lifecycle() {
         .compare_and_swap(part, key, exp_absent, v4, kt)
         .await
         .expect("cas absent");
-    assert_eq!(r, exp_absent);
+    assert_eq!(r, Hash::default());
+    assert!(
+        store.clone().load(part, key, kt).await.is_err(),
+        "non-zero expected CAS must not create a missing key"
+    );
+
+    // Zero is the observed value for an absent key, so zero-expected CAS
+    // inserts and reports success.
+    let r = store
+        .clone()
+        .compare_and_swap(part, key, Hash::default(), v4, kt)
+        .await
+        .expect("zero-expected cas absent");
+    assert_eq!(r, Hash::default());
     assert_eq!(
         store.clone().load(part, key, kt).await.expect("load v4"),
         v4
@@ -120,4 +134,24 @@ async fn mutable_cas_lifecycle() {
         2,
         "list returns both keys for the partition+type"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn mutable_store_satisfies_shared_conformance_battery() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping Postgres mutable-store conformance test");
+        return;
+    };
+    let store = Arc::new(
+        PostgresMutableStore::connect(&url, 5, &lore_postgres::pool::TlsConfig::default())
+            .await
+            .expect("connect + schema"),
+    );
+
+    lore_storage::mutable_conformance::verify_mutable_store(
+        store,
+        lore_storage::mutable_conformance::Capabilities::new("PostgresMutableStore"),
+    )
+    .await;
 }

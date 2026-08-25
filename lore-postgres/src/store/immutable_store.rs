@@ -383,6 +383,31 @@ impl PostgresImmutableStore {
         .map_err(db_err)
     }
 
+    /// Resolve the source form accepted by [`ImmutableStore::copy`]: an exact
+    /// context names one association, while zero context names any association
+    /// of the hash in the repository partition.
+    async fn copy_source_exists_tx(
+        tx: &Transaction<'_>,
+        repository: Context,
+        address: Address,
+    ) -> Result<bool, StoreError> {
+        if !address.context.is_zero() {
+            return Self::association_exists_tx(tx, repository, address).await;
+        }
+
+        tx.query_opt(
+            "SELECT 1 FROM lore_fragments \
+             WHERE hash = $1 AND repository = $2 LIMIT 1",
+            &[
+                &address.hash.data().as_slice(),
+                &repository.data().as_slice(),
+            ],
+        )
+        .await
+        .map(|row| row.is_some())
+        .map_err(db_err)
+    }
+
     async fn has_associations_tx(tx: &Transaction<'_>, hash: Hash) -> Result<bool, StoreError> {
         tx.query_opt(
             "SELECT 1 FROM lore_fragments WHERE hash = $1 LIMIT 1",
@@ -1133,7 +1158,7 @@ impl ImmutableStore for PostgresImmutableStore {
         let tx = client.transaction().await.map_err(db_err)?;
         Self::lock_hash(&tx, source_address.hash).await?;
         if Self::load_state_tx(&tx, source_address.hash).await? != Some(FragmentState::Stored)
-            || !Self::association_exists_tx(&tx, source_repository, source_address).await?
+            || !Self::copy_source_exists_tx(&tx, source_repository, source_address).await?
         {
             return Err(StoreError::from(AddressNotFound::from(source_address)));
         }
