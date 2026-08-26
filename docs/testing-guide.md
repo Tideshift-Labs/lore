@@ -237,6 +237,11 @@ will update an older check constraint or state schema.
 - Regenerate protobuf output and `Cargo.lock` from their sources; do not hand-splice generated files.
 - Check which `clippy.toml` governs the crate. A crate-local file shadows rather than extends the
   workspace configuration.
+- After rebasing exact selection over an upstream stage/state rewrite, a compile failure at
+  `file_modified_time_clear` means a normalized `String` path still crosses an API that now requires
+  `RelativePath`. Convert fallibly before clearing the witness, then run
+  `cargo test -p lore-revision --test stage_topology -j 4`; this compiles the seam and exercises the
+  public multi-worker stage-through-commit lifecycle.
 
 ### Deterministic async tests
 

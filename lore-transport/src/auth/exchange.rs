@@ -1768,6 +1768,7 @@ mod tests {
 
         assert_eq!(result.0, refreshed);
         assert_eq!(provider.custom_resource_calls.load(Ordering::SeqCst), 1);
+    }
 
     /// An expired supplied token is still the credential the caller asked for.
     ///

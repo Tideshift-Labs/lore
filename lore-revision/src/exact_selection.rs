@@ -1517,7 +1517,10 @@ pub async fn commit_exact_selection(
     // their timestamp was restored to the cached value.
     for file in &selected {
         if file.row.action != ExpectedFileAction::Delete {
-            state::file_modified_time_clear(repository.clone(), &file.row.path).await;
+            let path = RelativePath::new_from_initial_path(&file.row.path).map_err(|err| {
+                ExactSelectionError::internal("clearing the selected file witness", err)
+            })?;
+            state::file_modified_time_clear(repository.clone(), &path).await;
         }
     }
     stage_state(
