@@ -106,6 +106,12 @@ will update an older check constraint or state schema.
   and `Revision.total_size_bytes` remains optional tag 11. Protobuf field names are not on the wire;
   presence is required so an empty file's zero is encoded. Gates: `lore-proto/tests/v1_thin_client.rs`
   and thin-client revision-tree handler tests.
+- **CR-033 private object dispatch wire [SERVER]**: the package has exactly seven RPCs, 67 messages,
+  and 21 enums. `lore-proto/tests/v1_object_dispatch.rs` fingerprints the whitespace/comment-free
+  declaration stream copied from WP-121, checks both streaming directions and the fork-collision
+  annotation, and compiles against the checked-in client/server exports. Regenerate with `protoc`
+  before accepting a fingerprint change. Gate: `cargo test -p lore-proto --test v1_object_dispatch
+  -j 4`.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.
@@ -235,6 +241,10 @@ will update an older check constraint or state schema.
 - If an untouched file reports an impossible macro/import/rlib error after alternating Clippy and
   test builds, suspect stale incremental state. Clean only the affected crate before escalating.
 - Regenerate protobuf output and `Cargo.lock` from their sources; do not hand-splice generated files.
+- A large prost `oneof` can fail `clippy::large_enum_variant` after generation. Box every large
+  branch through `Config::boxed`; the matching path includes the oneof name
+  (`.package.Message.oneof_name.field_name`), not only the message and field. Regenerate, then pin
+  the checked-in `Box` shapes so a toolchain/configuration drift cannot silently restore the lint.
 - Check which `clippy.toml` governs the crate. A crate-local file shadows rather than extends the
   workspace configuration.
 - After rebasing exact selection over an upstream stage/state rewrite, a compile failure at

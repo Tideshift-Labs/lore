@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::env;
 use std::io::Result;
@@ -165,6 +166,36 @@ fn main() -> Result<()> {
         .compile_with_config(
             config,
             &["./proto/lore/environment/v1/environment.proto"],
+            &["./proto"],
+        )?;
+
+    // FORK-LOCAL (Tideshift, CR-033). This private, server-only package pins the seven
+    // /lore.object_dispatch.v1.ObjectStoreDispatchService/* method paths. Reconcile package,
+    // method, field-number and enum-value collisions before regenerating after an upstream merge.
+    let mut config = tonic_prost_build::Config::new();
+    config.enable_type_names();
+    config.bytes(["."]);
+    config.boxed(".lore.object_dispatch.v1.ObjectStoreRequestReceiptV1.outcome.request_state");
+    config.boxed(
+        ".lore.object_dispatch.v1.ObjectStoreRequestReceiptV1.outcome.continuity_quarantined",
+    );
+    config.boxed(
+        ".lore.object_dispatch.v1.ObjectStoreRequestReceiptV1.outcome.continuity_adjudicated",
+    );
+    config.boxed(".lore.object_dispatch.v1.ObjectStoreRequestOutcomeV1.outcome.request_state");
+    config.boxed(
+        ".lore.object_dispatch.v1.ObjectStoreRequestOutcomeV1.outcome.continuity_quarantined",
+    );
+    config.boxed(
+        ".lore.object_dispatch.v1.ObjectStoreRequestOutcomeV1.outcome.continuity_adjudicated",
+    );
+
+    tonic_prost_build::configure()
+        .out_dir(&output_dir)
+        .protoc_arg("--experimental_allow_proto3_optional")
+        .compile_with_config(
+            config,
+            &["./proto/lore/object_dispatch/v1/object_dispatch.proto"],
             &["./proto"],
         )?;
 

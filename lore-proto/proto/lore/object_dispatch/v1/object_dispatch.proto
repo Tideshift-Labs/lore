@@ -1,0 +1,643 @@
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
+// SPDX-License-Identifier: MIT
+
+syntax = "proto3";
+
+package lore.object_dispatch.v1;
+
+// FORK-LOCAL (Tideshift, CR-033). This whole private package is additive and dark.
+// It pins all message/enum field numbers below plus the seven on-wire method paths
+// under /lore.object_dispatch.v1.ObjectStoreDispatchService/. On every upstream
+// merge, check for a package, type, field-number, enum-value, or method-path
+// collision before preserving or regenerating these bindings.
+service ObjectStoreDispatchService {
+  rpc ReservePut(ReservePutRequestV1) returns (ReservePutAckV1);
+  rpc UploadPut(stream UploadPutChunkV1) returns (PutSpoolReadyV1);
+  rpc Submit(ObjectStoreRequestV1) returns (ObjectStoreRequestReceiptV1);
+  rpc GetRequest(ObjectStoreRequestQueryV1) returns (ObjectStoreRequestOutcomeV1);
+  rpc FetchResult(ObjectStoreResultFetchV1) returns (stream ObjectStoreResultChunkV1);
+  rpc AcknowledgeResult(ObjectStoreResultAckV1) returns (ObjectStoreResultAckReceiptV1);
+  rpc DiscardResult(ObjectStoreResultDiscardV1) returns (ObjectStoreResultDiscardReceiptV1);
+}
+enum PutReservationStateV1 {
+  PUT_RESERVATION_STATE_UNSPECIFIED = 0;
+  PUT_RESERVATION_STATE_RESERVED = 1;
+  PUT_RESERVATION_STATE_SPOOL_READY = 2;
+  PUT_RESERVATION_STATE_PREPARED_EXPIRED = 3;
+  PUT_RESERVATION_STATE_CLOSED = 4;
+  PUT_RESERVATION_STATE_PAYLOAD_DISPOSED = 5;
+}
+message ObjectStoreQuotaUnitsV1 {
+  uint64 bytes = 1; uint64 rows = 2; uint64 concurrency = 3;
+}
+message ReservePutRequestV1 {
+  string protocol_revision = 1; string policy_revision = 2;
+  string provider_boundary_id = 3; string authenticated_cell_id = 4;
+  string authenticated_tenant_id = 5; string logical_request_id = 6;
+  string attempt_id = 7; bytes put_reservation_fingerprint = 8;
+  string bucket = 9; string key = 10; uint64 expected_body_size = 11;
+  bytes body_blake3 = 12; string allocation_revision = 13;
+  uint64 allocation_fence = 14; int64 reservation_deadline_unix_ms = 15;
+  int64 allocation_hard_expiry_unix_ms = 16;
+}
+message ReservePutAckV1 {
+  string protocol_revision = 1; string policy_revision = 2;
+  string provider_boundary_id = 3; string authenticated_cell_id = 4;
+  string authenticated_tenant_id = 5; string logical_request_id = 6;
+  string attempt_id = 7; string upload_id = 8; uint64 upload_fence = 9;
+  PutReservationStateV1 state = 10; ObjectStoreQuotaUnitsV1 reserved_quota = 11;
+  int64 expires_at_unix_ms = 12; uint64 max_chunk_bytes = 13;
+  PutSpoolReadyV1 spool_ready = 14;
+  ObjectStorePayloadPurgeReceiptV1 payload_release_receipt = 15;
+  int64 admission_clock_unix_ms = 16;
+  int64 allocation_hard_expiry_unix_ms = 17;
+  PutReservationClosureV1 closure = 18;
+  ObjectStoreNoDispatchProofV1 no_dispatch_proof = 19;
+  bytes ack_blake3 = 20;
+}
+message UploadPutChunkV1 {
+  string protocol_revision = 1; string provider_boundary_id = 2;
+  string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
+  string logical_request_id = 5; string attempt_id = 6; string upload_id = 7;
+  uint64 upload_fence = 8; uint64 chunk_index = 9; bytes chunk = 10;
+  bool final_chunk = 11;
+}
+enum PutUploadStreamRejectReasonV1 {
+  PUT_UPLOAD_STREAM_REJECT_REASON_UNSPECIFIED = 0;
+  PUT_UPLOAD_STREAM_REJECT_REASON_IDENTITY_MISMATCH = 1;
+  PUT_UPLOAD_STREAM_REJECT_REASON_EMPTY_STREAM = 2;
+}
+message PutUploadStreamRejectedV1 {
+  string protocol_revision = 1;
+  PutUploadStreamRejectReasonV1 reason = 2;
+  bytes stream_identity_blake3 = 3;
+  uint64 rejected_chunk_index = 4;
+  uint32 rejected_field_number = 5;
+  bytes detail_blake3 = 6;
+}
+message PutSpoolReadyV1 {
+  string protocol_revision = 1; string provider_boundary_id = 2;
+  string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
+  string logical_request_id = 5; string attempt_id = 6; string upload_id = 7;
+  uint64 upload_fence = 8; string durable_body_handle = 9; uint64 body_size = 10;
+  bytes body_blake3 = 11; int64 ready_at_unix_ms = 12;
+}
+message PutReservationClosureV1 {
+  string terminal_result_id = 1;
+  ObjectStoreTerminalRetryabilityV1 terminal_retryability = 2;
+  ObjectStoreResultDispositionV1 result_disposition = 3;
+  ObjectStoreResultAckReceiptV1 ack_receipt = 4;
+  ObjectStoreResultDiscardReceiptV1 discard_receipt = 5;
+  int64 closed_at_unix_ms = 6; bytes closure_blake3 = 7;
+}
+enum PutUploadClosedStateV1 {
+  PUT_UPLOAD_CLOSED_STATE_UNSPECIFIED = 0;
+  PUT_UPLOAD_CLOSED_STATE_UPLOAD_CLOSED = 1;
+  PUT_UPLOAD_CLOSED_STATE_RESULT_PAYLOAD_DISPOSED = 2;
+}
+message PutUploadClosedV1 {
+  string protocol_revision = 1; string provider_boundary_id = 2;
+  string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
+  string logical_request_id = 5; string attempt_id = 6; string upload_id = 7;
+  uint64 upload_fence = 8; PutUploadClosedStateV1 state = 9;
+  PutReservationStateV1 reservation_state = 10; int64 expires_at_unix_ms = 11;
+  PutReservationClosureV1 closure = 12;
+  ObjectStorePayloadPurgeReceiptV1 payload_release_receipt = 13;
+  ObjectStoreNoDispatchProofV1 no_dispatch_proof = 14;
+  bytes detail_blake3 = 15;
+}
+
+message ObjectStoreRequestV1 {
+  string protocol_revision = 1;
+  string provider_boundary_id = 2;
+  string authenticated_cell_id = 3;
+  string authenticated_tenant_id = 4;
+  string logical_request_id = 5;
+  string attempt_id = 6;
+  bytes canonical_fingerprint = 7;
+  string allocation_revision = 8;
+  uint64 allocation_fence = 9;
+  string cell_admission_id = 10;
+  uint64 cell_admission_fence = 11;
+  int64 deadline_unix_ms = 12;
+  repeated ReservedDimensionV1 reservations = 13;
+  ResultConsumerContextV1 consumer_context = 14;
+  string policy_revision = 15;
+  oneof operation {
+    HeadBucketV1 head_bucket = 20;
+    ListObjectsV2V1 list_objects_v2 = 21;
+    HeadObjectV1 head_object = 22;
+    GetObjectV1 get_object = 23;
+    PutObjectV1 put_object = 24;
+    ListObjectVersionsV1 list_object_versions = 25;
+    DeleteObjectV1 delete_object = 26;
+  }
+}
+message HeadBucketV1 { string bucket = 1; }
+message ListObjectsV2V1 {
+  string bucket = 1; string prefix = 2; string delimiter = 3; uint32 max_keys = 4;
+  optional string continuation_token = 5;
+}
+message HeadObjectV1 { string bucket = 1; string key = 2; }
+message GetObjectV1 {
+  string bucket = 1; string key = 2; uint64 range_start = 3; uint64 range_length = 4;
+}
+message PutObjectV1 {
+  string bucket = 1; string key = 2; string durable_body_handle = 3;
+  uint64 body_size = 4; bytes body_blake3 = 5; repeated ObjectMetadataEntryV1 metadata = 6;
+}
+message ListObjectVersionsV1 {
+  string bucket = 1; string prefix = 2; string delimiter = 3; uint32 max_keys = 4;
+  optional string key_marker = 5; optional string version_id_marker = 6;
+}
+message DeleteObjectV1 { string bucket = 1; string key = 2; optional string version_id = 3; }
+message ObjectMetadataEntryV1 { string key = 1; string value = 2; }
+message ReservedDimensionV1 {
+  string reservation_id = 1; string physical_dimension_id = 2;
+  string operation_class_id = 3; uint64 units = 4;
+}
+message ProviderDimensionAuthorityV1 {
+  string physical_dimension_id = 1; string unit = 2;
+  uint64 sustained_units_per_interval = 3; uint64 max_burst_units = 4;
+  uint64 reserve_units = 5; uint64 unresolved_old_units = 6;
+  uint64 enforcement_interval_ms = 7;
+}
+message ObjectStoreDispatchAuthorityV1 {
+  string protocol_revision = 1; string policy_revision = 2;
+  string provider_boundary_id = 3; string boundary_evidence_revision = 4;
+  string allocation_revision = 5; uint64 allocation_fence = 6;
+  string provider_credential_revision = 7; uint64 dispatcher_lease_generation = 8;
+  repeated ProviderDimensionAuthorityV1 dimensions = 9;
+  int64 issued_at_unix_ms = 10; int64 hard_expiry_unix_ms = 11;
+  uint64 no_dispatch_authority_epoch = 12;
+}
+message ResultConsumerContextV1 {
+  oneof consumer {
+    FragmentLifecycleConsumerContextV1 fragment_lifecycle = 1;
+    StartupAdmissionConsumerContextV1 startup_admission = 2;
+    DurableConsumerContextV1 durable_consumer = 3;
+  }
+}
+message FragmentLifecycleConsumerContextV1 {
+  bytes fragment_id = 1; optional string repository_id = 2;
+  optional string association_context = 3; optional uint64 repository_generation = 4;
+  optional uint64 association_epoch = 5;
+  uint64 lifecycle_generation = 6; uint64 fragment_epoch = 7;
+  uint64 lifecycle_fence = 8; optional string reader_lease_id = 9;
+  optional uint64 reader_fence = 10;
+}
+message StartupAdmissionConsumerContextV1 {
+  string policy_revision = 1; string allocation_revision = 2; string config_revision = 3;
+  string startup_attempt_id = 4; uint64 readiness_generation = 5;
+}
+enum DurableConsumerKindV1 {
+  DURABLE_CONSUMER_KIND_UNSPECIFIED = 0;
+  DURABLE_CONSUMER_KIND_JOB = 1;
+  DURABLE_CONSUMER_KIND_OPERATOR = 2;
+  DURABLE_CONSUMER_KIND_MIGRATOR = 3;
+}
+message DurableConsumerContextV1 {
+  DurableConsumerKindV1 consumer_kind = 1; string authenticated_scope = 2;
+  string operation_id = 3; uint64 checkpoint_revision = 4; uint64 checkpoint_fence = 5;
+}
+
+enum ObjectStoreRequestPhaseV1 {
+  OBJECT_STORE_REQUEST_PHASE_UNSPECIFIED = 0;
+  OBJECT_STORE_REQUEST_PHASE_PREPARED = 1;
+  OBJECT_STORE_REQUEST_PHASE_ADMITTED = 2;
+  OBJECT_STORE_REQUEST_PHASE_DISPATCHING = 3;
+  OBJECT_STORE_REQUEST_PHASE_POSSIBLY_DISPATCHED = 4;
+  OBJECT_STORE_REQUEST_PHASE_TERMINAL = 5;
+  OBJECT_STORE_REQUEST_PHASE_NO_DISPATCH = 6;
+  OBJECT_STORE_REQUEST_PHASE_PREPARED_EXPIRED = 7;
+}
+enum ObjectStoreTerminalRetryabilityV1 {
+  OBJECT_STORE_TERMINAL_RETRYABILITY_UNSPECIFIED = 0;
+  OBJECT_STORE_TERMINAL_RETRYABILITY_NOT_APPLICABLE = 1;
+  OBJECT_STORE_TERMINAL_RETRYABILITY_RETRYABLE = 2;
+  OBJECT_STORE_TERMINAL_RETRYABILITY_NON_RETRYABLE = 3;
+}
+enum ObjectStoreResultDispositionV1 {
+  OBJECT_STORE_RESULT_DISPOSITION_UNSPECIFIED = 0;
+  OBJECT_STORE_RESULT_DISPOSITION_NOT_APPLICABLE = 1;
+  OBJECT_STORE_RESULT_DISPOSITION_AVAILABLE = 2;
+  OBJECT_STORE_RESULT_DISPOSITION_ACKED = 3;
+  OBJECT_STORE_RESULT_DISPOSITION_DISCARDED = 4;
+}
+enum ObjectStorePayloadKindV1 {
+  OBJECT_STORE_PAYLOAD_KIND_UNSPECIFIED = 0;
+  OBJECT_STORE_PAYLOAD_KIND_PUT_BODY = 1;
+  OBJECT_STORE_PAYLOAD_KIND_GET_RESULT = 2;
+}
+enum ObjectStorePayloadAvailabilityV1 {
+  OBJECT_STORE_PAYLOAD_AVAILABILITY_UNSPECIFIED = 0;
+  OBJECT_STORE_PAYLOAD_AVAILABILITY_NOT_APPLICABLE = 1;
+  OBJECT_STORE_PAYLOAD_AVAILABILITY_RETAINED = 2;
+  OBJECT_STORE_PAYLOAD_AVAILABILITY_DISPOSED = 3;
+  OBJECT_STORE_PAYLOAD_AVAILABILITY_PENDING_UPLOAD = 4;
+}
+enum ObjectStorePayloadPurgeStateV1 {
+  OBJECT_STORE_PAYLOAD_PURGE_STATE_UNSPECIFIED = 0;
+  OBJECT_STORE_PAYLOAD_PURGE_STATE_NOT_ELIGIBLE = 1;
+  OBJECT_STORE_PAYLOAD_PURGE_STATE_RETENTION_PENDING = 2;
+  OBJECT_STORE_PAYLOAD_PURGE_STATE_ELIGIBLE = 3;
+  OBJECT_STORE_PAYLOAD_PURGE_STATE_PURGED = 4;
+}
+enum ObjectStoreNoDispatchReasonV1 {
+  OBJECT_STORE_NO_DISPATCH_REASON_UNSPECIFIED = 0;
+  OBJECT_STORE_NO_DISPATCH_REASON_CELL_ADMISSION_REJECTED = 1;
+  OBJECT_STORE_NO_DISPATCH_REASON_AUTHORITY_CANCELLED_BEFORE_SEND = 2;
+  OBJECT_STORE_NO_DISPATCH_REASON_DISPATCHER_PROVED_NOT_SENT = 3;
+  OBJECT_STORE_NO_DISPATCH_REASON_PREPARED_TTL_EXPIRED = 4;
+  OBJECT_STORE_NO_DISPATCH_REASON_SDK_CONSTRUCTION_FAILED = 5;
+  OBJECT_STORE_NO_DISPATCH_REASON_LOCAL_VALIDATION_FAILED = 6;
+  OBJECT_STORE_NO_DISPATCH_REASON_REQUEST_DEADLINE_EXPIRED = 7;
+  OBJECT_STORE_NO_DISPATCH_REASON_AUTHORITY_LOST_BEFORE_DISPATCH = 8;
+}
+enum ObjectStorePayloadReleaseReasonV1 {
+  OBJECT_STORE_PAYLOAD_RELEASE_REASON_UNSPECIFIED = 0;
+  OBJECT_STORE_PAYLOAD_RELEASE_REASON_ACKED_RETENTION_ELAPSED = 1;
+  OBJECT_STORE_PAYLOAD_RELEASE_REASON_DISCARDED_RETENTION_ELAPSED = 2;
+  OBJECT_STORE_PAYLOAD_RELEASE_REASON_NO_PAYLOAD_CREATED = 3;
+  OBJECT_STORE_PAYLOAD_RELEASE_REASON_PREPARED_EXPIRED_BODY_PURGED = 4;
+  OBJECT_STORE_PAYLOAD_RELEASE_REASON_NO_DISPATCH_BODY_PURGED = 5;
+}
+message ObjectStoreDispatchAttemptV1 {
+  string provider_attempt_id = 1; string provider_grant_id = 2;
+  uint64 provider_grant_fence = 3; string dispatcher_id = 4;
+  uint64 dispatcher_lease_generation = 5; int64 dispatch_started_at_unix_ms = 6;
+  optional int64 ambiguity_recorded_at_unix_ms = 7;
+  string provider_credential_revision = 8;
+}
+message ObjectStoreNoDispatchProofV1 {
+  ObjectStoreNoDispatchReasonV1 reason = 1; string proof_id = 2;
+  uint64 proof_fence = 3; int64 committed_at_unix_ms = 4;
+  uint64 authority_epoch = 5; bytes proof_blake3 = 6;
+}
+message PutReservationUnavailableV1 {
+  string protocol_revision = 1; string provider_boundary_id = 2;
+  string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
+  string logical_request_id = 5; string attempt_id = 6;
+  bytes put_reservation_fingerprint = 7; PutReservationStateV1 reservation_state = 8;
+  int64 reservation_expires_at_unix_ms = 9;
+  ObjectStoreNoDispatchProofV1 reservation_no_dispatch_proof = 10;
+  ObjectStorePayloadPurgeReceiptV1 payload_release_receipt = 11;
+  bytes detail_blake3 = 12;
+}
+message PutSubmitBindingV1 {
+  string upload_id = 1; uint64 upload_fence = 2;
+  string durable_body_handle = 3; int64 reservation_expires_at_unix_ms = 4;
+  int64 bound_at_unix_ms = 5; uint64 binding_fence = 6;
+  bytes binding_blake3 = 7;
+}
+message ObjectStorePayloadPurgeReceiptV1 {
+  string purge_id = 1; ObjectStorePayloadKindV1 payload_kind = 2;
+  optional string terminal_result_id = 3; ObjectStoreResultDispositionV1 disposition = 4;
+  uint64 released_bytes = 5; uint64 released_rows = 6;
+  uint64 released_concurrency = 7; int64 purged_at_unix_ms = 8;
+  bool provider_authority_refunded = 9; bytes receipt_blake3 = 10;
+  ObjectStorePayloadReleaseReasonV1 release_reason = 11;
+  uint64 deleted_partial_temp_bytes = 12; uint64 deleted_partial_temp_files = 13;
+}
+message ObjectStorePayloadRetentionV1 {
+  ObjectStorePayloadKindV1 payload_kind = 1;
+  ObjectStorePayloadAvailabilityV1 availability = 2;
+  optional string durable_handle = 3; uint64 size = 4; bytes blake3 = 5;
+  ObjectStorePayloadPurgeStateV1 purge_state = 6;
+  optional int64 purge_eligible_at_unix_ms = 7;
+  ObjectStorePayloadPurgeReceiptV1 purge_receipt = 8;
+  uint64 partial_temp_bytes = 9; uint64 partial_temp_chunks = 10;
+}
+message ObjectStoreQuotaStateV1 {
+  repeated ReservedDimensionV1 provider_reservations = 1;
+  ObjectStoreQuotaUnitsV1 put_spool_quota = 2;
+  ObjectStoreQuotaUnitsV1 result_spool_quota = 3;
+  ObjectStoreQuotaUnitsV1 retained_metadata_quota = 4;
+  uint64 quota_revision = 5;
+}
+message ObjectStoreRequestQueryV1 {
+  string protocol_revision = 1; string provider_boundary_id = 2;
+  string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
+  string logical_request_id = 5; string attempt_id = 6;
+  oneof fingerprint {
+    bytes put_reservation_fingerprint = 7;
+    bytes canonical_descriptor_fingerprint = 8;
+  }
+}
+message ObjectStoreRequestStateV1 {
+  string protocol_revision = 1; string provider_boundary_id = 2;
+  string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
+  string logical_request_id = 5; string attempt_id = 6;
+  optional bytes put_reservation_fingerprint = 7;
+  optional bytes canonical_descriptor_fingerprint = 8;
+  ObjectStoreRequestPhaseV1 phase = 9;
+  string allocation_revision = 10; uint64 allocation_fence = 11;
+  optional string cell_admission_id = 12; optional uint64 cell_admission_fence = 13;
+  repeated ReservedDimensionV1 reservations = 14;
+  ObjectStoreDispatchAttemptV1 dispatch_attempt = 15;
+  ObjectStoreTerminalResultV1 terminal_result = 16;
+  ObjectStoreTerminalRetryabilityV1 terminal_retryability = 17;
+  ObjectStoreResultDispositionV1 result_disposition = 18;
+  ObjectStoreResultAckReceiptV1 ack_receipt = 19;
+  ObjectStoreResultDiscardReceiptV1 discard_receipt = 20;
+  ObjectStoreNoDispatchProofV1 no_dispatch_proof = 21;
+  ObjectStorePayloadRetentionV1 put_body = 22;
+  ObjectStorePayloadRetentionV1 result_payload = 23;
+  ObjectStoreQuotaStateV1 quota_state = 24;
+  int64 state_committed_at_unix_ms = 25; optional int64 closure_committed_at_unix_ms = 26;
+  bytes state_blake3 = 27;
+  string policy_revision = 28;
+  optional PutSubmitBindingV1 put_submit_binding = 29;
+}
+message ObjectStoreRequestReceiptV1 {
+  oneof outcome {
+    ObjectStoreRequestStateV1 request_state = 1;
+    ObjectStoreContinuityQuarantinedV1 continuity_quarantined = 4;
+    ObjectStoreContinuityAdjudicatedV1 continuity_adjudicated = 5;
+  }
+  bytes receipt_blake3 = 2; int64 receipt_committed_at_unix_ms = 3;
+}
+enum ObjectStoreContinuityIntentKindV1 {
+  OBJECT_STORE_CONTINUITY_INTENT_KIND_UNSPECIFIED = 0;
+  OBJECT_STORE_CONTINUITY_INTENT_KIND_UUID_ADMISSION = 1;
+  OBJECT_STORE_CONTINUITY_INTENT_KIND_DISPATCH_CAS = 2;
+}
+enum ObjectStoreContinuityQuarantineReasonV1 {
+  OBJECT_STORE_CONTINUITY_QUARANTINE_REASON_UNSPECIFIED = 0;
+  OBJECT_STORE_CONTINUITY_QUARANTINE_REASON_INCOMPLETE_INTENT = 1;
+  OBJECT_STORE_CONTINUITY_QUARANTINE_REASON_LOCAL_BINDING_MISSING = 2;
+  OBJECT_STORE_CONTINUITY_QUARANTINE_REASON_DISPATCH_OUTCOME_UNKNOWN = 3;
+  OBJECT_STORE_CONTINUITY_QUARANTINE_REASON_RESTORE_MISMATCH = 4;
+}
+message ObjectStoreContinuityQuotaOwnershipV1 {
+  string continuity_policy_revision = 1; string operation_quota_class = 2;
+  ObjectStoreQuotaUnitsV1 units = 3; string global_scope_id = 4;
+  string provider_boundary_id = 5; string authenticated_cell_id = 6;
+  string authenticated_tenant_id = 7; bytes ownership_blake3 = 8;
+}
+message ObjectStoreContinuityQuarantinedV1 {
+  string protocol_revision = 1; string provider_boundary_id = 2;
+  string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
+  string logical_request_id = 5; string attempt_id = 6;
+  string continuity_token_id = 7; uint64 authority_epoch = 8;
+  uint64 continuity_seq = 9; ObjectStoreContinuityIntentKindV1 intent_kind = 10;
+  oneof fingerprint {
+    bytes put_reservation_fingerprint = 11;
+    bytes canonical_descriptor_fingerprint = 12;
+  }
+  ObjectStoreContinuityQuarantineReasonV1 reason = 13;
+  int64 quarantined_at_unix_ms = 14; int64 retain_until_unix_ms = 15;
+  bool quota_bearing = 16; bytes detail_blake3 = 17;
+  ObjectStoreContinuityQuotaOwnershipV1 quota_ownership = 18;
+}
+message ObjectStoreRequestOutcomeV1 {
+  oneof outcome {
+    ObjectStoreRequestStateV1 request_state = 1;
+    ObjectStoreContinuityQuarantinedV1 continuity_quarantined = 2;
+    ObjectStoreContinuityAdjudicatedV1 continuity_adjudicated = 4;
+  }
+  bytes outcome_blake3 = 3;
+}
+enum ObjectStoreContinuityAdjudicationKindV1 {
+  OBJECT_STORE_CONTINUITY_ADJUDICATION_KIND_UNSPECIFIED = 0;
+  OBJECT_STORE_CONTINUITY_ADJUDICATION_KIND_NO_LOCAL_EFFECT = 1;
+  OBJECT_STORE_CONTINUITY_ADJUDICATION_KIND_NO_DISPATCH = 2;
+}
+message ObjectStoreContinuityAdjudicationProofV1 {
+  string proof_id = 1; ObjectStoreContinuityAdjudicationKindV1 adjudication_kind = 2;
+  bytes external_row_blake3 = 3; bytes local_quarantine_blake3 = 4;
+  uint64 authority_epoch = 5; uint64 continuity_seq = 6;
+  uint64 adjudication_fence = 7; string provider_credential_revision = 8;
+  optional bytes provider_no_dispatch_evidence_blake3 = 9;
+  int64 committed_at_unix_ms = 10; bytes proof_blake3 = 11;
+}
+message ObjectStoreContinuityQuotaReleaseReceiptV1 {
+  string release_id = 1; ObjectStoreContinuityAdjudicationKindV1 adjudication_kind = 2;
+  ObjectStoreQuotaUnitsV1 released_put_spool = 3;
+  ObjectStoreQuotaUnitsV1 released_result_spool = 4;
+  ObjectStoreQuotaUnitsV1 released_retained_metadata = 5;
+  bool provider_authority_refunded = 6; int64 released_at_unix_ms = 7;
+  uint64 quota_revision = 8; bytes receipt_blake3 = 9;
+}
+message ObjectStoreContinuityAdjudicatedV1 {
+  string protocol_revision = 1; string provider_boundary_id = 2;
+  string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
+  string logical_request_id = 5; string attempt_id = 6;
+  string continuity_token_id = 7; uint64 authority_epoch = 8;
+  uint64 continuity_seq = 9; ObjectStoreContinuityIntentKindV1 intent_kind = 10;
+  oneof fingerprint {
+    bytes put_reservation_fingerprint = 11;
+    bytes canonical_descriptor_fingerprint = 12;
+  }
+  ObjectStoreContinuityAdjudicationKindV1 adjudication_kind = 13;
+  ObjectStoreContinuityAdjudicationProofV1 proof = 14;
+  ObjectStoreContinuityQuotaReleaseReceiptV1 quota_release_receipt = 15;
+  int64 adjudicated_at_unix_ms = 16; int64 retain_until_unix_ms = 17;
+  bytes detail_blake3 = 18;
+  ObjectStoreContinuityQuotaOwnershipV1 quota_ownership = 19;
+}
+message ObjectStoreResultFetchV1 {
+  string protocol_revision = 1; string provider_boundary_id = 2;
+  string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
+  string logical_request_id = 5; string attempt_id = 6;
+  string terminal_result_id = 7; string byte_result_handle = 8;
+  uint64 canonical_result_size = 9; bytes canonical_result_blake3 = 10;
+  uint64 caller_fence = 11;
+}
+message ObjectStoreResultChunkV1 {
+  string protocol_revision = 1; string terminal_result_id = 2;
+  string byte_result_handle = 3; uint64 chunk_index = 4; bytes chunk = 5;
+  bool final_chunk = 6; optional uint64 final_size = 7;
+  optional bytes final_blake3 = 8;
+}
+message ObjectStoreResultPayloadDisposedV1 {
+  string protocol_revision = 1; string terminal_result_id = 2;
+  string byte_result_handle = 3; uint64 canonical_result_size = 4;
+  bytes canonical_result_blake3 = 5; int64 purged_at_unix_ms = 6;
+  bytes purge_receipt_blake3 = 7;
+}
+message ObjectStoreResultDiscardedV1 {
+  string protocol_revision = 1; string terminal_result_id = 2;
+  bytes discard_fingerprint = 3; int64 discarded_at_unix_ms = 4;
+}
+
+message ObjectStoreResultAckV1 {
+  string protocol_revision = 1; string provider_boundary_id = 2;
+  string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
+  string logical_request_id = 5; string attempt_id = 6; string terminal_result_id = 7;
+  uint64 canonical_result_size = 8; bytes canonical_result_blake3 = 9;
+  optional string byte_result_handle = 10;
+  oneof proof {
+    FragmentLifecycleResultAckProofV1 fragment_lifecycle = 20;
+    StartupAdmissionResultAckProofV1 startup_admission = 21;
+    DurableConsumerResultAckProofV1 durable_consumer = 22;
+  }
+}
+message FragmentLifecycleResultAckProofV1 {
+  bytes fragment_id = 1; optional string repository_id = 2;
+  optional string association_context = 3; optional uint64 repository_generation = 4;
+  optional uint64 association_epoch = 5;
+  uint64 lifecycle_generation = 6; uint64 fragment_epoch = 7;
+  uint64 lifecycle_fence = 8; optional string reader_lease_id = 9;
+  optional uint64 reader_fence = 10;
+  bytes terminal_result_blake3 = 11;
+}
+message StartupAdmissionResultAckProofV1 {
+  string policy_revision = 1; string allocation_revision = 2; string config_revision = 3;
+  string startup_attempt_id = 4; uint64 readiness_generation = 5;
+  bytes terminal_result_blake3 = 6;
+}
+message DurableConsumerResultAckProofV1 {
+  DurableConsumerKindV1 consumer_kind = 1; string authenticated_scope = 2;
+  string operation_id = 3; uint64 checkpoint_revision = 4; uint64 checkpoint_fence = 5;
+  bytes terminal_result_blake3 = 6;
+}
+enum ObjectStoreResultAckStateV1 {
+  OBJECT_STORE_RESULT_ACK_STATE_UNSPECIFIED = 0;
+  OBJECT_STORE_RESULT_ACK_STATE_ACKED = 1;
+}
+message ObjectStoreResultAckReceiptV1 {
+  ObjectStoreResultAckStateV1 state = 1; string terminal_result_id = 2;
+  bytes ack_fingerprint = 3; int64 acked_at_unix_ms = 4;
+  optional int64 payload_purge_after_unix_ms = 5;
+}
+message ObjectStoreResultDiscardV1 {
+  string protocol_revision = 1; string provider_boundary_id = 2;
+  string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
+  string logical_request_id = 5; string attempt_id = 6; string terminal_result_id = 7;
+  uint64 canonical_result_size = 8; bytes canonical_result_blake3 = 9;
+  optional string byte_result_handle = 10;
+  oneof proof {
+    FragmentLifecycleSupersededProofV1 fragment_lifecycle_superseded = 20;
+    StartupSupersededProofV1 startup_superseded = 21;
+    DurableConsumerCancelledProofV1 durable_consumer_cancelled = 22;
+  }
+}
+enum FragmentLifecycleSupersessionKindV1 {
+  FRAGMENT_LIFECYCLE_SUPERSESSION_KIND_UNSPECIFIED = 0;
+  FRAGMENT_LIFECYCLE_SUPERSESSION_KIND_SUCCESSOR = 1;
+  FRAGMENT_LIFECYCLE_SUPERSESSION_KIND_REMOVED = 2;
+  FRAGMENT_LIFECYCLE_SUPERSESSION_KIND_ASSOCIATION_TOMBSTONED = 3;
+  FRAGMENT_LIFECYCLE_SUPERSESSION_KIND_REPOSITORY_TOMBSTONED = 4;
+}
+message FragmentLifecycleSupersededProofV1 {
+  bytes fragment_id = 1; optional string repository_id = 2;
+  optional string association_context = 3; optional uint64 repository_generation = 4;
+  optional uint64 association_epoch = 5;
+  uint64 lifecycle_generation = 6; uint64 fragment_epoch = 7;
+  uint64 lifecycle_fence = 8; optional string reader_lease_id = 9;
+  optional uint64 reader_fence = 10;
+  FragmentLifecycleSupersessionKindV1 supersession_kind = 11;
+  optional uint64 superseding_lifecycle_generation = 12;
+  optional uint64 superseding_fragment_epoch = 13;
+  optional uint64 superseding_lifecycle_fence = 14; string no_exposure_checkpoint_id = 15;
+  uint64 no_exposure_checkpoint_revision = 16; uint64 no_exposure_checkpoint_fence = 17;
+  bytes terminal_result_blake3 = 18;
+  optional uint64 successor_repository_generation = 19;
+  optional uint64 successor_association_epoch = 20;
+  optional uint64 repository_tombstone_revision = 21;
+}
+message StartupSupersededProofV1 {
+  string policy_revision = 1; string allocation_revision = 2; string config_revision = 3;
+  string startup_attempt_id = 4; uint64 readiness_generation = 5;
+  string superseding_policy_revision = 6; string superseding_allocation_revision = 7;
+  string superseding_config_revision = 8; string superseding_startup_attempt_id = 9;
+  uint64 superseding_readiness_generation = 10; string no_exposure_checkpoint_id = 11;
+  uint64 no_exposure_checkpoint_revision = 12; uint64 no_exposure_checkpoint_fence = 13;
+  bytes terminal_result_blake3 = 14;
+}
+enum DurableConsumerCancellationKindV1 {
+  DURABLE_CONSUMER_CANCELLATION_KIND_UNSPECIFIED = 0;
+  DURABLE_CONSUMER_CANCELLATION_KIND_CANCELLED = 1;
+  DURABLE_CONSUMER_CANCELLATION_KIND_SUPERSEDED = 2;
+}
+message DurableConsumerCancelledProofV1 {
+  DurableConsumerKindV1 consumer_kind = 1; string authenticated_scope = 2;
+  string operation_id = 3; uint64 checkpoint_revision = 4; uint64 checkpoint_fence = 5;
+  DurableConsumerCancellationKindV1 cancellation_kind = 6;
+  string disposition_checkpoint_id = 7; uint64 disposition_checkpoint_revision = 8;
+  uint64 disposition_checkpoint_fence = 9; optional string superseding_operation_id = 10;
+  string no_exposure_checkpoint_id = 11; uint64 no_exposure_checkpoint_revision = 12;
+  uint64 no_exposure_checkpoint_fence = 13; bytes terminal_result_blake3 = 14;
+}
+enum ObjectStoreResultDiscardStateV1 {
+  OBJECT_STORE_RESULT_DISCARD_STATE_UNSPECIFIED = 0;
+  OBJECT_STORE_RESULT_DISCARD_STATE_DISCARDED = 1;
+}
+message ObjectStoreResultDiscardReceiptV1 {
+  ObjectStoreResultDiscardStateV1 state = 1; string terminal_result_id = 2;
+  bytes discard_fingerprint = 3; int64 discarded_at_unix_ms = 4;
+  optional int64 payload_purge_after_unix_ms = 5;
+}
+enum ObjectStoreExpiredOrUnknownStateV1 {
+  OBJECT_STORE_EXPIRED_OR_UNKNOWN_STATE_UNSPECIFIED = 0;
+  OBJECT_STORE_EXPIRED_OR_UNKNOWN_STATE_EXPIRED_OR_UNKNOWN = 1;
+}
+message ObjectStoreExpiredOrUnknownV1 {
+  string protocol_revision = 1;
+  ObjectStoreExpiredOrUnknownStateV1 state = 2;
+}
+
+message ObjectStoreTerminalResultV1 {
+  oneof result {
+    BoolResultV1 bool_result = 1;
+    HeadObjectResultV1 head_object = 2;
+    PutObjectResultV1 put_object = 3;
+    DeleteObjectResultV1 delete_object = 4;
+    ListObjectsV2ResultV1 list_objects_v2 = 5;
+    ListObjectVersionsResultV1 list_object_versions = 6;
+    ByteResultHandleV1 byte_result = 7;
+    ProviderErrorV1 provider_error = 8;
+  }
+  string terminal_result_id = 19;
+  bytes canonical_result_blake3 = 20;
+  uint64 canonical_result_size = 21;
+}
+message BoolResultV1 { bool value = 1; }
+message HeadObjectResultV1 {
+  uint64 content_length = 1; optional string etag = 2; optional int64 last_modified_unix_ms = 3;
+  optional string version_id = 4; repeated ObjectMetadataEntryV1 metadata = 5;
+}
+message PutObjectResultV1 { optional string etag = 1; optional string version_id = 2; }
+message DeleteObjectResultV1 { bool delete_marker = 1; optional string version_id = 2; }
+message ListObjectEntryV1 {
+  string key = 1; uint64 size = 2; optional string etag = 3;
+  optional int64 last_modified_unix_ms = 4;
+}
+message ListObjectsV2ResultV1 {
+  repeated ListObjectEntryV1 entries = 1; repeated string common_prefixes = 2;
+  bool is_truncated = 3; optional string next_continuation_token = 4;
+}
+message ObjectVersionV1 {
+  string key = 1; string version_id = 2; bool is_latest = 3; uint64 size = 4;
+  optional string etag = 5; optional int64 last_modified_unix_ms = 6;
+}
+message DeleteMarkerV1 {
+  string key = 1; string version_id = 2; bool is_latest = 3;
+  optional int64 last_modified_unix_ms = 4;
+}
+message ListObjectVersionsResultV1 {
+  repeated ObjectVersionV1 versions = 1; repeated DeleteMarkerV1 delete_markers = 2;
+  repeated string common_prefixes = 3; bool is_truncated = 4;
+  optional string next_key_marker = 5; optional string next_version_id_marker = 6;
+}
+message ByteResultHandleV1 {
+  string handle = 1; uint64 size = 2; bytes blake3 = 3; uint64 content_length = 4;
+  repeated ObjectMetadataEntryV1 metadata = 5;
+  optional string etag = 6; optional string version_id = 7;
+}
+enum ProviderErrorClassV1 {
+  PROVIDER_ERROR_CLASS_UNSPECIFIED = 0;
+  PROVIDER_ERROR_CLASS_NOT_FOUND = 1;
+  PROVIDER_ERROR_CLASS_AUTHORIZATION = 2;
+  PROVIDER_ERROR_CLASS_THROTTLED = 3;
+  PROVIDER_ERROR_CLASS_RETRYABLE_DECISIVE = 4;
+  PROVIDER_ERROR_CLASS_PERMANENT = 5;
+  PROVIDER_ERROR_CLASS_MALFORMED_RESULT = 6;
+  PROVIDER_ERROR_CLASS_OVERSIZED_RESULT = 7;
+}
+message ProviderErrorV1 {
+  ProviderErrorClassV1 error_class = 1; uint32 http_status = 2;
+  optional string provider_code = 3; optional string provider_request_id = 4;
+  optional uint64 retry_after_ms = 5; bytes provider_message_blake3 = 6;
+}
