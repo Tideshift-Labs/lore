@@ -23,8 +23,9 @@ mode. Connection and TLS material is redacted from diagnostics.
   and ownership-release evidence;
 - recording exact local durability snapshot coverage and releasing covered `BOUND` or `COMPLETED`
   shadow ownership; and
-- reading one boundary's current epoch, continuity high-water, ownership counters, and latest
-  snapshot.
+- allocating an exact next epoch from the expected drained namespace; and
+- reading one boundary's current or historical epoch, continuity high-water, ownership counters,
+  reconciliation state, and latest snapshot.
 
 Mutations run in serializable transactions. Unsigned 64-bit values cross the PostgreSQL
 `NUMERIC(20,0)` boundary as canonical decimal text, procedure results decode through closed enum and
@@ -57,21 +58,25 @@ cargo test -p lore-object-dispatch
 
 # Explicit, disposable, preprovisioned PostgreSQL target only
 cargo test -p lore-object-dispatch --test continuity_live -- --ignored --test-threads=1
+cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_allocates_dedicated_drained_epoch_one_to_two
 ```
 
 The unit suite validates configuration, TLS material, redaction, SQL procedure shapes, exact numeric
 transfer, closed result decoding, migration identity, and transient-error classification. The
-regular gate passes 41 tests with zero failures and three intentionally ignored live contracts.
+regular gate passes 42 tests with zero failures and four intentionally ignored live contracts.
 Each live contract has passed against disposable PostgreSQL 16 over real mTLS and the exact embedded
 migration. Run the shared-fixture contracts serially or by exact test name; a parallel all-ignored
 invocation can encounter expected serializable counter contention. They cover mapped boundary and
 reconciler identities, typed absence, serializable mutations, exact transition replay and readback,
-no-local-effect release, quarantine, ambiguous
-dispatch, both adjudication kinds through final release, nonzero `pg_lsn` snapshot recording and
+no-local-effect release, quarantine, ambiguous dispatch, both adjudication kinds through final
+release, nonzero `pg_lsn` snapshot recording and
 replay, covered `BOUND` ownership release, counter/readback invariants, and Begin replay of final
-rows. The probe separately confirmed that a connection without a client certificate is rejected.
+rows. The dedicated drained-epoch contract proves `1 -> 2`, zero new high-water, active epoch reads,
+historical reconciliation absence, local invalid-order rejection, and transient SQLSTATE `40001` on
+a stale exact request; callers adopt the winner through epoch readback rather than replay. The probe
+separately confirmed that a connection without a client certificate is rejected.
 The live harness uses mechanics-only SHA-256-as-BLAKE3 and typed-validator stubs; its snapshot
 evidence is synthetic contract data, not provider-local integration evidence. Deployment readiness
 still requires reviewed production BLAKE3 and typed validators, full cross-boundary negative
-isolation, timeout and bounded retry policy, epoch allocation, compaction and retirement client
-surfaces, and deployment-revision readback.
+isolation, timeout and bounded retry policy, archive/prune, authenticated pruned-interval read,
+retirement/readback client surfaces, and deployment-revision readback.

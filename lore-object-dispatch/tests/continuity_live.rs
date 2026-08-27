@@ -16,6 +16,10 @@
 //!   precomputed by disposable setup for policy/boundary from this environment, quota class
 //!   `LIVE_TEST`, quotas 1/1/1, cell `live-test-snapshot-cell`, and tenant
 //!   `live-test-snapshot-tenant`. Runtime and reconciler roles need no table grants.
+//! - `LORE_TEST_CONTINUITY_EPOCH_BOUNDARY_ID`: dedicated one-shot boundary provisioned at epoch 1
+//!   with high-water/counters zero, no intents or snapshots, and no epoch namespace at or above 2.
+//! - `LORE_TEST_CONTINUITY_NEXT_EPOCH_NAMESPACE_BLAKE3_HEX`: exact lowercase namespace digest for
+//!   epoch 2 on that dedicated boundary. The boundary must be rebuilt before rerunning the test.
 //! - `LORE_TEST_CONTINUITY_BOUNDARY_ID`: boundary mapped to the certificate login role.
 //! - `LORE_TEST_CONTINUITY_AUTHORITY_EPOCH`: active preprovisioned authority epoch.
 //! - `LORE_TEST_CONTINUITY_POLICY_REVISION`: installed policy revision for that epoch.
@@ -24,17 +28,20 @@
 //! `cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_begin_replay_get_and_no_local_effect_cleanup`
 //! `cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_adjudicates_quarantined_and_ambiguous_intents`
 //! `cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_records_snapshot_and_releases_bound_ownership`
+//! `cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_allocates_dedicated_drained_epoch_one_to_two`
 
 use std::fs;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use lore_object_dispatch::continuity::AllocateEpochRequest;
 use lore_object_dispatch::continuity::BeginIntentRequest;
 use lore_object_dispatch::continuity::CompleteAdjudicationRequest;
 use lore_object_dispatch::continuity::ContinuityAdjudicationKind;
 use lore_object_dispatch::continuity::ContinuityClient;
 use lore_object_dispatch::continuity::ContinuityEpochState;
+use lore_object_dispatch::continuity::ContinuityError;
 use lore_object_dispatch::continuity::ContinuityIntentIdentity;
 use lore_object_dispatch::continuity::ContinuityIntentKind;
 use lore_object_dispatch::continuity::ContinuityOwnershipState;
@@ -908,4 +915,123 @@ async fn live_mtls_reconciler_records_snapshot_and_releases_bound_ownership() {
             .expect("reconciler epoch read after release must succeed"),
     );
     assert_eq!(epoch_after, epoch_before);
+}
+
+#[ignore = "requires a disposable, dedicated, one-shot drained epoch-1 boundary over reconciler mTLS"]
+#[tokio::test]
+async fn live_mtls_reconciler_allocates_dedicated_drained_epoch_one_to_two() {
+    let boundary_id = required_env("LORE_TEST_CONTINUITY_EPOCH_BOUNDARY_ID");
+    let next_epoch_namespace_blake3 =
+        required_blake3_hex("LORE_TEST_CONTINUITY_NEXT_EPOCH_NAMESPACE_BLAKE3_HEX");
+    let reconciler = ContinuityClient::connect(&tls_config(
+        "LORE_TEST_CONTINUITY_RECONCILER_PG_URL",
+        "LORE_TEST_CONTINUITY_RECONCILER_CLIENT_CERT_PEM_PATH",
+        "LORE_TEST_CONTINUITY_RECONCILER_CLIENT_KEY_PEM_PATH",
+    ))
+    .await
+    .expect("exact reconciler continuity mTLS connection must succeed");
+
+    let epoch_one = require_epoch_state(
+        reconciler
+            .read_epoch(&boundary_id)
+            .await
+            .expect("dedicated boundary epoch read must succeed"),
+    );
+    assert_eq!(
+        epoch_one,
+        ContinuityEpochState {
+            authority_epoch: 1,
+            continuity_seq_high_water: 0,
+        },
+        "epoch allocation fixture must start as a fresh drained epoch 1"
+    );
+    let reconciliation_one = require_reconciliation_state(
+        reconciler
+            .read_reconciliation_state(&boundary_id, 1)
+            .await
+            .expect("epoch-1 reconciliation read must succeed before allocation"),
+    );
+    assert_eq!(reconciliation_one.current_authority_epoch, 1);
+    assert_eq!(reconciliation_one.continuity_seq_high_water, 0);
+    assert_eq!(reconciliation_one.owned_rows, 0);
+    assert_eq!(reconciliation_one.owned_bytes, 0);
+    assert_eq!(reconciliation_one.owned_concurrency, 0);
+    assert_eq!(reconciliation_one.latest_snapshot, None);
+
+    let allocation_request = AllocateEpochRequest {
+        provider_boundary_id: boundary_id.clone(),
+        expected_current_epoch: 1,
+        next_epoch: 2,
+        epoch_namespace_blake3: next_epoch_namespace_blake3,
+    };
+    assert_eq!(
+        allocation_request.epoch_namespace_blake3,
+        next_epoch_namespace_blake3
+    );
+    let allocated = reconciler
+        .allocate_epoch(&allocation_request)
+        .await
+        .expect("reconciler must allocate drained epoch 1 to epoch 2");
+    assert_eq!(
+        allocated,
+        ContinuityEpochState {
+            authority_epoch: 2,
+            continuity_seq_high_water: 0,
+        }
+    );
+
+    let epoch_two = require_epoch_state(
+        reconciler
+            .read_epoch(&boundary_id)
+            .await
+            .expect("current epoch read must succeed after allocation"),
+    );
+    assert_eq!(epoch_two, allocated);
+    let reconciliation_two = require_reconciliation_state(
+        reconciler
+            .read_reconciliation_state(&boundary_id, 2)
+            .await
+            .expect("epoch-2 reconciliation read must succeed after allocation"),
+    );
+    assert_eq!(reconciliation_two.current_authority_epoch, 2);
+    assert_eq!(reconciliation_two.continuity_seq_high_water, 0);
+    assert_eq!(reconciliation_two.owned_rows, 0);
+    assert_eq!(reconciliation_two.owned_bytes, 0);
+    assert_eq!(reconciliation_two.owned_concurrency, 0);
+    assert_eq!(reconciliation_two.latest_snapshot, None);
+
+    let old_epoch_reconciliation = reconciler
+        .read_reconciliation_state(&boundary_id, 1)
+        .await
+        .expect("old-epoch reconciliation query must return modeled absence");
+    assert_eq!(
+        old_epoch_reconciliation, None,
+        "the current read surface deliberately exposes reconciliation state only for the active epoch"
+    );
+
+    let exact_replay_error = reconciler
+        .allocate_epoch(&allocation_request)
+        .await
+        .expect_err("epoch allocation has CAS failure semantics, not successful replay semantics");
+    assert!(matches!(
+        exact_replay_error,
+        ContinuityError::Postgres { transient: true }
+    ));
+
+    let invalid_order = AllocateEpochRequest {
+        provider_boundary_id: boundary_id,
+        expected_current_epoch: 2,
+        next_epoch: 2,
+        epoch_namespace_blake3: next_epoch_namespace_blake3,
+    };
+    let invalid_order_error = reconciler
+        .allocate_epoch(&invalid_order)
+        .await
+        .expect_err("next epoch equal to current must fail before database access");
+    assert!(matches!(
+        invalid_order_error,
+        ContinuityError::InvalidConfiguration(
+            "epoch allocation identity and ordering must be valid"
+        )
+    ));
 }

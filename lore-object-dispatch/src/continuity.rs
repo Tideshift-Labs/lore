@@ -112,6 +112,11 @@ const READ_RECONCILIATION_STATE_SQL: &str = "SELECT current_authority_epoch::tex
     )";
 const READ_EPOCH_SQL: &str = "SELECT authority_epoch::text, continuity_seq_high_water::text FROM \
     object_store_continuity.object_store_continuity_read_epoch_v1($1, $2)";
+const ALLOCATE_EPOCH_SQL: &str = "SELECT authority_epoch::text, continuity_seq_high_water::text FROM \
+    object_store_continuity.object_store_continuity_allocate_epoch_v1(\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5\
+    )";
 
 /// Connection material for one continuity boundary identity.
 ///
@@ -487,6 +492,14 @@ pub struct ReconciliationState {
 pub struct ContinuityEpochState {
     pub authority_epoch: u64,
     pub continuity_seq_high_water: u64,
+}
+
+/// Compare-and-swap allocation of a strictly newer drained boundary epoch.
+pub struct AllocateEpochRequest {
+    pub provider_boundary_id: String,
+    pub expected_current_epoch: u64,
+    pub next_epoch: u64,
+    pub epoch_namespace_blake3: [u8; 32],
 }
 
 /// Server-derived result projection shared by continuity mutation and read procedures.
@@ -1242,6 +1255,54 @@ impl ContinuityClient {
             .map(|row| parse_epoch_state(&row))
             .transpose()
     }
+
+    /// Allocate a strictly newer epoch only after the authority proves the current epoch drained.
+    pub async fn allocate_epoch(
+        &self,
+        request: &AllocateEpochRequest,
+    ) -> Result<ContinuityEpochState, ContinuityError> {
+        if request.provider_boundary_id.is_empty()
+            || request.expected_current_epoch == 0
+            || request.next_epoch <= request.expected_current_epoch
+        {
+            return Err(ContinuityError::InvalidConfiguration(
+                "epoch allocation identity and ordering must be valid",
+            ));
+        }
+        let expected_current_epoch = request.expected_current_epoch.to_string();
+        let next_epoch = request.next_epoch.to_string();
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .build_transaction()
+            .isolation_level(MUTATION_ISOLATION_LEVEL)
+            .start()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let row = transaction
+            .query_one(
+                ALLOCATE_EPOCH_SQL,
+                &[
+                    &API_REVISION,
+                    &request.provider_boundary_id,
+                    &expected_current_epoch,
+                    &next_epoch,
+                    &&request.epoch_namespace_blake3[..],
+                ],
+            )
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let result = parse_epoch_state(&row)?;
+        if result.authority_epoch != request.next_epoch || result.continuity_seq_high_water != 0 {
+            return Err(ContinuityError::InvalidResponse(
+                "allocated epoch result is inconsistent",
+            ));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        Ok(result)
+    }
 }
 
 fn validate_begin_result(
@@ -1801,6 +1862,10 @@ mod tests {
              object_store_continuity.uint64 )",
             "CREATE FUNCTION object_store_continuity.object_store_continuity_read_epoch_v1( \
              api_revision text, provider_boundary_id text )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_allocate_epoch_v1( \
+             api_revision text, provider_boundary_id text, expected_current_epoch \
+             object_store_continuity.uint64, next_epoch object_store_continuity.uint64, \
+             epoch_namespace_blake3 bytea )",
         ] {
             assert!(
                 migration.contains(signature),
@@ -1952,6 +2017,12 @@ mod tests {
                 2,
                 0,
             ),
+            (
+                ALLOCATE_EPOCH_SQL,
+                "object_store_continuity_allocate_epoch_v1",
+                5,
+                2,
+            ),
         ] {
             assert!(
                 query.contains(&format!("object_store_continuity.{procedure}(")),
@@ -1974,6 +2045,31 @@ mod tests {
         }
         assert_eq!(CoveredReleaseState::Bound.as_sql(), "BOUND");
         assert_eq!(CoveredReleaseState::Completed.as_sql(), "COMPLETED");
+    }
+
+    #[test]
+    fn epoch_allocation_query_and_migration_pin_drained_cas_reset_semantics() {
+        assert_eq!(
+            ALLOCATE_EPOCH_SQL,
+            "SELECT authority_epoch::text, continuity_seq_high_water::text FROM \
+    object_store_continuity.object_store_continuity_allocate_epoch_v1(\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5\
+    )"
+        );
+        let migration = normalized_embedded_migration();
+        for invariant in [
+            "PERFORM object_store_continuity.assert_serializable_write_v1(); PERFORM object_store_continuity.assert_reconciler_v1();",
+            "IF next_epoch <= expected_current_epoch OR octet_length(epoch_namespace_blake3) <> 32 THEN RAISE EXCEPTION 'INVALID_NEXT_EPOCH' USING ERRCODE = '22023'; END IF;",
+            "AND intent.state NOT IN ('COMPLETED', 'NO_LOCAL_EFFECT', 'ADJUDICATED_NO_LOCAL_EFFECT', 'ADJUDICATED_NO_DISPATCH')",
+            "RAISE EXCEPTION 'EPOCH_CAS_OR_DRAIN_FAILED' USING ERRCODE = '40001';",
+            "current_authority_epoch = next_epoch, continuity_seq_high_water = 0, epoch_namespace_blake3 = object_store_continuity_allocate_epoch_v1.epoch_namespace_blake3",
+        ] {
+            assert!(
+                migration.contains(invariant),
+                "embedded epoch allocation lost invariant: {invariant}"
+            );
+        }
     }
 
     #[test]
