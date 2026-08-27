@@ -1090,6 +1090,13 @@ fn validate_first_seen_deadline(
 }
 
 fn parse_canonical_uuid_v7_timestamp(value: &str) -> Result<u64, RequestContractError> {
+    let decoded = decode_canonical_uuid_v7(value)?;
+    Ok(decoded[..6]
+        .iter()
+        .fold(0u64, |timestamp, byte| (timestamp << 8) | u64::from(*byte)))
+}
+
+pub(crate) fn decode_canonical_uuid_v7(value: &str) -> Result<[u8; 16], RequestContractError> {
     let bytes = value.as_bytes();
     if bytes.len() != 36
         || bytes[8] != b'-'
@@ -1106,16 +1113,21 @@ fn parse_canonical_uuid_v7_timestamp(value: &str) -> Result<u64, RequestContract
     {
         return Err(RequestContractError::InvalidUuidV7);
     }
-    let mut timestamp = 0u64;
-    for byte in bytes.iter().take(13).filter(|byte| **byte != b'-') {
+    let mut decoded = [0u8; 16];
+    for (nibble_index, byte) in bytes.iter().filter(|byte| **byte != b'-').enumerate() {
         let nibble = match byte {
-            b'0'..=b'9' => byte - b'0',
-            b'a'..=b'f' => byte - b'a' + 10,
+            b'0'..=b'9' => *byte - b'0',
+            b'a'..=b'f' => *byte - b'a' + 10,
             _ => return Err(RequestContractError::InvalidUuidV7),
         };
-        timestamp = (timestamp << 4) | u64::from(nibble);
+        let target = &mut decoded[nibble_index / 2];
+        if nibble_index.is_multiple_of(2) {
+            *target = nibble << 4;
+        } else {
+            *target |= nibble;
+        }
     }
-    Ok(timestamp)
+    Ok(decoded)
 }
 
 fn validate_canonical_text(value: &str, maximum: u32) -> Result<(), RequestContractError> {
