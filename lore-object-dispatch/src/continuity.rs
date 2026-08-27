@@ -29,9 +29,9 @@ const MUTATION_ISOLATION_LEVEL: IsolationLevel = IsolationLevel::Serializable;
 const BEGIN_SQL: &str = "SELECT result_code, state, ownership_state, authority_epoch::text, \
     continuity_seq::text, continuity_token_id, row_blake3, external_committed_at_unix_ms \
     FROM object_store_continuity.object_store_continuity_begin_v1(\
-      $1, $2, $3::object_store_continuity.uint64, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
-      $13::object_store_continuity.uint64, $14::object_store_continuity.uint64, \
-      $15::object_store_continuity.uint64, $16\
+      $1, $2::text::object_store_continuity.uint64, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+      $13::text::object_store_continuity.uint64, $14::text::object_store_continuity.uint64, \
+      $15::text::object_store_continuity.uint64, $16\
     )";
 const GET_BY_TOKEN_SQL: &str = "SELECT result_code, state, ownership_state, \
     authority_epoch::text, continuity_seq::text, continuity_token_id, row_blake3, \
@@ -40,22 +40,22 @@ const GET_BY_TOKEN_SQL: &str = "SELECT result_code, state, ownership_state, \
 const MARK_BOUND_SQL: &str = "SELECT result_code, state, ownership_state, authority_epoch::text, \
     continuity_seq::text, continuity_token_id, row_blake3, external_committed_at_unix_ms FROM \
     object_store_continuity.object_store_continuity_mark_bound_v1(\
-      $1, $2, $3::object_store_continuity.uint64, \
-      $4::object_store_continuity.uint64, $5, $6, $7, $8, $9, $10, $11, $12, $13\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5, $6, $7, $8, $9, $10, $11, $12, $13\
     )";
 const MARK_COMPLETED_SQL: &str = "SELECT result_code, state, ownership_state, \
     authority_epoch::text, continuity_seq::text, continuity_token_id, row_blake3, \
     external_committed_at_unix_ms FROM \
     object_store_continuity.object_store_continuity_mark_completed_v1(\
-      $1, $2, $3::object_store_continuity.uint64, \
-      $4::object_store_continuity.uint64, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15\
     )";
 const MARK_NO_LOCAL_EFFECT_SQL: &str = "SELECT result_code, state, ownership_state, \
     authority_epoch::text, continuity_seq::text, continuity_token_id, row_blake3, \
     external_committed_at_unix_ms FROM \
     object_store_continuity.object_store_continuity_mark_no_local_effect_v1(\
-      $1, $2, $3::object_store_continuity.uint64, \
-      $4::object_store_continuity.uint64, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16\
     )";
 
 /// Connection material for one continuity boundary identity.
@@ -221,7 +221,7 @@ pub struct BeginIntentRequest {
     pub quota_bytes: u64,
     pub quota_rows: u64,
     pub quota_concurrency: u64,
-    pub external_created_at_unix_ms: i64,
+    pub retention_deadline_unix_ms: i64,
 }
 
 /// Exact identity that every runtime transition re-presents to prevent cross-request adoption.
@@ -274,6 +274,15 @@ pub struct ContinuityProcedureResult {
     pub continuity_token_id: Uuid,
     pub row_blake3: [u8; 32],
     pub external_committed_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContinuityTokenLookup {
+    Found(ContinuityProcedureResult),
+    NotFound {
+        continuity_token_id: Uuid,
+        observed_at_unix_ms: i64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,9 +376,9 @@ impl ContinuityClient {
                 "continuity begin text must be nonempty",
             ));
         }
-        if request.external_created_at_unix_ms < 0 {
+        if request.retention_deadline_unix_ms < 0 {
             return Err(ContinuityError::InvalidConfiguration(
-                "external creation time must be nonnegative",
+                "retention deadline must be nonnegative",
             ));
         }
         let expected_authority_epoch = request.expected_authority_epoch.to_string();
@@ -388,21 +397,21 @@ impl ContinuityClient {
                 BEGIN_SQL,
                 &[
                     &API_REVISION,
-                    &request.provider_boundary_id,
                     &expected_authority_epoch,
                     &request.continuity_token_id,
+                    &request.provider_boundary_id,
                     &request.intent_kind.as_sql(),
                     &request.authenticated_cell_id,
                     &request.authenticated_tenant_id,
-                    &request.operation_quota_class,
                     &request.logical_request_id,
                     &request.attempt_id,
                     &&request.selected_fingerprint[..],
                     &request.continuity_policy_revision,
-                    &quota_bytes,
+                    &request.operation_quota_class,
                     &quota_rows,
+                    &quota_bytes,
                     &quota_concurrency,
-                    &request.external_created_at_unix_ms,
+                    &request.retention_deadline_unix_ms,
                 ],
             )
             .await
@@ -420,7 +429,7 @@ impl ContinuityClient {
         &self,
         provider_boundary_id: &str,
         continuity_token_id: Uuid,
-    ) -> Result<ContinuityProcedureResult, ContinuityError> {
+    ) -> Result<ContinuityTokenLookup, ContinuityError> {
         let client = self.client.lock().await;
         let row = client
             .query_one(
@@ -429,7 +438,20 @@ impl ContinuityClient {
             )
             .await
             .map_err(ContinuityError::postgres)?;
-        parse_procedure_result(&row)
+        let result = parse_token_lookup(&row)?;
+        let returned_token = match &result {
+            ContinuityTokenLookup::Found(found) => found.continuity_token_id,
+            ContinuityTokenLookup::NotFound {
+                continuity_token_id,
+                ..
+            } => *continuity_token_id,
+        };
+        if returned_token != continuity_token_id {
+            return Err(ContinuityError::InvalidResponse(
+                "token lookup returned a different token",
+            ));
+        }
+        Ok(result)
     }
 
     /// Bind an external intent to its exact durable local request state.
@@ -630,6 +652,71 @@ fn parse_procedure_result(row: &Row) -> Result<ContinuityProcedureResult, Contin
     })
 }
 
+fn parse_token_lookup(row: &Row) -> Result<ContinuityTokenLookup, ContinuityError> {
+    let result_code = required_text(row, 0, "result code is missing")?;
+    if result_code != "NOT_FOUND" {
+        return parse_procedure_result(row).map(ContinuityTokenLookup::Found);
+    }
+    let state = row
+        .try_get::<_, Option<String>>(1)
+        .map_err(|_| ContinuityError::InvalidResponse("not-found state is not nullable text"))?;
+    let ownership = row.try_get::<_, Option<String>>(2).map_err(|_| {
+        ContinuityError::InvalidResponse("not-found ownership is not nullable text")
+    })?;
+    let authority_epoch = row.try_get::<_, Option<String>>(3).map_err(|_| {
+        ContinuityError::InvalidResponse("not-found authority epoch is not nullable text")
+    })?;
+    let continuity_seq = row.try_get::<_, Option<String>>(4).map_err(|_| {
+        ContinuityError::InvalidResponse("not-found continuity sequence is not nullable text")
+    })?;
+    let row_blake3 = row.try_get::<_, Option<Vec<u8>>>(6).map_err(|_| {
+        ContinuityError::InvalidResponse("not-found row digest is not nullable bytea")
+    })?;
+    let observed_at_unix_ms = row
+        .try_get::<_, i64>(7)
+        .map_err(|_| ContinuityError::InvalidResponse("not-found time is not bigint"))?;
+    validate_not_found_shape(
+        state.as_deref(),
+        ownership.as_deref(),
+        authority_epoch.as_deref(),
+        continuity_seq.as_deref(),
+        row_blake3.as_deref(),
+        observed_at_unix_ms,
+    )?;
+    Ok(ContinuityTokenLookup::NotFound {
+        continuity_token_id: row
+            .try_get(5)
+            .map_err(|_| ContinuityError::InvalidResponse("continuity token is not UUID"))?,
+        observed_at_unix_ms,
+    })
+}
+
+fn validate_not_found_shape(
+    state: Option<&str>,
+    ownership: Option<&str>,
+    authority_epoch: Option<&str>,
+    continuity_seq: Option<&str>,
+    row_blake3: Option<&[u8]>,
+    observed_at_unix_ms: i64,
+) -> Result<(), ContinuityError> {
+    if state.is_some()
+        || ownership.is_some()
+        || authority_epoch.is_some()
+        || continuity_seq.is_some()
+        || row_blake3.is_some()
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "not-found result carries stored-row evidence",
+        ));
+    }
+    if observed_at_unix_ms < 0 {
+        return Err(ContinuityError::InvalidResponse(
+            "not-found time must be nonnegative",
+        ));
+    }
+    Ok(())
+}
+
 fn required_text(
     row: &Row,
     index: usize,
@@ -748,6 +835,56 @@ fn postgres_error_shape_is_transient(is_closed: bool, sqlstate: Option<&str>) ->
 mod tests {
     use super::*;
 
+    fn normalized_embedded_migration() -> String {
+        std::str::from_utf8(crate::schema::CONTINUITY_MIGRATION_V1)
+            .expect("embedded migration must remain UTF-8 SQL")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn client_procedure_signatures_match_the_embedded_migration() {
+        let migration = normalized_embedded_migration();
+        for signature in [
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_get_by_token_v1( \
+             api_revision text, provider_boundary_id text, continuity_token_id uuid )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_begin_v1( \
+             api_revision text, expected_current_epoch object_store_continuity.uint64, \
+             continuity_token_id uuid, provider_boundary_id text, intent_kind text, \
+             authenticated_cell_id text, authenticated_tenant_id text, logical_request_id uuid, \
+             attempt_id uuid, selected_fingerprint bytea, expected_policy_revision text, \
+             operation_quota_class text, requested_rows object_store_continuity.uint64, \
+             requested_bytes object_store_continuity.uint64, requested_concurrency \
+             object_store_continuity.uint64, retention_deadline_unix_ms bigint )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_mark_bound_v1( \
+             api_revision text, provider_boundary_id text, authority_epoch \
+             object_store_continuity.uint64, continuity_seq object_store_continuity.uint64, \
+             continuity_token_id uuid, authenticated_cell_id text, authenticated_tenant_id text, \
+             logical_request_id uuid, attempt_id uuid, intent_kind text, selected_fingerprint bytea, \
+             expected_prior_row_blake3 bytea, local_binding_blake3 bytea )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_mark_completed_v1( \
+             api_revision text, provider_boundary_id text, authority_epoch \
+             object_store_continuity.uint64, continuity_seq object_store_continuity.uint64, \
+             continuity_token_id uuid, authenticated_cell_id text, authenticated_tenant_id text, \
+             logical_request_id uuid, attempt_id uuid, intent_kind text, selected_fingerprint bytea, \
+             expected_prior_row_blake3 bytea, local_binding_blake3 bytea, \
+             terminal_evidence_blake3 bytea, expected_prior_state text DEFAULT 'BOUND' )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_mark_no_local_effect_v1( \
+             api_revision text, provider_boundary_id text, authority_epoch \
+             object_store_continuity.uint64, continuity_seq object_store_continuity.uint64, \
+             continuity_token_id uuid, authenticated_cell_id text, authenticated_tenant_id text, \
+             logical_request_id uuid, attempt_id uuid, intent_kind text, selected_fingerprint bytea, \
+             expected_prior_row_blake3 bytea, terminal_evidence_blake3 bytea, release_id uuid, \
+             release_basis_id text, release_basis_blake3 bytea )",
+        ] {
+            assert!(
+                migration.contains(signature),
+                "embedded migration is missing client procedure signature: {signature}"
+            );
+        }
+    }
+
     #[test]
     fn begin_query_calls_only_the_versioned_procedure_with_numeric_u64_parameters() {
         assert_eq!(
@@ -755,13 +892,14 @@ mod tests {
             "SELECT result_code, state, ownership_state, authority_epoch::text, \
     continuity_seq::text, continuity_token_id, row_blake3, external_committed_at_unix_ms \
     FROM object_store_continuity.object_store_continuity_begin_v1(\
-      $1, $2, $3::object_store_continuity.uint64, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
-      $13::object_store_continuity.uint64, $14::object_store_continuity.uint64, $15::object_store_continuity.uint64, $16\
+      $1, $2::text::object_store_continuity.uint64, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+      $13::text::object_store_continuity.uint64, $14::text::object_store_continuity.uint64, \
+      $15::text::object_store_continuity.uint64, $16\
     )"
         );
         assert_eq!(
             BEGIN_SQL
-                .matches("::object_store_continuity.uint64")
+                .matches("::text::object_store_continuity.uint64")
                 .count(),
             4
         );
@@ -803,7 +941,9 @@ mod tests {
                 "query did not call {procedure}: {query}"
             );
             assert_eq!(
-                query.matches("::object_store_continuity.uint64").count(),
+                query
+                    .matches("::text::object_store_continuity.uint64")
+                    .count(),
                 2,
                 "query: {query}"
             );
@@ -952,6 +1092,37 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    #[test]
+    fn not_found_shape_accepts_only_null_stored_evidence_and_nonnegative_time() {
+        validate_not_found_shape(None, None, None, None, None, 0)
+            .expect("the migration's exact nullable absence shape must parse");
+        validate_not_found_shape(None, None, None, None, None, i64::MAX)
+            .expect("a nonnegative observation time must parse");
+
+        let digest = [0x5a; 32];
+        for result in [
+            validate_not_found_shape(Some("INTENT"), None, None, None, None, 0),
+            validate_not_found_shape(None, Some("SHADOW_RESERVED"), None, None, None, 0),
+            validate_not_found_shape(None, None, Some("1"), None, None, 0),
+            validate_not_found_shape(None, None, None, Some("1"), None, 0),
+            validate_not_found_shape(None, None, None, None, Some(&digest), 0),
+        ] {
+            assert!(matches!(
+                result,
+                Err(ContinuityError::InvalidResponse(
+                    "not-found result carries stored-row evidence"
+                ))
+            ));
+        }
+
+        assert!(matches!(
+            validate_not_found_shape(None, None, None, None, None, -1),
+            Err(ContinuityError::InvalidResponse(
+                "not-found time must be nonnegative"
+            ))
+        ));
     }
 
     #[test]

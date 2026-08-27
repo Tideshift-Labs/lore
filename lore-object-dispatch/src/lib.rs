@@ -7,3 +7,4 @@
 //! traffic or first-seen admission until the WP-121 deployment and calibration gates are current.
 
 pub mod continuity;
+pub mod schema;

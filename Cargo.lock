@@ -2831,6 +2831,7 @@ dependencies = [
 name = "lore-object-dispatch"
 version = "0.8.7-nightly"
 dependencies = [
+ "blake3",
  "lore-base",
  "rcgen",
  "rustls",
