@@ -75,6 +75,19 @@ traffic. Its rejection counter accepts only the seven frozen RPC names plus fixe
 `source_dark` labels; arbitrary HTTP paths, methods, user agents, certificates, tenants, boundaries,
 requests, buckets, and keys never become metric labels.
 
+The pure request-contract kernel validates and canonicalizes the complete seven-operation
+descriptor, reservations, consumer context, authenticated scope, metadata, range/list/body bounds,
+and optional durable PUT spool evidence. It derives the exact five-part durable request key and the
+frozen `object-dispatch-fingerprint-v1` BLAKE3 fingerprint. Canonical lowercase RFC 9562 UUIDv7
+identities are classified against an inclusive injected database-time window. One effect-free API
+atomically validates the caller-supplied fingerprint and classifies absent identity, exact full or
+compact replay, and identity reuse with a different fingerprint. Current authority, cell admission,
+deadline, reservation, and PUT spool checks are first-seen-only prerequisites.
+
+These functions perform no database, spool, clock, provider, or network access and are not called by
+the source-dark handlers. Durable lookup and serializable first-seen admission remain future
+composition work.
+
 The standalone binary requires exactly:
 
 - `LORE_OBJECT_DISPATCH_SERVICE_CONFIG_REVISION=object-store-dispatch-service-mtls-shell-v1`;
@@ -108,7 +121,8 @@ cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact l
 ```
 
 The library suite validates service and continuity configuration, mutual TLS, URI-SAN registration,
-allocation/admission fence validation, redaction, SQL procedure shapes, exact numeric transfer,
+allocation/admission fence validation, canonical request fingerprinting, UUIDv7 and idempotency
+classification, first-seen prerequisites, redaction, SQL procedure shapes, exact numeric transfer,
 closed result decoding, migration identity, transient-error classification, and exact ambiguous-
 commit reconciliation.
 Each live contract has passed against disposable PostgreSQL 16 over real mTLS and the exact embedded

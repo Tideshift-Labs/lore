@@ -2831,6 +2831,7 @@ dependencies = [
 name = "lore-object-dispatch"
 version = "0.8.7-nightly"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "lore-base",
  "lore-proto",
