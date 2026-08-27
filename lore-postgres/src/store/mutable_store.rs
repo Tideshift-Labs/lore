@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Postgres-backed mutable store (CR-007) — the branch-tip compare-and-swap.
 //!
@@ -94,7 +95,7 @@ async fn lock_key(
     tx.execute(
         "SELECT pg_advisory_xact_lock( \
              hashtextextended( \
-                 encode($1, 'hex') || ':' || $2::text || ':' || encode($3, 'hex'), \
+                 encode($1, 'hex') || ':' || $2::smallint::text || ':' || encode($3, 'hex'), \
                  0 \
              ) \
          )",

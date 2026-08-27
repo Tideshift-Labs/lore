@@ -18,6 +18,30 @@ fn pg_url() -> Option<String> {
 }
 
 #[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn mutable_store_advisory_lock_accepts_smallint_key_type() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping Postgres mutable-store advisory-lock test");
+        return;
+    };
+    let store = Arc::new(
+        PostgresMutableStore::connect(&url, 1, &lore_postgres::pool::TlsConfig::default())
+            .await
+            .expect("connect + schema"),
+    );
+
+    store
+        .store(
+            rand::random(),
+            rand::random(),
+            rand::random(),
+            KeyType::RepositoryId,
+        )
+        .await
+        .expect("advisory lock must accept the store's i16 key type");
+}
+
+#[tokio::test]
 #[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
 async fn mutable_cas_lifecycle() {
     let Some(url) = pg_url() else {

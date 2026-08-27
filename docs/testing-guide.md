@@ -278,6 +278,16 @@ will update an older check constraint or state schema.
 - Shared mock state must use `Arc`-backed counters/maps so the test and code-under-test observe the
   same clone.
 
+### Postgres parameter typing and retry classification
+
+- Symptom: the first mutable-store write returns `SlowDown` forever while Postgres logs no SQL
+  error. Cause: a query expression such as `$2::text` makes Postgres expect `TEXT`, but the Rust
+  caller binds `i16`; `tokio-postgres` reports a client-side `WrongType` with no `DbError`, which a
+  broad no-DB-error retry classifier can mistake for transport failure. What to do: cast through
+  the bound SQL type (`$2::smallint::text`), keep any test-side duplicate query identical, and pin
+  both layers with `cargo test -p lore-postgres --lib pool::tests -j 4` plus the ignored live test
+  `mutable_store_advisory_lock_accepts_smallint_key_type` under `LORE_TEST_PG_URL`.
+
 ### Poisoning a persisted `State`/`Tree` field for a fault-injection test
 
 `State::set_delta_block(hash, count)` is `pub` and the cheapest lever to make a *persisted*

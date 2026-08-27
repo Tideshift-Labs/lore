@@ -165,7 +165,7 @@ async fn cas_outcome_is_serialized_with_interleaving_writer() {
     tx.execute(
         "SELECT pg_advisory_xact_lock( \
              hashtextextended( \
-                 encode($1, 'hex') || ':' || $2::text || ':' || encode($3, 'hex'), \
+                 encode($1, 'hex') || ':' || $2::smallint::text || ':' || encode($3, 'hex'), \
                  0 \
              ) \
          )",

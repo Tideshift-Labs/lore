@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Shared Postgres connection-pool construction + error classification for the
 //! three CR-007 stores.
@@ -27,10 +28,10 @@
 //! `prefer` (the default) can silently fall back to **plaintext** if the TLS
 //! handshake fails — use `require` in production.
 //!
-//! **Transient errors (A2):** pool/connection/serialization failures are
-//! classified as *retryable* so each store can surface `SlowDown` (clients back
-//! off and retry) instead of a hard `internal` error, mirroring how `lore-aws`
-//! maps throttling/timeouts.
+//! **Transient errors (A2):** pool exhaustion, connection failures, and
+//! transient database transaction failures are classified as *retryable* so
+//! each store can surface `SlowDown` (clients back off and retry) instead of a
+//! hard `internal` error, mirroring how `lore-aws` maps throttling/timeouts.
 
 use std::sync::Arc;
 
@@ -225,9 +226,27 @@ pub fn is_transient_pg(err: &tokio_postgres::Error) -> bool {
     if let Some(db) = err.as_db_error() {
         return sqlstate_is_transient(db.code().code());
     }
+    if error_chain_contains::<tokio_postgres::types::WrongType>(err) {
+        return false;
+    }
     // No DB error attached ⇒ a transport/IO-level failure (connection reset,
-    // timeout). Treat as transient.
+    // timeout), unless the source chain identified a permanent client-side
+    // parameter type mismatch above. Treat the remaining cases as transient.
     true
+}
+
+fn error_chain_contains<T>(error: &(dyn std::error::Error + 'static)) -> bool
+where
+    T: std::error::Error + 'static,
+{
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if cause.is::<T>() {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 /// Whether a Postgres SQLSTATE code denotes a transient/retryable condition:
@@ -256,7 +275,39 @@ pub fn is_transient_pool(err: &PoolError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+    use std::fmt;
+
+    use tokio_postgres::types::Type;
+    use tokio_postgres::types::WrongType;
+
+    use super::error_chain_contains;
     use super::sqlstate_is_transient;
+
+    #[derive(Debug)]
+    struct WrappedError(WrongType);
+
+    impl fmt::Display for WrappedError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("wrapped parameter error")
+        }
+    }
+
+    impl Error for WrappedError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn error_chain_detects_wrong_type_parameter_error() {
+        let error = WrappedError(WrongType::new::<i16>(Type::TEXT));
+
+        assert!(error_chain_contains::<WrongType>(&error));
+        assert!(!error_chain_contains::<WrongType>(&std::io::Error::other(
+            "connection reset"
+        )));
+    }
 
     #[test]
     fn sqlstate_is_transient_true_cases() {
