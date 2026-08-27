@@ -57,6 +57,7 @@ use lore_object_dispatch::continuity::MarkNoLocalEffectRequest;
 use lore_object_dispatch::continuity::PrepareAdjudicationRequest;
 use lore_object_dispatch::continuity::QuarantinePriorState;
 use lore_object_dispatch::continuity::QuarantineRequest;
+use lore_object_dispatch::continuity::ReadShadowReleaseReceiptRequest;
 use lore_object_dispatch::continuity::ReconciliationState;
 use lore_object_dispatch::continuity::RecordSnapshotRequest;
 use lore_object_dispatch::continuity::ReleaseShadowOwnershipRequest;
@@ -864,6 +865,83 @@ async fn live_mtls_reconciler_records_snapshot_and_releases_bound_ownership() {
     assert_eq!(release_replay.result_code, ContinuityResultCode::Replay);
     assert_same_row(&released, &release_replay);
     assert_reconciler_readback(&reconciler, &boundary_id, &released).await;
+
+    let receipt_request = ReadShadowReleaseReceiptRequest {
+        provider_boundary_id: boundary_id.clone(),
+        authority_epoch: released.authority_epoch,
+        continuity_seq: released.continuity_seq,
+        continuity_token_id: released.continuity_token_id,
+    };
+    let receipt = reconciler
+        .read_shadow_release_receipt(&receipt_request)
+        .await
+        .expect("reconciler must read and canonically validate the exact release receipt")
+        .expect("the released BOUND row must have one release receipt");
+    assert_eq!(
+        receipt.provider_boundary_id,
+        receipt_request.provider_boundary_id
+    );
+    assert_eq!(receipt.authority_epoch, receipt_request.authority_epoch);
+    assert_eq!(receipt.continuity_seq, receipt_request.continuity_seq);
+    assert_eq!(
+        receipt.continuity_token_id,
+        receipt_request.continuity_token_id
+    );
+    assert_eq!(receipt.release_id, release_request.release_id);
+    assert_ne!(receipt.receipt_blake3, [0; 32]);
+    assert_eq!(
+        receipt.released_at_unix_ms, released.external_committed_at_unix_ms,
+        "the receipt and released row must identify the same committed release"
+    );
+
+    let receipt_after_replay = reconciler
+        .read_shadow_release_receipt(&receipt_request)
+        .await
+        .expect("receipt readback after exact release replay must succeed")
+        .expect("exact release replay must preserve the receipt");
+    assert_eq!(receipt_after_replay, receipt);
+
+    for absent_identity in [
+        ReadShadowReleaseReceiptRequest {
+            provider_boundary_id: format!("{boundary_id}-mismatch"),
+            authority_epoch: receipt_request.authority_epoch,
+            continuity_seq: receipt_request.continuity_seq,
+            continuity_token_id: receipt_request.continuity_token_id,
+        },
+        ReadShadowReleaseReceiptRequest {
+            provider_boundary_id: boundary_id.clone(),
+            authority_epoch: receipt_request.authority_epoch,
+            continuity_seq: receipt_request
+                .continuity_seq
+                .checked_add(1)
+                .expect("live sequence must leave room for an isolation probe"),
+            continuity_token_id: receipt_request.continuity_token_id,
+        },
+        ReadShadowReleaseReceiptRequest {
+            provider_boundary_id: boundary_id.clone(),
+            authority_epoch: receipt_request.authority_epoch,
+            continuity_seq: receipt_request.continuity_seq,
+            continuity_token_id: Uuid::now_v7(),
+        },
+    ] {
+        assert_eq!(
+            reconciler
+                .read_shadow_release_receipt(&absent_identity)
+                .await
+                .expect("mismatched receipt identity must return typed absence"),
+            None,
+            "one mismatched identity component must not disclose another receipt"
+        );
+    }
+
+    let boundary_receipt_error = boundary
+        .read_shadow_release_receipt(&receipt_request)
+        .await
+        .expect_err("boundary runtime identity must not execute the reconciler receipt read");
+    assert!(matches!(
+        boundary_receipt_error,
+        ContinuityError::Postgres { transient: false }
+    ));
 
     let begin_replay = boundary
         .begin(&begin_request)

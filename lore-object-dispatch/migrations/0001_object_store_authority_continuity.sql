@@ -2501,6 +2501,60 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION object_store_continuity.object_store_continuity_read_shadow_release_receipt_v1(
+  api_revision text, requested_provider_boundary_id text,
+  requested_authority_epoch object_store_continuity.uint64,
+  requested_continuity_seq object_store_continuity.uint64,
+  requested_continuity_token_id uuid
+)
+RETURNS TABLE(
+  receipt_provider_boundary_id text,
+  receipt_authority_epoch object_store_continuity.uint64,
+  receipt_continuity_seq object_store_continuity.uint64,
+  receipt_continuity_token_id uuid,
+  release_id uuid,
+  receipt_blake3 bytea,
+  released_at_unix_ms bigint
+)
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE stored object_store_continuity.shadow_release_receipts%ROWTYPE;
+DECLARE release_preimage bytea;
+BEGIN
+  PERFORM object_store_continuity.assert_api_revision_v1(api_revision);
+  PERFORM object_store_continuity.assert_reconciler_v1();
+  SELECT * INTO stored FROM object_store_continuity.shadow_release_receipts AS receipt
+   WHERE receipt.provider_boundary_id = requested_provider_boundary_id
+     AND receipt.authority_epoch = requested_authority_epoch
+     AND receipt.continuity_seq = requested_continuity_seq
+     AND receipt.continuity_token_id = requested_continuity_token_id;
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+  release_preimage := object_store_continuity.release_preimage_v1(
+    stored.release_id, stored.provider_boundary_id, stored.authority_epoch,
+    stored.continuity_seq, stored.continuity_token_id, stored.continuity_policy_revision,
+    stored.quota_ownership_blake3, stored.quota_bytes, stored.quota_rows,
+    stored.quota_concurrency, stored.authenticated_cell_id, stored.authenticated_tenant_id,
+    stored.release_basis_kind, stored.basis_id, stored.basis_blake3,
+    stored.released_at_unix_ms, stored.global_counter_revision,
+    stored.boundary_counter_revision, stored.cell_counter_revision,
+    stored.tenant_counter_revision
+  );
+  PERFORM object_store_continuity.assert_blake3_v1(release_preimage, stored.receipt_blake3);
+  IF stored.canonical_receipt_bytes IS DISTINCT FROM release_preimage || stored.receipt_blake3 THEN
+    RAISE EXCEPTION 'SHADOW_RELEASE_RECEIPT_CANONICAL_BYTES_MISMATCH' USING ERRCODE = '22000';
+  END IF;
+  receipt_provider_boundary_id := stored.provider_boundary_id;
+  receipt_authority_epoch := stored.authority_epoch;
+  receipt_continuity_seq := stored.continuity_seq;
+  receipt_continuity_token_id := stored.continuity_token_id;
+  release_id := stored.release_id;
+  receipt_blake3 := stored.receipt_blake3;
+  released_at_unix_ms := stored.released_at_unix_ms;
+  RETURN NEXT;
+END
+$$;
+
 CREATE FUNCTION object_store_continuity.object_store_continuity_archive_prune_v1(
   api_revision text, provider_boundary_id text,
   authority_epoch object_store_continuity.uint64,
@@ -3460,6 +3514,7 @@ GRANT USAGE ON SCHEMA object_store_continuity TO
   object_dispatch_continuity_reconciler, object_dispatch_continuity_migrator;
 GRANT EXECUTE ON FUNCTION
   object_store_continuity.object_store_continuity_get_by_token_v1(text, text, uuid),
+  object_store_continuity.object_store_continuity_read_shadow_release_receipt_v1(text, text, object_store_continuity.uint64, object_store_continuity.uint64, uuid),
   object_store_continuity.object_store_continuity_quarantine_v1(text, text, object_store_continuity.uint64, object_store_continuity.uint64, uuid, text, text, uuid, uuid, text, bytea, bytea, text, bytea, bytea),
   object_store_continuity.object_store_continuity_mark_ambiguous_dispatch_v1(text, text, object_store_continuity.uint64, object_store_continuity.uint64, uuid, text, text, uuid, uuid, text, bytea, bytea, bytea, bytea, text),
   object_store_continuity.object_store_continuity_prepare_adjudication_v1(text, text, object_store_continuity.uint64, object_store_continuity.uint64, uuid, text, text, uuid, uuid, text, bytea, bytea, text, bytea, bytea, text),

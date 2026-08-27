@@ -24,6 +24,8 @@ mode. Connection and TLS material is redacted from diagnostics.
 - recording exact local durability snapshot coverage and releasing covered `BOUND` or `COMPLETED`
   shadow ownership; and
 - allocating an exact next epoch from the expected drained namespace; and
+- reading one exact shadow-release receipt by boundary, epoch, sequence, and token with typed absence
+  and canonical digest/byte validation; and
 - reading one boundary's current or historical epoch, continuity high-water, ownership counters,
   reconciliation state, and latest snapshot.
 
@@ -34,9 +36,9 @@ client does not retry operations itself.
 
 ## Embedded migration
 
-`schema::CONTINUITY_MIGRATION_V1` embeds the exact 193,646-byte transactional migration used by the
+`schema::CONTINUITY_MIGRATION_V1` embeds the exact 196,426-byte transactional migration used by the
 independent authority. Its BLAKE3-256 is
-`1530e511568b42b9368b1296eb6cdbaeecbc7f56a7838ac253bcbeb95434e6dd`. Runtime code never installs
+`2b3664532b62cddbb94dbb83dde954fe121aecbc484e2f7190e153a61f38b003`. Runtime code never installs
 the migration. Provisioning must install and read back separately attested bytes before readiness.
 
 ## Private protocol
@@ -63,7 +65,7 @@ cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact l
 
 The unit suite validates configuration, TLS material, redaction, SQL procedure shapes, exact numeric
 transfer, closed result decoding, migration identity, and transient-error classification. The
-regular gate passes 42 tests with zero failures and four intentionally ignored live contracts.
+regular gate passes 43 tests with zero failures and four intentionally ignored live contracts.
 Each live contract has passed against disposable PostgreSQL 16 over real mTLS and the exact embedded
 migration. Run the shared-fixture contracts serially or by exact test name; a parallel all-ignored
 invocation can encounter expected serializable counter contention. They cover mapped boundary and
@@ -71,7 +73,10 @@ reconciler identities, typed absence, serializable mutations, exact transition r
 no-local-effect release, quarantine, ambiguous dispatch, both adjudication kinds through final
 release, nonzero `pg_lsn` snapshot recording and
 replay, covered `BOUND` ownership release, counter/readback invariants, and Begin replay of final
-rows. The dedicated drained-epoch contract proves `1 -> 2`, zero new high-water, active epoch reads,
+rows. The snapshot/release contract also proves exact four-part shadow-release-receipt readback,
+canonical digest and byte validation, typed absence for each mismatched identity component, and
+denial to the boundary runtime identity. The dedicated drained-epoch contract proves `1 -> 2`, zero
+new high-water, active epoch reads,
 historical reconciliation absence, local invalid-order rejection, and transient SQLSTATE `40001` on
 a stale exact request; callers adopt the winner through epoch readback rather than replay. The probe
 separately confirmed that a connection without a client certificate is rejected.

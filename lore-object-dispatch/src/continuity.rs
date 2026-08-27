@@ -117,6 +117,13 @@ const ALLOCATE_EPOCH_SQL: &str = "SELECT authority_epoch::text, continuity_seq_h
       $1, $2, $3::text::object_store_continuity.uint64, \
       $4::text::object_store_continuity.uint64, $5\
     )";
+const READ_SHADOW_RELEASE_RECEIPT_SQL: &str = "SELECT receipt_provider_boundary_id, \
+    receipt_authority_epoch::text, receipt_continuity_seq::text, receipt_continuity_token_id, \
+    release_id, receipt_blake3, released_at_unix_ms FROM \
+    object_store_continuity.object_store_continuity_read_shadow_release_receipt_v1(\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5\
+    )";
 
 /// Connection material for one continuity boundary identity.
 ///
@@ -500,6 +507,25 @@ pub struct AllocateEpochRequest {
     pub expected_current_epoch: u64,
     pub next_epoch: u64,
     pub epoch_namespace_blake3: [u8; 32],
+}
+
+/// Exact released-token identity used for least-privilege receipt readback.
+pub struct ReadShadowReleaseReceiptRequest {
+    pub provider_boundary_id: String,
+    pub authority_epoch: u64,
+    pub continuity_seq: u64,
+    pub continuity_token_id: Uuid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShadowReleaseReceipt {
+    pub provider_boundary_id: String,
+    pub authority_epoch: u64,
+    pub continuity_seq: u64,
+    pub continuity_token_id: Uuid,
+    pub release_id: Uuid,
+    pub receipt_blake3: [u8; 32],
+    pub released_at_unix_ms: i64,
 }
 
 /// Server-derived result projection shared by continuity mutation and read procedures.
@@ -1303,6 +1329,51 @@ impl ContinuityClient {
             .map_err(ContinuityError::postgres)?;
         Ok(result)
     }
+
+    /// Read one exact canonical shadow-release receipt without granting table access.
+    pub async fn read_shadow_release_receipt(
+        &self,
+        request: &ReadShadowReleaseReceiptRequest,
+    ) -> Result<Option<ShadowReleaseReceipt>, ContinuityError> {
+        if request.provider_boundary_id.is_empty()
+            || request.authority_epoch == 0
+            || request.continuity_seq == 0
+        {
+            return Err(ContinuityError::InvalidConfiguration(
+                "shadow release receipt identity must be valid",
+            ));
+        }
+        let epoch = request.authority_epoch.to_string();
+        let sequence = request.continuity_seq.to_string();
+        let client = self.client.lock().await;
+        let row = client
+            .query_opt(
+                READ_SHADOW_RELEASE_RECEIPT_SQL,
+                &[
+                    &API_REVISION,
+                    &request.provider_boundary_id,
+                    &epoch,
+                    &sequence,
+                    &request.continuity_token_id,
+                ],
+            )
+            .await
+            .map_err(ContinuityError::postgres)?;
+        row.map(|row| {
+            let receipt = parse_shadow_release_receipt(&row)?;
+            if receipt.provider_boundary_id != request.provider_boundary_id
+                || receipt.authority_epoch != request.authority_epoch
+                || receipt.continuity_seq != request.continuity_seq
+                || receipt.continuity_token_id != request.continuity_token_id
+            {
+                return Err(ContinuityError::InvalidResponse(
+                    "shadow release receipt identity is inconsistent",
+                ));
+            }
+            Ok(receipt)
+        })
+        .transpose()
+    }
 }
 
 fn validate_begin_result(
@@ -1520,6 +1591,36 @@ fn parse_epoch_state(row: &Row) -> Result<ContinuityEpochState, ContinuityError>
     Ok(ContinuityEpochState {
         authority_epoch,
         continuity_seq_high_water: parse_u64_text(row, 1)?,
+    })
+}
+
+fn parse_shadow_release_receipt(row: &Row) -> Result<ShadowReleaseReceipt, ContinuityError> {
+    let released_at_unix_ms = row
+        .try_get::<_, i64>(6)
+        .map_err(|_| ContinuityError::InvalidResponse("release receipt time is invalid"))?;
+    if released_at_unix_ms < 0 {
+        return Err(ContinuityError::InvalidResponse(
+            "release receipt time must be nonnegative",
+        ));
+    }
+    Ok(ShadowReleaseReceipt {
+        provider_boundary_id: row
+            .try_get(0)
+            .map_err(|_| ContinuityError::InvalidResponse("release receipt boundary is invalid"))?,
+        authority_epoch: parse_u64_text(row, 1)?,
+        continuity_seq: parse_u64_text(row, 2)?,
+        continuity_token_id: row
+            .try_get(3)
+            .map_err(|_| ContinuityError::InvalidResponse("release receipt token is invalid"))?,
+        release_id: row
+            .try_get(4)
+            .map_err(|_| ContinuityError::InvalidResponse("release receipt ID is invalid"))?,
+        receipt_blake3: parse_digest(
+            row.try_get(5).map_err(|_| {
+                ContinuityError::InvalidResponse("release receipt digest is invalid")
+            })?,
+        )?,
+        released_at_unix_ms,
     })
 }
 
@@ -1866,6 +1967,10 @@ mod tests {
              api_revision text, provider_boundary_id text, expected_current_epoch \
              object_store_continuity.uint64, next_epoch object_store_continuity.uint64, \
              epoch_namespace_blake3 bytea )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_read_shadow_release_receipt_v1( \
+             api_revision text, requested_provider_boundary_id text, requested_authority_epoch \
+             object_store_continuity.uint64, requested_continuity_seq \
+             object_store_continuity.uint64, requested_continuity_token_id uuid )",
         ] {
             assert!(
                 migration.contains(signature),
@@ -2023,6 +2128,12 @@ mod tests {
                 5,
                 2,
             ),
+            (
+                READ_SHADOW_RELEASE_RECEIPT_SQL,
+                "object_store_continuity_read_shadow_release_receipt_v1",
+                5,
+                2,
+            ),
         ] {
             assert!(
                 query.contains(&format!("object_store_continuity.{procedure}(")),
@@ -2068,6 +2179,34 @@ mod tests {
             assert!(
                 migration.contains(invariant),
                 "embedded epoch allocation lost invariant: {invariant}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_receipt_read_pins_exact_projection_canonical_validation_and_reconciler_auth() {
+        assert_eq!(
+            READ_SHADOW_RELEASE_RECEIPT_SQL,
+            "SELECT receipt_provider_boundary_id, \
+    receipt_authority_epoch::text, receipt_continuity_seq::text, receipt_continuity_token_id, \
+    release_id, receipt_blake3, released_at_unix_ms FROM \
+    object_store_continuity.object_store_continuity_read_shadow_release_receipt_v1(\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5\
+    )"
+        );
+        let migration = normalized_embedded_migration();
+        for invariant in [
+            "PERFORM object_store_continuity.assert_api_revision_v1(api_revision); PERFORM object_store_continuity.assert_reconciler_v1();",
+            "WHERE receipt.provider_boundary_id = requested_provider_boundary_id AND receipt.authority_epoch = requested_authority_epoch AND receipt.continuity_seq = requested_continuity_seq AND receipt.continuity_token_id = requested_continuity_token_id; IF NOT FOUND THEN RETURN; END IF;",
+            "PERFORM object_store_continuity.assert_blake3_v1(release_preimage, stored.receipt_blake3);",
+            "IF stored.canonical_receipt_bytes IS DISTINCT FROM release_preimage || stored.receipt_blake3 THEN RAISE EXCEPTION 'SHADOW_RELEASE_RECEIPT_CANONICAL_BYTES_MISMATCH' USING ERRCODE = '22000'; END IF;",
+            "object_store_continuity.object_store_continuity_read_shadow_release_receipt_v1(text, text, object_store_continuity.uint64, object_store_continuity.uint64, uuid)",
+            "TO object_dispatch_continuity_reconciler;",
+        ] {
+            assert!(
+                migration.contains(invariant),
+                "embedded release-receipt read lost invariant: {invariant}"
             );
         }
     }
