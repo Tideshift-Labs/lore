@@ -20,6 +20,15 @@
 //!   with high-water/counters zero, no intents or snapshots, and no epoch namespace at or above 2.
 //! - `LORE_TEST_CONTINUITY_NEXT_EPOCH_NAMESPACE_BLAKE3_HEX`: exact lowercase namespace digest for
 //!   epoch 2 on that dedicated boundary. The boundary must be rebuilt before rerunning the test.
+//! - `LORE_TEST_CONTINUITY_ARCHIVE_BOUNDARY_ID`,
+//!   `LORE_TEST_CONTINUITY_ARCHIVE_AUTHORITY_EPOCH`,
+//!   `LORE_TEST_CONTINUITY_ARCHIVE_CONTINUITY_SEQ`, and
+//!   `LORE_TEST_CONTINUITY_ARCHIVE_TOKEN_ID`: exact identity of one dedicated admin-seeded,
+//!   retention-eligible terminal row with released ownership.
+//! - `LORE_TEST_CONTINUITY_ARCHIVE_ROW_BLAKE3_HEX`,
+//!   `LORE_TEST_CONTINUITY_ARCHIVE_RELEASE_RECEIPT_BLAKE3_HEX`, and
+//!   `LORE_TEST_CONTINUITY_ARCHIVE_PROOF_BLAKE3_HEX`: exact lowercase digests for that row, its
+//!   canonically validated release receipt, and proof bytes `live-test-archive-proof-v1`.
 //! - `LORE_TEST_CONTINUITY_BOUNDARY_ID`: boundary mapped to the certificate login role.
 //! - `LORE_TEST_CONTINUITY_AUTHORITY_EPOCH`: active preprovisioned authority epoch.
 //! - `LORE_TEST_CONTINUITY_POLICY_REVISION`: installed policy revision for that epoch.
@@ -29,6 +38,7 @@
 //! `cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_adjudicates_quarantined_and_ambiguous_intents`
 //! `cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_records_snapshot_and_releases_bound_ownership`
 //! `cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_allocates_dedicated_drained_epoch_one_to_two`
+//! `cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detail`
 
 use std::fs;
 use std::time::Duration;
@@ -36,6 +46,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use lore_object_dispatch::continuity::AllocateEpochRequest;
+use lore_object_dispatch::continuity::ArchivePruneRequest;
 use lore_object_dispatch::continuity::BeginIntentRequest;
 use lore_object_dispatch::continuity::CompleteAdjudicationRequest;
 use lore_object_dispatch::continuity::ContinuityAdjudicationKind;
@@ -1111,5 +1122,95 @@ async fn live_mtls_reconciler_allocates_dedicated_drained_epoch_one_to_two() {
         ContinuityError::InvalidConfiguration(
             "epoch allocation identity and ordering must be valid"
         )
+    ));
+}
+
+#[ignore = "requires a disposable, dedicated, admin-seeded retention-eligible archive fixture over mTLS"]
+#[tokio::test]
+async fn live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detail() {
+    const ARCHIVE_PROOF_BYTES: &[u8] = b"live-test-archive-proof-v1";
+
+    let boundary_id = required_env("LORE_TEST_CONTINUITY_ARCHIVE_BOUNDARY_ID");
+    let authority_epoch = required_env("LORE_TEST_CONTINUITY_ARCHIVE_AUTHORITY_EPOCH")
+        .parse::<u64>()
+        .expect("LORE_TEST_CONTINUITY_ARCHIVE_AUTHORITY_EPOCH must be uint64 text");
+    let continuity_seq = required_env("LORE_TEST_CONTINUITY_ARCHIVE_CONTINUITY_SEQ")
+        .parse::<u64>()
+        .expect("LORE_TEST_CONTINUITY_ARCHIVE_CONTINUITY_SEQ must be uint64 text");
+    let continuity_token_id = required_env("LORE_TEST_CONTINUITY_ARCHIVE_TOKEN_ID")
+        .parse::<Uuid>()
+        .expect("LORE_TEST_CONTINUITY_ARCHIVE_TOKEN_ID must be a UUID");
+    let expected_row_blake3 = required_blake3_hex("LORE_TEST_CONTINUITY_ARCHIVE_ROW_BLAKE3_HEX");
+    let expected_release_receipt_blake3 =
+        required_blake3_hex("LORE_TEST_CONTINUITY_ARCHIVE_RELEASE_RECEIPT_BLAKE3_HEX");
+    let archive_proof_blake3 = required_blake3_hex("LORE_TEST_CONTINUITY_ARCHIVE_PROOF_BLAKE3_HEX");
+    assert!(authority_epoch > 0, "archive epoch must be positive");
+    assert!(continuity_seq > 0, "archive sequence must be positive");
+
+    let reconciler = ContinuityClient::connect(&tls_config(
+        "LORE_TEST_CONTINUITY_RECONCILER_PG_URL",
+        "LORE_TEST_CONTINUITY_RECONCILER_CLIENT_CERT_PEM_PATH",
+        "LORE_TEST_CONTINUITY_RECONCILER_CLIENT_KEY_PEM_PATH",
+    ))
+    .await
+    .expect("exact reconciler continuity mTLS connection must succeed");
+    let boundary = ContinuityClient::connect(&tls_config(
+        "LORE_TEST_CONTINUITY_PG_URL",
+        "LORE_TEST_CONTINUITY_CLIENT_CERT_PEM_PATH",
+        "LORE_TEST_CONTINUITY_CLIENT_KEY_PEM_PATH",
+    ))
+    .await
+    .expect("exact boundary continuity mTLS connection must succeed");
+
+    let seeded = require_found(
+        reconciler
+            .get_by_token(&boundary_id, continuity_token_id)
+            .await
+            .expect("reconciler must read the admin-seeded archive fixture"),
+    );
+    assert_eq!(seeded.authority_epoch, authority_epoch);
+    assert_eq!(seeded.continuity_seq, continuity_seq);
+    assert_eq!(seeded.continuity_token_id, continuity_token_id);
+    assert_eq!(seeded.row_blake3, expected_row_blake3);
+
+    let request = ArchivePruneRequest {
+        provider_boundary_id: boundary_id.clone(),
+        authority_epoch,
+        continuity_seq,
+        continuity_token_id,
+        expected_row_blake3,
+        expected_release_receipt_blake3,
+        archive_proof_bytes: ARCHIVE_PROOF_BYTES.to_vec(),
+        archive_proof_blake3,
+    };
+    let boundary_error = boundary
+        .archive_prune(&request)
+        .await
+        .expect_err("boundary runtime identity must not execute reconciler archive/prune");
+    assert!(matches!(
+        boundary_error,
+        ContinuityError::Postgres { transient: false }
+    ));
+
+    let archived = reconciler
+        .archive_prune(&request)
+        .await
+        .expect("reconciler must archive the exact retention-eligible detail");
+    assert_eq!(archived.accepted_start_sequence, continuity_seq);
+    assert_eq!(archived.accepted_end_sequence, continuity_seq);
+    assert_eq!(archived.accepted_row_count, 1);
+    assert_eq!(archived.prune_commit_sequence, 1);
+    assert_ne!(archived.accepted_interval_blake3, [0; 32]);
+
+    let lookup_after_archive = reconciler
+        .get_by_token(&boundary_id, continuity_token_id)
+        .await
+        .expect("archived detail lookup must return modeled absence");
+    assert!(matches!(
+        lookup_after_archive,
+        ContinuityTokenLookup::NotFound {
+            continuity_token_id: missing_token,
+            ..
+        } if missing_token == continuity_token_id
     ));
 }

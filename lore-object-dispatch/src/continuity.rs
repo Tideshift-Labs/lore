@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 const API_REVISION: &str = "object-store-authority-continuity-v1";
 const MUTATION_ISOLATION_LEVEL: IsolationLevel = IsolationLevel::Serializable;
+const MAX_ARCHIVE_PROOF_BYTES: usize = 1_048_576;
 const BEGIN_SQL: &str = "SELECT result_code, state, ownership_state, authority_epoch::text, \
     continuity_seq::text, continuity_token_id, row_blake3, external_committed_at_unix_ms \
     FROM object_store_continuity.object_store_continuity_begin_v1(\
@@ -123,6 +124,13 @@ const READ_SHADOW_RELEASE_RECEIPT_SQL: &str = "SELECT receipt_provider_boundary_
     object_store_continuity.object_store_continuity_read_shadow_release_receipt_v1(\
       $1, $2, $3::text::object_store_continuity.uint64, \
       $4::text::object_store_continuity.uint64, $5\
+    )";
+const ARCHIVE_PRUNE_SQL: &str = "SELECT accepted_start_sequence::text, \
+    accepted_end_sequence::text, accepted_row_count::text, prune_commit_sequence::text, \
+    accepted_interval_blake3 FROM \
+    object_store_continuity.object_store_continuity_archive_prune_v1(\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5, $6, $7, $8, $9\
     )";
 
 /// Connection material for one continuity boundary identity.
@@ -526,6 +534,27 @@ pub struct ShadowReleaseReceipt {
     pub release_id: Uuid,
     pub receipt_blake3: [u8; 32],
     pub released_at_unix_ms: i64,
+}
+
+/// Exact terminal detail and local-dependency proof accepted for bounded archive/prune.
+pub struct ArchivePruneRequest {
+    pub provider_boundary_id: String,
+    pub authority_epoch: u64,
+    pub continuity_seq: u64,
+    pub continuity_token_id: Uuid,
+    pub expected_row_blake3: [u8; 32],
+    pub expected_release_receipt_blake3: [u8; 32],
+    pub archive_proof_bytes: Vec<u8>,
+    pub archive_proof_blake3: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchivePruneResult {
+    pub accepted_start_sequence: u64,
+    pub accepted_end_sequence: u64,
+    pub accepted_row_count: u64,
+    pub prune_commit_sequence: u64,
+    pub accepted_interval_blake3: [u8; 32],
 }
 
 /// Server-derived result projection shared by continuity mutation and read procedures.
@@ -1374,6 +1403,47 @@ impl ContinuityClient {
         })
         .transpose()
     }
+
+    /// Replace one exact eligible terminal detail row with its bounded authenticated interval.
+    pub async fn archive_prune(
+        &self,
+        request: &ArchivePruneRequest,
+    ) -> Result<ArchivePruneResult, ContinuityError> {
+        validate_archive_prune_request(request)?;
+        let epoch = request.authority_epoch.to_string();
+        let sequence = request.continuity_seq.to_string();
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .build_transaction()
+            .isolation_level(MUTATION_ISOLATION_LEVEL)
+            .start()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let row = transaction
+            .query_one(
+                ARCHIVE_PRUNE_SQL,
+                &[
+                    &API_REVISION,
+                    &request.provider_boundary_id,
+                    &epoch,
+                    &sequence,
+                    &request.continuity_token_id,
+                    &&request.expected_row_blake3[..],
+                    &&request.expected_release_receipt_blake3[..],
+                    &&request.archive_proof_bytes[..],
+                    &&request.archive_proof_blake3[..],
+                ],
+            )
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let result = parse_archive_prune_result(&row)?;
+        validate_archive_prune_result_for_sequence(&result, request.continuity_seq)?;
+        transaction
+            .commit()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        Ok(result)
+    }
 }
 
 fn validate_begin_result(
@@ -1622,6 +1692,66 @@ fn parse_shadow_release_receipt(row: &Row) -> Result<ShadowReleaseReceipt, Conti
         )?,
         released_at_unix_ms,
     })
+}
+
+fn parse_archive_prune_result(row: &Row) -> Result<ArchivePruneResult, ContinuityError> {
+    let result = ArchivePruneResult {
+        accepted_start_sequence: parse_u64_text(row, 0)?,
+        accepted_end_sequence: parse_u64_text(row, 1)?,
+        accepted_row_count: parse_u64_text(row, 2)?,
+        prune_commit_sequence: parse_u64_text(row, 3)?,
+        accepted_interval_blake3: parse_digest(row.try_get(4).map_err(|_| {
+            ContinuityError::InvalidResponse("archive interval digest is invalid")
+        })?)?,
+    };
+    validate_archive_prune_result(&result)?;
+    Ok(result)
+}
+
+fn validate_archive_prune_request(request: &ArchivePruneRequest) -> Result<(), ContinuityError> {
+    if request.provider_boundary_id.is_empty()
+        || request.authority_epoch == 0
+        || request.continuity_seq == 0
+        || request.archive_proof_bytes.is_empty()
+        || request.archive_proof_bytes.len() > MAX_ARCHIVE_PROOF_BYTES
+    {
+        return Err(ContinuityError::InvalidConfiguration(
+            "archive identity and proof must be valid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_archive_prune_result(result: &ArchivePruneResult) -> Result<(), ContinuityError> {
+    let expected_row_count = result
+        .accepted_end_sequence
+        .checked_sub(result.accepted_start_sequence)
+        .and_then(|width| width.checked_add(1));
+    if result.accepted_start_sequence == 0
+        || result.accepted_end_sequence == 0
+        || result.accepted_row_count == 0
+        || result.prune_commit_sequence == 0
+        || expected_row_count != Some(result.accepted_row_count)
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "archive interval result is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_archive_prune_result_for_sequence(
+    result: &ArchivePruneResult,
+    requested_sequence: u64,
+) -> Result<(), ContinuityError> {
+    if requested_sequence < result.accepted_start_sequence
+        || requested_sequence > result.accepted_end_sequence
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "archive result does not cover the requested sequence",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_procedure_result(row: &Row) -> Result<ContinuityProcedureResult, ContinuityError> {
@@ -1873,6 +2003,29 @@ mod tests {
         }
     }
 
+    fn sample_archive_prune_request() -> ArchivePruneRequest {
+        ArchivePruneRequest {
+            provider_boundary_id: "boundary-live-test".to_string(),
+            authority_epoch: 7,
+            continuity_seq: 11,
+            continuity_token_id: Uuid::from_u128(23),
+            expected_row_blake3: [0x31; 32],
+            expected_release_receipt_blake3: [0x41; 32],
+            archive_proof_bytes: vec![0x51],
+            archive_proof_blake3: [0x61; 32],
+        }
+    }
+
+    fn sample_archive_prune_result() -> ArchivePruneResult {
+        ArchivePruneResult {
+            accepted_start_sequence: 10,
+            accepted_end_sequence: 12,
+            accepted_row_count: 3,
+            prune_commit_sequence: 5,
+            accepted_interval_blake3: [0x71; 32],
+        }
+    }
+
     fn normalized_embedded_migration() -> String {
         std::str::from_utf8(crate::schema::CONTINUITY_MIGRATION_V1)
             .expect("embedded migration must remain UTF-8 SQL")
@@ -1971,6 +2124,12 @@ mod tests {
              api_revision text, requested_provider_boundary_id text, requested_authority_epoch \
              object_store_continuity.uint64, requested_continuity_seq \
              object_store_continuity.uint64, requested_continuity_token_id uuid )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_archive_prune_v1( \
+             api_revision text, provider_boundary_id text, authority_epoch \
+             object_store_continuity.uint64, continuity_seq object_store_continuity.uint64, \
+             continuity_token_id uuid, expected_row_blake3 bytea, \
+             expected_release_receipt_blake3 bytea, archive_proof_bytes bytea, \
+             archive_proof_blake3 bytea )",
         ] {
             assert!(
                 migration.contains(signature),
@@ -2208,6 +2367,131 @@ mod tests {
                 migration.contains(invariant),
                 "embedded release-receipt read lost invariant: {invariant}"
             );
+        }
+    }
+
+    #[test]
+    fn archive_prune_query_and_migration_pin_bounded_reconciler_contract() {
+        assert_eq!(
+            ARCHIVE_PRUNE_SQL,
+            "SELECT accepted_start_sequence::text, \
+    accepted_end_sequence::text, accepted_row_count::text, prune_commit_sequence::text, \
+    accepted_interval_blake3 FROM \
+    object_store_continuity.object_store_continuity_archive_prune_v1(\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5, $6, $7, $8, $9\
+    )"
+        );
+        assert_eq!(
+            ARCHIVE_PRUNE_SQL
+                .matches("::text::object_store_continuity.uint64")
+                .count(),
+            2
+        );
+        assert!(!ARCHIVE_PRUNE_SQL.contains("$10"));
+        assert!(!ARCHIVE_PRUNE_SQL.contains("::bigint"));
+
+        let migration = normalized_embedded_migration();
+        for invariant in [
+            "PERFORM object_store_continuity.assert_api_revision_v1(api_revision); PERFORM object_store_continuity.assert_serializable_write_v1(); PERFORM object_store_continuity.assert_reconciler_v1();",
+            "IF octet_length(expected_row_blake3) <> 32 OR octet_length(expected_release_receipt_blake3) <> 32 THEN RAISE EXCEPTION 'ARCHIVE_EXPECTED_DIGEST_INVALID' USING ERRCODE = '22023'; END IF;",
+            "PERFORM object_store_continuity.assert_archive_eligibility_v1( archive_proof_bytes, archive_proof_blake3, stored, release_value.receipt_blake3 );",
+            "accepted_start_sequence := merged.start_sequence; accepted_end_sequence := merged.end_sequence; accepted_row_count := merged.row_count; accepted_interval_blake3 := merged.interval_blake3; RETURN NEXT;",
+            "object_store_continuity.object_store_continuity_archive_prune_v1(text, text, object_store_continuity.uint64, object_store_continuity.uint64, uuid, bytea, bytea, bytea, bytea)",
+            "TO object_dispatch_continuity_reconciler;",
+        ] {
+            assert!(
+                migration.contains(invariant),
+                "embedded archive/prune contract lost invariant: {invariant}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_prune_request_accepts_nonempty_identity_and_bounded_proof() {
+        let mut request = sample_archive_prune_request();
+        request.archive_proof_bytes = vec![0x51; MAX_ARCHIVE_PROOF_BYTES];
+
+        validate_archive_prune_request(&request)
+            .expect("an exact maximum-sized archive proof must remain admissible");
+    }
+
+    #[test]
+    fn archive_prune_request_rejects_missing_identity_and_unbounded_proof() {
+        let mut invalid_requests = Vec::new();
+        let mut empty_boundary = sample_archive_prune_request();
+        empty_boundary.provider_boundary_id.clear();
+        invalid_requests.push(empty_boundary);
+        let mut zero_epoch = sample_archive_prune_request();
+        zero_epoch.authority_epoch = 0;
+        invalid_requests.push(zero_epoch);
+        let mut zero_sequence = sample_archive_prune_request();
+        zero_sequence.continuity_seq = 0;
+        invalid_requests.push(zero_sequence);
+        let mut empty_proof = sample_archive_prune_request();
+        empty_proof.archive_proof_bytes.clear();
+        invalid_requests.push(empty_proof);
+        let mut oversized_proof = sample_archive_prune_request();
+        oversized_proof.archive_proof_bytes = vec![0x51; MAX_ARCHIVE_PROOF_BYTES + 1];
+        invalid_requests.push(oversized_proof);
+
+        for request in invalid_requests {
+            assert!(matches!(
+                validate_archive_prune_request(&request),
+                Err(ContinuityError::InvalidConfiguration(
+                    "archive identity and proof must be valid"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn archive_prune_result_accepts_exact_nonzero_interval_and_digest() {
+        let result = sample_archive_prune_result();
+
+        validate_archive_prune_result(&result)
+            .expect("a contiguous nonzero archive interval must validate");
+        assert_eq!(result.accepted_interval_blake3, [0x71; 32]);
+    }
+
+    #[test]
+    fn archive_prune_result_rejects_zero_reversed_and_count_mismatch_shapes() {
+        let mut invalid_results = Vec::new();
+        let mut zero_start = sample_archive_prune_result();
+        zero_start.accepted_start_sequence = 0;
+        invalid_results.push(zero_start);
+        let mut reversed = sample_archive_prune_result();
+        reversed.accepted_start_sequence = 13;
+        invalid_results.push(reversed);
+        let mut count_mismatch = sample_archive_prune_result();
+        count_mismatch.accepted_row_count = 2;
+        invalid_results.push(count_mismatch);
+        let mut zero_commit = sample_archive_prune_result();
+        zero_commit.prune_commit_sequence = 0;
+        invalid_results.push(zero_commit);
+
+        for result in invalid_results {
+            assert!(matches!(
+                validate_archive_prune_result(&result),
+                Err(ContinuityError::InvalidResponse(
+                    "archive interval result is inconsistent"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn archive_prune_result_must_cover_the_requested_sequence() {
+        let result = sample_archive_prune_result();
+        validate_archive_prune_result_for_sequence(&result, 11)
+            .expect("the requested sequence is covered by the accepted interval");
+        for outside in [9, 13] {
+            assert!(matches!(
+                validate_archive_prune_result_for_sequence(&result, outside),
+                Err(ContinuityError::InvalidResponse(
+                    "archive result does not cover the requested sequence"
+                ))
+            ));
         }
     }
 

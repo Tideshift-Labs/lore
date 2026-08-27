@@ -26,6 +26,9 @@ mode. Connection and TLS material is redacted from diagnostics.
 - allocating an exact next epoch from the expected drained namespace; and
 - reading one exact shadow-release receipt by boundary, epoch, sequence, and token with typed absence
   and canonical digest/byte validation; and
+- replacing one exact retention-eligible terminal detail with its bounded authenticated pruned
+  interval, using the exact row and shadow-release-receipt digests plus a 1-byte-to-1-MiB local-
+  dependency proof; and
 - reading one boundary's current or historical epoch, continuity high-water, ownership counters,
   reconciliation state, and latest snapshot.
 
@@ -61,11 +64,12 @@ cargo test -p lore-object-dispatch
 # Explicit, disposable, preprovisioned PostgreSQL target only
 cargo test -p lore-object-dispatch --test continuity_live -- --ignored --test-threads=1
 cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_allocates_dedicated_drained_epoch_one_to_two
+cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detail
 ```
 
 The unit suite validates configuration, TLS material, redaction, SQL procedure shapes, exact numeric
 transfer, closed result decoding, migration identity, and transient-error classification. The
-regular gate passes 43 tests with zero failures and four intentionally ignored live contracts.
+regular gate passes 49 tests with zero failures and five intentionally ignored live contracts.
 Each live contract has passed against disposable PostgreSQL 16 over real mTLS and the exact embedded
 migration. Run the shared-fixture contracts serially or by exact test name; a parallel all-ignored
 invocation can encounter expected serializable counter contention. They cover mapped boundary and
@@ -78,10 +82,15 @@ canonical digest and byte validation, typed absence for each mismatched identity
 denial to the boundary runtime identity. The dedicated drained-epoch contract proves `1 -> 2`, zero
 new high-water, active epoch reads,
 historical reconciliation absence, local invalid-order rejection, and transient SQLSTATE `40001` on
-a stale exact request; callers adopt the winner through epoch readback rather than replay. The probe
-separately confirmed that a connection without a client certificate is rejected.
+a stale exact request; callers adopt the winner through epoch readback rather than replay. The
+archive contract uses normal Begin-to-`NO_LOCAL_EFFECT` transitions under a temporary historical
+database clock, restores the exact clock before archive, and proves singleton interval/prune
+sequence, post-prune detail absence, and boundary-role denial. Archive/prune is a one-shot
+serializable mutation with no automatic retry: it depends on the exact release-receipt digest, and
+response-loss recovery requires the authenticated pruned-interval read that remains to be added. The
+probe separately confirmed that a connection without a client certificate is rejected.
 The live harness uses mechanics-only SHA-256-as-BLAKE3 and typed-validator stubs; its snapshot
 evidence is synthetic contract data, not provider-local integration evidence. Deployment readiness
 still requires reviewed production BLAKE3 and typed validators, full cross-boundary negative
-isolation, timeout and bounded retry policy, archive/prune, authenticated pruned-interval read,
+isolation, timeout and bounded retry policy, authenticated pruned-interval read,
 retirement/readback client surfaces, and deployment-revision readback.
