@@ -54,6 +54,9 @@ fn valid_config() -> ContinuityTlsConfig {
         client_certificate_chain_pem: identity.client_certificate_pem,
         private_key_pem: identity.client_private_key_pem,
         connect_timeout: Duration::from_secs(5),
+        statement_timeout: Duration::from_secs(2),
+        lock_timeout: Duration::from_secs(1),
+        max_retry_attempts: 3,
     }
 }
 
@@ -90,6 +93,55 @@ fn validate_rejects_zero_connect_timeout() {
     config.connect_timeout = Duration::ZERO;
 
     assert_invalid_configuration(&config, "connect timeout must be positive");
+}
+
+#[test]
+fn validate_rejects_nonpositive_fractional_and_oversized_statement_timeouts() {
+    for timeout in [
+        Duration::ZERO,
+        Duration::from_nanos(1),
+        Duration::from_millis(1) + Duration::from_nanos(1),
+        Duration::MAX,
+    ] {
+        let mut config = valid_config();
+        config.statement_timeout = timeout;
+
+        assert_invalid_configuration(
+            &config,
+            "statement timeout must be a positive whole-millisecond value",
+        );
+    }
+}
+
+#[test]
+fn validate_rejects_nonpositive_fractional_and_oversized_lock_timeouts() {
+    for timeout in [
+        Duration::ZERO,
+        Duration::from_nanos(1),
+        Duration::from_millis(1) + Duration::from_nanos(1),
+        Duration::MAX,
+    ] {
+        let mut config = valid_config();
+        config.lock_timeout = timeout;
+
+        assert_invalid_configuration(
+            &config,
+            "lock timeout must be a positive whole-millisecond value",
+        );
+    }
+}
+
+#[test]
+fn validate_requires_exactly_three_retry_attempts() {
+    for attempts in [0, 1, 2, 4, u8::MAX] {
+        let mut config = valid_config();
+        config.max_retry_attempts = attempts;
+
+        assert_invalid_configuration(
+            &config,
+            "continuity mutation retry attempts must equal three",
+        );
+    }
 }
 
 #[test]
@@ -223,6 +275,9 @@ fn debug_and_validation_errors_redact_connection_and_pem_secrets() {
         client_certificate_chain_pem: CERTIFICATE_SECRET.to_string(),
         private_key_pem: KEY_SECRET.to_string(),
         connect_timeout: Duration::from_secs(5),
+        statement_timeout: Duration::from_secs(2),
+        lock_timeout: Duration::from_secs(1),
+        max_retry_attempts: 3,
     };
 
     let debug = format!("{config:?}");

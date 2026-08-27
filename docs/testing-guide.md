@@ -316,6 +316,21 @@ will update an older check constraint or state schema.
   the bound SQL type (`$2::smallint::text`), keep any test-side duplicate query identical, and pin
   both layers with `cargo test -p lore-postgres --lib pool::tests -j 4` plus the ignored live test
   `mutable_store_advisory_lock_accepts_smallint_key_type` under `LORE_TEST_PG_URL`.
+- Symptom: a mutation is replayed after connection loss, capacity exhaustion, or server restart.
+  Cause: reusing the broad caller-facing PostgreSQL transience classifier as mutation-retry
+  authority. What to do: keep mutation retry closed to known-aborted `40001` and `40P01`; treat
+  `08`, `53`, `57P01`, `57P03`, and a missing SQLSTATE as requiring operation-specific exact
+  readback before any replay. The continuity-client gate pins three total attempts, 25/100 ms
+  delays, whole-millisecond `SET LOCAL` statement/lock timeouts on both mutation and authoritative
+  read transactions, and the negative SQLSTATE set with
+  `cargo test -p lore-object-dispatch --lib -j 4`.
+- Symptom: commit-loss recovery returns lookup code `FOUND`, or treats a matching epoch/interval as
+  proof of an exact mutation. Cause: replacing the decoded pre-COMMIT result with an incomplete
+  read projection. What to do: adopt only when authoritative readback matches every projected
+  pre-COMMIT field and return the pre-COMMIT value; incomplete snapshot, epoch, or archive reads may
+  prove only safe retry or unresolved ambiguity. Pure readback matrices pin mismatched-winner
+  behavior offline. A real socket fault after server COMMIT remains an explicit live contract, not
+  something those pure tests claim to execute.
 
 ### Poisoning a persisted `State`/`Tree` field for a fault-injection test
 

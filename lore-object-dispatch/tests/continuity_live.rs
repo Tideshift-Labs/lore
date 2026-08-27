@@ -151,6 +151,9 @@ fn tls_config(
         client_certificate_chain_pem: required_pem(cert_env),
         private_key_pem: required_pem(key_env),
         connect_timeout: Duration::from_secs(10),
+        statement_timeout: Duration::from_secs(5),
+        lock_timeout: Duration::from_secs(2),
+        max_retry_attempts: 3,
     }
 }
 
@@ -242,6 +245,9 @@ async fn live_mtls_begin_replay_get_and_no_local_effect_cleanup() {
         client_certificate_chain_pem: required_pem("LORE_TEST_CONTINUITY_CLIENT_CERT_PEM_PATH"),
         private_key_pem: required_pem("LORE_TEST_CONTINUITY_CLIENT_KEY_PEM_PATH"),
         connect_timeout: Duration::from_secs(10),
+        statement_timeout: Duration::from_secs(5),
+        lock_timeout: Duration::from_secs(2),
+        max_retry_attempts: 3,
     };
     let client = ContinuityClient::connect(&config)
         .await
@@ -1207,6 +1213,8 @@ async fn live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detai
         authority_epoch,
         continuity_seq,
         continuity_token_id,
+        expected_continuity_policy_revision: continuity_policy_revision.clone(),
+        expected_epoch_namespace_blake3: epoch_namespace_blake3,
         expected_row_blake3,
         expected_release_receipt_blake3,
         archive_proof_bytes: ARCHIVE_PROOF_BYTES.to_vec(),

@@ -32,10 +32,14 @@ mode. Connection and TLS material is redacted from diagnostics.
 - reading one boundary's current or historical epoch, continuity high-water, ownership counters,
   reconciliation state, and latest snapshot.
 
-Mutations run in serializable transactions. Unsigned 64-bit values cross the PostgreSQL
-`NUMERIC(20,0)` boundary as canonical decimal text, procedure results decode through closed enum and
-digest allowlists, and retry classification is limited to an explicit transport/SQLSTATE set. The
-client does not retry operations itself.
+Mutations run in serializable transactions with server-enforced statement and lock timeouts. The
+client makes exactly three attempts for known-aborted `40001` serialization failures and `40P01`
+deadlocks, waiting 25 ms and then 100 ms. It never blindly retries a transport failure around
+commit: it reconnects, performs the operation-specific authoritative read, adopts only an exact
+committed result, replays only an exact prior or absent state, and otherwise fails closed. All
+authoritative reads use bounded read-only transactions and are never retried. Unsigned 64-bit values
+cross the PostgreSQL `NUMERIC(20,0)` boundary as canonical decimal text, and procedure results decode
+through closed enum and digest allowlists.
 
 ## Embedded migration
 
@@ -69,7 +73,8 @@ cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact l
 
 The unit suite validates configuration, TLS material, redaction, SQL procedure shapes, exact numeric
 transfer, closed result decoding, migration identity, and transient-error classification. The
-regular gate passes 49 tests with zero failures and five intentionally ignored live contracts.
+regular gate passes 56 library and 15 integration tests with zero failures and five intentionally
+ignored live contracts.
 Each live contract has passed against disposable PostgreSQL 16 over real mTLS and the exact embedded
 migration. Run the shared-fixture contracts serially or by exact test name; a parallel all-ignored
 invocation can encounter expected serializable counter contention. They cover mapped boundary and
@@ -85,12 +90,12 @@ historical reconciliation absence, local invalid-order rejection, and transient 
 a stale exact request; callers adopt the winner through epoch readback rather than replay. The
 archive contract uses normal Begin-to-`NO_LOCAL_EFFECT` transitions under a temporary historical
 database clock, restores the exact clock before archive, and proves singleton interval/prune
-sequence, post-prune detail absence, and boundary-role denial. Archive/prune is a one-shot
-serializable mutation with no automatic retry: it depends on the exact release-receipt digest, and
-response-loss recovery requires the authenticated pruned-interval read that remains to be added. The
-probe separately confirmed that a connection without a client certificate is rejected.
+sequence, post-prune detail absence, and boundary-role denial. Archive/prune depends on the exact
+release-receipt digest and reconciles response loss through the authenticated pruned-interval read.
+Retirement response loss similarly reconciles through the authenticated retired-summary read or
+exact active-interval checkpoint. The probe separately confirmed that a connection without a client
+certificate is rejected.
 The live harness uses mechanics-only SHA-256-as-BLAKE3 and typed-validator stubs; its snapshot
 evidence is synthetic contract data, not provider-local integration evidence. Deployment readiness
 still requires reviewed production BLAKE3 and typed validators, full cross-boundary negative
-isolation, timeout and bounded retry policy, authenticated pruned-interval read,
-retirement/readback client surfaces, and deployment-revision readback.
+isolation, deployment-revision readback, provisioning, and activation.

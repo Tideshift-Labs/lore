@@ -29,8 +29,293 @@ const API_REVISION: &str = "object-store-authority-continuity-v1";
 const SCHEMA_REVISION: &str = "object-store-authority-continuity-schema-v1";
 const CONTINUITY_CONTRACT_REVISION: &str = "object-store-authority-continuity-contract-v1";
 const MUTATION_ISOLATION_LEVEL: IsolationLevel = IsolationLevel::Serializable;
+const REQUIRED_MUTATION_RETRY_ATTEMPTS: u8 = 3;
+const FIRST_MUTATION_RETRY_DELAY: Duration = Duration::from_millis(25);
+const SECOND_MUTATION_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_ARCHIVE_PROOF_BYTES: usize = 1_048_576;
 const MAX_RETIREMENT_PROOF_BYTES: usize = 1_048_576;
+
+enum MutationAttemptOutcome<T> {
+    Committed(T),
+    RetryAfter(Duration),
+    Reconcile(T),
+    Exhausted,
+    Fail,
+}
+
+macro_rules! mutation_step_or_finish {
+    ($label:lifetime, $client_self:expr, $attempt:ident, $future:expr) => {{
+        match $future.await {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(delay) = $client_self.mutation_retry_delay(&error, $attempt) {
+                    break $label MutationAttemptOutcome::RetryAfter(delay);
+                }
+                if postgres_error_is_known_aborted_mutation(&error) {
+                    break $label MutationAttemptOutcome::Exhausted;
+                }
+                break $label MutationAttemptOutcome::Fail;
+            }
+        }
+    }};
+}
+
+macro_rules! run_serializable_mutation {
+    ($client_self:expr, $sql:expr, $params:expr, $decode_and_validate:expr, $reconcile:expr) => {{
+        let mut attempt = 1;
+        loop {
+            let outcome = 'attempt: {
+                let mut session = $client_self.session.lock().await;
+                let client = &mut session.client;
+                let transaction = mutation_step_or_finish!(
+                    'attempt,
+                    $client_self,
+                    attempt,
+                    client
+                        .build_transaction()
+                        .isolation_level(MUTATION_ISOLATION_LEVEL)
+                        .start()
+                );
+                mutation_step_or_finish!(
+                    'attempt,
+                    $client_self,
+                    attempt,
+                    $client_self.apply_mutation_timeouts(&transaction)
+                );
+                let row = mutation_step_or_finish!(
+                    'attempt,
+                    $client_self,
+                    attempt,
+                    transaction.query_one($sql, $params)
+                );
+                let result = ($decode_and_validate)(&row)?;
+                match transaction.commit().await {
+                    Ok(()) => MutationAttemptOutcome::Committed(result),
+                    Err(error) => match commit_failure_action(
+                        error.is_closed(),
+                        error
+                            .as_db_error()
+                            .map(|database_error| database_error.code().code()),
+                        attempt,
+                        $client_self.max_retry_attempts,
+                    ) {
+                        CommitFailureAction::RetryAfter(delay) => {
+                            MutationAttemptOutcome::RetryAfter(delay)
+                        }
+                        CommitFailureAction::Reconcile => {
+                            MutationAttemptOutcome::Reconcile(result)
+                        }
+                        CommitFailureAction::Exhausted => MutationAttemptOutcome::Exhausted,
+                        CommitFailureAction::Fail => MutationAttemptOutcome::Fail,
+                    },
+                }
+            };
+            match outcome {
+                MutationAttemptOutcome::Committed(result) => break Ok(result),
+                MutationAttemptOutcome::RetryAfter(delay) => {
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                MutationAttemptOutcome::Reconcile(result) => {
+                    if $client_self.reconnect().await.is_err() {
+                        break Err(ContinuityError::AmbiguousCommit);
+                    }
+                    match ($reconcile)(&result).await {
+                        CommitReconciliation::Adopt(adopted) => break Ok(adopted),
+                        CommitReconciliation::Retry => {
+                            let Some(delay) =
+                                bounded_retry_delay(attempt, $client_self.max_retry_attempts)
+                            else {
+                                break Err(ContinuityError::AmbiguousCommit);
+                            };
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                        }
+                        CommitReconciliation::Unresolved => {
+                            break Err(ContinuityError::AmbiguousCommit);
+                        }
+                    }
+                }
+                MutationAttemptOutcome::Exhausted => {
+                    break Err(ContinuityError::RetryExhausted);
+                }
+                MutationAttemptOutcome::Fail => {
+                    break Err(ContinuityError::Postgres { transient: false });
+                }
+            }
+        }
+    }};
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitFailureAction {
+    RetryAfter(Duration),
+    Reconcile,
+    Exhausted,
+    Fail,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CommitReconciliation<T> {
+    Adopt(T),
+    Retry,
+    Unresolved,
+}
+
+fn same_procedure_row(
+    authoritative: &ContinuityProcedureResult,
+    precommit: &ContinuityProcedureResult,
+) -> bool {
+    authoritative.state == precommit.state
+        && authoritative.ownership_state == precommit.ownership_state
+        && authoritative.authority_epoch == precommit.authority_epoch
+        && authoritative.continuity_seq == precommit.continuity_seq
+        && authoritative.continuity_token_id == precommit.continuity_token_id
+        && authoritative.row_blake3 == precommit.row_blake3
+        && authoritative.external_committed_at_unix_ms == precommit.external_committed_at_unix_ms
+}
+
+fn reconcile_begin_readback(
+    precommit: &ContinuityProcedureResult,
+    readback: Option<ContinuityTokenLookup>,
+) -> CommitReconciliation<ContinuityProcedureResult> {
+    match readback {
+        Some(ContinuityTokenLookup::Found(authoritative))
+            if same_procedure_row(&authoritative, precommit) =>
+        {
+            CommitReconciliation::Adopt(precommit.clone())
+        }
+        Some(ContinuityTokenLookup::NotFound { .. }) => CommitReconciliation::Retry,
+        Some(ContinuityTokenLookup::Found(_)) | None => CommitReconciliation::Unresolved,
+    }
+}
+
+fn reconcile_token_transition_readback(
+    identity: &ContinuityIntentIdentity,
+    expected_prior_row_blake3: &[u8; 32],
+    precommit: &ContinuityProcedureResult,
+    readback: Option<ContinuityTokenLookup>,
+) -> CommitReconciliation<ContinuityProcedureResult> {
+    match readback {
+        Some(ContinuityTokenLookup::Found(authoritative))
+            if same_procedure_row(&authoritative, precommit) =>
+        {
+            CommitReconciliation::Adopt(precommit.clone())
+        }
+        Some(ContinuityTokenLookup::Found(authoritative))
+            if authoritative.authority_epoch == identity.authority_epoch
+                && authoritative.continuity_seq == identity.continuity_seq
+                && authoritative.continuity_token_id == identity.continuity_token_id
+                && authoritative.row_blake3 == *expected_prior_row_blake3 =>
+        {
+            CommitReconciliation::Retry
+        }
+        Some(ContinuityTokenLookup::Found(_))
+        | Some(ContinuityTokenLookup::NotFound { .. })
+        | None => CommitReconciliation::Unresolved,
+    }
+}
+
+fn reconcile_snapshot_readback(
+    request: &RecordSnapshotRequest,
+    latest_snapshot: Option<Option<ReconciliationSnapshot>>,
+) -> CommitReconciliation<RecordSnapshotResult> {
+    match latest_snapshot {
+        Some(Some(snapshot))
+            if snapshot.snapshot_id == request.snapshot_id
+                && snapshot.through_continuity_seq == request.through_continuity_seq
+                && snapshot.manifest_blake3 == request.manifest_blake3 =>
+        {
+            CommitReconciliation::Retry
+        }
+        Some(None) => CommitReconciliation::Retry,
+        Some(Some(_)) | None => CommitReconciliation::Unresolved,
+    }
+}
+
+fn reconcile_epoch_allocation_readback(
+    request: &AllocateEpochRequest,
+    readback: Option<ContinuityEpochState>,
+) -> CommitReconciliation<ContinuityEpochState> {
+    match readback {
+        Some(state) if state.authority_epoch == request.expected_current_epoch => {
+            CommitReconciliation::Retry
+        }
+        Some(_) | None => CommitReconciliation::Unresolved,
+    }
+}
+
+fn reconcile_archive_readback(
+    request: &ArchivePruneRequest,
+    readback: Option<ContinuityTokenLookup>,
+) -> CommitReconciliation<ArchivePruneResult> {
+    match readback {
+        Some(ContinuityTokenLookup::Found(authoritative))
+            if authoritative.authority_epoch == request.authority_epoch
+                && authoritative.continuity_seq == request.continuity_seq
+                && authoritative.continuity_token_id == request.continuity_token_id
+                && authoritative.row_blake3 == request.expected_row_blake3 =>
+        {
+            CommitReconciliation::Retry
+        }
+        Some(ContinuityTokenLookup::Found(_))
+        | Some(ContinuityTokenLookup::NotFound { .. })
+        | None => CommitReconciliation::Unresolved,
+    }
+}
+
+fn reconcile_retirement_readback(
+    request: &RetireEpochRequest,
+    precommit: &RetiredEpochSummary,
+    retired_summary: Option<RetiredEpochSummary>,
+    active_interval: Option<PrunedInterval>,
+) -> CommitReconciliation<RetiredEpochSummary> {
+    if let Some(summary) = retired_summary {
+        return if summary == *precommit
+            && validate_retired_epoch_summary_for_retirement(&summary, request).is_ok()
+        {
+            CommitReconciliation::Adopt(precommit.clone())
+        } else {
+            CommitReconciliation::Unresolved
+        };
+    }
+    match active_interval {
+        Some(interval)
+            if interval.start_sequence == 1
+                && interval.interval_blake3 == request.expected_interval_checkpoint_blake3 =>
+        {
+            CommitReconciliation::Retry
+        }
+        Some(_) | None => CommitReconciliation::Unresolved,
+    }
+}
+
+macro_rules! run_bounded_read {
+    ($client_self:expr, $query_method:ident, $sql:expr, $params:expr, $decode_and_validate:expr) => {{
+        let mut session = $client_self.session.lock().await;
+        let transaction = session
+            .client
+            .build_transaction()
+            .read_only(true)
+            .start()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        $client_self
+            .apply_mutation_timeouts(&transaction)
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let row = transaction
+            .$query_method($sql, $params)
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let result = ($decode_and_validate)(row)?;
+        transaction
+            .commit()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        Ok(result)
+    }};
+}
 const BEGIN_SQL: &str = "SELECT result_code, state, ownership_state, authority_epoch::text, \
     continuity_seq::text, continuity_token_id, row_blake3, external_committed_at_unix_ms \
     FROM object_store_continuity.object_store_continuity_begin_v1(\
@@ -190,6 +475,9 @@ pub struct ContinuityTlsConfig {
     pub client_certificate_chain_pem: String,
     pub private_key_pem: String,
     pub connect_timeout: Duration,
+    pub statement_timeout: Duration,
+    pub lock_timeout: Duration,
+    pub max_retry_attempts: u8,
 }
 
 impl fmt::Debug for ContinuityTlsConfig {
@@ -201,6 +489,9 @@ impl fmt::Debug for ContinuityTlsConfig {
             .field("client_certificate_chain_pem", &"<redacted>")
             .field("private_key_pem", &"<redacted>")
             .field("connect_timeout", &self.connect_timeout)
+            .field("statement_timeout", &self.statement_timeout)
+            .field("lock_timeout", &self.lock_timeout)
+            .field("max_retry_attempts", &self.max_retry_attempts)
             .finish()
     }
 }
@@ -217,6 +508,30 @@ impl ContinuityTlsConfig {
         if self.connect_timeout.is_zero() {
             return Err(ContinuityError::InvalidConfiguration(
                 "connect timeout must be positive",
+            ));
+        }
+        if self.statement_timeout.as_millis() == 0
+            || !self
+                .statement_timeout
+                .subsec_nanos()
+                .is_multiple_of(1_000_000)
+            || u64::try_from(self.statement_timeout.as_millis()).is_err()
+        {
+            return Err(ContinuityError::InvalidConfiguration(
+                "statement timeout must be a positive whole-millisecond value",
+            ));
+        }
+        if self.lock_timeout.as_millis() == 0
+            || !self.lock_timeout.subsec_nanos().is_multiple_of(1_000_000)
+            || u64::try_from(self.lock_timeout.as_millis()).is_err()
+        {
+            return Err(ContinuityError::InvalidConfiguration(
+                "lock timeout must be a positive whole-millisecond value",
+            ));
+        }
+        if self.max_retry_attempts != REQUIRED_MUTATION_RETRY_ATTEMPTS {
+            return Err(ContinuityError::InvalidConfiguration(
+                "continuity mutation retry attempts must equal three",
             ));
         }
         let postgres = self
@@ -292,7 +607,7 @@ impl ContinuityTlsConfig {
 
 /// Closed failure surface for the continuity client. Messages intentionally omit dynamic
 /// connection strings, PEM bodies, SQL parameter values, and server diagnostics.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ContinuityError {
     #[error("invalid continuity connection configuration: {0}")]
     InvalidConfiguration(&'static str),
@@ -302,6 +617,10 @@ pub enum ContinuityError {
     ConnectTimeout,
     #[error("continuity database operation failed")]
     Postgres { transient: bool },
+    #[error("continuity mutation retry budget exhausted")]
+    RetryExhausted,
+    #[error("continuity mutation commit outcome is ambiguous")]
+    AmbiguousCommit,
     #[error("invalid continuity procedure result: {0}")]
     InvalidResponse(&'static str),
 }
@@ -320,6 +639,8 @@ impl ContinuityError {
             Self::Postgres { transient } => *transient,
             Self::InvalidConfiguration(_)
             | Self::InvalidTlsMaterial(_)
+            | Self::RetryExhausted
+            | Self::AmbiguousCommit
             | Self::InvalidResponse(_) => false,
         }
     }
@@ -587,6 +908,8 @@ pub struct ArchivePruneRequest {
     pub authority_epoch: u64,
     pub continuity_seq: u64,
     pub continuity_token_id: Uuid,
+    pub expected_continuity_policy_revision: String,
+    pub expected_epoch_namespace_blake3: [u8; 32],
     pub expected_row_blake3: [u8; 32],
     pub expected_release_receipt_blake3: [u8; 32],
     pub archive_proof_bytes: Vec<u8>,
@@ -771,13 +1094,37 @@ impl ContinuityIntentKind {
 
 /// One direct connection to the independent continuity authority.
 pub struct ContinuityClient {
-    client: Mutex<tokio_postgres::Client>,
+    config: ContinuityTlsConfig,
+    session: Mutex<ContinuitySession>,
+    statement_timeout_ms: u64,
+    lock_timeout_ms: u64,
+    max_retry_attempts: u8,
+}
+
+struct ContinuitySession {
+    client: tokio_postgres::Client,
     _connection_task: AbortOnDropHandle<()>,
 }
 
 impl ContinuityClient {
     /// Connect with mandatory server-name verification and client-certificate authentication.
     pub async fn connect(config: &ContinuityTlsConfig) -> Result<Self, ContinuityError> {
+        let session = Self::connect_session(config).await?;
+        Ok(Self {
+            config: config.clone(),
+            session: Mutex::new(session),
+            statement_timeout_ms: u64::try_from(config.statement_timeout.as_millis()).map_err(
+                |_| ContinuityError::InvalidConfiguration("statement timeout is too large"),
+            )?,
+            lock_timeout_ms: u64::try_from(config.lock_timeout.as_millis())
+                .map_err(|_| ContinuityError::InvalidConfiguration("lock timeout is too large"))?,
+            max_retry_attempts: config.max_retry_attempts,
+        })
+    }
+
+    async fn connect_session(
+        config: &ContinuityTlsConfig,
+    ) -> Result<ContinuitySession, ContinuityError> {
         let (postgres, tls) = config.connection_material()?;
         let connected = tokio::time::timeout(config.connect_timeout, postgres.connect(tls))
             .await
@@ -792,10 +1139,134 @@ impl ContinuityClient {
                 }
             }
         ));
-        Ok(Self {
-            client: Mutex::new(client),
+        Ok(ContinuitySession {
+            client,
             _connection_task: connection_task,
         })
+    }
+
+    async fn reconnect(&self) -> Result<(), ContinuityError> {
+        let replacement = Self::connect_session(&self.config).await?;
+        let mut session = self.session.lock().await;
+        *session = replacement;
+        Ok(())
+    }
+
+    async fn apply_mutation_timeouts(
+        &self,
+        transaction: &tokio_postgres::Transaction<'_>,
+    ) -> Result<(), tokio_postgres::Error> {
+        let statement = mutation_timeout_sql(self.statement_timeout_ms, self.lock_timeout_ms);
+        transaction.batch_execute(&statement).await
+    }
+
+    fn mutation_retry_delay(&self, error: &tokio_postgres::Error, attempt: u8) -> Option<Duration> {
+        mutation_retry_delay_for_shape(
+            error
+                .as_db_error()
+                .map(|database_error| database_error.code().code()),
+            attempt,
+            self.max_retry_attempts,
+        )
+    }
+
+    async fn reconcile_begin_commit(
+        &self,
+        request: &BeginIntentRequest,
+        precommit: &ContinuityProcedureResult,
+    ) -> CommitReconciliation<ContinuityProcedureResult> {
+        let readback = self
+            .get_by_token(&request.provider_boundary_id, request.continuity_token_id)
+            .await
+            .ok();
+        reconcile_begin_readback(precommit, readback)
+    }
+
+    async fn reconcile_token_transition_commit(
+        &self,
+        identity: &ContinuityIntentIdentity,
+        expected_prior_row_blake3: &[u8; 32],
+        precommit: &ContinuityProcedureResult,
+    ) -> CommitReconciliation<ContinuityProcedureResult> {
+        let readback = self
+            .get_by_token(&identity.provider_boundary_id, identity.continuity_token_id)
+            .await
+            .ok();
+        reconcile_token_transition_readback(
+            identity,
+            expected_prior_row_blake3,
+            precommit,
+            readback,
+        )
+    }
+
+    async fn reconcile_snapshot_commit(
+        &self,
+        request: &RecordSnapshotRequest,
+        _precommit: &RecordSnapshotResult,
+    ) -> CommitReconciliation<RecordSnapshotResult> {
+        let latest_snapshot = match self
+            .read_reconciliation_state(&request.provider_boundary_id, request.authority_epoch)
+            .await
+        {
+            Ok(Some(state)) => Some(state.latest_snapshot),
+            Ok(None) | Err(_) => None,
+        };
+        reconcile_snapshot_readback(request, latest_snapshot)
+    }
+
+    async fn reconcile_epoch_allocation_commit(
+        &self,
+        request: &AllocateEpochRequest,
+        _precommit: &ContinuityEpochState,
+    ) -> CommitReconciliation<ContinuityEpochState> {
+        let readback = self
+            .read_epoch(&request.provider_boundary_id)
+            .await
+            .ok()
+            .flatten();
+        reconcile_epoch_allocation_readback(request, readback)
+    }
+
+    async fn reconcile_archive_commit(
+        &self,
+        request: &ArchivePruneRequest,
+        _precommit: &ArchivePruneResult,
+    ) -> CommitReconciliation<ArchivePruneResult> {
+        let readback = self
+            .get_by_token(&request.provider_boundary_id, request.continuity_token_id)
+            .await
+            .ok();
+        reconcile_archive_readback(request, readback)
+    }
+
+    async fn reconcile_retirement_commit(
+        &self,
+        request: &RetireEpochRequest,
+        precommit: &RetiredEpochSummary,
+    ) -> CommitReconciliation<RetiredEpochSummary> {
+        let read_request = ReadRetiredEpochRequest {
+            provider_boundary_id: request.provider_boundary_id.clone(),
+            authority_epoch: request.authority_epoch,
+            expected_continuity_policy_revision: request
+                .expected_continuity_policy_revision
+                .clone(),
+            expected_epoch_namespace_blake3: request.expected_epoch_namespace_blake3,
+        };
+        if let Ok(summary) = self.read_retired_epoch(&read_request).await {
+            return reconcile_retirement_readback(request, precommit, Some(summary), None);
+        }
+        let interval_request = ReadPrunedIntervalRequest {
+            provider_boundary_id: request.provider_boundary_id.clone(),
+            authority_epoch: request.authority_epoch,
+            continuity_seq: 1,
+            expected_continuity_policy_revision: request
+                .expected_continuity_policy_revision
+                .clone(),
+            expected_epoch_namespace_blake3: request.expected_epoch_namespace_blake3,
+        };
+        let interval = self.read_pruned_interval(&interval_request).await.ok();
+        reconcile_retirement_readback(request, precommit, None, interval)
     }
 
     /// Allocate or replay an exact intent in a serializable read-write transaction.
@@ -827,44 +1298,34 @@ impl ContinuityClient {
         let quota_bytes = request.quota_bytes.to_string();
         let quota_rows = request.quota_rows.to_string();
         let quota_concurrency = request.quota_concurrency.to_string();
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(MUTATION_ISOLATION_LEVEL)
-            .start()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let row = transaction
-            .query_one(
-                BEGIN_SQL,
-                &[
-                    &API_REVISION,
-                    &expected_authority_epoch,
-                    &request.continuity_token_id,
-                    &request.provider_boundary_id,
-                    &request.intent_kind.as_sql(),
-                    &request.authenticated_cell_id,
-                    &request.authenticated_tenant_id,
-                    &request.logical_request_id,
-                    &request.attempt_id,
-                    &&request.selected_fingerprint[..],
-                    &request.continuity_policy_revision,
-                    &request.operation_quota_class,
-                    &quota_rows,
-                    &quota_bytes,
-                    &quota_concurrency,
-                    &request.retention_deadline_unix_ms,
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let result = parse_procedure_result(&row)?;
-        validate_begin_result(&result, request)?;
-        transaction
-            .commit()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        Ok(result)
+        run_serializable_mutation!(
+            self,
+            BEGIN_SQL,
+            &[
+                &API_REVISION,
+                &expected_authority_epoch,
+                &request.continuity_token_id,
+                &request.provider_boundary_id,
+                &request.intent_kind.as_sql(),
+                &request.authenticated_cell_id,
+                &request.authenticated_tenant_id,
+                &request.logical_request_id,
+                &request.attempt_id,
+                &&request.selected_fingerprint[..],
+                &request.continuity_policy_revision,
+                &request.operation_quota_class,
+                &quota_rows,
+                &quota_bytes,
+                &quota_concurrency,
+                &request.retention_deadline_unix_ms,
+            ],
+            |row: &Row| {
+                let result = parse_procedure_result(row)?;
+                validate_begin_result(&result, request)?;
+                Ok(result)
+            },
+            |precommit| self.reconcile_begin_commit(request, precommit)
+        )
     }
 
     /// Read an exact token through the boundary-authorized SECURITY DEFINER surface.
@@ -873,31 +1334,31 @@ impl ContinuityClient {
         provider_boundary_id: &str,
         continuity_token_id: Uuid,
     ) -> Result<ContinuityTokenLookup, ContinuityError> {
-        let client = self.client.lock().await;
-        let row = client
-            .query_one(
-                GET_BY_TOKEN_SQL,
-                &[&API_REVISION, &provider_boundary_id, &continuity_token_id],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let result = parse_token_lookup(&row)?;
-        if let ContinuityTokenLookup::Found(found) = &result {
-            validate_lookup_result(found)?;
-        }
-        let returned_token = match &result {
-            ContinuityTokenLookup::Found(found) => found.continuity_token_id,
-            ContinuityTokenLookup::NotFound {
-                continuity_token_id,
-                ..
-            } => *continuity_token_id,
-        };
-        if returned_token != continuity_token_id {
-            return Err(ContinuityError::InvalidResponse(
-                "token lookup returned a different token",
-            ));
-        }
-        Ok(result)
+        run_bounded_read!(
+            self,
+            query_one,
+            GET_BY_TOKEN_SQL,
+            &[&API_REVISION, &provider_boundary_id, &continuity_token_id],
+            |row: Row| {
+                let result = parse_token_lookup(&row)?;
+                if let ContinuityTokenLookup::Found(found) = &result {
+                    validate_lookup_result(found)?;
+                }
+                let returned_token = match &result {
+                    ContinuityTokenLookup::Found(found) => found.continuity_token_id,
+                    ContinuityTokenLookup::NotFound {
+                        continuity_token_id,
+                        ..
+                    } => *continuity_token_id,
+                };
+                if returned_token != continuity_token_id {
+                    return Err(ContinuityError::InvalidResponse(
+                        "token lookup returned a different token",
+                    ));
+                }
+                Ok(result)
+            }
+        )
     }
 
     /// Bind an external intent to its exact durable local request state.
@@ -908,46 +1369,42 @@ impl ContinuityClient {
         validate_identity(&request.identity)?;
         let epoch = request.identity.authority_epoch.to_string();
         let sequence = request.identity.continuity_seq.to_string();
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(MUTATION_ISOLATION_LEVEL)
-            .start()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let row = transaction
-            .query_one(
-                MARK_BOUND_SQL,
-                &[
-                    &API_REVISION,
-                    &request.identity.provider_boundary_id,
-                    &epoch,
-                    &sequence,
-                    &request.identity.continuity_token_id,
-                    &request.identity.authenticated_cell_id,
-                    &request.identity.authenticated_tenant_id,
-                    &request.identity.logical_request_id,
-                    &request.identity.attempt_id,
-                    &request.identity.intent_kind.as_sql(),
-                    &&request.identity.selected_fingerprint[..],
-                    &&request.expected_prior_row_blake3[..],
-                    &&request.local_binding_blake3[..],
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let result = parse_procedure_result(&row)?;
-        validate_transition_result(
-            &result,
-            &request.identity,
-            ContinuityState::Bound,
-            ContinuityOwnershipState::ShadowReserved,
-        )?;
-        transaction
-            .commit()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        Ok(result)
+        run_serializable_mutation!(
+            self,
+            MARK_BOUND_SQL,
+            &[
+                &API_REVISION,
+                &request.identity.provider_boundary_id,
+                &epoch,
+                &sequence,
+                &request.identity.continuity_token_id,
+                &request.identity.authenticated_cell_id,
+                &request.identity.authenticated_tenant_id,
+                &request.identity.logical_request_id,
+                &request.identity.attempt_id,
+                &request.identity.intent_kind.as_sql(),
+                &&request.identity.selected_fingerprint[..],
+                &&request.expected_prior_row_blake3[..],
+                &&request.local_binding_blake3[..],
+            ],
+            |row: &Row| {
+                let result = parse_procedure_result(row)?;
+                validate_transition_result(
+                    &result,
+                    &request.identity,
+                    ContinuityState::Bound,
+                    ContinuityOwnershipState::ShadowReserved,
+                )?;
+                Ok(result)
+            },
+            |precommit| {
+                self.reconcile_token_transition_commit(
+                    &request.identity,
+                    &request.expected_prior_row_blake3,
+                    precommit,
+                )
+            }
+        )
     }
 
     /// Record exact terminal evidence while retaining shadow ownership for snapshot coverage.
@@ -958,48 +1415,44 @@ impl ContinuityClient {
         validate_identity(&request.identity)?;
         let epoch = request.identity.authority_epoch.to_string();
         let sequence = request.identity.continuity_seq.to_string();
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(MUTATION_ISOLATION_LEVEL)
-            .start()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let row = transaction
-            .query_one(
-                MARK_COMPLETED_SQL,
-                &[
-                    &API_REVISION,
-                    &request.identity.provider_boundary_id,
-                    &epoch,
-                    &sequence,
-                    &request.identity.continuity_token_id,
-                    &request.identity.authenticated_cell_id,
-                    &request.identity.authenticated_tenant_id,
-                    &request.identity.logical_request_id,
-                    &request.identity.attempt_id,
-                    &request.identity.intent_kind.as_sql(),
-                    &&request.identity.selected_fingerprint[..],
-                    &&request.expected_prior_row_blake3[..],
-                    &&request.local_binding_blake3[..],
-                    &&request.terminal_evidence_blake3[..],
-                    &"BOUND",
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let result = parse_procedure_result(&row)?;
-        validate_transition_result(
-            &result,
-            &request.identity,
-            ContinuityState::Completed,
-            ContinuityOwnershipState::ShadowReserved,
-        )?;
-        transaction
-            .commit()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        Ok(result)
+        run_serializable_mutation!(
+            self,
+            MARK_COMPLETED_SQL,
+            &[
+                &API_REVISION,
+                &request.identity.provider_boundary_id,
+                &epoch,
+                &sequence,
+                &request.identity.continuity_token_id,
+                &request.identity.authenticated_cell_id,
+                &request.identity.authenticated_tenant_id,
+                &request.identity.logical_request_id,
+                &request.identity.attempt_id,
+                &request.identity.intent_kind.as_sql(),
+                &&request.identity.selected_fingerprint[..],
+                &&request.expected_prior_row_blake3[..],
+                &&request.local_binding_blake3[..],
+                &&request.terminal_evidence_blake3[..],
+                &"BOUND",
+            ],
+            |row: &Row| {
+                let result = parse_procedure_result(row)?;
+                validate_transition_result(
+                    &result,
+                    &request.identity,
+                    ContinuityState::Completed,
+                    ContinuityOwnershipState::ShadowReserved,
+                )?;
+                Ok(result)
+            },
+            |precommit| {
+                self.reconcile_token_transition_commit(
+                    &request.identity,
+                    &request.expected_prior_row_blake3,
+                    precommit,
+                )
+            }
+        )
     }
 
     /// Close an intent that provably produced no local effect and release its shadow ownership.
@@ -1011,49 +1464,45 @@ impl ContinuityClient {
         validate_release_basis_id(&request.release_basis_id)?;
         let epoch = request.identity.authority_epoch.to_string();
         let sequence = request.identity.continuity_seq.to_string();
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(MUTATION_ISOLATION_LEVEL)
-            .start()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let row = transaction
-            .query_one(
-                MARK_NO_LOCAL_EFFECT_SQL,
-                &[
-                    &API_REVISION,
-                    &request.identity.provider_boundary_id,
-                    &epoch,
-                    &sequence,
-                    &request.identity.continuity_token_id,
-                    &request.identity.authenticated_cell_id,
-                    &request.identity.authenticated_tenant_id,
-                    &request.identity.logical_request_id,
-                    &request.identity.attempt_id,
-                    &request.identity.intent_kind.as_sql(),
-                    &&request.identity.selected_fingerprint[..],
-                    &&request.expected_prior_row_blake3[..],
-                    &&request.terminal_evidence_blake3[..],
-                    &request.release_id,
-                    &request.release_basis_id,
-                    &&request.release_basis_blake3[..],
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let result = parse_procedure_result(&row)?;
-        validate_transition_result(
-            &result,
-            &request.identity,
-            ContinuityState::NoLocalEffect,
-            ContinuityOwnershipState::OwnershipReleased,
-        )?;
-        transaction
-            .commit()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        Ok(result)
+        run_serializable_mutation!(
+            self,
+            MARK_NO_LOCAL_EFFECT_SQL,
+            &[
+                &API_REVISION,
+                &request.identity.provider_boundary_id,
+                &epoch,
+                &sequence,
+                &request.identity.continuity_token_id,
+                &request.identity.authenticated_cell_id,
+                &request.identity.authenticated_tenant_id,
+                &request.identity.logical_request_id,
+                &request.identity.attempt_id,
+                &request.identity.intent_kind.as_sql(),
+                &&request.identity.selected_fingerprint[..],
+                &&request.expected_prior_row_blake3[..],
+                &&request.terminal_evidence_blake3[..],
+                &request.release_id,
+                &request.release_basis_id,
+                &&request.release_basis_blake3[..],
+            ],
+            |row: &Row| {
+                let result = parse_procedure_result(row)?;
+                validate_transition_result(
+                    &result,
+                    &request.identity,
+                    ContinuityState::NoLocalEffect,
+                    ContinuityOwnershipState::OwnershipReleased,
+                )?;
+                Ok(result)
+            },
+            |precommit| {
+                self.reconcile_token_transition_commit(
+                    &request.identity,
+                    &request.expected_prior_row_blake3,
+                    precommit,
+                )
+            }
+        )
     }
 
     /// Preserve shadow ownership while recording an exact INTENT or BOUND quarantine.
@@ -1065,48 +1514,44 @@ impl ContinuityClient {
         let epoch = request.identity.authority_epoch.to_string();
         let sequence = request.identity.continuity_seq.to_string();
         let local_binding = request.prior_state.local_binding_blake3();
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(MUTATION_ISOLATION_LEVEL)
-            .start()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let row = transaction
-            .query_one(
-                QUARANTINE_SQL,
-                &[
-                    &API_REVISION,
-                    &request.identity.provider_boundary_id,
-                    &epoch,
-                    &sequence,
-                    &request.identity.continuity_token_id,
-                    &request.identity.authenticated_cell_id,
-                    &request.identity.authenticated_tenant_id,
-                    &request.identity.logical_request_id,
-                    &request.identity.attempt_id,
-                    &request.identity.intent_kind.as_sql(),
-                    &&request.identity.selected_fingerprint[..],
-                    &&request.expected_prior_row_blake3[..],
-                    &request.prior_state.as_sql(),
-                    &local_binding,
-                    &&request.terminal_evidence_blake3[..],
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let result = parse_procedure_result(&row)?;
-        validate_transition_result(
-            &result,
-            &request.identity,
-            ContinuityState::Quarantined,
-            ContinuityOwnershipState::ShadowReserved,
-        )?;
-        transaction
-            .commit()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        Ok(result)
+        run_serializable_mutation!(
+            self,
+            QUARANTINE_SQL,
+            &[
+                &API_REVISION,
+                &request.identity.provider_boundary_id,
+                &epoch,
+                &sequence,
+                &request.identity.continuity_token_id,
+                &request.identity.authenticated_cell_id,
+                &request.identity.authenticated_tenant_id,
+                &request.identity.logical_request_id,
+                &request.identity.attempt_id,
+                &request.identity.intent_kind.as_sql(),
+                &&request.identity.selected_fingerprint[..],
+                &&request.expected_prior_row_blake3[..],
+                &request.prior_state.as_sql(),
+                &local_binding,
+                &&request.terminal_evidence_blake3[..],
+            ],
+            |row: &Row| {
+                let result = parse_procedure_result(row)?;
+                validate_transition_result(
+                    &result,
+                    &request.identity,
+                    ContinuityState::Quarantined,
+                    ContinuityOwnershipState::ShadowReserved,
+                )?;
+                Ok(result)
+            },
+            |precommit| {
+                self.reconcile_token_transition_commit(
+                    &request.identity,
+                    &request.expected_prior_row_blake3,
+                    precommit,
+                )
+            }
+        )
     }
 
     /// Preserve shadow ownership while recording a BOUND dispatch as externally ambiguous.
@@ -1117,48 +1562,44 @@ impl ContinuityClient {
         validate_identity(&request.identity)?;
         let epoch = request.identity.authority_epoch.to_string();
         let sequence = request.identity.continuity_seq.to_string();
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(MUTATION_ISOLATION_LEVEL)
-            .start()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let row = transaction
-            .query_one(
-                MARK_AMBIGUOUS_DISPATCH_SQL,
-                &[
-                    &API_REVISION,
-                    &request.identity.provider_boundary_id,
-                    &epoch,
-                    &sequence,
-                    &request.identity.continuity_token_id,
-                    &request.identity.authenticated_cell_id,
-                    &request.identity.authenticated_tenant_id,
-                    &request.identity.logical_request_id,
-                    &request.identity.attempt_id,
-                    &request.identity.intent_kind.as_sql(),
-                    &&request.identity.selected_fingerprint[..],
-                    &&request.expected_prior_row_blake3[..],
-                    &&request.local_binding_blake3[..],
-                    &&request.terminal_evidence_blake3[..],
-                    &"BOUND",
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let result = parse_procedure_result(&row)?;
-        validate_transition_result(
-            &result,
-            &request.identity,
-            ContinuityState::AmbiguousDispatch,
-            ContinuityOwnershipState::ShadowReserved,
-        )?;
-        transaction
-            .commit()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        Ok(result)
+        run_serializable_mutation!(
+            self,
+            MARK_AMBIGUOUS_DISPATCH_SQL,
+            &[
+                &API_REVISION,
+                &request.identity.provider_boundary_id,
+                &epoch,
+                &sequence,
+                &request.identity.continuity_token_id,
+                &request.identity.authenticated_cell_id,
+                &request.identity.authenticated_tenant_id,
+                &request.identity.logical_request_id,
+                &request.identity.attempt_id,
+                &request.identity.intent_kind.as_sql(),
+                &&request.identity.selected_fingerprint[..],
+                &&request.expected_prior_row_blake3[..],
+                &&request.local_binding_blake3[..],
+                &&request.terminal_evidence_blake3[..],
+                &"BOUND",
+            ],
+            |row: &Row| {
+                let result = parse_procedure_result(row)?;
+                validate_transition_result(
+                    &result,
+                    &request.identity,
+                    ContinuityState::AmbiguousDispatch,
+                    ContinuityOwnershipState::ShadowReserved,
+                )?;
+                Ok(result)
+            },
+            |precommit| {
+                self.reconcile_token_transition_commit(
+                    &request.identity,
+                    &request.expected_prior_row_blake3,
+                    precommit,
+                )
+            }
+        )
     }
 
     /// Prepare a typed adjudication while retaining shadow ownership.
@@ -1177,49 +1618,45 @@ impl ContinuityClient {
             .local_binding_blake3
             .as_ref()
             .map(|digest| &digest[..]);
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(MUTATION_ISOLATION_LEVEL)
-            .start()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let row = transaction
-            .query_one(
-                PREPARE_ADJUDICATION_SQL,
-                &[
-                    &API_REVISION,
-                    &request.identity.provider_boundary_id,
-                    &epoch,
-                    &sequence,
-                    &request.identity.continuity_token_id,
-                    &request.identity.authenticated_cell_id,
-                    &request.identity.authenticated_tenant_id,
-                    &request.identity.logical_request_id,
-                    &request.identity.attempt_id,
-                    &request.identity.intent_kind.as_sql(),
-                    &&request.identity.selected_fingerprint[..],
-                    &&request.expected_prior_row_blake3[..],
-                    &request.adjudication_kind.prepared_prior_state_sql(),
-                    &local_binding,
-                    &&request.terminal_evidence_blake3[..],
-                    &request.adjudication_kind.as_sql(),
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let result = parse_procedure_result(&row)?;
-        validate_transition_result(
-            &result,
-            &request.identity,
-            ContinuityState::AdjudicationPrepared,
-            ContinuityOwnershipState::ShadowReserved,
-        )?;
-        transaction
-            .commit()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        Ok(result)
+        run_serializable_mutation!(
+            self,
+            PREPARE_ADJUDICATION_SQL,
+            &[
+                &API_REVISION,
+                &request.identity.provider_boundary_id,
+                &epoch,
+                &sequence,
+                &request.identity.continuity_token_id,
+                &request.identity.authenticated_cell_id,
+                &request.identity.authenticated_tenant_id,
+                &request.identity.logical_request_id,
+                &request.identity.attempt_id,
+                &request.identity.intent_kind.as_sql(),
+                &&request.identity.selected_fingerprint[..],
+                &&request.expected_prior_row_blake3[..],
+                &request.adjudication_kind.prepared_prior_state_sql(),
+                &local_binding,
+                &&request.terminal_evidence_blake3[..],
+                &request.adjudication_kind.as_sql(),
+            ],
+            |row: &Row| {
+                let result = parse_procedure_result(row)?;
+                validate_transition_result(
+                    &result,
+                    &request.identity,
+                    ContinuityState::AdjudicationPrepared,
+                    ContinuityOwnershipState::ShadowReserved,
+                )?;
+                Ok(result)
+            },
+            |precommit| {
+                self.reconcile_token_transition_commit(
+                    &request.identity,
+                    &request.expected_prior_row_blake3,
+                    precommit,
+                )
+            }
+        )
     }
 
     /// Complete a prepared adjudication and release its exact shadow ownership once.
@@ -1239,56 +1676,52 @@ impl ContinuityClient {
             .local_binding_blake3
             .as_ref()
             .map(|digest| &digest[..]);
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(MUTATION_ISOLATION_LEVEL)
-            .start()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let row = transaction
-            .query_one(
-                COMPLETE_ADJUDICATION_SQL,
-                &[
-                    &API_REVISION,
-                    &request.identity.provider_boundary_id,
-                    &epoch,
-                    &sequence,
-                    &request.identity.continuity_token_id,
-                    &request.identity.authenticated_cell_id,
-                    &request.identity.authenticated_tenant_id,
-                    &request.identity.logical_request_id,
-                    &request.identity.attempt_id,
-                    &request.identity.intent_kind.as_sql(),
-                    &&request.identity.selected_fingerprint[..],
-                    &&request.expected_prior_row_blake3[..],
-                    &local_binding,
-                    &&request.terminal_evidence_blake3[..],
-                    &request.adjudication_kind.as_sql(),
-                    &request.adjudication_kind.final_state_sql(),
-                    &request.release_id,
-                    &request.release_basis_id,
-                    &&request.release_basis_blake3[..],
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let result = parse_procedure_result(&row)?;
         let expected_state = match request.adjudication_kind {
             ContinuityAdjudicationKind::NoLocalEffect => ContinuityState::AdjudicatedNoLocalEffect,
             ContinuityAdjudicationKind::NoDispatch => ContinuityState::AdjudicatedNoDispatch,
         };
-        validate_transition_result(
-            &result,
-            &request.identity,
-            expected_state,
-            ContinuityOwnershipState::OwnershipReleased,
-        )?;
-        transaction
-            .commit()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        Ok(result)
+        run_serializable_mutation!(
+            self,
+            COMPLETE_ADJUDICATION_SQL,
+            &[
+                &API_REVISION,
+                &request.identity.provider_boundary_id,
+                &epoch,
+                &sequence,
+                &request.identity.continuity_token_id,
+                &request.identity.authenticated_cell_id,
+                &request.identity.authenticated_tenant_id,
+                &request.identity.logical_request_id,
+                &request.identity.attempt_id,
+                &request.identity.intent_kind.as_sql(),
+                &&request.identity.selected_fingerprint[..],
+                &&request.expected_prior_row_blake3[..],
+                &local_binding,
+                &&request.terminal_evidence_blake3[..],
+                &request.adjudication_kind.as_sql(),
+                &request.adjudication_kind.final_state_sql(),
+                &request.release_id,
+                &request.release_basis_id,
+                &&request.release_basis_blake3[..],
+            ],
+            |row: &Row| {
+                let result = parse_procedure_result(row)?;
+                validate_transition_result(
+                    &result,
+                    &request.identity,
+                    expected_state,
+                    ContinuityOwnershipState::OwnershipReleased,
+                )?;
+                Ok(result)
+            },
+            |precommit| {
+                self.reconcile_token_transition_commit(
+                    &request.identity,
+                    &request.expected_prior_row_blake3,
+                    precommit,
+                )
+            }
+        )
     }
 
     /// Record exact local durability coverage without installing or deriving local evidence.
@@ -1310,48 +1743,38 @@ impl ContinuityClient {
         let sequence = request.continuity_seq.to_string();
         let counter_revision = request.local_counter_revision.to_string();
         let authority_lsn = PgLsn::from(request.authority_lsn);
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(MUTATION_ISOLATION_LEVEL)
-            .start()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let row = transaction
-            .query_one(
-                RECORD_SNAPSHOT_SQL,
-                &[
-                    &API_REVISION,
-                    &request.snapshot_id,
-                    &request.provider_boundary_id,
-                    &epoch,
-                    &through_sequence,
-                    &authority_lsn,
-                    &&request.manifest_blake3[..],
-                    &sequence,
-                    &request.continuity_token_id,
-                    &&request.local_binding_blake3[..],
-                    &&request.local_state_blake3[..],
-                    &&request.local_quota_ownership_blake3[..],
-                    &counter_revision,
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let result = parse_snapshot_result(&row)?;
-        if result.accepted_snapshot_id != request.snapshot_id
-            || result.accepted_through_continuity_seq != request.through_continuity_seq
-            || result.accepted_manifest_blake3 != request.manifest_blake3
-        {
-            return Err(ContinuityError::InvalidResponse(
-                "snapshot result identity is inconsistent",
-            ));
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        Ok(result)
+        run_serializable_mutation!(
+            self,
+            RECORD_SNAPSHOT_SQL,
+            &[
+                &API_REVISION,
+                &request.snapshot_id,
+                &request.provider_boundary_id,
+                &epoch,
+                &through_sequence,
+                &authority_lsn,
+                &&request.manifest_blake3[..],
+                &sequence,
+                &request.continuity_token_id,
+                &&request.local_binding_blake3[..],
+                &&request.local_state_blake3[..],
+                &&request.local_quota_ownership_blake3[..],
+                &counter_revision,
+            ],
+            |row: &Row| {
+                let result = parse_snapshot_result(row)?;
+                if result.accepted_snapshot_id != request.snapshot_id
+                    || result.accepted_through_continuity_seq != request.through_continuity_seq
+                    || result.accepted_manifest_blake3 != request.manifest_blake3
+                {
+                    return Err(ContinuityError::InvalidResponse(
+                        "snapshot result identity is inconsistent",
+                    ));
+                }
+                Ok(result)
+            },
+            |precommit| self.reconcile_snapshot_commit(request, precommit)
+        )
     }
 
     /// Release BOUND or COMPLETED ownership only from exact accepted snapshot coverage.
@@ -1362,50 +1785,46 @@ impl ContinuityClient {
         validate_identity(&request.identity)?;
         let epoch = request.identity.authority_epoch.to_string();
         let sequence = request.identity.continuity_seq.to_string();
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(MUTATION_ISOLATION_LEVEL)
-            .start()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let row = transaction
-            .query_one(
-                RELEASE_SHADOW_OWNERSHIP_SQL,
-                &[
-                    &API_REVISION,
-                    &request.identity.provider_boundary_id,
-                    &epoch,
-                    &sequence,
-                    &request.identity.continuity_token_id,
-                    &request.identity.authenticated_cell_id,
-                    &request.identity.authenticated_tenant_id,
-                    &request.identity.logical_request_id,
-                    &request.identity.attempt_id,
-                    &request.identity.intent_kind.as_sql(),
-                    &&request.identity.selected_fingerprint[..],
-                    &&request.expected_prior_row_blake3[..],
-                    &request.expected_state.as_sql(),
-                    &request.snapshot_id,
-                    &&request.expected_manifest_blake3[..],
-                    &&request.expected_coverage_blake3[..],
-                    &request.release_id,
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let result = parse_procedure_result(&row)?;
-        validate_transition_result(
-            &result,
-            &request.identity,
-            request.expected_state.as_state(),
-            ContinuityOwnershipState::OwnershipReleased,
-        )?;
-        transaction
-            .commit()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        Ok(result)
+        run_serializable_mutation!(
+            self,
+            RELEASE_SHADOW_OWNERSHIP_SQL,
+            &[
+                &API_REVISION,
+                &request.identity.provider_boundary_id,
+                &epoch,
+                &sequence,
+                &request.identity.continuity_token_id,
+                &request.identity.authenticated_cell_id,
+                &request.identity.authenticated_tenant_id,
+                &request.identity.logical_request_id,
+                &request.identity.attempt_id,
+                &request.identity.intent_kind.as_sql(),
+                &&request.identity.selected_fingerprint[..],
+                &&request.expected_prior_row_blake3[..],
+                &request.expected_state.as_sql(),
+                &request.snapshot_id,
+                &&request.expected_manifest_blake3[..],
+                &&request.expected_coverage_blake3[..],
+                &request.release_id,
+            ],
+            |row: &Row| {
+                let result = parse_procedure_result(row)?;
+                validate_transition_result(
+                    &result,
+                    &request.identity,
+                    request.expected_state.as_state(),
+                    ContinuityOwnershipState::OwnershipReleased,
+                )?;
+                Ok(result)
+            },
+            |precommit| {
+                self.reconcile_token_transition_commit(
+                    &request.identity,
+                    &request.expected_prior_row_blake3,
+                    precommit,
+                )
+            }
+        )
     }
 
     /// Read one boundary's exact current reconciliation counters and latest snapshot.
@@ -1420,24 +1839,24 @@ impl ContinuityClient {
             ));
         }
         let epoch = authority_epoch.to_string();
-        let client = self.client.lock().await;
-        let row = client
-            .query_opt(
-                READ_RECONCILIATION_STATE_SQL,
-                &[&API_REVISION, &provider_boundary_id, &epoch],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        row.map(|row| {
-            let state = parse_reconciliation_state(&row)?;
-            if state.current_authority_epoch != authority_epoch {
-                return Err(ContinuityError::InvalidResponse(
-                    "reconciliation epoch is inconsistent",
-                ));
+        run_bounded_read!(
+            self,
+            query_opt,
+            READ_RECONCILIATION_STATE_SQL,
+            &[&API_REVISION, &provider_boundary_id, &epoch],
+            |row: Option<Row>| {
+                row.map(|row| {
+                    let state = parse_reconciliation_state(&row)?;
+                    if state.current_authority_epoch != authority_epoch {
+                        return Err(ContinuityError::InvalidResponse(
+                            "reconciliation epoch is inconsistent",
+                        ));
+                    }
+                    Ok(state)
+                })
+                .transpose()
             }
-            Ok(state)
-        })
-        .transpose()
+        )
     }
 
     /// Read the current epoch and its gapless continuity sequence high-water.
@@ -1450,13 +1869,13 @@ impl ContinuityClient {
                 "provider boundary ID must be nonempty",
             ));
         }
-        let client = self.client.lock().await;
-        client
-            .query_opt(READ_EPOCH_SQL, &[&API_REVISION, &provider_boundary_id])
-            .await
-            .map_err(ContinuityError::postgres)?
-            .map(|row| parse_epoch_state(&row))
-            .transpose()
+        run_bounded_read!(
+            self,
+            query_opt,
+            READ_EPOCH_SQL,
+            &[&API_REVISION, &provider_boundary_id],
+            |row: Option<Row>| row.map(|row| parse_epoch_state(&row)).transpose()
+        )
     }
 
     /// Allocate a strictly newer epoch only after the authority proves the current epoch drained.
@@ -1474,37 +1893,29 @@ impl ContinuityClient {
         }
         let expected_current_epoch = request.expected_current_epoch.to_string();
         let next_epoch = request.next_epoch.to_string();
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(MUTATION_ISOLATION_LEVEL)
-            .start()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let row = transaction
-            .query_one(
-                ALLOCATE_EPOCH_SQL,
-                &[
-                    &API_REVISION,
-                    &request.provider_boundary_id,
-                    &expected_current_epoch,
-                    &next_epoch,
-                    &&request.epoch_namespace_blake3[..],
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let result = parse_epoch_state(&row)?;
-        if result.authority_epoch != request.next_epoch || result.continuity_seq_high_water != 0 {
-            return Err(ContinuityError::InvalidResponse(
-                "allocated epoch result is inconsistent",
-            ));
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        Ok(result)
+        run_serializable_mutation!(
+            self,
+            ALLOCATE_EPOCH_SQL,
+            &[
+                &API_REVISION,
+                &request.provider_boundary_id,
+                &expected_current_epoch,
+                &next_epoch,
+                &&request.epoch_namespace_blake3[..],
+            ],
+            |row: &Row| {
+                let result = parse_epoch_state(row)?;
+                if result.authority_epoch != request.next_epoch
+                    || result.continuity_seq_high_water != 0
+                {
+                    return Err(ContinuityError::InvalidResponse(
+                        "allocated epoch result is inconsistent",
+                    ));
+                }
+                Ok(result)
+            },
+            |precommit| self.reconcile_epoch_allocation_commit(request, precommit)
+        )
     }
 
     /// Read one exact canonical shadow-release receipt without granting table access.
@@ -1522,34 +1933,34 @@ impl ContinuityClient {
         }
         let epoch = request.authority_epoch.to_string();
         let sequence = request.continuity_seq.to_string();
-        let client = self.client.lock().await;
-        let row = client
-            .query_opt(
-                READ_SHADOW_RELEASE_RECEIPT_SQL,
-                &[
-                    &API_REVISION,
-                    &request.provider_boundary_id,
-                    &epoch,
-                    &sequence,
-                    &request.continuity_token_id,
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        row.map(|row| {
-            let receipt = parse_shadow_release_receipt(&row)?;
-            if receipt.provider_boundary_id != request.provider_boundary_id
-                || receipt.authority_epoch != request.authority_epoch
-                || receipt.continuity_seq != request.continuity_seq
-                || receipt.continuity_token_id != request.continuity_token_id
-            {
-                return Err(ContinuityError::InvalidResponse(
-                    "shadow release receipt identity is inconsistent",
-                ));
+        run_bounded_read!(
+            self,
+            query_opt,
+            READ_SHADOW_RELEASE_RECEIPT_SQL,
+            &[
+                &API_REVISION,
+                &request.provider_boundary_id,
+                &epoch,
+                &sequence,
+                &request.continuity_token_id,
+            ],
+            |row: Option<Row>| {
+                row.map(|row| {
+                    let receipt = parse_shadow_release_receipt(&row)?;
+                    if receipt.provider_boundary_id != request.provider_boundary_id
+                        || receipt.authority_epoch != request.authority_epoch
+                        || receipt.continuity_seq != request.continuity_seq
+                        || receipt.continuity_token_id != request.continuity_token_id
+                    {
+                        return Err(ContinuityError::InvalidResponse(
+                            "shadow release receipt identity is inconsistent",
+                        ));
+                    }
+                    Ok(receipt)
+                })
+                .transpose()
             }
-            Ok(receipt)
-        })
-        .transpose()
+        )
     }
 
     /// Replace one exact eligible terminal detail row with its bounded authenticated interval.
@@ -1560,37 +1971,27 @@ impl ContinuityClient {
         validate_archive_prune_request(request)?;
         let epoch = request.authority_epoch.to_string();
         let sequence = request.continuity_seq.to_string();
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(MUTATION_ISOLATION_LEVEL)
-            .start()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let row = transaction
-            .query_one(
-                ARCHIVE_PRUNE_SQL,
-                &[
-                    &API_REVISION,
-                    &request.provider_boundary_id,
-                    &epoch,
-                    &sequence,
-                    &request.continuity_token_id,
-                    &&request.expected_row_blake3[..],
-                    &&request.expected_release_receipt_blake3[..],
-                    &&request.archive_proof_bytes[..],
-                    &&request.archive_proof_blake3[..],
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let result = parse_archive_prune_result(&row)?;
-        validate_archive_prune_result_for_sequence(&result, request.continuity_seq)?;
-        transaction
-            .commit()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        Ok(result)
+        run_serializable_mutation!(
+            self,
+            ARCHIVE_PRUNE_SQL,
+            &[
+                &API_REVISION,
+                &request.provider_boundary_id,
+                &epoch,
+                &sequence,
+                &request.continuity_token_id,
+                &&request.expected_row_blake3[..],
+                &&request.expected_release_receipt_blake3[..],
+                &&request.archive_proof_bytes[..],
+                &&request.archive_proof_blake3[..],
+            ],
+            |row: &Row| {
+                let result = parse_archive_prune_result(row)?;
+                validate_archive_prune_result_for_sequence(&result, request.continuity_seq)?;
+                Ok(result)
+            },
+            |precommit| self.reconcile_archive_commit(request, precommit)
+        )
     }
 
     /// Read and validate the authenticated pruned interval containing one exact sequence.
@@ -1601,26 +2002,26 @@ impl ContinuityClient {
         validate_read_pruned_interval_request(request)?;
         let epoch = request.authority_epoch.to_string();
         let sequence = request.continuity_seq.to_string();
-        let client = self.client.lock().await;
-        let row = client
-            .query_one(
-                READ_PRUNED_INTERVAL_SQL,
-                &[
-                    &API_REVISION,
-                    &request.provider_boundary_id,
-                    &epoch,
-                    &sequence,
-                    &SCHEMA_REVISION,
-                    &CONTINUITY_CONTRACT_REVISION,
-                    &request.expected_continuity_policy_revision,
-                    &&request.expected_epoch_namespace_blake3[..],
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let interval = parse_pruned_interval(&row)?;
-        validate_pruned_interval(&interval, request)?;
-        Ok(interval)
+        run_bounded_read!(
+            self,
+            query_one,
+            READ_PRUNED_INTERVAL_SQL,
+            &[
+                &API_REVISION,
+                &request.provider_boundary_id,
+                &epoch,
+                &sequence,
+                &SCHEMA_REVISION,
+                &CONTINUITY_CONTRACT_REVISION,
+                &request.expected_continuity_policy_revision,
+                &&request.expected_epoch_namespace_blake3[..],
+            ],
+            |row: Row| {
+                let interval = parse_pruned_interval(&row)?;
+                validate_pruned_interval(&interval, request)?;
+                Ok(interval)
+            }
+        )
     }
 
     /// Replace one fully covered old-epoch interval with its canonical retired summary.
@@ -1630,37 +2031,27 @@ impl ContinuityClient {
     ) -> Result<RetiredEpochSummary, ContinuityError> {
         validate_retire_epoch_request(request)?;
         let epoch = request.authority_epoch.to_string();
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(MUTATION_ISOLATION_LEVEL)
-            .start()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let row = transaction
-            .query_one(
-                RETIRE_EPOCH_SQL,
-                &[
-                    &API_REVISION,
-                    &request.provider_boundary_id,
-                    &epoch,
-                    &&request.expected_epoch_namespace_blake3[..],
-                    &&request.expected_interval_checkpoint_blake3[..],
-                    &request.covering_snapshot_id,
-                    &&request.expected_snapshot_manifest_blake3[..],
-                    &&request.retirement_proof_bytes[..],
-                    &&request.retirement_proof_blake3[..],
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let summary = parse_retired_epoch_summary(&row)?;
-        validate_retired_epoch_summary_for_retirement(&summary, request)?;
-        transaction
-            .commit()
-            .await
-            .map_err(ContinuityError::postgres)?;
-        Ok(summary)
+        run_serializable_mutation!(
+            self,
+            RETIRE_EPOCH_SQL,
+            &[
+                &API_REVISION,
+                &request.provider_boundary_id,
+                &epoch,
+                &&request.expected_epoch_namespace_blake3[..],
+                &&request.expected_interval_checkpoint_blake3[..],
+                &request.covering_snapshot_id,
+                &&request.expected_snapshot_manifest_blake3[..],
+                &&request.retirement_proof_bytes[..],
+                &&request.retirement_proof_blake3[..],
+            ],
+            |row: &Row| {
+                let summary = parse_retired_epoch_summary(row)?;
+                validate_retired_epoch_summary_for_retirement(&summary, request)?;
+                Ok(summary)
+            },
+            |precommit| self.reconcile_retirement_commit(request, precommit)
+        )
     }
 
     /// Read and validate one authenticated retired namespace checkpoint.
@@ -1670,30 +2061,30 @@ impl ContinuityClient {
     ) -> Result<RetiredEpochSummary, ContinuityError> {
         validate_read_retired_epoch_request(request)?;
         let epoch = request.authority_epoch.to_string();
-        let client = self.client.lock().await;
-        let row = client
-            .query_one(
-                READ_RETIRED_EPOCH_SQL,
-                &[
-                    &API_REVISION,
+        run_bounded_read!(
+            self,
+            query_one,
+            READ_RETIRED_EPOCH_SQL,
+            &[
+                &API_REVISION,
+                &request.provider_boundary_id,
+                &epoch,
+                &SCHEMA_REVISION,
+                &CONTINUITY_CONTRACT_REVISION,
+                &request.expected_continuity_policy_revision,
+                &&request.expected_epoch_namespace_blake3[..],
+            ],
+            |row: Row| {
+                let summary = parse_retired_epoch_summary(&row)?;
+                validate_retired_epoch_summary_namespace(
+                    &summary,
                     &request.provider_boundary_id,
-                    &epoch,
-                    &SCHEMA_REVISION,
-                    &CONTINUITY_CONTRACT_REVISION,
+                    request.authority_epoch,
                     &request.expected_continuity_policy_revision,
-                    &&request.expected_epoch_namespace_blake3[..],
-                ],
-            )
-            .await
-            .map_err(ContinuityError::postgres)?;
-        let summary = parse_retired_epoch_summary(&row)?;
-        validate_retired_epoch_summary_namespace(
-            &summary,
-            &request.provider_boundary_id,
-            request.authority_epoch,
-            &request.expected_continuity_policy_revision,
-        )?;
-        Ok(summary)
+                )?;
+                Ok(summary)
+            }
+        )
     }
 }
 
@@ -2076,6 +2467,7 @@ fn parse_retired_epoch_summary(row: &Row) -> Result<RetiredEpochSummary, Continu
 
 fn validate_archive_prune_request(request: &ArchivePruneRequest) -> Result<(), ContinuityError> {
     if request.provider_boundary_id.is_empty()
+        || request.expected_continuity_policy_revision.is_empty()
         || request.authority_epoch == 0
         || request.continuity_seq == 0
         || request.archive_proof_bytes.is_empty()
@@ -2579,6 +2971,65 @@ fn postgres_error_is_transient(error: &tokio_postgres::Error) -> bool {
     )
 }
 
+fn postgres_error_is_known_aborted_mutation(error: &tokio_postgres::Error) -> bool {
+    postgres_error_shape_is_known_aborted_mutation(
+        error
+            .as_db_error()
+            .map(|database_error| database_error.code().code()),
+    )
+}
+
+fn postgres_error_shape_is_known_aborted_mutation(sqlstate: Option<&str>) -> bool {
+    matches!(sqlstate, Some("40001" | "40P01"))
+}
+
+fn mutation_retry_delay_for_shape(
+    sqlstate: Option<&str>,
+    attempt: u8,
+    max_retry_attempts: u8,
+) -> Option<Duration> {
+    if attempt >= max_retry_attempts || !postgres_error_shape_is_known_aborted_mutation(sqlstate) {
+        return None;
+    }
+    bounded_retry_delay(attempt, max_retry_attempts)
+}
+
+fn bounded_retry_delay(attempt: u8, max_retry_attempts: u8) -> Option<Duration> {
+    if attempt >= max_retry_attempts {
+        return None;
+    }
+    match attempt {
+        1 => Some(FIRST_MUTATION_RETRY_DELAY),
+        2 => Some(SECOND_MUTATION_RETRY_DELAY),
+        _ => None,
+    }
+}
+
+fn commit_failure_action(
+    is_closed: bool,
+    sqlstate: Option<&str>,
+    attempt: u8,
+    max_retry_attempts: u8,
+) -> CommitFailureAction {
+    if postgres_error_shape_is_known_aborted_mutation(sqlstate) {
+        return mutation_retry_delay_for_shape(sqlstate, attempt, max_retry_attempts).map_or(
+            CommitFailureAction::Exhausted,
+            CommitFailureAction::RetryAfter,
+        );
+    }
+    if is_closed || sqlstate.is_some_and(|code| code.starts_with("08")) {
+        return CommitFailureAction::Reconcile;
+    }
+    CommitFailureAction::Fail
+}
+
+fn mutation_timeout_sql(statement_timeout_ms: u64, lock_timeout_ms: u64) -> String {
+    format!(
+        "SET LOCAL statement_timeout = '{statement_timeout_ms}ms'; \
+         SET LOCAL lock_timeout = '{lock_timeout_ms}ms';"
+    )
+}
+
 fn postgres_error_shape_is_transient(is_closed: bool, sqlstate: Option<&str>) -> bool {
     if is_closed {
         return true;
@@ -2631,6 +3082,8 @@ mod tests {
             authority_epoch: 7,
             continuity_seq: 11,
             continuity_token_id: Uuid::from_u128(23),
+            expected_continuity_policy_revision: "policy-v1".to_string(),
+            expected_epoch_namespace_blake3: [0x29; 32],
             expected_row_blake3: [0x31; 32],
             expected_release_receipt_blake3: [0x41; 32],
             archive_proof_bytes: vec![0x51],
@@ -2761,6 +3214,26 @@ mod tests {
             summary_blake3,
             retired_at_unix_ms: 10,
         }
+    }
+
+    fn assert_adopted<T>(outcome: CommitReconciliation<T>, expected: &T)
+    where
+        T: std::fmt::Debug + PartialEq,
+    {
+        match outcome {
+            CommitReconciliation::Adopt(adopted) => assert_eq!(&adopted, expected),
+            CommitReconciliation::Retry | CommitReconciliation::Unresolved => {
+                panic!("expected exact authoritative adoption")
+            }
+        }
+    }
+
+    fn assert_retry<T>(outcome: CommitReconciliation<T>) {
+        assert!(matches!(outcome, CommitReconciliation::Retry));
+    }
+
+    fn assert_unresolved<T>(outcome: CommitReconciliation<T>) {
+        assert!(matches!(outcome, CommitReconciliation::Unresolved));
     }
 
     fn normalized_embedded_migration() -> String {
@@ -3980,6 +4453,88 @@ mod tests {
     }
 
     #[test]
+    fn mutation_and_read_inventories_use_their_shared_bounded_executors() {
+        let production_source = include_str!("continuity.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("continuity source must contain its test module boundary");
+        let transaction_count = production_source.matches(".build_transaction()").count();
+        let timeout_count = production_source
+            .matches("apply_mutation_timeouts(&transaction)")
+            .count();
+        let mutation_count = production_source
+            .matches("run_serializable_mutation!(")
+            .count();
+        let bounded_read_count = production_source.matches("run_bounded_read!(").count();
+        let read_only_transaction_count = production_source.matches(".read_only(true)").count();
+        let reconciliation_callback_count = production_source.matches("self.reconcile_").count();
+
+        assert_eq!(mutation_count, 13, "mutation inventory changed");
+        assert_eq!(reconciliation_callback_count, mutation_count);
+        assert_eq!(bounded_read_count, 6, "read inventory changed");
+        assert_eq!(transaction_count, 2, "shared database executors split");
+        assert_eq!(read_only_transaction_count, 1);
+        assert_eq!(timeout_count, transaction_count);
+    }
+
+    #[test]
+    fn bounded_read_executor_has_no_retry_or_backoff_path() {
+        let production_source = include_str!("continuity.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("continuity source must contain its test module boundary");
+        let bounded_read_source = production_source
+            .split("macro_rules! run_bounded_read")
+            .nth(1)
+            .and_then(|source| source.split("const BEGIN_SQL").next())
+            .expect("bounded read executor must precede the SQL inventory");
+
+        assert!(bounded_read_source.contains(".read_only(true)"));
+        assert!(bounded_read_source.contains("apply_mutation_timeouts(&transaction)"));
+        for forbidden in [
+            "tokio::time::sleep",
+            "continue",
+            "mutation_retry",
+            "CommitFailureAction",
+        ] {
+            assert!(
+                !bounded_read_source.contains(forbidden),
+                "bounded read executor gained retry behavior {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_backoff_and_reconnect_run_after_the_attempt_scope_releases_session() {
+        let production_source = include_str!("continuity.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("continuity source must contain its test module boundary");
+        let mutation_executor = production_source
+            .split("macro_rules! run_serializable_mutation")
+            .nth(1)
+            .and_then(|source| source.split("enum CommitFailureAction").next())
+            .expect("serializable mutation executor must be present");
+        let attempt_scope = mutation_executor
+            .split("let outcome = 'attempt: {")
+            .nth(1)
+            .and_then(|source| source.split("match outcome").next())
+            .expect("mutation attempt must have a lexical resource scope");
+        assert!(attempt_scope.contains("session.lock().await"));
+        assert!(attempt_scope.contains("transaction.commit().await"));
+        assert!(!attempt_scope.contains("tokio::time::sleep"));
+        assert!(!attempt_scope.contains("reconnect().await"));
+
+        let after_attempt = mutation_executor
+            .split("match outcome")
+            .nth(1)
+            .expect("mutation outcomes must run after the lexical attempt scope");
+        assert!(after_attempt.contains("tokio::time::sleep"));
+        assert!(after_attempt.contains("reconnect().await"));
+        assert!(after_attempt.contains("($reconcile)(&result).await"));
+    }
+
+    #[test]
     fn u64_max_has_an_exact_lossless_numeric_text_representation() {
         assert_eq!(u64::MAX.to_string(), "18446744073709551615");
         assert_eq!(
@@ -4167,6 +4722,355 @@ mod tests {
     }
 
     #[test]
+    fn mutation_timeout_query_sets_both_server_enforced_local_bounds() {
+        assert_eq!(
+            mutation_timeout_sql(2_000, 750),
+            "SET LOCAL statement_timeout = '2000ms'; SET LOCAL lock_timeout = '750ms';"
+        );
+        assert_eq!(
+            mutation_timeout_sql(u64::MAX, 1),
+            format!(
+                "SET LOCAL statement_timeout = '{}ms'; SET LOCAL lock_timeout = '1ms';",
+                u64::MAX
+            )
+        );
+    }
+
+    #[test]
+    fn mutation_retry_schedule_is_exactly_three_attempts_with_frozen_delays() {
+        for sqlstate in ["40001", "40P01"] {
+            assert_eq!(
+                mutation_retry_delay_for_shape(Some(sqlstate), 1, 3),
+                Some(Duration::from_millis(25))
+            );
+            assert_eq!(
+                mutation_retry_delay_for_shape(Some(sqlstate), 2, 3),
+                Some(Duration::from_millis(100))
+            );
+            assert_eq!(mutation_retry_delay_for_shape(Some(sqlstate), 3, 3), None);
+            assert_eq!(mutation_retry_delay_for_shape(Some(sqlstate), 4, 3), None);
+        }
+    }
+
+    #[test]
+    fn mutation_retry_rejects_transport_capacity_restart_and_unknown_failures() {
+        for sqlstate in [
+            None,
+            Some("08000"),
+            Some("08006"),
+            Some("40003"),
+            Some("53000"),
+            Some("53100"),
+            Some("57P01"),
+            Some("57P03"),
+            Some("XXXXX"),
+        ] {
+            assert_eq!(
+                mutation_retry_delay_for_shape(sqlstate, 1, 3),
+                None,
+                "mutation retry accepted unresolved failure {sqlstate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn begin_reconciliation_adopts_only_the_exact_precommit_row_and_never_found() {
+        let identity = sample_identity();
+        let mut precommit = sample_result(&identity);
+        precommit.result_code = ContinuityResultCode::Created;
+        let mut authoritative = precommit.clone();
+        authoritative.result_code = ContinuityResultCode::Found;
+
+        assert_adopted(
+            reconcile_begin_readback(
+                &precommit,
+                Some(ContinuityTokenLookup::Found(authoritative.clone())),
+            ),
+            &precommit,
+        );
+
+        let mut mismatches = Vec::new();
+        let mut mismatch = authoritative.clone();
+        mismatch.state = ContinuityState::Completed;
+        mismatches.push(mismatch);
+        let mut mismatch = authoritative.clone();
+        mismatch.ownership_state = ContinuityOwnershipState::OwnershipReleased;
+        mismatches.push(mismatch);
+        let mut mismatch = authoritative.clone();
+        mismatch.authority_epoch += 1;
+        mismatches.push(mismatch);
+        let mut mismatch = authoritative.clone();
+        mismatch.continuity_seq += 1;
+        mismatches.push(mismatch);
+        let mut mismatch = authoritative.clone();
+        mismatch.continuity_token_id = Uuid::from_u128(0xDEAD);
+        mismatches.push(mismatch);
+        let mut mismatch = authoritative.clone();
+        mismatch.row_blake3 = [0x52; 32];
+        mismatches.push(mismatch);
+        let mut mismatch = authoritative;
+        mismatch.external_committed_at_unix_ms += 1;
+        mismatches.push(mismatch);
+
+        for mismatch in mismatches {
+            assert_unresolved(reconcile_begin_readback(
+                &precommit,
+                Some(ContinuityTokenLookup::Found(mismatch)),
+            ));
+        }
+        assert_retry(reconcile_begin_readback(
+            &precommit,
+            Some(ContinuityTokenLookup::NotFound {
+                continuity_token_id: precommit.continuity_token_id,
+                observed_at_unix_ms: 1,
+            }),
+        ));
+        assert_unresolved(reconcile_begin_readback(&precommit, None));
+    }
+
+    #[test]
+    fn token_transition_reconciliation_distinguishes_exact_result_prior_and_mismatch() {
+        let identity = sample_identity();
+        let precommit = sample_result(&identity);
+        let expected_prior_row_blake3 = [0x31; 32];
+        let mut authoritative = precommit.clone();
+        authoritative.result_code = ContinuityResultCode::Found;
+
+        assert_adopted(
+            reconcile_token_transition_readback(
+                &identity,
+                &expected_prior_row_blake3,
+                &precommit,
+                Some(ContinuityTokenLookup::Found(authoritative.clone())),
+            ),
+            &precommit,
+        );
+
+        let mut prior = authoritative.clone();
+        prior.state = ContinuityState::Bound;
+        prior.row_blake3 = expected_prior_row_blake3;
+        assert_retry(reconcile_token_transition_readback(
+            &identity,
+            &expected_prior_row_blake3,
+            &precommit,
+            Some(ContinuityTokenLookup::Found(prior)),
+        ));
+
+        for mismatch in [
+            {
+                let mut value = authoritative.clone();
+                value.row_blake3 = [0x52; 32];
+                value
+            },
+            {
+                let mut value = authoritative.clone();
+                value.external_committed_at_unix_ms += 1;
+                value
+            },
+            {
+                let mut value = authoritative;
+                value.continuity_token_id = Uuid::from_u128(0xBEEF);
+                value
+            },
+        ] {
+            assert_unresolved(reconcile_token_transition_readback(
+                &identity,
+                &expected_prior_row_blake3,
+                &precommit,
+                Some(ContinuityTokenLookup::Found(mismatch)),
+            ));
+        }
+        assert_unresolved(reconcile_token_transition_readback(
+            &identity,
+            &expected_prior_row_blake3,
+            &precommit,
+            Some(ContinuityTokenLookup::NotFound {
+                continuity_token_id: identity.continuity_token_id,
+                observed_at_unix_ms: 1,
+            }),
+        ));
+        assert_unresolved(reconcile_token_transition_readback(
+            &identity,
+            &expected_prior_row_blake3,
+            &precommit,
+            None,
+        ));
+    }
+
+    #[test]
+    fn incomplete_snapshot_epoch_and_archive_reads_never_fabricate_adoption() {
+        let snapshot_request = RecordSnapshotRequest {
+            snapshot_id: Uuid::from_u128(0x101),
+            provider_boundary_id: "boundary-a".to_string(),
+            authority_epoch: 7,
+            through_continuity_seq: 11,
+            authority_lsn: 13,
+            manifest_blake3: [0x21; 32],
+            continuity_seq: 11,
+            continuity_token_id: Uuid::from_u128(0x102),
+            local_binding_blake3: [0x31; 32],
+            local_state_blake3: [0x41; 32],
+            local_quota_ownership_blake3: [0x51; 32],
+            local_counter_revision: 17,
+        };
+        let exact_snapshot = ReconciliationSnapshot {
+            snapshot_id: snapshot_request.snapshot_id,
+            through_continuity_seq: snapshot_request.through_continuity_seq,
+            manifest_blake3: snapshot_request.manifest_blake3,
+        };
+        assert_retry(reconcile_snapshot_readback(
+            &snapshot_request,
+            Some(Some(exact_snapshot.clone())),
+        ));
+        assert_retry(reconcile_snapshot_readback(&snapshot_request, Some(None)));
+        let mut mismatched_snapshot = exact_snapshot;
+        mismatched_snapshot.manifest_blake3 = [0x22; 32];
+        assert_unresolved(reconcile_snapshot_readback(
+            &snapshot_request,
+            Some(Some(mismatched_snapshot)),
+        ));
+        assert_unresolved(reconcile_snapshot_readback(&snapshot_request, None));
+
+        let epoch_request = AllocateEpochRequest {
+            provider_boundary_id: "boundary-a".to_string(),
+            expected_current_epoch: 7,
+            next_epoch: 8,
+            epoch_namespace_blake3: [0x61; 32],
+        };
+        assert_retry(reconcile_epoch_allocation_readback(
+            &epoch_request,
+            Some(ContinuityEpochState {
+                authority_epoch: 7,
+                continuity_seq_high_water: 0,
+            }),
+        ));
+        assert_unresolved(reconcile_epoch_allocation_readback(
+            &epoch_request,
+            Some(ContinuityEpochState {
+                authority_epoch: 8,
+                continuity_seq_high_water: 0,
+            }),
+        ));
+        assert_unresolved(reconcile_epoch_allocation_readback(&epoch_request, None));
+
+        let archive_request = sample_archive_prune_request();
+        let prior = ContinuityProcedureResult {
+            result_code: ContinuityResultCode::Found,
+            state: ContinuityState::NoLocalEffect,
+            ownership_state: ContinuityOwnershipState::OwnershipReleased,
+            authority_epoch: archive_request.authority_epoch,
+            continuity_seq: archive_request.continuity_seq,
+            continuity_token_id: archive_request.continuity_token_id,
+            row_blake3: archive_request.expected_row_blake3,
+            external_committed_at_unix_ms: 1,
+        };
+        assert_retry(reconcile_archive_readback(
+            &archive_request,
+            Some(ContinuityTokenLookup::Found(prior.clone())),
+        ));
+        let mut mismatched_prior = prior;
+        mismatched_prior.row_blake3 = [0x32; 32];
+        assert_unresolved(reconcile_archive_readback(
+            &archive_request,
+            Some(ContinuityTokenLookup::Found(mismatched_prior)),
+        ));
+        assert_unresolved(reconcile_archive_readback(
+            &archive_request,
+            Some(ContinuityTokenLookup::NotFound {
+                continuity_token_id: archive_request.continuity_token_id,
+                observed_at_unix_ms: 1,
+            }),
+        ));
+        assert_unresolved(reconcile_archive_readback(&archive_request, None));
+    }
+
+    #[test]
+    fn retirement_reconciliation_adopts_only_exact_validated_precommit_summary() {
+        let request = sample_retire_epoch_request();
+        let precommit = sample_retired_epoch_summary();
+
+        assert_adopted(
+            reconcile_retirement_readback(&request, &precommit, Some(precommit.clone()), None),
+            &precommit,
+        );
+        let mut mismatched_summary = precommit.clone();
+        mismatched_summary.retirement_proof_blake3 = [0xC2; 32];
+        assert_unresolved(reconcile_retirement_readback(
+            &request,
+            &precommit,
+            Some(mismatched_summary),
+            None,
+        ));
+        let mut mismatched_request = sample_retire_epoch_request();
+        mismatched_request.expected_snapshot_manifest_blake3 = [0xA2; 32];
+        assert_unresolved(reconcile_retirement_readback(
+            &mismatched_request,
+            &precommit,
+            Some(precommit.clone()),
+            None,
+        ));
+
+        let mut active_interval = sample_pruned_interval();
+        active_interval.start_sequence = 1;
+        active_interval.interval_blake3 = request.expected_interval_checkpoint_blake3;
+        assert_retry(reconcile_retirement_readback(
+            &request,
+            &precommit,
+            None,
+            Some(active_interval.clone()),
+        ));
+        active_interval.interval_blake3 = [0x92; 32];
+        assert_unresolved(reconcile_retirement_readback(
+            &request,
+            &precommit,
+            None,
+            Some(active_interval),
+        ));
+        assert_unresolved(reconcile_retirement_readback(
+            &request, &precommit, None, None,
+        ));
+    }
+
+    #[test]
+    fn commit_failure_requires_reconciliation_only_for_transport_ambiguity() {
+        assert_eq!(
+            commit_failure_action(true, None, 1, 3),
+            CommitFailureAction::Reconcile
+        );
+        for sqlstate in ["08000", "08006"] {
+            assert_eq!(
+                commit_failure_action(false, Some(sqlstate), 1, 3),
+                CommitFailureAction::Reconcile
+            );
+        }
+        for sqlstate in ["53000", "53100", "57P01", "57P03", "XXXXX"] {
+            assert_eq!(
+                commit_failure_action(false, Some(sqlstate), 1, 3),
+                CommitFailureAction::Fail,
+                "commit classified broad transient SQLSTATE {sqlstate} as replay authority"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_known_abort_retry_exhausts_after_the_third_attempt() {
+        for sqlstate in ["40001", "40P01"] {
+            assert_eq!(
+                commit_failure_action(false, Some(sqlstate), 1, 3),
+                CommitFailureAction::RetryAfter(Duration::from_millis(25))
+            );
+            assert_eq!(
+                commit_failure_action(false, Some(sqlstate), 2, 3),
+                CommitFailureAction::RetryAfter(Duration::from_millis(100))
+            );
+            assert_eq!(
+                commit_failure_action(false, Some(sqlstate), 3, 3),
+                CommitFailureAction::Exhausted
+            );
+        }
+    }
+
+    #[test]
     fn postgres_transience_is_a_closed_transport_and_sqlstate_set() {
         assert!(postgres_error_shape_is_transient(true, None));
         for sqlstate in ["08006", "40001", "40P01", "53000", "57P01", "57P03"] {
@@ -4186,6 +5090,14 @@ mod tests {
 
     #[test]
     fn client_level_errors_are_transient_only_when_the_contract_says_so() {
+        assert_eq!(
+            ContinuityError::AmbiguousCommit,
+            ContinuityError::AmbiguousCommit
+        );
+        assert_ne!(
+            ContinuityError::AmbiguousCommit,
+            ContinuityError::RetryExhausted
+        );
         assert!(ContinuityError::ConnectTimeout.is_transient());
         assert!(ContinuityError::Postgres { transient: true }.is_transient());
         assert!(!ContinuityError::Postgres { transient: false }.is_transient());
@@ -4193,6 +5105,8 @@ mod tests {
             !ContinuityError::InvalidConfiguration("test configuration failure").is_transient()
         );
         assert!(!ContinuityError::InvalidTlsMaterial("test TLS failure").is_transient());
+        assert!(!ContinuityError::RetryExhausted.is_transient());
+        assert!(!ContinuityError::AmbiguousCommit.is_transient());
         assert!(!ContinuityError::InvalidResponse("test response failure").is_transient());
     }
 
@@ -4202,5 +5116,14 @@ mod tests {
         assert_eq!(format!("{error}"), "continuity database operation failed");
         assert_eq!(format!("{error:?}"), "Postgres { transient: true }");
         assert!(std::error::Error::source(&error).is_none());
+
+        assert_eq!(
+            ContinuityError::RetryExhausted.to_string(),
+            "continuity mutation retry budget exhausted"
+        );
+        assert_eq!(
+            ContinuityError::AmbiguousCommit.to_string(),
+            "continuity mutation commit outcome is ambiguous"
+        );
     }
 }
