@@ -9,13 +9,18 @@ publish = false
 [dependencies]
 blake3 = { workspace = true }
 lore-base = { workspace = true }
+lore-proto = { workspace = true }
+lore-telemetry = { workspace = true }
+opentelemetry = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = "2"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 tokio-postgres-rustls = { version = "0.13", default-features = false }
+tokio-stream = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
+tonic = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 

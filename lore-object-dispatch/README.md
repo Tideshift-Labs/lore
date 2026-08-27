@@ -54,9 +54,24 @@ The exact private `lore.object_dispatch.v1.ObjectStoreDispatchService` contract 
 `lore-proto`. It has seven RPCs, including client-streaming upload and server-streaming result
 fetch, with checked-in generated client and server bindings exported from
 `lore_proto::lore::object_dispatch::v1`. A semantic declaration-token guard pins the package,
-service, RPC streaming shapes, messages, fields, presence, oneofs, and enums. This wire surface is
-still dark: no service implementation is composed into loreserver and no provider route or
-credential is available to it.
+service, RPC streaming shapes, messages, fields, presence, oneofs, and enums.
+
+The source-dark service shell implements all seven generated methods and immediately returns gRPC
+`UNAVAILABLE` before inspecting a request or polling an upload stream. `FetchResult` fails before it
+returns a stream. The shell has no continuity, admission, spool, allocation, or provider dependency,
+so it cannot create durable state or authorize traffic. Its rejection counter accepts only the
+seven frozen RPC names plus fixed `Unavailable` and `source_dark` labels; arbitrary HTTP paths,
+methods, user agents, tenants, boundaries, requests, buckets, and keys never become metric labels.
+
+The standalone binary requires exactly:
+
+- `LORE_OBJECT_DISPATCH_SERVICE_CONFIG_REVISION=object-store-dispatch-service-shell-v1`; and
+- `LORE_OBJECT_DISPATCH_LISTEN_ADDR=<nonzero loopback socket address>`.
+
+Every other `LORE_OBJECT_DISPATCH_*` key is rejected at this shell stage. There is no health or
+readiness endpoint, server TLS, provider route, credential, migration installer, or loreserver
+composition. The local image supplies `127.0.0.1:50051`, runs as an unprivileged user, exposes no
+port, and has no readiness `HEALTHCHECK`.
 
 ## Verification
 
@@ -65,15 +80,19 @@ cargo +nightly fmt --all -- --check
 cargo clippy -p lore-object-dispatch --all-targets -- -D warnings --no-deps
 cargo test -p lore-object-dispatch
 
+# Local source-dark image only; do not publish or deploy it
+docker build -f lore-object-dispatch/Dockerfile -t lore-object-dispatch:local .
+
 # Explicit, disposable, preprovisioned PostgreSQL target only
 cargo test -p lore-object-dispatch --test continuity_live -- --ignored --test-threads=1
 cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_allocates_dedicated_drained_epoch_one_to_two
 cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detail
 ```
 
-The unit suite validates configuration, TLS material, redaction, SQL procedure shapes, exact numeric
-transfer, closed result decoding, migration identity, and transient-error classification. The
-regular gate passes 56 library and 15 integration tests with zero failures and five intentionally
+The library suite validates service and continuity configuration, TLS material, redaction, SQL
+procedure shapes, exact numeric transfer, closed result decoding, migration identity, transient-
+error classification, and exact ambiguous-commit reconciliation. The regular gate passes 61 library,
+15 continuity integration, and 15 service-shell tests with zero failures and five intentionally
 ignored live contracts.
 Each live contract has passed against disposable PostgreSQL 16 over real mTLS and the exact embedded
 migration. Run the shared-fixture contracts serially or by exact test name; a parallel all-ignored

@@ -131,6 +131,14 @@ will update an older check constraint or state schema.
   then prove retirement, exact replay, authenticated summary readback, boundary denial, policy and
   namespace mismatch rejection, `pg_lsn` decoding, and removal of the old active interval. A
   wrong-policy retirement must roll back before commit, and changed proof evidence must reject replay.
+- **CR-033 source-dark object-dispatch service shell [SERVER]**: all seven generated RPC paths return
+  one fixed redacted `UNAVAILABLE` status before authority, admission, spool, or provider work. The
+  pre-bound transport test uses a permanently pending `UploadPut` request stream, so a bounded
+  response proves the handler does not await the first frame; `FetchResult` must fail before returning
+  a stream. Config has exactly two required shell keys; metrics accept only the closed seven-value
+  RPC enum and fixed `UNAVAILABLE`/`source_dark` labels, never request paths or user agents. The
+  Docker source contract stays loopback-only, digest-pinned, locked, nonroot, and without a readiness
+  probe. Gate: `cargo test -p lore-object-dispatch --test service_shell -j 4`.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

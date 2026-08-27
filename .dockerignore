@@ -1,2 +1,14 @@
 target/
 **/target/
+.git/
+**/.git/
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.crt
+**/*.csr
+**/*.key
+**/*.p12
+**/*.pem
+**/*.pfx

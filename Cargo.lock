@@ -2833,6 +2833,9 @@ version = "0.8.7-nightly"
 dependencies = [
  "blake3",
  "lore-base",
+ "lore-proto",
+ "lore-telemetry",
+ "opentelemetry",
  "rcgen",
  "rustls",
  "rustls-pemfile",
@@ -2840,7 +2843,9 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "tokio-stream",
  "tokio-util",
+ "tonic",
  "tracing",
  "uuid",
 ]
