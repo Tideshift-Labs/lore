@@ -14,6 +14,7 @@ members = [
     "lore-io",
     "lore-macro",
     "lore-notification",
+    "lore-object-dispatch",
     "lore-postgres",
     "lore-proto",
     "lore-revision",
@@ -39,6 +40,7 @@ lore-integration-tests = { path = "lore-integration-tests" }
 lore-io = { path = "lore-io" }
 lore-macro = { path = "lore-macro" }
 lore-notification = { path = "lore-notification" }
+lore-object-dispatch = { path = "lore-object-dispatch" }
 lore-proto = { path = "lore-proto" }
 lore-revision = { path = "lore-revision" }
 lore-server = { path = "lore-server" }

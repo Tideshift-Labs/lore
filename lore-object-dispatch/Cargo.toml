@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 Tideshift Labs
+# SPDX-License-Identifier: MIT
+[package]
+name = "lore-object-dispatch"
+edition = "2024"
+version.workspace = true
+publish = false
+
+[dependencies]
+lore-base = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = "2"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+tokio-postgres-rustls = { version = "0.13", default-features = false }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }

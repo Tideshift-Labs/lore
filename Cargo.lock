@@ -2828,6 +2828,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "lore-object-dispatch"
+version = "0.8.7-nightly"
+dependencies = [
+ "lore-base",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "lore-postgres"
 version = "0.8.7-nightly"
 dependencies = [
@@ -3684,6 +3701,7 @@ dependencies = [
  "bytes",
  "fallible-iterator",
  "postgres-protocol",
+ "uuid",
 ]
 
 [[package]]
