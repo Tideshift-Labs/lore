@@ -13,6 +13,7 @@ lore-base = { workspace = true }
 lore-proto = { workspace = true }
 lore-telemetry = { workspace = true }
 opentelemetry = { workspace = true }
+prost = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = "2"
 thiserror = { workspace = true }

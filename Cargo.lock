@@ -2837,6 +2837,7 @@ dependencies = [
  "lore-proto",
  "lore-telemetry",
  "opentelemetry",
+ "prost",
  "rcgen",
  "rustls",
  "rustls-pemfile",

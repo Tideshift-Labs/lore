@@ -19,6 +19,7 @@ pub mod schema;
 pub mod server;
 pub mod service;
 pub mod spool;
+pub mod terminal_result;
 pub mod upload;
 
 pub use auth::AuthenticatedCaller;
@@ -100,6 +101,10 @@ pub use spool::SpoolRecoveryInconsistency;
 pub use spool::VerifiedFileObservation;
 pub use spool::classify_spool_recovery;
 pub use spool::validate_spool_boundary_binding;
+pub use terminal_result::CanonicalTerminalResult;
+pub use terminal_result::TerminalResultError;
+pub use terminal_result::TerminalResultLimits;
+pub use terminal_result::validate_and_encode_terminal_result;
 pub use upload::CanonicalPutUploadStreamRejected;
 pub use upload::CanonicalUploadPutStreamIdentity;
 pub use upload::PutUploadStreamRejectReason;

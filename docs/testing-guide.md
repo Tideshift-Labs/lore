@@ -152,6 +152,11 @@ will update an older check constraint or state schema.
   (exactly six valid), persisted admission recomputation, cleanup equality, lowest upload mismatch
   field, rejection shapes, and redacted diagnostics. Gate: `cargo test -p lore-object-dispatch
   --test no_dispatch --test reserve_put --test upload -j 4`.
+  Terminal-result canonicalization is likewise pure and source-dark: encode only the selected
+  protobuf payload message, without its envelope oneof tag, terminal ID, digest, or size fields.
+  Pin independent bool/empty BLAKE3 vectors, the full nested version-list wire literal, optional
+  scalar presence, closed provider classes, detached sorted metadata, and redacted diagnostics with
+  `cargo test -p lore-object-dispatch --test terminal_result -j 4`.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.
