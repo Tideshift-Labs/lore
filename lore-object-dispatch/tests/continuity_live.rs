@@ -12,6 +12,10 @@
 //!   `object_dispatch_continuity_reconciler`.
 //! - `LORE_TEST_CONTINUITY_RECONCILER_CLIENT_CERT_PEM_PATH`: reconciler certificate-chain PEM.
 //! - `LORE_TEST_CONTINUITY_RECONCILER_CLIENT_KEY_PEM_PATH`: matching reconciler private-key PEM.
+//! - `LORE_TEST_CONTINUITY_SNAPSHOT_QUOTA_OWNERSHIP_BLAKE3_HEX`: lowercase hex digest
+//!   precomputed by disposable setup for policy/boundary from this environment, quota class
+//!   `LIVE_TEST`, quotas 1/1/1, cell `live-test-snapshot-cell`, and tenant
+//!   `live-test-snapshot-tenant`. Runtime and reconciler roles need no table grants.
 //! - `LORE_TEST_CONTINUITY_BOUNDARY_ID`: boundary mapped to the certificate login role.
 //! - `LORE_TEST_CONTINUITY_AUTHORITY_EPOCH`: active preprovisioned authority epoch.
 //! - `LORE_TEST_CONTINUITY_POLICY_REVISION`: installed policy revision for that epoch.
@@ -19,6 +23,7 @@
 //! Run only against a disposable database:
 //! `cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_begin_replay_get_and_no_local_effect_cleanup`
 //! `cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_adjudicates_quarantined_and_ambiguous_intents`
+//! `cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_records_snapshot_and_releases_bound_ownership`
 
 use std::fs;
 use std::time::Duration;
@@ -29,6 +34,7 @@ use lore_object_dispatch::continuity::BeginIntentRequest;
 use lore_object_dispatch::continuity::CompleteAdjudicationRequest;
 use lore_object_dispatch::continuity::ContinuityAdjudicationKind;
 use lore_object_dispatch::continuity::ContinuityClient;
+use lore_object_dispatch::continuity::ContinuityEpochState;
 use lore_object_dispatch::continuity::ContinuityIntentIdentity;
 use lore_object_dispatch::continuity::ContinuityIntentKind;
 use lore_object_dispatch::continuity::ContinuityOwnershipState;
@@ -37,12 +43,16 @@ use lore_object_dispatch::continuity::ContinuityResultCode;
 use lore_object_dispatch::continuity::ContinuityState;
 use lore_object_dispatch::continuity::ContinuityTlsConfig;
 use lore_object_dispatch::continuity::ContinuityTokenLookup;
+use lore_object_dispatch::continuity::CoveredReleaseState;
 use lore_object_dispatch::continuity::MarkAmbiguousDispatchRequest;
 use lore_object_dispatch::continuity::MarkBoundRequest;
 use lore_object_dispatch::continuity::MarkNoLocalEffectRequest;
 use lore_object_dispatch::continuity::PrepareAdjudicationRequest;
 use lore_object_dispatch::continuity::QuarantinePriorState;
 use lore_object_dispatch::continuity::QuarantineRequest;
+use lore_object_dispatch::continuity::ReconciliationState;
+use lore_object_dispatch::continuity::RecordSnapshotRequest;
+use lore_object_dispatch::continuity::ReleaseShadowOwnershipRequest;
 use uuid::Uuid;
 
 fn required_env(name: &'static str) -> String {
@@ -54,6 +64,28 @@ fn required_pem(name: &'static str) -> String {
     let path = required_env(name);
     fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read live-test PEM from {name}: {error}"))
+}
+
+fn required_blake3_hex(name: &'static str) -> [u8; 32] {
+    let value = required_env(name);
+    assert_eq!(
+        value.len(),
+        64,
+        "{name} must be exactly 64 lowercase hexadecimal characters"
+    );
+    assert!(
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{name} must be canonical lowercase hexadecimal text"
+    );
+    let mut digest = [0u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16)
+            .unwrap_or_else(|_| panic!("{name} must contain only hexadecimal octets"));
+    }
+    digest
 }
 
 fn assert_same_row(left: &ContinuityProcedureResult, right: &ContinuityProcedureResult) {
@@ -153,6 +185,14 @@ async fn assert_reconciler_readback(
     );
     assert_eq!(readback.result_code, ContinuityResultCode::Found);
     assert_same_row(expected, &readback);
+}
+
+fn require_reconciliation_state(state: Option<ReconciliationState>) -> ReconciliationState {
+    state.unwrap_or_else(|| panic!("expected reconciliation state for the active boundary epoch"))
+}
+
+fn require_epoch_state(state: Option<ContinuityEpochState>) -> ContinuityEpochState {
+    state.unwrap_or_else(|| panic!("expected the active boundary epoch to exist"))
 }
 
 #[ignore = "requires a disposable, preprovisioned continuity PostgreSQL database over mTLS"]
@@ -623,4 +663,249 @@ async fn live_mtls_reconciler_adjudicates_quarantined_and_ambiguous_intents() {
     );
     assert_same_row(&no_dispatch_completed, &no_dispatch_final_begin_replay);
     assert_reconciler_readback(&reconciler, &boundary_id, &no_dispatch_final_begin_replay).await;
+}
+
+#[ignore = "requires disposable continuity PostgreSQL, boundary/reconciler mTLS, and an admin-precomputed ownership digest"]
+#[tokio::test]
+async fn live_mtls_reconciler_records_snapshot_and_releases_bound_ownership() {
+    let authority_epoch = required_env("LORE_TEST_CONTINUITY_AUTHORITY_EPOCH")
+        .parse::<u64>()
+        .expect("LORE_TEST_CONTINUITY_AUTHORITY_EPOCH must be canonical uint64 text");
+    assert!(authority_epoch > 0, "authority epoch must be positive");
+    let boundary_id = required_env("LORE_TEST_CONTINUITY_BOUNDARY_ID");
+    let policy_revision = required_env("LORE_TEST_CONTINUITY_POLICY_REVISION");
+    let local_quota_ownership_blake3 =
+        required_blake3_hex("LORE_TEST_CONTINUITY_SNAPSHOT_QUOTA_OWNERSHIP_BLAKE3_HEX");
+    let boundary = ContinuityClient::connect(&tls_config(
+        "LORE_TEST_CONTINUITY_PG_URL",
+        "LORE_TEST_CONTINUITY_CLIENT_CERT_PEM_PATH",
+        "LORE_TEST_CONTINUITY_CLIENT_KEY_PEM_PATH",
+    ))
+    .await
+    .expect("boundary continuity mTLS connection must succeed");
+    let reconciler = ContinuityClient::connect(&tls_config(
+        "LORE_TEST_CONTINUITY_RECONCILER_PG_URL",
+        "LORE_TEST_CONTINUITY_RECONCILER_CLIENT_CERT_PEM_PATH",
+        "LORE_TEST_CONTINUITY_RECONCILER_CLIENT_KEY_PEM_PATH",
+    ))
+    .await
+    .expect("exact reconciler continuity mTLS connection must succeed");
+
+    let mut begin_request =
+        live_begin_request(&boundary_id, authority_epoch, &policy_revision, "snapshot");
+    begin_request.authenticated_cell_id = "live-test-snapshot-cell".to_string();
+    begin_request.authenticated_tenant_id = "live-test-snapshot-tenant".to_string();
+    let intent = boundary
+        .begin(&begin_request)
+        .await
+        .expect("boundary role must seed the snapshot INTENT");
+    assert_eq!(intent.result_code, ContinuityResultCode::Created);
+    assert_eq!(intent.state, ContinuityState::Intent);
+    assert_eq!(
+        intent.ownership_state,
+        ContinuityOwnershipState::ShadowReserved
+    );
+
+    let local_binding_blake3 = [0x91; 32];
+    let mark_bound = MarkBoundRequest {
+        identity: intent_identity(&begin_request, &intent),
+        expected_prior_row_blake3: intent.row_blake3,
+        local_binding_blake3,
+    };
+    let bound = boundary
+        .mark_bound(&mark_bound)
+        .await
+        .expect("boundary role must seed the snapshot BOUND state");
+    assert_eq!(bound.result_code, ContinuityResultCode::Updated);
+    assert_eq!(bound.state, ContinuityState::Bound);
+    assert_eq!(
+        bound.ownership_state,
+        ContinuityOwnershipState::ShadowReserved
+    );
+    assert_reconciler_readback(&reconciler, &boundary_id, &bound).await;
+
+    let epoch_before = require_epoch_state(
+        reconciler
+            .read_epoch(&boundary_id)
+            .await
+            .expect("reconciler epoch read must succeed"),
+    );
+    assert_eq!(epoch_before.authority_epoch, authority_epoch);
+    assert!(
+        epoch_before.continuity_seq_high_water >= bound.continuity_seq,
+        "epoch high-water must cover the BOUND token"
+    );
+    let reconciliation_before = require_reconciliation_state(
+        reconciler
+            .read_reconciliation_state(&boundary_id, authority_epoch)
+            .await
+            .expect("reconciler state read before snapshot must succeed"),
+    );
+    assert_eq!(
+        reconciliation_before.current_authority_epoch,
+        authority_epoch
+    );
+    assert_eq!(
+        reconciliation_before.continuity_seq_high_water,
+        epoch_before.continuity_seq_high_water
+    );
+    assert!(reconciliation_before.owned_rows >= 1);
+    assert!(reconciliation_before.owned_bytes >= 1);
+    assert!(reconciliation_before.owned_concurrency >= 1);
+
+    let snapshot_request = RecordSnapshotRequest {
+        snapshot_id: Uuid::now_v7(),
+        provider_boundary_id: boundary_id.clone(),
+        authority_epoch,
+        through_continuity_seq: epoch_before.continuity_seq_high_water,
+        // PostgreSQL's active WAL position is necessarily above 0/1 after cluster bootstrap.
+        // A nonzero value discriminates the u64-to-pg_lsn encoding seam without coupling the
+        // contract probe to an additional privileged WAL-read API.
+        authority_lsn: 1,
+        manifest_blake3: [0x92; 32],
+        continuity_seq: bound.continuity_seq,
+        continuity_token_id: bound.continuity_token_id,
+        local_binding_blake3,
+        local_state_blake3: [0x93; 32],
+        local_quota_ownership_blake3,
+        local_counter_revision: 1,
+    };
+    let snapshot = reconciler
+        .record_snapshot(&snapshot_request)
+        .await
+        .expect("reconciler must record exact BOUND snapshot coverage");
+    assert_eq!(snapshot.accepted_snapshot_id, snapshot_request.snapshot_id);
+    assert_eq!(
+        snapshot.accepted_through_continuity_seq,
+        snapshot_request.through_continuity_seq
+    );
+    assert_eq!(
+        snapshot.accepted_manifest_blake3,
+        snapshot_request.manifest_blake3
+    );
+    assert_ne!(snapshot.accepted_coverage_blake3, [0; 32]);
+    assert!(snapshot.recorded_at_unix_ms >= 0);
+    let snapshot_replay = reconciler
+        .record_snapshot(&snapshot_request)
+        .await
+        .expect("exact snapshot replay must succeed");
+    assert_eq!(snapshot_replay, snapshot);
+
+    let reconciliation_with_snapshot = require_reconciliation_state(
+        reconciler
+            .read_reconciliation_state(&boundary_id, authority_epoch)
+            .await
+            .expect("reconciler state read after snapshot must succeed"),
+    );
+    assert_eq!(
+        reconciliation_with_snapshot.current_authority_epoch,
+        authority_epoch
+    );
+    assert_eq!(
+        reconciliation_with_snapshot.continuity_seq_high_water,
+        reconciliation_before.continuity_seq_high_water
+    );
+    assert_eq!(
+        reconciliation_with_snapshot.owned_rows,
+        reconciliation_before.owned_rows
+    );
+    assert_eq!(
+        reconciliation_with_snapshot.owned_bytes,
+        reconciliation_before.owned_bytes
+    );
+    assert_eq!(
+        reconciliation_with_snapshot.owned_concurrency,
+        reconciliation_before.owned_concurrency
+    );
+    let latest_snapshot = reconciliation_with_snapshot
+        .latest_snapshot
+        .as_ref()
+        .expect("the recorded snapshot must become the latest snapshot");
+    assert_eq!(latest_snapshot.snapshot_id, snapshot.accepted_snapshot_id);
+    assert_eq!(
+        latest_snapshot.through_continuity_seq,
+        snapshot.accepted_through_continuity_seq
+    );
+    assert_eq!(
+        latest_snapshot.manifest_blake3,
+        snapshot.accepted_manifest_blake3
+    );
+
+    let release_request = ReleaseShadowOwnershipRequest {
+        identity: intent_identity(&begin_request, &intent),
+        expected_prior_row_blake3: bound.row_blake3,
+        expected_state: CoveredReleaseState::Bound,
+        snapshot_id: snapshot.accepted_snapshot_id,
+        expected_manifest_blake3: snapshot.accepted_manifest_blake3,
+        expected_coverage_blake3: snapshot.accepted_coverage_blake3,
+        release_id: Uuid::now_v7(),
+    };
+    let released = reconciler
+        .release_shadow_ownership(&release_request)
+        .await
+        .expect("covered BOUND snapshot must release shadow ownership");
+    assert_eq!(released.result_code, ContinuityResultCode::Updated);
+    assert_eq!(released.state, ContinuityState::Bound);
+    assert_eq!(
+        released.ownership_state,
+        ContinuityOwnershipState::OwnershipReleased
+    );
+    let release_replay = reconciler
+        .release_shadow_ownership(&release_request)
+        .await
+        .expect("exact covered BOUND release replay must succeed");
+    assert_eq!(release_replay.result_code, ContinuityResultCode::Replay);
+    assert_same_row(&released, &release_replay);
+    assert_reconciler_readback(&reconciler, &boundary_id, &released).await;
+
+    let begin_replay = boundary
+        .begin(&begin_request)
+        .await
+        .expect("original begin must replay the released BOUND row");
+    assert_eq!(begin_replay.result_code, ContinuityResultCode::Replay);
+    assert_same_row(&released, &begin_replay);
+    assert_reconciler_readback(&reconciler, &boundary_id, &begin_replay).await;
+
+    let reconciliation_after = require_reconciliation_state(
+        reconciler
+            .read_reconciliation_state(&boundary_id, authority_epoch)
+            .await
+            .expect("reconciler state read after release must succeed"),
+    );
+    assert_eq!(
+        reconciliation_after.continuity_seq_high_water,
+        reconciliation_before.continuity_seq_high_water
+    );
+    assert_eq!(
+        reconciliation_after.owned_rows,
+        reconciliation_before
+            .owned_rows
+            .checked_sub(1)
+            .expect("seeded ownership must make the row counter positive")
+    );
+    assert_eq!(
+        reconciliation_after.owned_bytes,
+        reconciliation_before
+            .owned_bytes
+            .checked_sub(1)
+            .expect("seeded ownership must make the byte counter positive")
+    );
+    assert_eq!(
+        reconciliation_after.owned_concurrency,
+        reconciliation_before
+            .owned_concurrency
+            .checked_sub(1)
+            .expect("seeded ownership must make the concurrency counter positive")
+    );
+    assert_eq!(
+        reconciliation_after.latest_snapshot,
+        reconciliation_with_snapshot.latest_snapshot
+    );
+    let epoch_after = require_epoch_state(
+        reconciler
+            .read_epoch(&boundary_id)
+            .await
+            .expect("reconciler epoch read after release must succeed"),
+    );
+    assert_eq!(epoch_after, epoch_before);
 }

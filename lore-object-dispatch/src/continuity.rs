@@ -20,6 +20,7 @@ use tokio_postgres::IsolationLevel;
 use tokio_postgres::Row;
 use tokio_postgres::config::Host;
 use tokio_postgres::config::SslMode;
+use tokio_postgres::types::PgLsn;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
@@ -85,6 +86,32 @@ const COMPLETE_ADJUDICATION_SQL: &str = "SELECT result_code, state, ownership_st
       $4::text::object_store_continuity.uint64, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
       $16, $17, $18, $19\
     )";
+const RECORD_SNAPSHOT_SQL: &str = "SELECT accepted_snapshot_id, \
+    accepted_through_continuity_seq::text, accepted_manifest_blake3, \
+    accepted_coverage_blake3, recorded_at_unix_ms FROM \
+    object_store_continuity.object_store_continuity_record_snapshot_v1(\
+      $1, $2, $3, $4::text::object_store_continuity.uint64, \
+      $5::text::object_store_continuity.uint64, $6, $7, \
+      $8::text::object_store_continuity.uint64, $9, $10, $11, $12, \
+      $13::text::object_store_continuity.uint64\
+    )";
+const RELEASE_SHADOW_OWNERSHIP_SQL: &str = "SELECT result_code, state, ownership_state, \
+    authority_epoch::text, continuity_seq::text, continuity_token_id, row_blake3, \
+    external_committed_at_unix_ms FROM \
+    object_store_continuity.object_store_continuity_release_shadow_ownership_v1(\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+      $15, $16, $17\
+    )";
+const READ_RECONCILIATION_STATE_SQL: &str = "SELECT current_authority_epoch::text, \
+    continuity_seq_high_water::text, owned_rows::text, owned_bytes::text, \
+    owned_concurrency::text, latest_snapshot_id, latest_snapshot_through_continuity_seq::text, \
+    latest_snapshot_manifest_blake3 FROM \
+    object_store_continuity.object_store_continuity_read_reconciliation_state_v1(\
+      $1, $2, $3::text::object_store_continuity.uint64\
+    )";
+const READ_EPOCH_SQL: &str = "SELECT authority_epoch::text, continuity_seq_high_water::text FROM \
+    object_store_continuity.object_store_continuity_read_epoch_v1($1, $2)";
 
 /// Connection material for one continuity boundary identity.
 ///
@@ -379,6 +406,87 @@ pub struct CompleteAdjudicationRequest {
     pub release_id: Uuid,
     pub release_basis_id: String,
     pub release_basis_blake3: [u8; 32],
+}
+
+/// Exact local durability evidence accepted into one monotonic continuity snapshot.
+pub struct RecordSnapshotRequest {
+    pub snapshot_id: Uuid,
+    pub provider_boundary_id: String,
+    pub authority_epoch: u64,
+    pub through_continuity_seq: u64,
+    pub authority_lsn: u64,
+    pub manifest_blake3: [u8; 32],
+    pub continuity_seq: u64,
+    pub continuity_token_id: Uuid,
+    pub local_binding_blake3: [u8; 32],
+    pub local_state_blake3: [u8; 32],
+    pub local_quota_ownership_blake3: [u8; 32],
+    pub local_counter_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordSnapshotResult {
+    pub accepted_snapshot_id: Uuid,
+    pub accepted_through_continuity_seq: u64,
+    pub accepted_manifest_blake3: [u8; 32],
+    pub accepted_coverage_blake3: [u8; 32],
+    pub recorded_at_unix_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoveredReleaseState {
+    Bound,
+    Completed,
+}
+
+impl CoveredReleaseState {
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::Bound => "BOUND",
+            Self::Completed => "COMPLETED",
+        }
+    }
+
+    fn as_state(self) -> ContinuityState {
+        match self {
+            Self::Bound => ContinuityState::Bound,
+            Self::Completed => ContinuityState::Completed,
+        }
+    }
+}
+
+/// Release request bound to an exact accepted snapshot coverage receipt.
+pub struct ReleaseShadowOwnershipRequest {
+    pub identity: ContinuityIntentIdentity,
+    pub expected_prior_row_blake3: [u8; 32],
+    pub expected_state: CoveredReleaseState,
+    pub snapshot_id: Uuid,
+    pub expected_manifest_blake3: [u8; 32],
+    pub expected_coverage_blake3: [u8; 32],
+    pub release_id: Uuid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconciliationSnapshot {
+    pub snapshot_id: Uuid,
+    pub through_continuity_seq: u64,
+    pub manifest_blake3: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconciliationState {
+    pub current_authority_epoch: u64,
+    pub continuity_seq_high_water: u64,
+    pub owned_rows: u64,
+    pub owned_bytes: u64,
+    pub owned_concurrency: u64,
+    pub latest_snapshot: Option<ReconciliationSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContinuityEpochState {
+    pub authority_epoch: u64,
+    pub continuity_seq_high_water: u64,
 }
 
 /// Server-derived result projection shared by continuity mutation and read procedures.
@@ -966,6 +1074,174 @@ impl ContinuityClient {
             .map_err(ContinuityError::postgres)?;
         Ok(result)
     }
+
+    /// Record exact local durability coverage without installing or deriving local evidence.
+    pub async fn record_snapshot(
+        &self,
+        request: &RecordSnapshotRequest,
+    ) -> Result<RecordSnapshotResult, ContinuityError> {
+        if request.provider_boundary_id.is_empty()
+            || request.authority_epoch == 0
+            || request.continuity_seq == 0
+            || request.through_continuity_seq < request.continuity_seq
+        {
+            return Err(ContinuityError::InvalidConfiguration(
+                "snapshot identity and coverage must be valid",
+            ));
+        }
+        let epoch = request.authority_epoch.to_string();
+        let through_sequence = request.through_continuity_seq.to_string();
+        let sequence = request.continuity_seq.to_string();
+        let counter_revision = request.local_counter_revision.to_string();
+        let authority_lsn = PgLsn::from(request.authority_lsn);
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .build_transaction()
+            .isolation_level(MUTATION_ISOLATION_LEVEL)
+            .start()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let row = transaction
+            .query_one(
+                RECORD_SNAPSHOT_SQL,
+                &[
+                    &API_REVISION,
+                    &request.snapshot_id,
+                    &request.provider_boundary_id,
+                    &epoch,
+                    &through_sequence,
+                    &authority_lsn,
+                    &&request.manifest_blake3[..],
+                    &sequence,
+                    &request.continuity_token_id,
+                    &&request.local_binding_blake3[..],
+                    &&request.local_state_blake3[..],
+                    &&request.local_quota_ownership_blake3[..],
+                    &counter_revision,
+                ],
+            )
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let result = parse_snapshot_result(&row)?;
+        if result.accepted_snapshot_id != request.snapshot_id
+            || result.accepted_through_continuity_seq != request.through_continuity_seq
+            || result.accepted_manifest_blake3 != request.manifest_blake3
+        {
+            return Err(ContinuityError::InvalidResponse(
+                "snapshot result identity is inconsistent",
+            ));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        Ok(result)
+    }
+
+    /// Release BOUND or COMPLETED ownership only from exact accepted snapshot coverage.
+    pub async fn release_shadow_ownership(
+        &self,
+        request: &ReleaseShadowOwnershipRequest,
+    ) -> Result<ContinuityProcedureResult, ContinuityError> {
+        validate_identity(&request.identity)?;
+        let epoch = request.identity.authority_epoch.to_string();
+        let sequence = request.identity.continuity_seq.to_string();
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .build_transaction()
+            .isolation_level(MUTATION_ISOLATION_LEVEL)
+            .start()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let row = transaction
+            .query_one(
+                RELEASE_SHADOW_OWNERSHIP_SQL,
+                &[
+                    &API_REVISION,
+                    &request.identity.provider_boundary_id,
+                    &epoch,
+                    &sequence,
+                    &request.identity.continuity_token_id,
+                    &request.identity.authenticated_cell_id,
+                    &request.identity.authenticated_tenant_id,
+                    &request.identity.logical_request_id,
+                    &request.identity.attempt_id,
+                    &request.identity.intent_kind.as_sql(),
+                    &&request.identity.selected_fingerprint[..],
+                    &&request.expected_prior_row_blake3[..],
+                    &request.expected_state.as_sql(),
+                    &request.snapshot_id,
+                    &&request.expected_manifest_blake3[..],
+                    &&request.expected_coverage_blake3[..],
+                    &request.release_id,
+                ],
+            )
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let result = parse_procedure_result(&row)?;
+        validate_transition_result(
+            &result,
+            &request.identity,
+            request.expected_state.as_state(),
+            ContinuityOwnershipState::OwnershipReleased,
+        )?;
+        transaction
+            .commit()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        Ok(result)
+    }
+
+    /// Read one boundary's exact current reconciliation counters and latest snapshot.
+    pub async fn read_reconciliation_state(
+        &self,
+        provider_boundary_id: &str,
+        authority_epoch: u64,
+    ) -> Result<Option<ReconciliationState>, ContinuityError> {
+        if provider_boundary_id.is_empty() || authority_epoch == 0 {
+            return Err(ContinuityError::InvalidConfiguration(
+                "reconciliation identity must be valid",
+            ));
+        }
+        let epoch = authority_epoch.to_string();
+        let client = self.client.lock().await;
+        let row = client
+            .query_opt(
+                READ_RECONCILIATION_STATE_SQL,
+                &[&API_REVISION, &provider_boundary_id, &epoch],
+            )
+            .await
+            .map_err(ContinuityError::postgres)?;
+        row.map(|row| {
+            let state = parse_reconciliation_state(&row)?;
+            if state.current_authority_epoch != authority_epoch {
+                return Err(ContinuityError::InvalidResponse(
+                    "reconciliation epoch is inconsistent",
+                ));
+            }
+            Ok(state)
+        })
+        .transpose()
+    }
+
+    /// Read the current epoch and its gapless continuity sequence high-water.
+    pub async fn read_epoch(
+        &self,
+        provider_boundary_id: &str,
+    ) -> Result<Option<ContinuityEpochState>, ContinuityError> {
+        if provider_boundary_id.is_empty() {
+            return Err(ContinuityError::InvalidConfiguration(
+                "provider boundary ID must be nonempty",
+            ));
+        }
+        let client = self.client.lock().await;
+        client
+            .query_opt(READ_EPOCH_SQL, &[&API_REVISION, &provider_boundary_id])
+            .await
+            .map_err(ContinuityError::postgres)?
+            .map(|row| parse_epoch_state(&row))
+            .transpose()
+    }
 }
 
 fn validate_begin_result(
@@ -1098,6 +1374,92 @@ fn validate_identity(identity: &ContinuityIntentIdentity) -> Result<(), Continui
         ));
     }
     Ok(())
+}
+
+fn parse_snapshot_result(row: &Row) -> Result<RecordSnapshotResult, ContinuityError> {
+    let recorded_at_unix_ms = row
+        .try_get::<_, i64>(4)
+        .map_err(|_| ContinuityError::InvalidResponse("snapshot time is not bigint"))?;
+    if recorded_at_unix_ms < 0 {
+        return Err(ContinuityError::InvalidResponse(
+            "snapshot time must be nonnegative",
+        ));
+    }
+    Ok(RecordSnapshotResult {
+        accepted_snapshot_id: row
+            .try_get(0)
+            .map_err(|_| ContinuityError::InvalidResponse("snapshot ID is not UUID"))?,
+        accepted_through_continuity_seq: parse_u64_text(row, 1)?,
+        accepted_manifest_blake3: parse_digest(
+            row.try_get(2)
+                .map_err(|_| ContinuityError::InvalidResponse("manifest digest is not bytea"))?,
+        )?,
+        accepted_coverage_blake3: parse_digest(
+            row.try_get(3)
+                .map_err(|_| ContinuityError::InvalidResponse("coverage digest is not bytea"))?,
+        )?,
+        recorded_at_unix_ms,
+    })
+}
+
+fn parse_reconciliation_state(row: &Row) -> Result<ReconciliationState, ContinuityError> {
+    let current_authority_epoch = parse_u64_text(row, 0)?;
+    if current_authority_epoch == 0 {
+        return Err(ContinuityError::InvalidResponse(
+            "authority epoch must be positive",
+        ));
+    }
+    let snapshot_id = row
+        .try_get::<_, Option<Uuid>>(5)
+        .map_err(|_| ContinuityError::InvalidResponse("latest snapshot ID is not nullable UUID"))?;
+    let snapshot_sequence = row.try_get::<_, Option<String>>(6).map_err(|_| {
+        ContinuityError::InvalidResponse("latest snapshot sequence is not nullable text")
+    })?;
+    let snapshot_digest = row.try_get::<_, Option<Vec<u8>>>(7).map_err(|_| {
+        ContinuityError::InvalidResponse("latest snapshot digest is not nullable bytea")
+    })?;
+    let latest_snapshot = match (snapshot_id, snapshot_sequence, snapshot_digest) {
+        (None, None, None) => None,
+        (Some(snapshot_id), Some(sequence), Some(digest)) => {
+            let through_continuity_seq = parse_u64_text_value(&sequence)?;
+            if through_continuity_seq == 0 {
+                return Err(ContinuityError::InvalidResponse(
+                    "latest snapshot sequence must be positive",
+                ));
+            }
+            Some(ReconciliationSnapshot {
+                snapshot_id,
+                through_continuity_seq,
+                manifest_blake3: parse_digest(digest)?,
+            })
+        }
+        _ => {
+            return Err(ContinuityError::InvalidResponse(
+                "latest snapshot evidence is partially null",
+            ));
+        }
+    };
+    Ok(ReconciliationState {
+        current_authority_epoch,
+        continuity_seq_high_water: parse_u64_text(row, 1)?,
+        owned_rows: parse_u64_text(row, 2)?,
+        owned_bytes: parse_u64_text(row, 3)?,
+        owned_concurrency: parse_u64_text(row, 4)?,
+        latest_snapshot,
+    })
+}
+
+fn parse_epoch_state(row: &Row) -> Result<ContinuityEpochState, ContinuityError> {
+    let authority_epoch = parse_u64_text(row, 0)?;
+    if authority_epoch == 0 {
+        return Err(ContinuityError::InvalidResponse(
+            "authority epoch must be positive",
+        ));
+    }
+    Ok(ContinuityEpochState {
+        authority_epoch,
+        continuity_seq_high_water: parse_u64_text(row, 1)?,
+    })
 }
 
 fn parse_procedure_result(row: &Row) -> Result<ContinuityProcedureResult, ContinuityError> {
@@ -1420,6 +1782,25 @@ mod tests {
              expected_prior_row_blake3 bytea, local_binding_blake3 bytea, \
              terminal_evidence_blake3 bytea, adjudication_kind text, final_state text, \
              release_id uuid, release_basis_id text, release_basis_blake3 bytea )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_record_snapshot_v1( \
+             api_revision text, snapshot_id uuid, provider_boundary_id text, authority_epoch \
+             object_store_continuity.uint64, through_continuity_seq object_store_continuity.uint64, \
+             authority_lsn pg_lsn, manifest_blake3 bytea, continuity_seq \
+             object_store_continuity.uint64, continuity_token_id uuid, local_binding_blake3 bytea, \
+             local_state_blake3 bytea, local_quota_ownership_blake3 bytea, \
+             local_counter_revision object_store_continuity.uint64 )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_release_shadow_ownership_v1( \
+             api_revision text, provider_boundary_id text, authority_epoch \
+             object_store_continuity.uint64, continuity_seq object_store_continuity.uint64, \
+             continuity_token_id uuid, authenticated_cell_id text, authenticated_tenant_id text, \
+             logical_request_id uuid, attempt_id uuid, intent_kind text, selected_fingerprint bytea, \
+             expected_prior_row_blake3 bytea, expected_state text, snapshot_id uuid, \
+             expected_manifest_blake3 bytea, expected_coverage_blake3 bytea, release_id uuid )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_read_reconciliation_state_v1( \
+             api_revision text, provider_boundary_id text, authority_epoch \
+             object_store_continuity.uint64 )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_read_epoch_v1( \
+             api_revision text, provider_boundary_id text )",
         ] {
             assert!(
                 migration.contains(signature),
@@ -1542,6 +1923,57 @@ mod tests {
             assert!(!query.contains("::bigint"), "query: {query}");
             assert_eq!(query.matches("SELECT").count(), 1, "query: {query}");
         }
+    }
+
+    #[test]
+    fn snapshot_release_and_read_queries_pin_arity_and_uint64_transfer() {
+        for (query, procedure, parameter_count, uint64_casts) in [
+            (
+                RECORD_SNAPSHOT_SQL,
+                "object_store_continuity_record_snapshot_v1",
+                13,
+                4,
+            ),
+            (
+                RELEASE_SHADOW_OWNERSHIP_SQL,
+                "object_store_continuity_release_shadow_ownership_v1",
+                17,
+                2,
+            ),
+            (
+                READ_RECONCILIATION_STATE_SQL,
+                "object_store_continuity_read_reconciliation_state_v1",
+                3,
+                1,
+            ),
+            (
+                READ_EPOCH_SQL,
+                "object_store_continuity_read_epoch_v1",
+                2,
+                0,
+            ),
+        ] {
+            assert!(
+                query.contains(&format!("object_store_continuity.{procedure}(")),
+                "query did not call {procedure}: {query}"
+            );
+            assert_eq!(
+                query
+                    .matches("::text::object_store_continuity.uint64")
+                    .count(),
+                uint64_casts,
+                "query: {query}"
+            );
+            assert!(
+                query.contains(&format!("${parameter_count}")),
+                "query: {query}"
+            );
+            assert!(!query.contains(&format!("${}", parameter_count + 1)));
+            assert!(!query.contains("::bigint"), "query: {query}");
+            assert_eq!(query.matches("SELECT").count(), 1, "query: {query}");
+        }
+        assert_eq!(CoveredReleaseState::Bound.as_sql(), "BOUND");
+        assert_eq!(CoveredReleaseState::Completed.as_sql(), "COMPLETED");
     }
 
     #[test]
