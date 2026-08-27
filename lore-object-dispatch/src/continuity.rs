@@ -26,6 +26,8 @@ use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 
 const API_REVISION: &str = "object-store-authority-continuity-v1";
+const SCHEMA_REVISION: &str = "object-store-authority-continuity-schema-v1";
+const CONTINUITY_CONTRACT_REVISION: &str = "object-store-authority-continuity-contract-v1";
 const MUTATION_ISOLATION_LEVEL: IsolationLevel = IsolationLevel::Serializable;
 const MAX_ARCHIVE_PROOF_BYTES: usize = 1_048_576;
 const BEGIN_SQL: &str = "SELECT result_code, state, ownership_state, authority_epoch::text, \
@@ -131,6 +133,22 @@ const ARCHIVE_PRUNE_SQL: &str = "SELECT accepted_start_sequence::text, \
     object_store_continuity.object_store_continuity_archive_prune_v1(\
       $1, $2, $3::text::object_store_continuity.uint64, \
       $4::text::object_store_continuity.uint64, $5, $6, $7, $8, $9\
+    )";
+const READ_PRUNED_INTERVAL_SQL: &str = "SELECT provider_boundary_id, authority_epoch::text, \
+    start_sequence::text, end_sequence::text, row_count::text, api_revision, schema_revision, \
+    continuity_contract_revision, continuity_policy_revision, completed_count::text, \
+    no_local_effect_count::text, adjudicated_no_local_effect_count::text, \
+    adjudicated_no_dispatch_count::text, canonical_row_bytes_sum::text, \
+    canonical_row_bytes_min::text, canonical_row_bytes_max::text, quota_rows_sum::text, \
+    quota_rows_min::text, quota_rows_max::text, quota_bytes_sum::text, quota_bytes_min::text, \
+    quota_bytes_max::text, quota_concurrency_sum::text, quota_concurrency_min::text, \
+    quota_concurrency_max::text, created_at_min_unix_ms, created_at_max_unix_ms, \
+    closed_at_min_unix_ms, closed_at_max_unix_ms, prune_commit_sequence_min::text, \
+    prune_commit_sequence_max::text, pruned_at_min_unix_ms, pruned_at_max_unix_ms, \
+    canonical_interval_bytes, interval_blake3 FROM \
+    object_store_continuity.object_store_continuity_read_pruned_interval_v2(\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5, $6, $7, $8\
     )";
 
 /// Connection material for one continuity boundary identity.
@@ -555,6 +573,54 @@ pub struct ArchivePruneResult {
     pub accepted_row_count: u64,
     pub prune_commit_sequence: u64,
     pub accepted_interval_blake3: [u8; 32],
+}
+
+/// Authenticated namespace and sequence used to adopt one containing pruned interval.
+pub struct ReadPrunedIntervalRequest {
+    pub provider_boundary_id: String,
+    pub authority_epoch: u64,
+    pub continuity_seq: u64,
+    pub expected_continuity_policy_revision: String,
+    pub expected_epoch_namespace_blake3: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrunedInterval {
+    pub provider_boundary_id: String,
+    pub authority_epoch: u64,
+    pub start_sequence: u64,
+    pub end_sequence: u64,
+    pub row_count: u64,
+    pub api_revision: String,
+    pub schema_revision: String,
+    pub continuity_contract_revision: String,
+    pub continuity_policy_revision: String,
+    pub completed_count: u64,
+    pub no_local_effect_count: u64,
+    pub adjudicated_no_local_effect_count: u64,
+    pub adjudicated_no_dispatch_count: u64,
+    pub canonical_row_bytes_sum: u64,
+    pub canonical_row_bytes_min: u64,
+    pub canonical_row_bytes_max: u64,
+    pub quota_rows_sum: u64,
+    pub quota_rows_min: u64,
+    pub quota_rows_max: u64,
+    pub quota_bytes_sum: u64,
+    pub quota_bytes_min: u64,
+    pub quota_bytes_max: u64,
+    pub quota_concurrency_sum: u64,
+    pub quota_concurrency_min: u64,
+    pub quota_concurrency_max: u64,
+    pub created_at_min_unix_ms: i64,
+    pub created_at_max_unix_ms: i64,
+    pub closed_at_min_unix_ms: i64,
+    pub closed_at_max_unix_ms: i64,
+    pub prune_commit_sequence_min: u64,
+    pub prune_commit_sequence_max: u64,
+    pub pruned_at_min_unix_ms: i64,
+    pub pruned_at_max_unix_ms: i64,
+    pub canonical_interval_bytes: Vec<u8>,
+    pub interval_blake3: [u8; 32],
 }
 
 /// Server-derived result projection shared by continuity mutation and read procedures.
@@ -1444,6 +1510,36 @@ impl ContinuityClient {
             .map_err(ContinuityError::postgres)?;
         Ok(result)
     }
+
+    /// Read and validate the authenticated pruned interval containing one exact sequence.
+    pub async fn read_pruned_interval(
+        &self,
+        request: &ReadPrunedIntervalRequest,
+    ) -> Result<PrunedInterval, ContinuityError> {
+        validate_read_pruned_interval_request(request)?;
+        let epoch = request.authority_epoch.to_string();
+        let sequence = request.continuity_seq.to_string();
+        let client = self.client.lock().await;
+        let row = client
+            .query_one(
+                READ_PRUNED_INTERVAL_SQL,
+                &[
+                    &API_REVISION,
+                    &request.provider_boundary_id,
+                    &epoch,
+                    &sequence,
+                    &SCHEMA_REVISION,
+                    &CONTINUITY_CONTRACT_REVISION,
+                    &request.expected_continuity_policy_revision,
+                    &&request.expected_epoch_namespace_blake3[..],
+                ],
+            )
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let interval = parse_pruned_interval(&row)?;
+        validate_pruned_interval(&interval, request)?;
+        Ok(interval)
+    }
 }
 
 fn validate_begin_result(
@@ -1708,6 +1804,62 @@ fn parse_archive_prune_result(row: &Row) -> Result<ArchivePruneResult, Continuit
     Ok(result)
 }
 
+fn parse_pruned_interval(row: &Row) -> Result<PrunedInterval, ContinuityError> {
+    let interval = PrunedInterval {
+        provider_boundary_id: required_text(row, 0, "pruned interval boundary is invalid")?,
+        authority_epoch: parse_u64_text(row, 1)?,
+        start_sequence: parse_u64_text(row, 2)?,
+        end_sequence: parse_u64_text(row, 3)?,
+        row_count: parse_u64_text(row, 4)?,
+        api_revision: required_text(row, 5, "pruned interval API revision is invalid")?,
+        schema_revision: required_text(row, 6, "pruned interval schema revision is invalid")?,
+        continuity_contract_revision: required_text(
+            row,
+            7,
+            "pruned interval contract revision is invalid",
+        )?,
+        continuity_policy_revision: required_text(
+            row,
+            8,
+            "pruned interval policy revision is invalid",
+        )?,
+        completed_count: parse_u64_text(row, 9)?,
+        no_local_effect_count: parse_u64_text(row, 10)?,
+        adjudicated_no_local_effect_count: parse_u64_text(row, 11)?,
+        adjudicated_no_dispatch_count: parse_u64_text(row, 12)?,
+        canonical_row_bytes_sum: parse_u64_text(row, 13)?,
+        canonical_row_bytes_min: parse_u64_text(row, 14)?,
+        canonical_row_bytes_max: parse_u64_text(row, 15)?,
+        quota_rows_sum: parse_u64_text(row, 16)?,
+        quota_rows_min: parse_u64_text(row, 17)?,
+        quota_rows_max: parse_u64_text(row, 18)?,
+        quota_bytes_sum: parse_u64_text(row, 19)?,
+        quota_bytes_min: parse_u64_text(row, 20)?,
+        quota_bytes_max: parse_u64_text(row, 21)?,
+        quota_concurrency_sum: parse_u64_text(row, 22)?,
+        quota_concurrency_min: parse_u64_text(row, 23)?,
+        quota_concurrency_max: parse_u64_text(row, 24)?,
+        created_at_min_unix_ms: parse_i64(row, 25, "pruned interval created minimum is invalid")?,
+        created_at_max_unix_ms: parse_i64(row, 26, "pruned interval created maximum is invalid")?,
+        closed_at_min_unix_ms: parse_i64(row, 27, "pruned interval closed minimum is invalid")?,
+        closed_at_max_unix_ms: parse_i64(row, 28, "pruned interval closed maximum is invalid")?,
+        prune_commit_sequence_min: parse_u64_text(row, 29)?,
+        prune_commit_sequence_max: parse_u64_text(row, 30)?,
+        pruned_at_min_unix_ms: parse_i64(row, 31, "pruned interval pruned minimum is invalid")?,
+        pruned_at_max_unix_ms: parse_i64(row, 32, "pruned interval pruned maximum is invalid")?,
+        canonical_interval_bytes: row.try_get(33).map_err(|_| {
+            ContinuityError::InvalidResponse("pruned interval canonical bytes are invalid")
+        })?,
+        interval_blake3: parse_digest(
+            row.try_get(34).map_err(|_| {
+                ContinuityError::InvalidResponse("pruned interval digest is invalid")
+            })?,
+        )?,
+    };
+    validate_pruned_interval_shape(&interval)?;
+    Ok(interval)
+}
+
 fn validate_archive_prune_request(request: &ArchivePruneRequest) -> Result<(), ContinuityError> {
     if request.provider_boundary_id.is_empty()
         || request.authority_epoch == 0
@@ -1749,6 +1901,117 @@ fn validate_archive_prune_result_for_sequence(
     {
         return Err(ContinuityError::InvalidResponse(
             "archive result does not cover the requested sequence",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_read_pruned_interval_request(
+    request: &ReadPrunedIntervalRequest,
+) -> Result<(), ContinuityError> {
+    if request.provider_boundary_id.is_empty()
+        || request.authority_epoch == 0
+        || request.continuity_seq == 0
+        || request.expected_continuity_policy_revision.is_empty()
+    {
+        return Err(ContinuityError::InvalidConfiguration(
+            "pruned interval read identity and policy must be valid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pruned_interval(
+    interval: &PrunedInterval,
+    request: &ReadPrunedIntervalRequest,
+) -> Result<(), ContinuityError> {
+    if interval.provider_boundary_id != request.provider_boundary_id
+        || interval.authority_epoch != request.authority_epoch
+        || request.continuity_seq < interval.start_sequence
+        || request.continuity_seq > interval.end_sequence
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "pruned interval identity is inconsistent",
+        ));
+    }
+    if interval.api_revision != API_REVISION
+        || interval.schema_revision != SCHEMA_REVISION
+        || interval.continuity_contract_revision != CONTINUITY_CONTRACT_REVISION
+        || interval.continuity_policy_revision != request.expected_continuity_policy_revision
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "pruned interval revision is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pruned_interval_shape(interval: &PrunedInterval) -> Result<(), ContinuityError> {
+    let expected_row_count = interval
+        .end_sequence
+        .checked_sub(interval.start_sequence)
+        .and_then(|width| width.checked_add(1));
+    if interval.start_sequence == 0
+        || interval.end_sequence == 0
+        || interval.row_count == 0
+        || expected_row_count != Some(interval.row_count)
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "pruned interval range is inconsistent",
+        ));
+    }
+
+    let terminal_count = [
+        interval.completed_count,
+        interval.no_local_effect_count,
+        interval.adjudicated_no_local_effect_count,
+        interval.adjudicated_no_dispatch_count,
+    ]
+    .into_iter()
+    .try_fold(0_u64, u64::checked_add);
+    if terminal_count != Some(interval.row_count) {
+        return Err(ContinuityError::InvalidResponse(
+            "pruned interval terminal counts are inconsistent",
+        ));
+    }
+
+    if interval.canonical_row_bytes_min > interval.canonical_row_bytes_max
+        || interval.quota_rows_min > interval.quota_rows_max
+        || interval.quota_bytes_min > interval.quota_bytes_max
+        || interval.quota_concurrency_min > interval.quota_concurrency_max
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "pruned interval aggregate bounds are inconsistent",
+        ));
+    }
+
+    if interval.created_at_min_unix_ms < 0
+        || interval.created_at_min_unix_ms > interval.created_at_max_unix_ms
+        || interval.closed_at_min_unix_ms < 0
+        || interval.closed_at_min_unix_ms > interval.closed_at_max_unix_ms
+        || interval.pruned_at_min_unix_ms < 0
+        || interval.pruned_at_min_unix_ms > interval.pruned_at_max_unix_ms
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "pruned interval time bounds are inconsistent",
+        ));
+    }
+
+    if interval.prune_commit_sequence_min == 0
+        || interval.prune_commit_sequence_min > interval.prune_commit_sequence_max
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "pruned interval prune sequence bounds are inconsistent",
+        ));
+    }
+
+    if interval.canonical_interval_bytes.len() <= interval.interval_blake3.len()
+        || !interval
+            .canonical_interval_bytes
+            .ends_with(&interval.interval_blake3)
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "pruned interval canonical evidence is inconsistent",
         ));
     }
     Ok(())
@@ -1927,6 +2190,11 @@ fn parse_u64_text_value(value: &str) -> Result<u64, ContinuityError> {
     Ok(parsed)
 }
 
+fn parse_i64(row: &Row, index: usize, message: &'static str) -> Result<i64, ContinuityError> {
+    row.try_get(index)
+        .map_err(|_| ContinuityError::InvalidResponse(message))
+}
+
 fn parse_digest(value: Vec<u8>) -> Result<[u8; 32], ContinuityError> {
     value
         .try_into()
@@ -2023,6 +2291,59 @@ mod tests {
             accepted_row_count: 3,
             prune_commit_sequence: 5,
             accepted_interval_blake3: [0x71; 32],
+        }
+    }
+
+    fn sample_read_pruned_interval_request() -> ReadPrunedIntervalRequest {
+        ReadPrunedIntervalRequest {
+            provider_boundary_id: "boundary-live-test".to_string(),
+            authority_epoch: 7,
+            continuity_seq: 11,
+            expected_continuity_policy_revision: "policy-live-test".to_string(),
+            expected_epoch_namespace_blake3: [0x81; 32],
+        }
+    }
+
+    fn sample_pruned_interval() -> PrunedInterval {
+        let interval_blake3 = [0x91; 32];
+        let mut canonical_interval_bytes = vec![0xA1; 64];
+        canonical_interval_bytes.extend_from_slice(&interval_blake3);
+        PrunedInterval {
+            provider_boundary_id: "boundary-live-test".to_string(),
+            authority_epoch: 7,
+            start_sequence: 10,
+            end_sequence: 12,
+            row_count: 3,
+            api_revision: API_REVISION.to_string(),
+            schema_revision: SCHEMA_REVISION.to_string(),
+            continuity_contract_revision: CONTINUITY_CONTRACT_REVISION.to_string(),
+            continuity_policy_revision: "policy-live-test".to_string(),
+            completed_count: 1,
+            no_local_effect_count: 1,
+            adjudicated_no_local_effect_count: 0,
+            adjudicated_no_dispatch_count: 1,
+            canonical_row_bytes_sum: 300,
+            canonical_row_bytes_min: 90,
+            canonical_row_bytes_max: 110,
+            quota_rows_sum: 6,
+            quota_rows_min: 1,
+            quota_rows_max: 3,
+            quota_bytes_sum: 60,
+            quota_bytes_min: 10,
+            quota_bytes_max: 30,
+            quota_concurrency_sum: 3,
+            quota_concurrency_min: 1,
+            quota_concurrency_max: 1,
+            created_at_min_unix_ms: 1,
+            created_at_max_unix_ms: 3,
+            closed_at_min_unix_ms: 4,
+            closed_at_max_unix_ms: 6,
+            prune_commit_sequence_min: 2,
+            prune_commit_sequence_max: 4,
+            pruned_at_min_unix_ms: 7,
+            pruned_at_max_unix_ms: 9,
+            canonical_interval_bytes,
+            interval_blake3,
         }
     }
 
@@ -2492,6 +2813,189 @@ mod tests {
                     "archive result does not cover the requested sequence"
                 ))
             ));
+        }
+    }
+
+    #[test]
+    fn pruned_interval_read_query_and_migration_pin_authenticated_closed_contract() {
+        assert_eq!(
+            READ_PRUNED_INTERVAL_SQL,
+            "SELECT provider_boundary_id, authority_epoch::text, \
+    start_sequence::text, end_sequence::text, row_count::text, api_revision, schema_revision, \
+    continuity_contract_revision, continuity_policy_revision, completed_count::text, \
+    no_local_effect_count::text, adjudicated_no_local_effect_count::text, \
+    adjudicated_no_dispatch_count::text, canonical_row_bytes_sum::text, \
+    canonical_row_bytes_min::text, canonical_row_bytes_max::text, quota_rows_sum::text, \
+    quota_rows_min::text, quota_rows_max::text, quota_bytes_sum::text, quota_bytes_min::text, \
+    quota_bytes_max::text, quota_concurrency_sum::text, quota_concurrency_min::text, \
+    quota_concurrency_max::text, created_at_min_unix_ms, created_at_max_unix_ms, \
+    closed_at_min_unix_ms, closed_at_max_unix_ms, prune_commit_sequence_min::text, \
+    prune_commit_sequence_max::text, pruned_at_min_unix_ms, pruned_at_max_unix_ms, \
+    canonical_interval_bytes, interval_blake3 FROM \
+    object_store_continuity.object_store_continuity_read_pruned_interval_v2(\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5, $6, $7, $8\
+    )"
+        );
+        assert_eq!(
+            READ_PRUNED_INTERVAL_SQL
+                .matches("::text::object_store_continuity.uint64")
+                .count(),
+            2
+        );
+        assert!(READ_PRUNED_INTERVAL_SQL.contains("$8"));
+        assert!(!READ_PRUNED_INTERVAL_SQL.contains("$9"));
+        assert!(!READ_PRUNED_INTERVAL_SQL.contains("::bigint"));
+
+        let migration = normalized_embedded_migration();
+        for invariant in [
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_read_pruned_interval_v2( api_revision text, provider_boundary_id text, authority_epoch object_store_continuity.uint64, continuity_seq object_store_continuity.uint64, expected_schema_revision text, expected_continuity_contract_revision text, expected_continuity_policy_revision text, expected_epoch_namespace_blake3 bytea )",
+            "PERFORM object_store_continuity.assert_api_revision_v1(api_revision); PERFORM object_store_continuity.assert_reconciler_v1();",
+            "OR epoch_value.schema_revision IS DISTINCT FROM expected_schema_revision OR epoch_value.continuity_contract_revision IS DISTINCT FROM expected_continuity_contract_revision OR epoch_value.continuity_policy_revision IS DISTINCT FROM expected_continuity_policy_revision OR epoch_value.epoch_namespace_blake3 IS DISTINCT FROM expected_epoch_namespace_blake3 THEN RAISE EXCEPTION 'PRUNED_INTERVAL_NAMESPACE_MISMATCH' USING ERRCODE = '22023';",
+            "AND existing.start_sequence <= object_store_continuity_read_pruned_interval_v2.continuity_seq AND existing.end_sequence >= object_store_continuity_read_pruned_interval_v2.continuity_seq;",
+            "IF NOT FOUND THEN RAISE EXCEPTION 'PRUNED_INTERVAL_NOT_FOUND' USING ERRCODE = '02000'; END IF;",
+            "PERFORM object_store_continuity.assert_blake3_v1( object_store_continuity.pruned_range_preimage_v2(stored_range), stored_range.interval_blake3 );",
+            "IF stored_range.canonical_interval_bytes IS DISTINCT FROM object_store_continuity.pruned_range_preimage_v2(stored_range) || stored_range.interval_blake3 THEN RAISE EXCEPTION 'PRUNED_INTERVAL_CANONICAL_BYTES_MISMATCH' USING ERRCODE = '22000'; END IF;",
+            "object_store_continuity.object_store_continuity_read_pruned_interval_v2(text, text, object_store_continuity.uint64, object_store_continuity.uint64, text, text, text, bytea)",
+            "TO object_dispatch_continuity_reconciler;",
+        ] {
+            assert!(
+                migration.contains(invariant),
+                "embedded pruned-interval read lost invariant: {invariant}"
+            );
+        }
+        assert!(
+            !migration.contains("GRANT SELECT ON"),
+            "continuity roles must not receive direct table reads"
+        );
+    }
+
+    #[test]
+    fn pruned_interval_read_request_requires_exact_nonempty_identity_and_policy() {
+        validate_read_pruned_interval_request(&sample_read_pruned_interval_request())
+            .expect("an exact namespace request must validate");
+
+        let mut invalid_requests = Vec::new();
+        let mut empty_boundary = sample_read_pruned_interval_request();
+        empty_boundary.provider_boundary_id.clear();
+        invalid_requests.push(empty_boundary);
+        let mut zero_epoch = sample_read_pruned_interval_request();
+        zero_epoch.authority_epoch = 0;
+        invalid_requests.push(zero_epoch);
+        let mut zero_sequence = sample_read_pruned_interval_request();
+        zero_sequence.continuity_seq = 0;
+        invalid_requests.push(zero_sequence);
+        let mut empty_policy = sample_read_pruned_interval_request();
+        empty_policy.expected_continuity_policy_revision.clear();
+        invalid_requests.push(empty_policy);
+
+        for request in invalid_requests {
+            assert!(matches!(
+                validate_read_pruned_interval_request(&request),
+                Err(ContinuityError::InvalidConfiguration(
+                    "pruned interval read identity and policy must be valid"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn pruned_interval_accepts_closed_range_aggregates_and_canonical_digest() {
+        let request = sample_read_pruned_interval_request();
+        let interval = sample_pruned_interval();
+
+        validate_pruned_interval_shape(&interval)
+            .expect("a closed, bounded aggregate interval must validate");
+        validate_pruned_interval(&interval, &request)
+            .expect("the exact containing namespace interval must validate");
+        assert_eq!(interval.interval_blake3, [0x91; 32]);
+        assert!(
+            interval
+                .canonical_interval_bytes
+                .ends_with(&interval.interval_blake3)
+        );
+    }
+
+    #[test]
+    fn pruned_interval_rejects_each_closed_shape_invariant() {
+        let mut invalid_intervals = Vec::new();
+        let mut zero_start = sample_pruned_interval();
+        zero_start.start_sequence = 0;
+        invalid_intervals.push(zero_start);
+        let mut count_mismatch = sample_pruned_interval();
+        count_mismatch.row_count = 2;
+        invalid_intervals.push(count_mismatch);
+        let mut terminal_overflow = sample_pruned_interval();
+        terminal_overflow.completed_count = u64::MAX;
+        invalid_intervals.push(terminal_overflow);
+        let mut terminal_mismatch = sample_pruned_interval();
+        terminal_mismatch.completed_count = 0;
+        invalid_intervals.push(terminal_mismatch);
+        let mut aggregate_bounds = sample_pruned_interval();
+        aggregate_bounds.quota_bytes_min = 31;
+        invalid_intervals.push(aggregate_bounds);
+        let mut negative_time = sample_pruned_interval();
+        negative_time.created_at_min_unix_ms = -1;
+        invalid_intervals.push(negative_time);
+        let mut reversed_time = sample_pruned_interval();
+        reversed_time.closed_at_min_unix_ms = 7;
+        invalid_intervals.push(reversed_time);
+        let mut zero_prune_sequence = sample_pruned_interval();
+        zero_prune_sequence.prune_commit_sequence_min = 0;
+        invalid_intervals.push(zero_prune_sequence);
+        let mut reversed_prune_sequence = sample_pruned_interval();
+        reversed_prune_sequence.prune_commit_sequence_min = 5;
+        invalid_intervals.push(reversed_prune_sequence);
+        let mut missing_canonical_preimage = sample_pruned_interval();
+        missing_canonical_preimage.canonical_interval_bytes = vec![0x91; 32];
+        invalid_intervals.push(missing_canonical_preimage);
+        let mut wrong_canonical_digest = sample_pruned_interval();
+        wrong_canonical_digest.canonical_interval_bytes.pop();
+        wrong_canonical_digest.canonical_interval_bytes.push(0x92);
+        invalid_intervals.push(wrong_canonical_digest);
+
+        for interval in invalid_intervals {
+            assert!(
+                validate_pruned_interval_shape(&interval).is_err(),
+                "invalid pruned interval shape must fail closed: {interval:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pruned_interval_rejects_identity_containment_and_revision_mismatch() {
+        let request = sample_read_pruned_interval_request();
+        let mut invalid_intervals = Vec::new();
+        let mut wrong_boundary = sample_pruned_interval();
+        wrong_boundary.provider_boundary_id = "boundary-other".to_string();
+        invalid_intervals.push(wrong_boundary);
+        let mut wrong_epoch = sample_pruned_interval();
+        wrong_epoch.authority_epoch += 1;
+        invalid_intervals.push(wrong_epoch);
+        let mut misses_sequence = sample_pruned_interval();
+        misses_sequence.start_sequence = 12;
+        misses_sequence.end_sequence = 14;
+        invalid_intervals.push(misses_sequence);
+        let mut wrong_api = sample_pruned_interval();
+        wrong_api.api_revision.push_str("-other");
+        invalid_intervals.push(wrong_api);
+        let mut wrong_schema = sample_pruned_interval();
+        wrong_schema.schema_revision.push_str("-other");
+        invalid_intervals.push(wrong_schema);
+        let mut wrong_contract = sample_pruned_interval();
+        wrong_contract
+            .continuity_contract_revision
+            .push_str("-other");
+        invalid_intervals.push(wrong_contract);
+        let mut wrong_policy = sample_pruned_interval();
+        wrong_policy.continuity_policy_revision.push_str("-other");
+        invalid_intervals.push(wrong_policy);
+
+        for interval in invalid_intervals {
+            assert!(
+                validate_pruned_interval(&interval, &request).is_err(),
+                "mismatched pruned interval must fail closed: {interval:?}"
+            );
         }
     }
 

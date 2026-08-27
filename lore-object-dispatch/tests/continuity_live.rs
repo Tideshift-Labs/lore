@@ -29,6 +29,8 @@
 //!   `LORE_TEST_CONTINUITY_ARCHIVE_RELEASE_RECEIPT_BLAKE3_HEX`, and
 //!   `LORE_TEST_CONTINUITY_ARCHIVE_PROOF_BLAKE3_HEX`: exact lowercase digests for that row, its
 //!   canonically validated release receipt, and proof bytes `live-test-archive-proof-v1`.
+//! - `LORE_TEST_CONTINUITY_ARCHIVE_EPOCH_NAMESPACE_BLAKE3_HEX`: exact lowercase namespace digest
+//!   provisioned for the archived row's epoch.
 //! - `LORE_TEST_CONTINUITY_BOUNDARY_ID`: boundary mapped to the certificate login role.
 //! - `LORE_TEST_CONTINUITY_AUTHORITY_EPOCH`: active preprovisioned authority epoch.
 //! - `LORE_TEST_CONTINUITY_POLICY_REVISION`: installed policy revision for that epoch.
@@ -68,6 +70,7 @@ use lore_object_dispatch::continuity::MarkNoLocalEffectRequest;
 use lore_object_dispatch::continuity::PrepareAdjudicationRequest;
 use lore_object_dispatch::continuity::QuarantinePriorState;
 use lore_object_dispatch::continuity::QuarantineRequest;
+use lore_object_dispatch::continuity::ReadPrunedIntervalRequest;
 use lore_object_dispatch::continuity::ReadShadowReleaseReceiptRequest;
 use lore_object_dispatch::continuity::ReconciliationState;
 use lore_object_dispatch::continuity::RecordSnapshotRequest;
@@ -1144,6 +1147,9 @@ async fn live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detai
     let expected_release_receipt_blake3 =
         required_blake3_hex("LORE_TEST_CONTINUITY_ARCHIVE_RELEASE_RECEIPT_BLAKE3_HEX");
     let archive_proof_blake3 = required_blake3_hex("LORE_TEST_CONTINUITY_ARCHIVE_PROOF_BLAKE3_HEX");
+    let epoch_namespace_blake3 =
+        required_blake3_hex("LORE_TEST_CONTINUITY_ARCHIVE_EPOCH_NAMESPACE_BLAKE3_HEX");
+    let continuity_policy_revision = required_env("LORE_TEST_CONTINUITY_POLICY_REVISION");
     assert!(authority_epoch > 0, "archive epoch must be positive");
     assert!(continuity_seq > 0, "archive sequence must be positive");
 
@@ -1201,6 +1207,139 @@ async fn live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detai
     assert_eq!(archived.accepted_row_count, 1);
     assert_eq!(archived.prune_commit_sequence, 1);
     assert_ne!(archived.accepted_interval_blake3, [0; 32]);
+
+    let read_request = ReadPrunedIntervalRequest {
+        provider_boundary_id: boundary_id.clone(),
+        authority_epoch,
+        continuity_seq,
+        expected_continuity_policy_revision: continuity_policy_revision.clone(),
+        expected_epoch_namespace_blake3: epoch_namespace_blake3,
+    };
+    let boundary_read_error = boundary
+        .read_pruned_interval(&read_request)
+        .await
+        .expect_err("boundary runtime identity must not read authoritative pruned intervals");
+    assert!(matches!(
+        boundary_read_error,
+        ContinuityError::Postgres { transient: false }
+    ));
+
+    let interval = reconciler
+        .read_pruned_interval(&read_request)
+        .await
+        .expect("reconciler must adopt the authenticated containing pruned interval");
+    assert_eq!(interval.provider_boundary_id, boundary_id);
+    assert_eq!(interval.authority_epoch, authority_epoch);
+    assert_eq!(interval.start_sequence, continuity_seq);
+    assert_eq!(interval.end_sequence, continuity_seq);
+    assert_eq!(interval.row_count, 1);
+    assert_eq!(
+        interval.api_revision,
+        "object-store-authority-continuity-v1"
+    );
+    assert_eq!(
+        interval.schema_revision,
+        "object-store-authority-continuity-schema-v1"
+    );
+    assert_eq!(
+        interval.continuity_contract_revision,
+        "object-store-authority-continuity-contract-v1"
+    );
+    assert_eq!(
+        interval.continuity_policy_revision,
+        continuity_policy_revision
+    );
+    assert_eq!(interval.completed_count, 0);
+    assert_eq!(interval.no_local_effect_count, 1);
+    assert_eq!(interval.adjudicated_no_local_effect_count, 0);
+    assert_eq!(interval.adjudicated_no_dispatch_count, 0);
+    assert!(interval.canonical_row_bytes_sum > 0);
+    assert_eq!(
+        interval.canonical_row_bytes_sum,
+        interval.canonical_row_bytes_min
+    );
+    assert_eq!(
+        interval.canonical_row_bytes_sum,
+        interval.canonical_row_bytes_max
+    );
+    assert_eq!(
+        (
+            interval.quota_rows_sum,
+            interval.quota_rows_min,
+            interval.quota_rows_max
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        (
+            interval.quota_bytes_sum,
+            interval.quota_bytes_min,
+            interval.quota_bytes_max
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        (
+            interval.quota_concurrency_sum,
+            interval.quota_concurrency_min,
+            interval.quota_concurrency_max,
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        interval.created_at_min_unix_ms,
+        interval.created_at_max_unix_ms
+    );
+    assert_eq!(
+        interval.closed_at_min_unix_ms,
+        interval.closed_at_max_unix_ms
+    );
+    assert_eq!(interval.prune_commit_sequence_min, 1);
+    assert_eq!(interval.prune_commit_sequence_max, 1);
+    assert_eq!(
+        interval.pruned_at_min_unix_ms,
+        interval.pruned_at_max_unix_ms
+    );
+    assert_eq!(interval.interval_blake3, archived.accepted_interval_blake3);
+    assert!(interval.canonical_interval_bytes.len() > 32);
+    assert!(
+        interval
+            .canonical_interval_bytes
+            .ends_with(&interval.interval_blake3),
+        "canonical interval bytes must be closed by their exact digest"
+    );
+
+    let wrong_policy_request = ReadPrunedIntervalRequest {
+        provider_boundary_id: boundary_id.clone(),
+        authority_epoch,
+        continuity_seq,
+        expected_continuity_policy_revision: format!("{continuity_policy_revision}-mismatch"),
+        expected_epoch_namespace_blake3: epoch_namespace_blake3,
+    };
+    let wrong_policy_error = reconciler
+        .read_pruned_interval(&wrong_policy_request)
+        .await
+        .expect_err("policy revision mismatch must fail closed");
+    assert!(matches!(
+        wrong_policy_error,
+        ContinuityError::Postgres { transient: false }
+    ));
+
+    let wrong_namespace_request = ReadPrunedIntervalRequest {
+        provider_boundary_id: boundary_id.clone(),
+        authority_epoch,
+        continuity_seq,
+        expected_continuity_policy_revision: continuity_policy_revision,
+        expected_epoch_namespace_blake3: [0xFF; 32],
+    };
+    let wrong_namespace_error = reconciler
+        .read_pruned_interval(&wrong_namespace_request)
+        .await
+        .expect_err("epoch namespace mismatch must fail closed");
+    assert!(matches!(
+        wrong_namespace_error,
+        ContinuityError::Postgres { transient: false }
+    ));
 
     let lookup_after_archive = reconciler
         .get_by_token(&boundary_id, continuity_token_id)

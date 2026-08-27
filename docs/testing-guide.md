@@ -120,6 +120,12 @@ will update an older check constraint or state schema.
   `object_dispatch_continuity_reconciler` session identity to exercise quarantine, ambiguity, and
   both adjudication paths. A boundary-role-only live pass cannot prove reconciler authority. Gate:
   `cargo test -p lore-object-dispatch -j 4`; the live tier remains explicit `#[ignore]`.
+  Authenticated pruned-interval readback extends the one-shot archive fixture: pin the full 35-column
+  projection and both canonical `uint64` request casts offline, then archive and read the containing
+  interval with the reconciler identity. Assert boundary-role denial before the authoritative read,
+  exact revision/namespace/containment, checked range and terminal-class totals, aggregate/time/prune
+  bounds, and canonical interval bytes closed by the returned 32-byte digest. Policy and namespace
+  mismatch controls must fail closed.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.
