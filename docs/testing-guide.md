@@ -126,6 +126,11 @@ will update an older check constraint or state schema.
   exact revision/namespace/containment, checked range and terminal-class totals, aggregate/time/prune
   bounds, and canonical interval bytes closed by the returned 32-byte digest. Policy and namespace
   mismatch controls must fail closed.
+  Epoch-retirement proof may reuse that disposable singleton after seeding a canonical snapshot row;
+  retirement consumes the snapshot checkpoint, not a coverage row. Archive epoch 1, allocate epoch 2,
+  then prove retirement, exact replay, authenticated summary readback, boundary denial, policy and
+  namespace mismatch rejection, `pg_lsn` decoding, and removal of the old active interval. A
+  wrong-policy retirement must roll back before commit, and changed proof evidence must reject replay.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

@@ -31,6 +31,14 @@
 //!   canonically validated release receipt, and proof bytes `live-test-archive-proof-v1`.
 //! - `LORE_TEST_CONTINUITY_ARCHIVE_EPOCH_NAMESPACE_BLAKE3_HEX`: exact lowercase namespace digest
 //!   provisioned for the archived row's epoch.
+//! - `LORE_TEST_CONTINUITY_ARCHIVE_COVERING_SNAPSHOT_ID` and
+//!   `LORE_TEST_CONTINUITY_ARCHIVE_SNAPSHOT_MANIFEST_BLAKE3_HEX`: an admin-seeded UUIDv7 snapshot
+//!   for the archive boundary's epoch whose through-sequence reaches the singleton continuity
+//!   sequence and whose authority LSN is `0/1`. Retirement does not consume a coverage row.
+//! - `LORE_TEST_CONTINUITY_ARCHIVE_NEXT_EPOCH_NAMESPACE_BLAKE3_HEX`: exact lowercase namespace
+//!   digest for epoch 2. The archive boundary must start at epoch 1 and be rebuilt before rerun.
+//! - `LORE_TEST_CONTINUITY_RETIREMENT_PROOF_BLAKE3_HEX`: exact lowercase digest for proof bytes
+//!   `live-test-retirement-proof-v2`, accepted by the disposable mechanics-only validator.
 //! - `LORE_TEST_CONTINUITY_BOUNDARY_ID`: boundary mapped to the certificate login role.
 //! - `LORE_TEST_CONTINUITY_AUTHORITY_EPOCH`: active preprovisioned authority epoch.
 //! - `LORE_TEST_CONTINUITY_POLICY_REVISION`: installed policy revision for that epoch.
@@ -71,10 +79,12 @@ use lore_object_dispatch::continuity::PrepareAdjudicationRequest;
 use lore_object_dispatch::continuity::QuarantinePriorState;
 use lore_object_dispatch::continuity::QuarantineRequest;
 use lore_object_dispatch::continuity::ReadPrunedIntervalRequest;
+use lore_object_dispatch::continuity::ReadRetiredEpochRequest;
 use lore_object_dispatch::continuity::ReadShadowReleaseReceiptRequest;
 use lore_object_dispatch::continuity::ReconciliationState;
 use lore_object_dispatch::continuity::RecordSnapshotRequest;
 use lore_object_dispatch::continuity::ReleaseShadowOwnershipRequest;
+use lore_object_dispatch::continuity::RetireEpochRequest;
 use uuid::Uuid;
 
 fn required_env(name: &'static str) -> String {
@@ -1132,6 +1142,7 @@ async fn live_mtls_reconciler_allocates_dedicated_drained_epoch_one_to_two() {
 #[tokio::test]
 async fn live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detail() {
     const ARCHIVE_PROOF_BYTES: &[u8] = b"live-test-archive-proof-v1";
+    const RETIREMENT_PROOF_BYTES: &[u8] = b"live-test-retirement-proof-v2";
 
     let boundary_id = required_env("LORE_TEST_CONTINUITY_ARCHIVE_BOUNDARY_ID");
     let authority_epoch = required_env("LORE_TEST_CONTINUITY_ARCHIVE_AUTHORITY_EPOCH")
@@ -1149,9 +1160,21 @@ async fn live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detai
     let archive_proof_blake3 = required_blake3_hex("LORE_TEST_CONTINUITY_ARCHIVE_PROOF_BLAKE3_HEX");
     let epoch_namespace_blake3 =
         required_blake3_hex("LORE_TEST_CONTINUITY_ARCHIVE_EPOCH_NAMESPACE_BLAKE3_HEX");
+    let covering_snapshot_id = required_env("LORE_TEST_CONTINUITY_ARCHIVE_COVERING_SNAPSHOT_ID")
+        .parse::<Uuid>()
+        .expect("LORE_TEST_CONTINUITY_ARCHIVE_COVERING_SNAPSHOT_ID must be a UUIDv7");
+    let covering_snapshot_manifest_blake3 =
+        required_blake3_hex("LORE_TEST_CONTINUITY_ARCHIVE_SNAPSHOT_MANIFEST_BLAKE3_HEX");
+    let next_epoch_namespace_blake3 =
+        required_blake3_hex("LORE_TEST_CONTINUITY_ARCHIVE_NEXT_EPOCH_NAMESPACE_BLAKE3_HEX");
+    let retirement_proof_blake3 =
+        required_blake3_hex("LORE_TEST_CONTINUITY_RETIREMENT_PROOF_BLAKE3_HEX");
     let continuity_policy_revision = required_env("LORE_TEST_CONTINUITY_POLICY_REVISION");
-    assert!(authority_epoch > 0, "archive epoch must be positive");
-    assert!(continuity_seq > 0, "archive sequence must be positive");
+    assert_eq!(
+        authority_epoch, 1,
+        "retirement fixture must begin at epoch 1"
+    );
+    assert_eq!(continuity_seq, 1, "retirement fixture must be singleton");
 
     let reconciler = ContinuityClient::connect(&tls_config(
         "LORE_TEST_CONTINUITY_RECONCILER_PG_URL",
@@ -1329,7 +1352,7 @@ async fn live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detai
         provider_boundary_id: boundary_id.clone(),
         authority_epoch,
         continuity_seq,
-        expected_continuity_policy_revision: continuity_policy_revision,
+        expected_continuity_policy_revision: continuity_policy_revision.clone(),
         expected_epoch_namespace_blake3: [0xFF; 32],
     };
     let wrong_namespace_error = reconciler
@@ -1351,5 +1374,221 @@ async fn live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detai
             continuity_token_id: missing_token,
             ..
         } if missing_token == continuity_token_id
+    ));
+
+    let allocation_request = AllocateEpochRequest {
+        provider_boundary_id: boundary_id.clone(),
+        expected_current_epoch: authority_epoch,
+        next_epoch: authority_epoch + 1,
+        epoch_namespace_blake3: next_epoch_namespace_blake3,
+    };
+    let allocated = reconciler
+        .allocate_epoch(&allocation_request)
+        .await
+        .expect("fully archived drained epoch 1 must allocate epoch 2");
+    assert_eq!(allocated.authority_epoch, 2);
+    assert_eq!(allocated.continuity_seq_high_water, 0);
+
+    let retirement_request = RetireEpochRequest {
+        provider_boundary_id: boundary_id.clone(),
+        authority_epoch,
+        expected_continuity_policy_revision: continuity_policy_revision.clone(),
+        expected_epoch_namespace_blake3: epoch_namespace_blake3,
+        expected_interval_checkpoint_blake3: archived.accepted_interval_blake3,
+        covering_snapshot_id,
+        expected_snapshot_manifest_blake3: covering_snapshot_manifest_blake3,
+        retirement_proof_bytes: RETIREMENT_PROOF_BYTES.to_vec(),
+        retirement_proof_blake3,
+    };
+    let boundary_retirement_error = boundary
+        .retire_epoch(&retirement_request)
+        .await
+        .expect_err("boundary runtime identity must not retire an epoch");
+    assert!(matches!(
+        boundary_retirement_error,
+        ContinuityError::Postgres { transient: false }
+    ));
+
+    let wrong_policy_retirement = RetireEpochRequest {
+        provider_boundary_id: boundary_id.clone(),
+        authority_epoch,
+        expected_continuity_policy_revision: format!("{continuity_policy_revision}-mismatch"),
+        expected_epoch_namespace_blake3: epoch_namespace_blake3,
+        expected_interval_checkpoint_blake3: archived.accepted_interval_blake3,
+        covering_snapshot_id,
+        expected_snapshot_manifest_blake3: covering_snapshot_manifest_blake3,
+        retirement_proof_bytes: RETIREMENT_PROOF_BYTES.to_vec(),
+        retirement_proof_blake3,
+    };
+    let wrong_policy_retirement_error = reconciler
+        .retire_epoch(&wrong_policy_retirement)
+        .await
+        .expect_err("client policy mismatch must roll retirement back before commit");
+    assert!(matches!(
+        wrong_policy_retirement_error,
+        ContinuityError::InvalidResponse("retired epoch revision is inconsistent")
+    ));
+
+    let retired = reconciler
+        .retire_epoch(&retirement_request)
+        .await
+        .expect("reconciler must retire the fully pruned old epoch");
+    assert_eq!(retired.provider_boundary_id, boundary_id);
+    assert_eq!(retired.authority_epoch, authority_epoch);
+    assert_eq!(retired.start_sequence, 1);
+    assert_eq!(retired.final_sequence, continuity_seq);
+    assert_eq!(retired.row_count, 1);
+    assert_eq!(retired.api_revision, "object-store-authority-continuity-v1");
+    assert_eq!(
+        retired.schema_revision,
+        "object-store-authority-continuity-schema-v1"
+    );
+    assert_eq!(
+        retired.continuity_contract_revision,
+        "object-store-authority-continuity-contract-v1"
+    );
+    assert_eq!(
+        retired.continuity_policy_revision,
+        continuity_policy_revision
+    );
+    assert_eq!(retired.completed_count, 0);
+    assert_eq!(retired.no_local_effect_count, 1);
+    assert_eq!(retired.adjudicated_no_local_effect_count, 0);
+    assert_eq!(retired.adjudicated_no_dispatch_count, 0);
+    assert_eq!(
+        retired.interval_checkpoint_blake3,
+        archived.accepted_interval_blake3
+    );
+    assert_eq!(
+        retired.created_at_min_unix_ms,
+        interval.created_at_min_unix_ms
+    );
+    assert_eq!(
+        retired.created_at_max_unix_ms,
+        interval.created_at_max_unix_ms
+    );
+    assert_eq!(
+        retired.closed_at_min_unix_ms,
+        interval.closed_at_min_unix_ms
+    );
+    assert_eq!(
+        retired.closed_at_max_unix_ms,
+        interval.closed_at_max_unix_ms
+    );
+    assert_eq!(
+        retired.pruned_at_min_unix_ms,
+        interval.pruned_at_min_unix_ms
+    );
+    assert_eq!(
+        retired.pruned_at_max_unix_ms,
+        interval.pruned_at_max_unix_ms
+    );
+    assert_eq!(
+        retired.prune_commit_sequence_max,
+        interval.prune_commit_sequence_max
+    );
+    assert_eq!(retired.covering_snapshot_id, covering_snapshot_id);
+    assert!(
+        retired.covering_snapshot_through_sequence >= retired.final_sequence,
+        "the frozen covering snapshot must reach the retired high-water"
+    );
+    assert_eq!(retired.covering_snapshot_authority_lsn, 1);
+    assert_eq!(
+        retired.covering_snapshot_manifest_blake3,
+        covering_snapshot_manifest_blake3
+    );
+    assert_eq!(retired.retirement_proof_blake3, retirement_proof_blake3);
+    assert!(retired.retired_at_unix_ms >= retired.pruned_at_max_unix_ms);
+    assert!(retired.canonical_summary_bytes.len() > 32);
+    assert!(
+        retired
+            .canonical_summary_bytes
+            .ends_with(&retired.summary_blake3),
+        "canonical retired summary bytes must be closed by their exact digest"
+    );
+
+    let retirement_replay = reconciler
+        .retire_epoch(&retirement_request)
+        .await
+        .expect("exact epoch retirement replay must return the same summary");
+    assert_eq!(retirement_replay, retired);
+
+    let mismatched_replay = RetireEpochRequest {
+        provider_boundary_id: boundary_id.clone(),
+        authority_epoch,
+        expected_continuity_policy_revision: continuity_policy_revision.clone(),
+        expected_epoch_namespace_blake3: epoch_namespace_blake3,
+        expected_interval_checkpoint_blake3: archived.accepted_interval_blake3,
+        covering_snapshot_id,
+        expected_snapshot_manifest_blake3: covering_snapshot_manifest_blake3,
+        retirement_proof_bytes: RETIREMENT_PROOF_BYTES.to_vec(),
+        retirement_proof_blake3: [0xEE; 32],
+    };
+    let mismatched_replay_error = reconciler
+        .retire_epoch(&mismatched_replay)
+        .await
+        .expect_err("retirement replay with changed proof evidence must fail closed");
+    assert!(matches!(
+        mismatched_replay_error,
+        ContinuityError::Postgres { transient: false }
+    ));
+
+    let retired_read_request = ReadRetiredEpochRequest {
+        provider_boundary_id: boundary_id.clone(),
+        authority_epoch,
+        expected_continuity_policy_revision: continuity_policy_revision.clone(),
+        expected_epoch_namespace_blake3: epoch_namespace_blake3,
+    };
+    let boundary_retired_read_error = boundary
+        .read_retired_epoch(&retired_read_request)
+        .await
+        .expect_err("boundary runtime identity must not read retired epoch summaries");
+    assert!(matches!(
+        boundary_retired_read_error,
+        ContinuityError::Postgres { transient: false }
+    ));
+    let retired_readback = reconciler
+        .read_retired_epoch(&retired_read_request)
+        .await
+        .expect("reconciler must adopt the authenticated retired epoch summary");
+    assert_eq!(retired_readback, retired);
+
+    let wrong_retired_policy = ReadRetiredEpochRequest {
+        provider_boundary_id: boundary_id.clone(),
+        authority_epoch,
+        expected_continuity_policy_revision: format!("{continuity_policy_revision}-mismatch"),
+        expected_epoch_namespace_blake3: epoch_namespace_blake3,
+    };
+    let wrong_retired_policy_error = reconciler
+        .read_retired_epoch(&wrong_retired_policy)
+        .await
+        .expect_err("retired epoch policy revision mismatch must fail closed");
+    assert!(matches!(
+        wrong_retired_policy_error,
+        ContinuityError::Postgres { transient: false }
+    ));
+
+    let wrong_retired_namespace = ReadRetiredEpochRequest {
+        provider_boundary_id: boundary_id.clone(),
+        authority_epoch,
+        expected_continuity_policy_revision: continuity_policy_revision,
+        expected_epoch_namespace_blake3: [0xFF; 32],
+    };
+    let wrong_retired_namespace_error = reconciler
+        .read_retired_epoch(&wrong_retired_namespace)
+        .await
+        .expect_err("retired epoch namespace mismatch must fail closed");
+    assert!(matches!(
+        wrong_retired_namespace_error,
+        ContinuityError::Postgres { transient: false }
+    ));
+
+    let removed_interval_error = reconciler
+        .read_pruned_interval(&read_request)
+        .await
+        .expect_err("retirement must remove the old epoch's active pruned interval");
+    assert!(matches!(
+        removed_interval_error,
+        ContinuityError::Postgres { transient: false }
     ));
 }

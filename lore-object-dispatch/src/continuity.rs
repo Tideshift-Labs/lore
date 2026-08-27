@@ -30,6 +30,7 @@ const SCHEMA_REVISION: &str = "object-store-authority-continuity-schema-v1";
 const CONTINUITY_CONTRACT_REVISION: &str = "object-store-authority-continuity-contract-v1";
 const MUTATION_ISOLATION_LEVEL: IsolationLevel = IsolationLevel::Serializable;
 const MAX_ARCHIVE_PROOF_BYTES: usize = 1_048_576;
+const MAX_RETIREMENT_PROOF_BYTES: usize = 1_048_576;
 const BEGIN_SQL: &str = "SELECT result_code, state, ownership_state, authority_epoch::text, \
     continuity_seq::text, continuity_token_id, row_blake3, external_committed_at_unix_ms \
     FROM object_store_continuity.object_store_continuity_begin_v1(\
@@ -149,6 +150,32 @@ const READ_PRUNED_INTERVAL_SQL: &str = "SELECT provider_boundary_id, authority_e
     object_store_continuity.object_store_continuity_read_pruned_interval_v2(\
       $1, $2, $3::text::object_store_continuity.uint64, \
       $4::text::object_store_continuity.uint64, $5, $6, $7, $8\
+    )";
+const RETIRE_EPOCH_SQL: &str = "SELECT provider_boundary_id, authority_epoch::text, \
+    start_sequence::text, final_sequence::text, row_count::text, api_revision, schema_revision, \
+    continuity_contract_revision, continuity_policy_revision, completed_count::text, \
+    no_local_effect_count::text, adjudicated_no_local_effect_count::text, \
+    adjudicated_no_dispatch_count::text, interval_checkpoint_blake3, created_at_min_unix_ms, \
+    created_at_max_unix_ms, closed_at_min_unix_ms, closed_at_max_unix_ms, \
+    pruned_at_min_unix_ms, pruned_at_max_unix_ms, prune_commit_sequence_max::text, \
+    covering_snapshot_id, covering_snapshot_through_sequence::text, \
+    covering_snapshot_authority_lsn, covering_snapshot_manifest_blake3, \
+    retirement_proof_blake3, canonical_summary_bytes, summary_blake3, retired_at_unix_ms FROM \
+    object_store_continuity.object_store_continuity_retire_epoch_v2(\
+      $1, $2, $3::text::object_store_continuity.uint64, $4, $5, $6, $7, $8, $9\
+    )";
+const READ_RETIRED_EPOCH_SQL: &str = "SELECT provider_boundary_id, authority_epoch::text, \
+    start_sequence::text, final_sequence::text, row_count::text, api_revision, schema_revision, \
+    continuity_contract_revision, continuity_policy_revision, completed_count::text, \
+    no_local_effect_count::text, adjudicated_no_local_effect_count::text, \
+    adjudicated_no_dispatch_count::text, interval_checkpoint_blake3, created_at_min_unix_ms, \
+    created_at_max_unix_ms, closed_at_min_unix_ms, closed_at_max_unix_ms, \
+    pruned_at_min_unix_ms, pruned_at_max_unix_ms, prune_commit_sequence_max::text, \
+    covering_snapshot_id, covering_snapshot_through_sequence::text, \
+    covering_snapshot_authority_lsn, covering_snapshot_manifest_blake3, \
+    retirement_proof_blake3, canonical_summary_bytes, summary_blake3, retired_at_unix_ms FROM \
+    object_store_continuity.object_store_continuity_read_retired_epoch_v2(\
+      $1, $2, $3::text::object_store_continuity.uint64, $4, $5, $6, $7\
     )";
 
 /// Connection material for one continuity boundary identity.
@@ -621,6 +648,61 @@ pub struct PrunedInterval {
     pub pruned_at_max_unix_ms: i64,
     pub canonical_interval_bytes: Vec<u8>,
     pub interval_blake3: [u8; 32],
+}
+
+/// Exact old-epoch checkpoint and proof accepted for one bounded retirement.
+pub struct RetireEpochRequest {
+    pub provider_boundary_id: String,
+    pub authority_epoch: u64,
+    pub expected_continuity_policy_revision: String,
+    pub expected_epoch_namespace_blake3: [u8; 32],
+    pub expected_interval_checkpoint_blake3: [u8; 32],
+    pub covering_snapshot_id: Uuid,
+    pub expected_snapshot_manifest_blake3: [u8; 32],
+    pub retirement_proof_bytes: Vec<u8>,
+    pub retirement_proof_blake3: [u8; 32],
+}
+
+/// Authenticated namespace used to adopt one retired epoch summary.
+pub struct ReadRetiredEpochRequest {
+    pub provider_boundary_id: String,
+    pub authority_epoch: u64,
+    pub expected_continuity_policy_revision: String,
+    pub expected_epoch_namespace_blake3: [u8; 32],
+}
+
+/// Canonical namespace checkpoint for one completely pruned retired epoch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetiredEpochSummary {
+    pub provider_boundary_id: String,
+    pub authority_epoch: u64,
+    pub start_sequence: u64,
+    pub final_sequence: u64,
+    pub row_count: u64,
+    pub api_revision: String,
+    pub schema_revision: String,
+    pub continuity_contract_revision: String,
+    pub continuity_policy_revision: String,
+    pub completed_count: u64,
+    pub no_local_effect_count: u64,
+    pub adjudicated_no_local_effect_count: u64,
+    pub adjudicated_no_dispatch_count: u64,
+    pub interval_checkpoint_blake3: [u8; 32],
+    pub created_at_min_unix_ms: i64,
+    pub created_at_max_unix_ms: i64,
+    pub closed_at_min_unix_ms: i64,
+    pub closed_at_max_unix_ms: i64,
+    pub pruned_at_min_unix_ms: i64,
+    pub pruned_at_max_unix_ms: i64,
+    pub prune_commit_sequence_max: u64,
+    pub covering_snapshot_id: Uuid,
+    pub covering_snapshot_through_sequence: u64,
+    pub covering_snapshot_authority_lsn: u64,
+    pub covering_snapshot_manifest_blake3: [u8; 32],
+    pub retirement_proof_blake3: [u8; 32],
+    pub canonical_summary_bytes: Vec<u8>,
+    pub summary_blake3: [u8; 32],
+    pub retired_at_unix_ms: i64,
 }
 
 /// Server-derived result projection shared by continuity mutation and read procedures.
@@ -1540,6 +1622,79 @@ impl ContinuityClient {
         validate_pruned_interval(&interval, request)?;
         Ok(interval)
     }
+
+    /// Replace one fully covered old-epoch interval with its canonical retired summary.
+    pub async fn retire_epoch(
+        &self,
+        request: &RetireEpochRequest,
+    ) -> Result<RetiredEpochSummary, ContinuityError> {
+        validate_retire_epoch_request(request)?;
+        let epoch = request.authority_epoch.to_string();
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .build_transaction()
+            .isolation_level(MUTATION_ISOLATION_LEVEL)
+            .start()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let row = transaction
+            .query_one(
+                RETIRE_EPOCH_SQL,
+                &[
+                    &API_REVISION,
+                    &request.provider_boundary_id,
+                    &epoch,
+                    &&request.expected_epoch_namespace_blake3[..],
+                    &&request.expected_interval_checkpoint_blake3[..],
+                    &request.covering_snapshot_id,
+                    &&request.expected_snapshot_manifest_blake3[..],
+                    &&request.retirement_proof_bytes[..],
+                    &&request.retirement_proof_blake3[..],
+                ],
+            )
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let summary = parse_retired_epoch_summary(&row)?;
+        validate_retired_epoch_summary_for_retirement(&summary, request)?;
+        transaction
+            .commit()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        Ok(summary)
+    }
+
+    /// Read and validate one authenticated retired namespace checkpoint.
+    pub async fn read_retired_epoch(
+        &self,
+        request: &ReadRetiredEpochRequest,
+    ) -> Result<RetiredEpochSummary, ContinuityError> {
+        validate_read_retired_epoch_request(request)?;
+        let epoch = request.authority_epoch.to_string();
+        let client = self.client.lock().await;
+        let row = client
+            .query_one(
+                READ_RETIRED_EPOCH_SQL,
+                &[
+                    &API_REVISION,
+                    &request.provider_boundary_id,
+                    &epoch,
+                    &SCHEMA_REVISION,
+                    &CONTINUITY_CONTRACT_REVISION,
+                    &request.expected_continuity_policy_revision,
+                    &&request.expected_epoch_namespace_blake3[..],
+                ],
+            )
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let summary = parse_retired_epoch_summary(&row)?;
+        validate_retired_epoch_summary_namespace(
+            &summary,
+            &request.provider_boundary_id,
+            request.authority_epoch,
+            &request.expected_continuity_policy_revision,
+        )?;
+        Ok(summary)
+    }
 }
 
 fn validate_begin_result(
@@ -1860,6 +2015,65 @@ fn parse_pruned_interval(row: &Row) -> Result<PrunedInterval, ContinuityError> {
     Ok(interval)
 }
 
+fn parse_retired_epoch_summary(row: &Row) -> Result<RetiredEpochSummary, ContinuityError> {
+    let covering_snapshot_authority_lsn = row
+        .try_get::<_, PgLsn>(23)
+        .map_err(|_| ContinuityError::InvalidResponse("retired epoch snapshot LSN is invalid"))?;
+    let summary = RetiredEpochSummary {
+        provider_boundary_id: required_text(row, 0, "retired epoch boundary is invalid")?,
+        authority_epoch: parse_u64_text(row, 1)?,
+        start_sequence: parse_u64_text(row, 2)?,
+        final_sequence: parse_u64_text(row, 3)?,
+        row_count: parse_u64_text(row, 4)?,
+        api_revision: required_text(row, 5, "retired epoch API revision is invalid")?,
+        schema_revision: required_text(row, 6, "retired epoch schema revision is invalid")?,
+        continuity_contract_revision: required_text(
+            row,
+            7,
+            "retired epoch contract revision is invalid",
+        )?,
+        continuity_policy_revision: required_text(
+            row,
+            8,
+            "retired epoch policy revision is invalid",
+        )?,
+        completed_count: parse_u64_text(row, 9)?,
+        no_local_effect_count: parse_u64_text(row, 10)?,
+        adjudicated_no_local_effect_count: parse_u64_text(row, 11)?,
+        adjudicated_no_dispatch_count: parse_u64_text(row, 12)?,
+        interval_checkpoint_blake3: parse_digest(row.try_get(13).map_err(|_| {
+            ContinuityError::InvalidResponse("retired epoch interval digest is invalid")
+        })?)?,
+        created_at_min_unix_ms: parse_i64(row, 14, "retired epoch created minimum is invalid")?,
+        created_at_max_unix_ms: parse_i64(row, 15, "retired epoch created maximum is invalid")?,
+        closed_at_min_unix_ms: parse_i64(row, 16, "retired epoch closed minimum is invalid")?,
+        closed_at_max_unix_ms: parse_i64(row, 17, "retired epoch closed maximum is invalid")?,
+        pruned_at_min_unix_ms: parse_i64(row, 18, "retired epoch pruned minimum is invalid")?,
+        pruned_at_max_unix_ms: parse_i64(row, 19, "retired epoch pruned maximum is invalid")?,
+        prune_commit_sequence_max: parse_u64_text(row, 20)?,
+        covering_snapshot_id: row.try_get(21).map_err(|_| {
+            ContinuityError::InvalidResponse("retired epoch snapshot ID is invalid")
+        })?,
+        covering_snapshot_through_sequence: parse_u64_text(row, 22)?,
+        covering_snapshot_authority_lsn: covering_snapshot_authority_lsn.into(),
+        covering_snapshot_manifest_blake3: parse_digest(row.try_get(24).map_err(|_| {
+            ContinuityError::InvalidResponse("retired epoch snapshot manifest is invalid")
+        })?)?,
+        retirement_proof_blake3: parse_digest(row.try_get(25).map_err(|_| {
+            ContinuityError::InvalidResponse("retired epoch proof digest is invalid")
+        })?)?,
+        canonical_summary_bytes: row.try_get(26).map_err(|_| {
+            ContinuityError::InvalidResponse("retired epoch canonical bytes are invalid")
+        })?,
+        summary_blake3: parse_digest(row.try_get(27).map_err(|_| {
+            ContinuityError::InvalidResponse("retired epoch summary digest is invalid")
+        })?)?,
+        retired_at_unix_ms: parse_i64(row, 28, "retired epoch time is invalid")?,
+    };
+    validate_retired_epoch_summary_shape(&summary)?;
+    Ok(summary)
+}
+
 fn validate_archive_prune_request(request: &ArchivePruneRequest) -> Result<(), ContinuityError> {
     if request.provider_boundary_id.is_empty()
         || request.authority_epoch == 0
@@ -2012,6 +2226,146 @@ fn validate_pruned_interval_shape(interval: &PrunedInterval) -> Result<(), Conti
     {
         return Err(ContinuityError::InvalidResponse(
             "pruned interval canonical evidence is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retire_epoch_request(request: &RetireEpochRequest) -> Result<(), ContinuityError> {
+    if request.provider_boundary_id.is_empty()
+        || request.authority_epoch == 0
+        || request.expected_continuity_policy_revision.is_empty()
+        || request.retirement_proof_bytes.is_empty()
+        || request.retirement_proof_bytes.len() > MAX_RETIREMENT_PROOF_BYTES
+    {
+        return Err(ContinuityError::InvalidConfiguration(
+            "epoch retirement identity and proof must be valid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_read_retired_epoch_request(
+    request: &ReadRetiredEpochRequest,
+) -> Result<(), ContinuityError> {
+    if request.provider_boundary_id.is_empty()
+        || request.authority_epoch == 0
+        || request.expected_continuity_policy_revision.is_empty()
+    {
+        return Err(ContinuityError::InvalidConfiguration(
+            "retired epoch read identity and policy must be valid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retired_epoch_summary_namespace(
+    summary: &RetiredEpochSummary,
+    provider_boundary_id: &str,
+    authority_epoch: u64,
+    expected_continuity_policy_revision: &str,
+) -> Result<(), ContinuityError> {
+    if summary.provider_boundary_id != provider_boundary_id
+        || summary.authority_epoch != authority_epoch
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "retired epoch identity is inconsistent",
+        ));
+    }
+    if summary.api_revision != API_REVISION
+        || summary.schema_revision != SCHEMA_REVISION
+        || summary.continuity_contract_revision != CONTINUITY_CONTRACT_REVISION
+        || summary.continuity_policy_revision != expected_continuity_policy_revision
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "retired epoch revision is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retired_epoch_summary_for_retirement(
+    summary: &RetiredEpochSummary,
+    request: &RetireEpochRequest,
+) -> Result<(), ContinuityError> {
+    validate_retired_epoch_summary_namespace(
+        summary,
+        &request.provider_boundary_id,
+        request.authority_epoch,
+        &request.expected_continuity_policy_revision,
+    )?;
+    if summary.interval_checkpoint_blake3 != request.expected_interval_checkpoint_blake3
+        || summary.covering_snapshot_id != request.covering_snapshot_id
+        || summary.covering_snapshot_manifest_blake3 != request.expected_snapshot_manifest_blake3
+        || summary.retirement_proof_blake3 != request.retirement_proof_blake3
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "retired epoch checkpoint evidence is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retired_epoch_summary_shape(
+    summary: &RetiredEpochSummary,
+) -> Result<(), ContinuityError> {
+    let expected_row_count = summary
+        .final_sequence
+        .checked_sub(summary.start_sequence)
+        .and_then(|width| width.checked_add(1));
+    if summary.authority_epoch == 0
+        || summary.start_sequence != 1
+        || summary.final_sequence == 0
+        || summary.row_count == 0
+        || expected_row_count != Some(summary.row_count)
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "retired epoch range is inconsistent",
+        ));
+    }
+
+    let terminal_count = [
+        summary.completed_count,
+        summary.no_local_effect_count,
+        summary.adjudicated_no_local_effect_count,
+        summary.adjudicated_no_dispatch_count,
+    ]
+    .into_iter()
+    .try_fold(0_u64, u64::checked_add);
+    if terminal_count != Some(summary.row_count) {
+        return Err(ContinuityError::InvalidResponse(
+            "retired epoch terminal counts are inconsistent",
+        ));
+    }
+
+    if summary.created_at_min_unix_ms < 0
+        || summary.created_at_min_unix_ms > summary.created_at_max_unix_ms
+        || summary.closed_at_min_unix_ms < 0
+        || summary.closed_at_min_unix_ms > summary.closed_at_max_unix_ms
+        || summary.pruned_at_min_unix_ms < 0
+        || summary.pruned_at_min_unix_ms > summary.pruned_at_max_unix_ms
+        || summary.retired_at_unix_ms < summary.pruned_at_max_unix_ms
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "retired epoch time bounds are inconsistent",
+        ));
+    }
+
+    if summary.prune_commit_sequence_max == 0
+        || summary.covering_snapshot_through_sequence < summary.final_sequence
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "retired epoch checkpoint bounds are inconsistent",
+        ));
+    }
+
+    if summary.canonical_summary_bytes.len() <= summary.summary_blake3.len()
+        || !summary
+            .canonical_summary_bytes
+            .ends_with(&summary.summary_blake3)
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "retired epoch canonical evidence is inconsistent",
         ));
     }
     Ok(())
@@ -2347,6 +2701,68 @@ mod tests {
         }
     }
 
+    fn sample_retire_epoch_request() -> RetireEpochRequest {
+        RetireEpochRequest {
+            provider_boundary_id: "boundary-live-test".to_string(),
+            authority_epoch: 7,
+            expected_continuity_policy_revision: "policy-live-test".to_string(),
+            expected_epoch_namespace_blake3: [0x81; 32],
+            expected_interval_checkpoint_blake3: [0x91; 32],
+            covering_snapshot_id: Uuid::parse_str("018f0000-0000-7000-8000-000000000001")
+                .expect("sample snapshot ID must be UUIDv7"),
+            expected_snapshot_manifest_blake3: [0xA1; 32],
+            retirement_proof_bytes: vec![0xB1],
+            retirement_proof_blake3: [0xC1; 32],
+        }
+    }
+
+    fn sample_read_retired_epoch_request() -> ReadRetiredEpochRequest {
+        ReadRetiredEpochRequest {
+            provider_boundary_id: "boundary-live-test".to_string(),
+            authority_epoch: 7,
+            expected_continuity_policy_revision: "policy-live-test".to_string(),
+            expected_epoch_namespace_blake3: [0x81; 32],
+        }
+    }
+
+    fn sample_retired_epoch_summary() -> RetiredEpochSummary {
+        let summary_blake3 = [0xD1; 32];
+        let mut canonical_summary_bytes = vec![0xE1; 64];
+        canonical_summary_bytes.extend_from_slice(&summary_blake3);
+        RetiredEpochSummary {
+            provider_boundary_id: "boundary-live-test".to_string(),
+            authority_epoch: 7,
+            start_sequence: 1,
+            final_sequence: 3,
+            row_count: 3,
+            api_revision: API_REVISION.to_string(),
+            schema_revision: SCHEMA_REVISION.to_string(),
+            continuity_contract_revision: CONTINUITY_CONTRACT_REVISION.to_string(),
+            continuity_policy_revision: "policy-live-test".to_string(),
+            completed_count: 1,
+            no_local_effect_count: 1,
+            adjudicated_no_local_effect_count: 0,
+            adjudicated_no_dispatch_count: 1,
+            interval_checkpoint_blake3: [0x91; 32],
+            created_at_min_unix_ms: 1,
+            created_at_max_unix_ms: 3,
+            closed_at_min_unix_ms: 4,
+            closed_at_max_unix_ms: 6,
+            pruned_at_min_unix_ms: 7,
+            pruned_at_max_unix_ms: 9,
+            prune_commit_sequence_max: 4,
+            covering_snapshot_id: Uuid::parse_str("018f0000-0000-7000-8000-000000000001")
+                .expect("sample snapshot ID must be UUIDv7"),
+            covering_snapshot_through_sequence: 3,
+            covering_snapshot_authority_lsn: 17,
+            covering_snapshot_manifest_blake3: [0xA1; 32],
+            retirement_proof_blake3: [0xC1; 32],
+            canonical_summary_bytes,
+            summary_blake3,
+            retired_at_unix_ms: 10,
+        }
+    }
+
     fn normalized_embedded_migration() -> String {
         std::str::from_utf8(crate::schema::CONTINUITY_MIGRATION_V1)
             .expect("embedded migration must remain UTF-8 SQL")
@@ -2451,6 +2867,17 @@ mod tests {
              continuity_token_id uuid, expected_row_blake3 bytea, \
              expected_release_receipt_blake3 bytea, archive_proof_bytes bytea, \
              archive_proof_blake3 bytea )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_retire_epoch_v2( \
+             api_revision text, provider_boundary_id text, authority_epoch \
+             object_store_continuity.uint64, expected_epoch_namespace_blake3 bytea, \
+             expected_interval_checkpoint_blake3 bytea, covering_snapshot_id uuid, \
+             expected_snapshot_manifest_blake3 bytea, retirement_proof_bytes bytea, \
+             retirement_proof_blake3 bytea )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_read_retired_epoch_v2( \
+             api_revision text, provider_boundary_id text, authority_epoch \
+             object_store_continuity.uint64, expected_schema_revision text, \
+             expected_continuity_contract_revision text, \
+             expected_continuity_policy_revision text, expected_epoch_namespace_blake3 bytea )",
         ] {
             assert!(
                 migration.contains(signature),
@@ -2995,6 +3422,298 @@ mod tests {
             assert!(
                 validate_pruned_interval(&interval, &request).is_err(),
                 "mismatched pruned interval must fail closed: {interval:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_retirement_query_and_migration_pin_serializable_replay_contract() {
+        assert_eq!(
+            RETIRE_EPOCH_SQL,
+            "SELECT provider_boundary_id, authority_epoch::text, \
+    start_sequence::text, final_sequence::text, row_count::text, api_revision, schema_revision, \
+    continuity_contract_revision, continuity_policy_revision, completed_count::text, \
+    no_local_effect_count::text, adjudicated_no_local_effect_count::text, \
+    adjudicated_no_dispatch_count::text, interval_checkpoint_blake3, created_at_min_unix_ms, \
+    created_at_max_unix_ms, closed_at_min_unix_ms, closed_at_max_unix_ms, \
+    pruned_at_min_unix_ms, pruned_at_max_unix_ms, prune_commit_sequence_max::text, \
+    covering_snapshot_id, covering_snapshot_through_sequence::text, \
+    covering_snapshot_authority_lsn, covering_snapshot_manifest_blake3, \
+    retirement_proof_blake3, canonical_summary_bytes, summary_blake3, retired_at_unix_ms FROM \
+    object_store_continuity.object_store_continuity_retire_epoch_v2(\
+      $1, $2, $3::text::object_store_continuity.uint64, $4, $5, $6, $7, $8, $9\
+    )"
+        );
+        assert_eq!(
+            RETIRE_EPOCH_SQL
+                .matches("::text::object_store_continuity.uint64")
+                .count(),
+            1
+        );
+        assert!(RETIRE_EPOCH_SQL.contains("$9"));
+        assert!(!RETIRE_EPOCH_SQL.contains("$10"));
+        assert!(!RETIRE_EPOCH_SQL.contains("::bigint"));
+
+        let migration = normalized_embedded_migration();
+        for invariant in [
+            "PERFORM object_store_continuity.assert_api_revision_v1(api_revision); PERFORM object_store_continuity.assert_serializable_write_v1(); PERFORM object_store_continuity.assert_reconciler_v1();",
+            "IF octet_length(expected_epoch_namespace_blake3) <> 32 OR octet_length(expected_interval_checkpoint_blake3) <> 32 OR octet_length(expected_snapshot_manifest_blake3) <> 32 OR octet_length(retirement_proof_blake3) <> 32 THEN RAISE EXCEPTION 'EPOCH_RETIREMENT_EXPECTED_DIGEST_INVALID' USING ERRCODE = '22023'; END IF;",
+            "IF FOUND THEN IF NOT epoch_value.retired OR summary_value.interval_checkpoint_blake3 IS DISTINCT FROM expected_interval_checkpoint_blake3 OR summary_value.covering_snapshot_id IS DISTINCT FROM covering_snapshot_id OR summary_value.covering_snapshot_manifest_blake3 IS DISTINCT FROM expected_snapshot_manifest_blake3 OR summary_value.retirement_proof_blake3 IS DISTINCT FROM retirement_proof_blake3 THEN RAISE EXCEPTION 'EPOCH_RETIREMENT_REPLAY_MISMATCH' USING ERRCODE = '23505';",
+            "IF epoch_value.retired OR boundary.current_authority_epoch = authority_epoch OR epoch_value.continuity_seq_high_water = 0 THEN RAISE EXCEPTION 'EPOCH_RETIREMENT_NOT_OLD_ACTIVE_NAMESPACE' USING ERRCODE = '22023'; END IF;",
+            "IF EXISTS ( SELECT 1 FROM object_store_continuity.intents AS intent WHERE intent.provider_boundary_id = object_store_continuity_retire_epoch_v2.provider_boundary_id AND intent.authority_epoch = object_store_continuity_retire_epoch_v2.authority_epoch ) THEN RAISE EXCEPTION 'EPOCH_RETIREMENT_LIVE_DETAIL_REMAINS' USING ERRCODE = '55000'; END IF;",
+            "IF interval_count <> 1 OR active_range.start_sequence <> 1 OR active_range.end_sequence IS DISTINCT FROM epoch_value.continuity_seq_high_water THEN RAISE EXCEPTION 'EPOCH_RETIREMENT_INTERVAL_COVERAGE_INCOMPLETE' USING ERRCODE = '55000'; END IF;",
+            "AND snapshot.authority_epoch = object_store_continuity_retire_epoch_v2.authority_epoch AND snapshot.through_continuity_seq >= epoch_value.continuity_seq_high_water;",
+            "PERFORM object_store_continuity.assert_epoch_retirement_eligibility_v2( retirement_proof_bytes, retirement_proof_blake3, provider_boundary_id, authority_epoch, epoch_value.continuity_seq_high_water, active_range.interval_blake3, snapshot_value.snapshot_id, snapshot_value.manifest_blake3, epoch_value.prune_commit_sequence_high_water );",
+            "INSERT INTO object_store_continuity.retired_epoch_summaries SELECT (summary_value).*; DELETE FROM object_store_continuity.pruned_ranges AS existing",
+            "UPDATE object_store_continuity.epoch_counters SET retired = true",
+            "object_store_continuity.object_store_continuity_retire_epoch_v2(text, text, object_store_continuity.uint64, bytea, bytea, uuid, bytea, bytea, bytea)",
+            "TO object_dispatch_continuity_reconciler;",
+        ] {
+            assert!(
+                migration.contains(invariant),
+                "embedded epoch retirement lost invariant: {invariant}"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_epoch_read_query_and_migration_pin_authenticated_closed_contract() {
+        assert_eq!(
+            READ_RETIRED_EPOCH_SQL,
+            "SELECT provider_boundary_id, authority_epoch::text, \
+    start_sequence::text, final_sequence::text, row_count::text, api_revision, schema_revision, \
+    continuity_contract_revision, continuity_policy_revision, completed_count::text, \
+    no_local_effect_count::text, adjudicated_no_local_effect_count::text, \
+    adjudicated_no_dispatch_count::text, interval_checkpoint_blake3, created_at_min_unix_ms, \
+    created_at_max_unix_ms, closed_at_min_unix_ms, closed_at_max_unix_ms, \
+    pruned_at_min_unix_ms, pruned_at_max_unix_ms, prune_commit_sequence_max::text, \
+    covering_snapshot_id, covering_snapshot_through_sequence::text, \
+    covering_snapshot_authority_lsn, covering_snapshot_manifest_blake3, \
+    retirement_proof_blake3, canonical_summary_bytes, summary_blake3, retired_at_unix_ms FROM \
+    object_store_continuity.object_store_continuity_read_retired_epoch_v2(\
+      $1, $2, $3::text::object_store_continuity.uint64, $4, $5, $6, $7\
+    )"
+        );
+        assert_eq!(
+            READ_RETIRED_EPOCH_SQL
+                .matches("::text::object_store_continuity.uint64")
+                .count(),
+            1
+        );
+        assert!(READ_RETIRED_EPOCH_SQL.contains("$7"));
+        assert!(!READ_RETIRED_EPOCH_SQL.contains("$8"));
+        assert!(!READ_RETIRED_EPOCH_SQL.contains("::bigint"));
+
+        let migration = normalized_embedded_migration();
+        for invariant in [
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_read_retired_epoch_v2( api_revision text, provider_boundary_id text, authority_epoch object_store_continuity.uint64, expected_schema_revision text, expected_continuity_contract_revision text, expected_continuity_policy_revision text, expected_epoch_namespace_blake3 bytea )",
+            "RETURNS SETOF object_store_continuity.retired_epoch_summaries LANGUAGE plpgsql STABLE SECURITY DEFINER",
+            "PERFORM object_store_continuity.assert_api_revision_v1(api_revision); PERFORM object_store_continuity.assert_reconciler_v1();",
+            "IF NOT FOUND OR NOT epoch_value.retired OR epoch_value.api_revision IS DISTINCT FROM api_revision OR epoch_value.schema_revision IS DISTINCT FROM expected_schema_revision OR epoch_value.continuity_contract_revision IS DISTINCT FROM expected_continuity_contract_revision OR epoch_value.continuity_policy_revision IS DISTINCT FROM expected_continuity_policy_revision OR epoch_value.epoch_namespace_blake3 IS DISTINCT FROM expected_epoch_namespace_blake3 THEN RAISE EXCEPTION 'RETIRED_EPOCH_NAMESPACE_MISMATCH' USING ERRCODE = '22023'; END IF;",
+            "IF NOT FOUND THEN RAISE EXCEPTION 'RETIRED_EPOCH_SUMMARY_NOT_FOUND' USING ERRCODE = '02000'; END IF;",
+            "PERFORM object_store_continuity.assert_retired_epoch_summary_v2( summary_value, epoch_value, snapshot_value ); RETURN NEXT summary_value;",
+            "object_store_continuity.object_store_continuity_read_retired_epoch_v2(text, text, object_store_continuity.uint64, text, text, text, bytea)",
+            "TO object_dispatch_continuity_reconciler;",
+        ] {
+            assert!(
+                migration.contains(invariant),
+                "embedded retired epoch read lost invariant: {invariant}"
+            );
+        }
+        assert!(
+            !migration.contains("GRANT SELECT ON"),
+            "continuity roles must not receive direct table reads"
+        );
+    }
+
+    #[test]
+    fn epoch_retirement_request_accepts_bounded_proof_and_rejects_invalid_identity() {
+        let mut maximum = sample_retire_epoch_request();
+        maximum.retirement_proof_bytes = vec![0xB1; MAX_RETIREMENT_PROOF_BYTES];
+        validate_retire_epoch_request(&maximum)
+            .expect("an exact maximum-sized retirement proof must remain admissible");
+
+        let mut invalid_requests = Vec::new();
+        let mut empty_boundary = sample_retire_epoch_request();
+        empty_boundary.provider_boundary_id.clear();
+        invalid_requests.push(empty_boundary);
+        let mut zero_epoch = sample_retire_epoch_request();
+        zero_epoch.authority_epoch = 0;
+        invalid_requests.push(zero_epoch);
+        let mut empty_policy = sample_retire_epoch_request();
+        empty_policy.expected_continuity_policy_revision.clear();
+        invalid_requests.push(empty_policy);
+        let mut empty_proof = sample_retire_epoch_request();
+        empty_proof.retirement_proof_bytes.clear();
+        invalid_requests.push(empty_proof);
+        let mut oversized_proof = sample_retire_epoch_request();
+        oversized_proof.retirement_proof_bytes = vec![0xB1; MAX_RETIREMENT_PROOF_BYTES + 1];
+        invalid_requests.push(oversized_proof);
+
+        for request in invalid_requests {
+            assert!(matches!(
+                validate_retire_epoch_request(&request),
+                Err(ContinuityError::InvalidConfiguration(
+                    "epoch retirement identity and proof must be valid"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn retired_epoch_read_request_requires_nonempty_identity_and_policy() {
+        validate_read_retired_epoch_request(&sample_read_retired_epoch_request())
+            .expect("an exact retired namespace request must validate");
+
+        let mut invalid_requests = Vec::new();
+        let mut empty_boundary = sample_read_retired_epoch_request();
+        empty_boundary.provider_boundary_id.clear();
+        invalid_requests.push(empty_boundary);
+        let mut zero_epoch = sample_read_retired_epoch_request();
+        zero_epoch.authority_epoch = 0;
+        invalid_requests.push(zero_epoch);
+        let mut empty_policy = sample_read_retired_epoch_request();
+        empty_policy.expected_continuity_policy_revision.clear();
+        invalid_requests.push(empty_policy);
+
+        for request in invalid_requests {
+            assert!(matches!(
+                validate_read_retired_epoch_request(&request),
+                Err(ContinuityError::InvalidConfiguration(
+                    "retired epoch read identity and policy must be valid"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn retired_epoch_summary_accepts_closed_checkpoint_and_retirement_evidence() {
+        let request = sample_retire_epoch_request();
+        let summary = sample_retired_epoch_summary();
+
+        validate_retired_epoch_summary_shape(&summary)
+            .expect("a closed retired epoch summary must validate");
+        validate_retired_epoch_summary_for_retirement(&summary, &request)
+            .expect("the exact retirement checkpoint evidence must validate");
+        validate_retired_epoch_summary_namespace(
+            &summary,
+            &request.provider_boundary_id,
+            request.authority_epoch,
+            &request.expected_continuity_policy_revision,
+        )
+        .expect("the exact retired namespace must validate for readback");
+        assert!(
+            summary
+                .canonical_summary_bytes
+                .ends_with(&summary.summary_blake3)
+        );
+    }
+
+    #[test]
+    fn retired_epoch_summary_rejects_each_closed_shape_invariant() {
+        let mut invalid_summaries = Vec::new();
+        let mut zero_epoch = sample_retired_epoch_summary();
+        zero_epoch.authority_epoch = 0;
+        invalid_summaries.push(zero_epoch);
+        let mut wrong_start = sample_retired_epoch_summary();
+        wrong_start.start_sequence = 2;
+        invalid_summaries.push(wrong_start);
+        let mut count_mismatch = sample_retired_epoch_summary();
+        count_mismatch.row_count = 2;
+        invalid_summaries.push(count_mismatch);
+        let mut terminal_overflow = sample_retired_epoch_summary();
+        terminal_overflow.completed_count = u64::MAX;
+        invalid_summaries.push(terminal_overflow);
+        let mut terminal_mismatch = sample_retired_epoch_summary();
+        terminal_mismatch.completed_count = 0;
+        invalid_summaries.push(terminal_mismatch);
+        let mut negative_time = sample_retired_epoch_summary();
+        negative_time.created_at_min_unix_ms = -1;
+        invalid_summaries.push(negative_time);
+        let mut reversed_time = sample_retired_epoch_summary();
+        reversed_time.closed_at_min_unix_ms = 7;
+        invalid_summaries.push(reversed_time);
+        let mut retired_before_pruned = sample_retired_epoch_summary();
+        retired_before_pruned.retired_at_unix_ms = 8;
+        invalid_summaries.push(retired_before_pruned);
+        let mut zero_prune_sequence = sample_retired_epoch_summary();
+        zero_prune_sequence.prune_commit_sequence_max = 0;
+        invalid_summaries.push(zero_prune_sequence);
+        let mut insufficient_snapshot = sample_retired_epoch_summary();
+        insufficient_snapshot.covering_snapshot_through_sequence = 2;
+        invalid_summaries.push(insufficient_snapshot);
+        let mut missing_canonical_preimage = sample_retired_epoch_summary();
+        missing_canonical_preimage.canonical_summary_bytes = vec![0xD1; 32];
+        invalid_summaries.push(missing_canonical_preimage);
+        let mut wrong_canonical_digest = sample_retired_epoch_summary();
+        wrong_canonical_digest.canonical_summary_bytes.pop();
+        wrong_canonical_digest.canonical_summary_bytes.push(0xD2);
+        invalid_summaries.push(wrong_canonical_digest);
+
+        for summary in invalid_summaries {
+            assert!(
+                validate_retired_epoch_summary_shape(&summary).is_err(),
+                "invalid retired epoch summary must fail closed: {summary:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_epoch_summary_rejects_namespace_and_checkpoint_mismatch() {
+        let request = sample_retire_epoch_request();
+        let mut namespace_mismatches = Vec::new();
+        let mut wrong_boundary = sample_retired_epoch_summary();
+        wrong_boundary.provider_boundary_id = "boundary-other".to_string();
+        namespace_mismatches.push(wrong_boundary);
+        let mut wrong_epoch = sample_retired_epoch_summary();
+        wrong_epoch.authority_epoch += 1;
+        namespace_mismatches.push(wrong_epoch);
+        let mut wrong_api = sample_retired_epoch_summary();
+        wrong_api.api_revision.push_str("-other");
+        namespace_mismatches.push(wrong_api);
+        let mut wrong_schema = sample_retired_epoch_summary();
+        wrong_schema.schema_revision.push_str("-other");
+        namespace_mismatches.push(wrong_schema);
+        let mut wrong_contract = sample_retired_epoch_summary();
+        wrong_contract
+            .continuity_contract_revision
+            .push_str("-other");
+        namespace_mismatches.push(wrong_contract);
+        let mut wrong_policy = sample_retired_epoch_summary();
+        wrong_policy.continuity_policy_revision.push_str("-other");
+        namespace_mismatches.push(wrong_policy);
+
+        for summary in namespace_mismatches {
+            assert!(
+                validate_retired_epoch_summary_namespace(
+                    &summary,
+                    &request.provider_boundary_id,
+                    request.authority_epoch,
+                    &request.expected_continuity_policy_revision,
+                )
+                .is_err(),
+                "mismatched retired namespace must fail closed: {summary:?}"
+            );
+        }
+
+        let mut checkpoint_mismatches = Vec::new();
+        let mut wrong_interval = sample_retired_epoch_summary();
+        wrong_interval.interval_checkpoint_blake3 = [0x01; 32];
+        checkpoint_mismatches.push(wrong_interval);
+        let mut wrong_snapshot = sample_retired_epoch_summary();
+        wrong_snapshot.covering_snapshot_id = Uuid::now_v7();
+        checkpoint_mismatches.push(wrong_snapshot);
+        let mut wrong_manifest = sample_retired_epoch_summary();
+        wrong_manifest.covering_snapshot_manifest_blake3 = [0x02; 32];
+        checkpoint_mismatches.push(wrong_manifest);
+        let mut wrong_proof = sample_retired_epoch_summary();
+        wrong_proof.retirement_proof_blake3 = [0x03; 32];
+        checkpoint_mismatches.push(wrong_proof);
+
+        for summary in checkpoint_mismatches {
+            assert!(
+                validate_retired_epoch_summary_for_retirement(&summary, &request).is_err(),
+                "mismatched retirement checkpoint must fail closed: {summary:?}"
             );
         }
     }
