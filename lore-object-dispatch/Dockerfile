@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=builder /build/lore-object-dispatch-bin /usr/local/bin/lore-object-dispatch
 
-ENV LORE_OBJECT_DISPATCH_SERVICE_CONFIG_REVISION=object-store-dispatch-service-shell-v1
+ENV LORE_OBJECT_DISPATCH_SERVICE_CONFIG_REVISION=object-store-dispatch-service-mtls-shell-v1
 ENV LORE_OBJECT_DISPATCH_LISTEN_ADDR=127.0.0.1:50051
 
 USER 10001:10001

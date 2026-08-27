@@ -5,19 +5,25 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore_object_dispatch::DispatchMetricRecorder;
 use lore_object_dispatch::DispatchRpc;
+use lore_object_dispatch::MAX_TLS_PEM_BYTES;
 use lore_object_dispatch::SERVICE_CONFIG_REVISION;
 use lore_object_dispatch::SOURCE_DARK_STATUS_MESSAGE;
 use lore_object_dispatch::ServiceConfig;
 use lore_object_dispatch::ServiceConfigError;
-use lore_object_dispatch::ServiceServerError;
+use lore_object_dispatch::ServiceTlsConfig;
+use lore_object_dispatch::ServiceTlsConfigError;
 use lore_object_dispatch::SourceDarkObjectStoreDispatchService;
+use lore_object_dispatch::config::CLIENT_CA_PEM_PATH_ENV;
 use lore_object_dispatch::config::LISTEN_ADDR_ENV;
+use lore_object_dispatch::config::SERVER_CERT_CHAIN_PEM_PATH_ENV;
+use lore_object_dispatch::config::SERVER_PRIVATE_KEY_PEM_PATH_ENV;
 use lore_object_dispatch::config::SERVICE_CONFIG_REVISION_ENV;
-use lore_object_dispatch::serve_prebound;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreRequestQueryV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreRequestV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreResultAckV1;
@@ -35,14 +41,55 @@ use tonic::Request;
 use tonic::Status;
 use tonic::transport::Server;
 
-const REVISION: &str = "object-store-dispatch-service-shell-v1";
+const REVISION: &str = "object-store-dispatch-service-mtls-shell-v1";
 const ADDRESS: &str = "127.0.0.1:50051";
 const RPC_TIMEOUT: Duration = Duration::from_secs(2);
+static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
-fn config_vars(address: &str) -> [(&'static str, &str); 2] {
-    [
-        (SERVICE_CONFIG_REVISION_ENV, REVISION),
-        (LISTEN_ADDR_ENV, address),
+struct TestDirectory(std::path::PathBuf);
+
+impl TestDirectory {
+    fn new() -> Self {
+        let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "lore-object-dispatch-tls-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("unique TLS test directory must be creatable");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).expect("TLS test directory must be removable");
+    }
+}
+
+fn config_vars(address: &str) -> Vec<(String, String)> {
+    let base = std::env::temp_dir().join("lore-object-dispatch-config-contract");
+    vec![
+        (
+            SERVICE_CONFIG_REVISION_ENV.to_string(),
+            REVISION.to_string(),
+        ),
+        (LISTEN_ADDR_ENV.to_string(), address.to_string()),
+        (
+            SERVER_CERT_CHAIN_PEM_PATH_ENV.to_string(),
+            base.join("server-cert.pem").to_string_lossy().into_owned(),
+        ),
+        (
+            SERVER_PRIVATE_KEY_PEM_PATH_ENV.to_string(),
+            base.join("server-key.pem").to_string_lossy().into_owned(),
+        ),
+        (
+            CLIENT_CA_PEM_PATH_ENV.to_string(),
+            base.join("client-ca.pem").to_string_lossy().into_owned(),
+        ),
     ]
 }
 
@@ -73,6 +120,9 @@ fn service_config_accepts_only_the_exact_required_surface() {
 
     assert_eq!(config.service_config_revision(), SERVICE_CONFIG_REVISION);
     assert_eq!(config.listen_addr().to_string(), ADDRESS);
+    assert!(config.server_cert_chain_pem_path().is_absolute());
+    assert!(config.server_private_key_pem_path().is_absolute());
+    assert!(config.client_ca_pem_path().is_absolute());
 }
 
 #[test]
@@ -85,17 +135,31 @@ fn service_config_has_no_implicit_defaults() {
         ServiceConfig::from_prefixed_vars([(SERVICE_CONFIG_REVISION_ENV, REVISION)]),
         Err(ServiceConfigError::MissingListenAddress)
     );
+    assert_eq!(
+        ServiceConfig::from_prefixed_vars([
+            (SERVICE_CONFIG_REVISION_ENV, REVISION),
+            (LISTEN_ADDR_ENV, ADDRESS),
+        ]),
+        Err(ServiceConfigError::MissingServerCertificate)
+    );
+    let mut missing_private_key = config_vars(ADDRESS);
+    missing_private_key.remove(3);
+    assert_eq!(
+        ServiceConfig::from_prefixed_vars(missing_private_key),
+        Err(ServiceConfigError::MissingServerPrivateKey)
+    );
+    let mut missing_client_ca = config_vars(ADDRESS);
+    missing_client_ca.remove(4);
+    assert_eq!(
+        ServiceConfig::from_prefixed_vars(missing_client_ca),
+        Err(ServiceConfigError::MissingClientCertificateAuthority)
+    );
 }
 
 #[test]
 fn service_config_rejects_changed_revision() {
-    let vars = [
-        (
-            SERVICE_CONFIG_REVISION_ENV,
-            "object-store-dispatch-service-shell-v2",
-        ),
-        (LISTEN_ADDR_ENV, ADDRESS),
-    ];
+    let mut vars = config_vars(ADDRESS);
+    vars[0].1 = "object-store-dispatch-service-mtls-shell-v2".to_string();
 
     assert_eq!(
         ServiceConfig::from_prefixed_vars(vars),
@@ -105,14 +169,11 @@ fn service_config_rejects_changed_revision() {
 
 #[test]
 fn service_config_rejects_unknown_object_dispatch_keys() {
-    let vars = [
-        (SERVICE_CONFIG_REVISION_ENV, REVISION),
-        (LISTEN_ADDR_ENV, ADDRESS),
-        (
-            "LORE_OBJECT_DISPATCH_CONTINUITY_DATABASE_URL",
-            "postgresql://must-not-be-consumed",
-        ),
-    ];
+    let mut vars = config_vars(ADDRESS);
+    vars.push((
+        "LORE_OBJECT_DISPATCH_CONTINUITY_DATABASE_URL".to_string(),
+        "postgresql://must-not-be-consumed".to_string(),
+    ));
 
     assert_eq!(
         ServiceConfig::from_prefixed_vars(vars),
@@ -137,22 +198,22 @@ fn service_config_rejects_bytewise_prefixed_nonunicode_key() {
 
 #[test]
 fn service_config_ignores_unrelated_environment_keys() {
-    let vars = [
-        (SERVICE_CONFIG_REVISION_ENV, REVISION),
-        (LISTEN_ADDR_ENV, ADDRESS),
-        ("UNRELATED_SECRET", "must-not-be-read"),
-    ];
+    let mut vars = config_vars(ADDRESS);
+    vars.push((
+        "UNRELATED_SECRET".to_string(),
+        "must-not-be-read".to_string(),
+    ));
 
     assert!(ServiceConfig::from_prefixed_vars(vars).is_ok());
 }
 
 #[test]
 fn service_config_rejects_duplicate_keys() {
-    let vars = [
-        (SERVICE_CONFIG_REVISION_ENV, REVISION),
-        (SERVICE_CONFIG_REVISION_ENV, REVISION),
-        (LISTEN_ADDR_ENV, ADDRESS),
-    ];
+    let mut vars = config_vars(ADDRESS);
+    vars.push((
+        SERVICE_CONFIG_REVISION_ENV.to_string(),
+        REVISION.to_string(),
+    ));
 
     assert_eq!(
         ServiceConfig::from_prefixed_vars(vars),
@@ -186,8 +247,88 @@ fn service_config_debug_contains_only_validated_nonsecret_values() {
 
     assert_eq!(
         format!("{config:?}"),
-        "ServiceConfig { service_config_revision: \"object-store-dispatch-service-shell-v1\", listen_addr: 127.0.0.1:50051 }"
+        "ServiceConfig { service_config_revision: \"object-store-dispatch-service-mtls-shell-v1\", listen_addr: 127.0.0.1:50051, server_cert_chain_pem_path: \"[REDACTED]\", server_private_key_pem_path: \"[REDACTED]\", client_ca_pem_path: \"[REDACTED]\" }"
     );
+}
+
+#[test]
+fn service_config_rejects_relative_or_reused_tls_paths() {
+    let mut relative = config_vars(ADDRESS);
+    relative[2].1 = "relative/server-cert.pem".to_string();
+    assert_eq!(
+        ServiceConfig::from_prefixed_vars(relative),
+        Err(ServiceConfigError::UnsafeTlsPath)
+    );
+
+    let mut duplicate = config_vars(ADDRESS);
+    duplicate[3].1 = duplicate[2].1.clone();
+    assert_eq!(
+        ServiceConfig::from_prefixed_vars(duplicate),
+        Err(ServiceConfigError::DuplicateTlsPath)
+    );
+}
+
+#[test]
+fn tls_file_read_errors_preserve_sources_without_disclosing_paths() {
+    use std::error::Error as _;
+
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let secret_path = std::env::temp_dir().join("sensitive-boundary-a-private-key.pem");
+    let cases = [
+        ServiceTlsConfig::from_pem_files(&secret_path, &manifest, &manifest)
+            .expect_err("missing server certificate must fail"),
+        ServiceTlsConfig::from_pem_files(&manifest, &secret_path, &manifest)
+            .expect_err("missing server private key must fail"),
+        ServiceTlsConfig::from_pem_files(&manifest, &manifest, &secret_path)
+            .expect_err("missing client CA must fail"),
+    ];
+
+    for error in cases {
+        assert!(
+            error.source().is_some(),
+            "file error must retain its source"
+        );
+        let rendered = format!("{error} {error:?}");
+        assert!(!rendered.contains("sensitive-boundary-a"));
+        assert!(!rendered.contains("private-key.pem"));
+    }
+}
+
+#[test]
+fn tls_file_loader_rejects_directories_and_oversized_material() {
+    let temp = TestDirectory::new();
+    let small = temp.path().join("small.pem");
+    std::fs::write(&small, b"nonempty test material")
+        .expect("small TLS test material must be writable");
+    let oversized = temp.path().join("oversized-sensitive-private-key.pem");
+    let oversized_len =
+        usize::try_from(MAX_TLS_PEM_BYTES + 1).expect("TLS material bound must fit usize in tests");
+    std::fs::write(&oversized, vec![b'x'; oversized_len])
+        .expect("oversized TLS test material must be writable");
+
+    for error in [
+        ServiceTlsConfig::from_pem_files(temp.path(), &small, &small)
+            .expect_err("certificate directory must fail closed"),
+        ServiceTlsConfig::from_pem_files(&small, temp.path(), &small)
+            .expect_err("private-key directory must fail closed"),
+        ServiceTlsConfig::from_pem_files(&small, &small, temp.path())
+            .expect_err("client-CA directory must fail closed"),
+    ] {
+        assert_eq!(error, ServiceTlsConfigError::NonRegularTlsMaterial);
+    }
+    for error in [
+        ServiceTlsConfig::from_pem_files(&oversized, &small, &small)
+            .expect_err("oversized certificate must fail closed"),
+        ServiceTlsConfig::from_pem_files(&small, &oversized, &small)
+            .expect_err("oversized private key must fail closed"),
+        ServiceTlsConfig::from_pem_files(&small, &small, &oversized)
+            .expect_err("oversized client CA must fail closed"),
+    ] {
+        assert_eq!(error, ServiceTlsConfigError::OversizedTlsMaterial);
+        let rendered = format!("{error} {error:?}");
+        assert!(!rendered.contains("oversized-sensitive"));
+        assert!(!rendered.contains("private-key.pem"));
+    }
 }
 
 #[tokio::test]
@@ -245,96 +386,6 @@ fn generated_server_accepts_the_source_dark_service() {
     }
 
     generated_server(SourceDarkObjectStoreDispatchService::new());
-}
-
-#[tokio::test]
-async fn prebound_server_keeps_all_seven_rpc_paths_source_dark_and_shuts_down() {
-    lore_base::runtime::LORE_CONTEXT
-        .scope(Arc::new(()), async {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener must bind");
-            let address = listener
-                .local_addr()
-                .expect("listener must expose its address");
-            let (shutdown_tx, shutdown_rx) = oneshot::channel();
-            let server = lore_base::lore_spawn!(async move {
-                serve_prebound(listener, async move {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-            });
-            let mut client = ObjectStoreDispatchServiceClient::connect(format!("http://{address}"))
-                .await
-                .expect("pre-bound source-dark server must accept a client");
-
-            assert_source_dark(
-                client
-                    .reserve_put(ReservePutRequestV1::default())
-                    .await
-                    .expect_err("ReservePut must stay source-dark"),
-            );
-            let upload = timeout(
-                RPC_TIMEOUT,
-                client.upload_put(tokio_stream::pending::<UploadPutChunkV1>()),
-            )
-            .await
-            .expect("UploadPut must return before polling a request frame")
-            .expect_err("UploadPut must stay source-dark");
-            assert_source_dark(upload);
-            assert_source_dark(
-                client
-                    .submit(ObjectStoreRequestV1::default())
-                    .await
-                    .expect_err("Submit must stay source-dark"),
-            );
-            assert_source_dark(
-                client
-                    .get_request(ObjectStoreRequestQueryV1::default())
-                    .await
-                    .expect_err("GetRequest must stay source-dark"),
-            );
-            assert_source_dark(
-                client
-                    .fetch_result(ObjectStoreResultFetchV1::default())
-                    .await
-                    .expect_err("FetchResult must fail before returning a stream"),
-            );
-            assert_source_dark(
-                client
-                    .acknowledge_result(ObjectStoreResultAckV1::default())
-                    .await
-                    .expect_err("AcknowledgeResult must stay source-dark"),
-            );
-            assert_source_dark(
-                client
-                    .discard_result(ObjectStoreResultDiscardV1::default())
-                    .await
-                    .expect_err("DiscardResult must stay source-dark"),
-            );
-
-            shutdown_tx
-                .send(())
-                .expect("server shutdown receiver must remain live");
-            timeout(RPC_TIMEOUT, server)
-                .await
-                .expect("graceful shutdown must be bounded")
-                .expect("server task must not panic")
-                .expect("server must shut down cleanly");
-        })
-        .await;
-}
-
-#[tokio::test]
-async fn prebound_server_rejects_an_unsafe_listener_before_serving() {
-    lore_base::runtime::LORE_CONTEXT
-        .scope(Arc::new(()), async {
-            let listener = TcpListener::bind("0.0.0.0:0").expect("wildcard listener must bind");
-
-            assert_eq!(
-                serve_prebound(listener, std::future::pending()).await,
-                Err(ServiceServerError::UnsafeListener)
-            );
-        })
-        .await;
 }
 
 #[tokio::test]
@@ -458,6 +509,10 @@ async fn metric_recorder_observes_each_closed_rpc_value_exactly_once() {
                 "user_agent",
                 "http.route",
                 "request.uri",
+                "uri_san",
+                "service_instance_id",
+                "provider_boundary_id",
+                "cell_id",
             ] {
                 assert!(
                     !server_source.contains(forbidden) && !metrics_source.contains(forbidden),
@@ -545,9 +600,29 @@ fn dockerfile_builds_a_nonroot_source_dark_runtime_image() {
     ));
     assert!(dockerfile.contains("USER 10001:10001"));
     assert!(dockerfile.contains(
-        "ENV LORE_OBJECT_DISPATCH_SERVICE_CONFIG_REVISION=object-store-dispatch-service-shell-v1"
+        "ENV LORE_OBJECT_DISPATCH_SERVICE_CONFIG_REVISION=object-store-dispatch-service-mtls-shell-v1"
     ));
     assert!(dockerfile.contains("ENV LORE_OBJECT_DISPATCH_LISTEN_ADDR=127.0.0.1:50051"));
+    for runtime_only_tls_path in [
+        SERVER_CERT_CHAIN_PEM_PATH_ENV,
+        SERVER_PRIVATE_KEY_PEM_PATH_ENV,
+        CLIENT_CA_PEM_PATH_ENV,
+    ] {
+        assert!(
+            !dockerfile
+                .lines()
+                .any(|line| line.starts_with(&format!("ENV {runtime_only_tls_path}="))),
+            "TLS material path {runtime_only_tls_path} must be supplied at runtime"
+        );
+    }
+    assert_eq!(
+        dockerfile
+            .lines()
+            .filter(|line| line.starts_with("ENV LORE_OBJECT_DISPATCH_"))
+            .count(),
+        2,
+        "the image must bake only the revision and loopback listener defaults"
+    );
     assert!(dockerfile.contains("ENTRYPOINT [\"lore-object-dispatch\"]"));
     assert!(!uppercase.contains("HEALTHCHECK"));
     for forbidden in [

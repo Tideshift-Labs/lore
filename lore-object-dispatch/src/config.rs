@@ -7,12 +7,18 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::Path;
+use std::path::PathBuf;
 
 use thiserror::Error;
 
-pub const SERVICE_CONFIG_REVISION: &str = "object-store-dispatch-service-shell-v1";
+pub const SERVICE_CONFIG_REVISION: &str = "object-store-dispatch-service-mtls-shell-v1";
 pub const SERVICE_CONFIG_REVISION_ENV: &str = "LORE_OBJECT_DISPATCH_SERVICE_CONFIG_REVISION";
 pub const LISTEN_ADDR_ENV: &str = "LORE_OBJECT_DISPATCH_LISTEN_ADDR";
+pub const SERVER_CERT_CHAIN_PEM_PATH_ENV: &str = "LORE_OBJECT_DISPATCH_SERVER_CERT_CHAIN_PEM_PATH";
+pub const SERVER_PRIVATE_KEY_PEM_PATH_ENV: &str =
+    "LORE_OBJECT_DISPATCH_SERVER_PRIVATE_KEY_PEM_PATH";
+pub const CLIENT_CA_PEM_PATH_ENV: &str = "LORE_OBJECT_DISPATCH_CLIENT_CA_PEM_PATH";
 const ENV_PREFIX: &str = "LORE_OBJECT_DISPATCH_";
 
 fn has_object_dispatch_prefix(key: &OsStr) -> bool {
@@ -38,6 +44,9 @@ fn has_object_dispatch_prefix(key: &OsStr) -> bool {
 pub struct ServiceConfig {
     service_config_revision: String,
     listen_addr: SocketAddr,
+    server_cert_chain_pem_path: PathBuf,
+    server_private_key_pem_path: PathBuf,
+    client_ca_pem_path: PathBuf,
 }
 
 impl fmt::Debug for ServiceConfig {
@@ -46,6 +55,9 @@ impl fmt::Debug for ServiceConfig {
             .debug_struct("ServiceConfig")
             .field("service_config_revision", &self.service_config_revision)
             .field("listen_addr", &self.listen_addr)
+            .field("server_cert_chain_pem_path", &"[REDACTED]")
+            .field("server_private_key_pem_path", &"[REDACTED]")
+            .field("client_ca_pem_path", &"[REDACTED]")
             .finish()
     }
 }
@@ -76,6 +88,9 @@ impl ServiceConfig {
     {
         let mut revision = None;
         let mut listen_addr = None;
+        let mut server_cert_chain_pem_path = None;
+        let mut server_private_key_pem_path = None;
+        let mut client_ca_pem_path = None;
         for (key, value) in vars {
             let key = key.into();
             if !has_object_dispatch_prefix(&key) {
@@ -99,6 +114,21 @@ impl ServiceConfig {
                         return Err(ServiceConfigError::DuplicateVariable);
                     }
                 }
+                SERVER_CERT_CHAIN_PEM_PATH_ENV => {
+                    if server_cert_chain_pem_path.replace(value).is_some() {
+                        return Err(ServiceConfigError::DuplicateVariable);
+                    }
+                }
+                SERVER_PRIVATE_KEY_PEM_PATH_ENV => {
+                    if server_private_key_pem_path.replace(value).is_some() {
+                        return Err(ServiceConfigError::DuplicateVariable);
+                    }
+                }
+                CLIENT_CA_PEM_PATH_ENV => {
+                    if client_ca_pem_path.replace(value).is_some() {
+                        return Err(ServiceConfigError::DuplicateVariable);
+                    }
+                }
                 _ => return Err(ServiceConfigError::UnknownVariable),
             }
         }
@@ -114,10 +144,31 @@ impl ServiceConfig {
         if listen_addr.port() == 0 || !listen_addr.ip().is_loopback() {
             return Err(ServiceConfigError::UnsafeListenAddress);
         }
+        let server_cert_chain_pem_path = required_absolute_path(
+            server_cert_chain_pem_path,
+            ServiceConfigError::MissingServerCertificate,
+        )?;
+        let server_private_key_pem_path = required_absolute_path(
+            server_private_key_pem_path,
+            ServiceConfigError::MissingServerPrivateKey,
+        )?;
+        let client_ca_pem_path = required_absolute_path(
+            client_ca_pem_path,
+            ServiceConfigError::MissingClientCertificateAuthority,
+        )?;
+        if server_cert_chain_pem_path == server_private_key_pem_path
+            || server_cert_chain_pem_path == client_ca_pem_path
+            || server_private_key_pem_path == client_ca_pem_path
+        {
+            return Err(ServiceConfigError::DuplicateTlsPath);
+        }
 
         Ok(Self {
             service_config_revision,
             listen_addr,
+            server_cert_chain_pem_path,
+            server_private_key_pem_path,
+            client_ca_pem_path,
         })
     }
 
@@ -128,6 +179,33 @@ impl ServiceConfig {
     pub fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
     }
+
+    pub fn server_cert_chain_pem_path(&self) -> &Path {
+        &self.server_cert_chain_pem_path
+    }
+
+    pub fn server_private_key_pem_path(&self) -> &Path {
+        &self.server_private_key_pem_path
+    }
+
+    pub fn client_ca_pem_path(&self) -> &Path {
+        &self.client_ca_pem_path
+    }
+}
+
+fn required_absolute_path(
+    value: Option<String>,
+    missing: ServiceConfigError,
+) -> Result<PathBuf, ServiceConfigError> {
+    let value = value.ok_or(missing)?;
+    if value.is_empty() {
+        return Err(ServiceConfigError::InvalidTlsPath);
+    }
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(ServiceConfigError::UnsafeTlsPath);
+    }
+    Ok(path)
 }
 
 #[derive(Debug, PartialEq, Eq, Error)]
@@ -150,4 +228,16 @@ pub enum ServiceConfigError {
     InvalidListenAddress,
     #[error("source-dark object-dispatch service must use a nonzero loopback listen address")]
     UnsafeListenAddress,
+    #[error("object-dispatch server certificate chain path is missing")]
+    MissingServerCertificate,
+    #[error("object-dispatch server private key path is missing")]
+    MissingServerPrivateKey,
+    #[error("object-dispatch client certificate authority path is missing")]
+    MissingClientCertificateAuthority,
+    #[error("object-dispatch TLS material path is invalid")]
+    InvalidTlsPath,
+    #[error("object-dispatch TLS material path must be absolute")]
+    UnsafeTlsPath,
+    #[error("object-dispatch TLS material paths must be distinct")]
+    DuplicateTlsPath,
 }

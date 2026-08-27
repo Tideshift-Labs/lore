@@ -58,20 +58,38 @@ service, RPC streaming shapes, messages, fields, presence, oneofs, and enums.
 
 The source-dark service shell implements all seven generated methods and immediately returns gRPC
 `UNAVAILABLE` before inspecting a request or polling an upload stream. `FetchResult` fails before it
-returns a stream. The shell has no continuity, admission, spool, allocation, or provider dependency,
-so it cannot create durable state or authorize traffic. Its rejection counter accepts only the
-seven frozen RPC names plus fixed `Unavailable` and `source_dark` labels; arbitrary HTTP paths,
-methods, user agents, tenants, boundaries, requests, buckets, and keys never become metric labels.
+returns a stream. Every transport requires a client certificate from the configured CA. An exact
+URI-SAN registry maps one certificate identity to one service instance, one provider boundary, and
+a nonempty bounded cell set before a handler can run. Missing, invalid, expired, unregistered, or
+ambiguous identities fail before the handler and record no source-dark RPC metric. The standalone
+binary deliberately installs an empty deny-all registry; later deployment composition must inject an
+accepted registry before any caller can reach a handler.
+
+Pure injected validators exact-match the certificate-derived boundary/cell scope, authenticated
+tenant, protocol and policy revisions, one ACTIVE unexpired cell allocation revision/fence, and one
+cell-admission ID/fence. They use an injected database time, have no lookup client, and remain
+unwired from the request handlers because the authenticated-tenant wire context and authoritative
+allocation/admission read sources are not frozen. The shell has no continuity, spool, allocation
+store, admission store, or provider dependency, so it cannot create durable state or authorize
+traffic. Its rejection counter accepts only the seven frozen RPC names plus fixed `Unavailable` and
+`source_dark` labels; arbitrary HTTP paths, methods, user agents, certificates, tenants, boundaries,
+requests, buckets, and keys never become metric labels.
 
 The standalone binary requires exactly:
 
-- `LORE_OBJECT_DISPATCH_SERVICE_CONFIG_REVISION=object-store-dispatch-service-shell-v1`; and
-- `LORE_OBJECT_DISPATCH_LISTEN_ADDR=<nonzero loopback socket address>`.
+- `LORE_OBJECT_DISPATCH_SERVICE_CONFIG_REVISION=object-store-dispatch-service-mtls-shell-v1`;
+- `LORE_OBJECT_DISPATCH_LISTEN_ADDR=<nonzero loopback socket address>`;
+- `LORE_OBJECT_DISPATCH_SERVER_CERT_CHAIN_PEM_PATH=<absolute path>`;
+- `LORE_OBJECT_DISPATCH_SERVER_PRIVATE_KEY_PEM_PATH=<absolute path>`; and
+- `LORE_OBJECT_DISPATCH_CLIENT_CA_PEM_PATH=<absolute path>`.
 
-Every other `LORE_OBJECT_DISPATCH_*` key is rejected at this shell stage. There is no health or
-readiness endpoint, server TLS, provider route, credential, migration installer, or loreserver
-composition. The local image supplies `127.0.0.1:50051`, runs as an unprivileged user, exposes no
-port, and has no readiness `HEALTHCHECK`.
+Every other `LORE_OBJECT_DISPATCH_*` key is rejected at this shell stage. TLS material is loaded only
+from regular files at those runtime paths, with a 1 MiB bound per file, and is redacted from
+diagnostics; no certificate or key is embedded in the image. There is no health or readiness
+endpoint, provider route, provider credential, migration
+installer, or loreserver composition. The local image supplies `127.0.0.1:50051`, runs as an
+unprivileged user, exposes no port, and has no readiness `HEALTHCHECK`. Its three TLS path variables
+and read-only secret mounts must be supplied at runtime; the image declares neither.
 
 ## Verification
 
@@ -89,11 +107,10 @@ cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact l
 cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detail
 ```
 
-The library suite validates service and continuity configuration, TLS material, redaction, SQL
-procedure shapes, exact numeric transfer, closed result decoding, migration identity, transient-
-error classification, and exact ambiguous-commit reconciliation. The regular gate passes 61 library,
-15 continuity integration, and 15 service-shell tests with zero failures and five intentionally
-ignored live contracts.
+The library suite validates service and continuity configuration, mutual TLS, URI-SAN registration,
+allocation/admission fence validation, redaction, SQL procedure shapes, exact numeric transfer,
+closed result decoding, migration identity, transient-error classification, and exact ambiguous-
+commit reconciliation.
 Each live contract has passed against disposable PostgreSQL 16 over real mTLS and the exact embedded
 migration. Run the shared-fixture contracts serially or by exact test name; a parallel all-ignored
 invocation can encounter expected serializable counter contention. They cover mapped boundary and

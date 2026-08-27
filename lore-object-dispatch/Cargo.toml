@@ -22,7 +22,9 @@ tokio-stream = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
+unicode-normalization = "0.1.25"
 uuid = { workspace = true }
+x509-parser = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

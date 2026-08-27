@@ -2847,7 +2847,9 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tracing",
+ "unicode-normalization",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
