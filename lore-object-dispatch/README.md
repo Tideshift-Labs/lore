@@ -31,6 +31,16 @@ independent authority. Its BLAKE3-256 is
 `1530e511568b42b9368b1296eb6cdbaeecbc7f56a7838ac253bcbeb95434e6dd`. Runtime code never installs
 the migration. Provisioning must install and read back separately attested bytes before readiness.
 
+## Private protocol
+
+The exact private `lore.object_dispatch.v1.ObjectStoreDispatchService` contract lives in
+`lore-proto`. It has seven RPCs, including client-streaming upload and server-streaming result
+fetch, with checked-in generated client and server bindings exported from
+`lore_proto::lore::object_dispatch::v1`. A semantic declaration-token guard pins the package,
+service, RPC streaming shapes, messages, fields, presence, oneofs, and enums. This wire surface is
+still dark: no service implementation is composed into loreserver and no provider route or
+credential is available to it.
+
 ## Verification
 
 ```sh
