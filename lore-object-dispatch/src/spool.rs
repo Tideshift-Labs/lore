@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::auth::validate_id;
-use crate::request::decode_canonical_uuid_v7;
+use crate::contract::decode_canonical_uuid_v7;
 
 pub const SPOOL_LAYOUT_REVISION_V1: &str = "object-store-spool-layout-v1";
 const BOUNDARY_TOKEN_PREFIX: &str = "odsb_";

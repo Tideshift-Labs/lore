@@ -21,6 +21,8 @@ use lore_proto::lore::object_dispatch::v1::result_consumer_context_v1;
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::contract::canonical_uuid_v7_timestamp;
+
 const FINGERPRINT_DOMAIN: &[u8] = b"object-dispatch-fingerprint-v1\0";
 const UUID_PAST_WINDOW_MS: i64 = 365 * 24 * 60 * 60 * 1_000;
 const UUID_FUTURE_WINDOW_MS: i64 = 5 * 60 * 1_000;
@@ -1090,44 +1092,7 @@ fn validate_first_seen_deadline(
 }
 
 fn parse_canonical_uuid_v7_timestamp(value: &str) -> Result<u64, RequestContractError> {
-    let decoded = decode_canonical_uuid_v7(value)?;
-    Ok(decoded[..6]
-        .iter()
-        .fold(0u64, |timestamp, byte| (timestamp << 8) | u64::from(*byte)))
-}
-
-pub(crate) fn decode_canonical_uuid_v7(value: &str) -> Result<[u8; 16], RequestContractError> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 36
-        || bytes[8] != b'-'
-        || bytes[13] != b'-'
-        || bytes[18] != b'-'
-        || bytes[23] != b'-'
-        || bytes[14] != b'7'
-        || !matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
-        || bytes.iter().enumerate().any(|(index, byte)| {
-            !(matches!(index, 8 | 13 | 18 | 23)
-                || byte.is_ascii_digit()
-                || matches!(byte, b'a'..=b'f'))
-        })
-    {
-        return Err(RequestContractError::InvalidUuidV7);
-    }
-    let mut decoded = [0u8; 16];
-    for (nibble_index, byte) in bytes.iter().filter(|byte| **byte != b'-').enumerate() {
-        let nibble = match byte {
-            b'0'..=b'9' => *byte - b'0',
-            b'a'..=b'f' => *byte - b'a' + 10,
-            _ => return Err(RequestContractError::InvalidUuidV7),
-        };
-        let target = &mut decoded[nibble_index / 2];
-        if nibble_index.is_multiple_of(2) {
-            *target = nibble << 4;
-        } else {
-            *target |= nibble;
-        }
-    }
-    Ok(decoded)
+    canonical_uuid_v7_timestamp(value).map_err(|_| RequestContractError::InvalidUuidV7)
 }
 
 fn validate_canonical_text(value: &str, maximum: u32) -> Result<(), RequestContractError> {

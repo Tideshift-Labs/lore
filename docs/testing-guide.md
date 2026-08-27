@@ -147,6 +147,11 @@ will update an older check constraint or state schema.
   contract stays loopback-only, digest-pinned, locked, nonroot, runtime-secret-mounted, and without a
   readiness probe. Gates: `cargo test -p lore-object-dispatch --test service_shell -j 4` and
   `cargo test -p lore-object-dispatch --test service_mtls -j 4`.
+  The pure ReservePut/no-dispatch/upload contracts remain unwired and effect-free. Their offline
+  suites pin the no-dispatch and upload canonical goldens, all 80 ReservePut evidence-presence masks
+  (exactly six valid), persisted admission recomputation, cleanup equality, lowest upload mismatch
+  field, rejection shapes, and redacted diagnostics. Gate: `cargo test -p lore-object-dispatch
+  --test no_dispatch --test reserve_put --test upload -j 4`.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.
