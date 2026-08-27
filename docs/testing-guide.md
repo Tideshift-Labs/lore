@@ -112,6 +112,14 @@ will update an older check constraint or state schema.
   annotation, and compiles against the checked-in client/server exports. Regenerate with `protoc`
   before accepting a fingerprint change. Gate: `cargo test -p lore-proto --test v1_object_dispatch
   -j 4`.
+- **CR-033 direct continuity authority client [SERVER]**: offline unit tests must pin each SQL
+  procedure name, full result projection, parameter arity, canonical text-to-`uint64` casts, exact
+  embedded-migration signature, and closed transition algebra. The runtime and reconciler paths use
+  different PostgreSQL login roles, so a live reconciler test needs two mTLS clients: a boundary
+  identity to seed `INTENT`/`BOUND`, then the exact
+  `object_dispatch_continuity_reconciler` session identity to exercise quarantine, ambiguity, and
+  both adjudication paths. A boundary-role-only live pass cannot prove reconciler authority. Gate:
+  `cargo test -p lore-object-dispatch -j 4`; the live tier remains explicit `#[ignore]`.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

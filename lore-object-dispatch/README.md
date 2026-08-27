@@ -17,7 +17,10 @@ mode. Connection and TLS material is redacted from diagnostics.
 - reading an intent by boundary and token;
 - binding an intent to durable local state;
 - marking exact completion evidence; and
-- marking a decisive no-local-effect outcome and release basis.
+- marking a decisive no-local-effect outcome and release basis;
+- quarantining an exact `INTENT` or `BOUND` row and recording `BOUND` dispatch ambiguity; and
+- preparing and completing typed `NO_LOCAL_EFFECT` or `NO_DISPATCH` adjudication with exact binding
+  and ownership-release evidence.
 
 Mutations run in serializable transactions. Unsigned 64-bit values cross the PostgreSQL
 `NUMERIC(20,0)` boundary as canonical decimal text, procedure results decode through closed enum and
@@ -49,13 +52,18 @@ cargo clippy -p lore-object-dispatch --all-targets -- -D warnings --no-deps
 cargo test -p lore-object-dispatch
 
 # Explicit, disposable, preprovisioned PostgreSQL target only
-cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_begin_replay_get_and_no_local_effect_cleanup
+cargo test -p lore-object-dispatch --test continuity_live -- --ignored
 ```
 
 The unit suite validates configuration, TLS material, redaction, SQL procedure shapes, exact numeric
 transfer, closed result decoding, migration identity, and transient-error classification. The
-ignored live contract requires explicit environment variables and a disposable database; it covers
-the real PostgreSQL 16 mTLS handshake, mapped boundary role, typed absence, serializable intent,
-replay/readback, and no-local-effect release. Deployment readiness still requires reviewed
-production BLAKE3 and typed validators, full cross-boundary negative isolation, timeout policy,
-retry/reconciliation behavior, and deployment-revision readback.
+regular gate passes 40 tests with zero failures and two intentionally ignored live contracts. With
+explicit environment variables and a disposable database, both live contracts pass against
+PostgreSQL 16 over real mTLS and the exact embedded migration. They cover mapped boundary and
+reconciler identities, typed absence, serializable mutations, exact transition replay and readback,
+no-local-effect release, quarantine, ambiguous dispatch, and both adjudication kinds through final
+release and Begin replay of the adjudicated row. The probe separately confirmed that a connection
+without a client certificate is rejected. The live harness uses mechanics-only SHA-256-as-BLAKE3
+and typed-validator stubs. Deployment readiness still requires reviewed production BLAKE3 and typed
+validators, full cross-boundary negative isolation, timeout and bounded retry policy, the remaining
+snapshot/release/read/epoch/compaction client surface, and deployment-revision readback.

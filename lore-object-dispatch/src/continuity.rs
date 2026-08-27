@@ -57,6 +57,34 @@ const MARK_NO_LOCAL_EFFECT_SQL: &str = "SELECT result_code, state, ownership_sta
       $1, $2, $3::text::object_store_continuity.uint64, \
       $4::text::object_store_continuity.uint64, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16\
     )";
+const QUARANTINE_SQL: &str = "SELECT result_code, state, ownership_state, authority_epoch::text, \
+    continuity_seq::text, continuity_token_id, row_blake3, external_committed_at_unix_ms FROM \
+    object_store_continuity.object_store_continuity_quarantine_v1(\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15\
+    )";
+const MARK_AMBIGUOUS_DISPATCH_SQL: &str = "SELECT result_code, state, ownership_state, \
+    authority_epoch::text, continuity_seq::text, continuity_token_id, row_blake3, \
+    external_committed_at_unix_ms FROM \
+    object_store_continuity.object_store_continuity_mark_ambiguous_dispatch_v1(\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15\
+    )";
+const PREPARE_ADJUDICATION_SQL: &str = "SELECT result_code, state, ownership_state, \
+    authority_epoch::text, continuity_seq::text, continuity_token_id, row_blake3, \
+    external_committed_at_unix_ms FROM \
+    object_store_continuity.object_store_continuity_prepare_adjudication_v1(\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16\
+    )";
+const COMPLETE_ADJUDICATION_SQL: &str = "SELECT result_code, state, ownership_state, \
+    authority_epoch::text, continuity_seq::text, continuity_token_id, row_blake3, \
+    external_committed_at_unix_ms FROM \
+    object_store_continuity.object_store_continuity_complete_adjudication_v1(\
+      $1, $2, $3::text::object_store_continuity.uint64, \
+      $4::text::object_store_continuity.uint64, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+      $16, $17, $18, $19\
+    )";
 
 /// Connection material for one continuity boundary identity.
 ///
@@ -263,6 +291,96 @@ pub struct MarkNoLocalEffectRequest {
     pub release_basis_blake3: [u8; 32],
 }
 
+/// Exact stored state and binding evidence accepted by a quarantine transition.
+pub enum QuarantinePriorState {
+    Intent,
+    Bound { local_binding_blake3: [u8; 32] },
+}
+
+impl QuarantinePriorState {
+    fn as_sql(&self) -> &'static str {
+        match self {
+            Self::Intent => "INTENT",
+            Self::Bound { .. } => "BOUND",
+        }
+    }
+
+    fn local_binding_blake3(&self) -> Option<&[u8]> {
+        match self {
+            Self::Intent => None,
+            Self::Bound {
+                local_binding_blake3,
+            } => Some(local_binding_blake3),
+        }
+    }
+}
+
+/// Reconciler transition that preserves ownership while making ambiguity explicit.
+pub struct QuarantineRequest {
+    pub identity: ContinuityIntentIdentity,
+    pub expected_prior_row_blake3: [u8; 32],
+    pub prior_state: QuarantinePriorState,
+    pub terminal_evidence_blake3: [u8; 32],
+}
+
+/// Reconciler transition from BOUND to explicit possible-provider-dispatch ambiguity.
+pub struct MarkAmbiguousDispatchRequest {
+    pub identity: ContinuityIntentIdentity,
+    pub expected_prior_row_blake3: [u8; 32],
+    pub local_binding_blake3: [u8; 32],
+    pub terminal_evidence_blake3: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContinuityAdjudicationKind {
+    NoLocalEffect,
+    NoDispatch,
+}
+
+impl ContinuityAdjudicationKind {
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::NoLocalEffect => "NO_LOCAL_EFFECT",
+            Self::NoDispatch => "NO_DISPATCH",
+        }
+    }
+
+    fn prepared_prior_state_sql(self) -> &'static str {
+        match self {
+            Self::NoLocalEffect => "QUARANTINED",
+            Self::NoDispatch => "AMBIGUOUS_DISPATCH",
+        }
+    }
+
+    fn final_state_sql(self) -> &'static str {
+        match self {
+            Self::NoLocalEffect => "ADJUDICATED_NO_LOCAL_EFFECT",
+            Self::NoDispatch => "ADJUDICATED_NO_DISPATCH",
+        }
+    }
+}
+
+/// First half of authenticated two-step adjudication. Ownership remains reserved.
+pub struct PrepareAdjudicationRequest {
+    pub identity: ContinuityIntentIdentity,
+    pub expected_prior_row_blake3: [u8; 32],
+    pub adjudication_kind: ContinuityAdjudicationKind,
+    pub local_binding_blake3: Option<[u8; 32]>,
+    pub terminal_evidence_blake3: [u8; 32],
+}
+
+/// Final adjudication evidence and exact release basis.
+pub struct CompleteAdjudicationRequest {
+    pub identity: ContinuityIntentIdentity,
+    pub expected_prior_row_blake3: [u8; 32],
+    pub adjudication_kind: ContinuityAdjudicationKind,
+    pub local_binding_blake3: Option<[u8; 32]>,
+    pub terminal_evidence_blake3: [u8; 32],
+    pub release_id: Uuid,
+    pub release_basis_id: String,
+    pub release_basis_blake3: [u8; 32],
+}
+
 /// Server-derived result projection shared by continuity mutation and read procedures.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContinuityProcedureResult {
@@ -417,6 +535,7 @@ impl ContinuityClient {
             .await
             .map_err(ContinuityError::postgres)?;
         let result = parse_procedure_result(&row)?;
+        validate_begin_result(&result, request)?;
         transaction
             .commit()
             .await
@@ -439,6 +558,9 @@ impl ContinuityClient {
             .await
             .map_err(ContinuityError::postgres)?;
         let result = parse_token_lookup(&row)?;
+        if let ContinuityTokenLookup::Found(found) = &result {
+            validate_lookup_result(found)?;
+        }
         let returned_token = match &result {
             ContinuityTokenLookup::Found(found) => found.continuity_token_id,
             ContinuityTokenLookup::NotFound {
@@ -491,6 +613,12 @@ impl ContinuityClient {
             .await
             .map_err(ContinuityError::postgres)?;
         let result = parse_procedure_result(&row)?;
+        validate_transition_result(
+            &result,
+            &request.identity,
+            ContinuityState::Bound,
+            ContinuityOwnershipState::ShadowReserved,
+        )?;
         transaction
             .commit()
             .await
@@ -537,6 +665,12 @@ impl ContinuityClient {
             .await
             .map_err(ContinuityError::postgres)?;
         let result = parse_procedure_result(&row)?;
+        validate_transition_result(
+            &result,
+            &request.identity,
+            ContinuityState::Completed,
+            ContinuityOwnershipState::ShadowReserved,
+        )?;
         transaction
             .commit()
             .await
@@ -550,11 +684,7 @@ impl ContinuityClient {
         request: &MarkNoLocalEffectRequest,
     ) -> Result<ContinuityProcedureResult, ContinuityError> {
         validate_identity(&request.identity)?;
-        if request.release_basis_id.is_empty() {
-            return Err(ContinuityError::InvalidConfiguration(
-                "release basis ID must be nonempty",
-            ));
-        }
+        validate_release_basis_id(&request.release_basis_id)?;
         let epoch = request.identity.authority_epoch.to_string();
         let sequence = request.identity.continuity_seq.to_string();
         let mut client = self.client.lock().await;
@@ -589,12 +719,368 @@ impl ContinuityClient {
             .await
             .map_err(ContinuityError::postgres)?;
         let result = parse_procedure_result(&row)?;
+        validate_transition_result(
+            &result,
+            &request.identity,
+            ContinuityState::NoLocalEffect,
+            ContinuityOwnershipState::OwnershipReleased,
+        )?;
         transaction
             .commit()
             .await
             .map_err(ContinuityError::postgres)?;
         Ok(result)
     }
+
+    /// Preserve shadow ownership while recording an exact INTENT or BOUND quarantine.
+    pub async fn quarantine(
+        &self,
+        request: &QuarantineRequest,
+    ) -> Result<ContinuityProcedureResult, ContinuityError> {
+        validate_identity(&request.identity)?;
+        let epoch = request.identity.authority_epoch.to_string();
+        let sequence = request.identity.continuity_seq.to_string();
+        let local_binding = request.prior_state.local_binding_blake3();
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .build_transaction()
+            .isolation_level(MUTATION_ISOLATION_LEVEL)
+            .start()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let row = transaction
+            .query_one(
+                QUARANTINE_SQL,
+                &[
+                    &API_REVISION,
+                    &request.identity.provider_boundary_id,
+                    &epoch,
+                    &sequence,
+                    &request.identity.continuity_token_id,
+                    &request.identity.authenticated_cell_id,
+                    &request.identity.authenticated_tenant_id,
+                    &request.identity.logical_request_id,
+                    &request.identity.attempt_id,
+                    &request.identity.intent_kind.as_sql(),
+                    &&request.identity.selected_fingerprint[..],
+                    &&request.expected_prior_row_blake3[..],
+                    &request.prior_state.as_sql(),
+                    &local_binding,
+                    &&request.terminal_evidence_blake3[..],
+                ],
+            )
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let result = parse_procedure_result(&row)?;
+        validate_transition_result(
+            &result,
+            &request.identity,
+            ContinuityState::Quarantined,
+            ContinuityOwnershipState::ShadowReserved,
+        )?;
+        transaction
+            .commit()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        Ok(result)
+    }
+
+    /// Preserve shadow ownership while recording a BOUND dispatch as externally ambiguous.
+    pub async fn mark_ambiguous_dispatch(
+        &self,
+        request: &MarkAmbiguousDispatchRequest,
+    ) -> Result<ContinuityProcedureResult, ContinuityError> {
+        validate_identity(&request.identity)?;
+        let epoch = request.identity.authority_epoch.to_string();
+        let sequence = request.identity.continuity_seq.to_string();
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .build_transaction()
+            .isolation_level(MUTATION_ISOLATION_LEVEL)
+            .start()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let row = transaction
+            .query_one(
+                MARK_AMBIGUOUS_DISPATCH_SQL,
+                &[
+                    &API_REVISION,
+                    &request.identity.provider_boundary_id,
+                    &epoch,
+                    &sequence,
+                    &request.identity.continuity_token_id,
+                    &request.identity.authenticated_cell_id,
+                    &request.identity.authenticated_tenant_id,
+                    &request.identity.logical_request_id,
+                    &request.identity.attempt_id,
+                    &request.identity.intent_kind.as_sql(),
+                    &&request.identity.selected_fingerprint[..],
+                    &&request.expected_prior_row_blake3[..],
+                    &&request.local_binding_blake3[..],
+                    &&request.terminal_evidence_blake3[..],
+                    &"BOUND",
+                ],
+            )
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let result = parse_procedure_result(&row)?;
+        validate_transition_result(
+            &result,
+            &request.identity,
+            ContinuityState::AmbiguousDispatch,
+            ContinuityOwnershipState::ShadowReserved,
+        )?;
+        transaction
+            .commit()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        Ok(result)
+    }
+
+    /// Prepare a typed adjudication while retaining shadow ownership.
+    pub async fn prepare_adjudication(
+        &self,
+        request: &PrepareAdjudicationRequest,
+    ) -> Result<ContinuityProcedureResult, ContinuityError> {
+        validate_identity(&request.identity)?;
+        validate_adjudication_binding(
+            request.adjudication_kind,
+            request.local_binding_blake3.as_ref(),
+        )?;
+        let epoch = request.identity.authority_epoch.to_string();
+        let sequence = request.identity.continuity_seq.to_string();
+        let local_binding = request
+            .local_binding_blake3
+            .as_ref()
+            .map(|digest| &digest[..]);
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .build_transaction()
+            .isolation_level(MUTATION_ISOLATION_LEVEL)
+            .start()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let row = transaction
+            .query_one(
+                PREPARE_ADJUDICATION_SQL,
+                &[
+                    &API_REVISION,
+                    &request.identity.provider_boundary_id,
+                    &epoch,
+                    &sequence,
+                    &request.identity.continuity_token_id,
+                    &request.identity.authenticated_cell_id,
+                    &request.identity.authenticated_tenant_id,
+                    &request.identity.logical_request_id,
+                    &request.identity.attempt_id,
+                    &request.identity.intent_kind.as_sql(),
+                    &&request.identity.selected_fingerprint[..],
+                    &&request.expected_prior_row_blake3[..],
+                    &request.adjudication_kind.prepared_prior_state_sql(),
+                    &local_binding,
+                    &&request.terminal_evidence_blake3[..],
+                    &request.adjudication_kind.as_sql(),
+                ],
+            )
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let result = parse_procedure_result(&row)?;
+        validate_transition_result(
+            &result,
+            &request.identity,
+            ContinuityState::AdjudicationPrepared,
+            ContinuityOwnershipState::ShadowReserved,
+        )?;
+        transaction
+            .commit()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        Ok(result)
+    }
+
+    /// Complete a prepared adjudication and release its exact shadow ownership once.
+    pub async fn complete_adjudication(
+        &self,
+        request: &CompleteAdjudicationRequest,
+    ) -> Result<ContinuityProcedureResult, ContinuityError> {
+        validate_identity(&request.identity)?;
+        validate_adjudication_binding(
+            request.adjudication_kind,
+            request.local_binding_blake3.as_ref(),
+        )?;
+        validate_release_basis_id(&request.release_basis_id)?;
+        let epoch = request.identity.authority_epoch.to_string();
+        let sequence = request.identity.continuity_seq.to_string();
+        let local_binding = request
+            .local_binding_blake3
+            .as_ref()
+            .map(|digest| &digest[..]);
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .build_transaction()
+            .isolation_level(MUTATION_ISOLATION_LEVEL)
+            .start()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let row = transaction
+            .query_one(
+                COMPLETE_ADJUDICATION_SQL,
+                &[
+                    &API_REVISION,
+                    &request.identity.provider_boundary_id,
+                    &epoch,
+                    &sequence,
+                    &request.identity.continuity_token_id,
+                    &request.identity.authenticated_cell_id,
+                    &request.identity.authenticated_tenant_id,
+                    &request.identity.logical_request_id,
+                    &request.identity.attempt_id,
+                    &request.identity.intent_kind.as_sql(),
+                    &&request.identity.selected_fingerprint[..],
+                    &&request.expected_prior_row_blake3[..],
+                    &local_binding,
+                    &&request.terminal_evidence_blake3[..],
+                    &request.adjudication_kind.as_sql(),
+                    &request.adjudication_kind.final_state_sql(),
+                    &request.release_id,
+                    &request.release_basis_id,
+                    &&request.release_basis_blake3[..],
+                ],
+            )
+            .await
+            .map_err(ContinuityError::postgres)?;
+        let result = parse_procedure_result(&row)?;
+        let expected_state = match request.adjudication_kind {
+            ContinuityAdjudicationKind::NoLocalEffect => ContinuityState::AdjudicatedNoLocalEffect,
+            ContinuityAdjudicationKind::NoDispatch => ContinuityState::AdjudicatedNoDispatch,
+        };
+        validate_transition_result(
+            &result,
+            &request.identity,
+            expected_state,
+            ContinuityOwnershipState::OwnershipReleased,
+        )?;
+        transaction
+            .commit()
+            .await
+            .map_err(ContinuityError::postgres)?;
+        Ok(result)
+    }
+}
+
+fn validate_begin_result(
+    result: &ContinuityProcedureResult,
+    request: &BeginIntentRequest,
+) -> Result<(), ContinuityError> {
+    match result.result_code {
+        ContinuityResultCode::Created
+            if result.state == ContinuityState::Intent
+                && result.ownership_state == ContinuityOwnershipState::ShadowReserved => {}
+        ContinuityResultCode::Replay if valid_state_ownership_pair(result) => {}
+        ContinuityResultCode::Created | ContinuityResultCode::Replay => {
+            return Err(ContinuityError::InvalidResponse(
+                "begin result state is inconsistent",
+            ));
+        }
+        ContinuityResultCode::Found | ContinuityResultCode::Updated => {
+            return Err(ContinuityError::InvalidResponse(
+                "begin result code is unsupported",
+            ));
+        }
+    }
+    if result.authority_epoch != request.expected_authority_epoch
+        || result.continuity_token_id != request.continuity_token_id
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "begin result identity is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_state_ownership_pair(result: &ContinuityProcedureResult) -> bool {
+    match result.state {
+        ContinuityState::Intent
+        | ContinuityState::Quarantined
+        | ContinuityState::AmbiguousDispatch
+        | ContinuityState::AdjudicationPrepared => {
+            result.ownership_state == ContinuityOwnershipState::ShadowReserved
+        }
+        ContinuityState::NoLocalEffect
+        | ContinuityState::AdjudicatedNoLocalEffect
+        | ContinuityState::AdjudicatedNoDispatch => {
+            result.ownership_state == ContinuityOwnershipState::OwnershipReleased
+        }
+        ContinuityState::Bound | ContinuityState::Completed => true,
+    }
+}
+
+fn validate_lookup_result(result: &ContinuityProcedureResult) -> Result<(), ContinuityError> {
+    if result.result_code != ContinuityResultCode::Found {
+        return Err(ContinuityError::InvalidResponse(
+            "token lookup result code is unsupported",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_transition_result(
+    result: &ContinuityProcedureResult,
+    identity: &ContinuityIntentIdentity,
+    expected_state: ContinuityState,
+    expected_ownership: ContinuityOwnershipState,
+) -> Result<(), ContinuityError> {
+    if !matches!(
+        result.result_code,
+        ContinuityResultCode::Updated | ContinuityResultCode::Replay
+    ) {
+        return Err(ContinuityError::InvalidResponse(
+            "transition result code is unsupported",
+        ));
+    }
+    if result.state != expected_state || result.ownership_state != expected_ownership {
+        return Err(ContinuityError::InvalidResponse(
+            "transition result state is inconsistent",
+        ));
+    }
+    if result.authority_epoch != identity.authority_epoch
+        || result.continuity_seq != identity.continuity_seq
+        || result.continuity_token_id != identity.continuity_token_id
+    {
+        return Err(ContinuityError::InvalidResponse(
+            "transition result identity is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_adjudication_binding(
+    kind: ContinuityAdjudicationKind,
+    local_binding_blake3: Option<&[u8; 32]>,
+) -> Result<(), ContinuityError> {
+    match (kind, local_binding_blake3) {
+        (ContinuityAdjudicationKind::NoLocalEffect, None)
+        | (ContinuityAdjudicationKind::NoDispatch, Some(_)) => Ok(()),
+        (ContinuityAdjudicationKind::NoLocalEffect, Some(_)) => {
+            Err(ContinuityError::InvalidConfiguration(
+                "no-local-effect adjudication forbids a local binding",
+            ))
+        }
+        (ContinuityAdjudicationKind::NoDispatch, None) => {
+            Err(ContinuityError::InvalidConfiguration(
+                "no-dispatch adjudication requires a local binding",
+            ))
+        }
+    }
+}
+
+fn validate_release_basis_id(release_basis_id: &str) -> Result<(), ContinuityError> {
+    if release_basis_id.is_empty() {
+        return Err(ContinuityError::InvalidConfiguration(
+            "release basis ID must be nonempty",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_identity(identity: &ContinuityIntentIdentity) -> Result<(), ContinuityError> {
@@ -835,6 +1321,34 @@ fn postgres_error_shape_is_transient(is_closed: bool, sqlstate: Option<&str>) ->
 mod tests {
     use super::*;
 
+    fn sample_identity() -> ContinuityIntentIdentity {
+        ContinuityIntentIdentity {
+            provider_boundary_id: "boundary-a".to_string(),
+            authority_epoch: 7,
+            continuity_seq: 11,
+            continuity_token_id: Uuid::from_u128(13),
+            authenticated_cell_id: "cell-a".to_string(),
+            authenticated_tenant_id: "tenant-a".to_string(),
+            logical_request_id: Uuid::from_u128(17),
+            attempt_id: Uuid::from_u128(19),
+            intent_kind: ContinuityIntentKind::DispatchCas,
+            selected_fingerprint: [0x21; 32],
+        }
+    }
+
+    fn sample_result(identity: &ContinuityIntentIdentity) -> ContinuityProcedureResult {
+        ContinuityProcedureResult {
+            result_code: ContinuityResultCode::Updated,
+            state: ContinuityState::Quarantined,
+            ownership_state: ContinuityOwnershipState::ShadowReserved,
+            authority_epoch: identity.authority_epoch,
+            continuity_seq: identity.continuity_seq,
+            continuity_token_id: identity.continuity_token_id,
+            row_blake3: [0x51; 32],
+            external_committed_at_unix_ms: 23,
+        }
+    }
+
     fn normalized_embedded_migration() -> String {
         std::str::from_utf8(crate::schema::CONTINUITY_MIGRATION_V1)
             .expect("embedded migration must remain UTF-8 SQL")
@@ -877,6 +1391,35 @@ mod tests {
              logical_request_id uuid, attempt_id uuid, intent_kind text, selected_fingerprint bytea, \
              expected_prior_row_blake3 bytea, terminal_evidence_blake3 bytea, release_id uuid, \
              release_basis_id text, release_basis_blake3 bytea )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_quarantine_v1( \
+             api_revision text, provider_boundary_id text, authority_epoch \
+             object_store_continuity.uint64, continuity_seq object_store_continuity.uint64, \
+             continuity_token_id uuid, authenticated_cell_id text, authenticated_tenant_id text, \
+             logical_request_id uuid, attempt_id uuid, intent_kind text, selected_fingerprint bytea, \
+             expected_prior_row_blake3 bytea, expected_prior_state text, local_binding_blake3 bytea, \
+             terminal_evidence_blake3 bytea )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_mark_ambiguous_dispatch_v1( \
+             api_revision text, provider_boundary_id text, authority_epoch \
+             object_store_continuity.uint64, continuity_seq object_store_continuity.uint64, \
+             continuity_token_id uuid, authenticated_cell_id text, authenticated_tenant_id text, \
+             logical_request_id uuid, attempt_id uuid, intent_kind text, selected_fingerprint bytea, \
+             expected_prior_row_blake3 bytea, local_binding_blake3 bytea, \
+             terminal_evidence_blake3 bytea, expected_prior_state text DEFAULT 'BOUND' )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_prepare_adjudication_v1( \
+             api_revision text, provider_boundary_id text, authority_epoch \
+             object_store_continuity.uint64, continuity_seq object_store_continuity.uint64, \
+             continuity_token_id uuid, authenticated_cell_id text, authenticated_tenant_id text, \
+             logical_request_id uuid, attempt_id uuid, intent_kind text, selected_fingerprint bytea, \
+             expected_prior_row_blake3 bytea, expected_prior_state text, local_binding_blake3 bytea, \
+             terminal_evidence_blake3 bytea, adjudication_kind text )",
+            "CREATE FUNCTION object_store_continuity.object_store_continuity_complete_adjudication_v1( \
+             api_revision text, provider_boundary_id text, authority_epoch \
+             object_store_continuity.uint64, continuity_seq object_store_continuity.uint64, \
+             continuity_token_id uuid, authenticated_cell_id text, authenticated_tenant_id text, \
+             logical_request_id uuid, attempt_id uuid, intent_kind text, selected_fingerprint bytea, \
+             expected_prior_row_blake3 bytea, local_binding_blake3 bytea, \
+             terminal_evidence_blake3 bytea, adjudication_kind text, final_state text, \
+             release_id uuid, release_basis_id text, release_basis_blake3 bytea )",
         ] {
             assert!(
                 migration.contains(signature),
@@ -950,6 +1493,307 @@ mod tests {
             assert!(query.contains(last_parameter), "query: {query}");
             assert!(!query.contains("::bigint"), "query: {query}");
             assert_eq!(query.matches("SELECT").count(), 1, "query: {query}");
+        }
+    }
+
+    #[test]
+    fn reconciler_queries_match_the_frozen_procedure_arity_and_numeric_identity() {
+        const RESULT_PROJECTION: &str = "SELECT result_code, state, ownership_state, authority_epoch::text, \
+    continuity_seq::text, continuity_token_id, row_blake3, \
+    external_committed_at_unix_ms FROM";
+        for (query, procedure, parameter_count) in [
+            (QUARANTINE_SQL, "object_store_continuity_quarantine_v1", 15),
+            (
+                MARK_AMBIGUOUS_DISPATCH_SQL,
+                "object_store_continuity_mark_ambiguous_dispatch_v1",
+                15,
+            ),
+            (
+                PREPARE_ADJUDICATION_SQL,
+                "object_store_continuity_prepare_adjudication_v1",
+                16,
+            ),
+            (
+                COMPLETE_ADJUDICATION_SQL,
+                "object_store_continuity_complete_adjudication_v1",
+                19,
+            ),
+        ] {
+            assert!(
+                query.starts_with(RESULT_PROJECTION),
+                "query does not present the complete procedure-result projection: {query}"
+            );
+            assert!(
+                query.contains(&format!("object_store_continuity.{procedure}(")),
+                "query did not call {procedure}: {query}"
+            );
+            assert_eq!(
+                query
+                    .matches("::text::object_store_continuity.uint64")
+                    .count(),
+                2,
+                "query: {query}"
+            );
+            assert!(
+                query.contains(&format!("${parameter_count}")),
+                "query does not present all {parameter_count} parameters: {query}"
+            );
+            assert!(!query.contains(&format!("${}", parameter_count + 1)));
+            assert!(!query.contains("::bigint"), "query: {query}");
+            assert_eq!(query.matches("SELECT").count(), 1, "query: {query}");
+        }
+    }
+
+    #[test]
+    fn reconciler_state_algebra_is_closed_and_pairs_adjudication_kind_with_final_state() {
+        assert_eq!(QuarantinePriorState::Intent.as_sql(), "INTENT");
+        assert_eq!(
+            QuarantinePriorState::Bound {
+                local_binding_blake3: [0x11; 32],
+            }
+            .as_sql(),
+            "BOUND"
+        );
+        for (kind, prior_state, final_state) in [
+            (
+                ContinuityAdjudicationKind::NoLocalEffect,
+                "QUARANTINED",
+                "ADJUDICATED_NO_LOCAL_EFFECT",
+            ),
+            (
+                ContinuityAdjudicationKind::NoDispatch,
+                "AMBIGUOUS_DISPATCH",
+                "ADJUDICATED_NO_DISPATCH",
+            ),
+        ] {
+            assert_eq!(kind.prepared_prior_state_sql(), prior_state);
+            assert_eq!(kind.final_state_sql(), final_state);
+        }
+    }
+
+    #[test]
+    fn quarantine_prior_state_preserves_only_bound_local_binding_evidence() {
+        assert_eq!(QuarantinePriorState::Intent.local_binding_blake3(), None);
+        let digest = [0xa5; 32];
+        assert_eq!(
+            QuarantinePriorState::Bound {
+                local_binding_blake3: digest,
+            }
+            .local_binding_blake3(),
+            Some(digest.as_slice())
+        );
+    }
+
+    #[test]
+    fn quarantine_request_requires_exact_terminal_evidence() {
+        let request = QuarantineRequest {
+            identity: sample_identity(),
+            expected_prior_row_blake3: [0x31; 32],
+            prior_state: QuarantinePriorState::Intent,
+            terminal_evidence_blake3: [0x41; 32],
+        };
+        assert_eq!(request.terminal_evidence_blake3, [0x41; 32]);
+        assert!(QUARANTINE_SQL.contains("$15"));
+    }
+
+    #[test]
+    fn adjudication_kind_requires_its_exact_local_binding_shape() {
+        let digest = [0x3c; 32];
+        assert!(
+            validate_adjudication_binding(ContinuityAdjudicationKind::NoLocalEffect, None).is_ok()
+        );
+        assert!(
+            validate_adjudication_binding(ContinuityAdjudicationKind::NoDispatch, Some(&digest))
+                .is_ok()
+        );
+        for (kind, binding) in [
+            (ContinuityAdjudicationKind::NoLocalEffect, Some(&digest)),
+            (ContinuityAdjudicationKind::NoDispatch, None),
+        ] {
+            assert!(matches!(
+                validate_adjudication_binding(kind, binding),
+                Err(ContinuityError::InvalidConfiguration(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn release_basis_validation_rejects_empty_ids_before_database_access() {
+        assert!(validate_release_basis_id("release-basis:v1").is_ok());
+        assert!(matches!(
+            validate_release_basis_id(""),
+            Err(ContinuityError::InvalidConfiguration(
+                "release basis ID must be nonempty"
+            ))
+        ));
+    }
+
+    #[test]
+    fn transition_result_validation_accepts_only_exact_identity_state_and_ownership() {
+        let identity = sample_identity();
+        let exact = sample_result(&identity);
+        validate_transition_result(
+            &exact,
+            &identity,
+            ContinuityState::Quarantined,
+            ContinuityOwnershipState::ShadowReserved,
+        )
+        .expect("the exact transition result must validate");
+
+        let mut replay = exact.clone();
+        replay.result_code = ContinuityResultCode::Replay;
+        validate_transition_result(
+            &replay,
+            &identity,
+            ContinuityState::Quarantined,
+            ContinuityOwnershipState::ShadowReserved,
+        )
+        .expect("an exact replay must validate");
+
+        let mut wrong_identity = exact.clone();
+        wrong_identity.continuity_seq += 1;
+        let mut wrong_code = exact.clone();
+        wrong_code.result_code = ContinuityResultCode::Found;
+        let mut wrong_state = exact.clone();
+        wrong_state.state = ContinuityState::AmbiguousDispatch;
+        let mut wrong_ownership = exact;
+        wrong_ownership.ownership_state = ContinuityOwnershipState::OwnershipReleased;
+        for result in [wrong_identity, wrong_code, wrong_state, wrong_ownership] {
+            assert!(matches!(
+                validate_transition_result(
+                    &result,
+                    &identity,
+                    ContinuityState::Quarantined,
+                    ContinuityOwnershipState::ShadowReserved,
+                ),
+                Err(ContinuityError::InvalidResponse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn begin_result_validation_accepts_current_row_replay_and_rejects_invalid_shapes() {
+        let identity = sample_identity();
+        let request = BeginIntentRequest {
+            provider_boundary_id: identity.provider_boundary_id.clone(),
+            expected_authority_epoch: identity.authority_epoch,
+            continuity_token_id: identity.continuity_token_id,
+            intent_kind: identity.intent_kind,
+            authenticated_cell_id: identity.authenticated_cell_id.clone(),
+            authenticated_tenant_id: identity.authenticated_tenant_id.clone(),
+            operation_quota_class: "test".to_string(),
+            logical_request_id: identity.logical_request_id,
+            attempt_id: identity.attempt_id,
+            selected_fingerprint: identity.selected_fingerprint,
+            continuity_policy_revision: "policy-v1".to_string(),
+            quota_bytes: 1,
+            quota_rows: 1,
+            quota_concurrency: 1,
+            retention_deadline_unix_ms: 1,
+        };
+        let mut exact = sample_result(&identity);
+        exact.result_code = ContinuityResultCode::Created;
+        exact.state = ContinuityState::Intent;
+        validate_begin_result(&exact, &request).expect("the exact begin result must validate");
+
+        for (state, ownership_state) in [
+            (
+                ContinuityState::Intent,
+                ContinuityOwnershipState::ShadowReserved,
+            ),
+            (
+                ContinuityState::Bound,
+                ContinuityOwnershipState::ShadowReserved,
+            ),
+            (
+                ContinuityState::Bound,
+                ContinuityOwnershipState::OwnershipReleased,
+            ),
+            (
+                ContinuityState::Completed,
+                ContinuityOwnershipState::ShadowReserved,
+            ),
+            (
+                ContinuityState::Completed,
+                ContinuityOwnershipState::OwnershipReleased,
+            ),
+            (
+                ContinuityState::NoLocalEffect,
+                ContinuityOwnershipState::OwnershipReleased,
+            ),
+            (
+                ContinuityState::Quarantined,
+                ContinuityOwnershipState::ShadowReserved,
+            ),
+            (
+                ContinuityState::AmbiguousDispatch,
+                ContinuityOwnershipState::ShadowReserved,
+            ),
+            (
+                ContinuityState::AdjudicationPrepared,
+                ContinuityOwnershipState::ShadowReserved,
+            ),
+            (
+                ContinuityState::AdjudicatedNoLocalEffect,
+                ContinuityOwnershipState::OwnershipReleased,
+            ),
+            (
+                ContinuityState::AdjudicatedNoDispatch,
+                ContinuityOwnershipState::OwnershipReleased,
+            ),
+        ] {
+            let mut replay = exact.clone();
+            replay.result_code = ContinuityResultCode::Replay;
+            replay.state = state;
+            replay.ownership_state = ownership_state;
+            validate_begin_result(&replay, &request)
+                .expect("begin replay must accept every closed stored-row state");
+        }
+
+        let mut wrong_identity = exact.clone();
+        wrong_identity.continuity_token_id = Uuid::from_u128(29);
+        let mut wrong_code = exact.clone();
+        wrong_code.result_code = ContinuityResultCode::Updated;
+        let mut wrong_state = exact.clone();
+        wrong_state.state = ContinuityState::Bound;
+        let mut wrong_ownership = exact.clone();
+        wrong_ownership.ownership_state = ContinuityOwnershipState::OwnershipReleased;
+        let mut wrong_replay_ownership = exact;
+        wrong_replay_ownership.result_code = ContinuityResultCode::Replay;
+        wrong_replay_ownership.state = ContinuityState::AdjudicatedNoDispatch;
+        for result in [
+            wrong_identity,
+            wrong_code,
+            wrong_state,
+            wrong_ownership,
+            wrong_replay_ownership,
+        ] {
+            assert!(matches!(
+                validate_begin_result(&result, &request),
+                Err(ContinuityError::InvalidResponse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn token_lookup_result_validation_accepts_only_found() {
+        let identity = sample_identity();
+        let mut found = sample_result(&identity);
+        found.result_code = ContinuityResultCode::Found;
+        validate_lookup_result(&found).expect("FOUND must validate for token lookup");
+        for result_code in [
+            ContinuityResultCode::Created,
+            ContinuityResultCode::Replay,
+            ContinuityResultCode::Updated,
+        ] {
+            let mut invalid = found.clone();
+            invalid.result_code = result_code;
+            assert!(matches!(
+                validate_lookup_result(&invalid),
+                Err(ContinuityError::InvalidResponse(
+                    "token lookup result code is unsupported"
+                ))
+            ));
         }
     }
 
