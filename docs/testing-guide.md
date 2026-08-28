@@ -162,6 +162,10 @@ will update an older check constraint or state schema.
   tags, optional-presence equality, closed durable-consumer kinds, terminal tuple and byte-handle
   equality, the inclusive preimage bound, and ACK receipt purge ordering with
   `cargo test -p lore-object-dispatch --test result_ack -j 4`.
+  Result discard must independently pin every fragment successor/removal/tombstone, startup, and
+  durable cancellation/supersession preimage. Exercise closed raw enums, successor tuple shapes,
+  checkpoint ordering, exact context/result binding, byte-handle presence, inclusive bounds, and
+  receipt purge ordering with `cargo test -p lore-object-dispatch --test result_discard -j 4`.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.
