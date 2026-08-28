@@ -22,6 +22,7 @@ pub mod local_authority_provisioning;
 pub mod local_authority_put_reservation_provisioning;
 pub mod local_authority_put_reservation_record_codec;
 pub mod local_authority_put_reservation_schema;
+pub mod local_authority_reserve_put_mutation;
 pub mod local_authority_schema;
 pub mod metrics;
 pub mod no_dispatch;
