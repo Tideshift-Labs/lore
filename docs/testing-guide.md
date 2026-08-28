@@ -183,6 +183,30 @@ will update an older check constraint or state schema.
   the drain matrix rejects any head evolution unless its revision delta exactly equals the open-lease
   decrement and its commit time is not older than the reservation. This remains pure `[SERVER]`
   source with no loreserver composition, provider traffic, credentials, or deployment authority.
+  The nine `local_authority_*` live tests (the retained cell-authority half; CR-033 D5's install
+  set is 0002, 0003, then 0007-0017) have a checked-in provisioning harness:
+  `lore-object-dispatch/tests/run-local-authority-live.ps1`. Unlike the retention-client live
+  tier, these tests call `tokio_postgres::connect` with `NoTls` -- no certificates, no
+  `pg_hba.conf`, no `ssl=on`; the container runs with `POSTGRES_HOST_AUTH_METHOD=trust` and plain
+  `postgresql://postgres@...` URLs. Eight of the nine self-provision: each idempotently creates
+  the four `object_dispatch_retention_*` roles itself and installs its own required migration
+  subset from its own `include_str!`'d copy of the migration file, so the harness only needs to
+  hand each an empty fresh database. The one exception is `local_authority_canonical_codec.rs`'s
+  live test, which installs neither roles nor migrations itself and documents its exact
+  requirement in its own `#[ignore = "..."]` message ("requires disposable PostgreSQL with
+  migrations 0002 and 0009 installed") -- the harness must pre-install precisely that pair, not
+  the full chain, matching what the test's calls actually touch (0009's codec functions need only
+  0002's schema/roles, not 0007/0008's dispatch tables). The harness also runs the full CD-1
+  install set (0002, 0003, 0007-0017) once into its own dedicated database as first executed
+  proof the post-deletion chain installs cleanly, and cheaply asserts CD-1's documented inert
+  state: four of the five tables 0002 creates (the ones inert while 0004-0006 are uninstalled;
+  the fifth, `object_dispatch_retention_schema_state`, is written by 0003's install procedure)
+  exist, and none of 0004-0006's mutation/readback procedures (which nothing installed can call)
+  are present. Run:
+  `pwsh -File lore-object-dispatch/tests/run-local-authority-live.ps1` (add `-KeepOnFailure` to
+  leave the labelled container up for debugging). All nine tests stay `#[ignore]`; the harness
+  opts them in explicitly with `--ignored --exact <name>`, it does not un-ignore them, so the
+  crate's baseline `cargo test -p lore-object-dispatch` ignored count (13) is unchanged by this.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.
@@ -529,6 +553,57 @@ current-thread/one-worker runs and event or stage-end counts do not prove topolo
 - `RetryConfig::disabled()` means Standard with one attempt; caller backoff/attempt overrides do not
   apply in Disabled mode.
 - Permanent S3 failures need negative assertions proving they are neither missing nor retryable.
+
+### PowerShell live-test runner scripts (Windows)
+
+- Symptom: `cargo test ... -- --ignored --exact <name>` reports `0 tests` / `N filtered out` even
+  though the name is correct and the binary target builds. Cause: building the trailing argument
+  list as a bare comma-separated list after a backtick line continuation (`` & cmd -- ` ``\n
+  `'--ignored', '--exact', $name`) makes PowerShell construct one array *value* that gets
+  stringified into a single argv token, not several separate arguments -- the native process sees
+  one blob it doesn't recognize as `--ignored`, silently filters everything out, and still exits
+  0. What to do: build the full argument list as its own named array (`$cargoArgs = @('test',
+  '-p', ..., '--', '--ignored', '--exact', $name)`) and invoke via splatting (`& cargo
+  @cargoArgs`) -- confirmed broken with the bare comma form and fixed by splatting, both against
+  the same `cargo test` invocation. Never trust a runner script's "N NOT RUN" report as evidence
+  the tests don't exist without first confirming an intentionally-broken filter reproduces the
+  same "0 tests" shape -- that confirms the parser path is actually reachable and not silently
+  vacuous itself.
+- `Format-Table -AutoSize | Out-String | Write-Host` truncates columns to the host's reported
+  console width, which a non-interactive/redirected `pwsh -File` invocation can report as
+  narrower than an interactive terminal -- a results table can silently drop its rightmost
+  columns (status/pass/fail counts) with no error. Pin a width: `Out-String -Width 200`.
+- A trailing `+` at end-of-line only continues an *expression* (`$x = "a" +`\n`"b"`). A cmdlet
+  invoked in command syntax (`Write-Host "a" +`\n`"b"`, `throw "a" +`\n`"b"`) parses `+` and the
+  following string as two more positional arguments, not concatenation -- the literal `+`
+  character and a line break land in the output. Confirmed: a multi-line `Write-Host`/`throw`
+  message built this way printed a bare ` +` mid-sentence with the message split across lines.
+  Fix by assigning the concatenation to a variable first (`$message = "a" +`\n`"b"`, which *is*
+  expression context) and passing that variable to the cmdlet, not by trying to keep `+` at
+  end-of-line inside the command call itself.
+- Cross-check a runner's hardcoded live-test name/target map against ground truth before trusting
+  it: `cargo test -p <crate> -- --ignored --list` needs no infrastructure and enumerates every
+  `<name>: test` line under each `Running tests\<target>.rs` header. Diff both directions --
+  every hardcoded entry must appear in the list (catches a rename), and every list entry in the
+  live family must appear in the hardcoded map (catches an unnoticed new live test) -- and treat
+  either direction failing as a hard error, not a warning. A `#[cfg(target_os = "linux")]`-gated
+  test does not appear in this list at all on a non-Linux rig; it is unenumerable, not merely
+  filtered, so a runner cannot detect or report it from this catalog and must instead name it as
+  NOT RUN from static source knowledge in its own documentation/output.
+- Piping a long-running provisioning script through `head` (or any early-closing consumer, e.g.
+  `... | tee log | head -5`) can `SIGPIPE` it mid-run without actually killing the underlying
+  process tree -- the foreground shell call returns once the truncating consumer exits, but a
+  detached child (here, the `pwsh.exe` driving Docker) can keep running unobserved, still holding
+  a labelled container open. Redirect to a file and read the file after the process exits instead
+  of piping through a line-limiting consumer.
+- A container label that merely restates the container's own name (e.g. a `run-id` label derived
+  from the same GUID embedded in the name) proves only self-consistency, not ownership -- it is
+  true for *any* correctly running instance of the script, not just the one you happen to be
+  looking at. A label-filtered `docker ps` listing tells you a labelled container exists, never
+  that it is yours or that whatever created it has exited. Before removing a container you did not
+  just create in the current process, get an independent ownership signal (e.g. an owning-pid
+  label written at creation time) and confirm that pid is actually dead -- do not infer ownership
+  from "I just ran something and there's a matching container now."
 
 ### Known tier limitations
 
