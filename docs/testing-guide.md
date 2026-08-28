@@ -384,6 +384,20 @@ will update an older check constraint or state schema.
   prove only safe retry or unresolved ambiguity. Pure readback matrices pin mismatched-winner
   behavior offline. A real socket fault after server COMMIT remains an explicit live contract, not
   something those pure tests claim to execute.
+- Symptom: a PostgreSQL TLS fault proxy times out during connection when bound only to
+  `127.0.0.1`. Cause: the production retention client correctly requires a DNS host, and Windows may
+  resolve `localhost` to `::1` first. What to do: bind the disposable proxy to `localhost`, preserve
+  that DNS name in the proxied URL and certificate SAN, and use its selected port. Gate:
+  `lore-object-dispatch/tests/run-retention-client-live.ps1`.
+- Symptom: a disposable trigger meant to raise `40001`/`40P01` instead returns a non-transient
+  permission error. Cause: the maintenance caller cannot advance the admin-owned nontransactional
+  attempt sequence. What to do: make the admin-owned trigger function `SECURITY DEFINER`, pin its
+  `search_path` to `pg_catalog`, qualify the sequence, and assert `last_value = 2` after one injected
+  abort and one successful mutation. The same live gate parses buffered PostgreSQL frames and drops
+  only after exact frontend `Q/COMMIT`, backend `CommandComplete/COMMIT`, and idle `ReadyForQuery`;
+  the test must observe its fault-fired signal before claiming immutable-receipt reconciliation.
+  Authenticate the proxy's downstream client certificate against the fixture CA and exact
+  maintenance CN, and hold a database advisory-lock lease so direct parallel invocations serialize.
 
 ### Poisoning a persisted `State`/`Tree` field for a fault-injection test
 

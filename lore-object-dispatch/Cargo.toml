@@ -30,3 +30,4 @@ x509-parser = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
