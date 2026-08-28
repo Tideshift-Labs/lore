@@ -226,7 +226,9 @@ finally {
     if ($containerStarted -and ($runPassed -or -not $KeepOnFailure)) {
         $actualLabel = (& docker inspect --format "{{ index .Config.Labels `"com.tideshift.lore.retention-client-live`" }}" $containerName 2>$null).Trim()
         if ($LASTEXITCODE -eq 0 -and $actualLabel -eq $runId) {
-            & docker rm --force $containerName *> $null
+            # --volumes: postgres:16 declares VOLUME /var/lib/postgresql/data, so a plain
+            # `docker rm --force` leaves an anonymous, now-unreferenced volume behind every run.
+            & docker rm --force --volumes $containerName *> $null
         }
         else {
             Write-Warning "refusing to remove unowned container $containerName"
