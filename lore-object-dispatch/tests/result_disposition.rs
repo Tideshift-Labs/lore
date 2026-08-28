@@ -5,13 +5,13 @@ use lore_object_dispatch::AuthenticatedConsumerIdentity;
 use lore_object_dispatch::CanonicalObjectStoreFetchHead;
 use lore_object_dispatch::CanonicalObjectStoreRequestState;
 use lore_object_dispatch::CanonicalTerminalResult;
-use lore_object_dispatch::ContinuityWireLimits;
 use lore_object_dispatch::ObjectStoreFetchAdmissionDecision;
 use lore_object_dispatch::ObjectStoreFetchHeadState;
 use lore_object_dispatch::ObjectStorePendingFetchDiscard;
 use lore_object_dispatch::ObjectStoreResultAckAuthority;
 use lore_object_dispatch::ObjectStoreResultDispositionIntent;
 use lore_object_dispatch::RequestIdentityLimits;
+use lore_object_dispatch::RequestStateWireLimits;
 use lore_object_dispatch::ResultAckLimits;
 use lore_object_dispatch::ResultDiscardLimits;
 use lore_object_dispatch::ResultDispositionCasDecision;
@@ -94,7 +94,7 @@ fn terminal_limits() -> TerminalResultLimits {
 
 fn limits() -> ResultDispositionLimits {
     ResultDispositionLimits {
-        state: ContinuityWireLimits {
+        state: RequestStateWireLimits {
             max_identity_bytes: 256,
             max_canonical_row_bytes: 16_384,
         },

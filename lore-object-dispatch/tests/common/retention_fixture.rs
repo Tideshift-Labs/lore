@@ -30,80 +30,28 @@ fn compact_limits() -> ObjectStoreCompactReceiptLimits {
     }
 }
 
-fn wire_limits() -> ContinuityWireLimits {
-    ContinuityWireLimits {
+fn wire_limits() -> RequestStateWireLimits {
+    RequestStateWireLimits {
         max_identity_bytes: 256,
         max_canonical_row_bytes: 16_384,
     }
 }
 
-fn reserve_put_ack_fixture() -> CanonicalObjectStoreReservePutAck {
-    let no_dispatch = build_no_dispatch_proof(
-        NoDispatchProofFields {
-            reason: NoDispatchReason::PreparedTtlExpired,
-            proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
-            proof_fence: 1,
-            committed_at_unix_ms: NOW,
-            authority_epoch: 1,
-        },
-        16_384,
-    )
-    .expect("ReservePut no-dispatch proof fixture");
-    validate_and_encode_object_store_reserve_put_ack(
-        &ReservePutAckV1 {
-            protocol_revision: "object-dispatch-v1".to_string(),
-            policy_revision: "policy-1".to_string(),
-            provider_boundary_id: "boundary-1".to_string(),
-            authenticated_cell_id: "cell-1".to_string(),
-            authenticated_tenant_id: "tenant-1".to_string(),
-            logical_request_id: REQUEST_ID.to_string(),
-            attempt_id: ATTEMPT_ID.to_string(),
-            upload_id: "018f3e12-a452-7abc-8def-0123456789ab".to_string(),
-            upload_fence: 1,
-            state: 3,
-            reserved_quota: Some(ObjectStoreQuotaUnitsV1 {
-                bytes: 64,
-                rows: 1,
-                concurrency: 1,
-            }),
-            expires_at_unix_ms: NOW,
-            max_chunk_bytes: 64,
-            spool_ready: None,
-            payload_release_receipt: Some(ObjectStorePayloadPurgeReceiptV1 {
-                purge_id: "reserve-put-purge-1".to_string(),
-                payload_kind: 1,
-                terminal_result_id: None,
-                disposition: 1,
-                released_bytes: 64,
-                released_rows: 1,
-                released_concurrency: 1,
-                purged_at_unix_ms: NOW + 10,
-                provider_authority_refunded: false,
-                receipt_blake3: Default::default(),
-                release_reason: 3,
-                deleted_partial_temp_bytes: 0,
-                deleted_partial_temp_files: 0,
-            }),
-            admission_clock_unix_ms: NOW - 10,
-            allocation_hard_expiry_unix_ms: NOW + 20,
-            closure: None,
-            no_dispatch_proof: Some(ObjectStoreNoDispatchProofV1 {
-                reason: 4,
-                proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
-                proof_fence: 1,
-                committed_at_unix_ms: NOW,
-                authority_epoch: 1,
-                proof_blake3: no_dispatch.proof().proof_blake3.to_vec().into(),
-            }),
-            ack_blake3: Default::default(),
-        },
-        &ReservePutAckLimits {
-            max_identity_bytes: 256,
-            max_durable_handle_bytes: 256,
-            max_canonical_row_bytes: 16_384,
-        },
-    )
-    .expect("ReservePut ACK fixture")
+fn terminal_limits() -> TerminalResultLimits {
+    TerminalResultLimits {
+        max_canonical_result_bytes: 16_384,
+        max_list_entries: 16_384,
+        max_key_bytes: 256,
+        max_metadata_entries: 16_384,
+        max_metadata_key_bytes: 256,
+        max_metadata_value_bytes: 16_384,
+        max_metadata_aggregate_bytes: 16_384,
+        max_opaque_value_bytes: 16_384,
+        max_result_handle_bytes: 256,
+        max_provider_code_bytes: 256,
+        max_provider_request_id_bytes: 256,
+        max_retry_after_ms: 60_000,
+    }
 }
 
 fn quota(bytes: u64, rows: u64, concurrency: u64) -> ObjectStoreQuotaUnitsV1 {
@@ -114,110 +62,183 @@ fn quota(bytes: u64, rows: u64, concurrency: u64) -> ObjectStoreQuotaUnitsV1 {
     }
 }
 
-pub fn compact_plan() -> ObjectStoreCompactReceiptDecision {
-    let kind =
-        ObjectStoreContinuityAdjudicationKindV1::ObjectStoreContinuityAdjudicationKindNoLocalEffect;
-    let authority_value = ObjectStoreContinuityAdjudicatedV1 {
-        protocol_revision: "object-dispatch-v1".to_string(),
-        provider_boundary_id: "boundary-1".to_string(),
-        authenticated_cell_id: "cell-1".to_string(),
-        authenticated_tenant_id: "tenant-1".to_string(),
-        logical_request_id: REQUEST_ID.to_string(),
-        attempt_id: ATTEMPT_ID.to_string(),
-        continuity_token_id: "018f3e12-a452-7abc-8def-0123456789ab".to_string(),
-        authority_epoch: 7,
-        continuity_seq: 11,
-        intent_kind: ObjectStoreContinuityIntentKindV1::ObjectStoreContinuityIntentKindUuidAdmission
+fn reservation() -> ReservedDimensionV1 {
+    ReservedDimensionV1 {
+        reservation_id: "reservation-1".to_string(),
+        physical_dimension_id: "physical-1".to_string(),
+        operation_class_id: "GET".to_string(),
+        units: 1,
+    }
+}
+
+fn not_applicable(kind: ObjectStorePayloadKindV1) -> ObjectStorePayloadRetentionV1 {
+    ObjectStorePayloadRetentionV1 {
+        payload_kind: kind as i32,
+        availability: ObjectStorePayloadAvailabilityV1::ObjectStorePayloadAvailabilityNotApplicable
             as i32,
-        adjudication_kind: kind as i32,
-        proof: Some(ObjectStoreContinuityAdjudicationProofV1 {
-            proof_id: "018f3e12-a453-7abc-8def-0123456789ab".to_string(),
-            adjudication_kind: kind as i32,
-            external_row_blake3: DIGEST.to_vec().into(),
-            local_quarantine_blake3: OTHER_DIGEST.to_vec().into(),
-            authority_epoch: 7,
-            continuity_seq: 11,
-            adjudication_fence: 3,
-            provider_credential_revision: "credential-9".to_string(),
-            provider_no_dispatch_evidence_blake3: None,
-            committed_at_unix_ms: NOW + 1,
-            proof_blake3: Default::default(),
-        }),
-        quota_release_receipt: Some(ObjectStoreContinuityQuotaReleaseReceiptV1 {
-            release_id: "018f3e12-a454-7abc-8def-0123456789ab".to_string(),
-            adjudication_kind: kind as i32,
-            released_put_spool: Some(quota(1, 1, 1)),
-            released_result_spool: Some(quota(0, 0, 0)),
-            released_retained_metadata: Some(quota(0, 0, 0)),
+        durable_handle: None,
+        size: 0,
+        blake3: Default::default(),
+        purge_state: ObjectStorePayloadPurgeStateV1::ObjectStorePayloadPurgeStateNotEligible as i32,
+        purge_eligible_at_unix_ms: None,
+        purge_receipt: None,
+        partial_temp_bytes: 0,
+        partial_temp_chunks: 0,
+    }
+}
+
+fn disposed_get() -> ObjectStorePayloadRetentionV1 {
+    ObjectStorePayloadRetentionV1 {
+        payload_kind: ObjectStorePayloadKindV1::ObjectStorePayloadKindGetResult as i32,
+        availability: ObjectStorePayloadAvailabilityV1::ObjectStorePayloadAvailabilityDisposed
+            as i32,
+        durable_handle: Some("result-1".to_string()),
+        size: 5,
+        blake3: DIGEST.to_vec().into(),
+        purge_state: ObjectStorePayloadPurgeStateV1::ObjectStorePayloadPurgeStatePurged as i32,
+        purge_eligible_at_unix_ms: Some(NOW + 10),
+        purge_receipt: Some(ObjectStorePayloadPurgeReceiptV1 {
+            purge_id: "purge-result-1".to_string(),
+            payload_kind: ObjectStorePayloadKindV1::ObjectStorePayloadKindGetResult as i32,
+            terminal_result_id: Some("terminal-1".to_string()),
+            disposition: ObjectStoreResultDispositionV1::ObjectStoreResultDispositionAcked as i32,
+            released_bytes: 5,
+            released_rows: 1,
+            released_concurrency: 0,
+            purged_at_unix_ms: NOW + 20,
             provider_authority_refunded: false,
-            released_at_unix_ms: NOW + 2,
-            quota_revision: 8,
             receipt_blake3: Default::default(),
+            release_reason:
+                ObjectStorePayloadReleaseReasonV1::ObjectStorePayloadReleaseReasonAckedRetentionElapsed
+                    as i32,
+            deleted_partial_temp_bytes: 0,
+            deleted_partial_temp_files: 0,
         }),
-        adjudicated_at_unix_ms: NOW + 20,
-        retain_until_unix_ms: NOW + 110,
-        detail_blake3: Default::default(),
-        quota_ownership: Some(ObjectStoreContinuityQuotaOwnershipV1 {
-            continuity_policy_revision: "continuity-policy-1".to_string(),
-            operation_quota_class: "PUT".to_string(),
-            units: Some(quota(1, 1, 1)),
-            global_scope_id: "object-store-continuity-global-v1".to_string(),
+        partial_temp_bytes: 0,
+        partial_temp_chunks: 0,
+    }
+}
+
+fn closed_state() -> lore_object_dispatch::CanonicalObjectStoreRequestState {
+    let terminal = validate_and_encode_terminal_result(
+        &ObjectStoreTerminalResultV1 {
+            terminal_result_id: "terminal-1".to_string(),
+            canonical_result_blake3: Default::default(),
+            canonical_result_size: 0,
+            result: Some(object_store_terminal_result_v1::Result::ByteResult(
+                ByteResultHandleV1 {
+                    handle: "result-1".to_string(),
+                    size: 5,
+                    blake3: DIGEST.to_vec().into(),
+                    content_length: 5,
+                    metadata: Vec::new(),
+                    etag: None,
+                    version_id: None,
+                },
+            )),
+        },
+        &terminal_limits(),
+    )
+    .expect("terminal fixture");
+    validate_and_encode_object_store_request_state(
+        &ObjectStoreRequestStateV1 {
+            protocol_revision: "object-dispatch-v1".to_string(),
             provider_boundary_id: "boundary-1".to_string(),
             authenticated_cell_id: "cell-1".to_string(),
             authenticated_tenant_id: "tenant-1".to_string(),
-            ownership_blake3: Default::default(),
-        }),
-        fingerprint: Some(
-            object_store_continuity_adjudicated_v1::Fingerprint::PutReservationFingerprint(
-                DIGEST.to_vec().into(),
-            ),
-        ),
-    };
-    let authority = ObjectStoreCompactAuthority::from(
-        &validate_and_encode_continuity_adjudicated(&authority_value, &wire_limits())
-            .expect("adjudicated authority"),
-    );
-    let ObjectStoreCompactAuthority::ContinuityAdjudicated(encoded) = &authority else {
-        unreachable!("adjudicated authority")
-    };
+            logical_request_id: REQUEST_ID.to_string(),
+            attempt_id: ATTEMPT_ID.to_string(),
+            put_reservation_fingerprint: None,
+            canonical_descriptor_fingerprint: Some(OTHER_DIGEST.to_vec().into()),
+            phase: ObjectStoreRequestPhaseV1::ObjectStoreRequestPhaseTerminal as i32,
+            allocation_revision: "allocation-1".to_string(),
+            allocation_fence: 2,
+            cell_admission_id: Some("admission-1".to_string()),
+            cell_admission_fence: Some(2),
+            reservations: vec![reservation()],
+            dispatch_attempt: Some(ObjectStoreDispatchAttemptV1 {
+                provider_attempt_id: "provider-attempt-1".to_string(),
+                provider_grant_id: "provider-grant-1".to_string(),
+                provider_grant_fence: 2,
+                dispatcher_id: "dispatcher-1".to_string(),
+                dispatcher_lease_generation: 3,
+                dispatch_started_at_unix_ms: NOW - 10,
+                ambiguity_recorded_at_unix_ms: None,
+                provider_credential_revision: "credential-1".to_string(),
+            }),
+            terminal_result: Some(terminal.result().clone()),
+            terminal_retryability:
+                ObjectStoreTerminalRetryabilityV1::ObjectStoreTerminalRetryabilityNonRetryable
+                    as i32,
+            result_disposition: ObjectStoreResultDispositionV1::ObjectStoreResultDispositionAcked
+                as i32,
+            ack_receipt: Some(ObjectStoreResultAckReceiptV1 {
+                state: ObjectStoreResultAckStateV1::ObjectStoreResultAckStateAcked as i32,
+                terminal_result_id: "terminal-1".to_string(),
+                ack_fingerprint: DIGEST.to_vec().into(),
+                acked_at_unix_ms: NOW,
+                payload_purge_after_unix_ms: Some(NOW + 10),
+            }),
+            discard_receipt: None,
+            no_dispatch_proof: None,
+            put_body: Some(not_applicable(
+                ObjectStorePayloadKindV1::ObjectStorePayloadKindPutBody,
+            )),
+            result_payload: Some(disposed_get()),
+            quota_state: Some(ObjectStoreQuotaStateV1 {
+                provider_reservations: vec![reservation()],
+                put_spool_quota: Some(quota(0, 0, 0)),
+                result_spool_quota: Some(quota(0, 0, 0)),
+                retained_metadata_quota: Some(quota(10, 1, 0)),
+                quota_revision: 4,
+            }),
+            state_committed_at_unix_ms: NOW + 20,
+            closure_committed_at_unix_ms: Some(NOW + 20),
+            state_blake3: Default::default(),
+            policy_revision: "policy-1".to_string(),
+            put_submit_binding: None,
+        },
+        &wire_limits(),
+    )
+    .expect("closed state fixture")
+}
+
+pub fn compact_plan() -> ObjectStoreCompactReceiptDecision {
+    let authority = ObjectStoreCompactAuthority::RequestState(Box::new(closed_state()));
+    let ObjectStoreCompactAuthority::RequestState(state) = &authority;
     let receipt = validate_and_encode_object_store_request_receipt(
         &ObjectStoreRequestReceiptV1 {
             receipt_blake3: Default::default(),
             receipt_committed_at_unix_ms: NOW + 20,
-            outcome: Some(
-                object_store_request_receipt_v1::Outcome::ContinuityAdjudicated(Box::new(
-                    encoded.value().clone(),
-                )),
-            ),
+            outcome: Some(object_store_request_receipt_v1::Outcome::RequestState(
+                Box::new(state.value().clone()),
+            )),
         },
         &wire_limits(),
     )
-    .expect("adjudicated receipt");
+    .expect("receipt fixture");
     let outcome = validate_and_encode_object_store_request_outcome(
         &ObjectStoreRequestOutcomeV1 {
             outcome_blake3: Default::default(),
-            outcome: Some(
-                object_store_request_outcome_v1::Outcome::ContinuityAdjudicated(Box::new(
-                    encoded.value().clone(),
-                )),
-            ),
+            outcome: Some(object_store_request_outcome_v1::Outcome::RequestState(
+                Box::new(state.value().clone()),
+            )),
         },
         &wire_limits(),
     )
-    .expect("adjudicated outcome");
-    let reserve_put_ack = reserve_put_ack_fixture();
+    .expect("outcome fixture");
     decide_object_store_compact_receipt(
         &ObjectStoreCompactReceiptPlannerInput {
             authority: &authority,
             submit_receipt: &receipt,
             get_outcome: &outcome,
             admission_created_at_unix_ms: NOW - 50,
-            reserve_put_ack: Some(&reserve_put_ack),
+            reserve_put_ack: None,
             provider_attempt_audit: &ObjectStoreProviderAttemptAudit {
-                attempt_count: 0,
-                committed_grant_count: 0,
+                attempt_count: 1,
+                committed_grant_count: 1,
                 no_dispatch_count: 0,
-                decisive_terminal_count: 0,
+                decisive_terminal_count: 1,
                 ambiguous_count: 0,
                 provider_authority_refunded: false,
                 audit_blake3: None,
@@ -228,7 +249,7 @@ pub fn compact_plan() -> ObjectStoreCompactReceiptDecision {
         },
         &compact_limits(),
     )
-    .expect("adjudicated compact plan")
+    .expect("compact plan fixture")
 }
 
 pub fn policy() -> ObjectStoreFullToCompactPolicy {

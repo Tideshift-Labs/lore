@@ -1,10 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-use lore_object_dispatch::ContinuityWireLimits;
+use lore_object_dispatch::RequestStateWireLimits;
 use lore_object_dispatch::TerminalResultLimits;
-use lore_object_dispatch::validate_and_encode_continuity_adjudicated;
-use lore_object_dispatch::validate_and_encode_continuity_quarantined;
 use lore_object_dispatch::validate_and_encode_object_store_request_outcome;
 use lore_object_dispatch::validate_and_encode_object_store_request_receipt;
 use lore_object_dispatch::validate_and_encode_object_store_request_state;
@@ -15,14 +13,6 @@ use lore_proto::lore::object_dispatch::v1::DeleteObjectResultV1;
 use lore_proto::lore::object_dispatch::v1::HeadObjectResultV1;
 use lore_proto::lore::object_dispatch::v1::ListObjectVersionsResultV1;
 use lore_proto::lore::object_dispatch::v1::ListObjectsV2ResultV1;
-use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityAdjudicatedV1;
-use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityAdjudicationKindV1;
-use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityAdjudicationProofV1;
-use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityIntentKindV1;
-use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityQuarantineReasonV1;
-use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityQuarantinedV1;
-use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityQuotaOwnershipV1;
-use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityQuotaReleaseReceiptV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreDispatchAttemptV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreNoDispatchProofV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreNoDispatchReasonV1;
@@ -50,8 +40,6 @@ use lore_proto::lore::object_dispatch::v1::ProviderErrorV1;
 use lore_proto::lore::object_dispatch::v1::PutObjectResultV1;
 use lore_proto::lore::object_dispatch::v1::PutSubmitBindingV1;
 use lore_proto::lore::object_dispatch::v1::ReservedDimensionV1;
-use lore_proto::lore::object_dispatch::v1::object_store_continuity_adjudicated_v1;
-use lore_proto::lore::object_dispatch::v1::object_store_continuity_quarantined_v1;
 use lore_proto::lore::object_dispatch::v1::object_store_request_outcome_v1;
 use lore_proto::lore::object_dispatch::v1::object_store_request_receipt_v1;
 use lore_proto::lore::object_dispatch::v1::object_store_terminal_result_v1;
@@ -74,8 +62,8 @@ const BOOL_DIGEST: [u8; 32] = [
     0x41, 0x94, 0xef, 0xa3, 0xf3, 0x8a, 0x3f, 0x9e, 0x22, 0x3d, 0x86, 0x02, 0xf1, 0xa5, 0x37, 0x20,
 ];
 
-fn limits() -> ContinuityWireLimits {
-    ContinuityWireLimits {
+fn limits() -> RequestStateWireLimits {
+    RequestStateWireLimits {
         max_identity_bytes: 256,
         max_canonical_row_bytes: 16_384,
     }
@@ -766,99 +754,6 @@ fn decode_digest(value: &str) -> [u8; 32] {
     bytes.try_into().expect("fixture digest is 32 bytes")
 }
 
-fn continuity_ownership() -> ObjectStoreContinuityQuotaOwnershipV1 {
-    ObjectStoreContinuityQuotaOwnershipV1 {
-        continuity_policy_revision: "continuity-policy-1".to_string(),
-        operation_quota_class: "PUT".to_string(),
-        units: Some(quota(125, 4, 1)),
-        global_scope_id: "object-store-continuity-global-v1".to_string(),
-        provider_boundary_id: "boundary-1".to_string(),
-        authenticated_cell_id: "cell-1".to_string(),
-        authenticated_tenant_id: "tenant-1".to_string(),
-        ownership_blake3: Default::default(),
-    }
-}
-
-fn quarantined() -> ObjectStoreContinuityQuarantinedV1 {
-    ObjectStoreContinuityQuarantinedV1 {
-        protocol_revision: "object-dispatch-v1".to_string(),
-        provider_boundary_id: "boundary-1".to_string(),
-        authenticated_cell_id: "cell-1".to_string(),
-        authenticated_tenant_id: "tenant-1".to_string(),
-        logical_request_id: REQUEST_ID.to_string(),
-        attempt_id: ATTEMPT_ID.to_string(),
-        continuity_token_id: "018f3e12-a452-7abc-8def-0123456789ab".to_string(),
-        authority_epoch: 7,
-        continuity_seq: 11,
-        intent_kind: ObjectStoreContinuityIntentKindV1::ObjectStoreContinuityIntentKindUuidAdmission
-            as i32,
-        reason: ObjectStoreContinuityQuarantineReasonV1::ObjectStoreContinuityQuarantineReasonIncompleteIntent
-            as i32,
-        quarantined_at_unix_ms: NOW,
-        retain_until_unix_ms: NOW + 1_000,
-        quota_bearing: true,
-        detail_blake3: Default::default(),
-        quota_ownership: Some(continuity_ownership()),
-        fingerprint: Some(
-            object_store_continuity_quarantined_v1::Fingerprint::PutReservationFingerprint(
-                DIGEST.to_vec().into(),
-            ),
-        ),
-    }
-}
-
-fn adjudicated() -> ObjectStoreContinuityAdjudicatedV1 {
-    let kind =
-        ObjectStoreContinuityAdjudicationKindV1::ObjectStoreContinuityAdjudicationKindNoLocalEffect;
-    ObjectStoreContinuityAdjudicatedV1 {
-        protocol_revision: "object-dispatch-v1".to_string(),
-        provider_boundary_id: "boundary-1".to_string(),
-        authenticated_cell_id: "cell-1".to_string(),
-        authenticated_tenant_id: "tenant-1".to_string(),
-        logical_request_id: REQUEST_ID.to_string(),
-        attempt_id: ATTEMPT_ID.to_string(),
-        continuity_token_id: "018f3e12-a452-7abc-8def-0123456789ab".to_string(),
-        authority_epoch: 7,
-        continuity_seq: 11,
-        intent_kind: ObjectStoreContinuityIntentKindV1::ObjectStoreContinuityIntentKindUuidAdmission
-            as i32,
-        adjudication_kind: kind as i32,
-        proof: Some(ObjectStoreContinuityAdjudicationProofV1 {
-            proof_id: "018f3e12-a453-7abc-8def-0123456789ab".to_string(),
-            adjudication_kind: kind as i32,
-            external_row_blake3: DIGEST.to_vec().into(),
-            local_quarantine_blake3: OTHER_DIGEST.to_vec().into(),
-            authority_epoch: 7,
-            continuity_seq: 11,
-            adjudication_fence: 3,
-            provider_credential_revision: "credential-9".to_string(),
-            provider_no_dispatch_evidence_blake3: None,
-            committed_at_unix_ms: NOW + 1,
-            proof_blake3: Default::default(),
-        }),
-        quota_release_receipt: Some(ObjectStoreContinuityQuotaReleaseReceiptV1 {
-            release_id: "018f3e12-a454-7abc-8def-0123456789ab".to_string(),
-            adjudication_kind: kind as i32,
-            released_put_spool: Some(quota(100, 1, 1)),
-            released_result_spool: Some(quota(20, 1, 0)),
-            released_retained_metadata: Some(quota(5, 2, 0)),
-            provider_authority_refunded: false,
-            released_at_unix_ms: NOW + 2,
-            quota_revision: 8,
-            receipt_blake3: Default::default(),
-        }),
-        adjudicated_at_unix_ms: NOW + 3,
-        retain_until_unix_ms: NOW + 1_000,
-        detail_blake3: Default::default(),
-        quota_ownership: Some(continuity_ownership()),
-        fingerprint: Some(
-            object_store_continuity_adjudicated_v1::Fingerprint::PutReservationFingerprint(
-                DIGEST.to_vec().into(),
-            ),
-        ),
-    }
-}
-
 #[test]
 fn all_seven_request_phases_match_independently_assembled_canonical_records() {
     let vectors = [
@@ -1354,7 +1249,7 @@ fn state_bound_is_inclusive_and_validated_value_is_detached() {
     assert!(
         validate_and_encode_object_store_request_state(
             &input,
-            &ContinuityWireLimits {
+            &RequestStateWireLimits {
                 max_identity_bytes: 256,
                 max_canonical_row_bytes: exact,
             },
@@ -1364,7 +1259,7 @@ fn state_bound_is_inclusive_and_validated_value_is_detached() {
     assert!(
         validate_and_encode_object_store_request_state(
             &input,
-            &ContinuityWireLimits {
+            &RequestStateWireLimits {
                 max_identity_bytes: 256,
                 max_canonical_row_bytes: exact - 1,
             },
@@ -1493,7 +1388,7 @@ fn request_state_wrappers_reject_stale_time_tamper_digest_and_short_bound() {
     assert!(
         validate_and_encode_object_store_request_outcome(
             &outcome(state.value().clone(), Default::default()),
-            &ContinuityWireLimits {
+            &RequestStateWireLimits {
                 max_identity_bytes: 256,
                 max_canonical_row_bytes: valid.canonical_bytes().len() as u32 - 1,
             },
@@ -1588,131 +1483,4 @@ fn request_receipt_fences_each_nested_durable_timestamp_source() {
     assert!(rejects(bound, NOW + 1));
     assert!(rejects(no_dispatch_state, NOW + 1));
     assert!(rejects(purged, NOW + 4));
-}
-
-#[test]
-fn continuity_wrappers_pin_quarantine_and_adjudicated_tags_lengths_and_digests() {
-    let quarantine = validate_and_encode_continuity_quarantined(&quarantined(), &limits())
-        .expect("quarantine fixture must validate");
-    let adjudicated = validate_and_encode_continuity_adjudicated(&adjudicated(), &limits())
-        .expect("adjudication fixture must validate");
-    let cases = [
-        (
-            object_store_request_receipt_v1::Outcome::ContinuityQuarantined(Box::new(
-                quarantine.value().clone(),
-            )),
-            object_store_request_outcome_v1::Outcome::ContinuityQuarantined(Box::new(
-                quarantine.value().clone(),
-            )),
-            4_u32,
-            2_u32,
-            quarantine.canonical_bytes(),
-            612,
-            "4246e0482e80cee40ba070ff81161e044fb542de6d9373328503a65a9e9a870e",
-            604,
-            "3eec007dae1dd4d98742d0df78b7c8185dfb8dcfd0f3636517881d9268670625",
-        ),
-        (
-            object_store_request_receipt_v1::Outcome::ContinuityAdjudicated(Box::new(
-                adjudicated.value().clone(),
-            )),
-            object_store_request_outcome_v1::Outcome::ContinuityAdjudicated(Box::new(
-                adjudicated.value().clone(),
-            )),
-            5_u32,
-            4_u32,
-            adjudicated.canonical_bytes(),
-            1_252,
-            "585b0b7e5db15cb8fc07fd12d72cbaefec901b8920fa08af4af9ddc8b5b6ba88",
-            1_244,
-            "19bc72b59776f93e04dcc92027f91cab66b18531df9092749742a32757584f54",
-        ),
-    ];
-
-    for (
-        receipt_child,
-        outcome_child,
-        receipt_tag,
-        outcome_tag,
-        child_bytes,
-        receipt_length,
-        receipt_digest,
-        outcome_length,
-        outcome_digest,
-    ) in cases
-    {
-        let receipt_input = ObjectStoreRequestReceiptV1 {
-            receipt_blake3: Default::default(),
-            receipt_committed_at_unix_ms: NOW + 1_001,
-            outcome: Some(receipt_child),
-        };
-        let outcome_input = ObjectStoreRequestOutcomeV1 {
-            outcome_blake3: Default::default(),
-            outcome: Some(outcome_child),
-        };
-        let receipt = validate_and_encode_object_store_request_receipt(&receipt_input, &limits())
-            .expect("continuity receipt must validate");
-        let outcome = validate_and_encode_object_store_request_outcome(&outcome_input, &limits())
-            .expect("continuity outcome must validate");
-
-        let mut receipt_preimage = b"object-store-request-receipt-v1\0".to_vec();
-        receipt_preimage.extend_from_slice(&receipt_tag.to_be_bytes());
-        receipt_preimage.extend(variable(child_bytes));
-        receipt_preimage.extend_from_slice(&((NOW + 1_001) as u64).to_be_bytes());
-        let mut outcome_preimage = b"object-store-request-outcome-v1\0".to_vec();
-        outcome_preimage.extend_from_slice(&outcome_tag.to_be_bytes());
-        outcome_preimage.extend(variable(child_bytes));
-
-        assert_eq!(receipt.canonical_preimage(), receipt_preimage);
-        assert_eq!(receipt.canonical_bytes().len(), receipt_length);
-        assert_eq!(receipt.receipt_blake3(), &decode_digest(receipt_digest));
-        assert_eq!(outcome.canonical_preimage(), outcome_preimage);
-        assert_eq!(outcome.canonical_bytes().len(), outcome_length);
-        assert_eq!(outcome.outcome_blake3(), &decode_digest(outcome_digest));
-    }
-}
-
-#[test]
-fn continuity_wrappers_reject_stale_child_time_and_tampered_projection() {
-    let quarantine = validate_and_encode_continuity_quarantined(&quarantined(), &limits())
-        .expect("quarantine fixture must validate");
-    let adjudicated = validate_and_encode_continuity_adjudicated(&adjudicated(), &limits())
-        .expect("adjudication fixture must validate");
-
-    let stale_quarantine = ObjectStoreRequestReceiptV1 {
-        receipt_blake3: Default::default(),
-        receipt_committed_at_unix_ms: NOW - 1,
-        outcome: Some(
-            object_store_request_receipt_v1::Outcome::ContinuityQuarantined(Box::new(
-                quarantine.value().clone(),
-            )),
-        ),
-    };
-    let stale_adjudicated = ObjectStoreRequestReceiptV1 {
-        receipt_blake3: Default::default(),
-        receipt_committed_at_unix_ms: NOW + 2,
-        outcome: Some(
-            object_store_request_receipt_v1::Outcome::ContinuityAdjudicated(Box::new(
-                adjudicated.value().clone(),
-            )),
-        ),
-    };
-    assert!(
-        validate_and_encode_object_store_request_receipt(&stale_quarantine, &limits()).is_err()
-    );
-    assert!(
-        validate_and_encode_object_store_request_receipt(&stale_adjudicated, &limits()).is_err()
-    );
-
-    let mut tampered = quarantine.value().clone();
-    tampered.protocol_revision = "object-dispatch-v2".to_string();
-    let tampered_outcome = ObjectStoreRequestOutcomeV1 {
-        outcome_blake3: Default::default(),
-        outcome: Some(
-            object_store_request_outcome_v1::Outcome::ContinuityQuarantined(Box::new(tampered)),
-        ),
-    };
-    assert!(
-        validate_and_encode_object_store_request_outcome(&tampered_outcome, &limits()).is_err()
-    );
 }

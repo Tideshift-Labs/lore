@@ -9,16 +9,11 @@
 
 use std::fmt;
 
-use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityAdjudicatedV1;
-use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityAdjudicationKindV1;
-use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityQuarantinedV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStorePayloadAvailabilityV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreRequestOutcomeV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreRequestPhaseV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreRequestReceiptV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreResultDispositionV1;
-use lore_proto::lore::object_dispatch::v1::object_store_continuity_adjudicated_v1;
-use lore_proto::lore::object_dispatch::v1::object_store_continuity_quarantined_v1;
 use lore_proto::lore::object_dispatch::v1::object_store_request_outcome_v1;
 use lore_proto::lore::object_dispatch::v1::object_store_request_receipt_v1;
 use thiserror::Error;
@@ -29,10 +24,9 @@ use crate::contract::validate_canonical_text;
 use crate::request_state_wire::CanonicalObjectStoreRequestOutcome;
 use crate::request_state_wire::CanonicalObjectStoreRequestReceipt;
 use crate::request_state_wire::CanonicalObjectStoreRequestState;
-use crate::request_state_wire::ContinuityChildEncoders;
 use crate::request_state_wire::RequestStateWireLimits;
-use crate::request_state_wire::validate_and_encode_object_store_request_outcome_with;
-use crate::request_state_wire::validate_and_encode_object_store_request_receipt_with;
+use crate::request_state_wire::validate_and_encode_object_store_request_outcome;
+use crate::request_state_wire::validate_and_encode_object_store_request_receipt;
 use crate::reserve_put_ack::CanonicalObjectStoreReservePutAck;
 
 const SCHEMA_REVISION: &str = "object-store-compact-receipt-v1";
@@ -62,92 +56,15 @@ impl ObjectStoreCompactReceiptLimits {
     }
 }
 
-/// One continuity authority record another module validated and canonically encoded.
-///
-/// Compaction owns this shape so the module dependency runs from the continuity module to here.
-/// The record also carries the child encoders that minted it, so recomputing the request-state
-/// envelopes over it goes back through the same encoders rather than through a module import.
-#[derive(Clone)]
-pub struct ObjectStoreCompactContinuityAuthority<T> {
-    value: T,
-    canonical_bytes: Vec<u8>,
-    detail_blake3: [u8; 32],
-    encoders: ContinuityChildEncoders,
-}
-
-impl<T> ObjectStoreCompactContinuityAuthority<T> {
-    pub(crate) fn new(
-        value: T,
-        canonical_bytes: Vec<u8>,
-        detail_blake3: [u8; 32],
-        encoders: ContinuityChildEncoders,
-    ) -> Self {
-        Self {
-            value,
-            canonical_bytes,
-            detail_blake3,
-            encoders,
-        }
-    }
-
-    pub fn value(&self) -> &T {
-        &self.value
-    }
-
-    pub fn canonical_bytes(&self) -> &[u8] {
-        &self.canonical_bytes
-    }
-
-    pub fn detail_blake3(&self) -> &[u8; 32] {
-        &self.detail_blake3
-    }
-
-    fn encoders(&self) -> ContinuityChildEncoders {
-        self.encoders
-    }
-}
-
-/// The encoder pair is provenance, not record content: equal canonical bytes are equal authority.
-///
-/// This holds while `CONTINUITY_CHILD_ENCODERS` is the only pair that can mint a record. Adding a
-/// second minting pair would make the encoder part of the record's identity and require comparing
-/// it here too.
-impl<T: PartialEq> PartialEq for ObjectStoreCompactContinuityAuthority<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.value == other.value
-            && self.canonical_bytes == other.canonical_bytes
-            && self.detail_blake3 == other.detail_blake3
-    }
-}
-
-impl<T> fmt::Debug for ObjectStoreCompactContinuityAuthority<T> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ObjectStoreCompactContinuityAuthority")
-            .field("value", &"[REDACTED]")
-            .field("canonical_bytes", &"[REDACTED]")
-            .field("detail_blake3", &"[REDACTED]")
-            .finish()
-    }
-}
-
 #[derive(Clone, PartialEq)]
 pub enum ObjectStoreCompactAuthority {
     RequestState(Box<CanonicalObjectStoreRequestState>),
-    ContinuityQuarantined(
-        Box<ObjectStoreCompactContinuityAuthority<ObjectStoreContinuityQuarantinedV1>>,
-    ),
-    ContinuityAdjudicated(
-        Box<ObjectStoreCompactContinuityAuthority<ObjectStoreContinuityAdjudicatedV1>>,
-    ),
 }
 
 impl fmt::Debug for ObjectStoreCompactAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self {
             Self::RequestState(_) => "REQUEST_STATE",
-            Self::ContinuityQuarantined(_) => "CONTINUITY_QUARANTINED",
-            Self::ContinuityAdjudicated(_) => "CONTINUITY_ADJUDICATED",
         };
         formatter
             .debug_struct("ObjectStoreCompactAuthority")
@@ -615,86 +532,10 @@ fn payload_free(
         && value.partial_temp_chunks == 0
 }
 
-fn fingerprint_projection(
-    value: Option<&object_store_continuity_adjudicated_v1::Fingerprint>,
-) -> (Option<&[u8]>, Option<&[u8]>) {
-    match value {
-        Some(object_store_continuity_adjudicated_v1::Fingerprint::PutReservationFingerprint(
-            digest,
-        )) => (Some(digest.as_ref()), None),
-        Some(
-            object_store_continuity_adjudicated_v1::Fingerprint::CanonicalDescriptorFingerprint(
-                digest,
-            ),
-        ) => (None, Some(digest.as_ref())),
-        None => (None, None),
-    }
-}
-
 fn project_authority(
     authority: &ObjectStoreCompactAuthority,
 ) -> Result<AuthorityProjection<'_>, CompactReceiptError> {
     match authority {
-        ObjectStoreCompactAuthority::ContinuityQuarantined(value) => {
-            let projected = value.value();
-            let fingerprints = match projected.fingerprint.as_ref() {
-                Some(object_store_continuity_quarantined_v1::Fingerprint::PutReservationFingerprint(
-                    digest,
-                )) => (Some(digest.as_ref()), None),
-                Some(object_store_continuity_quarantined_v1::Fingerprint::CanonicalDescriptorFingerprint(
-                    digest,
-                )) => (None, Some(digest.as_ref())),
-                None => (None, None),
-            };
-            Ok(AuthorityProjection {
-                protocol_revision: &projected.protocol_revision,
-                provider_boundary_id: &projected.provider_boundary_id,
-                authenticated_cell_id: &projected.authenticated_cell_id,
-                authenticated_tenant_id: &projected.authenticated_tenant_id,
-                logical_request_id: &projected.logical_request_id,
-                attempt_id: &projected.attempt_id,
-                put_reservation_fingerprint: fingerprints.0,
-                canonical_descriptor_fingerprint: fingerprints.1,
-                closure_committed_at_unix_ms: None,
-                authority_blake3: *value.detail_blake3(),
-                closed: false,
-                payload_free: false,
-                expected_no_dispatch_count: 0,
-                expected_decisive_terminal_count: 0,
-                expected_ambiguous_count: 0,
-                automatic_floors: Vec::new(),
-            })
-        }
-        ObjectStoreCompactAuthority::ContinuityAdjudicated(value) => {
-            let projected = value.value();
-            let fingerprints = fingerprint_projection(projected.fingerprint.as_ref());
-            let no_dispatch = projected.adjudication_kind
-                == ObjectStoreContinuityAdjudicationKindV1::ObjectStoreContinuityAdjudicationKindNoDispatch
-                    as i32;
-            Ok(AuthorityProjection {
-                protocol_revision: &projected.protocol_revision,
-                provider_boundary_id: &projected.provider_boundary_id,
-                authenticated_cell_id: &projected.authenticated_cell_id,
-                authenticated_tenant_id: &projected.authenticated_tenant_id,
-                logical_request_id: &projected.logical_request_id,
-                attempt_id: &projected.attempt_id,
-                put_reservation_fingerprint: fingerprints.0,
-                canonical_descriptor_fingerprint: fingerprints.1,
-                closure_committed_at_unix_ms: Some(projected.adjudicated_at_unix_ms),
-                authority_blake3: *value.detail_blake3(),
-                closed: true,
-                payload_free: true,
-                expected_no_dispatch_count: u64::from(no_dispatch),
-                expected_decisive_terminal_count: 0,
-                expected_ambiguous_count: 0,
-                automatic_floors: vec![ObjectStoreCompactDependencyFloor {
-                    kind: ObjectStoreCompactDependencyFloorKind::Continuity,
-                    dependency_id: projected.continuity_token_id.clone(),
-                    retain_until_unix_ms: projected.retain_until_unix_ms,
-                    floor_blake3: None,
-                }],
-            })
-        }
         ObjectStoreCompactAuthority::RequestState(value) => {
             let projected = value.value();
             let phase = ObjectStoreRequestPhaseV1::try_from(projected.phase)
@@ -801,31 +642,15 @@ fn project_authority(
     }
 }
 
-fn authority_kind_code(
-    authority: &ObjectStoreCompactAuthority,
-) -> Result<u32, CompactReceiptError> {
+fn authority_kind_code(authority: &ObjectStoreCompactAuthority) -> u32 {
     match authority {
-        ObjectStoreCompactAuthority::RequestState(_) => Ok(1),
-        ObjectStoreCompactAuthority::ContinuityAdjudicated(_) => Ok(2),
-        ObjectStoreCompactAuthority::ContinuityQuarantined(_) => {
-            Err(CompactReceiptError::InvalidAuthorityProjection)
-        }
-    }
-}
-
-fn continuity_encoders(authority: &ObjectStoreCompactAuthority) -> ContinuityChildEncoders {
-    match authority {
-        ObjectStoreCompactAuthority::RequestState(_) => ContinuityChildEncoders::UNAVAILABLE,
-        ObjectStoreCompactAuthority::ContinuityQuarantined(value) => value.encoders(),
-        ObjectStoreCompactAuthority::ContinuityAdjudicated(value) => value.encoders(),
+        ObjectStoreCompactAuthority::RequestState(_) => 1,
     }
 }
 
 fn authority_bytes(authority: &ObjectStoreCompactAuthority) -> &[u8] {
     match authority {
         ObjectStoreCompactAuthority::RequestState(value) => value.canonical_bytes(),
-        ObjectStoreCompactAuthority::ContinuityQuarantined(value) => value.canonical_bytes(),
-        ObjectStoreCompactAuthority::ContinuityAdjudicated(value) => value.canonical_bytes(),
     }
 }
 
@@ -839,22 +664,6 @@ fn authority_receipt_outcome(
         ObjectStoreCompactAuthority::RequestState(value) => (
             object_store_request_receipt_v1::Outcome::RequestState(Box::new(value.value().clone())),
             object_store_request_outcome_v1::Outcome::RequestState(Box::new(value.value().clone())),
-        ),
-        ObjectStoreCompactAuthority::ContinuityQuarantined(value) => (
-            object_store_request_receipt_v1::Outcome::ContinuityQuarantined(Box::new(
-                value.value().clone(),
-            )),
-            object_store_request_outcome_v1::Outcome::ContinuityQuarantined(Box::new(
-                value.value().clone(),
-            )),
-        ),
-        ObjectStoreCompactAuthority::ContinuityAdjudicated(value) => (
-            object_store_request_receipt_v1::Outcome::ContinuityAdjudicated(Box::new(
-                value.value().clone(),
-            )),
-            object_store_request_outcome_v1::Outcome::ContinuityAdjudicated(Box::new(
-                value.value().clone(),
-            )),
         ),
     }
 }
@@ -872,24 +681,21 @@ fn checked_wrappers(
     CompactReceiptError,
 > {
     let (receipt_outcome, outcome_outcome) = authority_receipt_outcome(authority);
-    let continuity = continuity_encoders(authority);
-    let checked_receipt = validate_and_encode_object_store_request_receipt_with(
+    let checked_receipt = validate_and_encode_object_store_request_receipt(
         &ObjectStoreRequestReceiptV1 {
             receipt_blake3: receipt.receipt_blake3().to_vec().into(),
             receipt_committed_at_unix_ms: receipt.value().receipt_committed_at_unix_ms,
             outcome: Some(receipt_outcome),
         },
         &limits.wire_limits(),
-        &continuity,
     )
     .map_err(|_| CompactReceiptError::WrapperMismatch)?;
-    let checked_outcome = validate_and_encode_object_store_request_outcome_with(
+    let checked_outcome = validate_and_encode_object_store_request_outcome(
         &ObjectStoreRequestOutcomeV1 {
             outcome_blake3: outcome.outcome_blake3().to_vec().into(),
             outcome: Some(outcome_outcome),
         },
         &limits.wire_limits(),
-        &continuity,
     )
     .map_err(|_| CompactReceiptError::WrapperMismatch)?;
     if checked_receipt.canonical_bytes() != receipt.canonical_bytes()
@@ -939,7 +745,7 @@ fn compact_fingerprint(
     floors: &[CanonicalObjectStoreCompactDependencyFloor],
     admission_created_at_unix_ms: i64,
 ) -> Result<[u8; 32], CompactReceiptError> {
-    let authority_kind = authority_kind_code(authority)?;
+    let authority_kind = authority_kind_code(authority);
     let floor_count =
         u32::try_from(floors.len()).map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
     let admission_created_at_unix_ms = nonnegative(admission_created_at_unix_ms)?;
@@ -1041,12 +847,6 @@ pub fn validate_and_encode_object_store_compact_receipt(
 ) -> Result<CanonicalObjectStoreCompactReceipt, CompactReceiptError> {
     validate_limits(limits)?;
     let projection = project_authority(input.authority)?;
-    if matches!(
-        input.authority,
-        ObjectStoreCompactAuthority::ContinuityQuarantined(_)
-    ) {
-        return Err(CompactReceiptError::InvalidAuthorityProjection);
-    }
     let (receipt, outcome) = checked_wrappers(
         input.authority,
         input.submit_receipt,
@@ -1145,7 +945,7 @@ pub fn validate_and_encode_object_store_compact_receipt(
     let closure_committed_at_unix_ms = nonnegative(input.closure_committed_at_unix_ms)?;
     let compacted_at_unix_ms = nonnegative(input.compacted_at_unix_ms)?;
     let compact_prune_after_unix_ms = nonnegative(input.compact_prune_after_unix_ms)?;
-    let authority_kind = authority_kind_code(input.authority)?;
+    let authority_kind = authority_kind_code(input.authority);
     let floor_count =
         u32::try_from(floors.len()).map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
     let mut output = writer(limits.max_compact_row_bytes)?;

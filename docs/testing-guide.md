@@ -106,47 +106,44 @@ will update an older check constraint or state schema.
   and `Revision.total_size_bytes` remains optional tag 11. Protobuf field names are not on the wire;
   presence is required so an empty file's zero is encoded. Gates: `lore-proto/tests/v1_thin_client.rs`
   and thin-client revision-tree handler tests.
-- **CR-033 private object dispatch wire [SERVER]**: the package has exactly seven RPCs, 67 messages,
-  and 21 enums. `lore-proto/tests/v1_object_dispatch.rs` fingerprints the whitespace/comment-free
-  declaration stream copied from WP-121, checks both streaming directions and the fork-collision
-  annotation, and compiles against the checked-in client/server exports. Regenerate with `protoc`
-  before accepting a fingerprint change. Gate: `cargo test -p lore-proto --test v1_object_dispatch
-  -j 4`.
-- **CR-033 direct continuity authority client [SERVER]**: offline unit tests must pin each SQL
-  procedure name, full result projection, parameter arity, canonical text-to-`uint64` casts, exact
-  embedded-migration signature, and closed transition algebra. The runtime and reconciler paths use
-  different PostgreSQL login roles, so a live reconciler test needs two mTLS clients: a boundary
-  identity to seed `INTENT`/`BOUND`, then the exact
-  `object_dispatch_continuity_reconciler` session identity to exercise quarantine, ambiguity, and
-  both adjudication paths. A boundary-role-only live pass cannot prove reconciler authority. Gate:
-  `cargo test -p lore-object-dispatch -j 4`; the live tier remains explicit `#[ignore]`.
-  Authenticated pruned-interval readback extends the one-shot archive fixture: pin the full 35-column
-  projection and both canonical `uint64` request casts offline, then archive and read the containing
-  interval with the reconciler identity. Assert boundary-role denial before the authoritative read,
-  exact revision/namespace/containment, checked range and terminal-class totals, aggregate/time/prune
-  bounds, and canonical interval bytes closed by the returned 32-byte digest. Policy and namespace
-  mismatch controls must fail closed.
-  Epoch-retirement proof may reuse that disposable singleton after seeding a canonical snapshot row;
-  retirement consumes the snapshot checkpoint, not a coverage row. Archive epoch 1, allocate epoch 2,
-  then prove retirement, exact replay, authenticated summary readback, boundary denial, policy and
-  namespace mismatch rejection, `pg_lsn` decoding, and removal of the old active interval. A
-  wrong-policy retirement must roll back before commit, and changed proof evidence must reject replay.
-- **CR-033 source-dark object-dispatch service shell [SERVER]**: mandatory mutual TLS precedes all
-  seven generated RPC paths. A trusted leaf must exact-match one registered URI SAN, service
-  instance, provider boundary, and nonempty bounded cell set; missing, invalid, expired,
-  unregistered, or ambiguous identities never reach a handler. Registered callers still receive one
-  fixed redacted `UNAVAILABLE` before authority, admission, spool, or provider work. The transport
-  test uses a permanently pending `UploadPut` request stream, so a bounded response proves the
-  handler does not await the first frame; `FetchResult` must fail before returning a stream. Pure
-  fixtures exact-match certificate-derived boundary/cell scope, authenticated tenant, ACTIVE
-  provider allocation revision/fence/expiry, and cell-admission ID/fence without wiring an authority
-  source. Negative database time and non-NFC revisions reject. Config requires revision, loopback
-  listener, and three absolute TLS-material paths whose regular files are each bounded to 1 MiB; metrics
-  accept only the closed seven-value RPC enum and fixed `UNAVAILABLE`/`source_dark` labels, never
-  request paths, user agents, certificates, SANs, boundaries, cells, or tenants. The Docker source
-  contract stays loopback-only, digest-pinned, locked, nonroot, runtime-secret-mounted, and without a
-  readiness probe. Gates: `cargo test -p lore-object-dispatch --test service_shell -j 4` and
-  `cargo test -p lore-object-dispatch --test service_mtls -j 4`.
+- **CR-033 private object dispatch wire [SERVER]**: `lore-proto/tests/v1_object_dispatch.rs`
+  fingerprints the whitespace/comment-free declaration stream copied from WP-121 (three constants at
+  lines 16-18: token length, FNV-1a64, DJB2-XOR64) and checks the fork-collision annotation. Re-freeze
+  the three constants in the *same commit* as any proto edit. Regenerate with `protoc` before
+  accepting a fingerprint change. Gate: `cargo test -p lore-proto --test v1_object_dispatch -j 4`.
+- **CR-033 cell dispatch authority: continuity family and separate-process service shell removed
+  [SERVER]** (2026-08-28 re-scope: boundary now equals cell, so the cell's own PostgreSQL is the one
+  authority — no separate dispatcher process, no
+  in-cell mTLS service, no continuity/quarantine/adjudication state machine. Removed whole:
+  `continuity.rs`, `continuity_wire.rs`, `continuity_quota.rs`, `schema.rs`, migration 0001, and their
+  `tests/continuity*.rs`/`tests/*continuity_seam.rs` suites; `server.rs`, `service.rs`, `auth.rs`,
+  `main.rs`, `Dockerfile`, the seven-RPC proto `service` block, and `tests/service_shell.rs`/
+  `service_mtls.rs`; `authority.rs` (folded into `request.rs`, keeping exact protocol/policy-revision-
+  NFC, exact cell, exact boundary, nonnegative database time, and a budget-revision pin, but dropping
+  the ACTIVE/expiry allocation state machine and requiring cell admission — both-NULL admission is now
+  legal). `config.rs`/`metrics.rs` are simplified, not deleted, but had **zero** prior `tests/`
+  coverage of their own — their only exercise was through the deleted `service_shell.rs`/
+  `service_mtls.rs`, so the simplified successors need fresh test files, not edits. Same gap for the
+  `authority.rs` fold: `authority.rs` itself had no test file or co-located unit tests before removal,
+  so its retained checks need new coverage added to `tests/request_fingerprint.rs` once `request.rs`'s
+  folded field/type shape (in particular whether cell admission becomes `Option`) is final — don't
+  guess the shape; ask the implementing lane instead of inventing struct fields.
+  `ObjectStoreCompactAuthority::{ContinuityQuarantined,ContinuityAdjudicated}` are removed
+  (`RequestState` is the sole remaining variant); `ObjectStoreCompactDependencyFloorKind::Continuity`
+  and its wire value `5` are explicitly retained (D5) — don't remove that variant chasing the rest of
+  the family out.
+  `ContinuityWireLimits` was only ever a `pub type` alias for `RequestStateWireLimits`
+  (`continuity_wire.rs`), not a distinct struct, so every test importing the alias needs a plain
+  rename to the underlying type when the aliasing module goes, not a field-by-field rewrite.
+  Symptom: a retained suite (`tests/canonical_id.rs`) breaks even though it never imports the removed
+  module by name. Cause: it tests a crate-private helper (`contract::validate_canonical_id`)
+  exclusively through *whichever public wrapper is convenient* (`auth::AuthorizedCallerRegistry`),
+  and deleting that wrapper module breaks the suite without deleting the private helper it exists to
+  cover. What to do: before declaring a module deletion's test-side cleanup complete, `grep` every
+  symbol the deleted module publicly exported across all of `tests/`, not just files named after the
+  module; re-point the character-class/behavior matrix through a surviving public caller with the
+  same private-helper contract (here, `spool.rs`'s `SpoolLayout::derive_boundary_binding`) rather than
+  losing the coverage.
   The pure ReservePut/no-dispatch/upload contracts remain unwired and effect-free. Their offline
   suites pin the no-dispatch and upload canonical goldens, all 80 ReservePut evidence-presence masks
   (exactly six valid), persisted admission recomputation, cleanup equality, lowest upload mismatch
@@ -174,16 +171,10 @@ will update an older check constraint or state schema.
   `cargo test -p lore-object-dispatch --test result_disposition -j 4`.
   Durable fetch leases and payload purge add two coupled source-dark CAS gates. Run
   `cargo test -p lore-object-dispatch --test fetch_lease --test result_disposition --test
-  payload_purge -j 4`; the verified focused run passed 23/23. The purge reservation's independent
-  TypeScript/Rust golden is 461 bytes, and the drain matrix rejects any head evolution unless its
-  revision delta exactly equals the open-lease decrement and its commit time is not older than the
-  reservation. The full crate passed 294 tests with five live tests intentionally ignored; scoped
-  warnings-denied Clippy, nightly format, and diff checks were clean. This remains pure `[SERVER]`
+  payload_purge -j 4`. The purge reservation's independent TypeScript/Rust golden is 461 bytes, and
+  the drain matrix rejects any head evolution unless its revision delta exactly equals the open-lease
+  decrement and its commit time is not older than the reservation. This remains pure `[SERVER]`
   source with no loreserver composition, provider traffic, credentials, or deployment authority.
-  Continuity quota ownership is a separate pure canonical record. Pin the independent 170-byte
-  `object-store-continuity-quota-ownership-v1` preimage, 32-byte digest, complete 202-byte record,
-  exact global scope, nonempty quota tuple, every text/size bound, detached value, and redacted
-  diagnostics with `cargo test -p lore-object-dispatch --test continuity_quota_ownership -j 4`.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

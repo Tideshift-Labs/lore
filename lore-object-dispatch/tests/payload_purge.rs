@@ -5,7 +5,6 @@ use lore_object_dispatch::AuthenticatedConsumerIdentity;
 use lore_object_dispatch::CanonicalObjectStoreFetchHead;
 use lore_object_dispatch::CanonicalObjectStorePayloadPurgeReservation;
 use lore_object_dispatch::CanonicalObjectStoreRequestState;
-use lore_object_dispatch::ContinuityWireLimits;
 use lore_object_dispatch::FetchLeaseLimits;
 use lore_object_dispatch::ObjectStoreFetchHeadState;
 use lore_object_dispatch::ObjectStorePayloadPurgeCasDecision;
@@ -17,6 +16,7 @@ use lore_object_dispatch::ObjectStoreResultDispositionIntent;
 use lore_object_dispatch::PayloadPurgeCasLimits;
 use lore_object_dispatch::PayloadPurgeError;
 use lore_object_dispatch::RequestIdentityLimits;
+use lore_object_dispatch::RequestStateWireLimits;
 use lore_object_dispatch::ReserveObjectStoreFetchDiscardDecision;
 use lore_object_dispatch::ReserveObjectStoreFetchDiscardInput;
 use lore_object_dispatch::ResultAckLimits;
@@ -95,8 +95,8 @@ struct DisposedFixture {
     head: Option<CanonicalObjectStoreFetchHead>,
 }
 
-fn state_limits() -> ContinuityWireLimits {
-    ContinuityWireLimits {
+fn state_limits() -> RequestStateWireLimits {
+    RequestStateWireLimits {
         max_identity_bytes: 256,
         max_canonical_row_bytes: 16_384,
     }
@@ -1211,7 +1211,7 @@ fn canonical_reservations_are_bounded_detached_and_structurally_complete() {
         Err(PayloadPurgeError::InvalidReservation)
     );
     let tiny = PayloadPurgeCasLimits {
-        state: ContinuityWireLimits {
+        state: RequestStateWireLimits {
             max_identity_bytes: 256,
             max_canonical_row_bytes: 128,
         },

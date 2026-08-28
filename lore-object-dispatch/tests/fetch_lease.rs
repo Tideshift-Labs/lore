@@ -3,7 +3,6 @@
 
 use lore_object_dispatch::CanonicalObjectStoreFetchHead;
 use lore_object_dispatch::CanonicalObjectStoreFetchLease;
-use lore_object_dispatch::ContinuityWireLimits;
 use lore_object_dispatch::FetchLeaseError;
 use lore_object_dispatch::FetchLeaseLimits;
 use lore_object_dispatch::ObjectStoreFetchChunkPermit;
@@ -17,6 +16,7 @@ use lore_object_dispatch::ObjectStoreFetchPayloadPurgeFenceDecision;
 use lore_object_dispatch::ObjectStoreFetchResolvedCallerAuthority;
 use lore_object_dispatch::OpenObjectStoreFetchLeaseDecision;
 use lore_object_dispatch::OpenObjectStoreFetchLeaseInput;
+use lore_object_dispatch::RequestStateWireLimits;
 use lore_object_dispatch::ReserveObjectStoreFetchDiscardDecision;
 use lore_object_dispatch::ReserveObjectStoreFetchDiscardInput;
 use lore_object_dispatch::TerminalObjectStoreFetchLeaseDecision;
@@ -63,8 +63,8 @@ const REVOCATION_ID: &str = "018f3e12-a453-7abc-8def-0123456789ab";
 const RESULT_DIGEST: [u8; 32] = [0x51; 32];
 const DESCRIPTOR_DIGEST: [u8; 32] = [0x31; 32];
 
-fn state_limits() -> ContinuityWireLimits {
-    ContinuityWireLimits {
+fn state_limits() -> RequestStateWireLimits {
+    RequestStateWireLimits {
         max_identity_bytes: 256,
         max_canonical_row_bytes: 16_384,
     }

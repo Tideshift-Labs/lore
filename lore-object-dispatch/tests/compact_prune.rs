@@ -29,8 +29,8 @@ fn compact_limits() -> ObjectStoreCompactReceiptLimits {
     }
 }
 
-fn wire_limits() -> ContinuityWireLimits {
-    ContinuityWireLimits {
+fn wire_limits() -> RequestStateWireLimits {
+    RequestStateWireLimits {
         max_identity_bytes: 256,
         max_canonical_row_bytes: 16_384,
     }
@@ -208,7 +208,6 @@ fn compact() -> CanonicalObjectStoreCompactReceipt {
             outcome: Some(object_store_request_receipt_v1::Outcome::RequestState(
                 Box::new(match &authority {
                     ObjectStoreCompactAuthority::RequestState(state) => state.value().clone(),
-                    _ => unreachable!("request-state fixture"),
                 }),
             )),
         },
@@ -221,7 +220,6 @@ fn compact() -> CanonicalObjectStoreCompactReceipt {
             outcome: Some(object_store_request_outcome_v1::Outcome::RequestState(
                 Box::new(match &authority {
                     ObjectStoreCompactAuthority::RequestState(state) => state.value().clone(),
-                    _ => unreachable!("request-state fixture"),
                 }),
             )),
         },

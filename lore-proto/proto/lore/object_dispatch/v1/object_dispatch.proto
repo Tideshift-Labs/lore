@@ -6,19 +6,11 @@ syntax = "proto3";
 package lore.object_dispatch.v1;
 
 // FORK-LOCAL (Tideshift, CR-033). This whole private package is additive and dark.
-// It pins all message/enum field numbers below plus the seven on-wire method paths
-// under /lore.object_dispatch.v1.ObjectStoreDispatchService/. On every upstream
-// merge, check for a package, type, field-number, enum-value, or method-path
-// collision before preserving or regenerating these bindings.
-service ObjectStoreDispatchService {
-  rpc ReservePut(ReservePutRequestV1) returns (ReservePutAckV1);
-  rpc UploadPut(stream UploadPutChunkV1) returns (PutSpoolReadyV1);
-  rpc Submit(ObjectStoreRequestV1) returns (ObjectStoreRequestReceiptV1);
-  rpc GetRequest(ObjectStoreRequestQueryV1) returns (ObjectStoreRequestOutcomeV1);
-  rpc FetchResult(ObjectStoreResultFetchV1) returns (stream ObjectStoreResultChunkV1);
-  rpc AcknowledgeResult(ObjectStoreResultAckV1) returns (ObjectStoreResultAckReceiptV1);
-  rpc DiscardResult(ObjectStoreResultDiscardV1) returns (ObjectStoreResultDiscardReceiptV1);
-}
+// It is the canonical record schema the cell dispatch authority's codecs encode, not
+// a wire protocol: CR-033's revised specification (D1) makes the authority in-process,
+// so it declares no service and no method paths. It still pins every message and enum
+// field number below. On every upstream merge, check for a package, type, field-number,
+// or enum-value collision before preserving or regenerating these bindings.
 enum PutReservationStateV1 {
   PUT_RESERVATION_STATE_UNSPECIFIED = 0;
   PUT_RESERVATION_STATE_RESERVED = 1;
@@ -350,91 +342,20 @@ message ObjectStoreRequestStateV1 {
   optional PutSubmitBindingV1 put_submit_binding = 29;
 }
 message ObjectStoreRequestReceiptV1 {
+  // 4 and 5 carried the superseded continuity arms (CR-033 D2/D6). Never reuse them.
+  reserved 4, 5;
   oneof outcome {
     ObjectStoreRequestStateV1 request_state = 1;
-    ObjectStoreContinuityQuarantinedV1 continuity_quarantined = 4;
-    ObjectStoreContinuityAdjudicatedV1 continuity_adjudicated = 5;
   }
   bytes receipt_blake3 = 2; int64 receipt_committed_at_unix_ms = 3;
 }
-enum ObjectStoreContinuityIntentKindV1 {
-  OBJECT_STORE_CONTINUITY_INTENT_KIND_UNSPECIFIED = 0;
-  OBJECT_STORE_CONTINUITY_INTENT_KIND_UUID_ADMISSION = 1;
-  OBJECT_STORE_CONTINUITY_INTENT_KIND_DISPATCH_CAS = 2;
-}
-enum ObjectStoreContinuityQuarantineReasonV1 {
-  OBJECT_STORE_CONTINUITY_QUARANTINE_REASON_UNSPECIFIED = 0;
-  OBJECT_STORE_CONTINUITY_QUARANTINE_REASON_INCOMPLETE_INTENT = 1;
-  OBJECT_STORE_CONTINUITY_QUARANTINE_REASON_LOCAL_BINDING_MISSING = 2;
-  OBJECT_STORE_CONTINUITY_QUARANTINE_REASON_DISPATCH_OUTCOME_UNKNOWN = 3;
-  OBJECT_STORE_CONTINUITY_QUARANTINE_REASON_RESTORE_MISMATCH = 4;
-}
-message ObjectStoreContinuityQuotaOwnershipV1 {
-  string continuity_policy_revision = 1; string operation_quota_class = 2;
-  ObjectStoreQuotaUnitsV1 units = 3; string global_scope_id = 4;
-  string provider_boundary_id = 5; string authenticated_cell_id = 6;
-  string authenticated_tenant_id = 7; bytes ownership_blake3 = 8;
-}
-message ObjectStoreContinuityQuarantinedV1 {
-  string protocol_revision = 1; string provider_boundary_id = 2;
-  string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
-  string logical_request_id = 5; string attempt_id = 6;
-  string continuity_token_id = 7; uint64 authority_epoch = 8;
-  uint64 continuity_seq = 9; ObjectStoreContinuityIntentKindV1 intent_kind = 10;
-  oneof fingerprint {
-    bytes put_reservation_fingerprint = 11;
-    bytes canonical_descriptor_fingerprint = 12;
-  }
-  ObjectStoreContinuityQuarantineReasonV1 reason = 13;
-  int64 quarantined_at_unix_ms = 14; int64 retain_until_unix_ms = 15;
-  bool quota_bearing = 16; bytes detail_blake3 = 17;
-  ObjectStoreContinuityQuotaOwnershipV1 quota_ownership = 18;
-}
 message ObjectStoreRequestOutcomeV1 {
+  // 2 and 4 carried the superseded continuity arms (CR-033 D2/D6). Never reuse them.
+  reserved 2, 4;
   oneof outcome {
     ObjectStoreRequestStateV1 request_state = 1;
-    ObjectStoreContinuityQuarantinedV1 continuity_quarantined = 2;
-    ObjectStoreContinuityAdjudicatedV1 continuity_adjudicated = 4;
   }
   bytes outcome_blake3 = 3;
-}
-enum ObjectStoreContinuityAdjudicationKindV1 {
-  OBJECT_STORE_CONTINUITY_ADJUDICATION_KIND_UNSPECIFIED = 0;
-  OBJECT_STORE_CONTINUITY_ADJUDICATION_KIND_NO_LOCAL_EFFECT = 1;
-  OBJECT_STORE_CONTINUITY_ADJUDICATION_KIND_NO_DISPATCH = 2;
-}
-message ObjectStoreContinuityAdjudicationProofV1 {
-  string proof_id = 1; ObjectStoreContinuityAdjudicationKindV1 adjudication_kind = 2;
-  bytes external_row_blake3 = 3; bytes local_quarantine_blake3 = 4;
-  uint64 authority_epoch = 5; uint64 continuity_seq = 6;
-  uint64 adjudication_fence = 7; string provider_credential_revision = 8;
-  optional bytes provider_no_dispatch_evidence_blake3 = 9;
-  int64 committed_at_unix_ms = 10; bytes proof_blake3 = 11;
-}
-message ObjectStoreContinuityQuotaReleaseReceiptV1 {
-  string release_id = 1; ObjectStoreContinuityAdjudicationKindV1 adjudication_kind = 2;
-  ObjectStoreQuotaUnitsV1 released_put_spool = 3;
-  ObjectStoreQuotaUnitsV1 released_result_spool = 4;
-  ObjectStoreQuotaUnitsV1 released_retained_metadata = 5;
-  bool provider_authority_refunded = 6; int64 released_at_unix_ms = 7;
-  uint64 quota_revision = 8; bytes receipt_blake3 = 9;
-}
-message ObjectStoreContinuityAdjudicatedV1 {
-  string protocol_revision = 1; string provider_boundary_id = 2;
-  string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
-  string logical_request_id = 5; string attempt_id = 6;
-  string continuity_token_id = 7; uint64 authority_epoch = 8;
-  uint64 continuity_seq = 9; ObjectStoreContinuityIntentKindV1 intent_kind = 10;
-  oneof fingerprint {
-    bytes put_reservation_fingerprint = 11;
-    bytes canonical_descriptor_fingerprint = 12;
-  }
-  ObjectStoreContinuityAdjudicationKindV1 adjudication_kind = 13;
-  ObjectStoreContinuityAdjudicationProofV1 proof = 14;
-  ObjectStoreContinuityQuotaReleaseReceiptV1 quota_release_receipt = 15;
-  int64 adjudicated_at_unix_ms = 16; int64 retain_until_unix_ms = 17;
-  bytes detail_blake3 = 18;
-  ObjectStoreContinuityQuotaOwnershipV1 quota_ownership = 19;
 }
 message ObjectStoreResultFetchV1 {
   string protocol_revision = 1; string provider_boundary_id = 2;

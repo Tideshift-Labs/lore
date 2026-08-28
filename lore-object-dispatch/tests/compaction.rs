@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT
 
 use lore_object_dispatch::CompactReceiptError;
-use lore_object_dispatch::ContinuityWireLimits;
 use lore_object_dispatch::NoDispatchProofFields;
 use lore_object_dispatch::NoDispatchReason;
 use lore_object_dispatch::ObjectStoreCompactAuthority;
@@ -13,13 +12,12 @@ use lore_object_dispatch::ObjectStoreCompactReceiptInput;
 use lore_object_dispatch::ObjectStoreCompactReceiptLimits;
 use lore_object_dispatch::ObjectStoreCompactReceiptPlannerInput;
 use lore_object_dispatch::ObjectStoreProviderAttemptAudit;
+use lore_object_dispatch::RequestStateWireLimits;
 use lore_object_dispatch::ReservePutAckError;
 use lore_object_dispatch::ReservePutAckLimits;
 use lore_object_dispatch::TerminalResultLimits;
 use lore_object_dispatch::build_no_dispatch_proof;
 use lore_object_dispatch::decide_object_store_compact_receipt;
-use lore_object_dispatch::validate_and_encode_continuity_adjudicated;
-use lore_object_dispatch::validate_and_encode_continuity_quarantined;
 use lore_object_dispatch::validate_and_encode_object_store_compact_dependency_floor;
 use lore_object_dispatch::validate_and_encode_object_store_compact_receipt;
 use lore_object_dispatch::validate_and_encode_object_store_provider_attempt_audit;
@@ -55,8 +53,8 @@ fn limits() -> ObjectStoreCompactReceiptLimits {
     }
 }
 
-fn wire_limits() -> ContinuityWireLimits {
-    ContinuityWireLimits {
+fn wire_limits() -> RequestStateWireLimits {
+    RequestStateWireLimits {
         max_identity_bytes: 256,
         max_canonical_row_bytes: 16_384,
     }
@@ -658,35 +656,11 @@ fn fixture(
         ObjectStoreCompactAuthority::RequestState(value) => {
             value.value().put_reservation_fingerprint.is_some()
         }
-        ObjectStoreCompactAuthority::ContinuityQuarantined(value) => matches!(
-            value.value().fingerprint.as_ref(),
-            Some(object_store_continuity_quarantined_v1::Fingerprint::PutReservationFingerprint(_))
-        ),
-        ObjectStoreCompactAuthority::ContinuityAdjudicated(value) => matches!(
-            value.value().fingerprint.as_ref(),
-            Some(object_store_continuity_adjudicated_v1::Fingerprint::PutReservationFingerprint(_))
-        ),
     };
     let (receipt_outcome, get_outcome) = match &authority {
         ObjectStoreCompactAuthority::RequestState(value) => (
             object_store_request_receipt_v1::Outcome::RequestState(Box::new(value.value().clone())),
             object_store_request_outcome_v1::Outcome::RequestState(Box::new(value.value().clone())),
-        ),
-        ObjectStoreCompactAuthority::ContinuityQuarantined(value) => (
-            object_store_request_receipt_v1::Outcome::ContinuityQuarantined(Box::new(
-                value.value().clone(),
-            )),
-            object_store_request_outcome_v1::Outcome::ContinuityQuarantined(Box::new(
-                value.value().clone(),
-            )),
-        ),
-        ObjectStoreCompactAuthority::ContinuityAdjudicated(value) => (
-            object_store_request_receipt_v1::Outcome::ContinuityAdjudicated(Box::new(
-                value.value().clone(),
-            )),
-            object_store_request_outcome_v1::Outcome::ContinuityAdjudicated(Box::new(
-                value.value().clone(),
-            )),
         ),
     };
     let receipt = validate_and_encode_object_store_request_receipt(
@@ -745,113 +719,6 @@ fn decode_hex(value: &str) -> Vec<u8> {
                 .expect("valid hex")
         })
         .collect()
-}
-
-fn adjudicated_authority(
-    kind: ObjectStoreContinuityAdjudicationKindV1,
-) -> ObjectStoreCompactAuthority {
-    let value = ObjectStoreContinuityAdjudicatedV1 {
-        protocol_revision: "object-dispatch-v1".to_string(),
-        provider_boundary_id: "boundary-1".to_string(),
-        authenticated_cell_id: "cell-1".to_string(),
-        authenticated_tenant_id: "tenant-1".to_string(),
-        logical_request_id: REQUEST_ID.to_string(),
-        attempt_id: ATTEMPT_ID.to_string(),
-        continuity_token_id: "018f3e12-a452-7abc-8def-0123456789ab".to_string(),
-        authority_epoch: 7,
-        continuity_seq: 11,
-        intent_kind: ObjectStoreContinuityIntentKindV1::ObjectStoreContinuityIntentKindUuidAdmission
-            as i32,
-        adjudication_kind: kind as i32,
-        proof: Some(ObjectStoreContinuityAdjudicationProofV1 {
-            proof_id: "018f3e12-a453-7abc-8def-0123456789ab".to_string(),
-            adjudication_kind: kind as i32,
-            external_row_blake3: DIGEST.to_vec().into(),
-            local_quarantine_blake3: OTHER_DIGEST.to_vec().into(),
-            authority_epoch: 7,
-            continuity_seq: 11,
-            adjudication_fence: 3,
-            provider_credential_revision: "credential-9".to_string(),
-            provider_no_dispatch_evidence_blake3: (kind
-                == ObjectStoreContinuityAdjudicationKindV1::ObjectStoreContinuityAdjudicationKindNoDispatch)
-                .then(|| vec![0x77; 32].into()),
-            committed_at_unix_ms: NOW + 1,
-            proof_blake3: Default::default(),
-        }),
-        quota_release_receipt: Some(ObjectStoreContinuityQuotaReleaseReceiptV1 {
-            release_id: "018f3e12-a454-7abc-8def-0123456789ab".to_string(),
-            adjudication_kind: kind as i32,
-            released_put_spool: Some(quota(1, 1, 1)),
-            released_result_spool: Some(quota(0, 0, 0)),
-            released_retained_metadata: Some(quota(0, 0, 0)),
-            provider_authority_refunded: false,
-            released_at_unix_ms: NOW + 2,
-            quota_revision: 8,
-            receipt_blake3: Default::default(),
-        }),
-        adjudicated_at_unix_ms: NOW + 20,
-        retain_until_unix_ms: NOW + 110,
-        detail_blake3: Default::default(),
-        quota_ownership: Some(ObjectStoreContinuityQuotaOwnershipV1 {
-            continuity_policy_revision: "continuity-policy-1".to_string(),
-            operation_quota_class: "PUT".to_string(),
-            units: Some(quota(1, 1, 1)),
-            global_scope_id: "object-store-continuity-global-v1".to_string(),
-            provider_boundary_id: "boundary-1".to_string(),
-            authenticated_cell_id: "cell-1".to_string(),
-            authenticated_tenant_id: "tenant-1".to_string(),
-            ownership_blake3: Default::default(),
-        }),
-        fingerprint: Some(
-            object_store_continuity_adjudicated_v1::Fingerprint::PutReservationFingerprint(
-                DIGEST.to_vec().into(),
-            ),
-        ),
-    };
-    ObjectStoreCompactAuthority::from(
-        &validate_and_encode_continuity_adjudicated(&value, &wire_limits())
-            .expect("adjudicated authority"),
-    )
-}
-
-fn quarantined_authority() -> ObjectStoreCompactAuthority {
-    let value = ObjectStoreContinuityQuarantinedV1 {
-        protocol_revision: "object-dispatch-v1".to_string(),
-        provider_boundary_id: "boundary-1".to_string(),
-        authenticated_cell_id: "cell-1".to_string(),
-        authenticated_tenant_id: "tenant-1".to_string(),
-        logical_request_id: REQUEST_ID.to_string(),
-        attempt_id: ATTEMPT_ID.to_string(),
-        continuity_token_id: "018f3e12-a452-7abc-8def-0123456789ab".to_string(),
-        authority_epoch: 7,
-        continuity_seq: 11,
-        intent_kind: ObjectStoreContinuityIntentKindV1::ObjectStoreContinuityIntentKindUuidAdmission
-            as i32,
-        reason: ObjectStoreContinuityQuarantineReasonV1::ObjectStoreContinuityQuarantineReasonIncompleteIntent as i32,
-        quarantined_at_unix_ms: NOW,
-        retain_until_unix_ms: NOW + 100,
-        quota_bearing: true,
-        detail_blake3: Default::default(),
-        quota_ownership: Some(ObjectStoreContinuityQuotaOwnershipV1 {
-            continuity_policy_revision: "policy-1".to_string(),
-            operation_quota_class: "PUT".to_string(),
-            units: Some(quota(1, 1, 1)),
-            global_scope_id: "object-store-continuity-global-v1".to_string(),
-            provider_boundary_id: "boundary-1".to_string(),
-            authenticated_cell_id: "cell-1".to_string(),
-            authenticated_tenant_id: "tenant-1".to_string(),
-            ownership_blake3: Default::default(),
-        }),
-        fingerprint: Some(
-            object_store_continuity_quarantined_v1::Fingerprint::PutReservationFingerprint(
-                DIGEST.to_vec().into(),
-            ),
-        ),
-    };
-    ObjectStoreCompactAuthority::from(
-        &validate_and_encode_continuity_quarantined(&value, &wire_limits())
-            .expect("quarantined authority"),
-    )
 }
 
 #[test]
@@ -972,80 +839,6 @@ fn disposed_put_compact_pins_reserve_ack_and_replay_projection() {
     assert_eq!(
         decide_object_store_compact_receipt(&replay, &limits()),
         Err(CompactReceiptError::InvalidReservePutAck)
-    );
-}
-
-#[test]
-fn final_continuity_adjudication_compacts_with_automatic_floor() {
-    let fixture = fixture(
-        adjudicated_authority(
-            ObjectStoreContinuityAdjudicationKindV1::ObjectStoreContinuityAdjudicationKindNoLocalEffect,
-        ),
-        ObjectStoreProviderAttemptAudit {
-            attempt_count: 0,
-            committed_grant_count: 0,
-            no_dispatch_count: 0,
-            decisive_terminal_count: 0,
-            ambiguous_count: 0,
-            provider_authority_refunded: false,
-            audit_blake3: None,
-        },
-    );
-    let decision = decide_object_store_compact_receipt(&planner(&fixture), &limits())
-        .expect("adjudicated decision");
-    let ObjectStoreCompactReceiptDecision::ApplyCompaction { compact, .. } = decision else {
-        panic!("adjudicated authority must compact");
-    };
-    assert_eq!(compact.value().dependency_floors.len(), 1);
-    assert_eq!(
-        compact.value().dependency_floors[0].value().kind,
-        ObjectStoreCompactDependencyFloorKind::Continuity
-    );
-    assert_eq!(
-        compact.value().dependency_floors[0]
-            .value()
-            .retain_until_unix_ms,
-        NOW + 110
-    );
-    assert_eq!(compact.canonical_bytes().len(), 5_105);
-    assert_eq!(
-        compact.compact_blake3(),
-        decode_hex("8e96074a7ca6cee392f89853607b7897c5171da8b7b6fe8fef62bfcd5eddaff0").as_slice()
-    );
-}
-
-#[test]
-fn continuity_no_dispatch_requires_its_exact_audit_classification() {
-    let selected = fixture(
-        adjudicated_authority(
-            ObjectStoreContinuityAdjudicationKindV1::ObjectStoreContinuityAdjudicationKindNoDispatch,
-        ),
-        ObjectStoreProviderAttemptAudit {
-            attempt_count: 0,
-            committed_grant_count: 1,
-            no_dispatch_count: 1,
-            decisive_terminal_count: 0,
-            ambiguous_count: 0,
-            provider_authority_refunded: false,
-            audit_blake3: None,
-        },
-    );
-    assert!(matches!(
-        decide_object_store_compact_receipt(&planner(&selected), &limits()),
-        Ok(ObjectStoreCompactReceiptDecision::ApplyCompaction { .. })
-    ));
-    let wrong = fixture(
-        adjudicated_authority(
-            ObjectStoreContinuityAdjudicationKindV1::ObjectStoreContinuityAdjudicationKindNoDispatch,
-        ),
-        ObjectStoreProviderAttemptAudit {
-            no_dispatch_count: 0,
-            ..selected.audit.clone()
-        },
-    );
-    assert_eq!(
-        decide_object_store_compact_receipt(&planner(&wrong), &limits()),
-        Err(CompactReceiptError::InvalidProviderAttemptAudit)
     );
 }
 
@@ -1192,29 +985,13 @@ fn prune_deadline_takes_maximum_of_all_contributors_and_utf8_sorts_ids() {
 }
 
 #[test]
-fn live_quarantined_and_retained_payload_authority_do_not_compact() {
+fn live_retained_payload_authority_does_not_compact() {
     let live = fixture(
         ObjectStoreCompactAuthority::RequestState(Box::new(terminal_state(StateKind::Available))),
         terminal_audit(),
     );
     assert_eq!(
         decide_object_store_compact_receipt(&planner(&live), &limits()),
-        Ok(ObjectStoreCompactReceiptDecision::RetainFullNotClosed)
-    );
-    let quarantine = fixture(
-        quarantined_authority(),
-        ObjectStoreProviderAttemptAudit {
-            attempt_count: 0,
-            committed_grant_count: 0,
-            no_dispatch_count: 0,
-            decisive_terminal_count: 0,
-            ambiguous_count: 0,
-            provider_authority_refunded: false,
-            audit_blake3: None,
-        },
-    );
-    assert_eq!(
-        decide_object_store_compact_receipt(&planner(&quarantine), &limits()),
         Ok(ObjectStoreCompactReceiptDecision::RetainFullNotClosed)
     );
 }

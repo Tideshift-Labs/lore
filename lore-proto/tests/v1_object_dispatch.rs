@@ -3,19 +3,17 @@
 //! Drift guard for the fork-local `lore.object_dispatch.v1` private wire.
 
 use lore_proto::lore::object_dispatch::v1::ObjectStoreRequestV1;
-use lore_proto::lore::object_dispatch::v1::object_store_dispatch_service_client::ObjectStoreDispatchServiceClient;
-use lore_proto::lore::object_dispatch::v1::object_store_dispatch_service_server::ObjectStoreDispatchService;
 
 const PROTO: &str = include_str!("../proto/lore/object_dispatch/v1/object_dispatch.proto");
 const GENERATED: &str = include_str!("../src/grpc/lore.object_dispatch.v1.rs");
 
-// These independent values fingerprint the exact declaration token stream frozen by the five
-// proto blocks in WP-121. Comments and formatting are deliberately excluded, while every package,
-// service, RPC streaming marker, type, field name, field number, optional/repeated qualifier,
-// oneof branch, enum name, and enum number remains covered.
-const CONTRACT_TOKEN_BYTES: usize = 25_211;
-const CONTRACT_FNV1A64: u64 = 0xf9f3_bc6a_e59c_092b;
-const CONTRACT_DJB2_XOR64: u64 = 0x6a28_3221_de00_e751;
+// These independent values fingerprint the exact declaration token stream of the canonical record
+// schema. Comments and formatting are deliberately excluded, while every package, type, field name,
+// field number, reserved field number, optional/repeated qualifier, oneof branch, enum name, and
+// enum number remains covered. Re-freeze all three together, in the same commit as the proto edit.
+const CONTRACT_TOKEN_BYTES: usize = 21_255;
+const CONTRACT_FNV1A64: u64 = 0x898f_5cbc_6c0e_a1ca;
+const CONTRACT_DJB2_XOR64: u64 = 0xa98b_c9ca_05c6_521a;
 
 fn without_line_comments(source: &str) -> String {
     source
@@ -62,22 +60,15 @@ fn object_dispatch_v1_contract_matches_wp_121() {
 }
 
 #[test]
-fn object_dispatch_v1_has_exact_service_and_streaming_shape() {
+fn object_dispatch_v1_has_no_service_or_streaming_surface() {
     let source = without_line_comments(PROTO);
-    let declarations = [
-        "rpc ReservePut(ReservePutRequestV1) returns (ReservePutAckV1);",
-        "rpc UploadPut(stream UploadPutChunkV1) returns (PutSpoolReadyV1);",
-        "rpc Submit(ObjectStoreRequestV1) returns (ObjectStoreRequestReceiptV1);",
-        "rpc GetRequest(ObjectStoreRequestQueryV1) returns (ObjectStoreRequestOutcomeV1);",
-        "rpc FetchResult(ObjectStoreResultFetchV1) returns (stream ObjectStoreResultChunkV1);",
-        "rpc AcknowledgeResult(ObjectStoreResultAckV1) returns (ObjectStoreResultAckReceiptV1);",
-        "rpc DiscardResult(ObjectStoreResultDiscardV1) returns (ObjectStoreResultDiscardReceiptV1);",
-    ];
+    let declarations: [&str; 0] = [];
 
     assert!(source.contains("package lore.object_dispatch.v1;"));
     assert_eq!(
         source.matches("service ObjectStoreDispatchService").count(),
-        1
+        0,
+        "the seven-RPC service block must not be present (CR-033 D1/D6)"
     );
     assert_eq!(source.matches("rpc ").count(), declarations.len());
     for declaration in declarations {
@@ -91,34 +82,55 @@ fn object_dispatch_v1_has_exact_service_and_streaming_shape() {
 #[test]
 fn object_dispatch_v1_is_marked_as_fork_local_cr_033() {
     assert!(PROTO.contains("FORK-LOCAL (Tideshift, CR-033)"));
-    assert!(PROTO.contains("lore.object_dispatch.v1.ObjectStoreDispatchService"));
+    assert!(PROTO.contains("package lore.object_dispatch.v1;"));
     assert!(PROTO.contains("upstream"));
     assert!(PROTO.contains("collision"));
 }
 
 #[test]
-fn checked_in_bindings_and_public_exports_are_available() {
-    fn client_export<T>() -> std::marker::PhantomData<ObjectStoreDispatchServiceClient<T>> {
-        std::marker::PhantomData
-    }
-    fn _server_export<T: ObjectStoreDispatchService>() {}
+fn removed_continuity_arm_field_numbers_stay_reserved() {
+    let source = without_line_comments(PROTO);
 
+    assert_eq!(
+        source.matches("reserved 4, 5;").count(),
+        1,
+        "the receipt envelope must reserve the removed continuity arms 4 and 5 (CR-033 D2)"
+    );
+    assert_eq!(
+        source.matches("reserved 2, 4;").count(),
+        1,
+        "the outcome envelope must reserve the removed continuity arms 2 and 4 (CR-033 D2)"
+    );
+}
+
+#[test]
+fn checked_in_bindings_and_public_exports_are_available() {
     let _ = ObjectStoreRequestV1::default();
-    let _ = client_export::<()>();
-    assert!(GENERATED.contains("pub mod object_store_dispatch_service_client"));
-    assert!(GENERATED.contains("pub mod object_store_dispatch_service_server"));
+    assert!(!GENERATED.contains("pub mod object_store_dispatch_service_client"));
+    assert!(!GENERATED.contains("pub mod object_store_dispatch_service_server"));
     let generated_tokens =
         String::from_utf8(contract_tokens(GENERATED)).expect("generated Rust is UTF-8");
-    let boxed_outcome_types = [
-        "::prost::alloc::boxed::Box<super::ObjectStoreRequestStateV1>",
-        "::prost::alloc::boxed::Box<super::ObjectStoreContinuityQuarantinedV1>",
-        "::prost::alloc::boxed::Box<super::ObjectStoreContinuityAdjudicatedV1>",
-    ];
+    let boxed_outcome_types = ["::prost::alloc::boxed::Box<super::ObjectStoreRequestStateV1>"];
     for outcome_type in boxed_outcome_types {
         assert_eq!(
             generated_tokens.matches(outcome_type).count(),
             2,
             "outcome type must remain boxed in both generated oneofs: {outcome_type}"
+        );
+    }
+    for removed_message in [
+        "ObjectStoreContinuityQuarantinedV1",
+        "ObjectStoreContinuityAdjudicatedV1",
+        "ObjectStoreContinuityIntentKindV1",
+        "ObjectStoreContinuityQuarantineReasonV1",
+        "ObjectStoreContinuityQuotaOwnershipV1",
+        "ObjectStoreContinuityAdjudicationKindV1",
+        "ObjectStoreContinuityAdjudicationProofV1",
+        "ObjectStoreContinuityQuotaReleaseReceiptV1",
+    ] {
+        assert!(
+            !GENERATED.contains(removed_message),
+            "removed continuity type must not reappear in generated bindings: {removed_message}"
         );
     }
 }

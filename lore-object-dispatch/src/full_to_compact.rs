@@ -180,7 +180,7 @@ fn applied_compaction(
         || compact_charge.concurrency != 0
         || compact_charge.bytes != bytes
         || compact.compact_blake3() != &compact.value().compact_blake3
-        || authority_digest(compact)? != expected_authority_blake3
+        || authority_digest(compact) != expected_authority_blake3
         || compact.value().submit_receipt.receipt_blake3() != expected_submit_receipt_blake3
         || compact.value().get_outcome.outcome_blake3() != expected_get_outcome_blake3
     {
@@ -193,15 +193,9 @@ fn applied_compaction(
     })
 }
 
-fn authority_digest(
-    compact: &CanonicalObjectStoreCompactReceipt,
-) -> Result<&[u8; 32], FullToCompactError> {
+fn authority_digest(compact: &CanonicalObjectStoreCompactReceipt) -> &[u8; 32] {
     match &compact.value().authority {
-        ObjectStoreCompactAuthority::RequestState(value) => Ok(value.state_blake3()),
-        ObjectStoreCompactAuthority::ContinuityAdjudicated(value) => Ok(value.detail_blake3()),
-        ObjectStoreCompactAuthority::ContinuityQuarantined(_) => {
-            Err(FullToCompactError::InvalidCompactPlan)
-        }
+        ObjectStoreCompactAuthority::RequestState(value) => value.state_blake3(),
     }
 }
 
