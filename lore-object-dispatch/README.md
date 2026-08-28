@@ -48,6 +48,12 @@ independent authority. Its BLAKE3-256 is
 `2b3664532b62cddbb94dbb83dde954fe121aecbc484e2f7190e153a61f38b003`. Runtime code never installs
 the migration. Provisioning must install and read back separately attested bytes before readiness.
 
+`local_authority_schema::LOCAL_AUTHORITY_MIGRATION_V1` embeds the exact 42,294-byte source-dark
+local authority core migration. Its BLAKE3-256 is
+`d762b841bd31a37908a6ff95c2292d5abfca234fa9b7d3c0c639ec63dcf3a7ff`. It extends the retention
+namespace with requests, attempts, spool objects, quota usage, dispatchers, payload purges, and
+fetch leases. Runtime code does not install it, and the artifact grants no direct table authority.
+
 ## Private protocol
 
 The exact private `lore.object_dispatch.v1.ObjectStoreDispatchService` contract lives in
