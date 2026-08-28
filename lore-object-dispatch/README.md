@@ -3,50 +3,42 @@
 Server-only object-store dispatch authority primitives. The crate is dark source: it is not linked
 into loreserver composition and cannot authorize provider traffic or first-seen admission.
 
-## Continuity client
+## Composition: in-process cell authority
 
-`continuity` connects directly to the independent object-dispatch continuity PostgreSQL authority.
-It accepts exactly one TCP DNS host with `sslmode=require`, verifies that DNS name through rustls
-against an explicit root CA, and requires a matching client certificate and private key. There is no
-plaintext, opportunistic TLS, native-root, IP-host, Unix-socket, password-only, or insecure-verifier
-mode. Connection and TLS material is redacted from diagnostics.
+There is no separate dispatcher process, no in-cell mTLS service, and no surviving RPC (CR-033 D1,
+2026-08-28). The cell dispatch authority is the retained PostgreSQL procedures below, installed in
+the cell database and called directly by every loreserver replica and drain worker through a typed
+Rust client linked into `lore-postgres`. That client consumes `lore-postgres`'s existing connection
+pool rather than a separately configured one; the external-endpoint connection contract (single ASCII
+DNS host, `sslmode=require`, pinned CA, mandatory client certificate) was written for an authority
+database outside every cell and does not survive now that the authority is the cell's own database.
+Redaction and the closed retry classification do survive: connection strings, PEM material,
+PostgreSQL diagnostics, and parameter values never reach `Display`, `Debug`, `Error::source`,
+tracing, or detached-task logs.
 
-`ContinuityClient` exposes the versioned stored-procedure surface for:
+The bounded-execution envelope is retained verbatim on that pool: `SET LOCAL statement_timeout` and
+`lock_timeout` inside every mutation and authoritative read; read-only transactions never retried;
+mutations at exactly three attempts retrying only known-aborted `40001` and `40P01` after 25 ms and
+100 ms, with the session released before sleeping; transport ambiguity around `COMMIT` resolved by
+reconnect plus the operation-specific authoritative read, adopting only an exact expected committed
+result and failing closed when the projection cannot prove either outcome.
 
-- allocating or replaying an exact continuity intent;
-- reading an intent by boundary and token;
-- binding an intent to durable local state;
-- marking exact completion evidence; and
-- marking a decisive no-local-effect outcome and release basis;
-- quarantining an exact `INTENT` or `BOUND` row and recording `BOUND` dispatch ambiguity; and
-- preparing and completing typed `NO_LOCAL_EFFECT` or `NO_DISPATCH` adjudication with exact binding
-  and ownership-release evidence;
-- recording exact local durability snapshot coverage and releasing covered `BOUND` or `COMPLETED`
-  shadow ownership; and
-- allocating an exact next epoch from the expected drained namespace; and
-- reading one exact shadow-release receipt by boundary, epoch, sequence, and token with typed absence
-  and canonical digest/byte validation; and
-- replacing one exact retention-eligible terminal detail with its bounded authenticated pruned
-  interval, using the exact row and shadow-release-receipt digests plus a 1-byte-to-1-MiB local-
-  dependency proof; and
-- reading one boundary's current or historical epoch, continuity high-water, ownership counters,
-  reconciliation state, and latest snapshot.
-
-Mutations run in serializable transactions with server-enforced statement and lock timeouts. The
-client makes exactly three attempts for known-aborted `40001` serialization failures and `40P01`
-deadlocks, waiting 25 ms and then 100 ms. It never blindly retries a transport failure around
-commit: it reconnects, performs the operation-specific authoritative read, adopts only an exact
-committed result, replays only an exact prior or absent state, and otherwise fails closed. All
-authoritative reads use bounded read-only transactions and are never retried. Unsigned 64-bit values
-cross the PostgreSQL `NUMERIC(20,0)` boundary as canonical decimal text, and procedure results decode
-through closed enum and digest allowlists.
+`lore-proto`'s `lore.object_dispatch.v1` messages and enums are retained as the canonical record
+schema the codecs below encode, not as a wire protocol; the seven-RPC `service` block and generated
+server bindings, and the independent `ObjectStoreContinuity*V1` messages/enums, were removed with the
+superseded continuity authority. `lore-proto/tests/v1_object_dispatch.rs` re-freezes a token/digest
+drift guard over the surviving proto source in the same commit as any further proto edit.
 
 ## Embedded migration
 
-`schema::CONTINUITY_MIGRATION_V1` embeds the exact 196,426-byte transactional migration used by the
-independent authority. Its BLAKE3-256 is
-`2b3664532b62cddbb94dbb83dde954fe121aecbc484e2f7190e153a61f38b003`. Runtime code never installs
-the migration. Provisioning must install and read back separately attested bytes before readiness.
+The cell install set is migrations 0002 and 0003 (`retention_schema`/`retention_provisioning`, the
+verified install prerequisites for the chain below) plus 0007 through 0017 (`local_authority_*`).
+Migrations 0004 through 0006 (`retention_readback`/`retention_mutations`/`retention_prune_receipts`)
+are deferred and not installed, alongside the pure compact-receipt, full-to-compact, and
+compact-prune planners in `compaction.rs`, `full_to_compact.rs`, and `compact_prune.rs`: correct,
+tested, sized for the former global ledger's row volume, and uncalled until CR-033 D5's cell-scale
+retention sizing lands. Runtime never auto-installs any migration; a migrator role installs out of
+band.
 
 `local_authority_schema::LOCAL_AUTHORITY_MIGRATION_V1` embeds the exact 42,294-byte source-dark
 local authority core migration. Its BLAKE3-256 is
@@ -170,61 +162,24 @@ unsafe file type, or mismatched path fails closed. The verifier is unsupported o
 grants no write, cleanup, publication, ledger, quota, request, provider, deployment, or readiness
 authority; callers must still revalidate candidate decisions under the authoritative row lock.
 
-## Private protocol
+## Request contract
 
-The exact private `lore.object_dispatch.v1.ObjectStoreDispatchService` contract lives in
-`lore-proto`. It has seven RPCs, including client-streaming upload and server-streaming result
-fetch, with checked-in generated client and server bindings exported from
-`lore_proto::lore::object_dispatch::v1`. A semantic declaration-token guard pins the package,
-service, RPC streaming shapes, messages, fields, presence, oneofs, and enums.
-
-The source-dark service shell implements all seven generated methods and immediately returns gRPC
-`UNAVAILABLE` before inspecting a request or polling an upload stream. `FetchResult` fails before it
-returns a stream. Every transport requires a client certificate from the configured CA. An exact
-URI-SAN registry maps one certificate identity to one service instance, one provider boundary, and
-a nonempty bounded cell set before a handler can run. Missing, invalid, expired, unregistered, or
-ambiguous identities fail before the handler and record no source-dark RPC metric. The standalone
-binary deliberately installs an empty deny-all registry; later deployment composition must inject an
-accepted registry before any caller can reach a handler.
-
-Pure injected validators exact-match the certificate-derived boundary/cell scope, authenticated
-tenant, protocol and policy revisions, one ACTIVE unexpired cell allocation revision/fence, and one
-cell-admission ID/fence. They use an injected database time, have no lookup client, and remain
-unwired from the request handlers because the authenticated-tenant wire context and authoritative
-allocation/admission read sources are not frozen. The shell has no continuity, spool, allocation
-store, admission store, or provider dependency, so it cannot create durable state or authorize
-traffic. Its rejection counter accepts only the seven frozen RPC names plus fixed `Unavailable` and
-`source_dark` labels; arbitrary HTTP paths, methods, user agents, certificates, tenants, boundaries,
-requests, buckets, and keys never become metric labels.
-
-The pure request-contract kernel validates and canonicalizes the complete seven-operation
+`request.rs`'s pure request-contract kernel validates and canonicalizes the complete seven-operation
 descriptor, reservations, consumer context, authenticated scope, metadata, range/list/body bounds,
 and optional durable PUT spool evidence. It derives the exact five-part durable request key and the
 frozen `object-dispatch-fingerprint-v1` BLAKE3 fingerprint. Canonical lowercase RFC 9562 UUIDv7
 identities are classified against an inclusive injected database-time window. One effect-free API
 atomically validates the caller-supplied fingerprint and classifies absent identity, exact full or
 compact replay, and identity reuse with a different fingerprint. Current authority, cell admission,
-deadline, reservation, and PUT spool checks are first-seen-only prerequisites.
+deadline, reservation, and PUT spool checks are first-seen-only prerequisites. The former
+`authority.rs` module's checks (exact protocol/policy revision, exact cell, exact derived boundary,
+nonnegative injected database time, and the cell's budget-configuration-revision pin) folded into
+this validator (CR-033 D3); with one boundary equal to one cell, "validate the authority context" and
+"validate the request" are the same operation.
 
-These functions perform no database, spool, clock, provider, or network access and are not called by
-the source-dark handlers. Durable lookup and serializable first-seen admission remain future
-composition work.
-
-The standalone binary requires exactly:
-
-- `LORE_OBJECT_DISPATCH_SERVICE_CONFIG_REVISION=object-store-dispatch-service-mtls-shell-v1`;
-- `LORE_OBJECT_DISPATCH_LISTEN_ADDR=<nonzero loopback socket address>`;
-- `LORE_OBJECT_DISPATCH_SERVER_CERT_CHAIN_PEM_PATH=<absolute path>`;
-- `LORE_OBJECT_DISPATCH_SERVER_PRIVATE_KEY_PEM_PATH=<absolute path>`; and
-- `LORE_OBJECT_DISPATCH_CLIENT_CA_PEM_PATH=<absolute path>`.
-
-Every other `LORE_OBJECT_DISPATCH_*` key is rejected at this shell stage. TLS material is loaded only
-from regular files at those runtime paths, with a 1 MiB bound per file, and is redacted from
-diagnostics; no certificate or key is embedded in the image. There is no health or readiness
-endpoint, provider route, provider credential, migration
-installer, or loreserver composition. The local image supplies `127.0.0.1:50051`, runs as an
-unprivileged user, exposes no port, and has no readiness `HEALTHCHECK`. Its three TLS path variables
-and read-only secret mounts must be supplied at runtime; the image declares neither.
+These functions perform no database, spool, clock, provider, or network access; the typed cell-
+authority client and drain workers call them, and call the retained PostgreSQL procedures for the
+durable admission, ReservePut, and spool-ready transitions themselves.
 
 ## Verification
 
@@ -233,13 +188,7 @@ cargo +nightly fmt --all -- --check
 cargo clippy -p lore-object-dispatch --all-targets -- -D warnings --no-deps
 cargo test -p lore-object-dispatch
 
-# Local source-dark image only; do not publish or deploy it
-docker build -f lore-object-dispatch/Dockerfile -t lore-object-dispatch:local .
-
 # Explicit, disposable, preprovisioned PostgreSQL target only
-cargo test -p lore-object-dispatch --test continuity_live -- --ignored --test-threads=1
-cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_allocates_dedicated_drained_epoch_one_to_two
-cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detail
 LORE_TEST_LOCAL_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_canonical_codec -- --ignored --exact live_postgres_reserved_and_spool_ready_bytes_match_independent_rust_vectors
 LORE_TEST_LOCAL_PUT_RESERVATION_SCHEMA_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_schema -- --ignored --exact live_postgres_enforces_put_result_shape_time_ack_and_service_acl
 LORE_TEST_LOCAL_PUT_RESERVATION_PROVISIONING_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_provisioning -- --ignored --exact live_postgres_chain_install_replay_read_and_drift_fail_closed
@@ -251,33 +200,17 @@ LORE_TEST_LOCAL_PUT_SPOOL_READY_CODEC_PG_URL=postgresql://... cargo test -p lore
 LORE_TEST_LOCAL_PUT_SPOOL_READY_MUTATION_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_spool_ready_mutation -- --ignored --exact live_postgres_spool_ready_is_atomic_replay_safe_and_source_dark
 ```
 
-The library suite validates service and continuity configuration, mutual TLS, URI-SAN registration,
-allocation/admission fence validation, canonical request fingerprinting, UUIDv7 and idempotency
-classification, first-seen prerequisites, redaction, SQL procedure shapes, exact numeric transfer,
-closed result decoding, migration identity, transient-error classification, and exact ambiguous-
-commit reconciliation.
-Each live contract has passed against disposable PostgreSQL 16 over real mTLS and the exact embedded
-migration. Run the shared-fixture contracts serially or by exact test name; a parallel all-ignored
-invocation can encounter expected serializable counter contention. They cover mapped boundary and
-reconciler identities, typed absence, serializable mutations, exact transition replay and readback,
-no-local-effect release, quarantine, ambiguous dispatch, both adjudication kinds through final
-release, nonzero `pg_lsn` snapshot recording and
-replay, covered `BOUND` ownership release, counter/readback invariants, and Begin replay of final
-rows. The snapshot/release contract also proves exact four-part shadow-release-receipt readback,
-canonical digest and byte validation, typed absence for each mismatched identity component, and
-denial to the boundary runtime identity. The dedicated drained-epoch contract proves `1 -> 2`, zero
-new high-water, active epoch reads,
-historical reconciliation absence, local invalid-order rejection, and transient SQLSTATE `40001` on
-a stale exact request; callers adopt the winner through epoch readback rather than replay. The
-archive contract uses normal Begin-to-`NO_LOCAL_EFFECT` transitions under a temporary historical
-database clock, restores the exact clock before archive, and proves singleton interval/prune
-sequence, post-prune detail absence, and boundary-role denial. Archive/prune depends on the exact
-release-receipt digest and reconciles response loss through the authenticated pruned-interval read.
-Retirement response loss similarly reconciles through the authenticated retired-summary read or
-exact active-interval checkpoint. The probe separately confirmed that a connection without a client
-certificate is rejected.
-The live harness uses mechanics-only SHA-256-as-BLAKE3 and typed-validator stubs; its snapshot
-evidence is synthetic contract data, not provider-local integration evidence. Deployment readiness
-still requires reviewed production BLAKE3 and typed validators, full cross-boundary negative
-isolation, external installation and effective-state readback, deployment-revision readback, and
-activation.
+The library suite validates cell-authority configuration, canonical request fingerprinting, UUIDv7
+and idempotency classification, first-seen prerequisites, redaction, SQL procedure shapes, exact
+numeric transfer, closed result decoding, migration identity, and transient-error classification.
+Each `local_authority_*` live contract, run by exact name against a disposable, separately
+provisioned PostgreSQL 16 with the matching migration installed, proves that instance's procedure
+signature, rows/bytes/retention semantics, typed absence, and replay safety against a real database
+rather than only the embedded migration bytes agreeing with the client statically.
+
+**There is no checked-in provisioning harness for this tier.** Unlike the retention client
+(`tests/run-retention-client-live.ps1`), the `local_authority_*` live fixtures above are
+environment-variable-gated `#[ignore]` tests with no runner to stand up the disposable database and
+install the CD-1 migration set. An `--ignored` run with the environment unset exits early — that is
+**NOT RUN**, never passing evidence. Building that harness is WP-114's CD-2 step and is a hard
+prerequisite before any of these live cases can be cited as real evidence.
