@@ -102,6 +102,10 @@ impl BoundedCanonicalWriter {
         Ok(())
     }
 
+    pub(crate) fn u8(&mut self, value: u8) -> Result<(), CanonicalPrimitiveError> {
+        self.raw(&[value])
+    }
+
     pub(crate) fn u32(&mut self, value: u32) -> Result<(), CanonicalPrimitiveError> {
         self.raw(&value.to_be_bytes())
     }

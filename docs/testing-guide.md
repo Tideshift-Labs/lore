@@ -157,6 +157,11 @@ will update an older check constraint or state schema.
   Pin independent bool/empty BLAKE3 vectors, the full nested version-list wire literal, optional
   scalar presence, closed provider classes, detached sorted metadata, and redacted diagnostics with
   `cargo test -p lore-object-dispatch --test terminal_result -j 4`.
+  Result ACK canonicalization must validate the stored request consumer context before encoding the
+  context-matched proof arm. Pin an independently derived full preimage and digest, all three proof
+  tags, optional-presence equality, closed durable-consumer kinds, terminal tuple and byte-handle
+  equality, the inclusive preimage bound, and ACK receipt purge ordering with
+  `cargo test -p lore-object-dispatch --test result_ack -j 4`.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

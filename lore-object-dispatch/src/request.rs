@@ -16,6 +16,7 @@ use lore_proto::lore::object_dispatch::v1::DurableConsumerKindV1;
 use lore_proto::lore::object_dispatch::v1::ObjectMetadataEntryV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreRequestV1;
 use lore_proto::lore::object_dispatch::v1::ReservedDimensionV1;
+use lore_proto::lore::object_dispatch::v1::ResultConsumerContextV1;
 use lore_proto::lore::object_dispatch::v1::object_store_request_v1;
 use lore_proto::lore::object_dispatch::v1::result_consumer_context_v1;
 use thiserror::Error;
@@ -617,22 +618,57 @@ fn validate_and_encode_consumer(
     identity: &AuthenticatedConsumerIdentity,
     limits: &RequestIdentityLimits,
 ) -> Result<(u32, Vec<CanonicalPart>), RequestContractError> {
-    let consumer = request
+    let context = request
         .consumer_context
         .as_ref()
-        .and_then(|context| context.consumer.as_ref())
+        .ok_or(RequestContractError::InvalidConsumerContext)?;
+    let operation = request
+        .operation
+        .as_ref()
+        .ok_or(RequestContractError::InvalidConsumerContext)?;
+    validate_and_encode_result_consumer_context(operation, context, identity, limits)
+}
+
+pub(crate) fn validate_result_consumer_context(
+    operation: &object_store_request_v1::Operation,
+    context: &ResultConsumerContextV1,
+    identity: &AuthenticatedConsumerIdentity,
+    limits: &RequestIdentityLimits,
+) -> Result<(), RequestContractError> {
+    if limits.max_identity_bytes == 0 || limits.max_authenticated_scope_bytes == 0 {
+        return Err(RequestContractError::InvalidLimits);
+    }
+    validate_and_encode_result_consumer_context(operation, context, identity, limits).map(|_| ())
+}
+
+fn validate_and_encode_result_consumer_context(
+    operation: &object_store_request_v1::Operation,
+    context: &ResultConsumerContextV1,
+    identity: &AuthenticatedConsumerIdentity,
+    limits: &RequestIdentityLimits,
+) -> Result<(u32, Vec<CanonicalPart>), RequestContractError> {
+    match operation {
+        object_store_request_v1::Operation::HeadBucket(_)
+        | object_store_request_v1::Operation::ListObjectsV2(_)
+        | object_store_request_v1::Operation::HeadObject(_)
+        | object_store_request_v1::Operation::GetObject(_)
+        | object_store_request_v1::Operation::PutObject(_)
+        | object_store_request_v1::Operation::ListObjectVersions(_)
+        | object_store_request_v1::Operation::DeleteObject(_) => {}
+    }
+    let consumer = context
+        .consumer
+        .as_ref()
         .ok_or(RequestContractError::InvalidConsumerContext)?;
     match consumer {
         result_consumer_context_v1::Consumer::FragmentLifecycle(context) => {
             if !matches!(
-                request.operation,
-                Some(
-                    object_store_request_v1::Operation::HeadObject(_)
-                        | object_store_request_v1::Operation::GetObject(_)
-                        | object_store_request_v1::Operation::PutObject(_)
-                        | object_store_request_v1::Operation::ListObjectVersions(_)
-                        | object_store_request_v1::Operation::DeleteObject(_)
-                )
+                operation,
+                object_store_request_v1::Operation::HeadObject(_)
+                    | object_store_request_v1::Operation::GetObject(_)
+                    | object_store_request_v1::Operation::PutObject(_)
+                    | object_store_request_v1::Operation::ListObjectVersions(_)
+                    | object_store_request_v1::Operation::DeleteObject(_)
             ) || context.fragment_id.len() != 32
                 || context.lifecycle_generation == 0
                 || context.fragment_epoch == 0
@@ -670,11 +706,9 @@ fn validate_and_encode_consumer(
                 + usize::from(context.reader_fence.is_some());
             if reader_count == 1
                 || (matches!(
-                    request.operation,
-                    Some(
-                        object_store_request_v1::Operation::HeadObject(_)
-                            | object_store_request_v1::Operation::GetObject(_)
-                    )
+                    operation,
+                    object_store_request_v1::Operation::HeadObject(_)
+                        | object_store_request_v1::Operation::GetObject(_)
                 ) && reader_count != 2)
             {
                 return Err(RequestContractError::InvalidConsumerContext);
@@ -704,10 +738,8 @@ fn validate_and_encode_consumer(
             ))
         }
         result_consumer_context_v1::Consumer::StartupAdmission(context) => {
-            if !matches!(
-                request.operation,
-                Some(object_store_request_v1::Operation::HeadBucket(_))
-            ) || context.readiness_generation == 0
+            if !matches!(operation, object_store_request_v1::Operation::HeadBucket(_))
+                || context.readiness_generation == 0
             {
                 return Err(RequestContractError::InvalidConsumerContext);
             }
