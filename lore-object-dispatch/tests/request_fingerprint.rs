@@ -1280,6 +1280,208 @@ fn first_seen_prerequisites_reject_authority_reservation_deadline_and_spool_mism
     );
 }
 
+fn identity_with_boundary(provider_boundary_id: &str) -> AuthenticatedConsumerIdentity {
+    AuthenticatedConsumerIdentity {
+        provider_boundary_id: provider_boundary_id.to_string(),
+        ..identity()
+    }
+}
+
+/// A `HeadBucket` request carrying `StartupAdmission` consumer context, whose validation never
+/// reconstructs an authenticated scope from `identity`'s fields (unlike the default `DurableConsumer`
+/// context `base_request` uses). That keeps a substituted `provider_boundary_id` isolated to the
+/// identity charset check this test is pinning, instead of also tripping an unrelated scope mismatch.
+fn request_with_boundary(provider_boundary_id: &str) -> ObjectStoreRequestV1 {
+    let mut request = base_request(head_bucket());
+    request.provider_boundary_id = provider_boundary_id.to_string();
+    request.consumer_context = Some(ResultConsumerContextV1 {
+        consumer: Some(result_consumer_context_v1::Consumer::StartupAdmission(
+            StartupAdmissionConsumerContextV1 {
+                policy_revision: "policy-1".to_string(),
+                allocation_revision: "allocation-1".to_string(),
+                config_revision: "config-1".to_string(),
+                startup_attempt_id: "startup-1".to_string(),
+                readiness_generation: 1,
+            },
+        )),
+    });
+    request
+}
+
+#[test]
+fn fingerprint_and_first_seen_agree_on_the_identity_charset_boundary() {
+    // Regression for a real defect: `fingerprint_object_store_request` used to validate
+    // `provider_boundary_id`/`authenticated_cell_id`/`authenticated_tenant_id` with the permissive
+    // `validate_canonical_text`, while `validate_first_seen_prerequisites` validated the same three
+    // with the strict `validate_canonical_id`. An id containing e.g. `@` would fingerprint
+    // successfully, get durably stored, and then be rejected by first-seen forever -- a wedged
+    // request behind a durable row it could never clear. Asserting only that a bad id is rejected
+    // "somewhere" would have passed against that broken code; the real assertion is agreement: an
+    // id fingerprint accepts, first-seen must also accept, and an id fingerprint rejects must never
+    // reach first-seen with a durable row at all (proven structurally: without a `ValidatedRequest`,
+    // first-seen cannot be called).
+    let cases: [(&str, bool); 5] = [
+        ("boundary-a", true),
+        ("boundary@bad", false),
+        ("boundary+bad", false),
+        ("boundary\u{00e9}bad", false),
+        ("-leadbad", false),
+    ];
+
+    for (id, should_accept) in cases {
+        let request = request_with_boundary(id);
+        let identity = identity_with_boundary(id);
+        let fingerprint_result = fingerprint_object_store_request(&request, &identity, &limits());
+
+        assert_eq!(
+            fingerprint_result.is_ok(),
+            should_accept,
+            "fingerprint acceptance for {id:?}"
+        );
+
+        let Ok(validated) = fingerprint_result else {
+            // Rejected before any `ValidatedRequest` exists: there is no durable row for
+            // first-seen to ever wedge behind, so there is nothing further to assert here.
+            continue;
+        };
+
+        let mut committed = request.clone();
+        committed.canonical_fingerprint = validated.canonical_fingerprint().to_vec().into();
+        let committed_validated =
+            fingerprint_object_store_request(&committed, &identity, &limits())
+                .expect("resubmitting an accepted id must refingerprint identically");
+        let authority = ExpectedRequestAuthority {
+            provider_boundary_id: id.to_string(),
+            ..expected_authority()
+        };
+        let admission = expected_admission();
+        let requirements = requirements();
+        let prerequisites = FirstSeenPrerequisites {
+            expected_authority: &authority,
+            expected_cell_admission: Some(&admission),
+            reservation_requirements: &requirements,
+            put_spool: None,
+            database_now_unix_ms: 1_724_999_999_000,
+            max_request_deadline_horizon_ms: 2_000,
+            cell_allocation_hard_expiry_unix_ms: 1_725_000_001_000,
+            dispatch_authority_hard_expiry_unix_ms: 1_725_000_001_000,
+        };
+
+        assert!(
+            matches!(
+                validate_first_seen_prerequisites(
+                    &committed,
+                    &committed_validated,
+                    &prerequisites,
+                    &limits()
+                ),
+                Ok(FirstSeenIdentityDecision::Admit { .. })
+            ),
+            "an id fingerprint accepts must also be accepted by first-seen: {id:?}"
+        );
+    }
+}
+
+fn elevated_identity_limits() -> RequestFingerprintLimits {
+    let mut limits = limits();
+    limits.identity.max_identity_bytes = 300;
+    limits
+}
+
+#[test]
+fn validate_authority_revision_bounds_are_independent_of_the_caller_limit() {
+    // `validate_authority_revision`'s nonempty/256-byte/control-character/NFC bounds are the checks
+    // the removed `authority.rs` applied and the `request.rs` fold restored. The 256-byte bound in
+    // particular is `MAX_CANONICAL_ID_BYTES`, deliberately independent of the caller's
+    // `max_identity_bytes` -- so this pins it with a caller limit set above 256 to prove the
+    // validator holds on its own rather than being subsumed by the caller's limit.
+    let mut request = base_request(head_bucket());
+    let computed = fingerprint(&request);
+    request.canonical_fingerprint = computed.canonical_fingerprint().to_vec().into();
+    let validated = fingerprint(&request);
+    let admission = expected_admission();
+    let requirements = requirements();
+
+    let run = |protocol_revision: String| {
+        let authority = ExpectedRequestAuthority {
+            protocol_revision,
+            ..expected_authority()
+        };
+        let prerequisites = FirstSeenPrerequisites {
+            expected_authority: &authority,
+            expected_cell_admission: Some(&admission),
+            reservation_requirements: &requirements,
+            put_spool: None,
+            database_now_unix_ms: 1_724_999_999_000,
+            max_request_deadline_horizon_ms: 2_000,
+            cell_allocation_hard_expiry_unix_ms: 1_725_000_001_000,
+            dispatch_authority_hard_expiry_unix_ms: 1_725_000_001_000,
+        };
+        validate_first_seen_prerequisites(
+            &request,
+            &validated,
+            &prerequisites,
+            &elevated_identity_limits(),
+        )
+    };
+
+    assert_eq!(
+        run(String::new()),
+        Err(RequestContractError::InvalidCanonicalText),
+        "empty revision"
+    );
+    assert_eq!(
+        run("a".repeat(257)),
+        Err(RequestContractError::InvalidCanonicalText),
+        "257-byte revision, under the caller's 300-byte limit but over MAX_CANONICAL_ID_BYTES"
+    );
+    assert_eq!(
+        run(format!("revision{}", '\u{0001}')),
+        Err(RequestContractError::InvalidCanonicalText),
+        "control character, which validate_canonical_text alone would not catch"
+    );
+    assert_eq!(
+        run("e\u{301}".to_string()),
+        Err(RequestContractError::InvalidCanonicalText),
+        "non-NFC (combining accent)"
+    );
+    // The equality check in `validate_expected_authority` runs after the revision-validity
+    // check, so the positive case needs its own fixture whose request actually carries the
+    // precomposed NFC revision (`run`'s shared `request`/`validated` fix `protocol_revision` at
+    // "protocol-1" and would otherwise fail on `AuthorityMismatch`, not prove NFC acceptance).
+    let mut nfc_request = base_request(head_bucket());
+    nfc_request.protocol_revision = "r\u{00e9}vision-1".to_string();
+    let nfc_computed = fingerprint(&nfc_request);
+    nfc_request.canonical_fingerprint = nfc_computed.canonical_fingerprint().to_vec().into();
+    let nfc_validated = fingerprint(&nfc_request);
+    let nfc_authority = ExpectedRequestAuthority {
+        protocol_revision: "r\u{00e9}vision-1".to_string(),
+        ..expected_authority()
+    };
+    let nfc_prerequisites = FirstSeenPrerequisites {
+        expected_authority: &nfc_authority,
+        expected_cell_admission: Some(&admission),
+        reservation_requirements: &requirements,
+        put_spool: None,
+        database_now_unix_ms: 1_724_999_999_000,
+        max_request_deadline_horizon_ms: 2_000,
+        cell_allocation_hard_expiry_unix_ms: 1_725_000_001_000,
+        dispatch_authority_hard_expiry_unix_ms: 1_725_000_001_000,
+    };
+    assert!(
+        matches!(
+            validate_first_seen_prerequisites(
+                &nfc_request,
+                &nfc_validated,
+                &nfc_prerequisites,
+                &elevated_identity_limits()
+            ),
+            Ok(FirstSeenIdentityDecision::Admit { .. })
+        ),
+        "precomposed NFC revision must be accepted"
+    );
+}
+
 #[test]
 fn request_fingerprint_primitives_remain_effect_free_and_unwired() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

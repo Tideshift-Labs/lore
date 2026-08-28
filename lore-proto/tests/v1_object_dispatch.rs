@@ -60,9 +60,8 @@ fn object_dispatch_v1_contract_matches_wp_121() {
 }
 
 #[test]
-fn object_dispatch_v1_has_no_service_or_streaming_surface() {
+fn object_dispatch_v1_declares_no_service_surface() {
     let source = without_line_comments(PROTO);
-    let declarations: [&str; 0] = [];
 
     assert!(source.contains("package lore.object_dispatch.v1;"));
     assert_eq!(
@@ -70,13 +69,11 @@ fn object_dispatch_v1_has_no_service_or_streaming_surface() {
         0,
         "the seven-RPC service block must not be present (CR-033 D1/D6)"
     );
-    assert_eq!(source.matches("rpc ").count(), declarations.len());
-    for declaration in declarations {
-        assert!(
-            source.contains(declaration),
-            "missing exact RPC declaration: {declaration}"
-        );
-    }
+    assert_eq!(
+        source.matches("rpc ").count(),
+        0,
+        "the package is a canonical record schema and declares no RPC (CR-033 D1/D2)"
+    );
 }
 
 #[test]

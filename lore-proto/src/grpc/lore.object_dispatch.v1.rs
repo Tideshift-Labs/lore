@@ -542,8 +542,10 @@ impl ::prost::Name for ReservedDimensionV1 {
 /// removed under CR-033 D6. They were the global dispatch authority record ADR-00025's
 /// 2026-08-28 amendment rejected, carrying the cross-cell context D3 collapses: boundary
 /// evidence revision, provider credential revision, dispatcher lease generation, and the
-/// no-dispatch authority epoch. ObjectStoreCellDispatchAuthorityV1 replaces them, and no
-/// field in this package was ever typed with either, so nothing encoded them.
+/// no-dispatch authority epoch. They have no replacement message here and will not get one:
+/// under D1 the authority is in-process, so the cell's authority context lives in the frozen
+/// migration-0007 columns and in config.rs's CELL_AUTHORITY_CONFIG_REVISION, not on a wire.
+/// No field in this package was ever typed with either, so nothing encoded them.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResultConsumerContextV1 {
     #[prost(oneof = "result_consumer_context_v1::Consumer", tags = "1, 2, 3")]

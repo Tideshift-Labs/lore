@@ -125,16 +125,24 @@ will update an older check constraint or state schema.
   coverage of their own — their only exercise was through the deleted `service_shell.rs`/
   `service_mtls.rs`, so the simplified successors need fresh test files, not edits. Same gap for the
   `authority.rs` fold: `authority.rs` itself had no test file or co-located unit tests before removal,
-  so its retained checks need new coverage added to `tests/request_fingerprint.rs` once `request.rs`'s
-  folded field/type shape (in particular whether cell admission becomes `Option`) is final — don't
-  guess the shape; ask the implementing lane instead of inventing struct fields.
+  so its retained checks needed new coverage in `tests/request_fingerprint.rs`. The folded shape is
+  now settled: `FirstSeenPrerequisites.expected_cell_admission` **is** an
+  `Option<&ExpectedCellAdmission>`, `None` being the cell authority's own shape, and the
+  request-side `cell_admission_id`/`cell_admission_fence` pair is all-or-none — both absent is legal,
+  a half-supplied pair is `AuthorityMismatch`. `ExpectedRequestAuthority` keeps its field names;
+  `allocation_revision`/`allocation_fence` are re-bound to the cell's frozen budget-configuration
+  revision and its monotonic generation.
   `ObjectStoreCompactAuthority::{ContinuityQuarantined,ContinuityAdjudicated}` are removed
   (`RequestState` is the sole remaining variant); `ObjectStoreCompactDependencyFloorKind::Continuity`
   and its wire value `5` are explicitly retained (D5) — don't remove that variant chasing the rest of
   the family out.
-  `ContinuityWireLimits` was only ever a `pub type` alias for `RequestStateWireLimits`
-  (`continuity_wire.rs`), not a distinct struct, so every test importing the alias needs a plain
-  rename to the underlying type when the aliasing module goes, not a field-by-field rewrite.
+  `ContinuityWireLimits` and `RequestStateWireLimits` were always one struct behind a `pub type`
+  alias, but check which side owns it before assuming a direction. At the `930ca46` anchor the
+  continuity module owned it (`pub type RequestStateWireLimits = ContinuityWireLimits`); Wave 1
+  (`9a8787f`) inverted the dependency, leaving `pub type ContinuityWireLimits =
+  RequestStateWireLimits` in `continuity_wire.rs`. Either way it is one struct, so a test importing
+  the alias needs a plain rename to the surviving type when the aliasing module goes, not a
+  field-by-field rewrite.
   Symptom: a retained suite (`tests/canonical_id.rs`) breaks even though it never imports the removed
   module by name. Cause: it tests a crate-private helper (`contract::validate_canonical_id`)
   exclusively through *whichever public wrapper is convenient* (`auth::AuthorizedCallerRegistry`),
@@ -429,6 +437,34 @@ actually care about -- silently flaky for a positive assertion, and close to vac
 one ("no Error event" then only proves the *first* event wasn't one). If you copy that drain
 pattern into a new test, drain to `End`, not to first-non-empty.
 
+### Two public callers of one private charset validator need an agreement test, not two isolated rejections
+
+Symptom: a durably-stored id gets rejected forever by a later validation pass, with no way to
+clear it. Cause: two public entry points validate the same identity field with different private
+helpers (e.g. `lore-object-dispatch/src/request.rs`'s `fingerprint_object_store_request`, whose
+output is durably stored, versus `validate_first_seen_prerequisites`, which runs later against
+that stored row) — a permissive `validate_canonical_text` at the earlier gate and a strict
+`validate_canonical_id` at the later one let an id like one containing `@` pass the first and wedge
+behind the second. What to do: when a fix makes an earlier gate re-apply the later gate's charset,
+test the *agreement property* directly — for a table of ids spanning the charset boundary, assert
+fingerprint-accepts implies first-seen-accepts, and that a rejected id never produces a
+`ValidatedRequest` to call first-seen with in the first place (structural proof, not just "the bad
+id is rejected somewhere"). A test that only checks the bad id is rejected once would have passed
+against the broken code. Gate:
+`cargo test -p lore-object-dispatch --test request_fingerprint -j 4 --
+fingerprint_and_first_seen_agree_on_the_identity_charset_boundary`.
+A crate-private validator reachable only through a folded struct field (here,
+`validate_authority_revision`, reachable through `ExpectedRequestAuthority`'s
+`protocol_revision`/`policy_revision`/`allocation_revision` via `validate_first_seen_prerequisites`)
+needs its bound proven independent of the caller-supplied limit it sits behind: set the caller's
+`max_identity_bytes` comfortably above the validator's own byte cap
+(`contract::MAX_CANONICAL_ID_BYTES`, 256) so an over-cap value clears the caller limit and is
+rejected only by the validator's own check — otherwise the test proves the caller's limit, not the
+validator's. The same asymmetry applies to a broader control-character rejection than the shared
+`validate_canonical_text` gate provides (which only excludes NUL): use a non-NUL control character
+to prove the stricter check is actually reached, not shadowed by the earlier gate agreeing by
+coincidence. Gate: `..validate_authority_revision_bounds_are_independent_of_the_caller_limit`.
+
 ### A negative control alone doesn't prove the positive path
 
 Two tests that both assert "zero rows / no error event" (a failure case and a genuinely-empty
@@ -464,9 +500,12 @@ current-thread/one-worker runs and event or stage-end counts do not prove topolo
   prose-described seam (public vs private fields, `fn(...)` vs closure) is rarely fully specified;
   expect one iteration pass to fix signature mismatches, not a full rewrite -- for CR-033's
   `request_state_wire`/`continuity_wire` split, the only guess that landed wrong was the import path:
-  a function relocated to a *different* module (the old two-arg `validate_and_encode_object_store_
-  request_receipt`/`..._outcome` moved into `continuity_wire.rs`) keeps its crate-root re-export, so
-  import it from `lore_object_dispatch::` directly rather than through either module's own path.
+  a function can relocate between modules while keeping its crate-root re-export, so import it from
+  `lore_object_dispatch::` directly rather than through any module's own path. The two-arg
+  `validate_and_encode_object_store_request_receipt`/`..._outcome` demonstrate both halves — they
+  moved into `continuity_wire.rs` under Wave 1, then back into `request_state_wire.rs` when that
+  module was deleted, absorbing the `_with` variants and dropping the encoder parameter. The
+  crate-root path was correct throughout; neither module path was.
 - `AuthorizedCallerRegistry` does not derive `PartialEq` (it wraps an `Arc<BTreeMap<..>>` of redacted
   entries). A helper that returns `Result<AuthorizedCallerRegistry, E>` can't be `assert_eq!`'d
   directly; map to `Result<(), E>` first, or compare `.err()` against `Some(..)`.

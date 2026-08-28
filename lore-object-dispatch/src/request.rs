@@ -282,6 +282,17 @@ pub fn fingerprint_object_store_request(
         &request.allocation_revision,
         limits.identity.max_identity_bytes,
     )?;
+    // The strict identity charset is enforced here, before anything durable is written, because
+    // the first-seen validator applies the same check. If the two disagreed, an id the fingerprint
+    // accepted would be rejected by first-seen forever, wedging the request behind a durable row
+    // it could never clear. One charset, checked at the earlier gate.
+    for id in [
+        &request.provider_boundary_id,
+        &request.authenticated_cell_id,
+        &request.authenticated_tenant_id,
+    ] {
+        validate_canonical_id(id).map_err(|_| RequestContractError::InvalidCanonicalText)?;
+    }
     // Cell admission is all-or-none, mirroring migration 0007's
     // CHECK (num_nonnulls(cell_admission_id, cell_admission_fence) IN (0, 2)). The cell authority
     // supplies neither (CR-033 D3), so the absent form is a legal retained state; a half-supplied
@@ -291,10 +302,14 @@ pub fn fingerprint_object_store_request(
         request.cell_admission_fence,
     ) {
         (true, 0) => {}
-        (false, fence) if fence > 0 => validate_canonical_text(
-            &request.cell_admission_id,
-            limits.identity.max_identity_bytes,
-        )?,
+        (false, fence) if fence > 0 => {
+            validate_canonical_text(
+                &request.cell_admission_id,
+                limits.identity.max_identity_bytes,
+            )?;
+            validate_canonical_id(&request.cell_admission_id)
+                .map_err(|_| RequestContractError::InvalidCanonicalText)?;
+        }
         _ => return Err(RequestContractError::AuthorityMismatch),
     }
     if request.allocation_fence == 0 {
@@ -521,12 +536,18 @@ fn validate_authenticated_consumer(
 
 /// A revision string carried by the cell's authority context.
 ///
-/// Folded verbatim from the removed `authority.rs` (CR-033 D3). `validate_canonical_text` bounds
-/// length and pins NFC but permits control characters, and its bound is caller-supplied; an
-/// authority revision additionally rejects control characters and is pinned to
-/// `MAX_CANONICAL_ID_BYTES` regardless of the caller's limit.
+/// Folded from the removed `authority.rs` (CR-033 D3), which required a revision to be nonempty,
+/// at most `MAX_CANONICAL_ID_BYTES`, free of control characters, and in NFC. All four are checked
+/// here. The bound and the NFC pin are not delegated to `validate_canonical_text`: that bound is
+/// caller-supplied, and D3 states the retained check as exact protocol and policy revision *in
+/// NFC*, so this validator must hold on its own rather than through a caller's limit or through
+/// an equality comparison that happens to bounce the same input first.
 fn validate_authority_revision(value: &str) -> Result<(), RequestContractError> {
-    if value.len() > MAX_CANONICAL_ID_BYTES || value.chars().any(char::is_control) {
+    if value.is_empty()
+        || value.len() > MAX_CANONICAL_ID_BYTES
+        || value.chars().any(char::is_control)
+        || value.nfc().ne(value.chars())
+    {
         return Err(RequestContractError::InvalidCanonicalText);
     }
     Ok(())
