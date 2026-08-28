@@ -148,21 +148,12 @@ message ReservedDimensionV1 {
   string reservation_id = 1; string physical_dimension_id = 2;
   string operation_class_id = 3; uint64 units = 4;
 }
-message ProviderDimensionAuthorityV1 {
-  string physical_dimension_id = 1; string unit = 2;
-  uint64 sustained_units_per_interval = 3; uint64 max_burst_units = 4;
-  uint64 reserve_units = 5; uint64 unresolved_old_units = 6;
-  uint64 enforcement_interval_ms = 7;
-}
-message ObjectStoreDispatchAuthorityV1 {
-  string protocol_revision = 1; string policy_revision = 2;
-  string provider_boundary_id = 3; string boundary_evidence_revision = 4;
-  string allocation_revision = 5; uint64 allocation_fence = 6;
-  string provider_credential_revision = 7; uint64 dispatcher_lease_generation = 8;
-  repeated ProviderDimensionAuthorityV1 dimensions = 9;
-  int64 issued_at_unix_ms = 10; int64 hard_expiry_unix_ms = 11;
-  uint64 no_dispatch_authority_epoch = 12;
-}
+// ObjectStoreDispatchAuthorityV1 and ProviderDimensionAuthorityV1 stood here and are
+// removed under CR-033 D6. They were the global dispatch authority record ADR-00025's
+// 2026-08-28 amendment rejected, carrying the cross-cell context D3 collapses: boundary
+// evidence revision, provider credential revision, dispatcher lease generation, and the
+// no-dispatch authority epoch. ObjectStoreCellDispatchAuthorityV1 replaces them, and no
+// field in this package was ever typed with either, so nothing encoded them.
 message ResultConsumerContextV1 {
   oneof consumer {
     FragmentLifecycleConsumerContextV1 fragment_lifecycle = 1;

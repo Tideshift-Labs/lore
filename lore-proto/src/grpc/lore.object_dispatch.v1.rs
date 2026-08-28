@@ -538,70 +538,12 @@ impl ::prost::Name for ReservedDimensionV1 {
         "/lore.object_dispatch.v1.ReservedDimensionV1".into()
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ProviderDimensionAuthorityV1 {
-    #[prost(string, tag = "1")]
-    pub physical_dimension_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub unit: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "3")]
-    pub sustained_units_per_interval: u64,
-    #[prost(uint64, tag = "4")]
-    pub max_burst_units: u64,
-    #[prost(uint64, tag = "5")]
-    pub reserve_units: u64,
-    #[prost(uint64, tag = "6")]
-    pub unresolved_old_units: u64,
-    #[prost(uint64, tag = "7")]
-    pub enforcement_interval_ms: u64,
-}
-impl ::prost::Name for ProviderDimensionAuthorityV1 {
-    const NAME: &'static str = "ProviderDimensionAuthorityV1";
-    const PACKAGE: &'static str = "lore.object_dispatch.v1";
-    fn full_name() -> ::prost::alloc::string::String {
-        "lore.object_dispatch.v1.ProviderDimensionAuthorityV1".into()
-    }
-    fn type_url() -> ::prost::alloc::string::String {
-        "/lore.object_dispatch.v1.ProviderDimensionAuthorityV1".into()
-    }
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ObjectStoreDispatchAuthorityV1 {
-    #[prost(string, tag = "1")]
-    pub protocol_revision: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub policy_revision: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub provider_boundary_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "4")]
-    pub boundary_evidence_revision: ::prost::alloc::string::String,
-    #[prost(string, tag = "5")]
-    pub allocation_revision: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "6")]
-    pub allocation_fence: u64,
-    #[prost(string, tag = "7")]
-    pub provider_credential_revision: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "8")]
-    pub dispatcher_lease_generation: u64,
-    #[prost(message, repeated, tag = "9")]
-    pub dimensions: ::prost::alloc::vec::Vec<ProviderDimensionAuthorityV1>,
-    #[prost(int64, tag = "10")]
-    pub issued_at_unix_ms: i64,
-    #[prost(int64, tag = "11")]
-    pub hard_expiry_unix_ms: i64,
-    #[prost(uint64, tag = "12")]
-    pub no_dispatch_authority_epoch: u64,
-}
-impl ::prost::Name for ObjectStoreDispatchAuthorityV1 {
-    const NAME: &'static str = "ObjectStoreDispatchAuthorityV1";
-    const PACKAGE: &'static str = "lore.object_dispatch.v1";
-    fn full_name() -> ::prost::alloc::string::String {
-        "lore.object_dispatch.v1.ObjectStoreDispatchAuthorityV1".into()
-    }
-    fn type_url() -> ::prost::alloc::string::String {
-        "/lore.object_dispatch.v1.ObjectStoreDispatchAuthorityV1".into()
-    }
-}
+/// ObjectStoreDispatchAuthorityV1 and ProviderDimensionAuthorityV1 stood here and are
+/// removed under CR-033 D6. They were the global dispatch authority record ADR-00025's
+/// 2026-08-28 amendment rejected, carrying the cross-cell context D3 collapses: boundary
+/// evidence revision, provider credential revision, dispatcher lease generation, and the
+/// no-dispatch authority epoch. ObjectStoreCellDispatchAuthorityV1 replaces them, and no
+/// field in this package was ever typed with either, so nothing encoded them.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResultConsumerContextV1 {
     #[prost(oneof = "result_consumer_context_v1::Consumer", tags = "1, 2, 3")]

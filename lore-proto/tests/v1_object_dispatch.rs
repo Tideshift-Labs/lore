@@ -11,9 +11,9 @@ const GENERATED: &str = include_str!("../src/grpc/lore.object_dispatch.v1.rs");
 // schema. Comments and formatting are deliberately excluded, while every package, type, field name,
 // field number, reserved field number, optional/repeated qualifier, oneof branch, enum name, and
 // enum number remains covered. Re-freeze all three together, in the same commit as the proto edit.
-const CONTRACT_TOKEN_BYTES: usize = 21_255;
-const CONTRACT_FNV1A64: u64 = 0x898f_5cbc_6c0e_a1ca;
-const CONTRACT_DJB2_XOR64: u64 = 0xa98b_c9ca_05c6_521a;
+const CONTRACT_TOKEN_BYTES: usize = 20_612;
+const CONTRACT_FNV1A64: u64 = 0x4d34_14d5_b5a6_438d;
+const CONTRACT_DJB2_XOR64: u64 = 0xb3d4_8c7d_3014_e8bb;
 
 fn without_line_comments(source: &str) -> String {
     source
@@ -118,6 +118,10 @@ fn checked_in_bindings_and_public_exports_are_available() {
             "outcome type must remain boxed in both generated oneofs: {outcome_type}"
         );
     }
+    // Compare against code only. Both files carry tombstone comments that name the removed
+    // types on purpose, so a raw containment check would trip on the documentation.
+    let proto_code = without_line_comments(PROTO);
+    let generated_code = without_line_comments(GENERATED);
     for removed_message in [
         "ObjectStoreContinuityQuarantinedV1",
         "ObjectStoreContinuityAdjudicatedV1",
@@ -127,10 +131,18 @@ fn checked_in_bindings_and_public_exports_are_available() {
         "ObjectStoreContinuityAdjudicationKindV1",
         "ObjectStoreContinuityAdjudicationProofV1",
         "ObjectStoreContinuityQuotaReleaseReceiptV1",
+        // The superseded global dispatch authority record and its per-dimension child
+        // (CR-033 D6). Nothing was ever typed with either, so they encoded nothing.
+        "ObjectStoreDispatchAuthorityV1",
+        "ProviderDimensionAuthorityV1",
     ] {
         assert!(
-            !GENERATED.contains(removed_message),
-            "removed continuity type must not reappear in generated bindings: {removed_message}"
+            !generated_code.contains(removed_message),
+            "removed type must not reappear in generated bindings: {removed_message}"
+        );
+        assert!(
+            !proto_code.contains(removed_message),
+            "removed type must not be re-declared in the proto: {removed_message}"
         );
     }
 }
