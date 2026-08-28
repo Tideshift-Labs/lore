@@ -76,7 +76,17 @@ embeds the exact 4,690-byte source-dark PUT-reservation schema migration. Its BL
 all-or-none pre-Submit reservation and current-ACK fields to the spool table, including the exact
 overflow-safe minimum expiry and canonical ACK suffix. The authenticated lookup index and table
 authority remain owner-only. The artifact adds no function, mutation path, runtime call, provider,
-or grant; provisioning/readback must attest the extended catalog before readiness.
+or grant; the replacement provisioning/readback surface below attests the extended catalog.
+
+`local_authority_put_reservation_provisioning::LOCAL_AUTHORITY_PUT_RESERVATION_PROVISIONING_MIGRATION_V1`
+embeds the exact 31,471-byte source-dark provisioning/readback migration for the extended authority.
+Its BLAKE3-256 is `afe63db96bf286d1f04e6015eaf797e020b2fcbb2b13012224c66ef462d47248`.
+The complete catalog manifest attests all authority relations, type/domain/composite objects, 29
+functions, and ACLs; its SHA-256 is
+`837aa8d2654cea2204e88fcc56d4cd291199c73829aa77c0e55b69544864e32c`. Exact install, replay,
+and migrator/maintenance readback use the replacement versioned surface; superseded entry points
+lose service-role execution. Runtime code neither installs nor calls it, and it adds no mutation,
+provider traffic, deployment, readiness, or named handoff.
 
 ## Private protocol
 
@@ -150,6 +160,7 @@ cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact l
 cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detail
 LORE_TEST_LOCAL_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_canonical_codec -- --ignored --exact live_postgres_reserved_and_spool_ready_bytes_match_independent_rust_vectors
 LORE_TEST_LOCAL_PUT_RESERVATION_SCHEMA_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_schema -- --ignored --exact live_postgres_enforces_put_result_shape_time_ack_and_service_acl
+LORE_TEST_LOCAL_PUT_RESERVATION_PROVISIONING_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_provisioning -- --ignored --exact live_postgres_chain_install_replay_read_and_drift_fail_closed
 ```
 
 The library suite validates service and continuity configuration, mutual TLS, URI-SAN registration,
