@@ -188,7 +188,32 @@ cargo +nightly fmt --all -- --check
 cargo clippy -p lore-object-dispatch --all-targets -- -D warnings --no-deps
 cargo test -p lore-object-dispatch
 
-# Explicit, disposable, preprovisioned PostgreSQL target only
+# Local-authority live tier: supported path (stands up disposable PostgreSQL 16,
+# installs the CD-1 set, runs all nine by exact name, reports PASS/FAIL/NOT RUN)
+tests/run-local-authority-live.ps1
+```
+
+The library suite validates cell-authority configuration, canonical request fingerprinting, UUIDv7
+and idempotency classification, first-seen prerequisites, redaction, SQL procedure shapes, exact
+numeric transfer, closed result decoding, migration identity, and transient-error classification.
+Each `local_authority_*` live contract, run by exact name against a disposable, separately
+provisioned PostgreSQL 16 with the matching migration installed, proves that instance's procedure
+signature, rows/bytes/retention semantics, typed absence, and replay safety against a real database
+rather than only the embedded migration bytes agreeing with the client statically.
+
+`run-local-authority-live.ps1` (WP-114 CD-2, Lore `1bb4ff7`) is the checked-in provisioning
+harness for this tier, modeled on the retention client's runner
+(`tests/run-retention-client-live.ps1`). Two independent clean runs: 9/9 PASS, exit 0, container
+removed, dangling-volume count unchanged. It installs the CD-1 set into a dedicated
+`local_install_chain_proof` database to run the WP-114 CD-1 inert-state assertion; the
+`local_authority_put_spool_ready_mutation` live test separately self-installs the full chain via
+compile-time `include_str!`. Full verification detail is in CR-033's "Verification: the retained
+half's live-test provisioning harness" section.
+
+Manual fallback — run one fixture directly against an explicit, disposable, preprovisioned
+PostgreSQL target without the runner:
+
+```sh
 LORE_TEST_LOCAL_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_canonical_codec -- --ignored --exact live_postgres_reserved_and_spool_ready_bytes_match_independent_rust_vectors
 LORE_TEST_LOCAL_PUT_RESERVATION_SCHEMA_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_schema -- --ignored --exact live_postgres_enforces_put_result_shape_time_ack_and_service_acl
 LORE_TEST_LOCAL_PUT_RESERVATION_PROVISIONING_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_provisioning -- --ignored --exact live_postgres_chain_install_replay_read_and_drift_fail_closed
@@ -200,17 +225,11 @@ LORE_TEST_LOCAL_PUT_SPOOL_READY_CODEC_PG_URL=postgresql://... cargo test -p lore
 LORE_TEST_LOCAL_PUT_SPOOL_READY_MUTATION_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_spool_ready_mutation -- --ignored --exact live_postgres_spool_ready_is_atomic_replay_safe_and_source_dark
 ```
 
-The library suite validates cell-authority configuration, canonical request fingerprinting, UUIDv7
-and idempotency classification, first-seen prerequisites, redaction, SQL procedure shapes, exact
-numeric transfer, closed result decoding, migration identity, and transient-error classification.
-Each `local_authority_*` live contract, run by exact name against a disposable, separately
-provisioned PostgreSQL 16 with the matching migration installed, proves that instance's procedure
-signature, rows/bytes/retention semantics, typed absence, and replay safety against a real database
-rather than only the embedded migration bytes agreeing with the client statically.
+An `--ignored` run with the environment unset exits early — that is **NOT RUN**, never passing
+evidence. Prefer the runner; the manual fallback exists for isolating one fixture.
 
-**There is no checked-in provisioning harness for this tier.** Unlike the retention client
-(`tests/run-retention-client-live.ps1`), the `local_authority_*` live fixtures above are
-environment-variable-gated `#[ignore]` tests with no runner to stand up the disposable database and
-install the CD-1 migration set. An `--ignored` run with the environment unset exits early — that is
-**NOT RUN**, never passing evidence. Building that harness is WP-114's CD-2 step and is a hard
-prerequisite before any of these live cases can be cited as real evidence.
+Limitations that stand regardless of path: `object_store_retention_read_state_v1` (0003's
+readback) has no live caller among the nine. Migrations 0012-0017 have no `read_state` procedure
+and are attested behaviourally by their own tests, not catalog readback. Every cell-authority
+procedure the typed client calls (WP-114 CD-3) still needs a live case here before it counts as
+evidence; the harness existing does not by itself supply that coverage.
