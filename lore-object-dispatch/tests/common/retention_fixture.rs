@@ -173,10 +173,10 @@ pub fn compact_plan() -> ObjectStoreCompactReceiptDecision {
             ),
         ),
     };
-    let authority = ObjectStoreCompactAuthority::ContinuityAdjudicated(Box::new(
-        validate_and_encode_continuity_adjudicated(&authority_value, &wire_limits())
+    let authority = ObjectStoreCompactAuthority::from(
+        &validate_and_encode_continuity_adjudicated(&authority_value, &wire_limits())
             .expect("adjudicated authority"),
-    ));
+    );
     let ObjectStoreCompactAuthority::ContinuityAdjudicated(encoded) = &authority else {
         unreachable!("adjudicated authority")
     };

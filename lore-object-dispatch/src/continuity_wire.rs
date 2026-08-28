@@ -17,16 +17,28 @@ use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityQuarantinedV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityQuotaOwnershipV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityQuotaReleaseReceiptV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreQuotaUnitsV1;
+use lore_proto::lore::object_dispatch::v1::ObjectStoreRequestOutcomeV1;
+use lore_proto::lore::object_dispatch::v1::ObjectStoreRequestReceiptV1;
 use lore_proto::lore::object_dispatch::v1::object_store_continuity_adjudicated_v1;
 use lore_proto::lore::object_dispatch::v1::object_store_continuity_quarantined_v1;
 use thiserror::Error;
 
+use crate::compaction::ObjectStoreCompactAuthority;
+use crate::compaction::ObjectStoreCompactContinuityAuthority;
 use crate::continuity_quota::ContinuityQuotaOwnershipError;
 use crate::continuity_quota::ContinuityQuotaOwnershipLimits;
 use crate::continuity_quota::validate_and_encode_continuity_quota_ownership;
 use crate::contract::BoundedCanonicalWriter;
 use crate::contract::canonical_uuid_v7_timestamp;
 use crate::contract::validate_canonical_text;
+use crate::request_state_wire::CanonicalObjectStoreRequestOutcome;
+use crate::request_state_wire::CanonicalObjectStoreRequestReceipt;
+use crate::request_state_wire::CheckedContinuityChild;
+use crate::request_state_wire::ContinuityChildEncoders;
+use crate::request_state_wire::RequestStateWireError;
+use crate::request_state_wire::RequestStateWireLimits;
+use crate::request_state_wire::validate_and_encode_object_store_request_outcome_with;
+use crate::request_state_wire::validate_and_encode_object_store_request_receipt_with;
 
 const QUARANTINED_DOMAIN: &[u8] = b"object-store-continuity-quarantined-v1\0";
 const PROOF_DOMAIN: &[u8] = b"object-store-continuity-adjudication-proof-v1\0";
@@ -34,11 +46,8 @@ const RELEASE_DOMAIN: &[u8] = b"object-store-continuity-quota-release-v1\0";
 const ADJUDICATED_DOMAIN: &[u8] = b"object-store-continuity-adjudicated-v1\0";
 const QUOTA_UNITS_DOMAIN: &[u8] = b"object-store-quota-units-v1\0";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ContinuityWireLimits {
-    pub max_identity_bytes: u32,
-    pub max_canonical_row_bytes: u32,
-}
+/// Continuity records share the request-state wire bounds, which own the definition.
+pub type ContinuityWireLimits = RequestStateWireLimits;
 
 macro_rules! canonical_record {
     ($name:ident, $value:ty, $digest_method:ident) => {
@@ -678,4 +687,94 @@ pub enum ContinuityWireError {
     CanonicalTooLarge,
     #[error(transparent)]
     Ownership(#[from] ContinuityQuotaOwnershipError),
+}
+
+fn encode_quarantined_child(
+    input: &ObjectStoreContinuityQuarantinedV1,
+    limits: &RequestStateWireLimits,
+) -> Result<CheckedContinuityChild<ObjectStoreContinuityQuarantinedV1>, RequestStateWireError> {
+    let encoded = validate_and_encode_continuity_quarantined(input, limits)?;
+    Ok(CheckedContinuityChild {
+        canonical_bytes: encoded.canonical_bytes().to_vec(),
+        latest_durable_time_unix_ms: encoded.value().quarantined_at_unix_ms,
+        value: encoded.value().clone(),
+    })
+}
+
+fn encode_adjudicated_child(
+    input: &ObjectStoreContinuityAdjudicatedV1,
+    limits: &RequestStateWireLimits,
+) -> Result<CheckedContinuityChild<ObjectStoreContinuityAdjudicatedV1>, RequestStateWireError> {
+    let encoded = validate_and_encode_continuity_adjudicated(input, limits)?;
+    Ok(CheckedContinuityChild {
+        canonical_bytes: encoded.canonical_bytes().to_vec(),
+        latest_durable_time_unix_ms: encoded.value().adjudicated_at_unix_ms,
+        value: encoded.value().clone(),
+    })
+}
+
+/// The continuity child encoders the persisted request-state envelopes dispatch to.
+pub const CONTINUITY_CHILD_ENCODERS: ContinuityChildEncoders = ContinuityChildEncoders {
+    quarantined: encode_quarantined_child,
+    adjudicated: encode_adjudicated_child,
+};
+
+/// Validates and canonically encodes one request receipt, including continuity outcome children.
+pub fn validate_and_encode_object_store_request_receipt(
+    input: &ObjectStoreRequestReceiptV1,
+    limits: &ContinuityWireLimits,
+) -> Result<CanonicalObjectStoreRequestReceipt, RequestStateWireError> {
+    validate_and_encode_object_store_request_receipt_with(input, limits, &CONTINUITY_CHILD_ENCODERS)
+}
+
+/// Validates and canonically encodes one request outcome, including continuity outcome children.
+pub fn validate_and_encode_object_store_request_outcome(
+    input: &ObjectStoreRequestOutcomeV1,
+    limits: &ContinuityWireLimits,
+) -> Result<CanonicalObjectStoreRequestOutcome, RequestStateWireError> {
+    validate_and_encode_object_store_request_outcome_with(input, limits, &CONTINUITY_CHILD_ENCODERS)
+}
+
+impl From<ContinuityWireError> for RequestStateWireError {
+    fn from(_: ContinuityWireError) -> Self {
+        Self::Continuity
+    }
+}
+
+impl From<&CanonicalContinuityQuarantined>
+    for ObjectStoreCompactContinuityAuthority<ObjectStoreContinuityQuarantinedV1>
+{
+    fn from(value: &CanonicalContinuityQuarantined) -> Self {
+        Self::new(
+            value.value().clone(),
+            value.canonical_bytes().to_vec(),
+            *value.detail_blake3(),
+            CONTINUITY_CHILD_ENCODERS,
+        )
+    }
+}
+
+impl From<&CanonicalContinuityAdjudicated>
+    for ObjectStoreCompactContinuityAuthority<ObjectStoreContinuityAdjudicatedV1>
+{
+    fn from(value: &CanonicalContinuityAdjudicated) -> Self {
+        Self::new(
+            value.value().clone(),
+            value.canonical_bytes().to_vec(),
+            *value.detail_blake3(),
+            CONTINUITY_CHILD_ENCODERS,
+        )
+    }
+}
+
+impl From<&CanonicalContinuityQuarantined> for ObjectStoreCompactAuthority {
+    fn from(value: &CanonicalContinuityQuarantined) -> Self {
+        Self::ContinuityQuarantined(Box::new(value.into()))
+    }
+}
+
+impl From<&CanonicalContinuityAdjudicated> for ObjectStoreCompactAuthority {
+    fn from(value: &CanonicalContinuityAdjudicated) -> Self {
+        Self::ContinuityAdjudicated(Box::new(value.into()))
+    }
 }

@@ -14,9 +14,6 @@ use lore_proto::lore::object_dispatch::v1::object_store_terminal_result_v1;
 use lore_proto::lore::object_dispatch::v1::*;
 use thiserror::Error;
 
-use crate::continuity_wire::ContinuityWireLimits;
-use crate::continuity_wire::validate_and_encode_continuity_adjudicated;
-use crate::continuity_wire::validate_and_encode_continuity_quarantined;
 use crate::contract::BoundedCanonicalWriter;
 use crate::contract::canonical_uuid_v7_timestamp;
 use crate::contract::validate_canonical_text;
@@ -27,7 +24,117 @@ const STATE_DOMAIN: &[u8] = b"object-store-request-state-v1\0";
 const RECEIPT_DOMAIN: &[u8] = b"object-store-request-receipt-v1\0";
 const OUTCOME_DOMAIN: &[u8] = b"object-store-request-outcome-v1\0";
 
-pub type RequestStateWireLimits = ContinuityWireLimits;
+/// Byte bounds for one canonical request-state wire record and the identities inside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestStateWireLimits {
+    pub max_identity_bytes: u32,
+    pub max_canonical_row_bytes: u32,
+}
+
+/// A continuity child another module has already validated and canonically encoded.
+///
+/// The receipt and outcome envelopes need exactly three facts about a continuity child: its
+/// canonical bytes for framing, the latest durable time it carries for the envelope time-order
+/// check, and the validated value to write back into the proto message.
+///
+/// The fields stay crate private so no caller outside this crate can frame unvalidated bytes or an
+/// unbound durable time into an envelope. Only an in-crate encoder can mint one.
+#[derive(Clone, PartialEq)]
+pub struct CheckedContinuityChild<T> {
+    pub(crate) value: T,
+    pub(crate) canonical_bytes: Vec<u8>,
+    pub(crate) latest_durable_time_unix_ms: i64,
+}
+
+impl<T> CheckedContinuityChild<T> {
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    pub fn latest_durable_time_unix_ms(&self) -> i64 {
+        self.latest_durable_time_unix_ms
+    }
+}
+
+impl<T> fmt::Debug for CheckedContinuityChild<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CheckedContinuityChild")
+            .field("value", &"[REDACTED]")
+            .field("canonical_bytes", &"[REDACTED]")
+            .field("latest_durable_time_unix_ms", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Encodes one continuity quarantine child for a request-state envelope.
+pub type ContinuityQuarantinedEncoder = fn(
+    &ObjectStoreContinuityQuarantinedV1,
+    &RequestStateWireLimits,
+) -> Result<
+    CheckedContinuityChild<ObjectStoreContinuityQuarantinedV1>,
+    RequestStateWireError,
+>;
+
+/// Encodes one continuity adjudication child for a request-state envelope.
+pub type ContinuityAdjudicatedEncoder = fn(
+    &ObjectStoreContinuityAdjudicatedV1,
+    &RequestStateWireLimits,
+) -> Result<
+    CheckedContinuityChild<ObjectStoreContinuityAdjudicatedV1>,
+    RequestStateWireError,
+>;
+
+/// The injected continuity child encoders the closed receipt and outcome oneofs dispatch to.
+///
+/// The proto oneofs are closed, so the envelope matches below stay exhaustive. Injecting the two
+/// child encoders keeps the module dependency running from the continuity module to this one and
+/// never back.
+///
+/// The fields stay crate private: injection reorders the module graph, it does not open the
+/// envelope contract to a caller-supplied encoder. Callers outside this crate can name only the
+/// two exported pairs, `ContinuityChildEncoders::UNAVAILABLE` and `CONTINUITY_CHILD_ENCODERS`.
+#[derive(Clone, Copy)]
+pub struct ContinuityChildEncoders {
+    pub(crate) quarantined: ContinuityQuarantinedEncoder,
+    pub(crate) adjudicated: ContinuityAdjudicatedEncoder,
+}
+
+impl ContinuityChildEncoders {
+    /// An encoder pair for callers that hold no continuity authority. Both children fail closed.
+    pub const UNAVAILABLE: Self = Self {
+        quarantined: reject_quarantined_child,
+        adjudicated: reject_adjudicated_child,
+    };
+}
+
+fn reject_quarantined_child(
+    _input: &ObjectStoreContinuityQuarantinedV1,
+    _limits: &RequestStateWireLimits,
+) -> Result<CheckedContinuityChild<ObjectStoreContinuityQuarantinedV1>, RequestStateWireError> {
+    Err(RequestStateWireError::Continuity)
+}
+
+fn reject_adjudicated_child(
+    _input: &ObjectStoreContinuityAdjudicatedV1,
+    _limits: &RequestStateWireLimits,
+) -> Result<CheckedContinuityChild<ObjectStoreContinuityAdjudicatedV1>, RequestStateWireError> {
+    Err(RequestStateWireError::Continuity)
+}
+
+impl fmt::Debug for ContinuityChildEncoders {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContinuityChildEncoders")
+            .field("quarantined", &"[REDACTED]")
+            .field("adjudicated", &"[REDACTED]")
+            .finish()
+    }
+}
 
 macro_rules! canonical_record {
     ($name:ident, $value:ty, $digest_method:ident) => {
@@ -984,7 +1091,7 @@ fn validate_state_algebra(input: &ObjectStoreRequestStateV1) -> Result<(), Reque
 
 pub fn validate_and_encode_object_store_request_state(
     input: &ObjectStoreRequestStateV1,
-    limits: &ContinuityWireLimits,
+    limits: &RequestStateWireLimits,
 ) -> Result<CanonicalObjectStoreRequestState, RequestStateWireError> {
     validate_limits(limits)?;
     validate_state_algebra(input)?;
@@ -1237,8 +1344,8 @@ pub fn validate_and_encode_object_store_request_state(
 
 enum CheckedAuthority {
     State(Box<CanonicalObjectStoreRequestState>),
-    Quarantined(Box<crate::continuity_wire::CanonicalContinuityQuarantined>),
-    Adjudicated(Box<crate::continuity_wire::CanonicalContinuityAdjudicated>),
+    Quarantined(Box<CheckedContinuityChild<ObjectStoreContinuityQuarantinedV1>>),
+    Adjudicated(Box<CheckedContinuityChild<ObjectStoreContinuityAdjudicatedV1>>),
 }
 
 fn latest_state_durable_time(value: &ObjectStoreRequestStateV1) -> i64 {
@@ -1292,23 +1399,24 @@ impl CheckedAuthority {
     fn canonical_bytes(&self) -> &[u8] {
         match self {
             Self::State(value) => value.canonical_bytes(),
-            Self::Quarantined(value) => value.canonical_bytes(),
-            Self::Adjudicated(value) => value.canonical_bytes(),
+            Self::Quarantined(value) => &value.canonical_bytes,
+            Self::Adjudicated(value) => &value.canonical_bytes,
         }
     }
 
     fn latest_time(&self) -> i64 {
         match self {
             Self::State(value) => latest_state_durable_time(value.value()),
-            Self::Quarantined(value) => value.value().quarantined_at_unix_ms,
-            Self::Adjudicated(value) => value.value().adjudicated_at_unix_ms,
+            Self::Quarantined(value) => value.latest_durable_time_unix_ms,
+            Self::Adjudicated(value) => value.latest_durable_time_unix_ms,
         }
     }
 }
 
-pub fn validate_and_encode_object_store_request_receipt(
+pub fn validate_and_encode_object_store_request_receipt_with(
     input: &ObjectStoreRequestReceiptV1,
-    limits: &ContinuityWireLimits,
+    limits: &RequestStateWireLimits,
+    continuity: &ContinuityChildEncoders,
 ) -> Result<CanonicalObjectStoreRequestReceipt, RequestStateWireError> {
     validate_limits(limits)?;
     let (tag, authority) = match input
@@ -1324,15 +1432,11 @@ pub fn validate_and_encode_object_store_request_receipt(
         ),
         object_store_request_receipt_v1::Outcome::ContinuityQuarantined(value) => (
             4,
-            CheckedAuthority::Quarantined(Box::new(validate_and_encode_continuity_quarantined(
-                value, limits,
-            )?)),
+            CheckedAuthority::Quarantined(Box::new((continuity.quarantined)(value, limits)?)),
         ),
         object_store_request_receipt_v1::Outcome::ContinuityAdjudicated(value) => (
             5,
-            CheckedAuthority::Adjudicated(Box::new(validate_and_encode_continuity_adjudicated(
-                value, limits,
-            )?)),
+            CheckedAuthority::Adjudicated(Box::new((continuity.adjudicated)(value, limits)?)),
         ),
     };
     if input.receipt_committed_at_unix_ms < authority.latest_time() {
@@ -1359,14 +1463,10 @@ pub fn validate_and_encode_object_store_request_receipt(
             object_store_request_receipt_v1::Outcome::RequestState(Box::new(value.value().clone()))
         }
         CheckedAuthority::Quarantined(value) => {
-            object_store_request_receipt_v1::Outcome::ContinuityQuarantined(Box::new(
-                value.value().clone(),
-            ))
+            object_store_request_receipt_v1::Outcome::ContinuityQuarantined(Box::new(value.value))
         }
         CheckedAuthority::Adjudicated(value) => {
-            object_store_request_receipt_v1::Outcome::ContinuityAdjudicated(Box::new(
-                value.value().clone(),
-            ))
+            object_store_request_receipt_v1::Outcome::ContinuityAdjudicated(Box::new(value.value))
         }
     });
     Ok(CanonicalObjectStoreRequestReceipt {
@@ -1377,9 +1477,10 @@ pub fn validate_and_encode_object_store_request_receipt(
     })
 }
 
-pub fn validate_and_encode_object_store_request_outcome(
+pub fn validate_and_encode_object_store_request_outcome_with(
     input: &ObjectStoreRequestOutcomeV1,
-    limits: &ContinuityWireLimits,
+    limits: &RequestStateWireLimits,
+    continuity: &ContinuityChildEncoders,
 ) -> Result<CanonicalObjectStoreRequestOutcome, RequestStateWireError> {
     validate_limits(limits)?;
     let (tag, authority) = match input
@@ -1395,15 +1496,11 @@ pub fn validate_and_encode_object_store_request_outcome(
         ),
         object_store_request_outcome_v1::Outcome::ContinuityQuarantined(value) => (
             2,
-            CheckedAuthority::Quarantined(Box::new(validate_and_encode_continuity_quarantined(
-                value, limits,
-            )?)),
+            CheckedAuthority::Quarantined(Box::new((continuity.quarantined)(value, limits)?)),
         ),
         object_store_request_outcome_v1::Outcome::ContinuityAdjudicated(value) => (
             4,
-            CheckedAuthority::Adjudicated(Box::new(validate_and_encode_continuity_adjudicated(
-                value, limits,
-            )?)),
+            CheckedAuthority::Adjudicated(Box::new((continuity.adjudicated)(value, limits)?)),
         ),
     };
     let mut output = writer(limits)?;
@@ -1424,14 +1521,10 @@ pub fn validate_and_encode_object_store_request_outcome(
             object_store_request_outcome_v1::Outcome::RequestState(Box::new(value.value().clone()))
         }
         CheckedAuthority::Quarantined(value) => {
-            object_store_request_outcome_v1::Outcome::ContinuityQuarantined(Box::new(
-                value.value().clone(),
-            ))
+            object_store_request_outcome_v1::Outcome::ContinuityQuarantined(Box::new(value.value))
         }
         CheckedAuthority::Adjudicated(value) => {
-            object_store_request_outcome_v1::Outcome::ContinuityAdjudicated(Box::new(
-                value.value().clone(),
-            ))
+            object_store_request_outcome_v1::Outcome::ContinuityAdjudicated(Box::new(value.value))
         }
     });
     Ok(CanonicalObjectStoreRequestOutcome {
@@ -1472,10 +1565,4 @@ pub enum RequestStateWireError {
     CanonicalTooLarge,
     #[error("continuity child authority is invalid")]
     Continuity,
-}
-
-impl From<crate::continuity_wire::ContinuityWireError> for RequestStateWireError {
-    fn from(_: crate::continuity_wire::ContinuityWireError) -> Self {
-        Self::Continuity
-    }
 }

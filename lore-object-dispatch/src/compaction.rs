@@ -9,7 +9,9 @@
 
 use std::fmt;
 
+use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityAdjudicatedV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityAdjudicationKindV1;
+use lore_proto::lore::object_dispatch::v1::ObjectStoreContinuityQuarantinedV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStorePayloadAvailabilityV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreRequestOutcomeV1;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreRequestPhaseV1;
@@ -21,17 +23,16 @@ use lore_proto::lore::object_dispatch::v1::object_store_request_outcome_v1;
 use lore_proto::lore::object_dispatch::v1::object_store_request_receipt_v1;
 use thiserror::Error;
 
-use crate::continuity_wire::CanonicalContinuityAdjudicated;
-use crate::continuity_wire::CanonicalContinuityQuarantined;
-use crate::continuity_wire::ContinuityWireLimits;
 use crate::contract::BoundedCanonicalWriter;
 use crate::contract::canonical_uuid_v7_timestamp;
 use crate::contract::validate_canonical_text;
 use crate::request_state_wire::CanonicalObjectStoreRequestOutcome;
 use crate::request_state_wire::CanonicalObjectStoreRequestReceipt;
 use crate::request_state_wire::CanonicalObjectStoreRequestState;
-use crate::request_state_wire::validate_and_encode_object_store_request_outcome;
-use crate::request_state_wire::validate_and_encode_object_store_request_receipt;
+use crate::request_state_wire::ContinuityChildEncoders;
+use crate::request_state_wire::RequestStateWireLimits;
+use crate::request_state_wire::validate_and_encode_object_store_request_outcome_with;
+use crate::request_state_wire::validate_and_encode_object_store_request_receipt_with;
 use crate::reserve_put_ack::CanonicalObjectStoreReservePutAck;
 
 const SCHEMA_REVISION: &str = "object-store-compact-receipt-v1";
@@ -53,19 +54,92 @@ pub struct ObjectStoreCompactReceiptLimits {
 }
 
 impl ObjectStoreCompactReceiptLimits {
-    fn wire_limits(&self) -> ContinuityWireLimits {
-        ContinuityWireLimits {
+    fn wire_limits(&self) -> RequestStateWireLimits {
+        RequestStateWireLimits {
             max_identity_bytes: self.max_identity_bytes,
             max_canonical_row_bytes: self.max_canonical_row_bytes,
         }
     }
 }
 
+/// One continuity authority record another module validated and canonically encoded.
+///
+/// Compaction owns this shape so the module dependency runs from the continuity module to here.
+/// The record also carries the child encoders that minted it, so recomputing the request-state
+/// envelopes over it goes back through the same encoders rather than through a module import.
+#[derive(Clone)]
+pub struct ObjectStoreCompactContinuityAuthority<T> {
+    value: T,
+    canonical_bytes: Vec<u8>,
+    detail_blake3: [u8; 32],
+    encoders: ContinuityChildEncoders,
+}
+
+impl<T> ObjectStoreCompactContinuityAuthority<T> {
+    pub(crate) fn new(
+        value: T,
+        canonical_bytes: Vec<u8>,
+        detail_blake3: [u8; 32],
+        encoders: ContinuityChildEncoders,
+    ) -> Self {
+        Self {
+            value,
+            canonical_bytes,
+            detail_blake3,
+            encoders,
+        }
+    }
+
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    pub fn detail_blake3(&self) -> &[u8; 32] {
+        &self.detail_blake3
+    }
+
+    fn encoders(&self) -> ContinuityChildEncoders {
+        self.encoders
+    }
+}
+
+/// The encoder pair is provenance, not record content: equal canonical bytes are equal authority.
+///
+/// This holds while `CONTINUITY_CHILD_ENCODERS` is the only pair that can mint a record. Adding a
+/// second minting pair would make the encoder part of the record's identity and require comparing
+/// it here too.
+impl<T: PartialEq> PartialEq for ObjectStoreCompactContinuityAuthority<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+            && self.canonical_bytes == other.canonical_bytes
+            && self.detail_blake3 == other.detail_blake3
+    }
+}
+
+impl<T> fmt::Debug for ObjectStoreCompactContinuityAuthority<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObjectStoreCompactContinuityAuthority")
+            .field("value", &"[REDACTED]")
+            .field("canonical_bytes", &"[REDACTED]")
+            .field("detail_blake3", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub enum ObjectStoreCompactAuthority {
     RequestState(Box<CanonicalObjectStoreRequestState>),
-    ContinuityQuarantined(Box<CanonicalContinuityQuarantined>),
-    ContinuityAdjudicated(Box<CanonicalContinuityAdjudicated>),
+    ContinuityQuarantined(
+        Box<ObjectStoreCompactContinuityAuthority<ObjectStoreContinuityQuarantinedV1>>,
+    ),
+    ContinuityAdjudicated(
+        Box<ObjectStoreCompactContinuityAuthority<ObjectStoreContinuityAdjudicatedV1>>,
+    ),
 }
 
 impl fmt::Debug for ObjectStoreCompactAuthority {
@@ -739,6 +813,14 @@ fn authority_kind_code(
     }
 }
 
+fn continuity_encoders(authority: &ObjectStoreCompactAuthority) -> ContinuityChildEncoders {
+    match authority {
+        ObjectStoreCompactAuthority::RequestState(_) => ContinuityChildEncoders::UNAVAILABLE,
+        ObjectStoreCompactAuthority::ContinuityQuarantined(value) => value.encoders(),
+        ObjectStoreCompactAuthority::ContinuityAdjudicated(value) => value.encoders(),
+    }
+}
+
 fn authority_bytes(authority: &ObjectStoreCompactAuthority) -> &[u8] {
     match authority {
         ObjectStoreCompactAuthority::RequestState(value) => value.canonical_bytes(),
@@ -790,21 +872,24 @@ fn checked_wrappers(
     CompactReceiptError,
 > {
     let (receipt_outcome, outcome_outcome) = authority_receipt_outcome(authority);
-    let checked_receipt = validate_and_encode_object_store_request_receipt(
+    let continuity = continuity_encoders(authority);
+    let checked_receipt = validate_and_encode_object_store_request_receipt_with(
         &ObjectStoreRequestReceiptV1 {
             receipt_blake3: receipt.receipt_blake3().to_vec().into(),
             receipt_committed_at_unix_ms: receipt.value().receipt_committed_at_unix_ms,
             outcome: Some(receipt_outcome),
         },
         &limits.wire_limits(),
+        &continuity,
     )
     .map_err(|_| CompactReceiptError::WrapperMismatch)?;
-    let checked_outcome = validate_and_encode_object_store_request_outcome(
+    let checked_outcome = validate_and_encode_object_store_request_outcome_with(
         &ObjectStoreRequestOutcomeV1 {
             outcome_blake3: outcome.outcome_blake3().to_vec().into(),
             outcome: Some(outcome_outcome),
         },
         &limits.wire_limits(),
+        &continuity,
     )
     .map_err(|_| CompactReceiptError::WrapperMismatch)?;
     if checked_receipt.canonical_bytes() != receipt.canonical_bytes()

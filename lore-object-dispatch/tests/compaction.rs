@@ -808,10 +808,10 @@ fn adjudicated_authority(
             ),
         ),
     };
-    ObjectStoreCompactAuthority::ContinuityAdjudicated(Box::new(
-        validate_and_encode_continuity_adjudicated(&value, &wire_limits())
+    ObjectStoreCompactAuthority::from(
+        &validate_and_encode_continuity_adjudicated(&value, &wire_limits())
             .expect("adjudicated authority"),
-    ))
+    )
 }
 
 fn quarantined_authority() -> ObjectStoreCompactAuthority {
@@ -848,10 +848,10 @@ fn quarantined_authority() -> ObjectStoreCompactAuthority {
             ),
         ),
     };
-    ObjectStoreCompactAuthority::ContinuityQuarantined(Box::new(
-        validate_and_encode_continuity_quarantined(&value, &wire_limits())
+    ObjectStoreCompactAuthority::from(
+        &validate_and_encode_continuity_quarantined(&value, &wire_limits())
             .expect("quarantined authority"),
-    ))
+    )
 }
 
 #[test]
