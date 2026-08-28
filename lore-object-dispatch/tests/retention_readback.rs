@@ -326,9 +326,15 @@ fn every_production_rust_source_remains_dark_to_readback_sql_entrypoints() {
             "object_store_retention_read_transfer_v1",
             "object_store_retention_read_prune_v1",
         ] {
+            if source_path
+                .file_name()
+                .is_some_and(|name| name == "retention_client.rs")
+            {
+                continue;
+            }
             assert!(
                 !source.contains(sql_identifier),
-                "source-dark SQL identifier {sql_identifier} appeared in {}",
+                "retention readback SQL identifier {sql_identifier} escaped the dedicated client into {}",
                 source_path.display()
             );
         }

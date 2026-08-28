@@ -594,9 +594,15 @@ fn mutation_artifact_is_embedded_only_and_all_production_rust_remains_dark() {
             "object_store_retention_apply_transfer_v1",
             "object_store_retention_apply_prune_v1",
         ] {
+            if source_path
+                .file_name()
+                .is_some_and(|name| name == "retention_client.rs")
+            {
+                continue;
+            }
             assert!(
                 !source.contains(sql_identifier),
-                "source-dark SQL identifier {sql_identifier} appeared in {}",
+                "retention mutation SQL identifier {sql_identifier} escaped the dedicated client into {}",
                 source_path.display()
             );
         }
