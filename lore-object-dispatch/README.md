@@ -109,6 +109,17 @@ low-water reserves, checked overflow, and digest-provider failure leave no parti
 codec helpers remain owner-only. No service call, object-provider traffic, deployment, readiness,
 or named handoff exists.
 
+`local_authority_put_upload_progress_codec::LOCAL_AUTHORITY_PUT_UPLOAD_PROGRESS_CODEC_MIGRATION_V1`
+embeds the exact 17,444-byte source-dark in-flight PUT upload-progress codec. Its BLAKE3-256 is
+`f5361aa66c3e1bdced683040e3a405557a8d2d07f85a182e8e33867e208631a0`. The owner-only
+generalized RESERVED-row codec preserves the initial record codec's bytes and digest exactly. A
+progress snapshot must satisfy `0 < bytes < expected`, positive chunks, one file,
+`chunks <= bytes <= chunks * maximum_chunk_bytes`, and `revision = chunks + 1`. ReservePut replay
+during progress returns the unchanged ACK without another quota charge. Explicit revocation on the
+v2 codec and both replaced `SECURITY DEFINER` functions prevents CREATE OR REPLACE from restoring
+service-role execution. This artifact adds no progress-transition mutation, fsync proof, service
+call, object-provider traffic, deployment, readiness, or named handoff.
+
 ## Private protocol
 
 The exact private `lore.object_dispatch.v1.ObjectStoreDispatchService` contract lives in
@@ -184,6 +195,7 @@ LORE_TEST_LOCAL_PUT_RESERVATION_SCHEMA_PG_URL=postgresql://... cargo test -p lor
 LORE_TEST_LOCAL_PUT_RESERVATION_PROVISIONING_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_provisioning -- --ignored --exact live_postgres_chain_install_replay_read_and_drift_fail_closed
 LORE_TEST_LOCAL_PUT_RESERVATION_RECORD_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_record_codec -- --ignored --exact live_postgres_row_bytes_match_independent_vector_and_invalid_inputs_fail
 LORE_TEST_LOCAL_RESERVE_PUT_MUTATION_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_reserve_put_mutation -- --ignored --exact live_postgres_reserve_put_is_atomic_exact_and_replay_safe
+LORE_TEST_LOCAL_PUT_UPLOAD_PROGRESS_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_upload_progress_codec -- --ignored --exact live_postgres_progress_codec_is_exact_and_replay_safe
 ```
 
 The library suite validates service and continuity configuration, mutual TLS, URI-SAN registration,
