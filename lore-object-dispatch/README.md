@@ -63,6 +63,13 @@ functions with a fixed `pg_catalog` search path. A frozen catalog manifest rejec
 constraint, index, function-security, policy, and ACL drift. Runtime code neither installs nor calls
 this surface; direct table and column authority remains owner-only.
 
+`local_authority_canonical_codec::LOCAL_AUTHORITY_CANONICAL_CODEC_MIGRATION_V1` embeds the exact
+16,704-byte source-dark RESERVED/SPOOL_READY canonical-codec migration. Its BLAKE3-256 is
+`b0803eacad028566e9fd5559f8f8069c44ad290d5631a8cef1a4f7c9669ea12a`. Eleven owner-only
+`SECURITY DEFINER` helpers with fixed `pg_catalog` search paths construct and hash server-derived
+canonical records; missing, NULL, or non-32-byte `public.blake3(bytea)` results fail closed. The
+artifact creates no tables, mutation procedure, provider implementation, runtime call, or grant.
+
 ## Private protocol
 
 The exact private `lore.object_dispatch.v1.ObjectStoreDispatchService` contract lives in
@@ -133,6 +140,7 @@ docker build -f lore-object-dispatch/Dockerfile -t lore-object-dispatch:local .
 cargo test -p lore-object-dispatch --test continuity_live -- --ignored --test-threads=1
 cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_allocates_dedicated_drained_epoch_one_to_two
 cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detail
+LORE_TEST_LOCAL_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_canonical_codec -- --ignored --exact live_postgres_reserved_and_spool_ready_bytes_match_independent_rust_vectors
 ```
 
 The library suite validates service and continuity configuration, mutual TLS, URI-SAN registration,
