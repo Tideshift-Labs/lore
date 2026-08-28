@@ -172,6 +172,14 @@ will update an older check constraint or state schema.
   same-kind fingerprint and receipt to win first, then separately pin both ACK/discard race orders,
   discard fence/drain planning, and disposed-before-discarded fetch classification with
   `cargo test -p lore-object-dispatch --test result_disposition -j 4`.
+  Durable fetch leases and payload purge add two coupled source-dark CAS gates. Run
+  `cargo test -p lore-object-dispatch --test fetch_lease --test result_disposition --test
+  payload_purge -j 4`; the verified focused run passed 23/23. The purge reservation's independent
+  TypeScript/Rust golden is 461 bytes, and the drain matrix rejects any head evolution unless its
+  revision delta exactly equals the open-lease decrement and its commit time is not older than the
+  reservation. The full crate passed 294 tests with five live tests intentionally ignored; scoped
+  warnings-denied Clippy, nightly format, and diff checks were clean. This remains pure `[SERVER]`
+  source with no loreserver composition, provider traffic, credentials, or deployment authority.
   Continuity quota ownership is a separate pure canonical record. Pin the independent 170-byte
   `object-store-continuity-quota-ownership-v1` preimage, 32-byte digest, complete 202-byte record,
   exact global scope, nonempty quota tuple, every text/size bound, detached value, and redacted

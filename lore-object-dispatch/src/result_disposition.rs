@@ -18,6 +18,15 @@ use lore_proto::lore::object_dispatch::v1::ObjectStoreTerminalResultV1;
 use lore_proto::lore::object_dispatch::v1::object_store_terminal_result_v1;
 use thiserror::Error;
 
+use crate::fetch_lease::CanonicalObjectStoreFetchHead;
+use crate::fetch_lease::FetchLeaseLimits;
+use crate::fetch_lease::ObjectStoreFetchHeadState;
+use crate::fetch_lease::ReserveObjectStoreFetchDiscardDecision;
+use crate::fetch_lease::ReserveObjectStoreFetchDiscardInput;
+use crate::fetch_lease::commit_object_store_fetch_discard;
+use crate::fetch_lease::decide_reserve_object_store_fetch_discard;
+use crate::fetch_lease::object_store_fetch_result_key_from_state;
+use crate::fetch_lease::validate_and_encode_object_store_fetch_head;
 use crate::request_state_wire::CanonicalObjectStoreRequestState;
 use crate::request_state_wire::RequestStateWireLimits;
 use crate::request_state_wire::validate_and_encode_object_store_request_state;
@@ -35,13 +44,6 @@ pub struct ResultDispositionLimits {
     pub discard: ResultDiscardLimits,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ObjectStoreFetchLeaseProjection {
-    pub fence_generation: u64,
-    pub new_fetches_fenced: bool,
-    pub open_lease_count: u64,
-}
-
 pub enum ObjectStoreResultDispositionIntent<'a> {
     Ack(&'a ValidatedObjectStoreResultAck),
     Discard(&'a ValidatedObjectStoreResultDiscard),
@@ -52,7 +54,7 @@ pub struct ResultDispositionCasInput<'a> {
     pub intent: ObjectStoreResultDispositionIntent<'a>,
     pub database_now_unix_ms: i64,
     pub minimum_retention_ms: i64,
-    pub fetch_leases: ObjectStoreFetchLeaseProjection,
+    pub fetch_head: Option<&'a CanonicalObjectStoreFetchHead>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +62,8 @@ pub enum ResultDispositionConflict {
     FingerprintReuse,
     AckAfterDiscard,
     DiscardAfterAck,
+    AckAfterDiscardReservation,
+    DiscardReservationMismatch,
 }
 
 #[derive(Clone, PartialEq)]
@@ -73,24 +77,27 @@ pub enum ResultDispositionCasDecision {
         receipt: ObjectStoreResultDiscardReceiptV1,
     },
     Conflict(ResultDispositionConflict),
-    FenceFetches {
+    ReserveFetchDiscard {
         expected_state_blake3: [u8; 32],
-        expected_fence_generation: u64,
-        next_fence_generation: u64,
+        expected_fetch_head_blake3: [u8; 32],
+        next_fetch_head: CanonicalObjectStoreFetchHead,
     },
     WaitForFetchDrain {
         expected_state_blake3: [u8; 32],
+        expected_fetch_head_blake3: [u8; 32],
         fence_generation: u64,
         open_lease_count: u64,
     },
     ApplyAck {
         expected_state_blake3: [u8; 32],
+        expected_fetch_head_blake3: Option<[u8; 32]>,
         next_state: CanonicalObjectStoreRequestState,
         receipt: ObjectStoreResultAckReceiptV1,
     },
     ApplyDiscard {
         expected_state_blake3: [u8; 32],
-        expected_fence_generation: u64,
+        expected_fetch_head_blake3: Option<[u8; 32]>,
+        next_fetch_head: Option<Box<CanonicalObjectStoreFetchHead>>,
         next_state: CanonicalObjectStoreRequestState,
         receipt: ObjectStoreResultDiscardReceiptV1,
     },
@@ -102,7 +109,7 @@ impl fmt::Debug for ResultDispositionCasDecision {
             Self::ReplayAck { .. } => "ReplayAck",
             Self::ReplayDiscard { .. } => "ReplayDiscard",
             Self::Conflict(_) => "Conflict",
-            Self::FenceFetches { .. } => "FenceFetches",
+            Self::ReserveFetchDiscard { .. } => "ReserveFetchDiscard",
             Self::WaitForFetchDrain { .. } => "WaitForFetchDrain",
             Self::ApplyAck { .. } => "ApplyAck",
             Self::ApplyDiscard { .. } => "ApplyDiscard",
@@ -154,6 +161,7 @@ enum IntentKind {
 struct CheckedIntent<'a> {
     kind: IntentKind,
     fingerprint: &'a [u8],
+    canonical_bytes: &'a [u8],
 }
 
 fn checked_current_state(
@@ -171,13 +179,35 @@ fn checked_current_state(
     Ok(checked)
 }
 
-fn validate_fetch_leases(
-    value: ObjectStoreFetchLeaseProjection,
-) -> Result<(), ResultDispositionError> {
-    if value.fence_generation == 0 {
+fn fetch_limits(limits: &ResultDispositionLimits) -> FetchLeaseLimits {
+    FetchLeaseLimits {
+        max_identity_bytes: limits.state.max_identity_bytes,
+        max_authenticated_scope_bytes: limits.discard.ack.identity.max_authenticated_scope_bytes,
+        max_canonical_record_bytes: limits.state.max_canonical_row_bytes,
+        max_canonical_discard_bytes: limits.state.max_canonical_row_bytes,
+    }
+}
+
+fn checked_fetch_head(
+    state: &CanonicalObjectStoreRequestState,
+    head: Option<&CanonicalObjectStoreFetchHead>,
+    limits: &ResultDispositionLimits,
+) -> Result<CanonicalObjectStoreFetchHead, ResultDispositionError> {
+    let head = head.ok_or(ResultDispositionError::InvalidFetchProjection)?;
+    let checked = validate_and_encode_object_store_fetch_head(head.value(), &fetch_limits(limits))
+        .map_err(|_| ResultDispositionError::InvalidFetchProjection)?;
+    if checked.canonical_preimage() != head.canonical_preimage()
+        || checked.canonical_bytes() != head.canonical_bytes()
+        || checked.head_blake3() != head.head_blake3()
+    {
         return Err(ResultDispositionError::InvalidFetchProjection);
     }
-    Ok(())
+    let expected = object_store_fetch_result_key_from_state(state, &limits.state)
+        .map_err(|_| ResultDispositionError::InvalidFetchProjection)?;
+    if checked.value().result_key != expected {
+        return Err(ResultDispositionError::InvalidFetchProjection);
+    }
+    Ok(checked)
 }
 
 fn expected_byte_handle(terminal: &ObjectStoreTerminalResultV1) -> Option<&str> {
@@ -187,6 +217,20 @@ fn expected_byte_handle(terminal: &ObjectStoreTerminalResultV1) -> Option<&str> 
         }
         _ => None,
     }
+}
+
+fn is_byte_result(state: &CanonicalObjectStoreRequestState) -> bool {
+    state
+        .value()
+        .terminal_result
+        .as_ref()
+        .and_then(|value| value.result.as_ref())
+        .is_some_and(|value| {
+            matches!(
+                value,
+                object_store_terminal_result_v1::Result::ByteResult(_)
+            )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -253,6 +297,7 @@ fn checked_intent<'a>(
             CheckedIntent {
                 kind: IntentKind::Ack,
                 fingerprint: validated.ack_fingerprint(),
+                canonical_bytes: validated.canonical_ack_bytes(),
             }
         }
         ObjectStoreResultDispositionIntent::Discard(validated) => {
@@ -274,6 +319,7 @@ fn checked_intent<'a>(
             CheckedIntent {
                 kind: IntentKind::Discard,
                 fingerprint: validated.discard_fingerprint(),
+                canonical_bytes: validated.canonical_discard_bytes(),
             }
         }
     };
@@ -424,32 +470,101 @@ pub fn decide_object_store_result_disposition_cas(
         return Ok(decision);
     }
 
-    if intent.kind == IntentKind::Discard {
-        validate_fetch_leases(input.fetch_leases)?;
-        if !input.fetch_leases.new_fetches_fenced {
-            let next = input
-                .fetch_leases
-                .fence_generation
-                .checked_add(1)
-                .ok_or(ResultDispositionError::FetchFenceOverflow)?;
-            return Ok(ResultDispositionCasDecision::FenceFetches {
-                expected_state_blake3: *current.state_blake3(),
-                expected_fence_generation: input.fetch_leases.fence_generation,
-                next_fence_generation: next,
-            });
-        }
-        if input.fetch_leases.open_lease_count != 0 {
-            return Ok(ResultDispositionCasDecision::WaitForFetchDrain {
-                expected_state_blake3: *current.state_blake3(),
-                fence_generation: input.fetch_leases.fence_generation,
-                open_lease_count: input.fetch_leases.open_lease_count,
-            });
+    let byte_result = is_byte_result(&current);
+    let fetch_head = if byte_result {
+        Some(checked_fetch_head(&current, input.fetch_head, limits)?)
+    } else {
+        None
+    };
+    if let Some(head) = fetch_head.as_ref() {
+        match intent.kind {
+            IntentKind::Ack => {
+                if head.value().state != ObjectStoreFetchHeadState::Unfenced {
+                    return Ok(ResultDispositionCasDecision::Conflict(
+                        ResultDispositionConflict::AckAfterDiscardReservation,
+                    ));
+                }
+            }
+            IntentKind::Discard => match head.value().state {
+                ObjectStoreFetchHeadState::Unfenced => {
+                    if input.database_now_unix_ms < latest_durable_time(&current) {
+                        return Err(ResultDispositionError::InvalidTime);
+                    }
+                    let fingerprint: [u8; 32] = intent
+                        .fingerprint
+                        .try_into()
+                        .map_err(|_| ResultDispositionError::InvalidFingerprint)?;
+                    let decision = decide_reserve_object_store_fetch_discard(
+                        &ReserveObjectStoreFetchDiscardInput {
+                            current_head: head,
+                            discard_fingerprint: fingerprint,
+                            canonical_discard_bytes: intent.canonical_bytes,
+                            expected_request_state_blake3: *current.state_blake3(),
+                            database_now_unix_ms: input.database_now_unix_ms,
+                        },
+                        &fetch_limits(limits),
+                    )
+                    .map_err(|error| match error {
+                        crate::fetch_lease::FetchLeaseError::GenerationOverflow => {
+                            ResultDispositionError::FetchFenceOverflow
+                        }
+                        _ => ResultDispositionError::InvalidFetchProjection,
+                    })?;
+                    let ReserveObjectStoreFetchDiscardDecision::Apply {
+                        expected_head_blake3,
+                        next_head,
+                        ..
+                    } = decision
+                    else {
+                        return Err(ResultDispositionError::InvalidFetchProjection);
+                    };
+                    return Ok(ResultDispositionCasDecision::ReserveFetchDiscard {
+                        expected_state_blake3: *current.state_blake3(),
+                        expected_fetch_head_blake3: expected_head_blake3,
+                        next_fetch_head: next_head,
+                    });
+                }
+                ObjectStoreFetchHeadState::DiscardReserved => {
+                    let pending = head
+                        .value()
+                        .pending_discard
+                        .as_ref()
+                        .ok_or(ResultDispositionError::InvalidFetchProjection)?;
+                    if pending.discard_fingerprint.as_ref() != intent.fingerprint
+                        || pending.canonical_discard_bytes != intent.canonical_bytes
+                        || pending.expected_request_state_blake3 != *current.state_blake3()
+                    {
+                        return Ok(ResultDispositionCasDecision::Conflict(
+                            ResultDispositionConflict::DiscardReservationMismatch,
+                        ));
+                    }
+                    if head.value().open_lease_count != 0 {
+                        return Ok(ResultDispositionCasDecision::WaitForFetchDrain {
+                            expected_state_blake3: *current.state_blake3(),
+                            expected_fetch_head_blake3: *head.head_blake3(),
+                            fence_generation: head.value().fence_generation,
+                            open_lease_count: head.value().open_lease_count,
+                        });
+                    }
+                }
+                ObjectStoreFetchHeadState::DiscardCommitted => {
+                    return Err(ResultDispositionError::InvalidFetchProjection);
+                }
+                ObjectStoreFetchHeadState::PayloadPurgeReserved
+                | ObjectStoreFetchHeadState::PayloadPurgeCommitted => {
+                    return Err(ResultDispositionError::InvalidFetchProjection);
+                }
+            },
         }
     }
 
     if input.database_now_unix_ms < 0
         || input.minimum_retention_ms <= 0
         || input.database_now_unix_ms < latest_durable_time(&current)
+        || (intent.kind == IntentKind::Ack
+            && fetch_head.as_ref().is_some_and(|head| {
+                input.database_now_unix_ms < head.value().head_committed_at_unix_ms
+            }))
     {
         return Err(ResultDispositionError::InvalidTime);
     }
@@ -494,6 +609,7 @@ pub fn decide_object_store_result_disposition_cas(
                 .map_err(|_| ResultDispositionError::InvalidNextState)?;
             Ok(ResultDispositionCasDecision::ApplyAck {
                 expected_state_blake3: *current.state_blake3(),
+                expected_fetch_head_blake3: fetch_head.as_ref().map(|value| *value.head_blake3()),
                 next_state,
                 receipt,
             })
@@ -515,9 +631,27 @@ pub fn decide_object_store_result_disposition_cas(
             next.discard_receipt = Some(receipt.clone());
             let next_state = validate_and_encode_object_store_request_state(&next, &limits.state)
                 .map_err(|_| ResultDispositionError::InvalidNextState)?;
+            let next_fetch_head = fetch_head
+                .as_ref()
+                .map(|value| {
+                    let fingerprint: [u8; 32] = intent
+                        .fingerprint
+                        .try_into()
+                        .map_err(|_| ResultDispositionError::InvalidFingerprint)?;
+                    commit_object_store_fetch_discard(
+                        value,
+                        fingerprint,
+                        input.database_now_unix_ms,
+                        &fetch_limits(limits),
+                    )
+                    .map_err(|_| ResultDispositionError::InvalidFetchProjection)
+                })
+                .transpose()?
+                .map(Box::new);
             Ok(ResultDispositionCasDecision::ApplyDiscard {
                 expected_state_blake3: *current.state_blake3(),
-                expected_fence_generation: input.fetch_leases.fence_generation,
+                expected_fetch_head_blake3: fetch_head.as_ref().map(|value| *value.head_blake3()),
+                next_fetch_head,
                 next_state,
                 receipt,
             })
@@ -527,7 +661,7 @@ pub fn decide_object_store_result_disposition_cas(
 
 pub fn decide_object_store_fetch_admission(
     current_state: &CanonicalObjectStoreRequestState,
-    fetch_leases: ObjectStoreFetchLeaseProjection,
+    fetch_head: Option<&CanonicalObjectStoreFetchHead>,
     limits: &RequestStateWireLimits,
 ) -> Result<ObjectStoreFetchAdmissionDecision, ResultDispositionError> {
     let state = checked_current_state(current_state, limits)?;
@@ -564,11 +698,28 @@ pub fn decide_object_store_fetch_admission(
     {
         return Ok(ObjectStoreFetchAdmissionDecision::NotFetchable);
     }
-    validate_fetch_leases(fetch_leases)?;
-    if fetch_leases.new_fetches_fenced {
+    let fetch_limits = FetchLeaseLimits {
+        max_identity_bytes: limits.max_identity_bytes,
+        max_authenticated_scope_bytes: limits.max_identity_bytes,
+        max_canonical_record_bytes: limits.max_canonical_row_bytes,
+        max_canonical_discard_bytes: limits.max_canonical_row_bytes,
+    };
+    let head = fetch_head.ok_or(ResultDispositionError::InvalidFetchProjection)?;
+    let checked = validate_and_encode_object_store_fetch_head(head.value(), &fetch_limits)
+        .map_err(|_| ResultDispositionError::InvalidFetchProjection)?;
+    if checked.canonical_preimage() != head.canonical_preimage()
+        || checked.canonical_bytes() != head.canonical_bytes()
+        || checked.head_blake3() != head.head_blake3()
+        || object_store_fetch_result_key_from_state(&state, limits)
+            .map_err(|_| ResultDispositionError::InvalidFetchProjection)?
+            != checked.value().result_key
+    {
+        return Err(ResultDispositionError::InvalidFetchProjection);
+    }
+    if checked.value().state != ObjectStoreFetchHeadState::Unfenced {
         return Ok(ObjectStoreFetchAdmissionDecision::FetchesFenced);
     }
     Ok(ObjectStoreFetchAdmissionDecision::Admit {
-        fence_generation: fetch_leases.fence_generation,
+        fence_generation: checked.value().fence_generation,
     })
 }
