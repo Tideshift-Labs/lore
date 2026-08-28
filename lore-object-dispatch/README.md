@@ -97,6 +97,18 @@ starts at zero; rows and concurrency start at one, including for a zero-byte PUT
 distinct from the ACK. Hard input and record-size caps fail closed. The artifact adds no mutation
 procedure, runtime call, provider traffic, deployment, readiness, or named handoff.
 
+`local_authority_reserve_put_mutation::LOCAL_AUTHORITY_RESERVE_PUT_MUTATION_MIGRATION_V1` embeds the
+exact 23,166-byte source-dark atomic ReservePut mutation. Its BLAKE3-256 is
+`eb5d413b9d5dd5d45802b3acaca193cc6b5ac783e38a4c00002a9f9abf77ed7`. The runtime-only
+`SECURITY DEFINER` procedure requires serializable isolation and locks schema state, the spool key,
+then global, boundary, and cell quota scopes. One database clock drives inclusive UUIDv7 windows
+and exact expiry. `CREATED` atomically persists the canonical ACK and lifecycle row and charges all
+three scopes; exact `REPLAY` preserves stable protocol/intent identity while permitting current
+policy, allocation, and clock inputs. Zero-byte PUTs charge one row and one concurrency unit. Caps,
+low-water reserves, checked overflow, and digest-provider failure leave no partial state. Tables and
+codec helpers remain owner-only. No service call, object-provider traffic, deployment, readiness,
+or named handoff exists.
+
 ## Private protocol
 
 The exact private `lore.object_dispatch.v1.ObjectStoreDispatchService` contract lives in
@@ -171,6 +183,7 @@ LORE_TEST_LOCAL_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch
 LORE_TEST_LOCAL_PUT_RESERVATION_SCHEMA_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_schema -- --ignored --exact live_postgres_enforces_put_result_shape_time_ack_and_service_acl
 LORE_TEST_LOCAL_PUT_RESERVATION_PROVISIONING_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_provisioning -- --ignored --exact live_postgres_chain_install_replay_read_and_drift_fail_closed
 LORE_TEST_LOCAL_PUT_RESERVATION_RECORD_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_record_codec -- --ignored --exact live_postgres_row_bytes_match_independent_vector_and_invalid_inputs_fail
+LORE_TEST_LOCAL_RESERVE_PUT_MUTATION_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_reserve_put_mutation -- --ignored --exact live_postgres_reserve_put_is_atomic_exact_and_replay_safe
 ```
 
 The library suite validates service and continuity configuration, mutual TLS, URI-SAN registration,
