@@ -155,6 +155,21 @@ digest-provider failure, tamper, and overflow roll back the whole row and quota 
 asserts prior durability; this procedure does not write, inspect, fsync, or rename filesystem
 content, wire service/provider behavior, clean up, deploy, publish readiness, or name a handoff.
 
+## Shared spool verifier
+
+`LinuxSpoolVerifier` is a source-dark, read-only observer for derived shared-spool paths. It retains
+the configured root descriptor and opens artifacts descriptor-relative with Linux `openat2`,
+requiring beneath-root, no-symlink, no-magic-link, and no-cross-mount resolution. Only regular files
+on the root device are accepted. Complete candidates are read through the opened descriptor under
+the configured size bound, hashed with exact BLAKE3-256, and checked for stable size and identity
+before an observation is returned.
+
+Recovery classification accepts only observations bound to the verifier's root identity and the
+exact derived paths. A replaced configured root, a different verifier root, changed file identity,
+unsafe file type, or mismatched path fails closed. The verifier is unsupported outside Linux and
+grants no write, cleanup, publication, ledger, quota, request, provider, deployment, or readiness
+authority; callers must still revalidate candidate decisions under the authoritative row lock.
+
 ## Private protocol
 
 The exact private `lore.object_dispatch.v1.ObjectStoreDispatchService` contract lives in
