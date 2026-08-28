@@ -54,6 +54,15 @@ local authority core migration. Its BLAKE3-256 is
 namespace with requests, attempts, spool objects, quota usage, dispatchers, payload purges, and
 fetch leases. Runtime code does not install it, and the artifact grants no direct table authority.
 
+`local_authority_provisioning::LOCAL_AUTHORITY_PROVISIONING_MIGRATION_V1` embeds the exact
+24,837-byte source-dark provisioning/readback migration. Its BLAKE3-256 is
+`90900a392e8d6ca0b59c12aa735e6acf8da364319025b8fae4cafe88a51ed14d`. It freezes API
+`object-store-dispatch-authority-provisioning-v1`, permits only the exact migrator to install, and
+permits migrator or maintenance state readback through authorization-first `SECURITY DEFINER`
+functions with a fixed `pg_catalog` search path. A frozen catalog manifest rejects schema,
+constraint, index, function-security, policy, and ACL drift. Runtime code neither installs nor calls
+this surface; direct table and column authority remains owner-only.
+
 ## Private protocol
 
 The exact private `lore.object_dispatch.v1.ObjectStoreDispatchService` contract lives in
@@ -154,4 +163,5 @@ certificate is rejected.
 The live harness uses mechanics-only SHA-256-as-BLAKE3 and typed-validator stubs; its snapshot
 evidence is synthetic contract data, not provider-local integration evidence. Deployment readiness
 still requires reviewed production BLAKE3 and typed validators, full cross-boundary negative
-isolation, deployment-revision readback, provisioning, and activation.
+isolation, external installation and effective-state readback, deployment-revision readback, and
+activation.
