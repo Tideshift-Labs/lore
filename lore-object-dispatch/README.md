@@ -117,8 +117,21 @@ progress snapshot must satisfy `0 < bytes < expected`, positive chunks, one file
 `chunks <= bytes <= chunks * maximum_chunk_bytes`, and `revision = chunks + 1`. ReservePut replay
 during progress returns the unchanged ACK without another quota charge. Explicit revocation on the
 v2 codec and both replaced `SECURITY DEFINER` functions prevents CREATE OR REPLACE from restoring
-service-role execution. This artifact adds no progress-transition mutation, fsync proof, service
-call, object-provider traffic, deployment, readiness, or named handoff.
+service-role execution. This artifact does not itself add a progress-transition mutation, fsync
+proof, service call, object-provider traffic, deployment, readiness, or named handoff.
+
+`local_authority_put_upload_progress_mutation::LOCAL_AUTHORITY_PUT_UPLOAD_PROGRESS_MUTATION_MIGRATION_V1`
+embeds the exact 10,942-byte source-dark nonfinal PUT progress mutation. Its BLAKE3-256 is
+`f9bb0d0ed36689b6c15b9686108adc905cd8fe9839156e051fc443b09941078c`. The runtime-only
+`SECURITY DEFINER` procedure requires serializable isolation and authenticates schema state, the
+exact fields-1-through-8 identity, and the current RESERVED row before atomically replacing the
+canonical record and incrementing bytes, chunks, files, and revision without changing quota. Exact
+latest replay precedes expiry and maxima checks; expiry equality blocks new progress but not replay.
+Typed gap, conflict, overflow, tamper, rollback, digest-provider, and schema failures preserve the
+whole row and quota state. The procedure records a caller assertion that the contiguous nonfinal
+prefix is already fsynced. It does not prove filesystem bytes/fsync, accept the final chunk, rename
+payloads, call the service, authorize object-provider traffic, deploy, publish readiness, or name a
+handoff.
 
 ## Private protocol
 
@@ -196,6 +209,7 @@ LORE_TEST_LOCAL_PUT_RESERVATION_PROVISIONING_PG_URL=postgresql://... cargo test 
 LORE_TEST_LOCAL_PUT_RESERVATION_RECORD_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_record_codec -- --ignored --exact live_postgres_row_bytes_match_independent_vector_and_invalid_inputs_fail
 LORE_TEST_LOCAL_RESERVE_PUT_MUTATION_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_reserve_put_mutation -- --ignored --exact live_postgres_reserve_put_is_atomic_exact_and_replay_safe
 LORE_TEST_LOCAL_PUT_UPLOAD_PROGRESS_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_upload_progress_codec -- --ignored --exact live_postgres_progress_codec_is_exact_and_replay_safe
+LORE_TEST_LOCAL_PUT_UPLOAD_PROGRESS_MUTATION_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_upload_progress_mutation -- --ignored --exact live_postgres_progress_mutation_is_atomic_and_replay_safe
 ```
 
 The library suite validates service and continuity configuration, mutual TLS, URI-SAN registration,
