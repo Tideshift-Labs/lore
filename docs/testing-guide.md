@@ -166,6 +166,10 @@ will update an older check constraint or state schema.
   durable cancellation/supersession preimage. Exercise closed raw enums, successor tuple shapes,
   checkpoint ordering, exact context/result binding, byte-handle presence, inclusive bounds, and
   receipt purge ordering with `cargo test -p lore-object-dispatch --test result_discard -j 4`.
+  Continuity quota ownership is a separate pure canonical record. Pin the independent 170-byte
+  `object-store-continuity-quota-ownership-v1` preimage, 32-byte digest, complete 202-byte record,
+  exact global scope, nonempty quota tuple, every text/size bound, detached value, and redacted
+  diagnostics with `cargo test -p lore-object-dispatch --test continuity_quota_ownership -j 4`.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.
