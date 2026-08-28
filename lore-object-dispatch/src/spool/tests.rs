@@ -15,6 +15,7 @@ const BOUNDARY_DIGEST: [u8; 32] = [
 const BODY_DIGEST: [u8; 32] = [0x11; 32];
 const OTHER_DIGEST: [u8; 32] = [0x22; 32];
 const RELEASE_DIGEST: [u8; 32] = [0x33; 32];
+const VERIFIER_ROOT_BINDING: [u8; 32] = [0x44; 32];
 const ADVERSARIAL_BOUNDARY_DIGEST: [u8; 32] = [
     0x4c, 0x54, 0x87, 0xd0, 0xcc, 0xc4, 0xab, 0x6e, 0x0a, 0xc5, 0x1c, 0x63, 0xbd, 0x73, 0x57, 0x42,
     0x01, 0x98, 0x0b, 0xe0, 0x7c, 0xd1, 0xb1, 0x21, 0xed, 0x74, 0x50, 0xb9, 0x28, 0x58, 0x4e, 0x6a,
@@ -72,6 +73,7 @@ fn observation_for(
 ) -> VerifiedFileObservation {
     VerifiedFileObservation {
         path_binding_blake3: paths.observation_binding_blake3,
+        verifier_root_binding_blake3: VERIFIER_ROOT_BINDING,
         kind,
     }
 }

@@ -4,8 +4,8 @@
 //! Pure shared-spool layout and crash-boundary classification.
 //!
 //! This module performs no filesystem access and grants no cleanup, publication, ledger, quota, or
-//! dispatch authority. Its observations must be produced by a future transaction-integrated,
-//! no-follow filesystem verifier. Every candidate decision still requires row-locked revalidation.
+//! dispatch authority. Its observations are produced by the source-dark, no-follow filesystem
+//! verifier. Every candidate decision still requires row-locked revalidation.
 
 use std::fmt;
 use std::path::Component;
@@ -143,6 +143,11 @@ impl SpoolLayout {
             observation_binding_blake3,
         })
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn shared_spool_root(&self) -> &Path {
+        &self.shared_spool_root
+    }
 }
 
 impl fmt::Debug for SpoolLayout {
@@ -178,6 +183,11 @@ impl SpoolPaths {
 
     pub fn boundary_binding(&self) -> &SpoolBoundaryBinding {
         &self.boundary_binding
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn observation_binding_blake3(&self) -> [u8; 32] {
+        self.observation_binding_blake3
     }
 }
 
@@ -263,12 +273,70 @@ impl fmt::Debug for LedgerSpoolView {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedFileObservation {
     path_binding_blake3: [u8; 32],
+    verifier_root_binding_blake3: [u8; 32],
     kind: VerifiedFileObservationKind,
 }
 
+#[cfg(target_os = "linux")]
+impl VerifiedFileObservation {
+    pub(crate) fn verifier_root_binding_blake3(&self) -> [u8; 32] {
+        self.verifier_root_binding_blake3
+    }
+
+    pub(crate) fn none(paths: &SpoolPaths, root_binding_blake3: [u8; 32]) -> Self {
+        Self {
+            path_binding_blake3: paths.observation_binding_blake3(),
+            verifier_root_binding_blake3: root_binding_blake3,
+            kind: VerifiedFileObservationKind::None,
+        }
+    }
+
+    pub(crate) fn part(
+        paths: &SpoolPaths,
+        root_binding_blake3: [u8; 32],
+        size: u64,
+        blake3: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            path_binding_blake3: paths.observation_binding_blake3(),
+            verifier_root_binding_blake3: root_binding_blake3,
+            kind: VerifiedFileObservationKind::Part { size, blake3 },
+        }
+    }
+
+    pub(crate) fn blob(
+        paths: &SpoolPaths,
+        root_binding_blake3: [u8; 32],
+        size: u64,
+        blake3: [u8; 32],
+    ) -> Self {
+        Self {
+            path_binding_blake3: paths.observation_binding_blake3(),
+            verifier_root_binding_blake3: root_binding_blake3,
+            kind: VerifiedFileObservationKind::Blob { size, blake3 },
+        }
+    }
+
+    pub(crate) fn both(paths: &SpoolPaths, root_binding_blake3: [u8; 32]) -> Self {
+        Self {
+            path_binding_blake3: paths.observation_binding_blake3(),
+            verifier_root_binding_blake3: root_binding_blake3,
+            kind: VerifiedFileObservationKind::Both,
+        }
+    }
+
+    pub(crate) fn unsafe_or_non_regular(paths: &SpoolPaths, root_binding_blake3: [u8; 32]) -> Self {
+        Self {
+            path_binding_blake3: paths.observation_binding_blake3(),
+            verifier_root_binding_blake3: root_binding_blake3,
+            kind: VerifiedFileObservationKind::UnsafeOrNonRegular,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
-// These variants are constructed only by this module's future no-follow verifier. Keeping the enum
-// private is what prevents callers from fabricating recovery evidence before that verifier lands.
+// These variants are constructed only by this crate's no-follow verifier. Keeping the enum private
+// prevents callers from fabricating recovery evidence.
 #[allow(dead_code)]
 enum VerifiedFileObservationKind {
     None,
@@ -325,9 +393,11 @@ pub enum SpoolRecoveryInconsistency {
     MissingReadyBlob,
     ReadyHandleMismatch,
     ObservationPathMismatch,
+    ObservationRootMismatch,
 }
 
-pub fn classify_spool_recovery(
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn classify_spool_recovery(
     ledger: &LedgerSpoolView,
     observation: VerifiedFileObservation,
     paths: &SpoolPaths,
@@ -358,6 +428,7 @@ pub fn classify_spool_recovery(
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn classify_absent_or_released(observation: VerifiedFileObservationKind) -> SpoolRecoveryDecision {
     match observation {
         VerifiedFileObservationKind::None => SpoolRecoveryDecision::ConsistentAbsent,
@@ -370,6 +441,7 @@ fn classify_absent_or_released(observation: VerifiedFileObservationKind) -> Spoo
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn classify_reserved(
     expected_size: u64,
     expected_blake3: &[u8; 32],
@@ -418,6 +490,7 @@ fn classify_reserved(
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn classify_ready(
     opaque_handle: &str,
     expected_size: u64,

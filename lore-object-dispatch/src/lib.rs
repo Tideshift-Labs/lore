@@ -48,6 +48,7 @@ pub mod schema;
 pub mod server;
 pub mod service;
 pub mod spool;
+pub mod spool_verifier;
 pub mod terminal_result;
 pub mod upload;
 
@@ -295,7 +296,6 @@ pub use spool::SpoolPaths;
 pub use spool::SpoolRecoveryDecision;
 pub use spool::SpoolRecoveryInconsistency;
 pub use spool::VerifiedFileObservation;
-pub use spool::classify_spool_recovery;
 pub use spool::validate_spool_boundary_binding;
 pub use terminal_result::CanonicalTerminalResult;
 pub use terminal_result::TerminalResultError;

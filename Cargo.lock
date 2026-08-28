@@ -2839,6 +2839,7 @@ dependencies = [
  "opentelemetry",
  "prost",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-pemfile",
  "thiserror 2.0.18",
