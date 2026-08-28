@@ -459,6 +459,30 @@ every selected path and staged flag, then commit and deserialize the exact commi
 complete file set. Include `force = true` with both committed and staged-add ancestor directories;
 current-thread/one-worker runs and event or stage-end counts do not prove topology retention.
 
+### Writing integration tests ahead of an in-flight `src/` contract change
+
+- Symptom: an unscoped `cargo test -p <crate>` starts failing to compile even though you only added
+  new `tests/*.rs` files and touched nothing existing. Cause: cargo auto-discovers every top-level
+  `tests/*.rs` as its own binary target, so one file written against a stated-but-not-yet-landed
+  `src/` contract (a parallel refactor in flight) blocks the whole crate's unscoped `cargo test`, not
+  just itself. What to do: scope with `cargo test -p <crate> --test <name>` while the src change is
+  still landing -- this builds/runs only that target and lets you keep proving the parts of the
+  contract that don't depend on the pending symbols (e.g. `lore-object-dispatch/tests/canonical_id.rs`
+  stayed green throughout CR-033's request-state/continuity decoupling because it only exercises
+  already-public wrappers). Once the src lands, the exact fn-pointer/struct-field shape of a
+  prose-described seam (public vs private fields, `fn(...)` vs closure) is rarely fully specified;
+  expect one iteration pass to fix signature mismatches, not a full rewrite -- for CR-033's
+  `request_state_wire`/`continuity_wire` split, the only guess that landed wrong was the import path:
+  a function relocated to a *different* module (the old two-arg `validate_and_encode_object_store_
+  request_receipt`/`..._outcome` moved into `continuity_wire.rs`) keeps its crate-root re-export, so
+  import it from `lore_object_dispatch::` directly rather than through either module's own path.
+- `AuthorizedCallerRegistry` does not derive `PartialEq` (it wraps an `Arc<BTreeMap<..>>` of redacted
+  entries). A helper that returns `Result<AuthorizedCallerRegistry, E>` can't be `assert_eq!`'d
+  directly; map to `Result<(), E>` first, or compare `.err()` against `Some(..)`.
+- `ObjectStorePayloadKindV1`'s two variants are `ObjectStorePayloadKindPutBody` and
+  `ObjectStorePayloadKindGetResult` -- not `...ResultPayload`. A minimal state/retention fixture that
+  guesses the second name fails at compile time with a "did you mean" pointing at the right one.
+
 ### Process-global state
 
 - OTel providers, connection maps, auth caches, and panic hooks are shared by the whole test binary.
