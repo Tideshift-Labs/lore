@@ -17,6 +17,7 @@ pub mod continuity_wire;
 mod contract;
 pub mod fetch_lease;
 pub mod full_to_compact;
+pub mod local_authority_provisioning;
 pub mod local_authority_schema;
 pub mod metrics;
 pub mod no_dispatch;
