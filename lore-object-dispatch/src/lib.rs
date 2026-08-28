@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod authority;
+pub mod compact_prune;
 pub mod compaction;
 pub mod config;
 pub mod continuity;
@@ -44,6 +45,14 @@ pub use authority::CurrentCellAdmission;
 pub use authority::CurrentCellAllocation;
 pub use authority::SubmittedAuthority;
 pub use authority::validate_request_authority;
+pub use compact_prune::CompactPruneError;
+pub use compact_prune::ObjectStoreCompactPruneBackupCoverage;
+pub use compact_prune::ObjectStoreCompactPruneBackupMissing;
+pub use compact_prune::ObjectStoreCompactPruneCandidate;
+pub use compact_prune::ObjectStoreCompactPruneDecision;
+pub use compact_prune::ObjectStoreCompactPruneInput;
+pub use compact_prune::ObjectStoreCompactPruneWatermark;
+pub use compact_prune::decide_object_store_compact_prune;
 pub use compaction::CanonicalObjectStoreCompactDependencyFloor;
 pub use compaction::CanonicalObjectStoreCompactReceipt;
 pub use compaction::CanonicalObjectStoreProviderAttemptAudit;
