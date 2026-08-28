@@ -142,6 +142,19 @@ lifecycle-v2 permits only exact SPOOL_READY replay. The owner-only artifact does
 transition, write/fsync/rename filesystem data, call the service, authorize object-provider
 traffic, deploy, publish readiness, or name a handoff.
 
+`local_authority_put_spool_ready_mutation::LOCAL_AUTHORITY_PUT_SPOOL_READY_MUTATION_MIGRATION_V1`
+embeds the exact 13,373-byte source-dark runtime transition from RESERVED lifecycle 1 to SPOOL_READY
+lifecycle 2. Its BLAKE3-256 is
+`1bf102fce2e86f48eed6295e1349795564c4aae48aa5ac5d5af5ab5233b0462c`. The serializable
+procedure requires the exact final index and current partial snapshot, complete expected size and
+hash, a final delta within the chunk maximum, and database ready time before expiry. `APPLIED`
+atomically writes the state-2 ACK and distinct canonical ready row, zeros partial counters, and
+leaves quota unchanged, including for zero-byte PUTs. Exact replay reconstructs the final index as
+`revision - 2` before maxima and clock checks and remains valid after expiry. Duplicate handles,
+digest-provider failure, tamper, and overflow roll back the whole row and quota state. The caller
+asserts prior durability; this procedure does not write, inspect, fsync, or rename filesystem
+content, wire service/provider behavior, clean up, deploy, publish readiness, or name a handoff.
+
 ## Private protocol
 
 The exact private `lore.object_dispatch.v1.ObjectStoreDispatchService` contract lives in
@@ -220,6 +233,7 @@ LORE_TEST_LOCAL_RESERVE_PUT_MUTATION_PG_URL=postgresql://... cargo test -p lore-
 LORE_TEST_LOCAL_PUT_UPLOAD_PROGRESS_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_upload_progress_codec -- --ignored --exact live_postgres_progress_codec_is_exact_and_replay_safe
 LORE_TEST_LOCAL_PUT_UPLOAD_PROGRESS_MUTATION_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_upload_progress_mutation -- --ignored --exact live_postgres_progress_mutation_is_atomic_and_replay_safe
 LORE_TEST_LOCAL_PUT_SPOOL_READY_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_spool_ready_codec -- --ignored --exact live_postgres_ready_codec_is_exact_fail_closed_and_replay_safe
+LORE_TEST_LOCAL_PUT_SPOOL_READY_MUTATION_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_spool_ready_mutation -- --ignored --exact live_postgres_spool_ready_is_atomic_replay_safe_and_source_dark
 ```
 
 The library suite validates service and continuity configuration, mutual TLS, URI-SAN registration,
