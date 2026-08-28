@@ -13,6 +13,8 @@ use lore_object_dispatch::ObjectStoreCompactReceiptInput;
 use lore_object_dispatch::ObjectStoreCompactReceiptLimits;
 use lore_object_dispatch::ObjectStoreCompactReceiptPlannerInput;
 use lore_object_dispatch::ObjectStoreProviderAttemptAudit;
+use lore_object_dispatch::ReservePutAckError;
+use lore_object_dispatch::ReservePutAckLimits;
 use lore_object_dispatch::TerminalResultLimits;
 use lore_object_dispatch::build_no_dispatch_proof;
 use lore_object_dispatch::decide_object_store_compact_receipt;
@@ -24,8 +26,8 @@ use lore_object_dispatch::validate_and_encode_object_store_provider_attempt_audi
 use lore_object_dispatch::validate_and_encode_object_store_request_outcome;
 use lore_object_dispatch::validate_and_encode_object_store_request_receipt;
 use lore_object_dispatch::validate_and_encode_object_store_request_state;
+use lore_object_dispatch::validate_and_encode_object_store_reserve_put_ack;
 use lore_object_dispatch::validate_and_encode_terminal_result;
-use lore_object_dispatch::validate_canonical_object_store_reserve_put_ack;
 use lore_proto::lore::object_dispatch::v1::*;
 
 const NOW: i64 = 0x018f_3e12_a456;
@@ -584,12 +586,68 @@ struct Fixture {
 }
 
 fn reserve_put_ack() -> lore_object_dispatch::CanonicalObjectStoreReservePutAck {
-    let mut canonical_bytes =
-        b"object-store-reserve-put-ack-test-fixture-v1\0deterministic".to_vec();
-    let digest = *blake3::hash(&canonical_bytes).as_bytes();
-    canonical_bytes.extend_from_slice(&digest);
-    validate_canonical_object_store_reserve_put_ack(&canonical_bytes, &digest, 16_384)
-        .expect("ReservePut ACK fixture")
+    let no_dispatch = build_no_dispatch_proof(
+        NoDispatchProofFields {
+            reason: NoDispatchReason::PreparedTtlExpired,
+            proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
+            proof_fence: 1,
+            committed_at_unix_ms: NOW,
+            authority_epoch: 1,
+        },
+        16_384,
+    )
+    .expect("ReservePut no-dispatch proof fixture");
+    validate_and_encode_object_store_reserve_put_ack(
+        &ReservePutAckV1 {
+            protocol_revision: "object-dispatch-v1".to_string(),
+            policy_revision: "policy-1".to_string(),
+            provider_boundary_id: "boundary-1".to_string(),
+            authenticated_cell_id: "cell-1".to_string(),
+            authenticated_tenant_id: "tenant-1".to_string(),
+            logical_request_id: REQUEST_ID.to_string(),
+            attempt_id: ATTEMPT_ID.to_string(),
+            upload_id: "018f3e12-a452-7abc-8def-0123456789ab".to_string(),
+            upload_fence: 1,
+            state: 3,
+            reserved_quota: Some(quota(64, 1, 1)),
+            expires_at_unix_ms: NOW,
+            max_chunk_bytes: 64,
+            spool_ready: None,
+            payload_release_receipt: Some(ObjectStorePayloadPurgeReceiptV1 {
+                purge_id: "reserve-put-purge-1".to_string(),
+                payload_kind: 1,
+                terminal_result_id: None,
+                disposition: 1,
+                released_bytes: 64,
+                released_rows: 1,
+                released_concurrency: 1,
+                purged_at_unix_ms: NOW + 10,
+                provider_authority_refunded: false,
+                receipt_blake3: Default::default(),
+                release_reason: 3,
+                deleted_partial_temp_bytes: 0,
+                deleted_partial_temp_files: 0,
+            }),
+            admission_clock_unix_ms: NOW - 10,
+            allocation_hard_expiry_unix_ms: NOW + 20,
+            closure: None,
+            no_dispatch_proof: Some(ObjectStoreNoDispatchProofV1 {
+                reason: 4,
+                proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
+                proof_fence: 1,
+                committed_at_unix_ms: NOW,
+                authority_epoch: 1,
+                proof_blake3: no_dispatch.proof().proof_blake3.to_vec().into(),
+            }),
+            ack_blake3: Default::default(),
+        },
+        &ReservePutAckLimits {
+            max_identity_bytes: 256,
+            max_durable_handle_bytes: 256,
+            max_canonical_row_bytes: 16_384,
+        },
+    )
+    .expect("ReservePut ACK fixture")
 }
 
 fn fixture(
@@ -882,15 +940,15 @@ fn disposed_put_compact_pins_reserve_ack_and_replay_projection() {
         compact_ack.canonical_bytes().as_ptr(),
         source_ack.canonical_bytes().as_ptr()
     );
-    assert_eq!(source_ack.canonical_bytes().len(), 90);
+    assert_eq!(source_ack.canonical_bytes().len(), 687);
     assert_eq!(
         source_ack.ack_blake3(),
-        decode_hex("b17bd3fd408467d111e3ad780da5a0f2e9ee7280d7b7281c6fbb33f373b7f7f0").as_slice()
+        decode_hex("9be99cf8cf771dae54f540a31ff5074839c4a3a71e928da7ba2885bdb2b623c5").as_slice()
     );
-    assert_eq!(compact.canonical_bytes().len(), 7_152);
+    assert_eq!(compact.canonical_bytes().len(), 7_749);
     assert_eq!(
         compact.compact_blake3(),
-        decode_hex("919436640e99825e1a3ec67e9cbc8de9c7148c422c0ddcf1f6349e29666accdc").as_slice()
+        decode_hex("06c714e55984f67f117f84b77e1e78b202dbd40d02258e1c3ae5680e1d73cd76").as_slice()
     );
 
     let mut replay = planner(&fixture);
@@ -949,10 +1007,10 @@ fn final_continuity_adjudication_compacts_with_automatic_floor() {
             .retain_until_unix_ms,
         NOW + 110
     );
-    assert_eq!(compact.canonical_bytes().len(), 4_508);
+    assert_eq!(compact.canonical_bytes().len(), 5_105);
     assert_eq!(
         compact.compact_blake3(),
-        decode_hex("bdd078e3fc0fb5d440946b03b9d3fdc2accd0a5ffa8c5b85313c65452363fa79").as_slice()
+        decode_hex("8e96074a7ca6cee392f89853607b7897c5171da8b7b6fe8fef62bfcd5eddaff0").as_slice()
     );
 }
 
@@ -1463,43 +1521,96 @@ fn audit_and_floor_records_reject_digest_algebra_duplicate_and_presence_drift() 
 }
 
 #[test]
-fn reserve_put_ack_validation_rejects_mutation_and_detaches_canonical_buffers() {
-    let mut canonical_bytes =
-        b"object-store-reserve-put-ack-test-fixture-v1\0deterministic".to_vec();
-    let digest = *blake3::hash(&canonical_bytes).as_bytes();
-    canonical_bytes.extend_from_slice(&digest);
-    let canonical =
-        validate_canonical_object_store_reserve_put_ack(&canonical_bytes, &digest, 16_384)
-            .expect("canonical ReservePut ACK");
-    assert_ne!(
-        canonical.canonical_bytes().as_ptr(),
-        canonical_bytes.as_ptr()
-    );
-    canonical_bytes[0] ^= 1;
-    assert_ne!(canonical.canonical_bytes(), canonical_bytes);
+fn reserve_put_ack_validation_rejects_digest_mutation_and_detaches_values() {
+    let canonical = reserve_put_ack();
+    let mut source = canonical.value().clone();
+    assert_ne!(source.ack_blake3.as_ptr(), canonical.ack_blake3().as_ptr());
+    source.policy_revision.push_str("-mutated");
+    assert_ne!(canonical.value().policy_revision, source.policy_revision);
 
-    let mut bad_bytes = canonical.canonical_bytes().to_vec();
-    bad_bytes[0] ^= 1;
+    let mut bad = canonical.value().clone();
+    bad.ack_blake3 = OTHER_DIGEST.to_vec().into();
     assert_eq!(
-        validate_canonical_object_store_reserve_put_ack(&bad_bytes, &digest, 16_384),
-        Err(CompactReceiptError::InvalidReservePutAck)
-    );
-    assert_eq!(
-        validate_canonical_object_store_reserve_put_ack(
-            canonical.canonical_bytes(),
-            &OTHER_DIGEST,
-            16_384,
+        validate_and_encode_object_store_reserve_put_ack(
+            &bad,
+            &ReservePutAckLimits {
+                max_identity_bytes: 256,
+                max_durable_handle_bytes: 256,
+                max_canonical_row_bytes: 16_384,
+            },
         ),
-        Err(CompactReceiptError::InvalidReservePutAck)
+        Err(ReservePutAckError::DigestMismatch)
     );
+}
+
+#[test]
+fn compact_rejects_foreign_or_nonterminal_reserve_put_ack_authority() {
+    let fixture = fixture(
+        ObjectStoreCompactAuthority::RequestState(Box::new(expired_state())),
+        no_dispatch_audit(),
+    );
+    let source = fixture.reserve_put_ack.as_ref().expect("PUT ACK fixture");
+    let ack_limits = ReservePutAckLimits {
+        max_identity_bytes: 256,
+        max_durable_handle_bytes: 256,
+        max_canonical_row_bytes: 16_384,
+    };
+
+    let mut foreign_value = source.value().clone();
+    foreign_value.authenticated_tenant_id = "tenant-foreign".to_string();
+    foreign_value.ack_blake3 = Default::default();
+    let foreign = validate_and_encode_object_store_reserve_put_ack(&foreign_value, &ack_limits)
+        .expect("foreign semantic ACK");
+    let mut input = planner(&fixture);
+    input.reserve_put_ack = Some(&foreign);
     assert_eq!(
-        validate_canonical_object_store_reserve_put_ack(
-            canonical.canonical_bytes(),
-            &digest,
-            canonical.canonical_bytes().len() as u32 - 1,
-        ),
+        decide_object_store_compact_receipt(&input, &limits()),
         Err(CompactReceiptError::InvalidReservePutAck)
     );
+
+    for state in [1, 2, 4] {
+        let mut value = source.value().clone();
+        value.state = state;
+        value.payload_release_receipt = None;
+        value.no_dispatch_proof = None;
+        value.ack_blake3 = Default::default();
+        if state == 2 {
+            value.spool_ready = Some(PutSpoolReadyV1 {
+                protocol_revision: value.protocol_revision.clone(),
+                provider_boundary_id: value.provider_boundary_id.clone(),
+                authenticated_cell_id: value.authenticated_cell_id.clone(),
+                authenticated_tenant_id: value.authenticated_tenant_id.clone(),
+                logical_request_id: value.logical_request_id.clone(),
+                attempt_id: value.attempt_id.clone(),
+                upload_id: value.upload_id.clone(),
+                upload_fence: value.upload_fence,
+                durable_body_handle: "put-body-1".to_string(),
+                body_size: 64,
+                body_blake3: DIGEST.to_vec().into(),
+                ready_at_unix_ms: NOW - 5,
+            });
+        }
+        if state == 4 {
+            value.closure = Some(PutReservationClosureV1 {
+                terminal_result_id: "terminal-1".to_string(),
+                terminal_retryability: 2,
+                result_disposition: 2,
+                ack_receipt: None,
+                discard_receipt: None,
+                closed_at_unix_ms: NOW,
+                closure_blake3: Default::default(),
+            });
+        }
+        let nonterminal = validate_and_encode_object_store_reserve_put_ack(&value, &ack_limits)
+            .expect("semantic nonterminal ACK");
+        let mut state_input = planner(&fixture);
+        state_input.reserve_put_ack = Some(&nonterminal);
+        assert_eq!(
+            decide_object_store_compact_receipt(&state_input, &limits()),
+            Err(CompactReceiptError::InvalidReservePutAck),
+            "state {state}"
+        );
+    }
 }
 
 fn direct_input<'a>(

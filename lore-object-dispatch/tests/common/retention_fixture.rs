@@ -37,6 +37,75 @@ fn wire_limits() -> ContinuityWireLimits {
     }
 }
 
+fn reserve_put_ack_fixture() -> CanonicalObjectStoreReservePutAck {
+    let no_dispatch = build_no_dispatch_proof(
+        NoDispatchProofFields {
+            reason: NoDispatchReason::PreparedTtlExpired,
+            proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
+            proof_fence: 1,
+            committed_at_unix_ms: NOW,
+            authority_epoch: 1,
+        },
+        16_384,
+    )
+    .expect("ReservePut no-dispatch proof fixture");
+    validate_and_encode_object_store_reserve_put_ack(
+        &ReservePutAckV1 {
+            protocol_revision: "object-dispatch-v1".to_string(),
+            policy_revision: "policy-1".to_string(),
+            provider_boundary_id: "boundary-1".to_string(),
+            authenticated_cell_id: "cell-1".to_string(),
+            authenticated_tenant_id: "tenant-1".to_string(),
+            logical_request_id: REQUEST_ID.to_string(),
+            attempt_id: ATTEMPT_ID.to_string(),
+            upload_id: "018f3e12-a452-7abc-8def-0123456789ab".to_string(),
+            upload_fence: 1,
+            state: 3,
+            reserved_quota: Some(ObjectStoreQuotaUnitsV1 {
+                bytes: 64,
+                rows: 1,
+                concurrency: 1,
+            }),
+            expires_at_unix_ms: NOW,
+            max_chunk_bytes: 64,
+            spool_ready: None,
+            payload_release_receipt: Some(ObjectStorePayloadPurgeReceiptV1 {
+                purge_id: "reserve-put-purge-1".to_string(),
+                payload_kind: 1,
+                terminal_result_id: None,
+                disposition: 1,
+                released_bytes: 64,
+                released_rows: 1,
+                released_concurrency: 1,
+                purged_at_unix_ms: NOW + 10,
+                provider_authority_refunded: false,
+                receipt_blake3: Default::default(),
+                release_reason: 3,
+                deleted_partial_temp_bytes: 0,
+                deleted_partial_temp_files: 0,
+            }),
+            admission_clock_unix_ms: NOW - 10,
+            allocation_hard_expiry_unix_ms: NOW + 20,
+            closure: None,
+            no_dispatch_proof: Some(ObjectStoreNoDispatchProofV1 {
+                reason: 4,
+                proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
+                proof_fence: 1,
+                committed_at_unix_ms: NOW,
+                authority_epoch: 1,
+                proof_blake3: no_dispatch.proof().proof_blake3.to_vec().into(),
+            }),
+            ack_blake3: Default::default(),
+        },
+        &ReservePutAckLimits {
+            max_identity_bytes: 256,
+            max_durable_handle_bytes: 256,
+            max_canonical_row_bytes: 16_384,
+        },
+    )
+    .expect("ReservePut ACK fixture")
+}
+
 fn quota(bytes: u64, rows: u64, concurrency: u64) -> ObjectStoreQuotaUnitsV1 {
     ObjectStoreQuotaUnitsV1 {
         bytes,
@@ -136,12 +205,7 @@ pub fn compact_plan() -> ObjectStoreCompactReceiptDecision {
         &wire_limits(),
     )
     .expect("adjudicated outcome");
-    let mut ack_bytes = b"retention-live-adjudicated-reserve-put-ack-v1\0".to_vec();
-    let ack_digest = *blake3::hash(&ack_bytes).as_bytes();
-    ack_bytes.extend_from_slice(&ack_digest);
-    let reserve_put_ack =
-        validate_canonical_object_store_reserve_put_ack(&ack_bytes, &ack_digest, 16_384)
-            .expect("adjudicated ReservePut ACK");
+    let reserve_put_ack = reserve_put_ack_fixture();
     decide_object_store_compact_receipt(
         &ObjectStoreCompactReceiptPlannerInput {
             authority: &authority,

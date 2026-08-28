@@ -32,6 +32,7 @@ use crate::request_state_wire::CanonicalObjectStoreRequestReceipt;
 use crate::request_state_wire::CanonicalObjectStoreRequestState;
 use crate::request_state_wire::validate_and_encode_object_store_request_outcome;
 use crate::request_state_wire::validate_and_encode_object_store_request_receipt;
+use crate::reserve_put_ack::CanonicalObjectStoreReservePutAck;
 
 const SCHEMA_REVISION: &str = "object-store-compact-receipt-v1";
 const COMPACT_DOMAIN: &[u8] = b"object-store-compact-receipt-v1\0";
@@ -98,32 +99,6 @@ pub struct CanonicalObjectStoreProviderAttemptAudit {
     value: ObjectStoreProviderAttemptAudit,
     canonical_bytes: Vec<u8>,
     audit_blake3: [u8; 32],
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct CanonicalObjectStoreReservePutAck {
-    canonical_bytes: Vec<u8>,
-    ack_blake3: [u8; 32],
-}
-
-impl CanonicalObjectStoreReservePutAck {
-    pub fn canonical_bytes(&self) -> &[u8] {
-        &self.canonical_bytes
-    }
-
-    pub fn ack_blake3(&self) -> &[u8; 32] {
-        &self.ack_blake3
-    }
-}
-
-impl fmt::Debug for CanonicalObjectStoreReservePutAck {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CanonicalObjectStoreReservePutAck")
-            .field("canonical_bytes", &"[REDACTED]")
-            .field("ack_blake3", &"[REDACTED]")
-            .finish()
-    }
 }
 
 impl CanonicalObjectStoreProviderAttemptAudit {
@@ -455,25 +430,6 @@ fn complete(
     bytes.extend_from_slice(&preimage);
     bytes.extend_from_slice(&digest);
     Ok((bytes, digest))
-}
-
-pub fn validate_canonical_object_store_reserve_put_ack(
-    canonical_bytes: &[u8],
-    ack_blake3: &[u8],
-    maximum: u32,
-) -> Result<CanonicalObjectStoreReservePutAck, CompactReceiptError> {
-    let digest = exact_digest(ack_blake3)?;
-    if canonical_bytes.len() <= 32 || canonical_bytes.len() > maximum as usize {
-        return Err(CompactReceiptError::InvalidReservePutAck);
-    }
-    let (preimage, trailing_digest) = canonical_bytes.split_at(canonical_bytes.len() - 32);
-    if trailing_digest != digest || blake3::hash(preimage).as_bytes() != &digest {
-        return Err(CompactReceiptError::InvalidReservePutAck);
-    }
-    Ok(CanonicalObjectStoreReservePutAck {
-        canonical_bytes: canonical_bytes.to_vec(),
-        ack_blake3: digest,
-    })
 }
 
 fn audit_fields(value: &ObjectStoreProviderAttemptAudit) -> Result<[u64; 5], CompactReceiptError> {
@@ -967,15 +923,29 @@ fn write_optional_digest(
     Ok(exact)
 }
 
-fn checked_reserve_put_ack(
-    value: Option<&CanonicalObjectStoreReservePutAck>,
-    required: bool,
+fn checked_reserve_put_ack<'a>(
+    value: Option<&'a CanonicalObjectStoreReservePutAck>,
+    projection: &AuthorityProjection<'_>,
     maximum: u32,
-) -> Result<Option<&CanonicalObjectStoreReservePutAck>, CompactReceiptError> {
+) -> Result<Option<&'a CanonicalObjectStoreReservePutAck>, CompactReceiptError> {
+    let required = projection.put_reservation_fingerprint.is_some();
     if required != value.is_some()
         || value.is_some_and(|ack| ack.canonical_bytes().len() > maximum as usize)
     {
         return Err(CompactReceiptError::InvalidReservePutAck);
+    }
+    if let Some(ack) = value {
+        let ack = ack.value();
+        if !matches!(ack.state, 3 | 5)
+            || ack.protocol_revision != projection.protocol_revision
+            || ack.provider_boundary_id != projection.provider_boundary_id
+            || ack.authenticated_cell_id != projection.authenticated_cell_id
+            || ack.authenticated_tenant_id != projection.authenticated_tenant_id
+            || ack.logical_request_id != projection.logical_request_id
+            || ack.attempt_id != projection.attempt_id
+        {
+            return Err(CompactReceiptError::InvalidReservePutAck);
+        }
     }
     Ok(value)
 }
@@ -1005,7 +975,7 @@ pub fn validate_and_encode_object_store_compact_receipt(
     let floors = checked_floors(input.dependency_floors, limits)?;
     let reserve_put_ack = checked_reserve_put_ack(
         input.reserve_put_ack,
-        projection.put_reservation_fingerprint.is_some(),
+        &projection,
         limits.max_canonical_row_bytes,
     )?;
     if !projection.closed
@@ -1231,7 +1201,7 @@ pub fn decide_object_store_compact_receipt(
     }
     let reserve_put_ack = checked_reserve_put_ack(
         input.reserve_put_ack,
-        projection.put_reservation_fingerprint.is_some(),
+        &projection,
         validation_limits.max_canonical_row_bytes,
     )?;
     let mut floor_values = projection.automatic_floors.clone();

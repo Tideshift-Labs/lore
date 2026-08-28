@@ -421,7 +421,7 @@ fn terminal_child(
     Ok((complete, normalized, byte))
 }
 
-fn ack_child(
+pub(crate) fn ack_child(
     value: &ObjectStoreResultAckReceiptV1,
     limits: &RequestStateWireLimits,
 ) -> Result<Vec<u8>, RequestStateWireError> {
@@ -459,7 +459,7 @@ fn ack_child(
     complete_child(output.finish(), &[], limits)
 }
 
-fn discard_child(
+pub(crate) fn discard_child(
     value: &ObjectStoreResultDiscardReceiptV1,
     limits: &RequestStateWireLimits,
 ) -> Result<Vec<u8>, RequestStateWireError> {
@@ -497,7 +497,7 @@ fn discard_child(
     complete_child(output.finish(), &[], limits)
 }
 
-fn no_dispatch_child(
+pub(crate) fn no_dispatch_child(
     value: &ObjectStoreNoDispatchProofV1,
     limits: &RequestStateWireLimits,
 ) -> Result<Vec<u8>, RequestStateWireError> {
@@ -533,7 +533,7 @@ fn no_dispatch_child(
     complete_child(output.finish(), &value.proof_blake3, limits)
 }
 
-fn purge_child(
+pub(crate) fn purge_child(
     value: &ObjectStorePayloadPurgeReceiptV1,
     limits: &RequestStateWireLimits,
 ) -> Result<(Vec<u8>, ObjectStorePayloadPurgeReceiptV1), RequestStateWireError> {
