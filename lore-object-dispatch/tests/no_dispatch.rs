@@ -195,21 +195,17 @@ fn no_dispatch_diagnostics_redact_proof_identity_digest_and_preimage() {
 #[test]
 fn no_dispatch_contract_remains_effect_free_and_unwired() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let service = std::fs::read_to_string(manifest.join("src/service.rs"))
-        .expect("source-dark service source must be readable");
+    // CR-033 D1/D6/P2 removed the separate-process service shell entirely; assert that
+    // structurally instead of grepping a deleted `src/service.rs` for the wiring it never had.
+    for removed in ["src/service.rs", "src/server.rs", "src/main.rs"] {
+        assert!(
+            !manifest.join(removed).exists(),
+            "process-composition surface must stay removed: {removed}"
+        );
+    }
     let source = std::fs::read_to_string(manifest.join("src/no_dispatch.rs"))
         .expect("no-dispatch source must be readable");
 
-    for forbidden in [
-        "crate::no_dispatch",
-        "build_no_dispatch_proof",
-        "validate_no_dispatch_proof",
-    ] {
-        assert!(
-            !service.contains(forbidden),
-            "source-dark service must not wire proof primitive {forbidden}"
-        );
-    }
     for forbidden in [
         "tokio_postgres",
         "std::fs",

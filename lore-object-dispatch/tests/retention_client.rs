@@ -390,25 +390,31 @@ fn decoding_closes_states_presence_scopes_digests_and_canonical_numbers() {
 }
 
 #[test]
-fn client_is_unreachable_from_rpc_server_provider_and_process_composition() {
-    for (name, source) in [
-        ("service", include_str!("../src/service.rs")),
-        ("server", include_str!("../src/server.rs")),
-        ("main", include_str!("../src/main.rs")),
-        ("config", include_str!("../src/config.rs")),
+fn client_is_unreachable_from_process_composition_and_the_cell_authority_config() {
+    // CR-033's revised specification (D1/D6/P2) removes the separate-process service shell
+    // (`service.rs`, `server.rs`, `main.rs`) entirely: the crate has no `[[bin]]` target and no
+    // process-composition surface left to escape into. Assert that structurally rather than by
+    // grepping deleted files, then keep the one remaining forbidden-substring check against the
+    // cell authority's own configuration surface.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for removed in ["src/service.rs", "src/server.rs", "src/main.rs"] {
+        assert!(
+            !manifest.join(removed).exists(),
+            "process-composition surface must stay removed: {removed}"
+        );
+    }
+    let config_source = include_str!("../src/config.rs");
+    for forbidden in [
+        "RetentionMaintenanceClient",
+        "RetentionTlsConfig",
+        "retention_client",
+        "object_store_retention_read_",
+        "object_store_retention_apply_",
     ] {
-        for forbidden in [
-            "RetentionMaintenanceClient",
-            "RetentionTlsConfig",
-            "retention_client",
-            "object_store_retention_read_",
-            "object_store_retention_apply_",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "source-dark retention client escaped into {name}: {forbidden}"
-            );
-        }
+        assert!(
+            !config_source.contains(forbidden),
+            "source-dark retention client escaped into config: {forbidden}"
+        );
     }
 }
 

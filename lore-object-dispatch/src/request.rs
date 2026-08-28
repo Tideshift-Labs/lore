@@ -3,9 +3,12 @@
 
 //! Pure request-shape, fingerprint, and idempotency prerequisites.
 //!
-//! Nothing in this module reads a clock, database, spool, or provider. The source-dark service does
-//! not call these functions. A future admission transaction must perform the durable fingerprint
-//! lookup before applying the first-seen-only authority, time, reservation, and spool checks.
+//! Nothing in this module reads a clock, database, spool, or provider, and nothing calls these
+//! functions yet. A future admission transaction must perform the durable fingerprint lookup
+//! before applying the first-seen-only authority, time, reservation, and spool checks.
+//!
+//! CR-033 D3 folded the former `authority.rs` slice in here: with boundary equal to cell, there is
+//! one authority context to validate, not two that can drift apart.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -22,7 +25,9 @@ use lore_proto::lore::object_dispatch::v1::result_consumer_context_v1;
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::contract::MAX_CANONICAL_ID_BYTES;
 use crate::contract::canonical_uuid_v7_timestamp;
+use crate::contract::validate_canonical_id;
 
 const FINGERPRINT_DOMAIN: &[u8] = b"object-dispatch-fingerprint-v1\0";
 const UUID_PAST_WINDOW_MS: i64 = 365 * 24 * 60 * 60 * 1_000;
@@ -89,6 +94,17 @@ pub struct DurablePutSpoolExpectation {
     pub body_blake3: [u8; 32],
 }
 
+/// The cell's current authority context, exact-matched against a first-seen request.
+///
+/// CR-033 D3 folded the former `authority.rs` slice into this validator: with one boundary, one
+/// budget and one cell, "validate the authority context" and "validate the request" are the same
+/// operation, and keeping them apart only invited them to drift.
+///
+/// `allocation_revision` and `allocation_fence` keep the frozen migration-0007 column names but no
+/// longer describe a cross-cell allocation state machine. They are re-bound to the cell's frozen
+/// budget-configuration revision from WP-121's per-cell `OBJECT-STORE-BUDGET-FROZEN` envelope and
+/// that envelope's monotonic generation. A request pinning anything but the cell's current pair
+/// fails closed. This is one pin, not a state machine: there is no ACTIVE state and no expiry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpectedRequestAuthority {
     pub protocol_revision: String,
@@ -100,6 +116,13 @@ pub struct ExpectedRequestAuthority {
     pub allocation_fence: u64,
 }
 
+/// Cell-admission identity, retained only for a caller that still supplies one.
+///
+/// The cell authority supplies neither field (CR-033 D3): admission existed so a cell could be
+/// admitted to or evicted from a global allocation set, and there is no global set. Migration
+/// 0007's columns stay nullable under
+/// `CHECK (num_nonnulls(cell_admission_id, cell_admission_fence) IN (0, 2))`, so both-absent is a
+/// legal retained state and needs no migration edit. A half-supplied pair is still rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpectedCellAdmission {
     pub cell_admission_id: String,
@@ -109,7 +132,9 @@ pub struct ExpectedCellAdmission {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FirstSeenPrerequisites<'a> {
     pub expected_authority: &'a ExpectedRequestAuthority,
-    pub expected_cell_admission: &'a ExpectedCellAdmission,
+    /// `None` is the cell authority's own shape: it supplies no admission identity, so the
+    /// request must carry none either.
+    pub expected_cell_admission: Option<&'a ExpectedCellAdmission>,
     pub reservation_requirements: &'a [ReservationRequirement],
     pub put_spool: Option<&'a DurablePutSpoolExpectation>,
     pub database_now_unix_ms: i64,
@@ -257,11 +282,22 @@ pub fn fingerprint_object_store_request(
         &request.allocation_revision,
         limits.identity.max_identity_bytes,
     )?;
-    validate_canonical_text(
-        &request.cell_admission_id,
-        limits.identity.max_identity_bytes,
-    )?;
-    if request.allocation_fence == 0 || request.cell_admission_fence == 0 {
+    // Cell admission is all-or-none, mirroring migration 0007's
+    // CHECK (num_nonnulls(cell_admission_id, cell_admission_fence) IN (0, 2)). The cell authority
+    // supplies neither (CR-033 D3), so the absent form is a legal retained state; a half-supplied
+    // pair is not. Both forms fingerprint distinctly because the preimage writes both fields.
+    match (
+        request.cell_admission_id.is_empty(),
+        request.cell_admission_fence,
+    ) {
+        (true, 0) => {}
+        (false, fence) if fence > 0 => validate_canonical_text(
+            &request.cell_admission_id,
+            limits.identity.max_identity_bytes,
+        )?,
+        _ => return Err(RequestContractError::AuthorityMismatch),
+    }
+    if request.allocation_fence == 0 {
         return Err(RequestContractError::AuthorityMismatch);
     }
     let logical_timestamp = parse_canonical_uuid_v7_timestamp(&request.logical_request_id)?;
@@ -483,6 +519,19 @@ fn validate_authenticated_consumer(
     Ok(())
 }
 
+/// A revision string carried by the cell's authority context.
+///
+/// Folded verbatim from the removed `authority.rs` (CR-033 D3). `validate_canonical_text` bounds
+/// length and pins NFC but permits control characters, and its bound is caller-supplied; an
+/// authority revision additionally rejects control characters and is pinned to
+/// `MAX_CANONICAL_ID_BYTES` regardless of the caller's limit.
+fn validate_authority_revision(value: &str) -> Result<(), RequestContractError> {
+    if value.len() > MAX_CANONICAL_ID_BYTES || value.chars().any(char::is_control) {
+        return Err(RequestContractError::InvalidCanonicalText);
+    }
+    Ok(())
+}
+
 fn validate_expected_authority(
     request: &ObjectStoreRequestV1,
     expected: &ExpectedRequestAuthority,
@@ -497,6 +546,27 @@ fn validate_expected_authority(
         &expected.allocation_revision,
     ] {
         validate_canonical_text(value, limits.max_identity_bytes)?;
+    }
+    // The revision and identity checks the removed `authority.rs` applied to the same fields.
+    for revision in [
+        &expected.protocol_revision,
+        &expected.policy_revision,
+        &expected.allocation_revision,
+        &request.protocol_revision,
+        &request.policy_revision,
+        &request.allocation_revision,
+    ] {
+        validate_authority_revision(revision)?;
+    }
+    for id in [
+        &expected.provider_boundary_id,
+        &expected.authenticated_cell_id,
+        &expected.authenticated_tenant_id,
+        &request.provider_boundary_id,
+        &request.authenticated_cell_id,
+        &request.authenticated_tenant_id,
+    ] {
+        validate_canonical_id(id).map_err(|_| RequestContractError::InvalidCanonicalText)?;
     }
     if expected.allocation_fence == 0
         || request.protocol_revision != expected.protocol_revision
@@ -514,10 +584,19 @@ fn validate_expected_authority(
 
 fn validate_expected_admission(
     request: &ObjectStoreRequestV1,
-    expected: &ExpectedCellAdmission,
+    expected: Option<&ExpectedCellAdmission>,
     limits: &RequestIdentityLimits,
 ) -> Result<(), RequestContractError> {
+    let Some(expected) = expected else {
+        // The cell authority holds no admission identity, so the request must carry none.
+        if !request.cell_admission_id.is_empty() || request.cell_admission_fence != 0 {
+            return Err(RequestContractError::CellAdmissionMismatch);
+        }
+        return Ok(());
+    };
     validate_canonical_text(&expected.cell_admission_id, limits.max_identity_bytes)?;
+    validate_canonical_id(&expected.cell_admission_id)
+        .map_err(|_| RequestContractError::InvalidCanonicalText)?;
     if expected.cell_admission_fence == 0
         || request.cell_admission_id != expected.cell_admission_id
         || request.cell_admission_fence != expected.cell_admission_fence

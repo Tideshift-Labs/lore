@@ -1,14 +1,20 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Closed-cardinality metrics for the source-dark service surface.
+//! Closed-cardinality metrics for the in-process cell dispatch authority.
+//!
+//! Every label value comes from a closed enum defined here. Nothing request-derived — an identity,
+//! a bucket, a key, a caller string — may become a label, because a label whose domain the caller
+//! controls is an unbounded time-series axis. CR-033 D1 re-bases the closed enum on the authority's
+//! operations rather than the generated gRPC handler set the removed service shell used.
 
 use lore_telemetry::InstrumentProvider;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 
+/// The closed set of operations the cell dispatch authority admits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DispatchRpc {
+pub enum DispatchOperation {
     ReservePut,
     UploadPut,
     Submit,
@@ -18,7 +24,7 @@ pub enum DispatchRpc {
     DiscardResult,
 }
 
-impl DispatchRpc {
+impl DispatchOperation {
     pub const ALL: [Self; 7] = [
         Self::ReservePut,
         Self::UploadPut,
@@ -43,7 +49,7 @@ impl DispatchRpc {
 }
 
 pub trait DispatchMetricRecorder: Send + Sync + 'static {
-    fn record_source_dark_rejection(&self, rpc: DispatchRpc);
+    fn record_source_dark_rejection(&self, operation: DispatchOperation);
 }
 
 struct DispatchInstrumentProvider;
@@ -56,13 +62,13 @@ impl InstrumentProvider for DispatchInstrumentProvider {
 
 #[derive(Clone)]
 pub struct DispatchMetrics {
-    rpc_rejections: Counter<u64>,
+    operation_rejections: Counter<u64>,
 }
 
 impl DispatchMetrics {
     pub fn new() -> Self {
         Self {
-            rpc_rejections: DispatchInstrumentProvider.counter("rpc_rejections"),
+            operation_rejections: DispatchInstrumentProvider.counter("operation_rejections"),
         }
     }
 }
@@ -74,12 +80,11 @@ impl Default for DispatchMetrics {
 }
 
 impl DispatchMetricRecorder for DispatchMetrics {
-    fn record_source_dark_rejection(&self, rpc: DispatchRpc) {
-        self.rpc_rejections.add(
+    fn record_source_dark_rejection(&self, operation: DispatchOperation) {
+        self.operation_rejections.add(
             1,
             &[
-                KeyValue::new("rpc.method", rpc.metric_label()),
-                KeyValue::new("rpc.grpc.status_code", "Unavailable"),
+                KeyValue::new("operation", operation.metric_label()),
                 KeyValue::new("outcome", "source_dark"),
             ],
         );

@@ -1012,7 +1012,7 @@ fn first_seen_prerequisites_classify_uuid_time_before_current_authority() {
     };
     let prerequisites = FirstSeenPrerequisites {
         expected_authority: &wrong_authority,
-        expected_cell_admission: &wrong_admission,
+        expected_cell_admission: Some(&wrong_admission),
         reservation_requirements: &wrong_requirements,
         put_spool: Some(&impossible_spool),
         database_now_unix_ms: NOW,
@@ -1043,7 +1043,7 @@ fn first_seen_prerequisites_accept_exact_authority_reservations_deadline_and_spo
     };
     let prerequisites = FirstSeenPrerequisites {
         expected_authority: &authority,
-        expected_cell_admission: &admission,
+        expected_cell_admission: Some(&admission),
         reservation_requirements: &requirements,
         put_spool: Some(&spool),
         database_now_unix_ms: 1_724_999_999_000,
@@ -1059,6 +1059,86 @@ fn first_seen_prerequisites_accept_exact_authority_reservations_deadline_and_spo
 }
 
 #[test]
+fn fingerprint_object_store_request_enforces_admission_all_or_none() {
+    // CR-033 D3: the cell authority supplies neither `cell_admission_id` nor
+    // `cell_admission_fence`, so both-absent is a legal retained state (migration 0007's
+    // `CHECK (num_nonnulls(cell_admission_id, cell_admission_fence) IN (0, 2))`), but a
+    // half-supplied pair is not.
+    let mut absent = base_request(head_bucket());
+    absent.cell_admission_id = String::new();
+    absent.cell_admission_fence = 0;
+    assert!(
+        fingerprint_object_store_request(&absent, &identity(), &limits()).is_ok(),
+        "both-absent admission must fingerprint"
+    );
+
+    let present = base_request(head_bucket());
+    assert!(
+        fingerprint_object_store_request(&present, &identity(), &limits()).is_ok(),
+        "fully-supplied admission must still fingerprint"
+    );
+
+    let mut id_only = base_request(head_bucket());
+    id_only.cell_admission_fence = 0;
+    assert_eq!(
+        fingerprint_object_store_request(&id_only, &identity(), &limits()),
+        Err(RequestContractError::AuthorityMismatch)
+    );
+
+    let mut fence_only = base_request(head_bucket());
+    fence_only.cell_admission_id = String::new();
+    assert_eq!(
+        fingerprint_object_store_request(&fence_only, &identity(), &limits()),
+        Err(RequestContractError::AuthorityMismatch)
+    );
+}
+
+#[test]
+fn first_seen_prerequisites_accept_absent_cell_admission_and_reject_a_half_supplied_pair() {
+    let mut absent = base_request(head_bucket());
+    absent.cell_admission_id = String::new();
+    absent.cell_admission_fence = 0;
+    let computed = fingerprint(&absent);
+    absent.canonical_fingerprint = computed.canonical_fingerprint().to_vec().into();
+    let validated = fingerprint(&absent);
+    let authority = expected_authority();
+    let requirements = requirements();
+    let prerequisites = FirstSeenPrerequisites {
+        expected_authority: &authority,
+        expected_cell_admission: None,
+        reservation_requirements: &requirements,
+        put_spool: None,
+        database_now_unix_ms: 1_724_999_999_000,
+        max_request_deadline_horizon_ms: 2_000,
+        cell_allocation_hard_expiry_unix_ms: 1_725_000_001_000,
+        dispatch_authority_hard_expiry_unix_ms: 1_725_000_001_000,
+    };
+
+    assert!(matches!(
+        validate_first_seen_prerequisites(&absent, &validated, &prerequisites, &limits()),
+        Ok(FirstSeenIdentityDecision::Admit { .. })
+    ));
+
+    let mut supplied = base_request(head_bucket());
+    let supplied_computed = fingerprint(&supplied);
+    supplied.canonical_fingerprint = supplied_computed.canonical_fingerprint().to_vec().into();
+    let supplied_validated = fingerprint(&supplied);
+    let supplied_prerequisites = FirstSeenPrerequisites {
+        expected_cell_admission: None,
+        ..prerequisites
+    };
+    assert_eq!(
+        validate_first_seen_prerequisites(
+            &supplied,
+            &supplied_validated,
+            &supplied_prerequisites,
+            &limits()
+        ),
+        Err(RequestContractError::CellAdmissionMismatch)
+    );
+}
+
+#[test]
 fn first_seen_deadline_rejects_equality_with_database_time() {
     let database_now_unix_ms = 1_714_733_360_214;
     let mut request = base_request(head_bucket());
@@ -1070,7 +1150,7 @@ fn first_seen_deadline_rejects_equality_with_database_time() {
     let requirements = requirements();
     let prerequisites = FirstSeenPrerequisites {
         expected_authority: &authority,
-        expected_cell_admission: &admission,
+        expected_cell_admission: Some(&admission),
         reservation_requirements: &requirements,
         put_spool: None,
         database_now_unix_ms,
@@ -1101,7 +1181,7 @@ fn first_seen_deadline_rejects_checked_horizon_addition_overflow() {
     let requirements = requirements();
     let prerequisites = FirstSeenPrerequisites {
         expected_authority: &authority,
-        expected_cell_admission: &admission,
+        expected_cell_admission: Some(&admission),
         reservation_requirements: &requirements,
         put_spool: None,
         database_now_unix_ms,
@@ -1137,7 +1217,7 @@ fn first_seen_prerequisites_reject_authority_reservation_deadline_and_spool_mism
     };
     let base = FirstSeenPrerequisites {
         expected_authority: &authority,
-        expected_cell_admission: &admission,
+        expected_cell_admission: Some(&admission),
         reservation_requirements: &requirements,
         put_spool: Some(&bad_spool),
         database_now_unix_ms: 1_724_999_999_000,
@@ -1203,21 +1283,17 @@ fn first_seen_prerequisites_reject_authority_reservation_deadline_and_spool_mism
 #[test]
 fn request_fingerprint_primitives_remain_effect_free_and_unwired() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let service_source = std::fs::read_to_string(manifest.join("src/service.rs"))
-        .expect("source-dark service source must be readable");
+    // CR-033 D1/D6/P2 removed the separate-process service shell entirely; assert that
+    // structurally instead of grepping a deleted `src/service.rs` for the wiring it never had.
+    for removed in ["src/service.rs", "src/server.rs", "src/main.rs"] {
+        assert!(
+            !manifest.join(removed).exists(),
+            "process-composition surface must stay removed: {removed}"
+        );
+    }
     let request_source = std::fs::read_to_string(manifest.join("src/request.rs"))
         .expect("request primitive source must be readable");
 
-    for forbidden in [
-        "crate::request",
-        "fingerprint_object_store_request",
-        "validate_first_seen_prerequisites",
-    ] {
-        assert!(
-            !service_source.contains(forbidden),
-            "source-dark service must not wire request primitive {forbidden}"
-        );
-    }
     for forbidden in [
         "tokio_postgres",
         "std::fs",

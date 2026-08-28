@@ -927,11 +927,16 @@ fn diagnostics_and_source_contract_redact_and_remain_effect_free() {
     assert!(diagnostic.contains("[REDACTED]"));
 
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let service = std::fs::read_to_string(manifest.join("src/service.rs"))
-        .expect("source-dark service source");
+    // CR-033 D1/D6/P2 removed the separate-process service shell entirely; assert that
+    // structurally instead of grepping a deleted `src/service.rs` for the wiring it never had.
+    for removed in ["src/service.rs", "src/server.rs", "src/main.rs"] {
+        assert!(
+            !manifest.join(removed).exists(),
+            "process-composition surface must stay removed: {removed}"
+        );
+    }
     let source = std::fs::read_to_string(manifest.join("src/reserve_put_ack.rs"))
         .expect("ReservePut ACK source");
-    assert!(!service.contains("validate_and_encode_object_store_reserve_put_ack"));
     for forbidden in [
         "tokio_postgres",
         "std::fs",

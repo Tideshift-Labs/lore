@@ -383,21 +383,17 @@ fn reserve_put_evidence_diagnostics_redact_record_digests() {
 #[test]
 fn reserve_put_contract_remains_abstract_effect_free_and_unwired() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let service = std::fs::read_to_string(manifest.join("src/service.rs"))
-        .expect("source-dark service source must be readable");
+    // CR-033 D1/D6/P2 removed the separate-process service shell entirely; assert that
+    // structurally instead of grepping a deleted `src/service.rs` for the wiring it never had.
+    for removed in ["src/service.rs", "src/server.rs", "src/main.rs"] {
+        assert!(
+            !manifest.join(removed).exists(),
+            "process-composition surface must stay removed: {removed}"
+        );
+    }
     let source = std::fs::read_to_string(manifest.join("src/reserve_put.rs"))
         .expect("ReservePut source must be readable");
 
-    for forbidden in [
-        "crate::reserve_put",
-        "calculate_reserve_put_admission",
-        "validate_reserve_put_state_snapshot",
-    ] {
-        assert!(
-            !service.contains(forbidden),
-            "source-dark service must not wire ReservePut primitive {forbidden}"
-        );
-    }
     for forbidden in [
         "tokio_postgres",
         "std::fs",
