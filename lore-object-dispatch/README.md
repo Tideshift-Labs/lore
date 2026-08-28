@@ -133,6 +133,15 @@ prefix is already fsynced. It does not prove filesystem bytes/fsync, accept the 
 payloads, call the service, authorize object-provider traffic, deploy, publish readiness, or name a
 handoff.
 
+`local_authority_put_spool_ready_codec::LOCAL_AUTHORITY_PUT_SPOOL_READY_CODEC_MIGRATION_V1` embeds
+the exact 17,033-byte source-dark canonical PUT SPOOL_READY snapshot codec. Its BLAKE3-256 is
+`180fed6b34db413c761e7dcd1e5250119aca5c50116977e8de54ca131408cf8c`. State 2 requires exact
+ReservePut ACK authentication and emits the canonical SPOOL_READY row without changing quota,
+including for zero-byte PUTs. Lifecycle-v1 projection remains byte-for-byte compatible;
+lifecycle-v2 permits only exact SPOOL_READY replay. The owner-only artifact does not perform the
+transition, write/fsync/rename filesystem data, call the service, authorize object-provider
+traffic, deploy, publish readiness, or name a handoff.
+
 ## Private protocol
 
 The exact private `lore.object_dispatch.v1.ObjectStoreDispatchService` contract lives in
@@ -210,6 +219,7 @@ LORE_TEST_LOCAL_PUT_RESERVATION_RECORD_CODEC_PG_URL=postgresql://... cargo test 
 LORE_TEST_LOCAL_RESERVE_PUT_MUTATION_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_reserve_put_mutation -- --ignored --exact live_postgres_reserve_put_is_atomic_exact_and_replay_safe
 LORE_TEST_LOCAL_PUT_UPLOAD_PROGRESS_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_upload_progress_codec -- --ignored --exact live_postgres_progress_codec_is_exact_and_replay_safe
 LORE_TEST_LOCAL_PUT_UPLOAD_PROGRESS_MUTATION_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_upload_progress_mutation -- --ignored --exact live_postgres_progress_mutation_is_atomic_and_replay_safe
+LORE_TEST_LOCAL_PUT_SPOOL_READY_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_spool_ready_codec -- --ignored --exact live_postgres_ready_codec_is_exact_fail_closed_and_replay_safe
 ```
 
 The library suite validates service and continuity configuration, mutual TLS, URI-SAN registration,
