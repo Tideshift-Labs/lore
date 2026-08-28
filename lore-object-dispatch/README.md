@@ -88,6 +88,15 @@ and migrator/maintenance readback use the replacement versioned surface; superse
 lose service-role execution. Runtime code neither installs nor calls it, and it adds no mutation,
 provider traffic, deployment, readiness, or named handoff.
 
+`local_authority_put_reservation_record_codec::LOCAL_AUTHORITY_PUT_RESERVATION_RECORD_CODEC_MIGRATION_V1`
+embeds the exact 10,874-byte source-dark canonical PUT-reservation lifecycle-record codec. Its
+BLAKE3-256 is `b37116d9d87e49ad5c0051514e721a80d0c39f1c9dcaa51c19f7a77618ee6514`.
+The owner-only codec constructs the initial `UNBOUND`/`PUT`/`RESERVED`/`RETAINED` record at revision
+1 from database time, the exact minimum expiry, and a recomputed RESERVED ACK. Partial accounting
+starts at zero; rows and concurrency start at one, including for a zero-byte PUT. This record is
+distinct from the ACK. Hard input and record-size caps fail closed. The artifact adds no mutation
+procedure, runtime call, provider traffic, deployment, readiness, or named handoff.
+
 ## Private protocol
 
 The exact private `lore.object_dispatch.v1.ObjectStoreDispatchService` contract lives in
@@ -161,6 +170,7 @@ cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact l
 LORE_TEST_LOCAL_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_canonical_codec -- --ignored --exact live_postgres_reserved_and_spool_ready_bytes_match_independent_rust_vectors
 LORE_TEST_LOCAL_PUT_RESERVATION_SCHEMA_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_schema -- --ignored --exact live_postgres_enforces_put_result_shape_time_ack_and_service_acl
 LORE_TEST_LOCAL_PUT_RESERVATION_PROVISIONING_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_provisioning -- --ignored --exact live_postgres_chain_install_replay_read_and_drift_fail_closed
+LORE_TEST_LOCAL_PUT_RESERVATION_RECORD_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_record_codec -- --ignored --exact live_postgres_row_bytes_match_independent_vector_and_invalid_inputs_fail
 ```
 
 The library suite validates service and continuity configuration, mutual TLS, URI-SAN registration,
