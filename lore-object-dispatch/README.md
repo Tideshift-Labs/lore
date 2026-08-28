@@ -70,6 +70,14 @@ this surface; direct table and column authority remains owner-only.
 canonical records; missing, NULL, or non-32-byte `public.blake3(bytea)` results fail closed. The
 artifact creates no tables, mutation procedure, provider implementation, runtime call, or grant.
 
+`local_authority_put_reservation_schema::LOCAL_AUTHORITY_PUT_RESERVATION_SCHEMA_MIGRATION_V1`
+embeds the exact 4,690-byte source-dark PUT-reservation schema migration. Its BLAKE3-256 is
+`56b6b891f6fa44875494a9d644b1a8ad66f1f87be5f886efeb324da05cb2ae67`. It adds 12 distinct,
+all-or-none pre-Submit reservation and current-ACK fields to the spool table, including the exact
+overflow-safe minimum expiry and canonical ACK suffix. The authenticated lookup index and table
+authority remain owner-only. The artifact adds no function, mutation path, runtime call, provider,
+or grant; provisioning/readback must attest the extended catalog before readiness.
+
 ## Private protocol
 
 The exact private `lore.object_dispatch.v1.ObjectStoreDispatchService` contract lives in
@@ -141,6 +149,7 @@ cargo test -p lore-object-dispatch --test continuity_live -- --ignored --test-th
 cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_allocates_dedicated_drained_epoch_one_to_two
 cargo test -p lore-object-dispatch --test continuity_live -- --ignored --exact live_mtls_reconciler_archives_one_admin_seeded_retention_eligible_detail
 LORE_TEST_LOCAL_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_canonical_codec -- --ignored --exact live_postgres_reserved_and_spool_ready_bytes_match_independent_rust_vectors
+LORE_TEST_LOCAL_PUT_RESERVATION_SCHEMA_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_reservation_schema -- --ignored --exact live_postgres_enforces_put_result_shape_time_ack_and_service_acl
 ```
 
 The library suite validates service and continuity configuration, mutual TLS, URI-SAN registration,
