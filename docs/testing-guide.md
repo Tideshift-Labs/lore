@@ -166,6 +166,12 @@ will update an older check constraint or state schema.
   durable cancellation/supersession preimage. Exercise closed raw enums, successor tuple shapes,
   checkpoint ordering, exact context/result binding, byte-handle presence, inclusive bounds, and
   receipt purge ordering with `cargo test -p lore-object-dispatch --test result_discard -j 4`.
+  Result-disposition replay tests must supply deliberately invalid later clock, retention, payload,
+  and fetch-lease projections. Symptom: an exact retry fails after policy or cleanup state drifts.
+  Cause: replay was evaluated after mutable first-seen authority. What to do: require the stored
+  same-kind fingerprint and receipt to win first, then separately pin both ACK/discard race orders,
+  discard fence/drain planning, and disposed-before-discarded fetch classification with
+  `cargo test -p lore-object-dispatch --test result_disposition -j 4`.
   Continuity quota ownership is a separate pure canonical record. Pin the independent 170-byte
   `object-store-continuity-quota-ownership-v1` preimage, 32-byte digest, complete 202-byte record,
   exact global scope, nonempty quota tuple, every text/size bound, detached value, and redacted
