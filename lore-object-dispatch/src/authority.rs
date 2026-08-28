@@ -10,7 +10,7 @@ use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::AuthenticatedCaller;
-use crate::auth::validate_id;
+use crate::contract::validate_canonical_id;
 
 const MAX_REVISION_BYTES: usize = 256;
 
@@ -153,7 +153,7 @@ fn validate_inputs(
         &current_admission.tenant_id,
         &current_admission.cell_admission_id,
     ] {
-        validate_id(id).map_err(|_| AuthorityValidationError::InvalidCanonicalInput)?;
+        validate_canonical_id(id).map_err(|_| AuthorityValidationError::InvalidCanonicalInput)?;
     }
     for revision in [
         &submitted.protocol_revision,

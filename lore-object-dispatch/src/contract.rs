@@ -5,12 +5,32 @@
 
 use unicode_normalization::UnicodeNormalization;
 
+/// Maximum byte length of a canonical identifier accepted anywhere in this crate.
+pub(crate) const MAX_CANONICAL_ID_BYTES: usize = 256;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CanonicalPrimitiveError {
     InvalidText,
+    InvalidId,
     InvalidUuidV7,
     InvalidMaximum,
     TooLarge,
+}
+
+/// Validates a canonical identifier: nonempty, bounded, ASCII alphanumeric first byte, and only
+/// ASCII alphanumeric or `.`, `_`, `:`, `/`, `-` thereafter.
+pub(crate) fn validate_canonical_id(value: &str) -> Result<(), CanonicalPrimitiveError> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_CANONICAL_ID_BYTES
+        || !bytes[0].is_ascii_alphanumeric()
+        || !bytes.iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'/' | b'-')
+        })
+    {
+        return Err(CanonicalPrimitiveError::InvalidId);
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_canonical_text(

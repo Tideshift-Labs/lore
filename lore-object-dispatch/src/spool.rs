@@ -14,8 +14,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::auth::validate_id;
 use crate::contract::decode_canonical_uuid_v7;
+use crate::contract::validate_canonical_id;
 
 pub const SPOOL_LAYOUT_REVISION_V1: &str = "object-store-spool-layout-v1";
 const BOUNDARY_TOKEN_PREFIX: &str = "odsb_";
@@ -105,7 +105,8 @@ impl SpoolLayout {
         &self,
         provider_boundary_id: &str,
     ) -> Result<SpoolBoundaryBinding, SpoolLayoutError> {
-        validate_id(provider_boundary_id).map_err(|_| SpoolLayoutError::InvalidBoundaryId)?;
+        validate_canonical_id(provider_boundary_id)
+            .map_err(|_| SpoolLayoutError::InvalidBoundaryId)?;
         let (boundary_blake3, boundary_token) = derive_boundary_token(provider_boundary_id);
         Ok(SpoolBoundaryBinding {
             provider_boundary_id: provider_boundary_id.to_string(),
@@ -209,7 +210,8 @@ pub fn validate_spool_boundary_binding(
     stored_boundary_blake3: &[u8; 32],
     stored_boundary_token: &str,
 ) -> Result<SpoolBoundaryBinding, SpoolLayoutError> {
-    validate_id(expected_provider_boundary_id).map_err(|_| SpoolLayoutError::InvalidBoundaryId)?;
+    validate_canonical_id(expected_provider_boundary_id)
+        .map_err(|_| SpoolLayoutError::InvalidBoundaryId)?;
     let (expected_digest, expected_token) = derive_boundary_token(expected_provider_boundary_id);
     if stored_provider_boundary_id != expected_provider_boundary_id
         || stored_boundary_blake3 != &expected_digest

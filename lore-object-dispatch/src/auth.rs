@@ -17,7 +17,8 @@ use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::FromDer;
 use x509_parser::prelude::X509Certificate;
 
-const MAX_ID_BYTES: usize = 256;
+use crate::contract::validate_canonical_id;
+
 const MAX_URI_SAN_BYTES: usize = 2048;
 const MAX_ALLOWED_CELLS: usize = 4096;
 pub const UNAUTHENTICATED_CALLER_MESSAGE: &str = "object-store dispatch caller is not authorized";
@@ -211,18 +212,8 @@ fn validate_uri_san(value: &str) -> Result<(), CallerRegistryError> {
     Ok(())
 }
 
-pub(crate) fn validate_id(value: &str) -> Result<(), CallerRegistryError> {
-    let bytes = value.as_bytes();
-    if bytes.is_empty()
-        || bytes.len() > MAX_ID_BYTES
-        || !bytes[0].is_ascii_alphanumeric()
-        || !bytes.iter().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'/' | b'-')
-        })
-    {
-        return Err(CallerRegistryError::InvalidId);
-    }
-    Ok(())
+fn validate_id(value: &str) -> Result<(), CallerRegistryError> {
+    validate_canonical_id(value).map_err(|_| CallerRegistryError::InvalidId)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
