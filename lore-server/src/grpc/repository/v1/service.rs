@@ -201,6 +201,7 @@ impl RepositoryService for LoreRepositoryV1Service {
                 repository_authorizer(self.auth_url()),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.domain_context.as_ref(),
             ),
         )
         .await

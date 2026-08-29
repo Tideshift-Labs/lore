@@ -179,6 +179,7 @@ impl RepositoryService for LoreRepositoryService {
                 ),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.domain_context.as_ref(),
             ),
         )
         .await

@@ -20,8 +20,13 @@ use tonic::Response;
 use tonic::Status;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::domain::DomainContext;
+use crate::domain::GovernedScope;
+use crate::domain::admit_at_entry;
+use crate::domain::reject_unwired_governed_operation;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization_optional;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::no_repository_access_status;
@@ -45,11 +50,32 @@ pub async fn handler(
     authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<RepositoryMetadataSetResponse>, Status> {
+    // Captured before `into_inner` consumes the request: the domain-operation
+    // headers and the verified principal both live outside the message body.
+    let request_metadata = request.metadata().clone();
+    let request_authorization = get_authorization_optional(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
+
+    // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
+    // at handler entry, before any handler logic or authorization side effect.
+    if let Some(admitted) = admit_at_entry(
+        domain_context,
+        &request_metadata,
+        request_authorization.as_ref(),
+        GovernedScope::TargetRepository {
+            repository_id: &req.id,
+        },
+    )? {
+        return Err(reject_unwired_governed_operation(
+            &admitted,
+            "lore.repository.v1.RepositoryService/RepositoryMetadataSet",
+        ));
+    }
 
     let repository_id: Context = req.id.into();
     if repository_id == Context::default() {
@@ -197,9 +223,19 @@ mod tests {
         use lore_base::types::RepositoryId;
         use lore_revision::repository::RepositoryMetadata;
         use tonic::Code;
+        use tonic::metadata::BinaryMetadataValue;
+        use uuid::Uuid;
 
         use super::super::*;
+        use crate::auth::jwt::AuthorizationToken;
         use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+        use crate::domain::test_support::context as build_domain_context;
+        use crate::grpc::domain_operation_metadata::FINGERPRINT_KEY;
+        use crate::grpc::domain_operation_metadata::FINGERPRINT_V1_LEN;
+        use crate::grpc::domain_operation_metadata::FINGERPRINT_VERSION_V1;
+        use crate::grpc::domain_operation_metadata::OPERATION_ID_KEY;
+        use crate::grpc::domain_operation_metadata::PREPARE_TOKEN_KEY;
+        use crate::grpc::domain_operation_metadata::PREPARE_TOKEN_LEN;
         use crate::store::test_store_create;
 
         mockall::mock! {
@@ -216,6 +252,122 @@ mod tests {
         }
 
         const REPOSITORY_ID: [u8; 16] = [1u8; 16];
+
+        /// Attach a well-formed set of the three CR-029 domain-operation
+        /// headers, so `admit_at_entry` sees carriage rather than the legacy
+        /// absence carve-out. Exact header contents don't matter here: this
+        /// handler-level pin only needs the no-coordinator path
+        /// (`admit_at_entry(None, ..)`), which decides before ever inspecting
+        /// the token or scope.
+        fn insert_valid_domain_operation_headers<T>(request: &mut Request<T>) {
+            let metadata = request.metadata_mut();
+            metadata.insert_bin(
+                OPERATION_ID_KEY,
+                BinaryMetadataValue::from_bytes(Uuid::now_v7().as_bytes()),
+            );
+            let mut fingerprint = vec![FINGERPRINT_VERSION_V1];
+            fingerprint.extend(std::iter::repeat_n(0xAB, FINGERPRINT_V1_LEN));
+            metadata.insert_bin(
+                FINGERPRINT_KEY,
+                BinaryMetadataValue::from_bytes(&fingerprint),
+            );
+            metadata.insert_bin(
+                PREPARE_TOKEN_KEY,
+                BinaryMetadataValue::from_bytes(&[0xCDu8; PREPARE_TOKEN_LEN]),
+            );
+        }
+
+        /// Panics on every method. Used as the mutable store for the
+        /// admission-short-circuit test below: any call at all is proof the
+        /// gate did not run before the handler body, so the panic message
+        /// names the property under test rather than a generic "not
+        /// implemented".
+        struct PanicOnAnyCallMutableStore;
+
+        #[async_trait::async_trait]
+        impl lore_storage::MutableStore for PanicOnAnyCallMutableStore {
+            async fn load(
+                self: Arc<Self>,
+                _partition: lore_storage::Partition,
+                _key: lore_base::types::Hash,
+                _key_type: KeyType,
+            ) -> Result<lore_base::types::Hash, lore_storage::StoreError> {
+                panic!("admission must short-circuit before any mutable-store access")
+            }
+
+            async fn store(
+                self: Arc<Self>,
+                _partition: lore_storage::Partition,
+                _key: lore_base::types::Hash,
+                _value: lore_base::types::Hash,
+                _key_type: KeyType,
+            ) -> Result<(), lore_storage::StoreError> {
+                panic!("admission must short-circuit before any mutable-store access")
+            }
+
+            async fn compare_and_swap(
+                self: Arc<Self>,
+                _partition: lore_storage::Partition,
+                _key: lore_base::types::Hash,
+                _expected: lore_base::types::Hash,
+                _value: lore_base::types::Hash,
+                _key_type: KeyType,
+            ) -> Result<lore_base::types::Hash, lore_storage::StoreError> {
+                panic!("admission must short-circuit before any mutable-store access")
+            }
+
+            async fn list(
+                self: Arc<Self>,
+                _partition: lore_storage::Partition,
+                _key_type: KeyType,
+            ) -> Result<lore_storage::KeyValueStream, lore_storage::StoreError> {
+                panic!("admission must short-circuit before any mutable-store access")
+            }
+
+            async fn flush(
+                self: Arc<Self>,
+                _sync_data: bool,
+            ) -> Result<(), lore_storage::StoreError> {
+                panic!("admission must short-circuit before any mutable-store access")
+            }
+        }
+
+        // CR-029 item 7: every other test in this file passes `None` for the
+        // coordinator, so `reject_unwired_governed_operation` is never
+        // reached — the only client-visible behaviour change in the whole
+        // handler-wiring commit had zero coverage. With a real coordinator
+        // present and valid carriage plus a verified principal, admission
+        // must short-circuit before the handler body runs at all:
+        // `Code::Unimplemented`, and not even one mutable-store call
+        // attempted (a real call would panic this test).
+        #[tokio::test]
+        async fn valid_carriage_with_a_coordinator_present_is_refused_as_unimplemented_before_any_store_access()
+         {
+            let (immutable, _, _) = test_store_create().await.unwrap();
+            let domain_context = Arc::new(build_domain_context(false));
+
+            let mut request = Request::new(RepositoryMetadataSetRequest {
+                id: REPOSITORY_ID.to_vec().into(),
+                expected: vec![0u8; 32].into(),
+                updated: vec![1u8; 32].into(),
+            });
+            insert_valid_domain_operation_headers(&mut request);
+            request
+                .extensions_mut()
+                .insert(AuthorizationToken::default());
+
+            let err = handler(
+                request,
+                Arc::new(AllowAllRepositoryAuthorizer),
+                immutable,
+                Arc::new(PanicOnAnyCallMutableStore),
+                Some(&domain_context),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.code(), Code::Unimplemented);
+        }
 
         /// Writes a valid metadata blob to the immutable store and returns its
         /// hash. `metadata_set` can then use that hash as `updated`.
@@ -239,6 +391,31 @@ mod tests {
             .unwrap()
         }
 
+        // CR-029 R-BLOCK-2: a caller that supplies domain-operation carriage
+        // against a cell with no coordinator must be refused, never silently
+        // ignored. `.times(0)` on the authorizer is the proof of "refused"
+        // over "ignored": the gate must decide before any authorization side
+        // effect.
+        #[tokio::test]
+        async fn carriage_with_no_domain_context_is_refused_before_any_authorization_side_effect() {
+            let (immutable, mutable, _) = test_store_create().await.unwrap();
+            let mut mock = MockAuthorizer::new();
+            mock.expect_check_repository_access().times(0);
+
+            let mut request = Request::new(RepositoryMetadataSetRequest {
+                id: REPOSITORY_ID.to_vec().into(),
+                expected: vec![0u8; 32].into(),
+                updated: vec![1u8; 32].into(),
+            });
+            insert_valid_domain_operation_headers(&mut request);
+
+            let err = handler(request, Arc::new(mock), immutable, mutable, None)
+                .await
+                .unwrap_err();
+
+            assert_eq!(err.code(), Code::FailedPrecondition);
+        }
+
         #[tokio::test]
         async fn no_auth_configured_allows_operation() {
             let (immutable, mutable, execution) = test_store_create().await.unwrap();
@@ -255,6 +432,7 @@ mod tests {
                         Arc::new(AllowAllRepositoryAuthorizer),
                         immutable,
                         mutable,
+                        None,
                     )
                     .await
                     .unwrap();
@@ -277,7 +455,7 @@ mod tests {
                 expected: vec![0u8; 32].into(),
                 updated: vec![1u8; 32].into(),
             });
-            let err = handler(request, Arc::new(mock), immutable, mutable)
+            let err = handler(request, Arc::new(mock), immutable, mutable, None)
                 .await
                 .unwrap_err();
             assert_eq!(err.code(), Code::PermissionDenied);
@@ -298,7 +476,7 @@ mod tests {
                         expected: vec![0u8; 32].into(),
                         updated: hash.into(),
                     });
-                    handler(request, Arc::new(mock), immutable, mutable)
+                    handler(request, Arc::new(mock), immutable, mutable, None)
                         .await
                         .unwrap();
                 })
@@ -535,6 +713,7 @@ mod tests {
                 repository_authorizer(Some(auth_url)),
                 immutable.clone(),
                 mutable.clone(),
+                None,
             )
             .await;
 
@@ -579,6 +758,7 @@ mod tests {
                 repository_authorizer(Some(auth_url)),
                 immutable,
                 mutable,
+                None,
             )
             .await
             .expect("a legitimate client CAS-writing its own repository must be unaffected");
@@ -608,6 +788,7 @@ mod tests {
                 repository_authorizer(None),
                 immutable,
                 mutable,
+                None,
             )
             .await
             .expect("auth-off must leave behavior unchanged");
