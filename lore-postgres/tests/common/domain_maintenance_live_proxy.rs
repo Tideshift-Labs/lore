@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 // Adapted from lore-object-dispatch/tests/common/retention_live_proxy.rs.
-// The PostgreSQL frame parsers and COMMIT-response state machine are kept
-// identical; only the TLS/mTLS envelope is omitted for local LORE_TEST_PG_URL.
+// The PostgreSQL frame parsers come from the proven retention proxy. This
+// variant also tolerates earlier pipelined responses between the frontend
+// COMMIT and its exact backend CommandComplete/ReadyForQuery pair.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -143,8 +144,20 @@ async fn serve_connection(
     let (downstream_read, downstream_write) = tokio::io::split(downstream);
     let (upstream_read, upstream_write) = tokio::io::split(upstream);
     let commit_pending = Arc::new(AtomicBool::new(false));
-    let frontend = forward_frontend(downstream_read, upstream_write, Arc::clone(&commit_pending));
-    let backend = forward_backend(upstream_read, downstream_write, commit_pending, faults);
+    let fault_close = CancellationToken::new();
+    let frontend = forward_frontend(
+        downstream_read,
+        upstream_write,
+        Arc::clone(&commit_pending),
+        fault_close.clone(),
+    );
+    let backend = forward_backend(
+        upstream_read,
+        downstream_write,
+        commit_pending,
+        faults,
+        fault_close,
+    );
     let _ = tokio::join!(frontend, backend);
     Ok(())
 }
@@ -153,6 +166,7 @@ async fn forward_frontend<R, W>(
     mut source: R,
     mut destination: W,
     commit_pending: Arc<AtomicBool>,
+    fault_close: CancellationToken,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -161,7 +175,10 @@ where
     let mut buffer = [0u8; 16_384];
     let mut frames = FrontendFrameParser::default();
     loop {
-        let read = source.read(&mut buffer).await?;
+        let read = tokio::select! {
+            () = fault_close.cancelled() => return Ok(()),
+            read = source.read(&mut buffer) => read?,
+        };
         if read == 0 {
             return Ok(());
         }
@@ -178,6 +195,7 @@ async fn forward_backend<R, W>(
     mut destination: W,
     commit_pending: Arc<AtomicBool>,
     faults: ConnectionFaults,
+    fault_close: CancellationToken,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -193,9 +211,24 @@ where
             return Ok(());
         }
         let parsed = frames.push(&buffer[..read])?;
-        if commit_pending.load(Ordering::Acquire)
-            && faults.drop_next_commit_response.load(Ordering::Acquire)
-        {
+        if commit_pending.load(Ordering::Acquire) {
+            let fault_armed = faults.drop_next_commit_response.load(Ordering::Acquire);
+            if !fault_armed {
+                for frame in &parsed {
+                    match commit_response.observe(frame) {
+                        CommitResponseOutcome::Pending => {}
+                        CommitResponseOutcome::Fire | CommitResponseOutcome::Reject => {
+                            commit_pending.store(false, Ordering::Release);
+                            commit_response = CommitResponseTracker::default();
+                            break;
+                        }
+                    }
+                }
+                destination.write_all(&buffer[..read]).await?;
+                destination.flush().await?;
+                continue;
+            }
+
             held_response.extend_from_slice(&buffer[..read]);
             for frame in parsed {
                 match commit_response.observe(&frame) {
@@ -206,6 +239,7 @@ where
                             .store(false, Ordering::Release);
                         faults.commit_fault_fired.store(true, Ordering::Release);
                         faults.commit_fault_notify.notify_waiters();
+                        fault_close.cancel();
                         return Ok(());
                     }
                     CommitResponseOutcome::Reject => {
@@ -335,9 +369,9 @@ impl CommitResponseTracker {
                 *self = Self::AwaitIdleReady;
                 CommitResponseOutcome::Pending
             }
-            Self::AwaitCommandComplete if frame.tag == b'E' || frame.tag == b'Z' => {
-                CommitResponseOutcome::Reject
-            }
+            // tokio-postgres can pipeline earlier extended-query responses
+            // after the frontend simple-query COMMIT is already visible.
+            // Ignore them until the exact C/COMMIT frame starts the boundary.
             Self::AwaitCommandComplete => CommitResponseOutcome::Pending,
             Self::AwaitIdleReady if frame.tag == b'Z' && frame.payload == b"I" => {
                 CommitResponseOutcome::Fire
@@ -380,6 +414,37 @@ mod tests {
         ));
         assert!(matches!(
             tracker.observe(&frames[1]),
+            CommitResponseOutcome::Fire
+        ));
+    }
+
+    #[test]
+    fn pipelined_response_before_exact_commit_does_not_disarm_the_fault() {
+        let mut tracker = CommitResponseTracker::default();
+        for frame in [
+            PgFrame {
+                tag: b'3',
+                payload: Vec::new(),
+            },
+            PgFrame {
+                tag: b'Z',
+                payload: b"T".to_vec(),
+            },
+            PgFrame {
+                tag: b'C',
+                payload: b"COMMIT\0".to_vec(),
+            },
+        ] {
+            assert!(matches!(
+                tracker.observe(&frame),
+                CommitResponseOutcome::Pending
+            ));
+        }
+        assert!(matches!(
+            tracker.observe(&PgFrame {
+                tag: b'Z',
+                payload: b"I".to_vec(),
+            }),
             CommitResponseOutcome::Fire
         ));
     }

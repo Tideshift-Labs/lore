@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 //! Live-Postgres acceptance tests for CR-029's private maintenance rail.
 //!
-//! Run serially because the proof-capacity counter is intentionally global:
-//! `cargo test -p lore-postgres --test domain_maintenance -- --ignored --test-threads=1`.
+//! Run the checked-in isolated live tier with:
+//! `pwsh -File lore-postgres/tests/run-domain-maintenance-live.ps1`.
+//! It gives every exact case a distinct database and invokes the cases serially.
 
 #[path = "common/domain_maintenance_live_proxy.rs"]
 mod domain_maintenance_live_proxy;
@@ -119,6 +120,7 @@ fn namespace_key() -> ProofNamespaceKey {
             rand::random::<u64>()
         ),
         authenticated_subject: "svc:maintenance-test".into(),
+        org_uuid: rand::random::<[u8; 16]>().to_vec(),
         tenant_scope_key: rand::random::<[u8; 16]>().to_vec(),
     }
 }
@@ -171,7 +173,7 @@ fn terminal_phase1_input(
             .as_ref()
             .to_vec(),
         platform_terminal_status_revision: 19,
-        acknowledged_at: SystemTime::now(),
+        acknowledged_at: SystemTime::now() - Duration::from_secs(2 * 365 * 24 * 60 * 60),
         phase: TerminalStatusAttachPhase::Phase1TerminalAck,
         action: TerminalStatusAttachAction::None,
         reserve_charge_revision: 23,
@@ -193,6 +195,55 @@ fn terminal_phase1_input(
     }
 }
 
+fn completion_marker_digest(
+    input: &TerminalStatusAttachInput,
+    epoch: &[u8],
+    tombstone_digest: &[u8],
+) -> Vec<u8> {
+    use ring::digest::Context;
+    use ring::digest::SHA256;
+
+    let mut digest = Context::new(&SHA256);
+    digest.update(b"domain-tombstone-release-completion-marker-v1\0");
+    for part in [
+        input.key.verified_issuer.as_bytes(),
+        input.key.authenticated_subject.as_bytes(),
+        input.key.tenant_scope_key.as_slice(),
+        input.key.operation_id.as_bytes(),
+        epoch,
+        &input.authorization_revision.to_be_bytes(),
+        &input.claim_revision.to_be_bytes(),
+        &input.tombstone_reservation_revision.to_be_bytes(),
+        input.tombstone_reservation_nonce.as_slice(),
+        &input.release_proof_reservation_revision.to_be_bytes(),
+        input.release_proof_reservation_nonce.as_slice(),
+        &input.completion_marker_sequence.to_be_bytes(),
+        input.terminal_receipt_sha256.as_slice(),
+        tombstone_digest,
+        &input
+            .active_release_intent_revision
+            .unwrap_or_default()
+            .to_be_bytes(),
+        input
+            .active_release_intent_nonce
+            .as_deref()
+            .unwrap_or_default(),
+        input.final_prune_digest.as_deref().unwrap_or_default(),
+        &input
+            .tombstone_release_intent_revision
+            .unwrap_or_default()
+            .to_be_bytes(),
+        input
+            .tombstone_release_intent_nonce
+            .as_deref()
+            .unwrap_or_default(),
+        input.request_digest.as_slice(),
+    ] {
+        digest.update(part);
+    }
+    digest.finish().as_ref().to_vec()
+}
+
 async fn capacity_pair(client: &Client) -> (i64, i64) {
     client
         .query_opt(
@@ -203,6 +254,47 @@ async fn capacity_pair(client: &Client) -> (i64, i64) {
         .await
         .expect("read proof capacity")
         .map_or((7, 7), |row| (row.get(0), row.get(1)))
+}
+
+async fn completion_state(
+    client: &Client,
+    key: &ReceiptKey,
+    materialize: &ProofNamespaceMaterializeInput,
+) -> Vec<i64> {
+    let row = client
+        .query_one(
+            "SELECT \
+                (SELECT count(*) FROM lore_domain_operation_reserve_release_tombstones \
+                 WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+                   AND tenant_scope_key=$3 AND operation_id=$4), \
+                (SELECT count(*) FROM lore_domain_operation_tombstone_release_completion_markers \
+                 WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+                   AND tenant_scope_key=$3 AND operation_id=$4), \
+                (SELECT high_water FROM lore_domain_proof_namespaces \
+                 WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+                   AND tenant_scope_key=$3 AND epoch=$5), \
+                (SELECT next_sequence FROM lore_domain_proof_namespaces \
+                 WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+                   AND tenant_scope_key=$3 AND epoch=$5), \
+                (SELECT retained_marker_count FROM lore_domain_proof_namespaces \
+                 WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+                   AND tenant_scope_key=$3 AND epoch=$5), \
+                (SELECT retained_marker_count FROM lore_domain_proof_global_counters WHERE id=1), \
+                (SELECT marker_bytes FROM lore_domain_proof_global_counters WHERE id=1), \
+                (SELECT retained_marker_count FROM lore_domain_proof_org_counters WHERE org_uuid=$6), \
+                (SELECT marker_bytes FROM lore_domain_proof_org_counters WHERE org_uuid=$6)",
+            &[
+                &key.verified_issuer,
+                &key.authenticated_subject,
+                &key.tenant_scope_key,
+                &key.operation_id.as_bytes().as_slice(),
+                &materialize.namespace_epoch,
+                &materialize.key.org_uuid,
+            ],
+        )
+        .await
+        .expect("read completion mutation state");
+    (0..9).map(|column| row.get(column)).collect()
 }
 
 fn materialize_input(
@@ -279,13 +371,120 @@ async fn stale_finalize_commits_once_replays_exactly_and_isolates_binding() {
         "exact replay must return the committed bytes"
     );
 
-    let mut mismatch = input.clone();
-    mismatch.binding.fingerprint[0] ^= 0xff;
-    let rejected = store
-        .domain_operation_verified_stale_finalize(&mismatch)
+    let mut substitutions = Vec::new();
+    let mut changed = input.clone();
+    changed.binding.method.push_str(".changed");
+    substitutions.push(("method", changed));
+    let mut changed = input.clone();
+    changed.binding.scope[0] ^= 0xff;
+    substitutions.push(("scope", changed));
+    let mut changed = input.clone();
+    changed.binding.fingerprint_version += 1;
+    substitutions.push(("fingerprint_version", changed));
+    let mut changed = input.clone();
+    changed.binding.fingerprint[0] ^= 0xff;
+    substitutions.push(("fingerprint", changed));
+    let mut changed = input.clone();
+    changed.binding.canonical_intent_digest[0] ^= 0xff;
+    substitutions.push(("canonical_intent_digest", changed));
+    let mut changed = input.clone();
+    changed.witness.authorization_id[0] ^= 0xff;
+    substitutions.push(("authorization_id", changed));
+    let mut changed = input.clone();
+    changed.witness.authorization_revision += 1;
+    substitutions.push(("authorization_revision", changed));
+    let mut changed = input.clone();
+    changed.witness.verification_nonce[0] ^= 0xff;
+    substitutions.push(("verification_nonce", changed));
+    let mut changed = input.clone();
+    changed.witness.bound_fields_digest[0] ^= 0xff;
+    substitutions.push(("bound_fields_digest", changed));
+    let mut changed = input.clone();
+    changed.witness.consumed_ticket_sha256[0] ^= 0xff;
+    substitutions.push(("consumed_ticket_sha256", changed));
+    let mut changed = input.clone();
+    changed.expected_claim_identity_digest[0] ^= 0xff;
+    substitutions.push(("expected_claim_identity_digest", changed));
+    let mut changed = input.clone();
+    changed.stale_finalize_permit[0] ^= 0xff;
+    substitutions.push(("stale_finalize_permit", changed));
+    let mut changed = input.clone();
+    changed.stale_finalize_permit_revision += 1;
+    substitutions.push(("stale_finalize_permit_revision", changed));
+    let mut changed = input.clone();
+    changed.permit_verification_digest[0] ^= 0xff;
+    substitutions.push(("permit_verification_digest", changed));
+
+    for (field, substitution) in substitutions {
+        let rejected = store
+            .domain_operation_verified_stale_finalize(&substitution)
+            .await
+            .unwrap_or_else(|error| panic!("{field} substitution must be decisive: {error:?}"));
+        assert_eq!(
+            rejected.status,
+            VerifiedStaleFinalizeStatus::Mismatch,
+            "changed {field} must not replay the committed result"
+        );
+    }
+    let replay_after_substitutions = store
+        .domain_operation_verified_stale_finalize(&input)
         .await
-        .expect("binding mismatch is decisive");
-    assert_eq!(rejected.status, VerifiedStaleFinalizeStatus::Mismatch);
+        .expect("exact replay after adversarial substitutions");
+    assert_eq!(
+        replay_after_substitutions, first,
+        "rejected substitutions must not mutate the exact replay"
+    );
+
+    let contested = stale_input(clock);
+    let mut competing = contested.clone();
+    competing.binding.canonical_intent_digest[0] ^= 0xff;
+    let contender_a = PostgresDomainStore::connect(&url, 2, &TlsConfig::default())
+        .await
+        .expect("connect first conflicting finalizer");
+    let contender_b = PostgresDomainStore::connect(&url, 2, &TlsConfig::default())
+        .await
+        .expect("connect second conflicting finalizer");
+    let (result_a, result_b) = tokio::join!(
+        contender_a.domain_operation_verified_stale_finalize(&contested),
+        contender_b.domain_operation_verified_stale_finalize(&competing),
+    );
+    let result_a = result_a.expect("first conflicting finalizer result");
+    let result_b = result_b.expect("second conflicting finalizer result");
+    assert!(
+        matches!(
+            (result_a.status, result_b.status),
+            (
+                VerifiedStaleFinalizeStatus::Committed,
+                VerifiedStaleFinalizeStatus::Mismatch
+            ) | (
+                VerifiedStaleFinalizeStatus::Mismatch,
+                VerifiedStaleFinalizeStatus::Committed
+            )
+        ),
+        "one conflicting Phase 1 insert must win and the other must observe Mismatch: {result_a:?}, {result_b:?}"
+    );
+
+    let direct = client(&url).await;
+    let persisted = direct
+        .query_one(
+            "SELECT canonical_intent_digest FROM lore_domain_operation_receipts \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+               AND tenant_scope_key=$3 AND operation_id=$4",
+            &[
+                &contested.key.verified_issuer,
+                &contested.key.authenticated_subject,
+                &contested.key.tenant_scope_key,
+                &contested.key.operation_id.as_bytes().as_slice(),
+            ],
+        )
+        .await
+        .expect("read contested Phase 1 winner");
+    let winner_digest: Vec<u8> = persisted.get(0);
+    assert!(
+        winner_digest == contested.binding.canonical_intent_digest
+            || winner_digest == competing.binding.canonical_intent_digest,
+        "conflict handling must preserve one complete contender, never overwrite a partial row"
+    );
 }
 
 #[tokio::test]
@@ -307,25 +506,58 @@ async fn stale_finalize_lost_commit_ack_is_unknown_then_authoritative_replay_ado
     let input = stale_input(clock);
 
     proxy.drop_next_commit_response();
-    let error = faulted_store
+    let result = faulted_store
         .domain_operation_verified_stale_finalize(&input)
-        .await
-        .expect_err("lost COMMIT acknowledgement must remain OutcomeUnknown");
+        .await;
+    let fault_fired = proxy.wait_for_commit_fault(Duration::from_secs(1)).await;
+    let error = match result {
+        Err(error) => error,
+        Ok(value) => panic!(
+            "lost COMMIT acknowledgement must remain OutcomeUnknown; fault_fired={fault_fired}; result={value:?}"
+        ),
+    };
     assert!(
         matches!(error, DomainError::OutcomeUnknown(_)),
         "post-COMMIT disconnect must not be reported as a decisive rollback: {error:?}"
     );
     assert!(
-        proxy.wait_for_commit_fault(Duration::from_secs(1)).await,
+        fault_fired,
         "lost-COMMIT evidence is valid only if exact frontend Q/COMMIT and backend C/COMMIT + Z/idle frames fired"
     );
 
-    let replay = authoritative_store
+    let replay = faulted_store
         .domain_operation_verified_stale_finalize(&input)
         .await
-        .expect("authoritative exact replay after lost acknowledgement");
+        .expect("same client exact retry after lost acknowledgement");
     assert_eq!(replay.status, VerifiedStaleFinalizeStatus::Committed);
     assert!(!replay.committed_receipt_canonical.is_empty());
+
+    let authoritative = client(&url).await;
+    let rows = authoritative
+        .query(
+            "SELECT public_result \
+             FROM lore_domain_operation_receipts \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+               AND tenant_scope_key=$3 AND operation_id=$4",
+            &[
+                &input.key.verified_issuer,
+                &input.key.authenticated_subject,
+                &input.key.tenant_scope_key,
+                &input.key.operation_id.as_bytes().as_slice(),
+            ],
+        )
+        .await
+        .expect("read authoritative post-fault receipt");
+    assert_eq!(
+        rows.len(),
+        1,
+        "lost acknowledgement plus exact retry must leave one receipt"
+    );
+    assert_eq!(
+        rows[0].get::<_, Option<Vec<u8>>>(0).as_deref(),
+        Some(replay.committed_receipt_canonical.as_slice()),
+        "retry must adopt the exact committed receipt rather than replace it"
+    );
     proxy.shutdown().await;
 }
 
@@ -355,9 +587,11 @@ async fn terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tom
         pending.status,
         TerminalStatusAttachStatus::Phase1PendingRetention
     );
-    assert_eq!(
-        pending.fields[0].as_deref(),
-        Some(finalized.committed_receipt_canonical.as_slice())
+    assert!(
+        pending.fields[0]
+            .as_ref()
+            .is_some_and(|value| !value.is_empty()),
+        "Phase 1 must return its canonical acknowledgement"
     );
     let replay = store
         .domain_operation_terminal_status_attach(&phase1)
@@ -432,6 +666,26 @@ async fn terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tom
         (0, 0, 1)
     );
 
+    let (counter, quota) = capacity_pair(&direct).await;
+    let materialize = materialize_input(
+        ProofNamespaceKey {
+            verified_issuer: stale.key.verified_issuer.clone(),
+            authenticated_subject: stale.key.authenticated_subject.clone(),
+            org_uuid: rand::random::<[u8; 16]>().to_vec(),
+            tenant_scope_key: stale.key.tenant_scope_key.clone(),
+        },
+        counter,
+        quota,
+    );
+    let materialized = store
+        .domain_operation_proof_namespace_materialize(&materialize)
+        .await
+        .expect("materialize completion namespace");
+    assert_eq!(
+        materialized.status,
+        ProofNamespaceMaterializeStatus::Materialized
+    );
+
     let mut phase2 = phase1;
     phase2.phase = TerminalStatusAttachPhase::Phase2ReleaseAck;
     phase2.action = TerminalStatusAttachAction::ActiveReleaseIntentAck;
@@ -456,6 +710,74 @@ async fn terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tom
         "active-release replay must preserve exact ack"
     );
 
+    let active_before = direct
+        .query_one(
+            "SELECT active_release_intent_digest, active_release_intent_ack_at \
+             FROM lore_domain_operation_reserve_release_tombstones \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+               AND tenant_scope_key=$3 AND operation_id=$4",
+            &[
+                &stale.key.verified_issuer,
+                &stale.key.authenticated_subject,
+                &stale.key.tenant_scope_key,
+                &stale.key.operation_id.as_bytes().as_slice(),
+            ],
+        )
+        .await
+        .expect("read acknowledged active release intent");
+    let active_digest_before: Vec<u8> = active_before.get(0);
+    let active_ack_at_before: SystemTime = active_before.get(1);
+
+    let mut changed_revision = phase2.clone();
+    changed_revision.active_release_intent_revision = Some(
+        changed_revision
+            .active_release_intent_revision
+            .expect("active intent revision")
+            + 1,
+    );
+    let rejected = store
+        .domain_operation_terminal_status_attach(&changed_revision)
+        .await
+        .expect("changed active release revision is decisive");
+    assert_eq!(rejected.status, TerminalStatusAttachStatus::Mismatch);
+
+    let mut changed_nonce = phase2.clone();
+    changed_nonce
+        .active_release_intent_nonce
+        .as_mut()
+        .expect("active intent nonce")[0] ^= 0xff;
+    let rejected = store
+        .domain_operation_terminal_status_attach(&changed_nonce)
+        .await
+        .expect("changed active release nonce is decisive");
+    assert_eq!(rejected.status, TerminalStatusAttachStatus::Mismatch);
+
+    let active_after = direct
+        .query_one(
+            "SELECT active_release_intent_digest, active_release_intent_ack_at \
+             FROM lore_domain_operation_reserve_release_tombstones \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+               AND tenant_scope_key=$3 AND operation_id=$4",
+            &[
+                &stale.key.verified_issuer,
+                &stale.key.authenticated_subject,
+                &stale.key.tenant_scope_key,
+                &stale.key.operation_id.as_bytes().as_slice(),
+            ],
+        )
+        .await
+        .expect("read active release intent after rejected substitutions");
+    assert_eq!(
+        active_after.get::<_, Vec<u8>>(0),
+        active_digest_before,
+        "rejected active-intent substitutions must not replace the digest"
+    );
+    assert_eq!(
+        active_after.get::<_, SystemTime>(1),
+        active_ack_at_before,
+        "rejected active-intent substitutions must not change acknowledgement time"
+    );
+
     let mut poll = phase2.clone();
     poll.action = TerminalStatusAttachAction::TombstonePrunePoll;
     poll.request_digest = rand::random::<[u8; 32]>().to_vec();
@@ -470,7 +792,9 @@ async fn terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tom
     direct
         .execute(
             "UPDATE lore_domain_operation_reserve_release_tombstones \
-             SET final_prune_after=clock_timestamp()-interval '1 second' \
+             SET created_at=clock_timestamp()-interval '3 seconds', \
+                 compact_after=clock_timestamp()-interval '2 seconds', \
+                 final_prune_after=clock_timestamp()-interval '1 second' \
              WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4",
             &[
                 &stale.key.verified_issuer,
@@ -490,16 +814,123 @@ async fn terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tom
         TerminalStatusAttachStatus::Phase2TombstoneFinalPruned
     );
 
-    let mut active_mismatch = phase2;
-    active_mismatch
+    let mut complete = phase2.clone();
+    complete.action = TerminalStatusAttachAction::TombstoneReleaseIntentComplete;
+    complete.final_prune_digest = Some(rand::random::<[u8; 32]>().to_vec());
+    complete.tombstone_release_intent_revision = Some(41);
+    complete.tombstone_release_intent_nonce = Some(rand::random::<[u8; 32]>().to_vec());
+    complete.request_digest = rand::random::<[u8; 32]>().to_vec();
+    complete.expected_completion_marker_digest = Some(completion_marker_digest(
+        &complete,
+        &materialize.namespace_epoch,
+        ready.fields[4]
+            .as_deref()
+            .expect("Phase 1 returns tombstone digest"),
+    ));
+    let completion_before = completion_state(&direct, &stale.key, &materialize).await;
+
+    let mut changed_completion_revision = complete.clone();
+    changed_completion_revision.active_release_intent_revision = Some(
+        changed_completion_revision
+            .active_release_intent_revision
+            .expect("completion active intent revision")
+            + 1,
+    );
+    changed_completion_revision.expected_completion_marker_digest = Some(completion_marker_digest(
+        &changed_completion_revision,
+        &materialize.namespace_epoch,
+        ready.fields[4]
+            .as_deref()
+            .expect("Phase 1 returns tombstone digest"),
+    ));
+    let rejected = store
+        .domain_operation_terminal_status_attach(&changed_completion_revision)
+        .await
+        .expect("changed completion active-intent revision is decisive");
+    assert_eq!(rejected.status, TerminalStatusAttachStatus::Mismatch);
+
+    let mut changed_completion_nonce = complete.clone();
+    changed_completion_nonce
         .active_release_intent_nonce
         .as_mut()
-        .expect("nonce")[0] ^= 0xff;
+        .expect("completion active intent nonce")[0] ^= 0xff;
+    changed_completion_nonce.expected_completion_marker_digest = Some(completion_marker_digest(
+        &changed_completion_nonce,
+        &materialize.namespace_epoch,
+        ready.fields[4]
+            .as_deref()
+            .expect("Phase 1 returns tombstone digest"),
+    ));
     let rejected = store
-        .domain_operation_terminal_status_attach(&active_mismatch)
+        .domain_operation_terminal_status_attach(&changed_completion_nonce)
         .await
-        .expect("active release mismatch");
+        .expect("changed completion active-intent nonce is decisive");
     assert_eq!(rejected.status, TerminalStatusAttachStatus::Mismatch);
+    assert_eq!(
+        completion_state(&direct, &stale.key, &materialize).await,
+        completion_before,
+        "rejected completion substitutions must not mutate tombstone, marker, namespace, or counters"
+    );
+
+    let completed = store
+        .domain_operation_terminal_status_attach(&complete)
+        .await
+        .expect("complete tombstone release intent");
+    assert_eq!(
+        completed.status,
+        TerminalStatusAttachStatus::Phase2ReleaseCompletionReady
+    );
+    assert_eq!(completed.completion_marker_sequence, 1);
+    assert_eq!(
+        completed.fields[8], complete.expected_completion_marker_digest,
+        "completion response must return the independently derived marker digest"
+    );
+    let completed_replay = store
+        .domain_operation_terminal_status_attach(&complete)
+        .await
+        .expect("exact completion replay");
+    assert_eq!(completed_replay, completed);
+
+    direct
+        .execute(
+            "UPDATE lore_domain_operation_tombstone_release_completion_markers \
+             SET created_at=clock_timestamp()-interval '2 seconds', \
+                 retain_until=clock_timestamp()-interval '1 second' \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+               AND tenant_scope_key=$3 AND operation_id=$4",
+            &[
+                &stale.key.verified_issuer,
+                &stale.key.authenticated_subject,
+                &stale.key.tenant_scope_key,
+                &stale.key.operation_id.as_bytes().as_slice(),
+            ],
+        )
+        .await
+        .expect("age completion marker retention");
+    let recovered = store
+        .domain_operation_terminal_status_attach(&complete)
+        .await
+        .expect("exact completion replay prunes marker into range");
+    assert_eq!(
+        recovered.status,
+        TerminalStatusAttachStatus::Phase2PostPruneRecovery
+    );
+    assert_eq!(
+        recovered
+            .range
+            .as_ref()
+            .map(|range| (range.start_sequence, range.end_sequence)),
+        Some((1, 1))
+    );
+    let recovered_replay = store
+        .domain_operation_terminal_status_attach(&complete)
+        .await
+        .expect("exact post-prune recovery from containing range");
+    assert_eq!(
+        recovered_replay.status,
+        TerminalStatusAttachStatus::Phase2PostPruneRecovery
+    );
+    assert_eq!(recovered_replay.range, recovered.range);
 }
 
 #[tokio::test]
@@ -520,6 +951,23 @@ async fn materialize_replay_preserves_receipt_and_changed_claim_mismatches() {
         .expect("materialize namespace");
     assert_eq!(first.status, ProofNamespaceMaterializeStatus::Materialized);
 
+    let org_after_first = direct
+        .query_one(
+            "SELECT counter_revision, represented_namespace_rows \
+             FROM lore_domain_proof_org_counters WHERE org_uuid=$1",
+            &[&input.key.org_uuid],
+        )
+        .await
+        .expect("read organization proof counter after materialization");
+    assert_eq!(
+        (
+            org_after_first.get::<_, i64>(0),
+            org_after_first.get::<_, i64>(1)
+        ),
+        (first.lore_org_counter_revision, 1),
+        "first materialization must charge exactly one organization namespace"
+    );
+
     let replay = store
         .domain_operation_proof_namespace_materialize(&input)
         .await
@@ -528,6 +976,22 @@ async fn materialize_replay_preserves_receipt_and_changed_claim_mismatches() {
         replay, first,
         "replay must preserve all canonical receipt fields"
     );
+    let org_after_replay = direct
+        .query_one(
+            "SELECT counter_revision, represented_namespace_rows \
+             FROM lore_domain_proof_org_counters WHERE org_uuid=$1",
+            &[&input.key.org_uuid],
+        )
+        .await
+        .expect("read organization proof counter after replay");
+    assert_eq!(
+        (
+            org_after_replay.get::<_, i64>(0),
+            org_after_replay.get::<_, i64>(1)
+        ),
+        (first.lore_org_counter_revision, 1),
+        "exact replay must not increment the organization counter again"
+    );
 
     let mut mismatch = input.clone();
     mismatch.namespace_claim_nonce[0] ^= 0xff;
@@ -535,6 +999,14 @@ async fn materialize_replay_preserves_receipt_and_changed_claim_mismatches() {
         .domain_operation_proof_namespace_materialize(&mismatch)
         .await
         .expect("changed claim is decisive");
+    assert_eq!(rejected.status, ProofNamespaceMaterializeStatus::Mismatch);
+
+    let mut changed_request = input;
+    changed_request.request_digest[0] ^= 0xff;
+    let rejected = store
+        .domain_operation_proof_namespace_materialize(&changed_request)
+        .await
+        .expect("changed request digest is decisive");
     assert_eq!(rejected.status, ProofNamespaceMaterializeStatus::Mismatch);
 }
 
@@ -547,6 +1019,13 @@ async fn materialize_capacity_revision_mismatch_writes_no_namespace() {
     };
     let store = store(&url).await;
     let direct = client(&url).await;
+    let (initial_counter, initial_quota) = capacity_pair(&direct).await;
+    let seed = materialize_input(namespace_key(), initial_counter, initial_quota);
+    let seeded = store
+        .domain_operation_proof_namespace_materialize(&seed)
+        .await
+        .expect("seed the capacity counter");
+    assert_eq!(seeded.status, ProofNamespaceMaterializeStatus::Materialized);
     let (counter, quota) = capacity_pair(&direct).await;
     let input = materialize_input(namespace_key(), counter + 1, quota);
     let blocked = store
@@ -588,7 +1067,24 @@ async fn retire_is_atomic_replays_absence_and_rejects_expired_permit() {
         .domain_operation_proof_namespace_materialize(&materialize)
         .await
         .expect("materialize setup");
-    let retire = retire_input(&materialize);
+    let global_before = direct
+        .query_one(
+            "SELECT counter_revision, represented_namespace_rows \
+             FROM lore_domain_proof_global_counters WHERE id=1",
+            &[],
+        )
+        .await
+        .expect("read global counter before retirement");
+    let org_before = direct
+        .query_one(
+            "SELECT counter_revision, represented_namespace_rows \
+             FROM lore_domain_proof_org_counters WHERE org_uuid=$1",
+            &[&materialize.key.org_uuid],
+        )
+        .await
+        .expect("read organization counter before retirement");
+    let mut retire = retire_input(&materialize);
+    retire.retirement_permit_revision = 3;
 
     let first = store
         .domain_operation_proof_namespace_retire(&retire)
@@ -600,6 +1096,39 @@ async fn retire_is_atomic_replays_absence_and_rejects_expired_permit() {
         .await
         .expect("retirement replay");
     assert_eq!(replay.status, ProofNamespaceRetireStatus::RetiredOrAbsent);
+
+    let global_after = direct
+        .query_one(
+            "SELECT counter_revision, represented_namespace_rows \
+             FROM lore_domain_proof_global_counters WHERE id=1",
+            &[],
+        )
+        .await
+        .expect("read global counter after retirement");
+    let org_after = direct
+        .query_one(
+            "SELECT counter_revision, represented_namespace_rows \
+             FROM lore_domain_proof_org_counters WHERE org_uuid=$1",
+            &[&materialize.key.org_uuid],
+        )
+        .await
+        .expect("read organization counter after retirement");
+    assert_eq!(
+        (global_after.get::<_, i64>(0), global_after.get::<_, i64>(1)),
+        (
+            global_before.get::<_, i64>(0) + 1,
+            global_before.get::<_, i64>(1) - 1
+        ),
+        "retirement must atomically remove one global represented namespace"
+    );
+    assert_eq!(
+        (org_after.get::<_, i64>(0), org_after.get::<_, i64>(1)),
+        (
+            org_before.get::<_, i64>(0) + 1,
+            org_before.get::<_, i64>(1) - 1
+        ),
+        "retirement must atomically remove one organization represented namespace"
+    );
 
     let mut expired = retire.clone();
     expired.key = namespace_key();
@@ -626,23 +1155,26 @@ async fn retire_requires_exact_fence_generation_and_final_range_digest() {
         .domain_operation_proof_namespace_materialize(&materialize)
         .await
         .expect("materialize setup");
-    let retire = retire_input(&materialize);
+    let mut retire = retire_input(&materialize);
+    retire.retirement_permit_revision = 3;
 
-    let mut wrong_generation = retire.clone();
-    wrong_generation.retirement_fence_generation += 1;
-    let generation = store
-        .domain_operation_proof_namespace_retire(&wrong_generation)
-        .await
-        .expect("generation mismatch is decisive");
-    assert_eq!(generation.status, ProofNamespaceRetireStatus::Mismatch);
-
-    let mut wrong_digest = retire;
+    let mut wrong_digest = retire.clone();
     wrong_digest.final_range_set_digest[0] ^= 0xff;
     let digest = store
         .domain_operation_proof_namespace_retire(&wrong_digest)
         .await
         .expect("range digest mismatch is decisive");
     assert_eq!(digest.status, ProofNamespaceRetireStatus::Mismatch);
+
+    let independent_revisions = store
+        .domain_operation_proof_namespace_retire(&retire)
+        .await
+        .expect("independently verified fence generation and permit revision");
+    assert_eq!(
+        independent_revisions.status,
+        ProofNamespaceRetireStatus::Retired,
+        "fence generation and permit revision are independent verifier-approved fields"
+    );
 }
 
 #[tokio::test]

@@ -357,13 +357,12 @@ will update an older check constraint or state schema.
   --test domain_backfill --test domain_migration_parity --test domain_mediated \
   --test domain_bypass --test domain_receipts_lifecycle --test domain_obliterate_fence \
   -- --ignored` under `LORE_TEST_PG_URL`.
-  The migration-parity and backfill tests each provision their own throwaway `CREATE DATABASE`
-  (`lore_wp116_parity_*`/`lore_wp116_backfill_*`) rather than sharing the suite's usual database,
-  because both run whole-table queries (`information_schema`/`pg_catalog`, or
-  `DomainBackfill::verify()`'s scan of every `lore_domain_repositories` row) with no per-test
-  scoping filter — running them against the shared database would see every other test file's raw
-  SQL fixture rows too. The rest of the suite shares one database and isolates by random
-  identity/name per test, matching `tests/mutable_store.rs`'s convention.
+  Migration-parity and backfill each create a throwaway database because their whole-catalog scans
+  cannot isolate shared fixtures. Most other cases use random identities in one database. The eight
+  maintenance cases instead use `tests/run-domain-maintenance-live.ps1`, which creates and drops a
+  distinct database per exact case. On a fresh database, the first materialization bootstraps the
+  global counter, so a capacity-revision rejection case must seed it, reread its revision, then
+  submit the mismatched revision; a guessed absent-row fallback can accidentally be admissible.
 - **CR-029 WP-116 Phase 4, gRPC metadata carriage, status mapping, and the admission gate
   [SERVER]**: offline, no Postgres. `domain_operation_metadata.rs`'s `extract`/`require` (R-BLOCK-2's
   one-reader header contract) and `scope_key_*` (R-BLOCK-5) are pinned in an inline `tests` module:
@@ -510,15 +509,14 @@ will update an older check constraint or state schema.
   resolve `localhost` to `::1` first. What to do: bind the disposable proxy to `localhost`, preserve
   that DNS name in the proxied URL and certificate SAN, and use its selected port. Gate:
   `lore-object-dispatch/tests/run-retention-client-live.ps1`.
-- Symptom: a disposable trigger meant to raise `40001`/`40P01` instead returns a non-transient
-  permission error. Cause: the maintenance caller cannot advance the admin-owned nontransactional
-  attempt sequence. What to do: make the admin-owned trigger function `SECURITY DEFINER`, pin its
-  `search_path` to `pg_catalog`, qualify the sequence, and assert `last_value = 2` after one injected
-  abort and one successful mutation. The same live gate parses buffered PostgreSQL frames and drops
-  only after exact frontend `Q/COMMIT`, backend `CommandComplete/COMMIT`, and idle `ReadyForQuery`;
-  the test must observe its fault-fired signal before claiming immutable-receipt reconciliation.
-  Authenticate the proxy's downstream client certificate against the fixture CA and exact
-  maintenance CN, and hold a database advisory-lock lease so direct parallel invocations serialize.
+- Symptom: a disposable `40001`/`40P01` trigger returns a permission error. Cause: the maintenance
+  caller cannot advance the admin-owned nontransactional attempt sequence. What to do: use a
+  `SECURITY DEFINER` function with `search_path=pg_catalog`, qualify the sequence, and assert two
+  attempts. A lost-COMMIT proxy must ignore earlier pipelined `ParseComplete`/`Z(T)` frames after
+  frontend `Q/COMMIT`, drop only after backend `C/COMMIT` plus `Z(I)`, close both socket halves, and
+  require its fault-fired signal before claiming reconciliation. Gate CR-029 with
+  `lore-postgres/tests/run-domain-maintenance-live.ps1`. The TLS retention proxy additionally pins
+  the fixture CA and maintenance CN. Serialize direct runs with a database advisory-lock lease.
 
 ### Poisoning a persisted `State`/`Tree` field for a fault-injection test
 

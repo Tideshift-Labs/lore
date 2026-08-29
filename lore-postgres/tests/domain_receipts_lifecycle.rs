@@ -724,6 +724,73 @@ async fn consume_rejects_a_token_presented_for_the_wrong_key_or_binding() {
     );
 }
 
+/// The canonical intent digest is part of the immutable operation binding.
+/// A caller that changes only this field must not read or consume the prepared
+/// row, and the failed attempts must leave the original token usable.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn consume_and_receipt_get_reject_changed_canonical_intent() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping canonical-intent binding test");
+        return;
+    };
+    connect_domain_store(&url).await;
+    let mut client = pg_client(&url).await;
+    let clock = capture_clock(&mut client).await;
+    let key = isolated_key(uuid_v7_at(clock));
+    let original = binding("lore.domain.v1.test/CanonicalIntent");
+
+    let tx = client.transaction().await.expect("begin prepare tx");
+    let prepared = prepare(&tx, &key, &original, None).await.expect("prepare");
+    tx.commit().await.expect("commit prepare");
+    let PrepareResult::Prepared { token, .. } = prepared else {
+        panic!("expected Prepared, got {prepared:?}");
+    };
+
+    let mut changed = original.clone();
+    changed.canonical_intent_digest[0] ^= 0xff;
+
+    let tx = client
+        .transaction()
+        .await
+        .expect("begin mismatched lookup tx");
+    let lookup = receipt_get(&tx, &key, &changed)
+        .await
+        .expect("mismatched lookup must not error");
+    tx.rollback().await.expect("rollback lookup");
+    assert_eq!(
+        lookup,
+        ReceiptLookup::Mismatch,
+        "changed canonical intent must not read the prepared receipt"
+    );
+
+    let tx = client
+        .transaction()
+        .await
+        .expect("begin mismatched consume tx");
+    let consumed = consume(&tx, &key, &changed, &token)
+        .await
+        .expect("mismatched consume must not error");
+    tx.rollback().await.expect("rollback mismatched consume");
+    assert!(
+        consumed.is_none(),
+        "changed canonical intent must not consume the prepared receipt"
+    );
+
+    let tx = client
+        .transaction()
+        .await
+        .expect("begin exact consume control tx");
+    let exact = consume(&tx, &key, &original, &token)
+        .await
+        .expect("exact consume must not error");
+    tx.rollback().await.expect("rollback exact consume control");
+    assert!(
+        exact.is_some(),
+        "mismatched lookup and consume must leave the original token usable"
+    );
+}
+
 // ─── hard-TTL expiry ─────────────────────────────────────────────────────────
 
 /// `prepare` against a row already past its hard TTL must terminalize it to
