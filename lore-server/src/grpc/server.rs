@@ -46,6 +46,7 @@ use crate::correlation::layer::CorrelationIdLayer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
 use crate::correlation::span::MakeCorrelationIdSpan;
+use crate::domain::DomainContext;
 use crate::grpc::admin_service::LoreAdminService;
 use crate::grpc::environment::LoreEnvironmentV1Service;
 use crate::grpc::environment_service::LoreEnvironmentService;
@@ -254,6 +255,36 @@ impl GrpcServerBuilder<MaybeLockStore> {
     pub fn with_lock_store(
         self,
         lock_store: Option<Arc<dyn LockStore>>,
+    ) -> GrpcServerBuilder<MaybeDomainContext> {
+        GrpcServerBuilder(MaybeDomainContext {
+            environment: self.0.environment,
+            feature: self.0.feature,
+            immutable_store: self.0.immutable_store,
+            local_store: self.0.local_store,
+            mutable_store: self.0.mutable_store,
+            lock_store,
+        })
+    }
+}
+
+pub struct MaybeDomainContext {
+    environment: EnvironmentConfig,
+    feature: FeatureSettings,
+    immutable_store: Arc<dyn ImmutableStore>,
+    local_store: Arc<dyn ImmutableStore>,
+    mutable_store: Arc<dyn MutableStore>,
+    lock_store: Option<Arc<dyn LockStore>>,
+}
+
+impl GrpcServerBuilder<MaybeDomainContext> {
+    /// Attach CR-029's domain coordinator, when this cell has one.
+    ///
+    /// `None` for every non-Postgres cell, and that absence is the legacy
+    /// path rather than an error: governed handlers fall through to today's
+    /// unsynchronised writes exactly as before.
+    pub fn with_domain_context(
+        self,
+        domain_context: Option<Arc<DomainContext>>,
     ) -> GrpcServerBuilder<WantsNotification> {
         GrpcServerBuilder(WantsNotification {
             environment: self.0.environment,
@@ -261,7 +292,8 @@ impl GrpcServerBuilder<MaybeLockStore> {
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
             mutable_store: self.0.mutable_store,
-            lock_store,
+            lock_store: self.0.lock_store,
+            domain_context,
         })
     }
 }
@@ -273,6 +305,7 @@ pub struct WantsNotification {
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
+    domain_context: Option<Arc<DomainContext>>,
 }
 
 impl GrpcServerBuilder<WantsNotification> {
@@ -288,6 +321,7 @@ impl GrpcServerBuilder<WantsNotification> {
             local_store: self.0.local_store,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
+            domain_context: self.0.domain_context,
             notification_sender: sender,
             notification_service: service,
         })
@@ -301,6 +335,7 @@ pub struct MaybeHookDispatcher {
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
+    domain_context: Option<Arc<DomainContext>>,
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
 }
@@ -317,6 +352,7 @@ impl GrpcServerBuilder<MaybeHookDispatcher> {
             local_store: self.0.local_store,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
+            domain_context: self.0.domain_context,
             notification_sender: self.0.notification_sender,
             notification_service: self.0.notification_service,
             hook_dispatcher,
@@ -331,6 +367,7 @@ pub struct WantsTlsConfig {
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
+    domain_context: Option<Arc<DomainContext>>,
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
     hook_dispatcher: Arc<HookDispatcher>,
@@ -371,6 +408,7 @@ impl GrpcServerBuilder<WantsTlsConfig> {
             local_store: self.0.local_store,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
+            domain_context: self.0.domain_context,
             hook_dispatcher: self.0.hook_dispatcher,
             notification_sender: self.0.notification_sender,
             notification_service: self.0.notification_service,
@@ -386,6 +424,7 @@ pub struct WantsAdminEndpoints {
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
+    domain_context: Option<Arc<DomainContext>>,
     hook_dispatcher: Arc<HookDispatcher>,
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
@@ -413,6 +452,7 @@ impl GrpcServerBuilder<WantsAdminEndpoints> {
             local_store: self.0.local_store,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
+            domain_context: self.0.domain_context,
             notification_sender: self.0.notification_sender,
             notification_service: self.0.notification_service,
             hook_dispatcher: self.0.hook_dispatcher,
@@ -429,6 +469,7 @@ pub struct WantsHttp2Config {
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
+    domain_context: Option<Arc<DomainContext>>,
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
     hook_dispatcher: Arc<HookDispatcher>,
@@ -453,6 +494,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
             local_store: self.0.local_store,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
+            domain_context: self.0.domain_context,
             notification_sender: self.0.notification_sender,
             notification_service: self.0.notification_service,
             hook_dispatcher: self.0.hook_dispatcher,
@@ -475,6 +517,7 @@ pub struct MaybeJwtVerifier {
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
+    domain_context: Option<Arc<DomainContext>>,
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
     hook_dispatcher: Arc<HookDispatcher>,
@@ -586,6 +629,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.mutable_store.clone(),
             self.0.hook_dispatcher.clone(),
             rpc_timeout,
+            self.0.domain_context.clone(),
         );
         let repository_v1_svc = LoreRepositoryV1Service::new(
             self.0.environment.clone(),
@@ -594,6 +638,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.hook_dispatcher.clone(),
             self.0.forwarded_requests.clone(),
             rpc_timeout,
+            self.0.domain_context.clone(),
         );
 
         let environment_svc = LoreEnvironmentService::new(self.0.environment.clone());

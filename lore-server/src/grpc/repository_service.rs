@@ -16,6 +16,7 @@ use super::handlers::repository_metadata_get;
 use super::handlers::repository_metadata_set;
 use super::handlers::repository_query;
 use crate::authnz::repository_authorizer::repository_authorizer;
+use crate::domain::DomainContext;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 use crate::legacy::rpc::repository_service_server::RepositoryService;
@@ -27,6 +28,9 @@ pub struct LoreRepositoryService {
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: Arc<HookDispatcher>,
     rpc_timeout: Duration,
+    /// CR-029 domain coordinator, when this cell has one. `None` is the legacy
+    /// path, not an error.
+    domain_context: Option<Arc<DomainContext>>,
 }
 
 impl InstrumentProvider for LoreRepositoryService {
@@ -42,6 +46,7 @@ impl LoreRepositoryService {
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         hook_dispatcher: Arc<HookDispatcher>,
         rpc_timeout: Duration,
+        domain_context: Option<Arc<DomainContext>>,
     ) -> Self {
         Self {
             environment,
@@ -49,6 +54,7 @@ impl LoreRepositoryService {
             mutable_store,
             hook_dispatcher,
             rpc_timeout,
+            domain_context,
         }
     }
 }
@@ -71,6 +77,7 @@ impl RepositoryService for LoreRepositoryService {
                 self.mutable_store.clone(),
                 &self.hook_dispatcher,
                 self,
+                self.domain_context.as_ref(),
             ),
         )
         .await
@@ -91,6 +98,7 @@ impl RepositoryService for LoreRepositoryService {
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self,
+                self.domain_context.as_ref(),
             ),
         )
         .await

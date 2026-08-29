@@ -34,6 +34,7 @@ use super::repository_metadata_get;
 use super::repository_metadata_set;
 use super::repository_storage_stats;
 use crate::authnz::repository_authorizer::repository_authorizer;
+use crate::domain::DomainContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
@@ -65,6 +66,9 @@ pub struct LoreRepositoryV1Service {
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
     instrument_provider: RepositoryServiceInstrumentProvider,
+    /// CR-029 domain coordinator, when this cell has one. `None` is the legacy
+    /// path, not an error.
+    domain_context: Option<Arc<DomainContext>>,
 }
 
 impl LoreRepositoryV1Service {
@@ -76,6 +80,7 @@ impl LoreRepositoryV1Service {
         hook_dispatcher: Arc<HookDispatcher>,
         forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
+        domain_context: Option<Arc<DomainContext>>,
     ) -> Self {
         Self {
             environment,
@@ -85,6 +90,7 @@ impl LoreRepositoryV1Service {
             forwarded_requests,
             rpc_timeout,
             instrument_provider: RepositoryServiceInstrumentProvider,
+            domain_context,
         }
     }
 
@@ -113,6 +119,7 @@ impl RepositoryService for LoreRepositoryV1Service {
                 &self.forwarded_requests,
                 &self.hook_dispatcher,
                 &self.instrument_provider,
+                self.domain_context.as_ref(),
             ),
         )
         .await
@@ -130,6 +137,7 @@ impl RepositoryService for LoreRepositoryV1Service {
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.instrument_provider,
+                self.domain_context.as_ref(),
             ),
         )
         .await

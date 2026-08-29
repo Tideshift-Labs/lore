@@ -24,11 +24,16 @@ use tracing::warn;
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
 use super::repository_get::repository_load_name;
+use crate::domain::DomainContext;
+use crate::domain::GovernedScope;
+use crate::domain::admit_at_entry;
+use crate::domain::reject_unwired_governed_operation;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::get_authorization_optional;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::handlers::repository_create::repository_create_auth_resource;
@@ -52,6 +57,9 @@ use crate::util::setup_execution;
     skip_all,
     fields(requested_repo_id)
 )]
+// One argument over the clippy threshold, matching the convention already used
+// for the repository services' constructors in this crate.
+#[allow(clippy::too_many_arguments)]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
     auth_url: Option<String>,
@@ -60,11 +68,32 @@ pub async fn handler(
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
+    // Captured before `into_inner` consumes the request: the domain-operation
+    // headers and the verified principal both live outside the message body.
+    let request_metadata = request.metadata().clone();
+    let request_authorization = get_authorization_optional(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
+
+    // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
+    // at handler entry, before any handler logic or authorization side effect.
+    if let Some(admitted) = admit_at_entry(
+        domain_context,
+        &request_metadata,
+        request_authorization.as_ref(),
+        GovernedScope::RepositoryCreate {
+            repository_id: &req.id,
+        },
+    )? {
+        return Err(reject_unwired_governed_operation(
+            &admitted,
+            "lore.repository.v1.RepositoryService/RepositoryCreate",
+        ));
+    }
     let caller_context = CallerContext {
         repository_id: RepositoryId::default(), // RepositoryCreate has no pre-existing repository
         user_id,
@@ -564,6 +593,7 @@ mod tests {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &TestInstrumentProvider,
+                    None, /* no domain coordinator */
                 )
                 .await
                 .expect("should succeed");
@@ -599,6 +629,7 @@ mod tests {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &TestInstrumentProvider,
+                    None, /* no domain coordinator */
                 )
                 .await
                 .expect_err("forwarded error should propagate");
@@ -631,6 +662,7 @@ mod tests {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &TestInstrumentProvider,
+                    None, /* no domain coordinator */
                 )
                 .await
                 .expect_err("transport error should become internal status");
@@ -664,6 +696,7 @@ mod tests {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &TestInstrumentProvider,
+                    None, /* no domain coordinator */
                 )
                 .await
                 .expect("local execution should succeed");

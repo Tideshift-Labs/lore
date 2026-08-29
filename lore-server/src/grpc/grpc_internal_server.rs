@@ -25,6 +25,7 @@ use tracing::info;
 
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
+use crate::domain::DomainContext;
 use crate::grpc;
 use crate::grpc::forwarded_repository::v1::service::LoreForwardedRepositoryV1Service;
 use crate::grpc::forwarded_revision::v1::service::LoreForwardedRevisionV1Service;
@@ -74,6 +75,9 @@ impl GrpcInternalServerBuilder<WantsComponents> {
         Self(WantsComponents(()))
     }
 
+    // One argument over the clippy threshold, matching the convention already
+    // used for the repository services' constructors in this crate.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_components(
         self,
         local_immutable_store: Arc<dyn ImmutableStore>,
@@ -82,6 +86,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
         notification_sender: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
         environment: EnvironmentConfig,
+        domain_context: Option<Arc<DomainContext>>,
     ) -> anyhow::Result<GrpcInternalServerBuilder<WantsTlsConfig>> {
         if !local_immutable_store.is_local() {
             return Err(anyhow!("Immutable store must be a local store"));
@@ -94,6 +99,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
             notification_sender,
             hook_dispatcher,
             environment,
+            domain_context,
         }))
     }
 }
@@ -105,6 +111,7 @@ pub struct WantsTlsConfig {
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     environment: EnvironmentConfig,
+    domain_context: Option<Arc<DomainContext>>,
 }
 
 impl GrpcInternalServerBuilder<WantsTlsConfig> {
@@ -154,6 +161,7 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
             notification_sender: self.0.notification_sender,
             hook_dispatcher: self.0.hook_dispatcher,
             environment: self.0.environment,
+            domain_context: self.0.domain_context,
             tls_config,
         }))
     }
@@ -166,6 +174,7 @@ pub struct WantsHttp2Config {
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     environment: EnvironmentConfig,
+    domain_context: Option<Arc<DomainContext>>,
     tls_config: Option<ServerTlsConfig>,
 }
 
@@ -219,6 +228,7 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
                 self.0.mutable_store,
                 self.0.hook_dispatcher,
                 rpc_timeout,
+                self.0.domain_context,
             ),
         ));
 

@@ -14,6 +14,7 @@ use tonic::Response;
 use tonic::Status;
 
 use super::repository_create;
+use crate::domain::DomainContext;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
@@ -35,6 +36,8 @@ pub struct LoreForwardedRepositoryV1Service {
     hook_dispatcher: Arc<HookDispatcher>,
     instrument_provider: ForwardedRepositoryServiceInstrumentProvider,
     rpc_timeout: Duration,
+    /// CR-029 domain coordinator, when this cell has one.
+    domain_context: Option<Arc<DomainContext>>,
 }
 
 impl LoreForwardedRepositoryV1Service {
@@ -44,6 +47,7 @@ impl LoreForwardedRepositoryV1Service {
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         hook_dispatcher: Arc<HookDispatcher>,
         rpc_timeout: Duration,
+        domain_context: Option<Arc<DomainContext>>,
     ) -> Self {
         let instrument_provider = ForwardedRepositoryServiceInstrumentProvider;
         Self {
@@ -53,6 +57,7 @@ impl LoreForwardedRepositoryV1Service {
             hook_dispatcher,
             rpc_timeout,
             instrument_provider,
+            domain_context,
         }
     }
 
@@ -79,6 +84,7 @@ impl ForwardedRepositoryService for LoreForwardedRepositoryV1Service {
                 self.mutable_store.clone(),
                 &self.hook_dispatcher,
                 &self.instrument_provider,
+                self.domain_context.as_ref(),
             ),
         )
         .await

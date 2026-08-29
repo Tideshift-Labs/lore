@@ -29,9 +29,14 @@ use super::repository_query::repository_query_name;
 use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
+use crate::domain::DomainContext;
+use crate::domain::GovernedScope;
+use crate::domain::admit_at_entry;
+use crate::domain::reject_unwired_governed_operation;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization_optional;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
@@ -49,11 +54,32 @@ pub async fn handler(
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
+    // Captured before `into_inner` consumes the request: the domain-operation
+    // headers and the verified principal both live outside the message body.
+    let request_metadata = request.metadata().clone();
+    let request_authorization = get_authorization_optional(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
+
+    // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
+    // at handler entry, before any handler logic or authorization side effect.
+    if let Some(admitted) = admit_at_entry(
+        domain_context,
+        &request_metadata,
+        request_authorization.as_ref(),
+        GovernedScope::RepositoryCreate {
+            repository_id: &req.id,
+        },
+    )? {
+        return Err(reject_unwired_governed_operation(
+            &admitted,
+            "lore.RepositoryService/RepositoryCreate",
+        ));
+    }
 
     let id: RepositoryId = Context::from(req.id).into();
 

@@ -498,6 +498,7 @@ async fn launch_grpc_server(
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
+    domain_context: Option<Arc<crate::domain::DomainContext>>,
     jwt_verifier: Option<JwtVerifier>,
     settings: Settings,
     notification_sender: Arc<dyn NotificationSender>,
@@ -571,6 +572,7 @@ async fn launch_grpc_server(
         .with_immutable_store(immutable_store, local_store)
         .with_mutable_store(mutable_store)
         .with_lock_store(lock_store)
+        .with_domain_context(domain_context)
         .with_notification(notification_sender, notification_service)
         .with_hook_dispatcher(hook_dispatcher)
         .with_tls_config(cert_path, key_path, cert_chain_path)?
@@ -662,6 +664,7 @@ async fn launch_grpc_internal_server(
     mutable_store: Arc<dyn MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
+    domain_context: Option<Arc<crate::domain::DomainContext>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let grpc_settings = settings
@@ -697,6 +700,7 @@ async fn launch_grpc_internal_server(
             notification_sender,
             hook_dispatcher,
             settings.environment.clone().unwrap_or_default(),
+            domain_context,
         )?
         .with_tls_config(cert_path, key_path, cert_chain_path)?
         .with_http2_config(
@@ -1895,6 +1899,14 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
 
     let lock_store = configure_lock_store_via_plugin(&plugin_registry, &settings)?;
 
+    // CR-029: the domain coordinator is built here, not inside the gRPC launch
+    // task, so a readiness refusal over an incomplete backfill aborts startup
+    // instead of being logged from a spawned task.
+    let domain_context = crate::domain::configure_domain_context(&settings).await?;
+    // The internal forwarding endpoint reaches the same repository handlers, so
+    // it gets the same coordinator handle rather than an ungoverned bypass.
+    let internal_domain_context = domain_context.clone();
+
     let connection_close_timeout =
         Duration::from_secs(settings.server.connection_close_timeout_seconds as u64);
 
@@ -2043,6 +2055,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 local_immutable_store,
                 mutable_store,
                 lock_store,
+                domain_context,
                 jwt_verifier,
                 settings,
                 notification,
@@ -2086,6 +2099,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     mutable_store,
                     notification_sender,
                     hook_dispatcher,
+                    internal_domain_context,
                     shutdown_rx,
                 )
             });

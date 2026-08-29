@@ -9,7 +9,12 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::domain::DomainContext;
+use crate::domain::GovernedScope;
+use crate::domain::admit_at_entry;
+use crate::domain::reject_unwired_governed_operation;
 use crate::grpc::forwarded_requests::CallerContext;
+use crate::grpc::get_authorization_optional;
 use crate::grpc::repository::v1::repository_create::repository_create_implementation;
 use crate::hooks::HookDispatcher;
 
@@ -24,11 +29,37 @@ pub async fn handler(
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
     let caller_context = CallerContext::from_forwarded_request(&request)?;
+    // Captured before `into_inner` consumes the request.
+    let request_metadata = request.metadata().clone();
+    let request_authorization = get_authorization_optional(request.extensions());
+    let req = request.into_inner();
+
+    // CR-029 R-BLOCK-2, at this entry point specifically. This handler
+    // delegates to the same `repository_create_implementation` the front-door
+    // v1 handler uses, so gating only the front door would leave this path
+    // ungoverned — the exact "wired into the front-door service only" failure
+    // CR-029's expected-source-scope correction #5 names. Note also that this
+    // service runs behind no interceptor at all, so `request_authorization` is
+    // `None` here and any carriage is refused as unauthenticated.
+    if let Some(admitted) = admit_at_entry(
+        domain_context,
+        &request_metadata,
+        request_authorization.as_ref(),
+        GovernedScope::RepositoryCreate {
+            repository_id: &req.id,
+        },
+    )? {
+        return Err(reject_unwired_governed_operation(
+            &admitted,
+            "lore.forwarded_repository.v1.ForwardedRepositoryService/RepositoryCreate",
+        ));
+    }
 
     repository_create_implementation(
-        request.into_inner(),
+        req,
         caller_context,
         auth_url,
         immutable_store,
@@ -104,6 +135,7 @@ mod test {
                 mutable_store,
                 &hook_dispatcher,
                 &TestInstrumentProvider,
+                None, /* no domain coordinator */
             )
             .await
             .expect_err("missing user id should fail");
@@ -135,6 +167,7 @@ mod test {
                     mutable_store,
                     &hook_dispatcher,
                     &TestInstrumentProvider,
+                    None, /* no domain coordinator */
                 )
                 .await
                 .expect("Request failed");
@@ -167,6 +200,7 @@ mod test {
                     mutable_store.clone(),
                     &hook_dispatcher,
                     &TestInstrumentProvider,
+                    None, /* no domain coordinator */
                 )
                 .await
                 .expect("first create should succeed");
@@ -179,6 +213,7 @@ mod test {
                     mutable_store,
                     &hook_dispatcher,
                     &TestInstrumentProvider,
+                    None, /* no domain coordinator */
                 )
                 .await
                 .expect_err("duplicate id with different name should fail");

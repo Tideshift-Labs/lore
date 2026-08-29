@@ -22,10 +22,15 @@ use tracing::info;
 
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
+use crate::domain::DomainContext;
+use crate::domain::GovernedScope;
+use crate::domain::admit_at_entry;
+use crate::domain::reject_unwired_governed_operation;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
+use crate::grpc::get_authorization_optional;
 use crate::grpc::get_user_id;
 use crate::grpc::handlers::repository_delete::repository_delete_auth_resource;
 use crate::util::setup_execution;
@@ -43,12 +48,33 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     instrument_provider: &impl InstrumentProvider,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<RepositoryDeleteResponse>, Status> {
+    // Captured before `into_inner` consumes the request: the domain-operation
+    // headers and the verified principal both live outside the message body.
+    let request_metadata = request.metadata().clone();
+    let request_authorization = get_authorization_optional(request.extensions());
     let user_info = get_authorization(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
+
+    // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
+    // at handler entry, before any handler logic or authorization side effect.
+    if let Some(admitted) = admit_at_entry(
+        domain_context,
+        &request_metadata,
+        request_authorization.as_ref(),
+        GovernedScope::TargetRepository {
+            repository_id: &req.id,
+        },
+    )? {
+        return Err(reject_unwired_governed_operation(
+            &admitted,
+            "lore.repository.v1.RepositoryService/RepositoryDelete",
+        ));
+    }
 
     // TODO(mjansson): Once the authz model has read/write/admin, replace
     // the service-account bypass with a proper permission check.
