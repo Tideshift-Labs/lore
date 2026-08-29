@@ -278,9 +278,16 @@ impl PostgresDomainStore {
         Ok(())
     }
 
-    /// Pool handle for the backfill and, from Phase 3, the transaction methods.
+    /// Pool handle for the backfill and the transaction methods.
     pub(crate) fn pool(&self) -> &Pool {
         &self.pool
+    }
+
+    /// Shared instruments. One histogram keyed by `{store, operation}`, so the
+    /// label set stays low-cardinality: `operation` is a fixed, closed set of
+    /// method names, never a repository or branch identity.
+    pub(crate) fn instruments(&self) -> &crate::metrics::Instruments {
+        &self.instruments
     }
 }
 

@@ -41,9 +41,13 @@
 
 pub mod backfill;
 pub mod bypass;
+pub mod coordinator;
 pub mod errors;
+pub mod lock_order;
 pub mod outbox;
+pub mod postgres_coordinator;
 pub mod receipts;
+pub mod retry;
 pub mod schema;
 pub mod schema_mediated;
 pub mod store;
