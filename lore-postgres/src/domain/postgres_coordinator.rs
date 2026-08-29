@@ -215,6 +215,78 @@ impl DomainTransactionStore for PostgresDomainStore {
         Ok(result)
     }
 
+    async fn domain_operation_verified_stale_finalize(
+        &self,
+        input: &crate::domain::maintenance::VerifiedStaleFinalizeInput,
+    ) -> Result<crate::domain::maintenance::VerifiedStaleFinalizeResult, DomainError> {
+        let _t = self.instruments().start(
+            "domain_operation_verified_stale_finalize",
+            self.pool().status(),
+        );
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("verified stale finalize transaction", e))?;
+        let result = crate::domain::maintenance::verified_stale_finalize(&tx, input).await?;
+        classify_commit(tx.commit().await, "verified stale finalize commit")?;
+        Ok(result)
+    }
+
+    async fn domain_operation_terminal_status_attach(
+        &self,
+        input: &crate::domain::maintenance::TerminalStatusAttachInput,
+    ) -> Result<crate::domain::maintenance::TerminalStatusAttachmentAck, DomainError> {
+        let _t = self.instruments().start(
+            "domain_operation_terminal_status_attach",
+            self.pool().status(),
+        );
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("terminal status attach transaction", e))?;
+        let result = crate::domain::maintenance::terminal_status_attach(&tx, input).await?;
+        classify_commit(tx.commit().await, "terminal status attach commit")?;
+        Ok(result)
+    }
+
+    async fn domain_operation_proof_namespace_materialize(
+        &self,
+        input: &crate::domain::maintenance::ProofNamespaceMaterializeInput,
+    ) -> Result<crate::domain::maintenance::ProofNamespaceMaterializeReceipt, DomainError> {
+        let _t = self.instruments().start(
+            "domain_operation_proof_namespace_materialize",
+            self.pool().status(),
+        );
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("proof namespace materialize transaction", e))?;
+        let result = crate::domain::maintenance::proof_namespace_materialize(&tx, input).await?;
+        classify_commit(tx.commit().await, "proof namespace materialize commit")?;
+        Ok(result)
+    }
+
+    async fn domain_operation_proof_namespace_retire(
+        &self,
+        input: &crate::domain::maintenance::ProofNamespaceRetireInput,
+    ) -> Result<crate::domain::maintenance::ProofNamespaceRetireAck, DomainError> {
+        let _t = self.instruments().start(
+            "domain_operation_proof_namespace_retire",
+            self.pool().status(),
+        );
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("proof namespace retire transaction", e))?;
+        let result = crate::domain::maintenance::proof_namespace_retire(&tx, input).await?;
+        classify_commit(tx.commit().await, "proof namespace retire commit")?;
+        Ok(result)
+    }
+
     async fn repository_snapshot(
         &self,
         repository_id: &[u8],

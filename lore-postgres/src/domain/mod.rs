@@ -44,6 +44,7 @@ pub mod bypass;
 pub mod coordinator;
 pub mod errors;
 pub mod lock_order;
+pub mod maintenance;
 pub mod outbox;
 pub mod postgres_coordinator;
 pub mod receipts;

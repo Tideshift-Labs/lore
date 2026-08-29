@@ -50,6 +50,14 @@ use async_trait::async_trait;
 
 use crate::domain::errors::DomainError;
 use crate::domain::errors::DomainOutcome;
+use crate::domain::maintenance::ProofNamespaceMaterializeInput;
+use crate::domain::maintenance::ProofNamespaceMaterializeReceipt;
+use crate::domain::maintenance::ProofNamespaceRetireAck;
+use crate::domain::maintenance::ProofNamespaceRetireInput;
+use crate::domain::maintenance::TerminalStatusAttachInput;
+use crate::domain::maintenance::TerminalStatusAttachmentAck;
+use crate::domain::maintenance::VerifiedStaleFinalizeInput;
+use crate::domain::maintenance::VerifiedStaleFinalizeResult;
 use crate::domain::receipts::AuthorizationWitness;
 use crate::domain::receipts::OperationBinding;
 use crate::domain::receipts::PrepareResult;
@@ -308,6 +316,31 @@ pub trait DomainTransactionStore: Send + Sync {
         key: &ReceiptKey,
         binding: &OperationBinding,
     ) -> Result<ReceiptLookup, DomainError>;
+
+    /// Terminalize an already-verified stale operation only after auth-grpc
+    /// atomically claims its current finalizer permit.
+    async fn domain_operation_verified_stale_finalize(
+        &self,
+        input: &VerifiedStaleFinalizeInput,
+    ) -> Result<VerifiedStaleFinalizeResult, DomainError>;
+
+    /// Persist/advance the two-phase terminal attachment lifecycle.
+    async fn domain_operation_terminal_status_attach(
+        &self,
+        input: &TerminalStatusAttachInput,
+    ) -> Result<TerminalStatusAttachmentAck, DomainError>;
+
+    /// Materialize a platform-reserved proof namespace in Lore Postgres.
+    async fn domain_operation_proof_namespace_materialize(
+        &self,
+        input: &ProofNamespaceMaterializeInput,
+    ) -> Result<ProofNamespaceMaterializeReceipt, DomainError>;
+
+    /// Retire an exact quiescent proof namespace epoch.
+    async fn domain_operation_proof_namespace_retire(
+        &self,
+        input: &ProofNamespaceRetireInput,
+    ) -> Result<ProofNamespaceRetireAck, DomainError>;
 
     /// Read one repository's domain row. `None` when the identity never existed.
     async fn repository_snapshot(

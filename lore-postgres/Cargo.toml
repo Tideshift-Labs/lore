@@ -17,6 +17,7 @@ hex = { workspace = true }
 # The prepare consume token is a 256-bit CSPRNG value, so rand is a real
 # dependency now, not just a test one.
 rand = { workspace = true }
+ring = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
@@ -47,3 +48,4 @@ lore-telemetry = { workspace = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }
+tokio-util = { workspace = true }

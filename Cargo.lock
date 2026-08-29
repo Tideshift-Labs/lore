@@ -2872,6 +2872,7 @@ dependencies = [
  "lore-telemetry",
  "opentelemetry",
  "rand 0.9.4",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
@@ -2880,6 +2881,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
