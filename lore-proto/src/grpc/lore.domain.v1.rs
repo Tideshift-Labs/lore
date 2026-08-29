@@ -174,6 +174,366 @@ impl ::prost::Name for DomainOperationReceiptGetResponse {
         "/lore.domain.v1.DomainOperationReceiptGetResponse".into()
     }
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationVerifiedStaleFinalizeRequest {
+    #[prost(string, tag = "1")]
+    pub verified_issuer: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub authenticated_subject: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub org_uuid: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub initiating_principal_namespace: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub operation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "6")]
+    pub method: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub scope: ::prost::bytes::Bytes,
+    #[prost(uint32, tag = "8")]
+    pub fingerprint_version: u32,
+    #[prost(bytes = "bytes", tag = "9")]
+    pub fingerprint: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "10")]
+    pub canonical_intent_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "11")]
+    pub authorization_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "12")]
+    pub authorization_revision: u64,
+    #[prost(bytes = "bytes", tag = "13")]
+    pub verification_nonce: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "14")]
+    pub bound_fields_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "15")]
+    pub consumed_ticket_sha256: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "16")]
+    pub expected_claim_identity_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "17")]
+    pub stale_finalize_permit: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "18")]
+    pub stale_finalize_permit_revision: u64,
+}
+impl ::prost::Name for DomainOperationVerifiedStaleFinalizeRequest {
+    const NAME: &'static str = "DomainOperationVerifiedStaleFinalizeRequest";
+    const PACKAGE: &'static str = "lore.domain.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.domain.v1.DomainOperationVerifiedStaleFinalizeRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.domain.v1.DomainOperationVerifiedStaleFinalizeRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationVerifiedStaleFinalizeResponse {
+    #[prost(enumeration = "DomainOperationVerifiedStaleFinalizeStatus", tag = "1")]
+    pub status: i32,
+    #[prost(uint64, tag = "2")]
+    pub stale_finalize_permit_revision: u64,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub committed_receipt_canonical: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub committed_receipt_sha256: ::prost::bytes::Bytes,
+    #[prost(int64, optional, tag = "5")]
+    pub stale_finalize_clock_unix_millis: ::core::option::Option<i64>,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub response_digest: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for DomainOperationVerifiedStaleFinalizeResponse {
+    const NAME: &'static str = "DomainOperationVerifiedStaleFinalizeResponse";
+    const PACKAGE: &'static str = "lore.domain.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.domain.v1.DomainOperationVerifiedStaleFinalizeResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.domain.v1.DomainOperationVerifiedStaleFinalizeResponse".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationTerminalStatusAttachRequest {
+    #[prost(string, tag = "1")]
+    pub verified_issuer: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub authenticated_subject: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub org_uuid: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub initiating_principal_namespace: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub operation_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub authorization_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "7")]
+    pub authorization_revision: u64,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub claim_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "9")]
+    pub claim_revision: u64,
+    #[prost(enumeration = "DomainOperationOutcome", tag = "10")]
+    pub terminal_outcome: i32,
+    #[prost(bytes = "bytes", tag = "11")]
+    pub terminal_receipt_sha256: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "12")]
+    pub platform_terminal_status_revision: u64,
+    #[prost(int64, tag = "13")]
+    pub acknowledged_at_unix_millis: i64,
+    #[prost(enumeration = "TerminalStatusAttachPhaseV1", tag = "14")]
+    pub phase: i32,
+    #[prost(uint64, tag = "15")]
+    pub reserve_charge_revision: u64,
+    #[prost(bytes = "bytes", tag = "16")]
+    pub reserve_charge_nonce: ::prost::bytes::Bytes,
+    #[prost(enumeration = "TerminalStatusAttachPhase2ActionV1", tag = "17")]
+    pub phase2_action: i32,
+    #[prost(bytes = "bytes", tag = "18")]
+    pub release_tombstone_digest: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "19")]
+    pub active_release_intent_revision: u64,
+    #[prost(bytes = "bytes", tag = "20")]
+    pub active_release_intent_nonce: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "21")]
+    pub tombstone_reservation_revision: u64,
+    #[prost(bytes = "bytes", tag = "22")]
+    pub tombstone_reservation_nonce: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "23")]
+    pub final_prune_digest: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "24")]
+    pub tombstone_release_intent_revision: u64,
+    #[prost(bytes = "bytes", tag = "25")]
+    pub tombstone_release_intent_nonce: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "26")]
+    pub release_proof_reservation_revision: u64,
+    #[prost(bytes = "bytes", tag = "27")]
+    pub release_proof_reservation_nonce: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "28")]
+    pub completion_marker_sequence: u64,
+    #[prost(bytes = "bytes", tag = "29")]
+    pub expected_completion_marker_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "30")]
+    pub request_digest: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for DomainOperationTerminalStatusAttachRequest {
+    const NAME: &'static str = "DomainOperationTerminalStatusAttachRequest";
+    const PACKAGE: &'static str = "lore.domain.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.domain.v1.DomainOperationTerminalStatusAttachRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.domain.v1.DomainOperationTerminalStatusAttachRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationTerminalStatusAttachmentAckV1 {
+    #[prost(enumeration = "DomainOperationTerminalStatusAttachmentStatusV1", tag = "1")]
+    pub status: i32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub terminal_ack_canonical: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub terminal_ack_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub receipt_prune_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub fence_prune_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub release_tombstone_digest: ::prost::bytes::Bytes,
+    #[prost(int64, optional, tag = "7")]
+    pub tombstone_created_at_unix_millis: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "8")]
+    pub tombstone_retain_until_unix_millis: ::core::option::Option<i64>,
+    #[prost(bytes = "bytes", tag = "9")]
+    pub active_release_ack_digest: ::prost::bytes::Bytes,
+    #[prost(int64, optional, tag = "10")]
+    pub active_release_ack_at_unix_millis: ::core::option::Option<i64>,
+    #[prost(bytes = "bytes", tag = "11")]
+    pub tombstone_reservation_claim_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "12")]
+    pub final_prune_digest: ::prost::bytes::Bytes,
+    #[prost(int64, optional, tag = "13")]
+    pub final_pruned_at_unix_millis: ::core::option::Option<i64>,
+    #[prost(bytes = "bytes", tag = "14")]
+    pub completion_marker_digest: ::prost::bytes::Bytes,
+    #[prost(int64, optional, tag = "15")]
+    pub completion_marker_created_at_unix_millis: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "16")]
+    pub completion_marker_retain_until_unix_millis: ::core::option::Option<i64>,
+    #[prost(uint64, tag = "17")]
+    pub completion_marker_sequence: u64,
+    #[prost(bytes = "bytes", tag = "18")]
+    pub completion_marker_proof_digest: ::prost::bytes::Bytes,
+    #[prost(uint64, optional, tag = "19")]
+    pub prune_range_start_sequence: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "20")]
+    pub prune_range_end_sequence: ::core::option::Option<u64>,
+    #[prost(bytes = "bytes", tag = "21")]
+    pub prune_range_digest: ::prost::bytes::Bytes,
+    #[prost(uint64, optional, tag = "22")]
+    pub prune_range_generation: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "23")]
+    pub informational_high_water: ::core::option::Option<u64>,
+    #[prost(bytes = "bytes", tag = "24")]
+    pub response_digest: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for DomainOperationTerminalStatusAttachmentAckV1 {
+    const NAME: &'static str = "DomainOperationTerminalStatusAttachmentAckV1";
+    const PACKAGE: &'static str = "lore.domain.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.domain.v1.DomainOperationTerminalStatusAttachmentAckV1".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.domain.v1.DomainOperationTerminalStatusAttachmentAckV1".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationProofNamespaceMaterializeRequestV1 {
+    #[prost(uint32, tag = "1")]
+    pub protocol_revision: u32,
+    #[prost(string, tag = "2")]
+    pub verified_issuer: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub authenticated_subject: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub org_uuid: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub initiating_principal_namespace: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub namespace_epoch: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "7")]
+    pub namespace_claim_revision: u64,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub namespace_claim_nonce: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "9")]
+    pub platform_capacity_revision: u64,
+    #[prost(uint64, tag = "10")]
+    pub lore_local_capacity_revision: u64,
+    #[prost(bytes = "bytes", tag = "11")]
+    pub request_digest: ::prost::bytes::Bytes,
+    #[prost(string, tag = "12")]
+    pub materialization_jwt: ::prost::alloc::string::String,
+}
+impl ::prost::Name for DomainOperationProofNamespaceMaterializeRequestV1 {
+    const NAME: &'static str = "DomainOperationProofNamespaceMaterializeRequestV1";
+    const PACKAGE: &'static str = "lore.domain.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.domain.v1.DomainOperationProofNamespaceMaterializeRequestV1".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.domain.v1.DomainOperationProofNamespaceMaterializeRequestV1".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationProofNamespaceMaterializeReceiptV1 {
+    #[prost(enumeration = "DomainOperationProofNamespaceMaterializeStatusV1", tag = "1")]
+    pub status: i32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub namespace_epoch: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "3")]
+    pub namespace_claim_revision: u64,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub namespace_claim_nonce: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "5")]
+    pub lore_namespace_revision: u64,
+    #[prost(uint64, tag = "6")]
+    pub lore_global_counter_revision: u64,
+    #[prost(uint64, tag = "7")]
+    pub lore_org_counter_revision: u64,
+    #[prost(int64, tag = "8")]
+    pub created_at_unix_millis: i64,
+    #[prost(bytes = "bytes", tag = "9")]
+    pub materialization_receipt_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "10")]
+    pub response_digest: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for DomainOperationProofNamespaceMaterializeReceiptV1 {
+    const NAME: &'static str = "DomainOperationProofNamespaceMaterializeReceiptV1";
+    const PACKAGE: &'static str = "lore.domain.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.domain.v1.DomainOperationProofNamespaceMaterializeReceiptV1".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.domain.v1.DomainOperationProofNamespaceMaterializeReceiptV1".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationProofNamespaceRetireRequestV1 {
+    #[prost(uint32, tag = "1")]
+    pub protocol_revision: u32,
+    #[prost(string, tag = "2")]
+    pub verified_issuer: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub authenticated_subject: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub org_uuid: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub initiating_principal_namespace: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub namespace_epoch: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "7")]
+    pub quota_revision: u64,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub final_range_set_digest: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "9")]
+    pub final_high_water: u64,
+    #[prost(uint64, tag = "10")]
+    pub retirement_fence_generation: u64,
+    #[prost(uint64, tag = "11")]
+    pub retirement_permit_revision: u64,
+    #[prost(int64, tag = "12")]
+    pub issued_at_unix_millis: i64,
+    #[prost(int64, tag = "13")]
+    pub expires_at_unix_millis: i64,
+    #[prost(bytes = "bytes", tag = "14")]
+    pub zero_platform_state_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "15")]
+    pub request_digest: ::prost::bytes::Bytes,
+    #[prost(string, tag = "16")]
+    pub retirement_permit_jwt: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "17")]
+    pub namespace_claim_revision: u64,
+    #[prost(bytes = "bytes", tag = "18")]
+    pub namespace_claim_nonce: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for DomainOperationProofNamespaceRetireRequestV1 {
+    const NAME: &'static str = "DomainOperationProofNamespaceRetireRequestV1";
+    const PACKAGE: &'static str = "lore.domain.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.domain.v1.DomainOperationProofNamespaceRetireRequestV1".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.domain.v1.DomainOperationProofNamespaceRetireRequestV1".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationProofNamespaceRetireAckV1 {
+    #[prost(enumeration = "DomainOperationProofNamespaceRetireStatusV1", tag = "1")]
+    pub status: i32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub namespace_epoch: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "3")]
+    pub retirement_fence_generation: u64,
+    #[prost(uint64, tag = "4")]
+    pub quota_revision: u64,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub final_range_set_digest: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "6")]
+    pub final_high_water: u64,
+    #[prost(int64, optional, tag = "7")]
+    pub retired_at_unix_millis: ::core::option::Option<i64>,
+    #[prost(uint64, tag = "8")]
+    pub namespace_claim_revision: u64,
+    #[prost(bytes = "bytes", tag = "9")]
+    pub namespace_claim_nonce: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "10")]
+    pub response_digest: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for DomainOperationProofNamespaceRetireAckV1 {
+    const NAME: &'static str = "DomainOperationProofNamespaceRetireAckV1";
+    const PACKAGE: &'static str = "lore.domain.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.domain.v1.DomainOperationProofNamespaceRetireAckV1".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.domain.v1.DomainOperationProofNamespaceRetireAckV1".into()
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum DomainOperationPrepareStatus {
@@ -294,6 +654,364 @@ impl DomainOperationReceiptStatus {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DomainOperationVerifiedStaleFinalizeStatus {
+    Unspecified = 0,
+    Committed = 1,
+    NotEligibleNotStale = 2,
+    IneligibleReceiptOrDispatchPossible = 3,
+    IneligibleFinalizePermit = 4,
+    Mismatch = 5,
+}
+impl DomainOperationVerifiedStaleFinalizeStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => {
+                "DOMAIN_OPERATION_VERIFIED_STALE_FINALIZE_STATUS_UNSPECIFIED"
+            }
+            Self::Committed => {
+                "DOMAIN_OPERATION_VERIFIED_STALE_FINALIZE_STATUS_COMMITTED"
+            }
+            Self::NotEligibleNotStale => {
+                "DOMAIN_OPERATION_VERIFIED_STALE_FINALIZE_STATUS_NOT_ELIGIBLE_NOT_STALE"
+            }
+            Self::IneligibleReceiptOrDispatchPossible => {
+                "DOMAIN_OPERATION_VERIFIED_STALE_FINALIZE_STATUS_INELIGIBLE_RECEIPT_OR_DISPATCH_POSSIBLE"
+            }
+            Self::IneligibleFinalizePermit => {
+                "DOMAIN_OPERATION_VERIFIED_STALE_FINALIZE_STATUS_INELIGIBLE_FINALIZE_PERMIT"
+            }
+            Self::Mismatch => "DOMAIN_OPERATION_VERIFIED_STALE_FINALIZE_STATUS_MISMATCH",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "DOMAIN_OPERATION_VERIFIED_STALE_FINALIZE_STATUS_UNSPECIFIED" => {
+                Some(Self::Unspecified)
+            }
+            "DOMAIN_OPERATION_VERIFIED_STALE_FINALIZE_STATUS_COMMITTED" => {
+                Some(Self::Committed)
+            }
+            "DOMAIN_OPERATION_VERIFIED_STALE_FINALIZE_STATUS_NOT_ELIGIBLE_NOT_STALE" => {
+                Some(Self::NotEligibleNotStale)
+            }
+            "DOMAIN_OPERATION_VERIFIED_STALE_FINALIZE_STATUS_INELIGIBLE_RECEIPT_OR_DISPATCH_POSSIBLE" => {
+                Some(Self::IneligibleReceiptOrDispatchPossible)
+            }
+            "DOMAIN_OPERATION_VERIFIED_STALE_FINALIZE_STATUS_INELIGIBLE_FINALIZE_PERMIT" => {
+                Some(Self::IneligibleFinalizePermit)
+            }
+            "DOMAIN_OPERATION_VERIFIED_STALE_FINALIZE_STATUS_MISMATCH" => {
+                Some(Self::Mismatch)
+            }
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TerminalStatusAttachPhaseV1 {
+    Unspecified = 0,
+    Phase1TerminalAck = 1,
+    Phase2ReleaseAck = 2,
+}
+impl TerminalStatusAttachPhaseV1 {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TERMINAL_STATUS_ATTACH_PHASE_V1_UNSPECIFIED",
+            Self::Phase1TerminalAck => {
+                "TERMINAL_STATUS_ATTACH_PHASE_V1_PHASE1_TERMINAL_ACK"
+            }
+            Self::Phase2ReleaseAck => {
+                "TERMINAL_STATUS_ATTACH_PHASE_V1_PHASE2_RELEASE_ACK"
+            }
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TERMINAL_STATUS_ATTACH_PHASE_V1_UNSPECIFIED" => Some(Self::Unspecified),
+            "TERMINAL_STATUS_ATTACH_PHASE_V1_PHASE1_TERMINAL_ACK" => {
+                Some(Self::Phase1TerminalAck)
+            }
+            "TERMINAL_STATUS_ATTACH_PHASE_V1_PHASE2_RELEASE_ACK" => {
+                Some(Self::Phase2ReleaseAck)
+            }
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TerminalStatusAttachPhase2ActionV1 {
+    Unspecified = 0,
+    ActiveReleaseIntentAck = 1,
+    TombstonePrunePoll = 2,
+    TombstoneReleaseIntentComplete = 3,
+}
+impl TerminalStatusAttachPhase2ActionV1 {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TERMINAL_STATUS_ATTACH_PHASE2_ACTION_V1_UNSPECIFIED",
+            Self::ActiveReleaseIntentAck => {
+                "TERMINAL_STATUS_ATTACH_PHASE2_ACTION_V1_ACTIVE_RELEASE_INTENT_ACK"
+            }
+            Self::TombstonePrunePoll => {
+                "TERMINAL_STATUS_ATTACH_PHASE2_ACTION_V1_TOMBSTONE_PRUNE_POLL"
+            }
+            Self::TombstoneReleaseIntentComplete => {
+                "TERMINAL_STATUS_ATTACH_PHASE2_ACTION_V1_TOMBSTONE_RELEASE_INTENT_COMPLETE"
+            }
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TERMINAL_STATUS_ATTACH_PHASE2_ACTION_V1_UNSPECIFIED" => {
+                Some(Self::Unspecified)
+            }
+            "TERMINAL_STATUS_ATTACH_PHASE2_ACTION_V1_ACTIVE_RELEASE_INTENT_ACK" => {
+                Some(Self::ActiveReleaseIntentAck)
+            }
+            "TERMINAL_STATUS_ATTACH_PHASE2_ACTION_V1_TOMBSTONE_PRUNE_POLL" => {
+                Some(Self::TombstonePrunePoll)
+            }
+            "TERMINAL_STATUS_ATTACH_PHASE2_ACTION_V1_TOMBSTONE_RELEASE_INTENT_COMPLETE" => {
+                Some(Self::TombstoneReleaseIntentComplete)
+            }
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DomainOperationTerminalStatusAttachmentStatusV1 {
+    Unspecified = 0,
+    Phase1PendingRetention = 1,
+    Phase1TombstoneReady = 2,
+    Phase2ActiveReleaseAcked = 3,
+    Phase2TombstoneRetentionPending = 4,
+    Phase2TombstoneFinalPruned = 5,
+    Phase2ReleaseCompletionReady = 6,
+    Phase2PostPruneRecovery = 7,
+    Phase2PostPruneCompletionReplayRequired = 8,
+    Mismatch = 9,
+    Invalid = 10,
+}
+impl DomainOperationTerminalStatusAttachmentStatusV1 {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => {
+                "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_UNSPECIFIED"
+            }
+            Self::Phase1PendingRetention => {
+                "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE1_PENDING_RETENTION"
+            }
+            Self::Phase1TombstoneReady => {
+                "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE1_TOMBSTONE_READY"
+            }
+            Self::Phase2ActiveReleaseAcked => {
+                "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_ACTIVE_RELEASE_ACKED"
+            }
+            Self::Phase2TombstoneRetentionPending => {
+                "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_TOMBSTONE_RETENTION_PENDING"
+            }
+            Self::Phase2TombstoneFinalPruned => {
+                "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_TOMBSTONE_FINAL_PRUNED"
+            }
+            Self::Phase2ReleaseCompletionReady => {
+                "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_RELEASE_COMPLETION_READY"
+            }
+            Self::Phase2PostPruneRecovery => {
+                "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_POST_PRUNE_RECOVERY"
+            }
+            Self::Phase2PostPruneCompletionReplayRequired => {
+                "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_POST_PRUNE_COMPLETION_REPLAY_REQUIRED"
+            }
+            Self::Mismatch => {
+                "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_MISMATCH"
+            }
+            Self::Invalid => {
+                "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_INVALID"
+            }
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_UNSPECIFIED" => {
+                Some(Self::Unspecified)
+            }
+            "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE1_PENDING_RETENTION" => {
+                Some(Self::Phase1PendingRetention)
+            }
+            "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE1_TOMBSTONE_READY" => {
+                Some(Self::Phase1TombstoneReady)
+            }
+            "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_ACTIVE_RELEASE_ACKED" => {
+                Some(Self::Phase2ActiveReleaseAcked)
+            }
+            "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_TOMBSTONE_RETENTION_PENDING" => {
+                Some(Self::Phase2TombstoneRetentionPending)
+            }
+            "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_TOMBSTONE_FINAL_PRUNED" => {
+                Some(Self::Phase2TombstoneFinalPruned)
+            }
+            "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_RELEASE_COMPLETION_READY" => {
+                Some(Self::Phase2ReleaseCompletionReady)
+            }
+            "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_POST_PRUNE_RECOVERY" => {
+                Some(Self::Phase2PostPruneRecovery)
+            }
+            "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_POST_PRUNE_COMPLETION_REPLAY_REQUIRED" => {
+                Some(Self::Phase2PostPruneCompletionReplayRequired)
+            }
+            "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_MISMATCH" => {
+                Some(Self::Mismatch)
+            }
+            "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_INVALID" => {
+                Some(Self::Invalid)
+            }
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DomainOperationProofNamespaceMaterializeStatusV1 {
+    Unspecified = 0,
+    Materialized = 1,
+    Mismatch = 2,
+    CapacityBlocked = 3,
+    Invalid = 4,
+}
+impl DomainOperationProofNamespaceMaterializeStatusV1 {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => {
+                "DOMAIN_OPERATION_PROOF_NAMESPACE_MATERIALIZE_STATUS_V1_UNSPECIFIED"
+            }
+            Self::Materialized => {
+                "DOMAIN_OPERATION_PROOF_NAMESPACE_MATERIALIZE_STATUS_V1_MATERIALIZED"
+            }
+            Self::Mismatch => {
+                "DOMAIN_OPERATION_PROOF_NAMESPACE_MATERIALIZE_STATUS_V1_MISMATCH"
+            }
+            Self::CapacityBlocked => {
+                "DOMAIN_OPERATION_PROOF_NAMESPACE_MATERIALIZE_STATUS_V1_CAPACITY_BLOCKED"
+            }
+            Self::Invalid => {
+                "DOMAIN_OPERATION_PROOF_NAMESPACE_MATERIALIZE_STATUS_V1_INVALID"
+            }
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "DOMAIN_OPERATION_PROOF_NAMESPACE_MATERIALIZE_STATUS_V1_UNSPECIFIED" => {
+                Some(Self::Unspecified)
+            }
+            "DOMAIN_OPERATION_PROOF_NAMESPACE_MATERIALIZE_STATUS_V1_MATERIALIZED" => {
+                Some(Self::Materialized)
+            }
+            "DOMAIN_OPERATION_PROOF_NAMESPACE_MATERIALIZE_STATUS_V1_MISMATCH" => {
+                Some(Self::Mismatch)
+            }
+            "DOMAIN_OPERATION_PROOF_NAMESPACE_MATERIALIZE_STATUS_V1_CAPACITY_BLOCKED" => {
+                Some(Self::CapacityBlocked)
+            }
+            "DOMAIN_OPERATION_PROOF_NAMESPACE_MATERIALIZE_STATUS_V1_INVALID" => {
+                Some(Self::Invalid)
+            }
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DomainOperationProofNamespaceRetireStatusV1 {
+    Unspecified = 0,
+    Retired = 1,
+    RetiredOrAbsent = 2,
+    NotQuiescent = 3,
+    Mismatch = 4,
+    Expired = 5,
+    Invalid = 6,
+}
+impl DomainOperationProofNamespaceRetireStatusV1 {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => {
+                "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_UNSPECIFIED"
+            }
+            Self::Retired => "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_RETIRED",
+            Self::RetiredOrAbsent => {
+                "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_RETIRED_OR_ABSENT"
+            }
+            Self::NotQuiescent => {
+                "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_NOT_QUIESCENT"
+            }
+            Self::Mismatch => {
+                "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_MISMATCH"
+            }
+            Self::Expired => "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_EXPIRED",
+            Self::Invalid => "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_INVALID",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_UNSPECIFIED" => {
+                Some(Self::Unspecified)
+            }
+            "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_RETIRED" => {
+                Some(Self::Retired)
+            }
+            "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_RETIRED_OR_ABSENT" => {
+                Some(Self::RetiredOrAbsent)
+            }
+            "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_NOT_QUIESCENT" => {
+                Some(Self::NotQuiescent)
+            }
+            "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_MISMATCH" => {
+                Some(Self::Mismatch)
+            }
+            "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_EXPIRED" => {
+                Some(Self::Expired)
+            }
+            "DOMAIN_OPERATION_PROOF_NAMESPACE_RETIRE_STATUS_V1_INVALID" => {
+                Some(Self::Invalid)
+            }
+            _ => None,
+        }
+    }
+}
 /// Generated client implementations.
 pub mod domain_operation_service_client {
     #![allow(
@@ -306,16 +1024,18 @@ pub mod domain_operation_service_client {
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
     /// FORK-LOCAL (Tideshift, CR-029). This private server-only service is the
-    /// prepare/receipt rail for Lorehub's control plane. The current API-first slice
-    /// pins these on-the-wire method paths:
+    /// private receipt and proof-namespace maintenance rail for Lorehub's control
+    /// plane. The on-the-wire method paths are:
     /// /lore.domain.v1.DomainOperationService/DomainOperationClockGet
     /// /lore.domain.v1.DomainOperationService/DomainOperationPrepare
     /// /lore.domain.v1.DomainOperationService/DomainOperationReceiptGet
+    /// /lore.domain.v1.DomainOperationService/DomainOperationVerifiedStaleFinalize
+    /// /lore.domain.v1.DomainOperationService/DomainOperationTerminalStatusAttach
+    /// /lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceMaterialize
+    /// /lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceRetire
     /// No upstream package claims lore.domain.v1 today. If upstream adds that
     /// package or any method/message below, reconcile names and every field/enum tag
-    /// before regeneration. CR-029's remaining four v2 methods are not declared
-    /// until their store contracts exist; this partial rail must not advertise the
-    /// domain_operation_receipt_v2 capability.
+    /// before regeneration.
     #[derive(Debug, Clone)]
     pub struct DomainOperationServiceClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -413,7 +1133,7 @@ pub mod domain_operation_service_client {
                         format!("Service was not ready: {}", e.into()),
                     )
                 })?;
-            let codec = tonic_prost::ProstCodec::default();
+            let codec = crate::DomainOperationV2StrictCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/lore.domain.v1.DomainOperationService/DomainOperationClockGet",
             );
@@ -442,7 +1162,7 @@ pub mod domain_operation_service_client {
                         format!("Service was not ready: {}", e.into()),
                     )
                 })?;
-            let codec = tonic_prost::ProstCodec::default();
+            let codec = crate::DomainOperationV2StrictCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/lore.domain.v1.DomainOperationService/DomainOperationPrepare",
             );
@@ -471,7 +1191,7 @@ pub mod domain_operation_service_client {
                         format!("Service was not ready: {}", e.into()),
                     )
                 })?;
-            let codec = tonic_prost::ProstCodec::default();
+            let codec = crate::DomainOperationV2StrictCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/lore.domain.v1.DomainOperationService/DomainOperationReceiptGet",
             );
@@ -481,6 +1201,130 @@ pub mod domain_operation_service_client {
                     GrpcMethod::new(
                         "lore.domain.v1.DomainOperationService",
                         "DomainOperationReceiptGet",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn domain_operation_verified_stale_finalize(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::DomainOperationVerifiedStaleFinalizeRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationVerifiedStaleFinalizeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = crate::DomainOperationV2StrictCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.domain.v1.DomainOperationService/DomainOperationVerifiedStaleFinalize",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.domain.v1.DomainOperationService",
+                        "DomainOperationVerifiedStaleFinalize",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn domain_operation_terminal_status_attach(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::DomainOperationTerminalStatusAttachRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationTerminalStatusAttachmentAckV1>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = crate::DomainOperationV2StrictCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.domain.v1.DomainOperationService/DomainOperationTerminalStatusAttach",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.domain.v1.DomainOperationService",
+                        "DomainOperationTerminalStatusAttach",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn domain_operation_proof_namespace_materialize(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::DomainOperationProofNamespaceMaterializeRequestV1,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationProofNamespaceMaterializeReceiptV1>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = crate::DomainOperationV2StrictCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceMaterialize",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.domain.v1.DomainOperationService",
+                        "DomainOperationProofNamespaceMaterialize",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn domain_operation_proof_namespace_retire(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::DomainOperationProofNamespaceRetireRequestV1,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationProofNamespaceRetireAckV1>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = crate::DomainOperationV2StrictCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceRetire",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.domain.v1.DomainOperationService",
+                        "DomainOperationProofNamespaceRetire",
                     ),
                 );
             self.inner.unary(req, path, codec).await
@@ -521,18 +1365,50 @@ pub mod domain_operation_service_server {
             tonic::Response<super::DomainOperationReceiptGetResponse>,
             tonic::Status,
         >;
+        async fn domain_operation_verified_stale_finalize(
+            &self,
+            request: tonic::Request<super::DomainOperationVerifiedStaleFinalizeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationVerifiedStaleFinalizeResponse>,
+            tonic::Status,
+        >;
+        async fn domain_operation_terminal_status_attach(
+            &self,
+            request: tonic::Request<super::DomainOperationTerminalStatusAttachRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationTerminalStatusAttachmentAckV1>,
+            tonic::Status,
+        >;
+        async fn domain_operation_proof_namespace_materialize(
+            &self,
+            request: tonic::Request<
+                super::DomainOperationProofNamespaceMaterializeRequestV1,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationProofNamespaceMaterializeReceiptV1>,
+            tonic::Status,
+        >;
+        async fn domain_operation_proof_namespace_retire(
+            &self,
+            request: tonic::Request<super::DomainOperationProofNamespaceRetireRequestV1>,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationProofNamespaceRetireAckV1>,
+            tonic::Status,
+        >;
     }
     /// FORK-LOCAL (Tideshift, CR-029). This private server-only service is the
-    /// prepare/receipt rail for Lorehub's control plane. The current API-first slice
-    /// pins these on-the-wire method paths:
+    /// private receipt and proof-namespace maintenance rail for Lorehub's control
+    /// plane. The on-the-wire method paths are:
     /// /lore.domain.v1.DomainOperationService/DomainOperationClockGet
     /// /lore.domain.v1.DomainOperationService/DomainOperationPrepare
     /// /lore.domain.v1.DomainOperationService/DomainOperationReceiptGet
+    /// /lore.domain.v1.DomainOperationService/DomainOperationVerifiedStaleFinalize
+    /// /lore.domain.v1.DomainOperationService/DomainOperationTerminalStatusAttach
+    /// /lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceMaterialize
+    /// /lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceRetire
     /// No upstream package claims lore.domain.v1 today. If upstream adds that
     /// package or any method/message below, reconcile names and every field/enum tag
-    /// before regeneration. CR-029's remaining four v2 methods are not declared
-    /// until their store contracts exist; this partial rail must not advertise the
-    /// domain_operation_receipt_v2 capability.
+    /// before regeneration.
     #[derive(Debug)]
     pub struct DomainOperationServiceServer<T> {
         inner: Arc<T>,
@@ -648,7 +1524,7 @@ pub mod domain_operation_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DomainOperationClockGetSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
+                        let codec = crate::DomainOperationV2StrictCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
                                 accept_compression_encodings,
@@ -699,7 +1575,7 @@ pub mod domain_operation_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DomainOperationPrepareSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
+                        let codec = crate::DomainOperationV2StrictCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
                                 accept_compression_encodings,
@@ -753,7 +1629,231 @@ pub mod domain_operation_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DomainOperationReceiptGetSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
+                        let codec = crate::DomainOperationV2StrictCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.domain.v1.DomainOperationService/DomainOperationVerifiedStaleFinalize" => {
+                    #[allow(non_camel_case_types)]
+                    struct DomainOperationVerifiedStaleFinalizeSvc<
+                        T: DomainOperationService,
+                    >(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: DomainOperationService,
+                    > tonic::server::UnaryService<
+                        super::DomainOperationVerifiedStaleFinalizeRequest,
+                    > for DomainOperationVerifiedStaleFinalizeSvc<T> {
+                        type Response = super::DomainOperationVerifiedStaleFinalizeResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::DomainOperationVerifiedStaleFinalizeRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as DomainOperationService>::domain_operation_verified_stale_finalize(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DomainOperationVerifiedStaleFinalizeSvc(inner);
+                        let codec = crate::DomainOperationV2StrictCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.domain.v1.DomainOperationService/DomainOperationTerminalStatusAttach" => {
+                    #[allow(non_camel_case_types)]
+                    struct DomainOperationTerminalStatusAttachSvc<
+                        T: DomainOperationService,
+                    >(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: DomainOperationService,
+                    > tonic::server::UnaryService<
+                        super::DomainOperationTerminalStatusAttachRequest,
+                    > for DomainOperationTerminalStatusAttachSvc<T> {
+                        type Response = super::DomainOperationTerminalStatusAttachmentAckV1;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::DomainOperationTerminalStatusAttachRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as DomainOperationService>::domain_operation_terminal_status_attach(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DomainOperationTerminalStatusAttachSvc(inner);
+                        let codec = crate::DomainOperationV2StrictCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceMaterialize" => {
+                    #[allow(non_camel_case_types)]
+                    struct DomainOperationProofNamespaceMaterializeSvc<
+                        T: DomainOperationService,
+                    >(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: DomainOperationService,
+                    > tonic::server::UnaryService<
+                        super::DomainOperationProofNamespaceMaterializeRequestV1,
+                    > for DomainOperationProofNamespaceMaterializeSvc<T> {
+                        type Response = super::DomainOperationProofNamespaceMaterializeReceiptV1;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::DomainOperationProofNamespaceMaterializeRequestV1,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as DomainOperationService>::domain_operation_proof_namespace_materialize(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DomainOperationProofNamespaceMaterializeSvc(inner);
+                        let codec = crate::DomainOperationV2StrictCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceRetire" => {
+                    #[allow(non_camel_case_types)]
+                    struct DomainOperationProofNamespaceRetireSvc<
+                        T: DomainOperationService,
+                    >(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: DomainOperationService,
+                    > tonic::server::UnaryService<
+                        super::DomainOperationProofNamespaceRetireRequestV1,
+                    > for DomainOperationProofNamespaceRetireSvc<T> {
+                        type Response = super::DomainOperationProofNamespaceRetireAckV1;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::DomainOperationProofNamespaceRetireRequestV1,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as DomainOperationService>::domain_operation_proof_namespace_retire(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DomainOperationProofNamespaceRetireSvc(inner);
+                        let codec = crate::DomainOperationV2StrictCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
                                 accept_compression_encodings,

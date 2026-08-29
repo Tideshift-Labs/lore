@@ -22,6 +22,14 @@ use lore_postgres::domain::coordinator::MutationResult;
 use lore_postgres::domain::coordinator::RepositoryCreateInput;
 use lore_postgres::domain::coordinator::RepositoryDeleteInput;
 use lore_postgres::domain::coordinator::RepositorySnapshot;
+use lore_postgres::domain::maintenance::ProofNamespaceMaterializeInput;
+use lore_postgres::domain::maintenance::ProofNamespaceMaterializeReceipt;
+use lore_postgres::domain::maintenance::ProofNamespaceRetireAck;
+use lore_postgres::domain::maintenance::ProofNamespaceRetireInput;
+use lore_postgres::domain::maintenance::TerminalStatusAttachInput;
+use lore_postgres::domain::maintenance::TerminalStatusAttachmentAck;
+use lore_postgres::domain::maintenance::VerifiedStaleFinalizeInput;
+use lore_postgres::domain::maintenance::VerifiedStaleFinalizeResult;
 use lore_postgres::domain::receipts::AuthorizationWitness;
 use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::PrepareResult;
@@ -31,9 +39,17 @@ use lore_proto::lore::domain::v1::DomainOperationClockGetRequest;
 use lore_proto::lore::domain::v1::DomainOperationOutcome;
 use lore_proto::lore::domain::v1::DomainOperationPrepareRequest;
 use lore_proto::lore::domain::v1::DomainOperationPrepareStatus;
+use lore_proto::lore::domain::v1::DomainOperationProofNamespaceMaterializeRequestV1;
+use lore_proto::lore::domain::v1::DomainOperationProofNamespaceRetireRequestV1;
 use lore_proto::lore::domain::v1::DomainOperationReceiptGetRequest;
 use lore_proto::lore::domain::v1::DomainOperationReceiptStatus;
+use lore_proto::lore::domain::v1::DomainOperationTerminalStatusAttachRequest;
+use lore_proto::lore::domain::v1::DomainOperationVerifiedStaleFinalizeRequest;
+use lore_proto::lore::domain::v1::TerminalStatusAttachPhase2ActionV1;
+use lore_proto::lore::domain::v1::TerminalStatusAttachPhaseV1;
 use lore_proto::lore::domain::v1::domain_operation_service_server::DomainOperationService;
+use lore_proto::rebac::DomainOperationMaintenanceVerificationRequest;
+use lore_proto::rebac::DomainOperationMaintenanceVerificationResponse;
 use lore_proto::rebac::VerifyRepositoryOperationAuthorizationRequest;
 use lore_proto::rebac::VerifyRepositoryOperationAuthorizationResponse;
 use lore_proto::rebac::verify_repository_operation_authorization_request::Proof;
@@ -42,11 +58,20 @@ use ring::digest::digest;
 use tonic::Code;
 use tonic::Request;
 use tonic::Status;
+use tonic_prost::prost::Message;
 use uuid::Uuid;
 
 use super::service::LoreDomainOperationV1Service;
 use super::strict_codec::validate_prepare;
+use super::strict_codec::validate_proof_namespace_materialize;
+use super::strict_codec::validate_proof_namespace_materialize_raw;
+use super::strict_codec::validate_proof_namespace_retire;
+use super::strict_codec::validate_proof_namespace_retire_raw;
 use super::strict_codec::validate_receipt_get;
+use super::strict_codec::validate_terminal_status_attach;
+use super::strict_codec::validate_terminal_status_attach_raw;
+use super::strict_codec::validate_verified_stale_finalize;
+use super::strict_codec::validate_verified_stale_finalize_raw;
 use crate::auth::jwt::AuthorizationToken;
 use crate::authnz::rebac::RepositoryOperationAuthorizationVerifier;
 use crate::domain::DomainContext;
@@ -131,6 +156,34 @@ impl DomainTransactionStore for RecordingStore {
         Ok(self.receipt_result.lock().expect("receipt result").clone())
     }
 
+    async fn domain_operation_verified_stale_finalize(
+        &self,
+        _input: &VerifiedStaleFinalizeInput,
+    ) -> Result<VerifiedStaleFinalizeResult, DomainError> {
+        unreachable!("receipt-rail tests do not call stale finalize yet")
+    }
+
+    async fn domain_operation_terminal_status_attach(
+        &self,
+        _input: &TerminalStatusAttachInput,
+    ) -> Result<TerminalStatusAttachmentAck, DomainError> {
+        unreachable!("receipt-rail tests do not call terminal attach yet")
+    }
+
+    async fn domain_operation_proof_namespace_materialize(
+        &self,
+        _input: &ProofNamespaceMaterializeInput,
+    ) -> Result<ProofNamespaceMaterializeReceipt, DomainError> {
+        unreachable!("receipt-rail tests do not call materialize yet")
+    }
+
+    async fn domain_operation_proof_namespace_retire(
+        &self,
+        _input: &ProofNamespaceRetireInput,
+    ) -> Result<ProofNamespaceRetireAck, DomainError> {
+        unreachable!("receipt-rail tests do not call retire yet")
+    }
+
     async fn repository_snapshot(
         &self,
         _repository_id: &[u8],
@@ -205,6 +258,36 @@ impl EchoVerifier {
             forwarded_authorization: Mutex::new(None),
         }
     }
+
+    fn maintenance_response(
+        &self,
+        request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> DomainOperationMaintenanceVerificationResponse {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self
+            .forwarded_authorization
+            .lock()
+            .expect("authorization record lock") = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let request = request.into_inner();
+        DomainOperationMaintenanceVerificationResponse {
+            method: request.method,
+            verified_issuer: request.verified_issuer,
+            authenticated_subject: request.authenticated_subject,
+            org_uuid: request.org_uuid,
+            initiating_principal_namespace: request.initiating_principal_namespace,
+            target_identity: if self.mismatch_echo.load(Ordering::SeqCst) {
+                Bytes::from_static(&[0xff; 16])
+            } else {
+                request.target_identity
+            },
+            canonical_request_sha256: request.canonical_request_sha256,
+            verification_digest: Bytes::from_static(&[0x61; 32]),
+        }
+    }
 }
 
 #[async_trait]
@@ -269,6 +352,34 @@ impl RepositoryOperationAuthorizationVerifier for EchoVerifier {
             authenticated_subject: request.authenticated_subject,
         })
     }
+
+    async fn claim_repository_operation_stale_finalize_permit(
+        &self,
+        request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
+        Ok(self.maintenance_response(request))
+    }
+
+    async fn verify_repository_operation_terminal_status_attach(
+        &self,
+        request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
+        Ok(self.maintenance_response(request))
+    }
+
+    async fn verify_repository_operation_proof_namespace_materialize(
+        &self,
+        request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
+        Ok(self.maintenance_response(request))
+    }
+
+    async fn verify_repository_operation_proof_namespace_retire(
+        &self,
+        request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
+        Ok(self.maintenance_response(request))
+    }
 }
 
 fn service() -> (
@@ -328,6 +439,114 @@ fn valid_receipt_get() -> DomainOperationReceiptGetRequest {
         authorization_id: prepare.authorization_id,
         authorization_revision: prepare.authorization_revision,
         consumed_ticket_sha256: Bytes::from_static(&[0x33; 32]),
+    }
+}
+
+fn valid_stale_finalize() -> DomainOperationVerifiedStaleFinalizeRequest {
+    let operation_id = Uuid::now_v7();
+    DomainOperationVerifiedStaleFinalizeRequest {
+        verified_issuer: "https://issuer.example".into(),
+        authenticated_subject: "lorehub-control-plane".into(),
+        org_uuid: Bytes::from_static(&[0x11; 16]),
+        initiating_principal_namespace: Bytes::from_static(
+            b"principal-v1\x0001111111-1111-4111-8111-111111111111",
+        ),
+        operation_id: Bytes::copy_from_slice(operation_id.as_bytes()),
+        method: "lore.domain.v1.RepositoryCreate".into(),
+        scope: Bytes::from_static(b"repository-scope"),
+        fingerprint_version: 1,
+        fingerprint: Bytes::from_static(&[0x21; 32]),
+        canonical_intent_digest: Bytes::from_static(&[0x22; 32]),
+        authorization_id: Bytes::copy_from_slice(operation_id.as_bytes()),
+        authorization_revision: 7,
+        verification_nonce: Bytes::from_static(&[0x23; 32]),
+        bound_fields_digest: Bytes::from_static(&[0x24; 32]),
+        consumed_ticket_sha256: Bytes::from_static(&[0x25; 32]),
+        expected_claim_identity_digest: Bytes::from_static(&[0x26; 32]),
+        stale_finalize_permit: Bytes::from_static(&[0x27; 32]),
+        stale_finalize_permit_revision: 9,
+    }
+}
+
+fn valid_terminal_attach_phase1() -> DomainOperationTerminalStatusAttachRequest {
+    let operation_id = Uuid::now_v7();
+    DomainOperationTerminalStatusAttachRequest {
+        verified_issuer: "https://issuer.example".into(),
+        authenticated_subject: "lorehub-control-plane".into(),
+        org_uuid: Bytes::from_static(&[0x11; 16]),
+        initiating_principal_namespace: Bytes::from_static(
+            b"principal-v1\x0001111111-1111-4111-8111-111111111111",
+        ),
+        operation_id: Bytes::copy_from_slice(operation_id.as_bytes()),
+        authorization_id: Bytes::copy_from_slice(operation_id.as_bytes()),
+        authorization_revision: 7,
+        claim_id: Bytes::from_static(&[0x31; 16]),
+        claim_revision: 8,
+        terminal_outcome: DomainOperationOutcome::Applied as i32,
+        terminal_receipt_sha256: Bytes::from_static(&[0x32; 32]),
+        platform_terminal_status_revision: 9,
+        acknowledged_at_unix_millis: 1,
+        phase: TerminalStatusAttachPhaseV1::Phase1TerminalAck as i32,
+        reserve_charge_revision: 10,
+        reserve_charge_nonce: Bytes::from_static(&[0x33; 32]),
+        phase2_action: TerminalStatusAttachPhase2ActionV1::Unspecified as i32,
+        release_tombstone_digest: Bytes::new(),
+        active_release_intent_revision: 0,
+        active_release_intent_nonce: Bytes::new(),
+        tombstone_reservation_revision: 11,
+        tombstone_reservation_nonce: Bytes::from_static(&[0x34; 32]),
+        final_prune_digest: Bytes::new(),
+        tombstone_release_intent_revision: 0,
+        tombstone_release_intent_nonce: Bytes::new(),
+        release_proof_reservation_revision: 12,
+        release_proof_reservation_nonce: Bytes::from_static(&[0x35; 32]),
+        completion_marker_sequence: 1,
+        expected_completion_marker_digest: Bytes::new(),
+        request_digest: Bytes::from_static(&[0x36; 32]),
+    }
+}
+
+fn valid_materialize() -> DomainOperationProofNamespaceMaterializeRequestV1 {
+    DomainOperationProofNamespaceMaterializeRequestV1 {
+        protocol_revision: 2,
+        verified_issuer: "https://issuer.example".into(),
+        authenticated_subject: "lorehub-control-plane".into(),
+        org_uuid: Bytes::from_static(&[0x11; 16]),
+        initiating_principal_namespace: Bytes::from_static(
+            b"principal-v1\x0001111111-1111-4111-8111-111111111111",
+        ),
+        namespace_epoch: Bytes::from_static(&[0x41; 16]),
+        namespace_claim_revision: 1,
+        namespace_claim_nonce: Bytes::from_static(&[0x42; 32]),
+        platform_capacity_revision: 2,
+        lore_local_capacity_revision: 3,
+        request_digest: Bytes::from_static(&[0x43; 32]),
+        materialization_jwt: "signed-materialization-jwt".into(),
+    }
+}
+
+fn valid_retire() -> DomainOperationProofNamespaceRetireRequestV1 {
+    DomainOperationProofNamespaceRetireRequestV1 {
+        protocol_revision: 2,
+        verified_issuer: "https://issuer.example".into(),
+        authenticated_subject: "lorehub-control-plane".into(),
+        org_uuid: Bytes::from_static(&[0x11; 16]),
+        initiating_principal_namespace: Bytes::from_static(
+            b"principal-v1\x0001111111-1111-4111-8111-111111111111",
+        ),
+        namespace_epoch: Bytes::from_static(&[0x41; 16]),
+        quota_revision: 4,
+        final_range_set_digest: Bytes::from_static(&[0x44; 32]),
+        final_high_water: 1,
+        retirement_fence_generation: 2,
+        retirement_permit_revision: 3,
+        issued_at_unix_millis: 1,
+        expires_at_unix_millis: 2,
+        zero_platform_state_digest: Bytes::from_static(&[0x45; 32]),
+        request_digest: Bytes::from_static(&[0x46; 32]),
+        retirement_permit_jwt: "signed-retirement-jwt".into(),
+        namespace_claim_revision: 5,
+        namespace_claim_nonce: Bytes::from_static(&[0x47; 32]),
     }
 }
 
@@ -403,6 +622,298 @@ fn decoded_field_bounds_and_presence_fail_closed() {
             .expect("long commitment")
             .code(),
         Code::InvalidArgument
+    );
+}
+
+type RawValidator = fn(&[u8]) -> Result<(), Status>;
+
+fn strict_raw_cases() -> Vec<(&'static str, Vec<u8>, RawValidator)> {
+    vec![
+        (
+            "stale finalize",
+            valid_stale_finalize().encode_to_vec(),
+            validate_verified_stale_finalize_raw,
+        ),
+        (
+            "terminal attach",
+            valid_terminal_attach_phase1().encode_to_vec(),
+            validate_terminal_status_attach_raw,
+        ),
+        (
+            "namespace materialize",
+            valid_materialize().encode_to_vec(),
+            validate_proof_namespace_materialize_raw,
+        ),
+        (
+            "namespace retire",
+            valid_retire().encode_to_vec(),
+            validate_proof_namespace_retire_raw,
+        ),
+    ]
+}
+
+fn length_delimited_field(tag: u8, value: &[u8]) -> Vec<u8> {
+    assert!(
+        tag < 16,
+        "test helper supports one-byte length-delimited keys"
+    );
+    assert!(value.len() < 128, "test helper supports one-byte lengths");
+    let mut encoded = vec![(tag << 3) | 2, value.len() as u8];
+    encoded.extend_from_slice(value);
+    encoded
+}
+
+#[test]
+fn strict_raw_validators_accept_each_complete_frozen_wire() {
+    for (name, raw, validate) in strict_raw_cases() {
+        validate(&raw).unwrap_or_else(|error| panic!("valid {name} frame rejected: {error}"));
+    }
+}
+
+#[test]
+fn strict_raw_validators_reject_unknown_and_duplicate_singular_fields() {
+    for (name, raw, validate) in strict_raw_cases() {
+        let mut unknown = raw.clone();
+        unknown.extend_from_slice(&[0xFA, 0x01, 0x00]); // length-delimited tag 31
+        assert!(
+            validate(&unknown).is_err(),
+            "{name} accepted unknown tag 31"
+        );
+
+        let mut duplicate = raw;
+        duplicate.extend_from_slice(&length_delimited_field(1, b"duplicate"));
+        assert!(
+            validate(&duplicate).is_err(),
+            "{name} accepted a duplicate singular tag"
+        );
+    }
+}
+
+#[test]
+fn strict_raw_validators_reject_wrong_wire_groups_field_zero_and_truncation() {
+    for (name, raw, validate) in strict_raw_cases() {
+        let mut wrong_wire = vec![0x08, 0x01]; // tag 1 as varint
+        wrong_wire.extend_from_slice(&raw);
+        assert!(
+            validate(&wrong_wire).is_err(),
+            "{name} accepted wrong wire type"
+        );
+
+        let mut group = vec![0x0B]; // tag 1, start-group wire type
+        group.extend_from_slice(&raw);
+        assert!(validate(&group).is_err(), "{name} accepted a group");
+
+        let mut field_zero = vec![0x00];
+        field_zero.extend_from_slice(&raw);
+        assert!(validate(&field_zero).is_err(), "{name} accepted field zero");
+
+        assert!(
+            validate(&[0x0A, 0x05, b'x']).is_err(),
+            "{name} accepted a truncated length-delimited field"
+        );
+    }
+}
+
+#[test]
+fn strict_raw_validators_reject_noncanonical_overflow_and_oversized_frames() {
+    for (name, raw, validate) in strict_raw_cases() {
+        let mut noncanonical_key = vec![0x8A, 0x00, 0x00];
+        noncanonical_key.extend_from_slice(&raw);
+        assert!(
+            validate(&noncanonical_key).is_err(),
+            "{name} accepted a noncanonical field-key varint"
+        );
+
+        let overflow_key = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        assert!(
+            validate(&overflow_key).is_err(),
+            "{name} accepted an overflowing varint"
+        );
+
+        assert!(
+            validate(&vec![0; 16 * 1024 + 1]).is_err(),
+            "{name} accepted an oversized raw frame"
+        );
+    }
+}
+
+#[test]
+fn strict_raw_validators_reject_missing_required_presence_and_field_bounds() {
+    let mut finalize = valid_stale_finalize();
+    finalize.stale_finalize_permit.clear();
+    assert!(validate_verified_stale_finalize_raw(&finalize.encode_to_vec()).is_err());
+    let mut finalize_oversized = valid_stale_finalize();
+    finalize_oversized.verified_issuer = "i".repeat(257);
+    assert!(validate_verified_stale_finalize_raw(&finalize_oversized.encode_to_vec()).is_err());
+
+    let mut attach = valid_terminal_attach_phase1();
+    attach.request_digest.clear();
+    assert!(validate_terminal_status_attach_raw(&attach.encode_to_vec()).is_err());
+    let mut attach_oversized = valid_terminal_attach_phase1();
+    attach_oversized.authenticated_subject = "s".repeat(257);
+    assert!(validate_terminal_status_attach_raw(&attach_oversized.encode_to_vec()).is_err());
+
+    let mut materialize = valid_materialize();
+    materialize.namespace_claim_nonce.clear();
+    assert!(validate_proof_namespace_materialize_raw(&materialize.encode_to_vec()).is_err());
+    let mut materialize_oversized = valid_materialize();
+    materialize_oversized.materialization_jwt = "j".repeat(8 * 1024 + 1);
+    assert!(
+        validate_proof_namespace_materialize_raw(&materialize_oversized.encode_to_vec()).is_err()
+    );
+
+    let mut retire = valid_retire();
+    retire.namespace_claim_nonce.clear();
+    assert!(validate_proof_namespace_retire_raw(&retire.encode_to_vec()).is_err());
+    let mut retire_oversized = valid_retire();
+    retire_oversized.retirement_permit_jwt = "j".repeat(8 * 1024 + 1);
+    assert!(validate_proof_namespace_retire_raw(&retire_oversized.encode_to_vec()).is_err());
+}
+
+#[test]
+fn terminal_attach_raw_presence_matrix_rejects_cross_phase_evidence() {
+    let mut phase1_with_phase2 = valid_terminal_attach_phase1();
+    phase1_with_phase2.phase2_action =
+        TerminalStatusAttachPhase2ActionV1::ActiveReleaseIntentAck as i32;
+    phase1_with_phase2.release_tombstone_digest = Bytes::from_static(&[0x51; 32]);
+    phase1_with_phase2.active_release_intent_revision = 1;
+    phase1_with_phase2.active_release_intent_nonce = Bytes::from_static(&[0x52; 32]);
+    assert!(validate_terminal_status_attach_raw(&phase1_with_phase2.encode_to_vec()).is_err());
+
+    let mut completion_missing_digest = valid_terminal_attach_phase1();
+    completion_missing_digest.phase = TerminalStatusAttachPhaseV1::Phase2ReleaseAck as i32;
+    completion_missing_digest.phase2_action =
+        TerminalStatusAttachPhase2ActionV1::TombstoneReleaseIntentComplete as i32;
+    completion_missing_digest.release_tombstone_digest = Bytes::from_static(&[0x53; 32]);
+    completion_missing_digest.active_release_intent_revision = 1;
+    completion_missing_digest.active_release_intent_nonce = Bytes::from_static(&[0x54; 32]);
+    completion_missing_digest.final_prune_digest = Bytes::from_static(&[0x55; 32]);
+    completion_missing_digest.tombstone_release_intent_revision = 1;
+    completion_missing_digest.tombstone_release_intent_nonce = Bytes::from_static(&[0x56; 32]);
+    assert!(
+        validate_terminal_status_attach_raw(&completion_missing_digest.encode_to_vec()).is_err()
+    );
+
+    let mut poll_with_completion_digest = completion_missing_digest;
+    poll_with_completion_digest.phase2_action =
+        TerminalStatusAttachPhase2ActionV1::TombstonePrunePoll as i32;
+    poll_with_completion_digest.expected_completion_marker_digest = Bytes::from_static(&[0x57; 32]);
+    assert!(
+        validate_terminal_status_attach_raw(&poll_with_completion_digest.encode_to_vec()).is_err()
+    );
+}
+
+#[test]
+fn maintenance_decoded_validators_enforce_exact_lengths_revisions_and_times() {
+    let mut finalize = valid_stale_finalize();
+    assert!(validate_verified_stale_finalize(&finalize).is_ok());
+    finalize.fingerprint.truncate(31);
+    assert!(validate_verified_stale_finalize(&finalize).is_err());
+    let mut finalize_zero_revision = valid_stale_finalize();
+    finalize_zero_revision.stale_finalize_permit_revision = 0;
+    assert!(validate_verified_stale_finalize(&finalize_zero_revision).is_err());
+
+    let mut attach = valid_terminal_attach_phase1();
+    assert!(validate_terminal_status_attach(&attach).is_ok());
+    attach.claim_id.truncate(15);
+    assert!(validate_terminal_status_attach(&attach).is_err());
+    let mut attach_bad_outcome = valid_terminal_attach_phase1();
+    attach_bad_outcome.terminal_outcome = 3;
+    assert!(validate_terminal_status_attach(&attach_bad_outcome).is_err());
+
+    let mut materialize = valid_materialize();
+    assert!(validate_proof_namespace_materialize(&materialize).is_ok());
+    materialize.namespace_epoch.truncate(15);
+    assert!(validate_proof_namespace_materialize(&materialize).is_err());
+    let mut materialize_bad_protocol = valid_materialize();
+    materialize_bad_protocol.protocol_revision = 3;
+    assert!(validate_proof_namespace_materialize(&materialize_bad_protocol).is_err());
+
+    let mut retire = valid_retire();
+    assert!(validate_proof_namespace_retire(&retire).is_ok());
+    retire.final_range_set_digest.truncate(31);
+    assert!(validate_proof_namespace_retire(&retire).is_err());
+    let mut retire_equal_expiry = valid_retire();
+    retire_equal_expiry.expires_at_unix_millis = retire_equal_expiry.issued_at_unix_millis;
+    assert!(validate_proof_namespace_retire(&retire_equal_expiry).is_err());
+}
+
+#[tokio::test]
+async fn maintenance_handlers_are_unimplemented_before_identity_verifier_and_store() {
+    let (service, _store, verifier) = service();
+
+    let mut finalize = valid_stale_finalize();
+    finalize.verified_issuer = "https://different-issuer.example".into();
+    let error = service
+        .domain_operation_verified_stale_finalize(authenticated(finalize))
+        .await
+        .expect_err("stale-finalize must remain guarded");
+    assert_eq!(error.code(), Code::Unimplemented);
+
+    let mut attach = valid_terminal_attach_phase1();
+    attach.authenticated_subject = "different-subject".into();
+    let error = service
+        .domain_operation_terminal_status_attach(authenticated(attach))
+        .await
+        .expect_err("terminal-attach must remain guarded");
+    assert_eq!(error.code(), Code::Unimplemented);
+
+    let mut materialize = valid_materialize();
+    materialize.verified_issuer = "https://different-issuer.example".into();
+    let error = service
+        .domain_operation_proof_namespace_materialize(authenticated(materialize))
+        .await
+        .expect_err("materialize must remain guarded");
+    assert_eq!(error.code(), Code::Unimplemented);
+
+    let mut retire = valid_retire();
+    retire.authenticated_subject = "different-subject".into();
+    let error = service
+        .domain_operation_proof_namespace_retire(authenticated(retire))
+        .await
+        .expect_err("retire must remain guarded");
+    assert_eq!(error.code(), Code::Unimplemented);
+
+    assert_eq!(
+        verifier.calls.load(Ordering::SeqCst),
+        0,
+        "guarded maintenance handlers must stop before every verifier port"
+    );
+}
+
+#[tokio::test]
+async fn guarded_maintenance_handlers_do_not_consult_verifier_bindings() {
+    let (service, _store, verifier) = service();
+    verifier.mismatch_echo.store(true, Ordering::SeqCst);
+
+    let error = service
+        .domain_operation_verified_stale_finalize(authenticated(valid_stale_finalize()))
+        .await
+        .expect_err("stale-finalize must remain guarded");
+    assert_eq!(error.code(), Code::Unimplemented);
+    let error = service
+        .domain_operation_terminal_status_attach(authenticated(valid_terminal_attach_phase1()))
+        .await
+        .expect_err("terminal-attach must remain guarded");
+    assert_eq!(error.code(), Code::Unimplemented);
+    let mut materialize = valid_materialize();
+    materialize.materialization_jwt = "service-token".into();
+    let error = service
+        .domain_operation_proof_namespace_materialize(authenticated(materialize))
+        .await
+        .expect_err("materialize must remain guarded");
+    assert_eq!(error.code(), Code::Unimplemented);
+    let mut retire = valid_retire();
+    retire.retirement_permit_jwt = "service-token".into();
+    let error = service
+        .domain_operation_proof_namespace_retire(authenticated(retire))
+        .await
+        .expect_err("retire must remain guarded");
+    assert_eq!(error.code(), Code::Unimplemented);
+    assert_eq!(
+        verifier.calls.load(Ordering::SeqCst),
+        0,
+        "guarded handlers must not consult maintenance verifier bindings"
     );
 }
 
@@ -598,14 +1109,14 @@ async fn missing_or_nonservice_identity_cannot_reach_the_private_rail() {
 }
 
 #[test]
-fn partial_three_rpc_rail_does_not_advertise_v2_capabilities() {
+fn incomplete_lifecycle_rail_does_not_advertise_v2_capabilities() {
     for deferred_capability in [
         "domain_operation_receipt_v2",
         "domain_operation_proof_namespace_lifecycle_v1",
     ] {
         assert!(
             !SERVER_ENTRY_SOURCE.contains(deferred_capability),
-            "partial rail must not advertise {deferred_capability}"
+            "incomplete lifecycle rail must not advertise {deferred_capability}"
         );
     }
 }

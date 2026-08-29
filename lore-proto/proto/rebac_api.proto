@@ -15,6 +15,19 @@ service RebacApi {
   // the method path and every field tag before regenerating this binding.
   rpc VerifyRepositoryOperationAuthorization(VerifyRepositoryOperationAuthorizationRequest)
       returns (VerifyRepositoryOperationAuthorizationResponse) {};
+
+  // FORK-LOCAL (Tideshift, CR-029). These private maintenance verifiers are
+  // called before Lore takes a receipt or proof-namespace lock. Each request
+  // carries the strict-codec-approved canonical domain request and its SHA-256
+  // so auth-grpc can bind its platform mutation/read to the exact wire intent.
+  rpc ClaimRepositoryOperationStaleFinalizePermit(DomainOperationMaintenanceVerificationRequest)
+      returns (DomainOperationMaintenanceVerificationResponse) {};
+  rpc VerifyRepositoryOperationTerminalStatusAttach(DomainOperationMaintenanceVerificationRequest)
+      returns (DomainOperationMaintenanceVerificationResponse) {};
+  rpc VerifyRepositoryOperationProofNamespaceMaterialize(DomainOperationMaintenanceVerificationRequest)
+      returns (DomainOperationMaintenanceVerificationResponse) {};
+  rpc VerifyRepositoryOperationProofNamespaceRetire(DomainOperationMaintenanceVerificationRequest)
+      returns (DomainOperationMaintenanceVerificationResponse) {};
 }
 
 // Messages for requests/responses
@@ -73,4 +86,119 @@ message VerifyRepositoryOperationAuthorizationResponse {
   bytes canonical_intent_digest = 13;
   string verified_issuer = 14;
   string authenticated_subject = 15;
+}
+
+// Closed method discriminator for the four CR-029 maintenance verifier ports.
+enum DomainOperationMaintenanceMethod {
+  DOMAIN_OPERATION_MAINTENANCE_METHOD_UNSPECIFIED = 0;
+  DOMAIN_OPERATION_MAINTENANCE_METHOD_VERIFIED_STALE_FINALIZE = 1;
+  DOMAIN_OPERATION_MAINTENANCE_METHOD_TERMINAL_STATUS_ATTACH = 2;
+  DOMAIN_OPERATION_MAINTENANCE_METHOD_PROOF_NAMESPACE_MATERIALIZE = 3;
+  DOMAIN_OPERATION_MAINTENANCE_METHOD_PROOF_NAMESPACE_RETIRE = 4;
+}
+
+message DomainOperationMaintenanceVerificationRequest {
+  DomainOperationMaintenanceMethod method = 1;
+  string verified_issuer = 2;
+  string authenticated_subject = 3;
+  bytes org_uuid = 4;
+  bytes initiating_principal_namespace = 5;
+  // Operation UUID for receipt maintenance, or namespace epoch for namespace
+  // lifecycle maintenance. The selected method fixes its exact 16-byte meaning.
+  bytes target_identity = 6;
+  // Deterministic Prost encoding after strict raw-frame validation. Unknown,
+  // duplicate, wrong-wire, noncanonical, and invalid-presence input never
+  // reaches this port.
+  bytes canonical_request = 7;
+  bytes canonical_request_sha256 = 8;
+  oneof method_binding {
+    DomainOperationStaleFinalizePermitVerification stale_finalize = 9;
+    DomainOperationTerminalStatusAttachmentVerification terminal_status_attach = 10;
+    DomainOperationProofNamespaceMaterializationVerification proof_namespace_materialize = 11;
+    DomainOperationProofNamespaceRetirementVerification proof_namespace_retire = 12;
+  }
+}
+
+message DomainOperationStaleFinalizePermitVerification {
+  bytes operation_id = 1;
+  bytes authorization_id = 2;
+  uint64 authorization_revision = 3;
+  bytes verification_nonce = 4;
+  bytes bound_fields_digest = 5;
+  bytes consumed_ticket_sha256 = 6;
+  bytes expected_claim_identity_digest = 7;
+  bytes stale_finalize_permit = 8;
+  uint64 stale_finalize_permit_revision = 9;
+  bytes request_digest = 10;
+}
+
+message DomainOperationTerminalStatusAttachmentVerification {
+  bytes operation_id = 1;
+  bytes authorization_id = 2;
+  uint64 authorization_revision = 3;
+  bytes claim_id = 4;
+  uint64 claim_revision = 5;
+  uint32 terminal_outcome = 6;
+  bytes terminal_receipt_sha256 = 7;
+  uint64 platform_terminal_status_revision = 8;
+  int64 acknowledged_at_unix_millis = 9;
+  uint32 phase = 10;
+  uint64 reserve_charge_revision = 11;
+  bytes reserve_charge_nonce = 12;
+  uint32 phase2_action = 13;
+  bytes release_tombstone_digest = 14;
+  uint64 active_release_intent_revision = 15;
+  bytes active_release_intent_nonce = 16;
+  uint64 tombstone_reservation_revision = 17;
+  bytes tombstone_reservation_nonce = 18;
+  bytes final_prune_digest = 19;
+  uint64 tombstone_release_intent_revision = 20;
+  bytes tombstone_release_intent_nonce = 21;
+  uint64 release_proof_reservation_revision = 22;
+  bytes release_proof_reservation_nonce = 23;
+  uint64 completion_marker_sequence = 24;
+  bytes expected_completion_marker_digest = 25;
+  bytes request_digest = 26;
+}
+
+message DomainOperationProofNamespaceMaterializationVerification {
+  uint32 protocol_revision = 1;
+  bytes namespace_epoch = 2;
+  uint64 namespace_claim_revision = 3;
+  bytes namespace_claim_nonce = 4;
+  uint64 platform_capacity_revision = 5;
+  uint64 lore_local_capacity_revision = 6;
+  bytes request_digest = 7;
+  string signed_jwt = 8;
+}
+
+message DomainOperationProofNamespaceRetirementVerification {
+  uint32 protocol_revision = 1;
+  bytes namespace_epoch = 2;
+  uint64 quota_revision = 3;
+  bytes final_range_set_digest = 4;
+  uint64 final_high_water = 5;
+  uint64 retirement_fence_generation = 6;
+  uint64 retirement_permit_revision = 7;
+  int64 issued_at_unix_millis = 8;
+  int64 expires_at_unix_millis = 9;
+  bytes zero_platform_state_digest = 10;
+  bytes request_digest = 11;
+  string signed_jwt = 12;
+  uint64 namespace_claim_revision = 13;
+  bytes namespace_claim_nonce = 14;
+}
+
+message DomainOperationMaintenanceVerificationResponse {
+  DomainOperationMaintenanceMethod method = 1;
+  string verified_issuer = 2;
+  string authenticated_subject = 3;
+  bytes org_uuid = 4;
+  bytes initiating_principal_namespace = 5;
+  bytes target_identity = 6;
+  bytes canonical_request_sha256 = 7;
+  // Auth-grpc's immutable proof that it accepted or atomically claimed the
+  // exact request. Loreserver requires 32 bytes and stores/binds it before a
+  // mutation. A rejection is a gRPC error, never an `authorized=false` value.
+  bytes verification_digest = 8;
 }

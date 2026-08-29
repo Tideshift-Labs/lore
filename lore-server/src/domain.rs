@@ -431,6 +431,14 @@ pub(crate) mod test_support {
     use lore_postgres::domain::coordinator::RepositoryCreateInput;
     use lore_postgres::domain::coordinator::RepositoryDeleteInput;
     use lore_postgres::domain::coordinator::RepositorySnapshot;
+    use lore_postgres::domain::maintenance::ProofNamespaceMaterializeInput;
+    use lore_postgres::domain::maintenance::ProofNamespaceMaterializeReceipt;
+    use lore_postgres::domain::maintenance::ProofNamespaceRetireAck;
+    use lore_postgres::domain::maintenance::ProofNamespaceRetireInput;
+    use lore_postgres::domain::maintenance::TerminalStatusAttachInput;
+    use lore_postgres::domain::maintenance::TerminalStatusAttachmentAck;
+    use lore_postgres::domain::maintenance::VerifiedStaleFinalizeInput;
+    use lore_postgres::domain::maintenance::VerifiedStaleFinalizeResult;
     use lore_postgres::domain::receipts::AuthorizationWitness;
     use lore_postgres::domain::receipts::OperationBinding;
     use lore_postgres::domain::receipts::PrepareResult;
@@ -468,6 +476,34 @@ pub(crate) mod test_support {
             _key: &ReceiptKey,
             _binding: &OperationBinding,
         ) -> Result<ReceiptLookup, DomainError> {
+            unreachable!("DomainContext::admit tests never call the coordinator")
+        }
+
+        async fn domain_operation_verified_stale_finalize(
+            &self,
+            _input: &VerifiedStaleFinalizeInput,
+        ) -> Result<VerifiedStaleFinalizeResult, DomainError> {
+            unreachable!("DomainContext::admit tests never call the coordinator")
+        }
+
+        async fn domain_operation_terminal_status_attach(
+            &self,
+            _input: &TerminalStatusAttachInput,
+        ) -> Result<TerminalStatusAttachmentAck, DomainError> {
+            unreachable!("DomainContext::admit tests never call the coordinator")
+        }
+
+        async fn domain_operation_proof_namespace_materialize(
+            &self,
+            _input: &ProofNamespaceMaterializeInput,
+        ) -> Result<ProofNamespaceMaterializeReceipt, DomainError> {
+            unreachable!("DomainContext::admit tests never call the coordinator")
+        }
+
+        async fn domain_operation_proof_namespace_retire(
+            &self,
+            _input: &ProofNamespaceRetireInput,
+        ) -> Result<ProofNamespaceRetireAck, DomainError> {
             unreachable!("DomainContext::admit tests never call the coordinator")
         }
 

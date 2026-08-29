@@ -6,6 +6,8 @@ use lore_proto::rebac::CreateResourceRequest;
 use lore_proto::rebac::CreateResourceResponse;
 use lore_proto::rebac::DeleteResourceRequest;
 use lore_proto::rebac::DeleteResourceResponse;
+use lore_proto::rebac::DomainOperationMaintenanceVerificationRequest;
+use lore_proto::rebac::DomainOperationMaintenanceVerificationResponse;
 use lore_proto::rebac::VerifyRepositoryOperationAuthorizationRequest;
 use lore_proto::rebac::VerifyRepositoryOperationAuthorizationResponse;
 use lore_telemetry::InstrumentProvider;
@@ -52,6 +54,35 @@ pub trait RepositoryOperationAuthorizationVerifier: Send + Sync {
         &self,
         request: Request<VerifyRepositoryOperationAuthorizationRequest>,
     ) -> Result<VerifyRepositoryOperationAuthorizationResponse, Status>;
+
+    /// Atomically claim the current stale-finalize permit for this exact
+    /// strict-codec-approved request. A stale, revoked, or mismatched permit is
+    /// a gRPC error and no Lore transaction may start.
+    async fn claim_repository_operation_stale_finalize_permit(
+        &self,
+        request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status>;
+
+    /// Verify the exact terminal-attachment phase/action and its platform
+    /// claim, charge, and release-intent state before Lore mutation.
+    async fn verify_repository_operation_terminal_status_attach(
+        &self,
+        request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status>;
+
+    /// Verify the signed platform namespace claim and capacity binding before
+    /// materializing a Lore-local epoch.
+    async fn verify_repository_operation_proof_namespace_materialize(
+        &self,
+        request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status>;
+
+    /// Verify and claim the current namespace-retirement permit before Lore
+    /// takes the namespace lock.
+    async fn verify_repository_operation_proof_namespace_retire(
+        &self,
+        request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status>;
 }
 
 /// Network implementation of the private CR-029 verifier.
@@ -85,6 +116,62 @@ impl RepositoryOperationAuthorizationVerifier for GrpcRepositoryOperationAuthori
         )
         .result
         .map(Response::into_inner)
+    }
+
+    async fn claim_repository_operation_stale_finalize_permit(
+        &self,
+        request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
+        let mut client = grpc_get_rebac_client(self.auth_url.clone())
+            .await
+            .map_err(|_| Status::unavailable("Repository operation verifier unavailable"))?;
+        client
+            .client
+            .claim_repository_operation_stale_finalize_permit(request)
+            .await
+            .map(Response::into_inner)
+    }
+
+    async fn verify_repository_operation_terminal_status_attach(
+        &self,
+        request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
+        let mut client = grpc_get_rebac_client(self.auth_url.clone())
+            .await
+            .map_err(|_| Status::unavailable("Repository operation verifier unavailable"))?;
+        client
+            .client
+            .verify_repository_operation_terminal_status_attach(request)
+            .await
+            .map(Response::into_inner)
+    }
+
+    async fn verify_repository_operation_proof_namespace_materialize(
+        &self,
+        request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
+        let mut client = grpc_get_rebac_client(self.auth_url.clone())
+            .await
+            .map_err(|_| Status::unavailable("Repository operation verifier unavailable"))?;
+        client
+            .client
+            .verify_repository_operation_proof_namespace_materialize(request)
+            .await
+            .map(Response::into_inner)
+    }
+
+    async fn verify_repository_operation_proof_namespace_retire(
+        &self,
+        request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
+        let mut client = grpc_get_rebac_client(self.auth_url.clone())
+            .await
+            .map_err(|_| Status::unavailable("Repository operation verifier unavailable"))?;
+        client
+            .client
+            .verify_repository_operation_proof_namespace_retire(request)
+            .await
+            .map(Response::into_inner)
     }
 }
 

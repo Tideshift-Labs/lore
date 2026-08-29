@@ -178,6 +178,7 @@ fn main() -> Result<()> {
 
     tonic_prost_build::configure()
         .out_dir(&output_dir)
+        .codec_path("crate::DomainOperationV2StrictCodec")
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_with_config(
             config,
@@ -206,6 +207,10 @@ fn main() -> Result<()> {
     let mut config = tonic_prost_build::Config::new();
     // Use Bytes for buffers instead of Vec
     config.bytes(["."]);
+    config.enum_attribute(
+        ".ucs.auth.DomainOperationMaintenanceVerificationRequest.method_binding",
+        "#[allow(clippy::large_enum_variant)]",
+    );
 
     tonic_prost_build::configure()
         .out_dir(&output_dir)

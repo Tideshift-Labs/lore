@@ -102,6 +102,256 @@ pub struct VerifyRepositoryOperationAuthorizationResponse {
     #[prost(string, tag = "15")]
     pub authenticated_subject: ::prost::alloc::string::String,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationMaintenanceVerificationRequest {
+    #[prost(enumeration = "DomainOperationMaintenanceMethod", tag = "1")]
+    pub method: i32,
+    #[prost(string, tag = "2")]
+    pub verified_issuer: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub authenticated_subject: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub org_uuid: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub initiating_principal_namespace: ::prost::bytes::Bytes,
+    /// Operation UUID for receipt maintenance, or namespace epoch for namespace
+    /// lifecycle maintenance. The selected method fixes its exact 16-byte meaning.
+    #[prost(bytes = "bytes", tag = "6")]
+    pub target_identity: ::prost::bytes::Bytes,
+    /// Deterministic Prost encoding after strict raw-frame validation. Unknown,
+    /// duplicate, wrong-wire, noncanonical, and invalid-presence input never
+    /// reaches this port.
+    #[prost(bytes = "bytes", tag = "7")]
+    pub canonical_request: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub canonical_request_sha256: ::prost::bytes::Bytes,
+    #[prost(
+        oneof = "domain_operation_maintenance_verification_request::MethodBinding",
+        tags = "9, 10, 11, 12"
+    )]
+    pub method_binding: ::core::option::Option<
+        domain_operation_maintenance_verification_request::MethodBinding,
+    >,
+}
+/// Nested message and enum types in `DomainOperationMaintenanceVerificationRequest`.
+pub mod domain_operation_maintenance_verification_request {
+    #[allow(clippy::large_enum_variant)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum MethodBinding {
+        #[prost(message, tag = "9")]
+        StaleFinalize(super::DomainOperationStaleFinalizePermitVerification),
+        #[prost(message, tag = "10")]
+        TerminalStatusAttach(super::DomainOperationTerminalStatusAttachmentVerification),
+        #[prost(message, tag = "11")]
+        ProofNamespaceMaterialize(
+            super::DomainOperationProofNamespaceMaterializationVerification,
+        ),
+        #[prost(message, tag = "12")]
+        ProofNamespaceRetire(super::DomainOperationProofNamespaceRetirementVerification),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationStaleFinalizePermitVerification {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub operation_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub authorization_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "3")]
+    pub authorization_revision: u64,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub verification_nonce: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub bound_fields_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub consumed_ticket_sha256: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub expected_claim_identity_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub stale_finalize_permit: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "9")]
+    pub stale_finalize_permit_revision: u64,
+    #[prost(bytes = "bytes", tag = "10")]
+    pub request_digest: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationTerminalStatusAttachmentVerification {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub operation_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub authorization_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "3")]
+    pub authorization_revision: u64,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub claim_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "5")]
+    pub claim_revision: u64,
+    #[prost(uint32, tag = "6")]
+    pub terminal_outcome: u32,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub terminal_receipt_sha256: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "8")]
+    pub platform_terminal_status_revision: u64,
+    #[prost(int64, tag = "9")]
+    pub acknowledged_at_unix_millis: i64,
+    #[prost(uint32, tag = "10")]
+    pub phase: u32,
+    #[prost(uint64, tag = "11")]
+    pub reserve_charge_revision: u64,
+    #[prost(bytes = "bytes", tag = "12")]
+    pub reserve_charge_nonce: ::prost::bytes::Bytes,
+    #[prost(uint32, tag = "13")]
+    pub phase2_action: u32,
+    #[prost(bytes = "bytes", tag = "14")]
+    pub release_tombstone_digest: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "15")]
+    pub active_release_intent_revision: u64,
+    #[prost(bytes = "bytes", tag = "16")]
+    pub active_release_intent_nonce: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "17")]
+    pub tombstone_reservation_revision: u64,
+    #[prost(bytes = "bytes", tag = "18")]
+    pub tombstone_reservation_nonce: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "19")]
+    pub final_prune_digest: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "20")]
+    pub tombstone_release_intent_revision: u64,
+    #[prost(bytes = "bytes", tag = "21")]
+    pub tombstone_release_intent_nonce: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "22")]
+    pub release_proof_reservation_revision: u64,
+    #[prost(bytes = "bytes", tag = "23")]
+    pub release_proof_reservation_nonce: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "24")]
+    pub completion_marker_sequence: u64,
+    #[prost(bytes = "bytes", tag = "25")]
+    pub expected_completion_marker_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "26")]
+    pub request_digest: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationProofNamespaceMaterializationVerification {
+    #[prost(uint32, tag = "1")]
+    pub protocol_revision: u32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub namespace_epoch: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "3")]
+    pub namespace_claim_revision: u64,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub namespace_claim_nonce: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "5")]
+    pub platform_capacity_revision: u64,
+    #[prost(uint64, tag = "6")]
+    pub lore_local_capacity_revision: u64,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub request_digest: ::prost::bytes::Bytes,
+    #[prost(string, tag = "8")]
+    pub signed_jwt: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationProofNamespaceRetirementVerification {
+    #[prost(uint32, tag = "1")]
+    pub protocol_revision: u32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub namespace_epoch: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "3")]
+    pub quota_revision: u64,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub final_range_set_digest: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "5")]
+    pub final_high_water: u64,
+    #[prost(uint64, tag = "6")]
+    pub retirement_fence_generation: u64,
+    #[prost(uint64, tag = "7")]
+    pub retirement_permit_revision: u64,
+    #[prost(int64, tag = "8")]
+    pub issued_at_unix_millis: i64,
+    #[prost(int64, tag = "9")]
+    pub expires_at_unix_millis: i64,
+    #[prost(bytes = "bytes", tag = "10")]
+    pub zero_platform_state_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "11")]
+    pub request_digest: ::prost::bytes::Bytes,
+    #[prost(string, tag = "12")]
+    pub signed_jwt: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "13")]
+    pub namespace_claim_revision: u64,
+    #[prost(bytes = "bytes", tag = "14")]
+    pub namespace_claim_nonce: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationMaintenanceVerificationResponse {
+    #[prost(enumeration = "DomainOperationMaintenanceMethod", tag = "1")]
+    pub method: i32,
+    #[prost(string, tag = "2")]
+    pub verified_issuer: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub authenticated_subject: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub org_uuid: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub initiating_principal_namespace: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub target_identity: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub canonical_request_sha256: ::prost::bytes::Bytes,
+    /// Auth-grpc's immutable proof that it accepted or atomically claimed the
+    /// exact request. Loreserver requires 32 bytes and stores/binds it before a
+    /// mutation. A rejection is a gRPC error, never an `authorized=false` value.
+    #[prost(bytes = "bytes", tag = "8")]
+    pub verification_digest: ::prost::bytes::Bytes,
+}
+/// Closed method discriminator for the four CR-029 maintenance verifier ports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DomainOperationMaintenanceMethod {
+    Unspecified = 0,
+    VerifiedStaleFinalize = 1,
+    TerminalStatusAttach = 2,
+    ProofNamespaceMaterialize = 3,
+    ProofNamespaceRetire = 4,
+}
+impl DomainOperationMaintenanceMethod {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "DOMAIN_OPERATION_MAINTENANCE_METHOD_UNSPECIFIED",
+            Self::VerifiedStaleFinalize => {
+                "DOMAIN_OPERATION_MAINTENANCE_METHOD_VERIFIED_STALE_FINALIZE"
+            }
+            Self::TerminalStatusAttach => {
+                "DOMAIN_OPERATION_MAINTENANCE_METHOD_TERMINAL_STATUS_ATTACH"
+            }
+            Self::ProofNamespaceMaterialize => {
+                "DOMAIN_OPERATION_MAINTENANCE_METHOD_PROOF_NAMESPACE_MATERIALIZE"
+            }
+            Self::ProofNamespaceRetire => {
+                "DOMAIN_OPERATION_MAINTENANCE_METHOD_PROOF_NAMESPACE_RETIRE"
+            }
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "DOMAIN_OPERATION_MAINTENANCE_METHOD_UNSPECIFIED" => Some(Self::Unspecified),
+            "DOMAIN_OPERATION_MAINTENANCE_METHOD_VERIFIED_STALE_FINALIZE" => {
+                Some(Self::VerifiedStaleFinalize)
+            }
+            "DOMAIN_OPERATION_MAINTENANCE_METHOD_TERMINAL_STATUS_ATTACH" => {
+                Some(Self::TerminalStatusAttach)
+            }
+            "DOMAIN_OPERATION_MAINTENANCE_METHOD_PROOF_NAMESPACE_MATERIALIZE" => {
+                Some(Self::ProofNamespaceMaterialize)
+            }
+            "DOMAIN_OPERATION_MAINTENANCE_METHOD_PROOF_NAMESPACE_RETIRE" => {
+                Some(Self::ProofNamespaceRetire)
+            }
+            _ => None,
+        }
+    }
+}
 /// Generated client implementations.
 pub mod rebac_api_client {
     #![allow(
@@ -275,6 +525,134 @@ pub mod rebac_api_client {
                     GrpcMethod::new(
                         "ucs.auth.RebacApi",
                         "VerifyRepositoryOperationAuthorization",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// FORK-LOCAL (Tideshift, CR-029). These private maintenance verifiers are
+        /// called before Lore takes a receipt or proof-namespace lock. Each request
+        /// carries the strict-codec-approved canonical domain request and its SHA-256
+        /// so auth-grpc can bind its platform mutation/read to the exact wire intent.
+        pub async fn claim_repository_operation_stale_finalize_permit(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::DomainOperationMaintenanceVerificationRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationMaintenanceVerificationResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ucs.auth.RebacApi/ClaimRepositoryOperationStaleFinalizePermit",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "ucs.auth.RebacApi",
+                        "ClaimRepositoryOperationStaleFinalizePermit",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn verify_repository_operation_terminal_status_attach(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::DomainOperationMaintenanceVerificationRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationMaintenanceVerificationResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ucs.auth.RebacApi/VerifyRepositoryOperationTerminalStatusAttach",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "ucs.auth.RebacApi",
+                        "VerifyRepositoryOperationTerminalStatusAttach",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn verify_repository_operation_proof_namespace_materialize(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::DomainOperationMaintenanceVerificationRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationMaintenanceVerificationResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ucs.auth.RebacApi/VerifyRepositoryOperationProofNamespaceMaterialize",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "ucs.auth.RebacApi",
+                        "VerifyRepositoryOperationProofNamespaceMaterialize",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn verify_repository_operation_proof_namespace_retire(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::DomainOperationMaintenanceVerificationRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationMaintenanceVerificationResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ucs.auth.RebacApi/VerifyRepositoryOperationProofNamespaceRetire",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "ucs.auth.RebacApi",
+                        "VerifyRepositoryOperationProofNamespaceRetire",
                     ),
                 );
             self.inner.unary(req, path, codec).await
