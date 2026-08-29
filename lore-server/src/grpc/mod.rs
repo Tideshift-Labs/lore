@@ -181,6 +181,96 @@ pub fn map_message_handle_error_to_status(
     Status::with_details(code, message, details.unwrap_or_default())
 }
 
+/// Stable client-facing meaning of an indeterminate domain commit.
+///
+/// Kept as a constant because it is the only thing distinguishing an
+/// outcome-unknown `ABORTED` from a contention `ABORTED` on the wire, and
+/// clients match on it.
+pub const DOMAIN_OUTCOME_UNKNOWN_DETAIL: &str =
+    "mutation outcome unknown; refetch authoritative state before retry";
+
+/// Fixed detail for every denied or race-lost repository result, so active,
+/// unknown, tombstoned, catalog-removed, and race-lost cases stay
+/// indistinguishable (CR-029 repository delete).
+pub const DOMAIN_REPOSITORY_NOT_FOUND_DETAIL: &str = "Repository not found";
+
+/// Translate a CR-029 domain-coordinator error into a gRPC status, in exactly
+/// one place.
+///
+/// # `OutcomeUnknown` is `ABORTED`, never `UNKNOWN` (R-BLOCK-1)
+///
+/// CR-029 originally mandated `UNKNOWN` for an indeterminate commit, to avoid
+/// the replay that generic retry policy applies to `UNAVAILABLE`. That is
+/// inverted in this fork: [`lore_transport::error::ProtocolError`]'s
+/// `From<tonic::Status>` folds `Unavailable` **and** `Unknown` into the same
+/// `Disconnected` variant, and `lore-transport/src/grpc/mod.rs` reissues the
+/// operation on exactly that variant, bounded by `MAX_RECONNECTS_PER_OP`. So
+/// `UNKNOWN` is one of the two codes that *cause* a replay of a mutation whose
+/// outcome is unknown, which is the specific thing that must never happen.
+///
+/// `ABORTED` is selected instead: it falls to the `_ => internal` arm, so it is
+/// never replayed, and CR-029 already uses it for the generation/witness loser
+/// with the meaning "rerun preflight and refetch authoritative state" — exactly
+/// the outcome-unknown instruction. The justification of record is that
+/// `From<tonic::Status>` mapping, not generic gRPC retry policy. This is not
+/// fixed by changing `lore-transport`: that is a `[CLIENT]`-path crate whose
+/// replay policy WP-120 owns, and WP-116 precedes it.
+pub fn map_domain_error_to_status(error: &lore_postgres::domain::DomainError) -> Status {
+    use lore_postgres::domain::DomainError;
+
+    let status = match error {
+        DomainError::InvalidInput(detail) => Status::invalid_argument(detail.clone()),
+        DomainError::NotReady(detail) => Status::failed_precondition(detail.clone()),
+        DomainError::DomainKeyBypass(detail) => Status::failed_precondition(detail.clone()),
+        DomainError::PreconditionRejected { reason, .. } => {
+            map_domain_rejection_to_status(reason.as_str())
+        }
+        // Bounded retry already ran and did not resolve it. Postgres proved the
+        // transaction rolled back, so the client may re-drive after refetching.
+        DomainError::Contention(detail) => Status::aborted(detail.clone()),
+        DomainError::Transient(detail) => Status::resource_exhausted(detail.clone()),
+        DomainError::OutcomeUnknown(detail) => {
+            warn!(detail = %detail, "Domain commit outcome unknown");
+            Status::aborted(DOMAIN_OUTCOME_UNKNOWN_DETAIL)
+        }
+        DomainError::Internal(detail) => {
+            warn!(detail = %detail, "Domain store internal error");
+            Status::internal("Internal error")
+        }
+    };
+    debug!(code = ?status.code(), error = %error, "Mapped domain error");
+    status
+}
+
+/// Map one frozen rejection reason to its public result.
+///
+/// Every denial-shaped reason collapses to the same `NOT_FOUND` and the same
+/// fixed detail, so a caller cannot distinguish an unauthorized live
+/// repository, an unknown one, a tombstoned one, and a race it lost.
+fn map_domain_rejection_to_status(reason: &str) -> Status {
+    use lore_postgres::domain::coordinator;
+
+    match reason {
+        coordinator::GENERATION_MISMATCH_V1 | coordinator::CAS_MISMATCH_V1 => {
+            Status::aborted(reason.to_owned())
+        }
+        coordinator::TOMBSTONED_V1 | coordinator::NOT_FOUND_V1 => {
+            Status::not_found(DOMAIN_REPOSITORY_NOT_FOUND_DETAIL)
+        }
+        coordinator::NAME_TAKEN_V1 | coordinator::FINGERPRINT_MISMATCH_V1 => {
+            Status::already_exists(reason.to_owned())
+        }
+        coordinator::ADMISSION_REJECTED_V1 => Status::failed_precondition(reason.to_owned()),
+        // Vocabulary drift between the coordinator and this mapper. Refusing to
+        // guess is deliberate: an unrecognised reason must not become a code
+        // that instructs the client to retry a decisive rejection.
+        other => {
+            warn!(reason = %other, "Unrecognised domain rejection reason");
+            Status::internal("Internal error")
+        }
+    }
+}
+
 pub fn get_repository(metadata: &MetadataMap) -> Result<RepositoryId, Status> {
     let repo_id = metadata
         .get_bin(PARTITION_ID_KEY)
@@ -193,6 +283,18 @@ pub fn get_repository(metadata: &MetadataMap) -> Result<RepositoryId, Status> {
         .into();
 
     Ok(context.into())
+}
+
+/// The verified token when one is present, without treating its absence as an
+/// error.
+///
+/// [`get_authorization`] is the right call when a missing token must fail the
+/// request. This one exists for callers that have to distinguish "no verified
+/// principal" from "verified principal X" and decide for themselves — the
+/// CR-029 domain admission gate, which refuses carriage from an unauthenticated
+/// caller but leaves an ordinary auth-off request alone.
+pub fn get_authorization_optional(extensions: &Extensions) -> Option<AuthorizationToken> {
+    extensions.get::<AuthorizationToken>().cloned()
 }
 
 pub fn get_authorization(extensions: &Extensions) -> Result<AuthorizationToken, Status> {
@@ -896,6 +998,140 @@ mod tests {
             let filtered = result.filter_slow_down().unwrap();
             let underlying_error = filtered.expect_err("Should be err");
             assert!(!underlying_error.is_slow_down());
+        }
+    }
+
+    mod domain_error_mapping_tests {
+        use lore_postgres::domain::DomainError;
+        use lore_postgres::domain::coordinator;
+        use lore_transport::error::ProtocolError;
+
+        use super::*;
+
+        #[test]
+        fn invalid_input_maps_to_invalid_argument() {
+            let status = map_domain_error_to_status(&DomainError::InvalidInput("bad".into()));
+            assert_eq!(status.code(), Code::InvalidArgument);
+        }
+
+        #[test]
+        fn not_ready_maps_to_failed_precondition() {
+            let status = map_domain_error_to_status(&DomainError::NotReady("not ready".into()));
+            assert_eq!(status.code(), Code::FailedPrecondition);
+        }
+
+        #[test]
+        fn domain_key_bypass_maps_to_failed_precondition() {
+            let status = map_domain_error_to_status(&DomainError::DomainKeyBypass("bypass".into()));
+            assert_eq!(status.code(), Code::FailedPrecondition);
+        }
+
+        #[test]
+        fn contention_maps_to_aborted() {
+            let status = map_domain_error_to_status(&DomainError::Contention("contention".into()));
+            assert_eq!(status.code(), Code::Aborted);
+        }
+
+        #[test]
+        fn transient_maps_to_resource_exhausted() {
+            let status = map_domain_error_to_status(&DomainError::Transient("transient".into()));
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        #[test]
+        fn outcome_unknown_maps_to_aborted_with_the_fixed_detail() {
+            let status =
+                map_domain_error_to_status(&DomainError::OutcomeUnknown("lost ack".into()));
+            assert_eq!(status.code(), Code::Aborted);
+            assert_eq!(status.message(), DOMAIN_OUTCOME_UNKNOWN_DETAIL);
+        }
+
+        #[test]
+        fn internal_maps_to_internal_without_leaking_the_inner_detail() {
+            let secret_detail = "connection string password=hunter2";
+            let status = map_domain_error_to_status(&DomainError::Internal(secret_detail.into()));
+            assert_eq!(status.code(), Code::Internal);
+            assert!(!status.message().contains(secret_detail));
+        }
+
+        #[test]
+        fn generation_and_cas_mismatch_reasons_map_to_aborted() {
+            for reason in [
+                coordinator::GENERATION_MISMATCH_V1,
+                coordinator::CAS_MISMATCH_V1,
+            ] {
+                let status = map_domain_rejection_to_status(reason);
+                assert_eq!(status.code(), Code::Aborted);
+            }
+        }
+
+        // Indistinguishability is the security property under test: a
+        // tombstoned repository and one that never existed must be
+        // byte-identical NOT_FOUND responses, or a caller could use the
+        // difference to probe for a repository's prior existence.
+        #[test]
+        fn tombstoned_and_never_existed_are_byte_identical_not_found_responses() {
+            let tombstoned = map_domain_rejection_to_status(coordinator::TOMBSTONED_V1);
+            let not_found = map_domain_rejection_to_status(coordinator::NOT_FOUND_V1);
+
+            assert_eq!(tombstoned.code(), Code::NotFound);
+            assert_eq!(tombstoned.message(), DOMAIN_REPOSITORY_NOT_FOUND_DETAIL);
+            assert_eq!(tombstoned.code(), not_found.code());
+            assert_eq!(tombstoned.message(), not_found.message());
+        }
+
+        #[test]
+        fn name_taken_and_fingerprint_mismatch_reasons_map_to_already_exists() {
+            for reason in [
+                coordinator::NAME_TAKEN_V1,
+                coordinator::FINGERPRINT_MISMATCH_V1,
+            ] {
+                let status = map_domain_rejection_to_status(reason);
+                assert_eq!(status.code(), Code::AlreadyExists);
+            }
+        }
+
+        #[test]
+        fn admission_rejected_maps_to_failed_precondition() {
+            let status = map_domain_rejection_to_status(coordinator::ADMISSION_REJECTED_V1);
+            assert_eq!(status.code(), Code::FailedPrecondition);
+        }
+
+        #[test]
+        fn unrecognised_reason_maps_to_internal() {
+            let status = map_domain_rejection_to_status("SOME_UNKNOWN_REASON_V99");
+            assert_eq!(status.code(), Code::Internal);
+        }
+
+        // R-BLOCK-1, CR-029: an indeterminate database commit must map to a
+        // gRPC code whose `From<tonic::Status>` arm in `lore-transport` is not
+        // `Disconnected`. `lore-transport/src/error.rs` folds `Unavailable`
+        // AND `Unknown` into `ProtocolError::Disconnected`, and
+        // `lore-transport/src/grpc/mod.rs` reissues the operation on exactly
+        // that variant (bounded by `MAX_RECONNECTS_PER_OP`) — i.e. it would
+        // replay a mutation whose outcome is unknown. This is the most
+        // important test in this batch: it is the regression pin for that
+        // rule, not merely a mapping check.
+        #[test]
+        fn outcome_unknown_never_maps_into_the_transport_replay_arm() {
+            let status =
+                map_domain_error_to_status(&DomainError::OutcomeUnknown("lost ack".into()));
+
+            let protocol_error = ProtocolError::from(status);
+
+            assert!(!matches!(protocol_error, ProtocolError::Disconnected(_)));
+
+            // The guard that gives the assertion above its teeth: without these
+            // two positive checks, the negative assertion would still pass if
+            // someone silently changed the transport's own mapping too.
+            assert!(matches!(
+                ProtocolError::from(Status::new(Code::Unknown, "")),
+                ProtocolError::Disconnected(_)
+            ));
+            assert!(matches!(
+                ProtocolError::from(Status::new(Code::Unavailable, "")),
+                ProtocolError::Disconnected(_)
+            ));
         }
     }
 }
