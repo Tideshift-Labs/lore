@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::str::FromStr;
 use std::sync::Arc;
@@ -356,6 +357,7 @@ pub(crate) async fn repository_create_auth_resource(
         CreateResourceRequest {
             resource_id: format!("urc-{repository_id}"),
             resource_name: String::from(name),
+            ..Default::default()
         },
         authorization,
     )?;

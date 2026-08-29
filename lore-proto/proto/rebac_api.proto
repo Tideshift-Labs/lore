@@ -35,8 +35,36 @@ service RebacApi {
 message CreateResourceRequest {
   string resource_id = 1;
   string resource_name = 2;
+  // FORK-LOCAL (Tideshift, CR-029). A governed create carries the complete
+  // attached platform claim. Presence is all-or-none; an ungoverned legacy
+  // create leaves every field below absent/default.
+  string verified_issuer = 3;
+  string authenticated_subject = 4;
+  bytes org_uuid = 5;
+  bytes initiating_principal_namespace = 6;
+  bytes operation_id = 7;
+  string method = 8;
+  bytes scope = 9;
+  uint32 fingerprint_version = 10;
+  bytes fingerprint = 11;
+  bytes canonical_intent_digest = 12;
+  bytes authorization_id = 13;
+  uint64 authorization_revision = 14;
+  bytes verification_nonce = 15;
+  bytes bound_fields_digest = 16;
+  bytes consumed_ticket_sha256 = 17;
+  bytes claim_id = 18;
+  uint64 claim_revision = 19;
+  bytes claim_verification_witness = 20;
+  bytes prepare_token = 21;
 }
-message CreateResourceResponse {}
+message CreateResourceResponse {
+  // Exact acknowledgement of the attached claim. Governed Lore callers reject
+  // an empty or divergent response before entering the mutation transaction.
+  bytes claim_id = 1;
+  uint64 claim_revision = 2;
+  bytes claim_verification_witness = 3;
+}
 
 message DeleteResourceRequest { string resource_id = 1; }
 message DeleteResourceResponse {}

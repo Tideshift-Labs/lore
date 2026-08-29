@@ -5,9 +5,54 @@ pub struct CreateResourceRequest {
     pub resource_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub resource_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub verified_issuer: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub authenticated_subject: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub org_uuid: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub initiating_principal_namespace: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub operation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "8")]
+    pub method: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "9")]
+    pub scope: ::prost::bytes::Bytes,
+    #[prost(uint32, tag = "10")]
+    pub fingerprint_version: u32,
+    #[prost(bytes = "bytes", tag = "11")]
+    pub fingerprint: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "12")]
+    pub canonical_intent_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "13")]
+    pub authorization_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "14")]
+    pub authorization_revision: u64,
+    #[prost(bytes = "bytes", tag = "15")]
+    pub verification_nonce: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "16")]
+    pub bound_fields_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "17")]
+    pub consumed_ticket_sha256: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "18")]
+    pub claim_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "19")]
+    pub claim_revision: u64,
+    #[prost(bytes = "bytes", tag = "20")]
+    pub claim_verification_witness: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "21")]
+    pub prepare_token: ::prost::bytes::Bytes,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct CreateResourceResponse {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateResourceResponse {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub claim_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "2")]
+    pub claim_revision: u64,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub claim_verification_witness: ::prost::bytes::Bytes,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteResourceRequest {
     #[prost(string, tag = "1")]
