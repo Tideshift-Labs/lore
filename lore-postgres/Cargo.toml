@@ -12,9 +12,15 @@ publish = false
 # metadata live together in S3-compatible object storage.
 [dependencies]
 async-trait = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
-tokio-postgres = "0.7"
+# with-uuid-1: the outbox event ID is a real `uuid` column, so the driver needs
+# the ToSql/FromSql impls for it. Nothing else in the crate uses UUIDs.
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 deadpool-postgres = "0.14"
 tracing = { workspace = true }
 # The immutable store reuses lore-aws's S3 client and object-metadata encoding. This is an
