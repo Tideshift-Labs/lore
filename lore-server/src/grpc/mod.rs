@@ -183,11 +183,27 @@ pub fn map_message_handle_error_to_status(
 
 /// Stable client-facing meaning of an indeterminate domain commit.
 ///
-/// Kept as a constant because it is the only thing distinguishing an
-/// outcome-unknown `ABORTED` from a contention `ABORTED` on the wire, and
-/// clients match on it.
+/// CR-029's triage selects `ABORTED` for both an outcome-unknown commit and a
+/// contention loss, so the message is what separates "may have committed" from
+/// "provably rolled back". That makes it a wire contract, not a log line: it is
+/// emitted verbatim with nothing interpolated, so a client compares it for
+/// equality rather than parsing it, and [`DOMAIN_CONTENTION_DETAIL`] is
+/// likewise fixed so the two can never collide.
+///
+/// A typed status detail would carry this better than a message does. That is a
+/// wire-contract decision CR-029's triage did not make - it chose the code and
+/// said nothing about details - so it is left to the CR rather than invented
+/// here.
 pub const DOMAIN_OUTCOME_UNKNOWN_DETAIL: &str =
     "mutation outcome unknown; refetch authoritative state before retry";
+
+/// Stable client-facing meaning of a contention loss.
+///
+/// Fixed rather than pass-through for two reasons: it must never coincide with
+/// [`DOMAIN_OUTCOME_UNKNOWN_DETAIL`], and the underlying value is a SQLSTATE
+/// context string that no client should see.
+pub const DOMAIN_CONTENTION_DETAIL: &str =
+    "domain transaction contention; the transaction rolled back, refetch and retry";
 
 /// Fixed detail for every denied or race-lost repository result, so active,
 /// unknown, tombstoned, catalog-removed, and race-lost cases stay
@@ -227,8 +243,16 @@ pub fn map_domain_error_to_status(error: &lore_postgres::domain::DomainError) ->
         }
         // Bounded retry already ran and did not resolve it. Postgres proved the
         // transaction rolled back, so the client may re-drive after refetching.
-        DomainError::Contention(detail) => Status::aborted(detail.clone()),
-        DomainError::Transient(detail) => Status::resource_exhausted(detail.clone()),
+        // Distinct from the outcome-unknown arm below, which shares this code
+        // but explicitly may have committed.
+        DomainError::Contention(detail) => {
+            debug!(detail = %detail, "Domain transaction contention");
+            Status::aborted(DOMAIN_CONTENTION_DETAIL)
+        }
+        DomainError::Transient(detail) => {
+            debug!(detail = %detail, "Domain store transient failure");
+            Status::resource_exhausted("Domain store temporarily unavailable")
+        }
         DomainError::OutcomeUnknown(detail) => {
             warn!(detail = %detail, "Domain commit outcome unknown");
             Status::aborted(DOMAIN_OUTCOME_UNKNOWN_DETAIL)
@@ -1026,16 +1050,30 @@ mod tests {
             assert_eq!(status.code(), Code::FailedPrecondition);
         }
 
+        // Contention and outcome-unknown share `ABORTED` by CR-029's explicit
+        // choice, so the message is the only discriminator a client has — it
+        // must be exact-comparable, never the raw SQLSTATE context string the
+        // error was constructed with (a client should never have to parse
+        // prose to tell "provably rolled back" from "may have committed").
         #[test]
-        fn contention_maps_to_aborted() {
-            let status = map_domain_error_to_status(&DomainError::Contention("contention".into()));
+        fn contention_maps_to_aborted_with_the_fixed_detail_not_the_sqlstate_context() {
+            let sqlstate_context = "SQLSTATE 40001: could not serialize access";
+            let status =
+                map_domain_error_to_status(&DomainError::Contention(sqlstate_context.into()));
+
             assert_eq!(status.code(), Code::Aborted);
+            assert_eq!(status.message(), DOMAIN_CONTENTION_DETAIL);
+            assert!(!status.message().contains(sqlstate_context));
         }
 
         #[test]
-        fn transient_maps_to_resource_exhausted() {
-            let status = map_domain_error_to_status(&DomainError::Transient("transient".into()));
+        fn transient_maps_to_resource_exhausted_without_leaking_the_inner_detail() {
+            let sqlstate_context = "SQLSTATE 08006: connection failure";
+            let status =
+                map_domain_error_to_status(&DomainError::Transient(sqlstate_context.into()));
+
             assert_eq!(status.code(), Code::ResourceExhausted);
+            assert!(!status.message().contains(sqlstate_context));
         }
 
         #[test]
@@ -1044,6 +1082,14 @@ mod tests {
                 map_domain_error_to_status(&DomainError::OutcomeUnknown("lost ack".into()));
             assert_eq!(status.code(), Code::Aborted);
             assert_eq!(status.message(), DOMAIN_OUTCOME_UNKNOWN_DETAIL);
+        }
+
+        // The two `ABORTED` details must never collide, or a client can no
+        // longer tell contention (provably rolled back, safe to retry) from
+        // outcome-unknown (may have committed, must refetch first) apart.
+        #[test]
+        fn domain_contention_detail_and_outcome_unknown_detail_are_distinct() {
+            assert_ne!(DOMAIN_CONTENTION_DETAIL, DOMAIN_OUTCOME_UNKNOWN_DETAIL);
         }
 
         #[test]

@@ -381,6 +381,12 @@ pub enum ScopeKeyError {
 }
 
 /// A raw 16-byte target identity, checked for length and `urc-` provenance.
+///
+/// The length arm already rejects every real resource string — `urc-*` is 5
+/// bytes and `urc-<32 hex>` is 36 — so the prefix arm is defence in depth here
+/// and only becomes load-bearing on [`scope_key_mediated`]'s unbounded
+/// `principal_user_id`. It is kept on both so the rule reads the same wherever
+/// a component enters.
 fn checked_identity(component: &'static str, bytes: &[u8]) -> Result<(), ScopeKeyError> {
     if bytes.starts_with(URC_PREFIX) {
         return Err(ScopeKeyError::UrcResource { component });
@@ -404,20 +410,14 @@ fn checked_identity(component: &'static str, bytes: &[u8]) -> Result<(), ScopeKe
 /// all.
 pub fn scope_key_repository_create(repository_id: &[u8]) -> Result<Vec<u8>, ScopeKeyError> {
     checked_identity("repository_id", repository_id)?;
-    Ok(build_scope_key(
-        SCOPE_METHOD_REPOSITORY_CREATE_V1,
-        &[repository_id],
-    ))
+    build_scope_key(SCOPE_METHOD_REPOSITORY_CREATE_V1, &[repository_id])
 }
 
 /// Scope key for every other direct governed operation: the target repository
 /// identity under a fixed constant.
 pub fn scope_key_target_repository(repository_id: &[u8]) -> Result<Vec<u8>, ScopeKeyError> {
     checked_identity("repository_id", repository_id)?;
-    Ok(build_scope_key(
-        SCOPE_METHOD_REPOSITORY_V1,
-        &[repository_id],
-    ))
+    build_scope_key(SCOPE_METHOD_REPOSITORY_V1, &[repository_id])
 }
 
 /// Scope key for a mediated operation: the auth-grpc-verified canonical tuple
@@ -437,25 +437,65 @@ pub fn scope_key_mediated(
         Vec::with_capacity(SCOPE_PRINCIPAL_NAMESPACE_V1.len() + principal_user_id.len());
     principal.extend_from_slice(SCOPE_PRINCIPAL_NAMESPACE_V1);
     principal.extend_from_slice(principal_user_id);
-    Ok(build_scope_key(
-        SCOPE_METHOD_MEDIATED_V1,
-        &[org_uuid, &principal],
-    ))
+    build_scope_key(SCOPE_METHOD_MEDIATED_V1, &[org_uuid, &principal])
 }
 
-/// Length-prefix every component so two different tuples cannot canonicalise to
-/// the same bytes.
-fn build_scope_key(method: &[u8], components: &[&[u8]]) -> Vec<u8> {
+/// Longest component this encoding admits.
+///
+/// Applied to the component as encoded, so for [`scope_key_mediated`] it bounds
+/// the `principal-v1 ` tag plus the principal id together: the caller-facing
+/// limit on `principal_user_id` is `MAX_SCOPE_COMPONENT_LEN - 13`, not the
+/// constant itself.
+///
+/// Every real component is an identity of at most a few dozen bytes. The bound
+/// exists so the length prefix below can never be a truncated value: silently
+/// clamping an oversized length would make two different tuples encode to the
+/// same bytes, which is exactly what length-prefixing is here to prevent.
+const MAX_SCOPE_COMPONENT_LEN: usize = 1024;
+
+/// Length-prefix the method **and** every component so two different tuples
+/// cannot canonicalise to the same bytes.
+///
+/// The method is prefixed too, rather than relying on the constants above being
+/// NUL-terminated and prefix-free. That property is true today, but it is an
+/// invariant nothing checks and that a future constant could quietly break —
+/// and the failure mode would be two different operations sharing one tenant
+/// scope, which is the worst outcome this function has.
+fn build_scope_key(method: &[u8], components: &[&[u8]]) -> Result<Vec<u8>, ScopeKeyError> {
     let payload: usize = components.iter().map(|c| c.len() + 4).sum();
-    let mut out = Vec::with_capacity(1 + method.len() + payload);
+    let mut out = Vec::with_capacity(1 + 4 + method.len() + payload);
     out.push(SCOPE_KEY_VERSION_V1);
-    out.extend_from_slice(method);
+    push_component("method", method, &mut out)?;
     for component in components {
-        let len = u32::try_from(component.len()).unwrap_or(u32::MAX);
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(component);
+        push_component("identity", component, &mut out)?;
     }
-    out
+    Ok(out)
+}
+
+/// Append one length-prefixed component, refusing a length the prefix cannot
+/// represent exactly.
+fn push_component(
+    component: &'static str,
+    bytes: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), ScopeKeyError> {
+    if bytes.len() > MAX_SCOPE_COMPONENT_LEN {
+        return Err(ScopeKeyError::WrongLength {
+            component,
+            expected: MAX_SCOPE_COMPONENT_LEN,
+            actual: bytes.len(),
+        });
+    }
+    // Infallible given the bound above, but written as a conversion rather than
+    // a cast so a change to the bound cannot silently truncate.
+    let len = u32::try_from(bytes.len()).map_err(|_| ScopeKeyError::WrongLength {
+        component,
+        expected: MAX_SCOPE_COMPONENT_LEN,
+        actual: bytes.len(),
+    })?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -911,6 +951,101 @@ mod tests {
         assert_eq!(target_key[0], SCOPE_KEY_VERSION_V1);
         assert!(contains_subslice(&create_key, &repository_id));
         assert!(contains_subslice(&target_key, &repository_id));
+    }
+
+    // Injectivity of the encoding: no two distinct (method, components) pairs
+    // built from this module's own constants may canonicalise to the same
+    // bytes. A pairwise check over a small grid, not just "these two specific
+    // outputs differ" (which the constants' happening to differ in length
+    // already gave for free, independent of whether the encoding is sound).
+    #[test]
+    fn build_scope_key_is_injective_across_the_module_s_method_constants() {
+        let methods: [&[u8]; 3] = [
+            SCOPE_METHOD_REPOSITORY_CREATE_V1,
+            SCOPE_METHOD_REPOSITORY_V1,
+            SCOPE_METHOD_MEDIATED_V1,
+        ];
+        let component_sets: [&[&[u8]]; 3] = [
+            &[b"AAAAAAAAAAAAAAAA"],
+            &[b"AAAAAAAAAAAAAAA"],
+            &[b"AAAAAAAAAAAAAAAA", b"BBBB"],
+        ];
+
+        let mut keys = Vec::new();
+        for method in methods {
+            for components in component_sets {
+                let key =
+                    build_scope_key(method, components).expect("bounded components must encode");
+                keys.push(key);
+            }
+        }
+
+        for i in 0..keys.len() {
+            for j in (i + 1)..keys.len() {
+                assert_ne!(keys[i], keys[j], "pair ({i}, {j}) of the grid collided");
+            }
+        }
+    }
+
+    // The pre-fix encoding omitted a method length prefix, so a method whose
+    // bytes happened to equal another pair's declared component length could
+    // canonicalise identically to that pair's own concatenation. This is a
+    // constructed instance of exactly that collision class (worked out by
+    // hand against the old `method || len(component) || component` layout),
+    // pinned to prove it no longer collides now that the method is
+    // length-prefixed too.
+    #[test]
+    fn build_scope_key_no_longer_collides_across_a_method_length_prefix_boundary() {
+        let method_a: &[u8] = &[0x00, 0x00, 0x00, 0x0E];
+        let component_a: &[u8] = b"HELLOWORLD";
+
+        let method_b: &[u8] = b"";
+        let component_b: &[u8] = &[
+            0x00, 0x00, 0x00, 0x0A, b'H', b'E', b'L', b'L', b'O', b'W', b'O', b'R', b'L', b'D',
+        ];
+
+        let key_a =
+            build_scope_key(method_a, &[component_a]).expect("bounded components must encode");
+        let key_b =
+            build_scope_key(method_b, &[component_b]).expect("bounded components must encode");
+
+        assert_ne!(
+            key_a, key_b,
+            "distinct (method, component) pairs must never canonicalise to the same key"
+        );
+    }
+
+    #[test]
+    fn principal_component_at_the_exact_bound_is_accepted() {
+        let org_uuid = *Uuid::new_v4().as_bytes();
+        let principal_user_id =
+            vec![b'x'; MAX_SCOPE_COMPONENT_LEN - SCOPE_PRINCIPAL_NAMESPACE_V1.len()];
+
+        scope_key_mediated(&org_uuid, &principal_user_id)
+            .expect("a component at the exact bound must be accepted");
+    }
+
+    // The old `u32::try_from(...).unwrap_or(u32::MAX)` would have silently
+    // clamped an oversized length rather than reporting it, breaking
+    // injectivity. Pin that an over-bound component is refused, not
+    // truncated.
+    #[test]
+    fn principal_component_one_byte_over_the_bound_is_rejected() {
+        let org_uuid = *Uuid::new_v4().as_bytes();
+        let principal_user_id =
+            vec![b'x'; MAX_SCOPE_COMPONENT_LEN - SCOPE_PRINCIPAL_NAMESPACE_V1.len() + 1];
+
+        let err = scope_key_mediated(&org_uuid, &principal_user_id)
+            .expect_err("one byte over the bound must be rejected, not silently truncated");
+
+        assert_eq!(
+            err,
+            ScopeKeyError::WrongLength {
+                component: "identity",
+                expected: MAX_SCOPE_COMPONENT_LEN,
+                actual: MAX_SCOPE_COMPONENT_LEN + 1,
+            }
+        );
     }
 
     #[test]

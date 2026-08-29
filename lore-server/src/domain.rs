@@ -39,6 +39,7 @@ use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::ReceiptKey;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
@@ -96,11 +97,15 @@ impl GovernedScope<'_> {
             } => domain_operation_metadata::scope_key_mediated(org_uuid, principal_user_id),
         };
         built.map_err(|e| {
-            // A bad scope component is a server-side provenance fault, not a
-            // client input fault: the identity was already validated by the
-            // handler before it reached here.
-            warn!(error = %e, "Refused to build a domain tenant scope key");
-            Status::internal("Internal error")
+            // A client fault, not a server one. The gate deliberately runs
+            // before handler logic, so the target identity here is raw request
+            // input that nothing has validated yet: a caller can send a
+            // repository id that is not 16 bytes, or one whose first bytes
+            // spell `urc-`, and both are its mistake to correct. Reporting
+            // `INTERNAL` would blame the server for a bad request and would
+            // also be the one code an operator would page on.
+            debug!(error = %e, "Rejected a domain tenant scope key component");
+            Status::invalid_argument(e.to_string())
         })
     }
 }
@@ -343,14 +348,24 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<Option<Arc<
                 .unwrap_or_default(),
         ),
     ] {
+        // A store on some other backend is genuinely out of scope for a
+        // same-database proof, so skipping it is correct.
         if mode != POSTGRES_MODE {
             continue;
         }
-        let Some(other) =
+        // A store that IS in postgres mode but resolves no configuration is
+        // not. Skipping it here would silently drop one leg of the very check
+        // whose entire purpose is to be positive, leaving the cell believing it
+        // proved co-location it never tested.
+        let other =
             resolve_plugin_config_with_fallback(&settings.plugins, POSTGRES_MODE, store_type)
-        else {
-            continue;
-        };
+                .ok_or_else(|| {
+                    anyhow!(
+                        "The {label} is in postgres mode but no [plugins.postgres] configuration \
+                 resolves for it, so its co-location with the domain coordinator cannot be \
+                 proven"
+                    )
+                })?;
         assert_domain_store_colocated(&store, label, &other)
             .await
             .map_err(|e| anyhow!("{e}"))?;
@@ -397,9 +412,15 @@ fn resolve_enforcement(state: &DomainSchemaState) -> Result<bool> {
     Ok(true)
 }
 
+/// Test-only fixtures shared across this crate's domain-admission tests: a
+/// coordinator whose methods are never reached, and a helper to wrap it in a
+/// [`DomainContext`]. `pub(crate)` and `#[cfg(test)]`-gated so a gated
+/// handler's own `mod tests` elsewhere in the crate can build a real
+/// `Some(&Arc<DomainContext>)` without duplicating the trait impl or leaking
+/// test-only code into a non-test build.
 #[cfg(test)]
-mod tests {
-    use std::time::SystemTime;
+pub(crate) mod test_support {
+    use std::sync::Arc;
 
     use async_trait::async_trait;
     use lore_postgres::domain::DomainError;
@@ -410,60 +431,17 @@ mod tests {
     use lore_postgres::domain::coordinator::RepositoryCreateInput;
     use lore_postgres::domain::coordinator::RepositoryDeleteInput;
     use lore_postgres::domain::coordinator::RepositorySnapshot;
-    use lore_postgres::domain::schema::BACKFILL_CUTOVER;
-    use lore_postgres::domain::schema::BACKFILL_NOT_STARTED;
-    use tonic::Code;
-    use tonic::metadata::BinaryMetadataValue;
-    use uuid::Uuid;
 
-    use super::*;
-    use crate::grpc::domain_operation_metadata::FINGERPRINT_KEY;
-    use crate::grpc::domain_operation_metadata::FINGERPRINT_V1_LEN;
-    use crate::grpc::domain_operation_metadata::FINGERPRINT_VERSION_V1;
-    use crate::grpc::domain_operation_metadata::OPERATION_ID_KEY;
-    use crate::grpc::domain_operation_metadata::PREPARE_TOKEN_KEY;
-    use crate::grpc::domain_operation_metadata::PREPARE_TOKEN_LEN;
-    use crate::grpc::domain_operation_metadata::SCOPE_PRINCIPAL_NAMESPACE_V1;
-
-    // --- shared helpers ------------------------------------------------
-
-    fn valid_metadata(operation_id: Uuid) -> MetadataMap {
-        let mut metadata = MetadataMap::new();
-        metadata.insert_bin(
-            OPERATION_ID_KEY,
-            BinaryMetadataValue::from_bytes(operation_id.as_bytes()),
-        );
-        let mut fingerprint = vec![FINGERPRINT_VERSION_V1];
-        fingerprint.extend(std::iter::repeat_n(0xAB, FINGERPRINT_V1_LEN));
-        metadata.insert_bin(
-            FINGERPRINT_KEY,
-            BinaryMetadataValue::from_bytes(&fingerprint),
-        );
-        metadata.insert_bin(
-            PREPARE_TOKEN_KEY,
-            BinaryMetadataValue::from_bytes(&[0xCDu8; PREPARE_TOKEN_LEN]),
-        );
-        metadata
-    }
-
-    fn test_token(issuer: &str, subject: &str) -> AuthorizationToken {
-        AuthorizationToken {
-            issuer: issuer.to_string(),
-            user_id: subject.to_string(),
-            ..Default::default()
-        }
-    }
-
-    fn test_repository_id() -> [u8; 16] {
-        *Uuid::new_v4().as_bytes()
-    }
+    use super::DomainContext;
+    use super::DomainTransactionStore;
+    use super::GovernedOperation;
 
     /// A coordinator whose methods are never reached: `DomainContext::admit`
     /// only runs the entry gate, never a coordinator call. Every method is
     /// implemented explicitly (never a trait default — `DomainTransactionStore`
     /// has none) so a signature drift fails to compile rather than silently
     /// inheriting a body.
-    struct UnreachableDomainStore;
+    pub(crate) struct UnreachableDomainStore;
 
     #[async_trait]
     impl DomainTransactionStore for UnreachableDomainStore {
@@ -523,8 +501,65 @@ mod tests {
         }
     }
 
-    fn context(enforcement: bool) -> DomainContext {
+    /// Wrap [`UnreachableDomainStore`] in a [`DomainContext`] with the given
+    /// enforcement setting. Safe for any admission test: the entry gate
+    /// decides before ever reaching the coordinator.
+    pub(crate) fn context(enforcement: bool) -> DomainContext {
         DomainContext::new(Arc::new(UnreachableDomainStore), enforcement)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use lore_postgres::domain::schema::BACKFILL_CUTOVER;
+    use lore_postgres::domain::schema::BACKFILL_NOT_STARTED;
+    use tonic::Code;
+    use tonic::metadata::BinaryMetadataValue;
+    use uuid::Uuid;
+
+    use super::test_support::context;
+    use super::*;
+    use crate::grpc::domain_operation_metadata::FINGERPRINT_KEY;
+    use crate::grpc::domain_operation_metadata::FINGERPRINT_V1_LEN;
+    use crate::grpc::domain_operation_metadata::FINGERPRINT_VERSION_V1;
+    use crate::grpc::domain_operation_metadata::OPERATION_ID_KEY;
+    use crate::grpc::domain_operation_metadata::PREPARE_TOKEN_KEY;
+    use crate::grpc::domain_operation_metadata::PREPARE_TOKEN_LEN;
+    use crate::grpc::domain_operation_metadata::SCOPE_PRINCIPAL_NAMESPACE_V1;
+
+    // --- shared helpers ------------------------------------------------
+
+    fn valid_metadata(operation_id: Uuid) -> MetadataMap {
+        let mut metadata = MetadataMap::new();
+        metadata.insert_bin(
+            OPERATION_ID_KEY,
+            BinaryMetadataValue::from_bytes(operation_id.as_bytes()),
+        );
+        let mut fingerprint = vec![FINGERPRINT_VERSION_V1];
+        fingerprint.extend(std::iter::repeat_n(0xAB, FINGERPRINT_V1_LEN));
+        metadata.insert_bin(
+            FINGERPRINT_KEY,
+            BinaryMetadataValue::from_bytes(&fingerprint),
+        );
+        metadata.insert_bin(
+            PREPARE_TOKEN_KEY,
+            BinaryMetadataValue::from_bytes(&[0xCDu8; PREPARE_TOKEN_LEN]),
+        );
+        metadata
+    }
+
+    fn test_token(issuer: &str, subject: &str) -> AuthorizationToken {
+        AuthorizationToken {
+            issuer: issuer.to_string(),
+            user_id: subject.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn test_repository_id() -> [u8; 16] {
+        *Uuid::new_v4().as_bytes()
     }
 
     // --- 1. GovernedScope::tenant_scope_key -------------------------------
@@ -562,6 +597,52 @@ mod tests {
             key.windows(SCOPE_PRINCIPAL_NAMESPACE_V1.len())
                 .any(|window| window == SCOPE_PRINCIPAL_NAMESPACE_V1)
         );
+    }
+
+    // A bad target identity is the caller's mistake, not the server's: the
+    // gate runs before handler logic, so nothing has validated `repository_id`
+    // yet. `Code::Internal` would misattribute the fault and is the one code
+    // an operator pages on. Both cases need carriage present and a token, or
+    // `admit` short-circuits before the scope key is ever built.
+    #[test]
+    fn wrong_length_repository_id_reaches_admit_as_invalid_argument_not_internal() {
+        let ctx = context(false);
+        let metadata = valid_metadata(Uuid::now_v7());
+        let token = test_token("https://issuer.example", "subject-123");
+        let repository_id = [0xAAu8; 15];
+
+        let err = ctx
+            .admit(
+                &metadata,
+                Some(&token),
+                GovernedScope::TargetRepository {
+                    repository_id: &repository_id,
+                },
+            )
+            .expect_err("a wrong-length repository id must be rejected");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn urc_prefixed_repository_id_reaches_admit_as_invalid_argument_not_internal() {
+        let ctx = context(false);
+        let metadata = valid_metadata(Uuid::now_v7());
+        let token = test_token("https://issuer.example", "subject-123");
+        let mut repository_id = [0u8; 16];
+        repository_id[..4].copy_from_slice(b"urc-");
+
+        let err = ctx
+            .admit(
+                &metadata,
+                Some(&token),
+                GovernedScope::TargetRepository {
+                    repository_id: &repository_id,
+                },
+            )
+            .expect_err("a urc--prefixed repository id must be rejected");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 
     // --- 2/3. admit_at_entry against a cell with no coordinator -----------

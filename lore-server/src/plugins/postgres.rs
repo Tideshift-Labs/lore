@@ -66,6 +66,18 @@ pub struct PostgresStoreConfig {
     /// otherwise, so `sslmode=require` behaves like `verify-ca`.
     #[serde(default)]
     pub tls_insecure_skip_verify: bool,
+    /// Max pooled connections for the CR-029 domain coordinator specifically.
+    ///
+    /// Deliberately its own knob with a small default rather than inheriting
+    /// `pool_max`. The coordinator is a **fourth** pool on every Postgres cell,
+    /// added whether or not domain enforcement is on, so inheriting a
+    /// `pool_max` of 10 would raise a cell's steady-state connection count by a
+    /// third to serve a subsystem that is idle until cutover. The two things it
+    /// actually does before then - bootstrap DDL and a singleton state read -
+    /// need one connection, and the backfill walks one repository at a time.
+    /// Raise it when a cell enables enforcement.
+    #[serde(default = "default_domain_pool_max")]
+    pub domain_pool_max: u32,
     /// S3-compatible object storage for fragment bytes and authoritative
     /// representation metadata. Required by the immutable-store factory;
     /// unused (and typically absent) for the mutable/lock stores, which keep
@@ -104,6 +116,10 @@ pub struct ObjectStoreConfig {
 
 fn default_pool_max() -> u32 {
     10
+}
+
+fn default_domain_pool_max() -> u32 {
+    4
 }
 
 fn default_slow_threshold() -> u64 {
@@ -200,7 +216,7 @@ pub(crate) async fn connect_domain_store(
     let cfg = parse_config(plugin_name, config)?;
     let tls = build_tls(plugin_name, &cfg)?;
 
-    PostgresDomainStore::connect(&cfg.url, cfg.pool_max, &tls)
+    PostgresDomainStore::connect(&cfg.url, cfg.domain_pool_max, &tls)
         .await
         .map_err(|e| {
             PluginError::from(PluginInitError {
@@ -379,4 +395,53 @@ pub fn register(registry: &mut PluginRegistry) {
     registry.register_immutable_store_plugin(Box::new(PostgresImmutableStorePluginFactory));
     registry.register_mutable_store_plugin(Box::new(PostgresMutableStorePluginFactory));
     registry.register_lock_store_plugin(Box::new(PostgresLockStorePluginFactory));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `domain_pool_max` is deliberately its own knob, not inherited from
+    // `pool_max` — see the field's own doc comment. These three pin that
+    // independence at the config-parsing boundary.
+
+    #[test]
+    fn domain_pool_max_defaults_to_four_when_absent() {
+        let config: toml::Value = toml::from_str(r#"url = "postgres://localhost/lore""#).unwrap();
+        let parsed: PostgresStoreConfig = config.try_into().unwrap();
+
+        assert_eq!(parsed.domain_pool_max, 4);
+    }
+
+    #[test]
+    fn domain_pool_max_explicit_value_is_honoured() {
+        let config: toml::Value = toml::from_str(
+            r#"
+            url = "postgres://localhost/lore"
+            domain_pool_max = 20
+            "#,
+        )
+        .unwrap();
+        let parsed: PostgresStoreConfig = config.try_into().unwrap();
+
+        assert_eq!(parsed.domain_pool_max, 20);
+    }
+
+    #[test]
+    fn pool_max_alone_does_not_change_domain_pool_max() {
+        let config: toml::Value = toml::from_str(
+            r#"
+            url = "postgres://localhost/lore"
+            pool_max = 50
+            "#,
+        )
+        .unwrap();
+        let parsed: PostgresStoreConfig = config.try_into().unwrap();
+
+        assert_eq!(parsed.pool_max, 50);
+        assert_eq!(
+            parsed.domain_pool_max, 4,
+            "domain_pool_max must not inherit pool_max"
+        );
+    }
 }

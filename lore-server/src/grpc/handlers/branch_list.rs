@@ -140,6 +140,7 @@ mod tests {
     use lore_base::types::Context;
     use lore_base::types::Hash;
     use lore_revision::branch::BranchLatestStatus;
+    use lore_revision::repository::RepositoryMetadata;
     use lore_transport::grpc::REPOSITORY_ID_KEY;
     use rand::random;
 
@@ -305,6 +306,169 @@ mod tests {
                 assert_eq!(
                     BranchListResponse { branches: vec![] },
                     response.into_inner()
+                );
+            })
+            .await;
+    }
+
+    /// Wraps a real `MutableStore`, delegating every method except `store()`,
+    /// which always fails once wrapped. Mirrors the self-heal write's actual
+    /// failure mode under CR-029 enforcement (the domain-key bypass guard
+    /// rejects a `BranchId`-typed write on the generic mutable path — see
+    /// `lore-postgres/tests/domain_bypass.rs`) without depending on a live
+    /// Postgres store.
+    struct FailStoreWritesMutableStore {
+        inner: Arc<dyn lore_storage::MutableStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl lore_storage::MutableStore for FailStoreWritesMutableStore {
+        async fn load(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+            key: Hash,
+            key_type: lore_base::types::KeyType,
+        ) -> Result<Hash, lore_storage::StoreError> {
+            self.inner.clone().load(partition, key, key_type).await
+        }
+
+        async fn store(
+            self: Arc<Self>,
+            _partition: lore_storage::Partition,
+            _key: Hash,
+            _value: Hash,
+            _key_type: lore_base::types::KeyType,
+        ) -> Result<(), lore_storage::StoreError> {
+            Err(lore_storage::StoreError::internal(
+                "simulated domain-key bypass guard rejection",
+            ))
+        }
+
+        async fn compare_and_swap(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+            key: Hash,
+            expected: Hash,
+            value: Hash,
+            key_type: lore_base::types::KeyType,
+        ) -> Result<Hash, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .compare_and_swap(partition, key, expected, value, key_type)
+                .await
+        }
+
+        async fn list(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+            key_type: lore_base::types::KeyType,
+        ) -> Result<lore_storage::KeyValueStream, lore_storage::StoreError> {
+            self.inner.clone().list(partition, key_type).await
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+    }
+
+    // CR-029, self-heal writer pin (companion to `lore-postgres/tests/
+    // domain_bypass.rs`, which proves the guard itself rejects the write —
+    // this proves the call site at line 116 swallows that rejection rather
+    // than propagating it). The reviewer's defence for leaving this handler
+    // ungated is that a missing default-branch mapping is repaired
+    // best-effort; if a future cleanup ever turns the `if let Err(err) = ...`
+    // into a `?`, this test must go red.
+    #[tokio::test]
+    async fn default_branch_mapping_repair_failure_does_not_fail_the_list() {
+        let repository_id = random::<Context>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository_id.into(),
+                ));
+                let write_token = get_write_token();
+                let default_branch = Context::from(uuid::Uuid::now_v7());
+
+                branch::create(
+                    repository.clone(),
+                    &write_token,
+                    default_branch,
+                    "main",
+                    branch::default_category(),
+                    "alice",
+                    0,
+                    vec![],
+                    false,
+                    false,
+                )
+                .await
+                .expect("create default branch");
+
+                // Publish repository metadata naming this branch the
+                // default, then remove just the branch's listing entry (its
+                // own metadata and latest pointer are untouched), so
+                // `branch::list()` no longer enumerates it — reproducing
+                // "default branch missing from list" directly rather than
+                // needing an inconsistent real-world write sequence first.
+                let repo_metadata_hash = repository::metadata_store(
+                    repository.clone(),
+                    RepositoryMetadata {
+                        name: "my-repo".to_string(),
+                        description: "a description".to_string(),
+                        default_branch,
+                        default_branch_name: "main".to_string(),
+                        creator: "alice".to_string(),
+                        created: 0,
+                    },
+                )
+                .await
+                .expect("serialize repository metadata");
+                repository::metadata_store_hash(repository.clone(), repo_metadata_hash)
+                    .await
+                    .expect("publish repository metadata pointer");
+
+                let (listing_key, listing_key_type) = branch::mutable_key(
+                    repository.salt(),
+                    branch::ID,
+                    repository.id,
+                    default_branch,
+                );
+                mutable_store
+                    .clone()
+                    .store(
+                        repository.id,
+                        listing_key,
+                        Hash::default(),
+                        listing_key_type,
+                    )
+                    .await
+                    .expect("remove the branch's listing entry");
+
+                let faulty_mutable: Arc<dyn lore_storage::MutableStore> =
+                    Arc::new(FailStoreWritesMutableStore {
+                        inner: mutable_store.clone(),
+                    });
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store,
+                    faulty_mutable,
+                    repository_id.into(),
+                ));
+
+                let response = branch_list_handler(repository)
+                    .await
+                    .expect("a failed default-branch mapping repair must not fail the list")
+                    .into_inner();
+
+                assert!(
+                    response
+                        .branches
+                        .iter()
+                        .any(|b| b.id.as_ref() == default_branch.data()),
+                    "the default branch must still be included despite the failed repair write"
                 );
             })
             .await;

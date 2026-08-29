@@ -210,3 +210,111 @@ pub(super) async fn repository_load_name(
 
     Ok((id, metadata, metadata_hash))
 }
+
+#[cfg(test)]
+mod tests {
+    use lore_storage::KeyValueStream;
+    use lore_storage::MutableStore;
+    use lore_storage::Partition;
+    use lore_storage::StoreError;
+
+    use super::*;
+    use crate::grpc::handlers::repository_query::authz_test_support::new_test_stores;
+    use crate::grpc::handlers::repository_query::authz_test_support::seed_repository_metadata;
+
+    /// Wraps a real `MutableStore`, delegating every method except `store()`,
+    /// which always fails once wrapped. Mirrors the self-heal write's actual
+    /// failure mode under CR-029 enforcement (the domain-key bypass guard
+    /// rejects a `RepositoryId`-typed write on the generic mutable path —
+    /// see `lore-postgres/tests/domain_bypass.rs`) without depending on a
+    /// live Postgres store.
+    struct FailStoreWritesMutableStore {
+        inner: Arc<dyn MutableStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl MutableStore for FailStoreWritesMutableStore {
+        async fn load(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            key_type: lore_base::types::KeyType,
+        ) -> Result<Hash, StoreError> {
+            self.inner.clone().load(partition, key, key_type).await
+        }
+
+        async fn store(
+            self: Arc<Self>,
+            _partition: Partition,
+            _key: Hash,
+            _value: Hash,
+            _key_type: lore_base::types::KeyType,
+        ) -> Result<(), StoreError> {
+            Err(StoreError::internal(
+                "simulated domain-key bypass guard rejection",
+            ))
+        }
+
+        async fn compare_and_swap(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            expected: Hash,
+            value: Hash,
+            key_type: lore_base::types::KeyType,
+        ) -> Result<Hash, StoreError> {
+            self.inner
+                .clone()
+                .compare_and_swap(partition, key, expected, value, key_type)
+                .await
+        }
+
+        async fn list(
+            self: Arc<Self>,
+            partition: Partition,
+            key_type: lore_base::types::KeyType,
+        ) -> Result<KeyValueStream, StoreError> {
+            self.inner.clone().list(partition, key_type).await
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+    }
+
+    // CR-029, self-heal writer pin (companion to `lore-postgres/tests/
+    // domain_bypass.rs`, which proves the guard itself rejects the write —
+    // this proves the call site at line 147 swallows that rejection rather
+    // than propagating it). The reviewer's defence for leaving this handler
+    // ungated is that a missing name -> ID mapping is repaired best-effort;
+    // if a future cleanup ever turns the `let _ = ...` into a `?`, this test
+    // must go red.
+    #[tokio::test]
+    async fn missing_name_mapping_repair_failure_does_not_fail_the_get() {
+        let (immutable, mutable) = new_test_stores().await;
+        let repository_id: RepositoryId = Context::from([9u8; 16]).into();
+        let metadata_hash = seed_repository_metadata(
+            immutable.clone(),
+            mutable.clone(),
+            repository_id,
+            "my-repo",
+            "a description",
+        )
+        .await;
+
+        let faulty_mutable: Arc<dyn MutableStore> =
+            Arc::new(FailStoreWritesMutableStore { inner: mutable });
+        let repository = Arc::new(RepositoryContext::new_server_context(
+            immutable,
+            faulty_mutable,
+            repository_id,
+        ));
+
+        let (metadata, hash) = repository_load_id(repository, repository_id, None, None)
+            .await
+            .expect("a failed name-mapping repair must not fail the get");
+
+        assert_eq!(metadata.name, "my-repo");
+        assert_eq!(hash, metadata_hash);
+    }
+}
