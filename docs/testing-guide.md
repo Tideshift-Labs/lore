@@ -112,37 +112,19 @@ will update an older check constraint or state schema.
   the three constants in the *same commit* as any proto edit. Regenerate with `protoc` before
   accepting a fingerprint change. Gate: `cargo test -p lore-proto --test v1_object_dispatch -j 4`.
 - **CR-033 cell dispatch authority: continuity family and separate-process service shell removed
-  [SERVER]** (2026-08-28 re-scope: boundary now equals cell, so the cell's own PostgreSQL is the one
-  authority — no separate dispatcher process, no
-  in-cell mTLS service, no continuity/quarantine/adjudication state machine. Removed whole:
-  `continuity.rs`, `continuity_wire.rs`, `continuity_quota.rs`, `schema.rs`, migration 0001, and their
-  `tests/continuity*.rs`/`tests/*continuity_seam.rs` suites; `server.rs`, `service.rs`, `auth.rs`,
-  `main.rs`, `Dockerfile`, the seven-RPC proto `service` block, and `tests/service_shell.rs`/
-  `service_mtls.rs`; `authority.rs` (folded into `request.rs`, keeping exact protocol/policy-revision-
-  NFC, exact cell, exact boundary, nonnegative database time, and a budget-revision pin, but dropping
-  the ACTIVE/expiry allocation state machine and requiring cell admission — both-NULL admission is now
-  legal). `config.rs`/`metrics.rs` are simplified, not deleted, but had **zero** prior `tests/`
-  coverage of their own — their only exercise was through the deleted `service_shell.rs`/
-  `service_mtls.rs`, so the simplified successors need fresh test files, not edits. Same gap for the
-  `authority.rs` fold: `authority.rs` itself had no test file or co-located unit tests before removal,
-  so its retained checks needed new coverage in `tests/request_fingerprint.rs`. The folded shape is
-  now settled: `FirstSeenPrerequisites.expected_cell_admission` **is** an
-  `Option<&ExpectedCellAdmission>`, `None` being the cell authority's own shape, and the
-  request-side `cell_admission_id`/`cell_admission_fence` pair is all-or-none — both absent is legal,
-  a half-supplied pair is `AuthorityMismatch`. `ExpectedRequestAuthority` keeps its field names;
-  `allocation_revision`/`allocation_fence` are re-bound to the cell's frozen budget-configuration
-  revision and its monotonic generation.
-  `ObjectStoreCompactAuthority::{ContinuityQuarantined,ContinuityAdjudicated}` are removed
-  (`RequestState` is the sole remaining variant); `ObjectStoreCompactDependencyFloorKind::Continuity`
-  and its wire value `5` are explicitly retained (D5) — don't remove that variant chasing the rest of
-  the family out.
-  `ContinuityWireLimits` and `RequestStateWireLimits` were always one struct behind a `pub type`
-  alias, but check which side owns it before assuming a direction. At the `930ca46` anchor the
-  continuity module owned it (`pub type RequestStateWireLimits = ContinuityWireLimits`); Wave 1
-  (`9a8787f`) inverted the dependency, leaving `pub type ContinuityWireLimits =
-  RequestStateWireLimits` in `continuity_wire.rs`. Either way it is one struct, so a test importing
-  the alias needs a plain rename to the surviving type when the aliasing module goes, not a
-  field-by-field rewrite.
+  [SERVER]** (2026-08-28 re-scope: the cell's own PostgreSQL is the one authority; see the CR-033
+  record for exactly which modules and RPCs were removed, not this guide). Two testing lessons
+  survive the removal: a module simplified rather than deleted, with **zero** prior `tests/`
+  coverage of its own (its only exercise was through a sibling module that WAS deleted), needs fresh
+  test files, not edits — `config.rs`/`metrics.rs` and the `authority.rs` fold (new coverage landed
+  in `tests/request_fingerprint.rs`) are both this shape. And:
+  `ObjectStoreCompactDependencyFloorKind::Continuity`'s wire value `5` is explicitly retained (D5)
+  even though its sibling `ContinuityQuarantined`/`ContinuityAdjudicated` variants were removed —
+  don't remove that variant chasing the rest of the family out.
+  `ContinuityWireLimits`/`RequestStateWireLimits` were always one struct behind a `pub type` alias
+  whose owning side can invert across waves — check current ownership before assuming a direction.
+  Either way it's one struct: a test importing the alias needs a plain rename to the surviving type
+  when the aliasing module goes, not a field-by-field rewrite.
   Symptom: a retained suite (`tests/canonical_id.rs`) breaks even though it never imports the removed
   module by name. Cause: it tests a crate-private helper (`contract::validate_canonical_id`)
   exclusively through *whichever public wrapper is convenient* (`auth::AuthorizedCallerRegistry`),
@@ -382,6 +364,41 @@ will update an older check constraint or state schema.
   scoping filter — running them against the shared database would see every other test file's raw
   SQL fixture rows too. The rest of the suite shares one database and isolates by random
   identity/name per test, matching `tests/mutable_store.rs`'s convention.
+- **CR-029 WP-116 Phase 4, gRPC metadata carriage, status mapping, and the admission gate
+  [SERVER]**: offline, no Postgres. `domain_operation_metadata.rs`'s `extract`/`require` (R-BLOCK-2's
+  one-reader header contract) and `scope_key_*` (R-BLOCK-5) are pinned in an inline `tests` module:
+  absence vs. every partial-carriage combination, wrong-length/version/non-UUIDv7 rejection, and
+  divergent-vs-identical duplicate headers. `grpc/mod.rs`'s
+  `map_domain_error_to_status`/`map_domain_rejection_to_status` are pinned in a
+  `domain_error_mapping_tests` submodule of that file's existing `tests` mod, including the R-BLOCK-1
+  pin: convert a mapped `OutcomeUnknown` status through `lore_transport::error::ProtocolError::from`,
+  assert not `Disconnected`, with `Code::Unknown`/`Code::Unavailable` pinned positive as the replay
+  arm so the test can't pass vacuously. The `urc-` guard in `checked_identity`/`scope_key_mediated` is
+  a **prefix** check on each raw component, not substring-freedom over the encoded key — a
+  `principal_user_id` embedding `urc-` past its first four bytes is accepted verbatim; test that
+  boundary as its own pinned case, not inside a "never contains `urc-`" property loop over realistic
+  inputs. `src/domain.rs`'s `DomainContext::admit`/`admit_at_entry`/`resolve_enforcement` need a
+  `DomainTransactionStore` to construct — the trait doc anticipates a test-only fake, every method
+  implemented explicitly (`unreachable!()` bodies; no trait default), since `admit` never calls the
+  coordinator. Contract: carriage with no verified-principal token is `Unauthenticated` **regardless
+  of enforcement** — pin that at both settings, since enforcement-off is not a licence to ignore
+  carriage. `domain.rs`'s test-only `UnreachableDomainStore`/`context()` moved out of `mod tests` into
+  a sibling `#[cfg(test)] pub(crate) mod test_support`, so any gated handler's own test module can
+  build a real `Some(&Arc<DomainContext>)` via `crate::domain::test_support::context(enforcement)`
+  without duplicating the trait impl — use this for the `Code::Unimplemented`-refusal proof (a gated
+  handler test needs a *present* coordinator, not `None`, to ever reach
+  `reject_unwired_governed_operation`; every handler test before this defaulted to `None` and so never
+  exercised it). Pair it with a small `PanicOnAnyCallMutableStore` (or a wrapper that delegates reads
+  and fails only `store()`) so the assertion also proves zero store access, not just the status code.
+  The three self-heal writers (`repository_query.rs:134`, `branch_list.rs:116`,
+  `repository/v1/repository_get.rs:147`) that write `RepositoryId`/`BranchId` mappings from read RPCs
+  are deliberately ungated because they swallow their write error; that swallow is now pinned
+  per-site with a `FailStoreWritesMutableStore`-style wrapper (delegates every method except `store()`)
+  proving the RPC still returns `Ok` — a companion to the guard-rejects-the-write proof already in
+  `lore-postgres/tests/domain_bypass.rs`. Gate: `cargo test -p lore-server --lib grpc::domain_operation_metadata
+  grpc::tests::domain_error_mapping_tests domain::tests grpc::handlers::repository_metadata_set
+  grpc::repository::v1::repository_metadata_set grpc::handlers::repository_query
+  grpc::handlers::branch_list grpc::repository::v1::repository_get`.
 
 ## Durable test patterns and gotchas
 
