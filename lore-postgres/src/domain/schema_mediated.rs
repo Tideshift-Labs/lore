@@ -8,8 +8,8 @@
 //! control plane release a charged reservation with proof rather than with a
 //! guess. The lifecycle rows in `schema.rs` stand alone without it.
 //!
-//! **Non-overlap of prune ranges will be enforced in code, not by an exclusion
-//! constraint — and that code does not exist yet.** A GiST `EXCLUDE` over
+//! **Non-overlap of prune ranges is enforced by the bounded marker-prune merge
+//! transaction, not by an exclusion constraint.** A GiST `EXCLUDE` over
 //! `(namespace..., int8range(start, end))` would need the `btree_gist`
 //! extension, and `CREATE EXTENSION` is not something boot-time DDL may assume
 //! it can run on a managed cell database. The intended design is that every
@@ -17,13 +17,9 @@
 //! family, with the unique indexes on `start_sequence` and `end_sequence` as a
 //! backstop against a duplicated bound.
 //!
-//! As of WP-116 Phase 2/3 this module is DDL and constants only: no
-//! insert or merge function exists, so **today the non-overlap invariant is
-//! enforced by nothing at all**. The catalog admits a general overlap that
-//! shares neither exact bound — `[1,10]` then `[5,15]` inserts cleanly — which
-//! is verified by test and is expected, not a defect. Whoever lands the merge
-//! transaction owns making the statement above true, and owns the concurrent-
-//! merge test that proves it.
+//! The catalog remains only a backstop: a direct SQL writer can insert a
+//! general overlap that shares neither exact bound. Production writes therefore
+//! go only through the namespace-locked merge in `maintenance`.
 //!
 //! **The interval algebra is associative and commutative** because a range
 //! stores only namespace, epoch, the three revisions, inclusive bounds, checked
@@ -128,6 +124,8 @@ CREATE TABLE IF NOT EXISTS lore_domain_operation_reserve_release_tombstones (
     scope                           bytea       NOT NULL,
     fingerprint_version             integer     NOT NULL CHECK (fingerprint_version >= 1),
     fingerprint                     bytea       NOT NULL CHECK (octet_length(fingerprint) = 32),
+    canonical_intent_digest         bytea       NOT NULL
+                                                CHECK (octet_length(canonical_intent_digest) = 32),
     authorization_id                bytea       NOT NULL,
     authorization_revision          bigint      NOT NULL CHECK (authorization_revision >= 0),
     claim_id                        bytea       NOT NULL,
@@ -149,9 +147,25 @@ CREATE TABLE IF NOT EXISTS lore_domain_operation_reserve_release_tombstones (
                                                 CHECK (octet_length(fence_prune_digest) = 32),
     phase1_response                 bytea       NOT NULL
                                                 CHECK (octet_length(phase1_response) <= 4096),
+    phase1_request_digest           bytea       NOT NULL
+                                                CHECK (octet_length(phase1_request_digest) = 32),
+    phase1_verification_digest      bytea       NOT NULL
+                                                CHECK (octet_length(phase1_verification_digest) = 32),
+    terminal_outcome                smallint    NOT NULL,
+    terminal_receipt_sha256         bytea       NOT NULL
+                                                CHECK (octet_length(terminal_receipt_sha256) = 32),
+    platform_terminal_status_revision bigint    NOT NULL CHECK (platform_terminal_status_revision >= 0),
+    platform_acknowledged_at        timestamptz NOT NULL,
+    release_proof_reservation_revision bigint   NOT NULL CHECK (release_proof_reservation_revision >= 0),
+    release_proof_reservation_nonce bytea       NOT NULL
+                                                CHECK (octet_length(release_proof_reservation_nonce) = 32),
 
     active_release_intent_digest    bytea       CHECK (active_release_intent_digest IS NULL
                                                        OR octet_length(active_release_intent_digest) = 32),
+    active_release_intent_revision  bigint      CHECK (active_release_intent_revision IS NULL
+                                                       OR active_release_intent_revision >= 0),
+    active_release_intent_nonce     bytea       CHECK (active_release_intent_nonce IS NULL
+                                                       OR octet_length(active_release_intent_nonce) = 32),
     active_release_intent_ack_at    timestamptz,
     historical_release_intent       boolean     NOT NULL DEFAULT false,
     platform_release_revision       bigint,
@@ -170,8 +184,14 @@ CREATE TABLE IF NOT EXISTS lore_domain_operation_reserve_release_tombstones (
      OR (release_ack_at IS NOT NULL AND platform_release_revision IS NOT NULL)
     ),
     CONSTRAINT lore_domain_tombstones_active_intent_shape CHECK (
-        (active_release_intent_digest IS NULL     AND active_release_intent_ack_at IS NULL)
-     OR (active_release_intent_digest IS NOT NULL AND active_release_intent_ack_at IS NOT NULL)
+        (active_release_intent_digest IS NULL
+            AND active_release_intent_revision IS NULL
+            AND active_release_intent_nonce IS NULL
+            AND active_release_intent_ack_at IS NULL)
+     OR (active_release_intent_digest IS NOT NULL
+            AND active_release_intent_revision IS NOT NULL
+            AND active_release_intent_nonce IS NOT NULL
+            AND active_release_intent_ack_at IS NOT NULL)
     ),
     CONSTRAINT lore_domain_tombstones_retention_order CHECK (
         final_prune_after >= compact_after AND compact_after >= created_at
@@ -211,12 +231,20 @@ CREATE TABLE IF NOT EXISTS lore_domain_operation_tombstone_release_completion_ma
                                                CHECK (octet_length(release_intent_digest) = 32),
     final_prune_digest             bytea       NOT NULL
                                                CHECK (octet_length(final_prune_digest) = 32),
+    final_prune_after              timestamptz NOT NULL,
     marker_reservation_revision    bigint      NOT NULL CHECK (marker_reservation_revision >= 0),
     marker_reservation_nonce       bytea       NOT NULL
                                                CHECK (octet_length(marker_reservation_nonce) = 32),
+    completion_request_binding     bytea       NOT NULL
+                                               CHECK (octet_length(completion_request_binding) = 32),
+    completion_request_digest      bytea       NOT NULL
+                                               CHECK (octet_length(completion_request_digest) = 32),
+    completion_verification_digest bytea       NOT NULL
+                                               CHECK (octet_length(completion_verification_digest) = 32),
     completion_ack                 bytea       CHECK (completion_ack IS NULL
                                                       OR octet_length(completion_ack) <= 4096),
     marker_digest                  bytea       NOT NULL CHECK (octet_length(marker_digest) = 32),
+    byte_charge                    bigint      NOT NULL CHECK (byte_charge >= 0),
     created_at                     timestamptz NOT NULL,
     retain_until                   timestamptz NOT NULL,
 
@@ -241,6 +269,7 @@ CREATE TABLE IF NOT EXISTS lore_domain_proof_namespaces (
     verified_issuer                 text        NOT NULL,
     authenticated_subject           text        NOT NULL,
     tenant_scope_key                bytea       NOT NULL,
+    org_uuid                        bytea       NOT NULL CHECK (octet_length(org_uuid) = 16),
     epoch                           bytea       NOT NULL CHECK (octet_length(epoch) = 16),
 
     protocol_revision               integer     NOT NULL CHECK (protocol_revision >= 1),
@@ -260,6 +289,15 @@ CREATE TABLE IF NOT EXISTS lore_domain_proof_namespaces (
     state                           smallint    NOT NULL CHECK (state IN (0, 1, 2)),
     materialization_receipt         bytea       CHECK (materialization_receipt IS NULL
                                                        OR octet_length(materialization_receipt) <= 4096),
+    materialization_request_digest  bytea       NOT NULL
+                                                CHECK (octet_length(materialization_request_digest) = 32),
+    materialization_verification_digest bytea   NOT NULL
+                                                CHECK (octet_length(materialization_verification_digest) = 32),
+    materialization_response_digest bytea       NOT NULL
+                                                CHECK (octet_length(materialization_response_digest) = 32),
+    namespace_revision              bigint      NOT NULL CHECK (namespace_revision >= 1),
+    materialized_global_counter_revision bigint NOT NULL CHECK (materialized_global_counter_revision >= 0),
+    materialized_org_counter_revision bigint    NOT NULL CHECK (materialized_org_counter_revision >= 0),
     created_at                      timestamptz NOT NULL,
     updated_at                      timestamptz NOT NULL,
 
@@ -302,6 +340,22 @@ CREATE TABLE IF NOT EXISTS lore_domain_proof_global_counters (
     )
 );
 
+-- Lore-local organization counters are independent from the global counter.
+-- A namespace materialization increments both exactly once; retirement
+-- decrements both exactly once in the same transaction.
+CREATE TABLE IF NOT EXISTS lore_domain_proof_org_counters (
+    org_uuid                   bytea       NOT NULL PRIMARY KEY
+                                           CHECK (octet_length(org_uuid) = 16),
+    counter_revision           bigint      NOT NULL CHECK (counter_revision >= 0),
+    quota_revision             integer     NOT NULL CHECK (quota_revision >= 1),
+    represented_namespace_rows bigint      NOT NULL CHECK (represented_namespace_rows >= 0),
+    retained_marker_count      bigint      NOT NULL CHECK (retained_marker_count >= 0),
+    fragment_count             bigint      NOT NULL CHECK (fragment_count >= 0),
+    fragment_bytes             bigint      NOT NULL CHECK (fragment_bytes >= 0),
+    marker_bytes               bigint      NOT NULL CHECK (marker_bytes >= 0),
+    updated_at                 timestamptz NOT NULL
+);
+
 -- Merged prune ranges over pruned completion-marker sequences. Field algebra is
 -- exactly CR-029's: namespace, immutable epoch, protocol/quota/interval-schema
 -- revisions, inclusive bounds, checked count, generation = end_sequence,
@@ -342,4 +396,73 @@ CREATE TABLE IF NOT EXISTS lore_domain_tombstone_marker_prune_ranges (
 CREATE UNIQUE INDEX IF NOT EXISTS lore_domain_prune_ranges_end
     ON lore_domain_tombstone_marker_prune_ranges
        (verified_issuer, authenticated_subject, tenant_scope_key, epoch, end_sequence);
+
+-- Additive upgrade path for cells that booted the guarded maintenance schema.
+-- The guarded handlers could not create lifecycle rows, so sentinel defaults
+-- can only affect manually seeded data. Such rows fail exact runtime binding.
+ALTER TABLE lore_domain_operation_reserve_release_tombstones
+    ADD COLUMN IF NOT EXISTS canonical_intent_digest bytea NOT NULL
+        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(canonical_intent_digest) = 32),
+    ADD COLUMN IF NOT EXISTS phase1_request_digest bytea NOT NULL
+        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(phase1_request_digest) = 32),
+    ADD COLUMN IF NOT EXISTS phase1_verification_digest bytea NOT NULL
+        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(phase1_verification_digest) = 32),
+    ADD COLUMN IF NOT EXISTS terminal_outcome smallint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS terminal_receipt_sha256 bytea NOT NULL
+        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(terminal_receipt_sha256) = 32),
+    ADD COLUMN IF NOT EXISTS platform_terminal_status_revision bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS platform_acknowledged_at timestamptz NOT NULL DEFAULT '-infinity',
+    ADD COLUMN IF NOT EXISTS release_proof_reservation_revision bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS release_proof_reservation_nonce bytea NOT NULL
+        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(release_proof_reservation_nonce) = 32),
+    ADD COLUMN IF NOT EXISTS active_release_intent_revision bigint
+        CHECK (active_release_intent_revision IS NULL OR active_release_intent_revision >= 0),
+    ADD COLUMN IF NOT EXISTS active_release_intent_nonce bytea
+        CHECK (active_release_intent_nonce IS NULL OR octet_length(active_release_intent_nonce) = 32);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'lore_domain_tombstones_active_intent_shape'
+          AND conrelid = 'lore_domain_operation_reserve_release_tombstones'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_reserve_release_tombstones
+            ADD CONSTRAINT lore_domain_tombstones_active_intent_shape CHECK (
+                (active_release_intent_digest IS NULL
+                    AND active_release_intent_revision IS NULL
+                    AND active_release_intent_nonce IS NULL
+                    AND active_release_intent_ack_at IS NULL)
+             OR (active_release_intent_digest IS NOT NULL
+                    AND active_release_intent_revision IS NOT NULL
+                    AND active_release_intent_nonce IS NOT NULL
+                    AND active_release_intent_ack_at IS NOT NULL)
+            );
+    END IF;
+END
+$$;
+
+ALTER TABLE lore_domain_operation_tombstone_release_completion_markers
+    ADD COLUMN IF NOT EXISTS completion_request_binding bytea NOT NULL
+        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(completion_request_binding) = 32),
+    ADD COLUMN IF NOT EXISTS completion_request_digest bytea NOT NULL
+        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(completion_request_digest) = 32),
+    ADD COLUMN IF NOT EXISTS completion_verification_digest bytea NOT NULL
+        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(completion_verification_digest) = 32),
+    ADD COLUMN IF NOT EXISTS byte_charge bigint NOT NULL DEFAULT 0 CHECK (byte_charge >= 0),
+    ADD COLUMN IF NOT EXISTS final_prune_after timestamptz NOT NULL DEFAULT '-infinity';
+
+ALTER TABLE lore_domain_proof_namespaces
+    ADD COLUMN IF NOT EXISTS org_uuid bytea NOT NULL
+        DEFAULT decode(repeat('00', 16), 'hex') CHECK (octet_length(org_uuid) = 16),
+    ADD COLUMN IF NOT EXISTS materialization_request_digest bytea NOT NULL
+        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(materialization_request_digest) = 32),
+    ADD COLUMN IF NOT EXISTS materialization_verification_digest bytea NOT NULL
+        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(materialization_verification_digest) = 32),
+    ADD COLUMN IF NOT EXISTS materialization_response_digest bytea NOT NULL
+        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(materialization_response_digest) = 32),
+    ADD COLUMN IF NOT EXISTS namespace_revision bigint NOT NULL DEFAULT 1 CHECK (namespace_revision >= 1),
+    ADD COLUMN IF NOT EXISTS materialized_global_counter_revision bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS materialized_org_counter_revision bigint NOT NULL DEFAULT 0;
 "#;

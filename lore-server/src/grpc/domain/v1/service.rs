@@ -351,6 +351,7 @@ fn proof_namespace_key(
         verified_issuer: token.issuer.clone(),
         authenticated_subject: token.user_id.clone(),
         tenant_scope_key,
+        org_uuid: org_uuid.to_vec(),
     })
 }
 

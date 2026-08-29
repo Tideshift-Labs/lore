@@ -246,6 +246,7 @@ async fn lock_receipt_row(
         .query_opt(
             "SELECT state, consume_token, outcome, not_applied_reason_version, \
                     not_applied_reason, method, scope, fingerprint_version, fingerprint, \
+                    canonical_intent_digest, \
                     prepared_at, hard_expires_at, committed_at, full_result_expires_at, \
                     compact_expires_at, compacted \
              FROM lore_domain_operation_receipts \
@@ -272,6 +273,7 @@ async fn lock_receipt_row(
         scope: r.get("scope"),
         fingerprint_version: r.get("fingerprint_version"),
         fingerprint: r.get("fingerprint"),
+        canonical_intent_digest: r.get("canonical_intent_digest"),
         prepared_at: r.get("prepared_at"),
         hard_expires_at: r.get("hard_expires_at"),
         committed_at: r.get("committed_at"),
@@ -289,6 +291,7 @@ struct ReceiptRow {
     scope: Vec<u8>,
     fingerprint_version: i32,
     fingerprint: Vec<u8>,
+    canonical_intent_digest: Vec<u8>,
     prepared_at: SystemTime,
     hard_expires_at: SystemTime,
     committed_at: Option<SystemTime>,
@@ -301,6 +304,7 @@ impl ReceiptRow {
             && self.scope == binding.scope
             && self.fingerprint_version == binding.fingerprint_version
             && self.fingerprint == binding.fingerprint
+            && self.canonical_intent_digest == binding.canonical_intent_digest
     }
 
     fn committed_outcome(&self) -> Result<DomainOutcome, DomainError> {
