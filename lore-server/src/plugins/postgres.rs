@@ -23,6 +23,7 @@ use std::sync::Arc;
 use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
+use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::pool::TlsConfig;
 use lore_postgres::store::immutable_store::ObjectStoreSettings;
 use lore_postgres::store::immutable_store::PostgresImmutableStore;
@@ -179,6 +180,72 @@ pub(crate) async fn connect_immutable_store(
             PluginError::from(PluginInitError {
                 plugin_name: plugin_name.to_string(),
                 message: format!("Failed to create Postgres immutable store: {e}"),
+            })
+        })
+}
+
+/// Build the CR-029 domain coordinator from the plugin configuration.
+///
+/// The domain coordinator is deliberately **not** a plugin-registry store: it
+/// implements `DomainTransactionStore`, not one of the three `lore-storage`
+/// traits, and there is exactly one implementation. It shares the same
+/// `[plugins.postgres.*]` connection shape as the three stores because CR-029's
+/// whole point is that a domain transaction writes its domain rows and the
+/// affected `lore_mutable` rows in **one** Postgres transaction — which is only
+/// atomic if they are in one database.
+pub(crate) async fn connect_domain_store(
+    config: &toml::Value,
+) -> Result<PostgresDomainStore, PluginError> {
+    let plugin_name = PLUGIN_NAME;
+    let cfg = parse_config(plugin_name, config)?;
+    let tls = build_tls(plugin_name, &cfg)?;
+
+    PostgresDomainStore::connect(&cfg.url, cfg.pool_max, &tls)
+        .await
+        .map_err(|e| {
+            PluginError::from(PluginInitError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("Failed to create Postgres domain store: {e}"),
+            })
+        })
+}
+
+/// R-SHOULD-1: prove positively that another configured CR-007 pool addresses
+/// the same physical database as the domain coordinator.
+///
+/// The four stores are configured as four independent URLs. Nothing today
+/// checks that they resolve to one database, so same-database atomicity is a
+/// configuration property rather than a checked one — and a cell misconfigured
+/// across two databases would silently lose the atomicity CR-029 exists to
+/// provide. This opens one short-lived pool against the *other* store's own
+/// configured URL and compares `(system_identifier, database OID)`, so the
+/// check is over the URL that store will actually use, not over an assumption
+/// that the config sections agree.
+pub(crate) async fn assert_domain_store_colocated(
+    domain: &PostgresDomainStore,
+    label: &'static str,
+    config: &toml::Value,
+) -> Result<(), PluginError> {
+    let plugin_name = PLUGIN_NAME;
+    let cfg = parse_config(plugin_name, config)?;
+    let tls = build_tls(plugin_name, &cfg)?;
+
+    // A tiny pool: this connection exists only to read the database identity
+    // once at startup and is dropped immediately afterwards.
+    let pool = lore_postgres::pool::build_pool(&cfg.url, 1, &tls).map_err(|e| {
+        PluginError::from(PluginInitError {
+            plugin_name: plugin_name.to_string(),
+            message: format!("Failed to build {label} identity-check pool: {e}"),
+        })
+    })?;
+
+    domain
+        .assert_same_database(&pool, label)
+        .await
+        .map_err(|e| {
+            PluginError::from(PluginInitError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("Postgres domain store is not co-located with the {label}: {e}"),
             })
         })
 }
