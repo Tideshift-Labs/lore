@@ -320,6 +320,69 @@ will update an older check constraint or state schema.
   Gates: `cargo test -p lore-revision --test info -j 4` and
   `cargo test -p lore-storage --lib read::tests::zero_hash_address_short_circuits_to_empty_without_touching_store -j 4`.
 
+- **CR-029 domain schema, receipts, outbox-base, backfill, bypass guard [SERVER, WP-116 Phase 2/3]**:
+  the Postgres-owned repository/branch lifecycle, generation, tombstone, and operation-receipt rows
+  under `lore-postgres/src/domain/` (`schema.rs`, `schema_mediated.rs`, `outbox/`, `backfill.rs`,
+  `receipts.rs`, `bypass.rs`, `store.rs`/`PostgresDomainStore`). Tests:
+  `lore-postgres/tests/domain_schema.rs` (bootstrap idempotence, CR-007 coexistence,
+  tombstone-evidence CHECKs, R-BLOCK-3 case-folding pair, name release, identity non-reuse, quota
+  bounds, schema-state gating, same-database identity), `domain_receipts.rs` (the receipt
+  state-machine CHECKs), `domain_outbox.rs` (F-032-2 base conformance: payload cap,
+  `(cell_id, idempotency_key)` retry, state enum, atomic rollback, restart survival),
+  `domain_backfill.rs` (restart-after-failure parity against a clean run, no-op rerun, R-SHOULD-7
+  residue classification via a fake `DomainBackfillSource` — the real source lives in `lore-server`
+  and deliberately isn't reachable from this crate), `domain_migration_parity.rs` (catalog-level
+  parity between `migrations/0001_init.sql` applied wholesale and `PostgresDomainStore::connect`'s
+  boot-time path, via `pg_get_constraintdef`/`pg_indexes` so it only fails on real semantic drift, not
+  formatting), `domain_mediated.rs` (schema_mediated.rs invariants that can't be a single-table CHECK:
+  the fence-to-tombstone atomic exchange commits or rolls back together, and the documented catalog
+  backstop on `lore_domain_tombstone_marker_prune_ranges` — exact duplicated `start_sequence`/
+  `end_sequence` collide, but a general overlap sharing neither exact bound does **not**; true
+  non-overlap depends on a namespace-row-lock discipline with no merge/insert function in this crate
+  yet to test, and that gap is deliberate, not an oversight — see the file's own docs before assuming
+  it's fixable from this side), `domain_bypass.rs` (R-SHOULD-4: `PostgresMutableStore`'s
+  `.with_domain_enforcement(..)` wiring actually rejects the five lifecycle key types plus `Instance`
+  on both `store`/`compare_and_swap` once enabled, never fences `Resolve`/`Untyped`, and toggles live
+  on one shared handle with no reconnect — `bypass.rs`'s own unit tests already cover the pure
+  classification/reversibility logic, so this file is deliberately about the wiring, not a duplicate),
+  `domain_receipts_lifecycle.rs` (the async `prepare`/`consume`/`commit_terminal`/`receipt_get` state
+  machine in `receipts.rs` — all five temporal classes, exact-retry token stability, per-field binding
+  mismatch, single-use consume scoped to key+binding, hard-TTL expiry, terminal immutability, the
+  future-reject quota's two limits, and future-marker binding scoping). Build a UUIDv7 at a precise
+  offset from a captured `admission_clock` with `Uuid::new_v7(Timestamp::from_unix(NoContext, secs,
+  nanos))` rather than sleeping. The future-reject quota keys on
+  `(verified_issuer, authenticated_subject, tenant_scope_key)` with no `operation_id`, so a quota-limit
+  test needing two prepares under the *same* namespace must reuse the seed call's exact
+  `verified_issuer`/`authenticated_subject` — a second `fresh_key()` call mints an unrelated random
+  issuer even when the caller intends "same tenant," landing the second prepare in an empty quota
+  namespace instead of the exhausted one (confirmed: both quota tests passed for the wrong reason —
+  a fresh empty quota — until fixed with a `same_namespace_key(base, operation_id)` helper that copies
+  the identity fields and varies only `operation_id`). This file caught and confirmed two now-fixed
+  defects, each with its own regression test: `receipt_get`'s `PREPARED` branch used to skip the
+  `hard_expires_at` check `prepare`/`consume` both apply (contradicting `expire_prepared`'s own "every
+  prepare, get, and consume touch" doc comment) — `receipt_get_of_a_past_ttl_prepared_row`; and
+  `load_future_marker` used to ignore the caller's binding entirely, so a differently-bound
+  `prepare`/`receipt_get` against an existing marker returned that marker's outcome regardless —
+  the two `..._under_a_different_binding_must_return_mismatch` tests. A concurrency test
+  (`tokio::join!` of two `prepare` calls against one identical beyond-horizon key, matching
+  `concurrency.rs`'s pattern) pins the fix for a third: `insert_future_marker`'s
+  `ON CONFLICT DO NOTHING` used to increment the quota unconditionally, over-counting a concurrent
+  duplicate permanently; it now gates the increment on rows-affected. `domain_obliterate_fence.rs`
+  covers `begin_obliterate`'s generation fence both ways (live advances by one; tombstoned refuses
+  with `TOMBSTONED_V1`, generation unchanged) plus push-versus-obliterate agreement: `branch_push_commit`
+  refuses the pre-obliteration generation and accepts the post-obliteration one.
+  Gate: `cargo test -p lore-postgres --test domain_schema --test domain_receipts --test domain_outbox \
+  --test domain_backfill --test domain_migration_parity --test domain_mediated \
+  --test domain_bypass --test domain_receipts_lifecycle --test domain_obliterate_fence \
+  -- --ignored` under `LORE_TEST_PG_URL`.
+  The migration-parity and backfill tests each provision their own throwaway `CREATE DATABASE`
+  (`lore_wp116_parity_*`/`lore_wp116_backfill_*`) rather than sharing the suite's usual database,
+  because both run whole-table queries (`information_schema`/`pg_catalog`, or
+  `DomainBackfill::verify()`'s scan of every `lore_domain_repositories` row) with no per-test
+  scoping filter — running them against the shared database would see every other test file's raw
+  SQL fixture rows too. The rest of the suite shares one database and isolates by random
+  identity/name per test, matching `tests/mutable_store.rs`'s convention.
+
 ## Durable test patterns and gotchas
 
 ### Build and merge hygiene
@@ -392,6 +455,24 @@ will update an older check constraint or state schema.
   the bound SQL type (`$2::smallint::text`), keep any test-side duplicate query identical, and pin
   both layers with `cargo test -p lore-postgres --lib pool::tests -j 4` plus the ignored live test
   `mutable_store_advisory_lock_accepts_smallint_key_type` under `LORE_TEST_PG_URL`.
+- Symptom: a query with one placeholder reused across several columns (`VALUES (1, $1, 0, $1, $1,
+  $1, ...)`) fails on *every* run against a fresh database with SQLSTATE `42P08` "inconsistent
+  types deduced for parameter $1", detail "bigint versus integer" — not a race, not
+  environment-specific. Cause: `tokio-postgres`'s extended protocol asks Postgres to infer one type
+  per parameter *number* for the whole statement; reusing `$1` against a `bigint` column and an
+  `integer` column in the same INSERT gives Postgres two different answers for the same slot, and
+  it refuses to unify them. This is a different failure from the `WrongType`/`$2::text` case above:
+  that one is a client-side mismatch with no `DbError` at all; this one *is* a `DbError` (planning
+  fails before execution), and `err.as_db_error()` carries the full `SqlState`/`detail`. What to
+  do: give every logically-independent value its own placeholder number even when the bound Rust
+  value is identical for all of them (`$1` for the `bigint` column, `$2` for every `integer`
+  column, bound as two separate `&params[]` entries) — don't rely on Postgres widening `integer` up
+  to match a `bigint` sibling using the same number. Caught here in
+  `PostgresDomainStore::ensure_state_rows`'s `lore_outbox_schema_state` insert (WP-116 Phase 2),
+  which reused `$1` across `migration_version bigint` and three `integer` compat-floor columns and
+  therefore failed `PostgresDomainStore::connect` unconditionally on a fresh database — reproduce
+  directly with `err.as_db_error()` rather than trusting a wrapping error type's `Display`, which
+  can collapse a rich `DbError` (code/message/detail) down to a bare `"db error"` string.
 - Symptom: a mutation is replayed after connection loss, capacity exhaustion, or server restart.
   Cause: reusing the broad caller-facing PostgreSQL transience classifier as mutation-retry
   authority. What to do: keep mutation retry closed to known-aborted `40001` and `40P01`; treat
