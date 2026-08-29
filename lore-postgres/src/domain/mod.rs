@@ -40,8 +40,10 @@
 //! transaction methods land in Phase 3.
 
 pub mod backfill;
+pub mod bypass;
 pub mod errors;
 pub mod outbox;
+pub mod receipts;
 pub mod schema;
 pub mod schema_mediated;
 pub mod store;

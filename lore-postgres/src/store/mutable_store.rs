@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS lore_mutable (
 pub struct PostgresMutableStore {
     pool: Pool,
     instruments: crate::metrics::Instruments,
+    /// CR-029 domain-key bypass fence. Shared with the domain coordinator, so
+    /// readiness flips it once rather than every write re-reading the schema
+    /// state. Starts disabled and fails closed: a cell that never completes
+    /// backfill never turns it on.
+    enforcement: crate::domain::bypass::DomainEnforcement,
 }
 
 impl PostgresMutableStore {
@@ -56,7 +61,38 @@ impl PostgresMutableStore {
         Ok(Self {
             pool,
             instruments: crate::metrics::Instruments::new("mutable"),
+            enforcement: crate::domain::bypass::DomainEnforcement::disabled(),
         })
+    }
+
+    /// Share the domain coordinator's enforcement handle with this store.
+    ///
+    /// Called during server construction, before the store is published. The
+    /// handle is a clone of one flag, so enabling enforcement anywhere enables
+    /// it here too.
+    pub fn with_domain_enforcement(
+        mut self,
+        enforcement: crate::domain::bypass::DomainEnforcement,
+    ) -> Self {
+        self.enforcement = enforcement;
+        self
+    }
+
+    /// Reject a domain-owned key write while enforcement is on.
+    ///
+    /// This is the single choke point for all seven generic mutable RPCs — the
+    /// v0/v1 gRPC pairs and the two QUIC command families — which pass the wire
+    /// `KeyType` through untouched and authorize only repository-level `write`.
+    /// Putting the check at the store rather than in the handlers is deliberate:
+    /// two of the seven use a different authorization path, so a handler-level
+    /// check would have to exist twice and stay in step.
+    fn reject_domain_key(&self, key_type: KeyType) -> Result<(), StoreError> {
+        if self.enforcement.is_enabled() && crate::domain::bypass::is_domain_owned(key_type) {
+            return Err(StoreError::internal(
+                crate::domain::bypass::rejection_message(key_type),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -146,6 +182,7 @@ impl MutableStore for PostgresMutableStore {
         value: Hash,
         key_type: KeyType,
     ) -> Result<(), StoreError> {
+        self.reject_domain_key(key_type)?;
         let _t = self.instruments.start("store", self.pool.status());
         let mut client = self.pool.get().await.map_err(pool_err)?;
         let part = partition.data().as_slice();
@@ -184,6 +221,7 @@ impl MutableStore for PostgresMutableStore {
         value: Hash,
         key_type: KeyType,
     ) -> Result<Hash, StoreError> {
+        self.reject_domain_key(key_type)?;
         let _t = self
             .instruments
             .start("compare_and_swap", self.pool.status());
