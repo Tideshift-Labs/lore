@@ -5,6 +5,16 @@ package ucs.auth;
 service RebacApi {
   rpc CreateResource(CreateResourceRequest) returns (CreateResourceResponse) {};
   rpc DeleteResource(DeleteResourceRequest) returns (DeleteResourceResponse) {};
+
+  // FORK-LOCAL (Tideshift, CR-029). Private server-to-auth callback. Additive:
+  // one RPC and new messages, with no existing field number or method changed.
+  // The on-the-wire method path is
+  // /ucs.auth.RebacApi/VerifyRepositoryOperationAuthorization. Lore's private
+  // domain prepare/receipt rail is pinned to that exact path. If upstream adds
+  // an authorization-verification RPC or messages with these names, reconcile
+  // the method path and every field tag before regenerating this binding.
+  rpc VerifyRepositoryOperationAuthorization(VerifyRepositoryOperationAuthorizationRequest)
+      returns (VerifyRepositoryOperationAuthorizationResponse) {};
 }
 
 // Messages for requests/responses
@@ -17,3 +27,50 @@ message CreateResourceResponse {}
 
 message DeleteResourceRequest { string resource_id = 1; }
 message DeleteResourceResponse {}
+
+// Exact private CR-029 authorization identity and caller-known operation
+// binding. The issuer and subject are supplied by loreserver from the verified
+// JWT extension. They are never copied from the public DomainOperation request.
+message VerifyRepositoryOperationAuthorizationRequest {
+  string verified_issuer = 1;
+  string authenticated_subject = 2;
+  bytes org_uuid = 3;
+  bytes initiating_principal_namespace = 4;
+  bytes operation_id = 5;
+  string method = 6;
+  bytes scope = 7;
+  uint32 fingerprint_version = 8;
+  bytes fingerprint = 9;
+  bytes canonical_intent_digest = 10;
+  // CR-029 freezes authorization_id to the canonical operation UUID until a
+  // separate authorization-id column exists. The verifier requires equality.
+  bytes authorization_id = 11;
+  uint64 authorization_revision = 12;
+  oneof proof {
+    // Decoded 32-byte one-use secret. Consumes ISSUED -> VERIFIED.
+    bytes preclaim_ticket = 13;
+    // Exact 32-byte commitment. Read-only verification for receipt lookup.
+    bytes consumed_ticket_sha256 = 14;
+  }
+}
+
+// The immutable witness persisted beside PREPARED, plus an exact echo of every
+// identity/binding field. Loreserver rejects any divergent echo before it
+// creates or reads a receipt.
+message VerifyRepositoryOperationAuthorizationResponse {
+  bytes authorization_id = 1;
+  uint64 authorization_revision = 2;
+  bytes verification_nonce = 3;
+  bytes bound_fields_digest = 4;
+  bytes consumed_ticket_sha256 = 5;
+  bytes org_uuid = 6;
+  bytes initiating_principal_namespace = 7;
+  bytes operation_id = 8;
+  string method = 9;
+  bytes scope = 10;
+  uint32 fingerprint_version = 11;
+  bytes fingerprint = 12;
+  bytes canonical_intent_digest = 13;
+  string verified_issuer = 14;
+  string authenticated_subject = 15;
+}

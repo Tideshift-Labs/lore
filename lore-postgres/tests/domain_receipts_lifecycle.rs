@@ -19,6 +19,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use lore_postgres::domain::PostgresDomainStore;
+use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::errors::DomainError;
 use lore_postgres::domain::errors::DomainOutcome;
 use lore_postgres::domain::receipts::AuthorizationWitness;
@@ -230,6 +231,106 @@ async fn capture_clock(client: &mut Client) -> SystemTime {
         .await
         .expect("roll back the read-only clock tx");
     clock
+}
+
+// ─── PostgresDomainStore wrapper seam ───────────────────────────────────────
+
+/// The coordinator wrapper must expose the same authoritative database clock
+/// used by receipt admission, bounded by samples from an independent
+/// connection rather than the process clock.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn coordinator_clock_get_samples_the_database_clock() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping coordinator clock test");
+        return;
+    };
+    let store = connect_domain_store(&url).await;
+    let mut client = pg_client(&url).await;
+
+    let before = capture_clock(&mut client).await;
+    let sampled = store
+        .domain_operation_clock_get()
+        .await
+        .expect("coordinator clock sample");
+    let after = capture_clock(&mut client).await;
+
+    assert!(
+        before <= sampled && sampled <= after,
+        "coordinator sample {sampled:?} must be bounded by independent DB samples {before:?}..={after:?}"
+    );
+}
+
+/// Exercise prepare and lookup through the public coordinator trait, not the
+/// lower-level receipt functions used by the rest of this suite. A successful
+/// wrapper commit must be visible on a separate connection, exact prepare
+/// replay must return the original token, and a changed binding must remain a
+/// nonmutating mismatch.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn coordinator_prepare_commit_is_visible_and_receipt_get_replays_it() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping coordinator receipt wrapper test");
+        return;
+    };
+    let store = connect_domain_store(&url).await;
+    let mut client = pg_client(&url).await;
+    let clock = capture_clock(&mut client).await;
+    let key = isolated_key(uuid_v7_at(clock));
+    let original = binding("lore.domain.v1.test/CoordinatorWrapper");
+
+    let first = store
+        .domain_operation_prepare(&key, &original, None)
+        .await
+        .expect("coordinator prepare");
+    let PrepareResult::Prepared {
+        token: first_token,
+        hard_expires_at: first_expiry,
+    } = first
+    else {
+        panic!("expected Prepared, got {first:?}");
+    };
+
+    let persisted = fetch_receipt(&client, &key).await;
+    assert_eq!(persisted.state, 0, "separate connection sees PREPARED");
+    assert_eq!(
+        persisted.consume_token.as_deref(),
+        Some(first_token.as_slice()),
+        "separate connection sees the committed token"
+    );
+
+    let lookup = store
+        .domain_operation_receipt_get(&key, &original)
+        .await
+        .expect("coordinator receipt lookup");
+    let ReceiptLookup::Prepared {
+        prepared_at,
+        hard_expires_at,
+    } = lookup
+    else {
+        panic!("expected Prepared lookup, got {lookup:?}");
+    };
+    assert!(prepared_at <= hard_expires_at);
+    assert_eq!(hard_expires_at, first_expiry);
+
+    let retry = store
+        .domain_operation_prepare(&key, &original, None)
+        .await
+        .expect("exact coordinator prepare retry");
+    assert!(matches!(
+        retry,
+        PrepareResult::Prepared { token, .. } if token == first_token
+    ));
+
+    let mut changed = original.clone();
+    changed.fingerprint[0] ^= 0xFF;
+    let mismatch = store
+        .domain_operation_prepare(&key, &changed, None)
+        .await
+        .expect("mismatched coordinator prepare");
+    assert_eq!(mismatch, PrepareResult::Mismatch);
+    let unchanged = fetch_receipt(&client, &key).await;
+    assert_eq!(unchanged.consume_token, persisted.consume_token);
 }
 
 // ─── the five temporal classes ──────────────────────────────────────────────

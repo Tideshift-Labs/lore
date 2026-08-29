@@ -431,6 +431,11 @@ pub(crate) mod test_support {
     use lore_postgres::domain::coordinator::RepositoryCreateInput;
     use lore_postgres::domain::coordinator::RepositoryDeleteInput;
     use lore_postgres::domain::coordinator::RepositorySnapshot;
+    use lore_postgres::domain::receipts::AuthorizationWitness;
+    use lore_postgres::domain::receipts::OperationBinding;
+    use lore_postgres::domain::receipts::PrepareResult;
+    use lore_postgres::domain::receipts::ReceiptKey;
+    use lore_postgres::domain::receipts::ReceiptLookup;
 
     use super::DomainContext;
     use super::DomainTransactionStore;
@@ -445,6 +450,27 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl DomainTransactionStore for UnreachableDomainStore {
+        async fn domain_operation_clock_get(&self) -> Result<std::time::SystemTime, DomainError> {
+            unreachable!("DomainContext::admit tests never call the coordinator")
+        }
+
+        async fn domain_operation_prepare(
+            &self,
+            _key: &ReceiptKey,
+            _binding: &OperationBinding,
+            _witness: Option<&AuthorizationWitness>,
+        ) -> Result<PrepareResult, DomainError> {
+            unreachable!("DomainContext::admit tests never call the coordinator")
+        }
+
+        async fn domain_operation_receipt_get(
+            &self,
+            _key: &ReceiptKey,
+            _binding: &OperationBinding,
+        ) -> Result<ReceiptLookup, DomainError> {
+            unreachable!("DomainContext::admit tests never call the coordinator")
+        }
+
         async fn repository_snapshot(
             &self,
             _repository_id: &[u8],

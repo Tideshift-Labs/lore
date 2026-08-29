@@ -15,6 +15,93 @@ pub struct DeleteResourceRequest {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteResourceResponse {}
+/// Exact private CR-029 authorization identity and caller-known operation
+/// binding. The issuer and subject are supplied by loreserver from the verified
+/// JWT extension. They are never copied from the public DomainOperation request.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct VerifyRepositoryOperationAuthorizationRequest {
+    #[prost(string, tag = "1")]
+    pub verified_issuer: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub authenticated_subject: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub org_uuid: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub initiating_principal_namespace: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub operation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "6")]
+    pub method: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub scope: ::prost::bytes::Bytes,
+    #[prost(uint32, tag = "8")]
+    pub fingerprint_version: u32,
+    #[prost(bytes = "bytes", tag = "9")]
+    pub fingerprint: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "10")]
+    pub canonical_intent_digest: ::prost::bytes::Bytes,
+    /// CR-029 freezes authorization_id to the canonical operation UUID until a
+    /// separate authorization-id column exists. The verifier requires equality.
+    #[prost(bytes = "bytes", tag = "11")]
+    pub authorization_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "12")]
+    pub authorization_revision: u64,
+    #[prost(
+        oneof = "verify_repository_operation_authorization_request::Proof",
+        tags = "13, 14"
+    )]
+    pub proof: ::core::option::Option<
+        verify_repository_operation_authorization_request::Proof,
+    >,
+}
+/// Nested message and enum types in `VerifyRepositoryOperationAuthorizationRequest`.
+pub mod verify_repository_operation_authorization_request {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Proof {
+        /// Decoded 32-byte one-use secret. Consumes ISSUED -> VERIFIED.
+        #[prost(bytes, tag = "13")]
+        PreclaimTicket(::prost::bytes::Bytes),
+        /// Exact 32-byte commitment. Read-only verification for receipt lookup.
+        #[prost(bytes, tag = "14")]
+        ConsumedTicketSha256(::prost::bytes::Bytes),
+    }
+}
+/// The immutable witness persisted beside PREPARED, plus an exact echo of every
+/// identity/binding field. Loreserver rejects any divergent echo before it
+/// creates or reads a receipt.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct VerifyRepositoryOperationAuthorizationResponse {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub authorization_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "2")]
+    pub authorization_revision: u64,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub verification_nonce: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub bound_fields_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub consumed_ticket_sha256: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub org_uuid: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub initiating_principal_namespace: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub operation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "9")]
+    pub method: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "10")]
+    pub scope: ::prost::bytes::Bytes,
+    #[prost(uint32, tag = "11")]
+    pub fingerprint_version: u32,
+    #[prost(bytes = "bytes", tag = "12")]
+    pub fingerprint: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "13")]
+    pub canonical_intent_digest: ::prost::bytes::Bytes,
+    #[prost(string, tag = "14")]
+    pub verified_issuer: ::prost::alloc::string::String,
+    #[prost(string, tag = "15")]
+    pub authenticated_subject: ::prost::alloc::string::String,
+}
 /// Generated client implementations.
 pub mod rebac_api_client {
     #![allow(
@@ -152,6 +239,44 @@ pub mod rebac_api_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("ucs.auth.RebacApi", "DeleteResource"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// FORK-LOCAL (Tideshift, CR-029). Private server-to-auth callback. Additive:
+        /// one RPC and new messages, with no existing field number or method changed.
+        /// The on-the-wire method path is
+        /// /ucs.auth.RebacApi/VerifyRepositoryOperationAuthorization. Lore's private
+        /// domain prepare/receipt rail is pinned to that exact path. If upstream adds
+        /// an authorization-verification RPC or messages with these names, reconcile
+        /// the method path and every field tag before regenerating this binding.
+        pub async fn verify_repository_operation_authorization(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::VerifyRepositoryOperationAuthorizationRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::VerifyRepositoryOperationAuthorizationResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ucs.auth.RebacApi/VerifyRepositoryOperationAuthorization",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "ucs.auth.RebacApi",
+                        "VerifyRepositoryOperationAuthorization",
+                    ),
+                );
             self.inner.unary(req, path, codec).await
         }
     }

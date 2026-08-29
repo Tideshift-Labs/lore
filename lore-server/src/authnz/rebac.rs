@@ -6,6 +6,8 @@ use lore_proto::rebac::CreateResourceRequest;
 use lore_proto::rebac::CreateResourceResponse;
 use lore_proto::rebac::DeleteResourceRequest;
 use lore_proto::rebac::DeleteResourceResponse;
+use lore_proto::rebac::VerifyRepositoryOperationAuthorizationRequest;
+use lore_proto::rebac::VerifyRepositoryOperationAuthorizationResponse;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::LabelArray;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
@@ -35,6 +37,55 @@ pub trait RebacApiClient {
         &mut self,
         request: Request<DeleteResourceRequest>,
     ) -> RebacApiResult<DeleteResourceResponse>;
+}
+
+/// Private CR-029 verifier used by the domain prepare/receipt service.
+///
+/// Kept separate from [`RebacApiClient`] so repository-handler test doubles do
+/// not gain an unrelated method and the private rail can inject a focused fake
+/// without opening a network connection.
+#[async_trait::async_trait]
+pub trait RepositoryOperationAuthorizationVerifier: Send + Sync {
+    /// Consume an ISSUED preclaim ticket or exact-load an already verified
+    /// authorization, returning its immutable witness and exact binding echo.
+    async fn verify_repository_operation_authorization(
+        &self,
+        request: Request<VerifyRepositoryOperationAuthorizationRequest>,
+    ) -> Result<VerifyRepositoryOperationAuthorizationResponse, Status>;
+}
+
+/// Network implementation of the private CR-029 verifier.
+pub struct GrpcRepositoryOperationAuthorizationVerifier {
+    auth_url: String,
+}
+
+impl GrpcRepositoryOperationAuthorizationVerifier {
+    /// Bind this verifier to the configured private auth-grpc endpoint.
+    pub fn new(auth_url: String) -> Self {
+        Self { auth_url }
+    }
+}
+
+#[async_trait::async_trait]
+impl RepositoryOperationAuthorizationVerifier for GrpcRepositoryOperationAuthorizationVerifier {
+    async fn verify_repository_operation_authorization(
+        &self,
+        request: Request<VerifyRepositoryOperationAuthorizationRequest>,
+    ) -> Result<VerifyRepositoryOperationAuthorizationResponse, Status> {
+        let mut client = grpc_get_rebac_client(self.auth_url.clone())
+            .await
+            .map_err(|_| Status::unavailable("Repository operation verifier unavailable"))?;
+        timed!(
+            self.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
+            &self.get_labels_for_operation_context("verify_repository_operation_authorization"),
+            client
+                .client
+                .verify_repository_operation_authorization(request)
+                .await
+        )
+        .result
+        .map(Response::into_inner)
+    }
 }
 
 pub struct RebacClientHelper {
@@ -100,5 +151,11 @@ pub async fn grpc_get_rebac_client(auth_url: String) -> Result<RebacClientHelper
 impl InstrumentProvider for RebacClientHelper {
     fn namespace(&self) -> &'static str {
         "urc.authnz.rebac"
+    }
+}
+
+impl InstrumentProvider for GrpcRepositoryOperationAuthorizationVerifier {
+    fn namespace(&self) -> &'static str {
+        "urc.authnz.repository_operation"
     }
 }

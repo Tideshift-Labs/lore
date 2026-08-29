@@ -1,0 +1,121 @@
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
+// SPDX-License-Identifier: MIT
+
+syntax = "proto3";
+
+package lore.domain.v1;
+
+// FORK-LOCAL (Tideshift, CR-029). This private server-only service is the
+// prepare/receipt rail for Lorehub's control plane. The current API-first slice
+// pins these on-the-wire method paths:
+// /lore.domain.v1.DomainOperationService/DomainOperationClockGet
+// /lore.domain.v1.DomainOperationService/DomainOperationPrepare
+// /lore.domain.v1.DomainOperationService/DomainOperationReceiptGet
+// No upstream package claims lore.domain.v1 today. If upstream adds that
+// package or any method/message below, reconcile names and every field/enum tag
+// before regeneration. CR-029's remaining four v2 methods are not declared
+// until their store contracts exist; this partial rail must not advertise the
+// domain_operation_receipt_v2 capability.
+service DomainOperationService {
+  rpc DomainOperationClockGet(DomainOperationClockGetRequest)
+      returns (DomainOperationClockGetResponse);
+  rpc DomainOperationPrepare(DomainOperationPrepareRequest)
+      returns (DomainOperationPrepareResponse);
+  rpc DomainOperationReceiptGet(DomainOperationReceiptGetRequest)
+      returns (DomainOperationReceiptGetResponse);
+}
+
+message DomainOperationClockGetRequest {}
+
+message DomainOperationClockGetResponse {
+  int64 lore_clock_unix_millis = 1;
+  bytes sample_nonce = 2;
+}
+
+message DomainOperationPrepareRequest {
+  bytes org_uuid = 1;
+  bytes initiating_principal_namespace = 2;
+  bytes operation_id = 3;
+  string method = 4;
+  bytes scope = 5;
+  uint32 fingerprint_version = 6;
+  bytes fingerprint = 7;
+  bytes canonical_intent_digest = 8;
+  bytes authorization_id = 9;
+  uint64 authorization_revision = 10;
+  // Decoded 32-byte one-use preclaim ticket. Never logged or persisted.
+  bytes preclaim_ticket = 11;
+}
+
+enum DomainOperationPrepareStatus {
+  DOMAIN_OPERATION_PREPARE_STATUS_UNSPECIFIED = 0;
+  DOMAIN_OPERATION_PREPARE_STATUS_PREPARED = 1;
+  DOMAIN_OPERATION_PREPARE_STATUS_COMMITTED = 2;
+  DOMAIN_OPERATION_PREPARE_STATUS_EXPIRED_OR_UNKNOWN = 3;
+  DOMAIN_OPERATION_PREPARE_STATUS_MISMATCH = 4;
+  DOMAIN_OPERATION_PREPARE_STATUS_CAPACITY_EXHAUSTED = 5;
+}
+
+enum DomainOperationOutcome {
+  DOMAIN_OPERATION_OUTCOME_UNSPECIFIED = 0;
+  DOMAIN_OPERATION_OUTCOME_APPLIED = 1;
+  DOMAIN_OPERATION_OUTCOME_NOT_APPLIED = 2;
+}
+
+message DomainOperationPrepareResponse {
+  DomainOperationPrepareStatus status = 1;
+  // Present only for PREPARED.
+  bytes consume_token = 2;
+  optional int64 hard_expires_at_unix_millis = 3;
+  // Present only for COMMITTED.
+  DomainOperationOutcome outcome = 4;
+  optional uint32 reason_version = 5;
+  string reason = 6;
+  // Immutable platform-verification witness recorded with PREPARED/receipt.
+  bytes verification_nonce = 7;
+  bytes bound_fields_digest = 8;
+  bytes consumed_ticket_sha256 = 9;
+  uint64 authorization_revision = 10;
+}
+
+message DomainOperationReceiptGetRequest {
+  bytes org_uuid = 1;
+  bytes initiating_principal_namespace = 2;
+  bytes operation_id = 3;
+  string method = 4;
+  bytes scope = 5;
+  uint32 fingerprint_version = 6;
+  bytes fingerprint = 7;
+  bytes canonical_intent_digest = 8;
+  bytes authorization_id = 9;
+  uint64 authorization_revision = 10;
+  // Exact 32-byte commitment persisted after the prepare ticket is consumed.
+  bytes consumed_ticket_sha256 = 11;
+}
+
+enum DomainOperationReceiptStatus {
+  DOMAIN_OPERATION_RECEIPT_STATUS_UNSPECIFIED = 0;
+  DOMAIN_OPERATION_RECEIPT_STATUS_PREPARED = 1;
+  DOMAIN_OPERATION_RECEIPT_STATUS_COMMITTED = 2;
+  DOMAIN_OPERATION_RECEIPT_STATUS_MISMATCH = 3;
+  DOMAIN_OPERATION_RECEIPT_STATUS_EXPIRED = 4;
+  DOMAIN_OPERATION_RECEIPT_STATUS_EXPIRED_OR_UNKNOWN = 5;
+  DOMAIN_OPERATION_RECEIPT_STATUS_NOT_FOUND = 6;
+}
+
+message DomainOperationReceiptGetResponse {
+  DomainOperationReceiptStatus status = 1;
+  // Present only for COMMITTED.
+  DomainOperationOutcome outcome = 2;
+  optional uint32 reason_version = 3;
+  string reason = 4;
+  bool from_future_marker = 5;
+  // Present only for PREPARED.
+  optional int64 prepared_at_unix_millis = 6;
+  optional int64 hard_expires_at_unix_millis = 7;
+  // Exact verified witness. Receipt lookup never returns the consume token.
+  bytes verification_nonce = 8;
+  bytes bound_fields_digest = 9;
+  bytes consumed_ticket_sha256 = 10;
+  uint64 authorization_revision = 11;
+}

@@ -44,12 +44,17 @@
 //! immutable-store serializations interleaved with six unsynchronised writes),
 //! which is what this shape removes.
 
+use std::time::SystemTime;
+
 use async_trait::async_trait;
 
 use crate::domain::errors::DomainError;
 use crate::domain::errors::DomainOutcome;
+use crate::domain::receipts::AuthorizationWitness;
 use crate::domain::receipts::OperationBinding;
+use crate::domain::receipts::PrepareResult;
 use crate::domain::receipts::ReceiptKey;
+use crate::domain::receipts::ReceiptLookup;
 
 /// A repository as the domain rows see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +282,33 @@ pub const ADMISSION_REJECTED_V1: &str = "ADMISSION_REJECTED_V1";
 /// compile rather than silently inherit a body.
 #[async_trait]
 pub trait DomainTransactionStore: Send + Sync {
+    /// Sample the authoritative Postgres clock used by receipt admission.
+    ///
+    /// This is read-only and creates no operation identity. The private
+    /// control-plane rail uses it to fail closed on unsafe cross-database
+    /// clock skew before allocating an authorization ticket.
+    async fn domain_operation_clock_get(&self) -> Result<SystemTime, DomainError>;
+
+    /// Create or exact-load the one keyed `PREPARED` admission row.
+    ///
+    /// The authorization witness is immutable server-only evidence. It is not
+    /// part of the caller-known fingerprint and must already have been verified
+    /// before this method is called.
+    async fn domain_operation_prepare(
+        &self,
+        key: &ReceiptKey,
+        binding: &OperationBinding,
+        witness: Option<&AuthorizationWitness>,
+    ) -> Result<PrepareResult, DomainError>;
+
+    /// Load one receipt or compact future-rejection marker in its exact
+    /// authenticated namespace. This never returns the consume token.
+    async fn domain_operation_receipt_get(
+        &self,
+        key: &ReceiptKey,
+        binding: &OperationBinding,
+    ) -> Result<ReceiptLookup, DomainError>;
+
     /// Read one repository's domain row. `None` when the identity never existed.
     async fn repository_snapshot(
         &self,

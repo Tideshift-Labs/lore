@@ -378,6 +378,11 @@ pub enum ScopeKeyError {
         /// Which component carried the prefix.
         component: &'static str,
     },
+
+    /// A mediated principal namespace was not the frozen
+    /// `principal-v1\0` plus lowercase canonical UUID representation.
+    #[error("scope key principal namespace is not canonical principal-v1 UUID bytes")]
+    InvalidPrincipalNamespace,
 }
 
 /// A raw 16-byte target identity, checked for length and `urc-` provenance.
@@ -440,10 +445,31 @@ pub fn scope_key_mediated(
     build_scope_key(SCOPE_METHOD_MEDIATED_V1, &[org_uuid, &principal])
 }
 
+/// Scope key for a mediated operation when the caller already carries the
+/// frozen canonical principal namespace. The namespace is validated and
+/// encoded byte-for-byte; it is never tagged a second time.
+pub fn scope_key_mediated_namespace(
+    org_uuid: &[u8],
+    principal_namespace: &[u8],
+) -> Result<Vec<u8>, ScopeKeyError> {
+    checked_identity("org_uuid", org_uuid)?;
+    let principal_id = principal_namespace
+        .strip_prefix(SCOPE_PRINCIPAL_NAMESPACE_V1)
+        .ok_or(ScopeKeyError::InvalidPrincipalNamespace)?;
+    let principal_id =
+        std::str::from_utf8(principal_id).map_err(|_| ScopeKeyError::InvalidPrincipalNamespace)?;
+    let parsed =
+        Uuid::parse_str(principal_id).map_err(|_| ScopeKeyError::InvalidPrincipalNamespace)?;
+    if parsed.to_string() != principal_id {
+        return Err(ScopeKeyError::InvalidPrincipalNamespace);
+    }
+    build_scope_key(SCOPE_METHOD_MEDIATED_V1, &[org_uuid, principal_namespace])
+}
+
 /// Longest component this encoding admits.
 ///
 /// Applied to the component as encoded, so for [`scope_key_mediated`] it bounds
-/// the `principal-v1 ` tag plus the principal id together: the caller-facing
+/// the `principal-v1\\0` tag plus the principal id together: the caller-facing
 /// limit on `principal_user_id` is `MAX_SCOPE_COMPONENT_LEN - 13`, not the
 /// constant itself.
 ///
@@ -1104,6 +1130,30 @@ mod tests {
 
         let key = scope_key_mediated(&org_uuid, b"user-1234").expect("a valid principal id");
         assert!(contains_subslice(&key, SCOPE_PRINCIPAL_NAMESPACE_V1));
+    }
+
+    #[test]
+    fn canonical_mediated_namespace_is_encoded_once_and_noncanonical_forms_fail() {
+        let org_uuid = *Uuid::new_v4().as_bytes();
+        let principal_id = "11111111-1111-4111-8111-111111111111";
+        let canonical = format!("principal-v1\0{principal_id}");
+
+        let from_id = scope_key_mediated(&org_uuid, principal_id.as_bytes())
+            .expect("raw principal id encodes");
+        let from_namespace = scope_key_mediated_namespace(&org_uuid, canonical.as_bytes())
+            .expect("canonical namespace encodes");
+        assert_eq!(from_namespace, from_id);
+
+        for invalid in [
+            principal_id.as_bytes(),
+            b"principal-v1\0not-a-uuid".as_slice(),
+            b"principal-v1\x0011111111-1111-4111-8111-11111111111A".as_slice(),
+        ] {
+            assert_eq!(
+                scope_key_mediated_namespace(&org_uuid, invalid),
+                Err(ScopeKeyError::InvalidPrincipalNamespace)
+            );
+        }
     }
 
     // Realistic identity shapes only: 16-byte binary UUIDs for repository/org

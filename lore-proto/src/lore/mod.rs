@@ -5,6 +5,7 @@
 #[path = "../grpc/lore.notification.rs"]
 pub mod notification;
 
+pub mod domain;
 pub mod environment;
 pub mod model;
 pub mod object_dispatch;

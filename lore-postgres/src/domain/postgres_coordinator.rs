@@ -160,6 +160,61 @@ impl PostgresDomainStore {
 
 #[async_trait]
 impl DomainTransactionStore for PostgresDomainStore {
+    async fn domain_operation_clock_get(&self) -> Result<std::time::SystemTime, DomainError> {
+        let _t = self
+            .instruments()
+            .start("domain_operation_clock_get", self.pool().status());
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("domain operation clock transaction", e))?;
+        let clock = receipts::admission_clock(&tx).await?;
+        // This transaction is read-only. Dropping it rolls back without any
+        // outcome-unknown ambiguity and creates no operation identity.
+        drop(tx);
+        Ok(clock)
+    }
+
+    async fn domain_operation_prepare(
+        &self,
+        key: &receipts::ReceiptKey,
+        binding: &receipts::OperationBinding,
+        witness: Option<&receipts::AuthorizationWitness>,
+    ) -> Result<receipts::PrepareResult, DomainError> {
+        let _t = self
+            .instruments()
+            .start("domain_operation_prepare", self.pool().status());
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("domain operation prepare transaction", e))?;
+        let result = receipts::prepare(&tx, key, binding, witness).await?;
+        classify_commit(tx.commit().await, "domain operation prepare commit")?;
+        Ok(result)
+    }
+
+    async fn domain_operation_receipt_get(
+        &self,
+        key: &receipts::ReceiptKey,
+        binding: &receipts::OperationBinding,
+    ) -> Result<receipts::ReceiptLookup, DomainError> {
+        let _t = self
+            .instruments()
+            .start("domain_operation_receipt_get", self.pool().status());
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("domain operation receipt transaction", e))?;
+        // Lookup can terminalize a PREPARED row past its hard TTL, so it must
+        // commit through the same outcome-unknown classifier as prepare.
+        let result = receipts::receipt_get(&tx, key, binding).await?;
+        classify_commit(tx.commit().await, "domain operation receipt commit")?;
+        Ok(result)
+    }
+
     async fn repository_snapshot(
         &self,
         repository_id: &[u8],

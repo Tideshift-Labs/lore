@@ -169,6 +169,22 @@ fn main() -> Result<()> {
             &["./proto"],
         )?;
 
+    // FORK-LOCAL (Tideshift, CR-029). Private control-plane prepare/receipt
+    // service. Reconcile package, message/enum tags, and the three pinned
+    // method paths before regeneration if upstream adds lore.domain.v1.
+    let mut config = tonic_prost_build::Config::new();
+    config.enable_type_names();
+    config.bytes(["."]);
+
+    tonic_prost_build::configure()
+        .out_dir(&output_dir)
+        .protoc_arg("--experimental_allow_proto3_optional")
+        .compile_with_config(
+            config,
+            &["./proto/lore/domain/v1/domain_operation.proto"],
+            &["./proto"],
+        )?;
+
     // FORK-LOCAL (Tideshift, CR-033). This private, server-only package is the canonical record
     // schema for the in-process cell dispatch authority and declares no service. Reconcile
     // package, field-number and enum-value collisions before regenerating after an upstream merge.

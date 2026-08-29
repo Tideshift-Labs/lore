@@ -12,6 +12,7 @@ use anyhow::anyhow;
 use lore_base::lore_spawn_net;
 use lore_proto::AdminServiceServer;
 use lore_proto::LockServiceServer;
+use lore_proto::lore::domain::v1::domain_operation_service_server::DomainOperationServiceServer;
 use lore_proto::lore::environment::v1::environment_service_server as environment_v1_server;
 use lore_proto::lore::repository::v1::repository_service_server as repository_v1_server;
 use lore_proto::lore::revision::v1::revision_service_server as revision_v1_server;
@@ -42,12 +43,14 @@ use super::lock_service::LoreLockService;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_interceptor::JWTAuthnInterceptor;
 use crate::auth::jwt_interceptor::JWTInterceptor;
+use crate::authnz::rebac::GrpcRepositoryOperationAuthorizationVerifier;
 use crate::correlation::layer::CorrelationIdLayer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
 use crate::correlation::span::MakeCorrelationIdSpan;
 use crate::domain::DomainContext;
 use crate::grpc::admin_service::LoreAdminService;
+use crate::grpc::domain::v1::LoreDomainOperationV1Service;
 use crate::grpc::environment::LoreEnvironmentV1Service;
 use crate::grpc::environment_service::LoreEnvironmentService;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -641,6 +644,25 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.domain_context.clone(),
         );
 
+        // The private receipt rail is meaningful only with all three pieces:
+        // a Postgres domain coordinator, JWT authentication, and the private
+        // auth-grpc verifier URL. It is registered below only in the auth-ON
+        // branch through JWTAuthnInterceptor. A partial configuration exposes
+        // no endpoint and advertises no v2 capability.
+        let domain_operation_svc = self.0.domain_context.clone().and_then(|domain| {
+            self.0
+                .environment
+                .endpoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.auth_url.clone())
+                .map(|auth_url| {
+                    LoreDomainOperationV1Service::new(
+                        domain,
+                        Arc::new(GrpcRepositoryOperationAuthorizationVerifier::new(auth_url)),
+                    )
+                })
+        });
+
         let environment_svc = LoreEnvironmentService::new(self.0.environment.clone());
         let environment_v1_svc = LoreEnvironmentV1Service::new(self.0.environment);
         let lock_svc = match self.0.lock_store {
@@ -732,6 +754,17 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                 .add_service(environment_v1_server::EnvironmentServiceServer::new(
                     environment_v1_svc,
                 ));
+
+            if let Some(domain_operation_svc) = domain_operation_svc {
+                let domain_operation_server =
+                    DomainOperationServiceServer::new(domain_operation_svc)
+                        .max_decoding_message_size(64 * 1024)
+                        .max_encoding_message_size(64 * 1024);
+                router = router.add_service(tonic::service::interceptor::InterceptedService::new(
+                    domain_operation_server,
+                    jwt_authn_interceptor.clone(),
+                ));
+            }
 
             // Locks require auth, so set that up here
             if let Some(lock_svc) = lock_svc {
