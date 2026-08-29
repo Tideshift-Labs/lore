@@ -177,15 +177,23 @@ impl PostgresDomainStore {
             )
             .await
             .map_err(|e| DomainError::from_pg("domain schema state insert", e))?;
+        // `migration_version` is bigint and the three compatibility floors are
+        // integer, so they need separate placeholders: Postgres infers one type
+        // per parameter number across the whole statement, and reusing `$1` for
+        // both fails with 42P08 "inconsistent types deduced for parameter $1
+        // (bigint versus integer)" on every fresh database.
         client
             .execute(
                 "INSERT INTO lore_outbox_schema_state ( \
                      id, migration_version, backfill_version, \
                      producer_compat_floor, relay_compat_floor, consumer_compat_floor, \
                      updated_at \
-                 ) VALUES (1, $1, 0, $1, $1, $1, clock_timestamp()) \
+                 ) VALUES (1, $1, 0, $2, $2, $2, clock_timestamp()) \
                  ON CONFLICT (id) DO NOTHING",
-                &[&OUTBOX_BASE_API_VERSION],
+                &[
+                    &i64::from(OUTBOX_BASE_API_VERSION),
+                    &OUTBOX_BASE_API_VERSION,
+                ],
             )
             .await
             .map_err(|e| DomainError::from_pg("outbox schema state insert", e))?;
