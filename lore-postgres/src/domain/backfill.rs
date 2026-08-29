@@ -203,9 +203,27 @@ impl<'a> DomainBackfill<'a> {
         let repositories = self.source.list_repositories().await?;
 
         let mut projected = 0u64;
+        let mut previous: Option<Vec<u8>> = None;
         for facts in repositories {
-            // The list is ascending by ID, so anything at or below the cursor
-            // already committed in a previous run.
+            // The cursor skip is only sound if the source really is ascending.
+            // An unsorted source would let the skip discard repositories that
+            // never landed, and the one-way verification below would still
+            // pass — a silent partial backfill reaching cutover, after which
+            // enforcement fences keys that have no domain row. Check rather
+            // than trust the contract.
+            if let Some(ref prev) = previous
+                && facts.repository_id.as_slice() <= prev.as_slice()
+            {
+                return Err(DomainError::InvalidInput(format!(
+                    "backfill source returned repository {} at or before {}; \
+                     list_repositories must be strictly ascending by repository_id \
+                     or the restart cursor silently drops repositories",
+                    hex::encode(&facts.repository_id),
+                    hex::encode(prev)
+                )));
+            }
+            previous = Some(facts.repository_id.clone());
+
             if let Some(ref c) = cursor
                 && facts.repository_id.as_slice() <= c.as_slice()
             {
@@ -220,24 +238,25 @@ impl<'a> DomainBackfill<'a> {
 
     /// Steps 3 through 5 for one repository.
     async fn project_repository(&self, facts: &RepositoryFacts) -> Result<(), DomainError> {
-        for attempt in 0..=self.max_snapshot_retries {
+        for _ in 0..=self.max_snapshot_retries {
             let before = self.source.snapshot_token(&facts.repository_id).await?;
             let branches = self.source.list_branches(&facts.repository_id).await?;
             let after = self.source.snapshot_token(&facts.repository_id).await?;
             if before != after {
-                if attempt == self.max_snapshot_retries {
-                    return Err(DomainError::Contention(format!(
-                        "repository {} mutable snapshot changed on every one of \
-                         {} attempts; the cell must be quiesced for backfill",
-                        hex::encode(&facts.repository_id),
-                        self.max_snapshot_retries + 1
-                    )));
-                }
                 continue;
             }
             return self.write_domain_rows(facts, &branches).await;
         }
-        unreachable!("the loop returns or errors on the final attempt")
+        // Falling out of the loop is the every-attempt-raced case. Returning the
+        // error here rather than `unreachable!` inside the loop keeps this file
+        // free of panics in non-test code: an unreachable branch that becomes
+        // reachable through a later edit is a process abort on a live cell.
+        Err(DomainError::Contention(format!(
+            "repository {} mutable snapshot changed on every one of {} attempts; \
+             the cell must be quiesced for backfill",
+            hex::encode(&facts.repository_id),
+            self.max_snapshot_retries + 1
+        )))
     }
 
     /// Step 4: one short transaction per repository.
@@ -356,7 +375,9 @@ impl<'a> DomainBackfill<'a> {
 
         let mut missing = 0u64;
         let mut name_map_mismatches = Vec::new();
+        let mut source_repositories = 0u64;
         for facts in self.source.list_repositories().await? {
+            source_repositories += 1;
             if !facts.name_map_resolves {
                 name_map_mismatches.push(facts.repository_id.clone());
             }
@@ -365,19 +386,37 @@ impl<'a> DomainBackfill<'a> {
         // Forward direction: every domain row must still have its projection.
         // A repository row whose metadata hash no longer matches the projection
         // means the domain rows led the projection, which the contract forbids.
+        //
+        // `key_type` is part of the match. Without it the EXISTS is satisfied by
+        // ANY row in that partition holding the same 32 bytes — a branch tip
+        // that happens to equal the repository metadata hash would vouch for a
+        // repository whose own projection row is gone, which is the one thing
+        // this check exists to catch.
         let stale = client
             .query_one(
                 "SELECT count(*)::bigint AS stale FROM lore_domain_repositories d \
                  WHERE NOT EXISTS ( \
                      SELECT 1 FROM lore_mutable m \
-                     WHERE m.partition = d.repository_id AND m.value = d.metadata_hash \
+                     WHERE m.partition = d.repository_id \
+                       AND m.key_type = $1 \
+                       AND m.value = d.metadata_hash \
                  )",
-                &[],
+                &[&(lore_base::types::KeyType::RepositoryMetadata as i16)],
             )
             .await
             .map_err(|e| DomainError::from_pg("backfill verify projection", e))?;
         let stale: i64 = stale.get("stale");
         missing += stale.max(0) as u64;
+
+        // Count parity. The forward check above says nothing about a repository
+        // the backfill never projected at all: it has no domain row, so there is
+        // nothing for the EXISTS to fail on. Comparing the source count against
+        // the projected count is what turns a silently dropped repository into a
+        // failed verification instead of a clean run.
+        let projected_repositories = repositories.max(0) as u64;
+        if projected_repositories < source_repositories {
+            missing += source_repositories - projected_repositories;
+        }
 
         let residue = self
             .source
@@ -407,6 +446,31 @@ impl<'a> DomainBackfill<'a> {
                 "{} domain rows have no matching lore_mutable projection row; \
                  the projection must never lag the domain rows",
                 report.missing_projection_rows
+            )));
+        }
+
+        // Residue is classified, not merely counted, precisely so this gate can
+        // read the classes. Delete residue and orphaned branch rows are expected
+        // on any cell that has served a delete and are safe to cut over with.
+        // A ForeignDomainKeyWrite is different: it is a domain-typed key no
+        // server writer produces, so something is writing one through the
+        // generic mutable RPCs. Enabling enforcement would start rejecting that
+        // writer. Refuse cutover until an operator has looked at it.
+        let foreign: Vec<&OrphanKey> = report
+            .residue
+            .iter()
+            .filter(|(_, class)| *class == ResidueClass::ForeignDomainKeyWrite)
+            .map(|(key, _)| key)
+            .collect();
+        if !foreign.is_empty() {
+            return Err(DomainError::NotReady(format!(
+                "{} domain-typed key(s) in this cell were written through the generic \
+                 mutable path, not by a server writer (first: key_type {}, partition {}). \
+                 Enforcement would start rejecting whatever wrote them, so cutover is \
+                 refused until the source is identified",
+                foreign.len(),
+                foreign[0].key_type,
+                hex::encode(&foreign[0].partition)
             )));
         }
         let client = self
@@ -443,7 +507,7 @@ impl<'a> DomainBackfill<'a> {
             .get()
             .await
             .map_err(|e| DomainError::from_pool("backfill state pool", e))?;
-        client
+        let updated = client
             .execute(
                 "UPDATE lore_domain_schema_state \
                  SET backfill_state = $1, backfill_version = $2, updated_at = clock_timestamp() \
@@ -456,6 +520,17 @@ impl<'a> DomainBackfill<'a> {
             )
             .await
             .map_err(|e| DomainError::from_pg("backfill mark running", e))?;
+        // Zero rows means the cell is already VERIFIED or past CUTOVER. Running
+        // the backfill again from there would re-drive projection writes against
+        // a cell that is already enforcing, so refuse loudly instead of
+        // proceeding with the state row silently unchanged.
+        if updated == 0 {
+            return Err(DomainError::NotReady(
+                "backfill cannot start: lore_domain_schema_state is neither NOT_STARTED nor \
+                 RUNNING, so this cell has already completed verification or cutover"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 

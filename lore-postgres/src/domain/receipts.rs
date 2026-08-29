@@ -578,14 +578,26 @@ pub struct AuthorizationWitness {
     pub consumed_ticket_sha256: Vec<u8>,
 }
 
-/// Mint a 256-bit consume token.
+/// Mint a 256-bit consume token from the OS CSPRNG.
 fn new_consume_token() -> [u8; 32] {
-    let mut token = [0u8; 32];
-    // `blake3` seeds from the OS CSPRNG via `rand`; the workspace already
-    // depends on both, and this avoids adding a third RNG surface.
-    let seed: [u8; 32] = rand::random();
-    token.copy_from_slice(&seed);
-    token
+    rand::random()
+}
+
+/// Compare two consume tokens in constant time.
+///
+/// The token is a bearer secret: whoever holds it may commit the mutation. A
+/// short-circuiting `==` leaks a prefix-match oracle to anyone who can measure
+/// the response, and an attacker who can retry cheaply can walk a token out
+/// byte by byte. The comparison is fixed-width and unconditional.
+fn tokens_match(stored: &[u8], presented: &[u8; 32]) -> bool {
+    if stored.len() != presented.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in stored.iter().zip(presented.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -747,47 +759,55 @@ async fn insert_future_marker(
     }
 
     let prune_after = later_of_compact_deadline(clock, key)?;
-    tx.execute(
-        "INSERT INTO lore_domain_operation_future_rejections ( \
+    // Rows affected decides whether the counters move. `ON CONFLICT DO NOTHING`
+    // means a concurrent duplicate inserts nothing, and incrementing regardless
+    // would over-count permanently — the namespace would drift toward
+    // CapacityExhausted with fewer retained markers than the counter claims,
+    // and nothing would ever correct it.
+    let inserted = tx
+        .execute(
+            "INSERT INTO lore_domain_operation_future_rejections ( \
              verified_issuer, authenticated_subject, tenant_scope_key, operation_id, \
              method, scope, fingerprint_version, fingerprint, \
              reason_version, reason, uuid_timestamp, rejected_at, prune_after \
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
          ON CONFLICT (verified_issuer, authenticated_subject, tenant_scope_key, operation_id) \
          DO NOTHING",
-        &[
-            &key.verified_issuer,
-            &key.authenticated_subject,
-            &key.tenant_scope_key,
-            &key.operation_id.as_bytes().as_slice(),
-            &binding.method,
-            &binding.scope,
-            &binding.fingerprint_version,
-            &binding.fingerprint,
-            &REASON_VERSION,
-            &UUID_FUTURE_HORIZON_EXCEEDED_V1,
-            &uuid_timestamp,
-            &clock,
-            &prune_after,
-        ],
-    )
-    .await
-    .map_err(|e| DomainError::from_pg("future marker insert", e))?;
+            &[
+                &key.verified_issuer,
+                &key.authenticated_subject,
+                &key.tenant_scope_key,
+                &key.operation_id.as_bytes().as_slice(),
+                &binding.method,
+                &binding.scope,
+                &binding.fingerprint_version,
+                &binding.fingerprint,
+                &REASON_VERSION,
+                &UUID_FUTURE_HORIZON_EXCEEDED_V1,
+                &uuid_timestamp,
+                &clock,
+                &prune_after,
+            ],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("future marker insert", e))?;
 
-    tx.execute(
-        "UPDATE lore_domain_operation_future_reject_quotas \
-         SET retained_count = retained_count + 1, bucket_count = bucket_count + 1, \
-             updated_at = $4 \
-         WHERE verified_issuer = $1 AND authenticated_subject = $2 AND tenant_scope_key = $3",
-        &[
-            &key.verified_issuer,
-            &key.authenticated_subject,
-            &key.tenant_scope_key,
-            &clock,
-        ],
-    )
-    .await
-    .map_err(|e| DomainError::from_pg("future reject quota increment", e))?;
+    if inserted == 1 {
+        tx.execute(
+            "UPDATE lore_domain_operation_future_reject_quotas \
+             SET retained_count = retained_count + 1, bucket_count = bucket_count + 1, \
+                 updated_at = $4 \
+             WHERE verified_issuer = $1 AND authenticated_subject = $2 AND tenant_scope_key = $3",
+            &[
+                &key.verified_issuer,
+                &key.authenticated_subject,
+                &key.tenant_scope_key,
+                &clock,
+            ],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("future reject quota increment", e))?;
+    }
 
     Ok(PrepareResult::Committed(DomainOutcome::NotApplied {
         reason_version: REASON_VERSION,
@@ -816,7 +836,10 @@ pub async fn consume(
     if !row.matches(binding) || row.state != schema::RECEIPT_STATE_PREPARED {
         return Ok(None);
     }
-    if row.consume_token.as_deref() != Some(token.as_slice()) {
+    let Some(stored) = row.consume_token.as_deref() else {
+        return Ok(None);
+    };
+    if !tokens_match(stored, token) {
         return Ok(None);
     }
     if clock >= row.hard_expires_at {
@@ -830,7 +853,12 @@ pub async fn consume(
     }))
 }
 
-/// `domain_operation_receipt_get`. Read-only in every path.
+/// `domain_operation_receipt_get`.
+///
+/// **Performs no domain mutation** — but it is not literally read-only. A
+/// PREPARED row past its hard TTL is terminalized here, exactly as prepare and
+/// consume do it, because an operation whose caller only polls for status must
+/// still reach a terminal answer rather than reporting PREPARED forever.
 ///
 /// Requires the operation ID, expected method, canonical scope, and versioned
 /// fingerprint, so it answers only within the authenticated principal's own
@@ -845,44 +873,23 @@ pub async fn receipt_get(
 ) -> Result<ReceiptLookup, DomainError> {
     let clock = admission_clock(tx).await?;
 
-    let row = tx
-        .query_opt(
-            "SELECT state, outcome, not_applied_reason_version, not_applied_reason, \
-                    method, scope, fingerprint_version, fingerprint, \
-                    prepared_at, hard_expires_at, committed_at, full_result_expires_at \
-             FROM lore_domain_operation_receipts \
-             WHERE verified_issuer = $1 AND authenticated_subject = $2 \
-               AND tenant_scope_key = $3 AND operation_id = $4",
-            &[
-                &key.verified_issuer,
-                &key.authenticated_subject,
-                &key.tenant_scope_key,
-                &key.operation_id.as_bytes().as_slice(),
-            ],
-        )
-        .await
-        .map_err(|e| DomainError::from_pg("receipt lookup", e))?;
+    // Locks the row, because a past-TTL PREPARED row is terminalized here as
+    // well as in prepare and consume. That is what "every prepare, get, and
+    // consume touch performs this same transition" means: an operation whose
+    // caller only ever polls for status must still reach a terminal answer.
+    let row = lock_receipt_row(tx, key).await?;
 
-    if let Some(r) = row {
-        let row = ReceiptRow {
-            state: r.get("state"),
-            consume_token: None,
-            outcome: r.get("outcome"),
-            not_applied_reason_version: r.get("not_applied_reason_version"),
-            not_applied_reason: r.get("not_applied_reason"),
-            method: r.get("method"),
-            scope: r.get("scope"),
-            fingerprint_version: r.get("fingerprint_version"),
-            fingerprint: r.get("fingerprint"),
-            prepared_at: r.get("prepared_at"),
-            hard_expires_at: r.get("hard_expires_at"),
-            committed_at: r.get("committed_at"),
-            full_result_expires_at: r.get("full_result_expires_at"),
-        };
+    if let Some(row) = row {
         if !row.matches(binding) {
             return Ok(ReceiptLookup::Mismatch);
         }
         if row.state == schema::RECEIPT_STATE_PREPARED {
+            if clock >= row.hard_expires_at {
+                return Ok(ReceiptLookup::Committed {
+                    outcome: expire_prepared(tx, key, clock).await?,
+                    from_future_marker: false,
+                });
+            }
             // PREPARED is nonterminal, not a decisive payload: bounded metadata
             // only, no token, no result. Public status maps it to
             // OutcomeUnknown/StillUnknown.

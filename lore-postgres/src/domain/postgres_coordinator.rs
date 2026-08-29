@@ -747,6 +747,17 @@ impl DomainTransactionStore for PostgresDomainStore {
             return Ok(result);
         };
 
+        // A tombstoned repository has no content left to obliterate, and bumping
+        // its generation would move a fence that nothing can still be racing.
+        // Every other mutation checks this; leaving it out here was an omission,
+        // not a carve-out.
+        if repository.state == schema::STATE_TOMBSTONED {
+            let result = MutationResult::rejected(TOMBSTONED_V1);
+            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
+            classify_commit(tx.commit().await, "obliterate tombstone commit")?;
+            return Ok(result);
+        }
+
         // Beginning an address obliteration increments the repository
         // generation in the same transaction that records the fence, which is
         // what any in-flight push is checked against.

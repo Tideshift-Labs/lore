@@ -8,15 +8,22 @@
 //! control plane release a charged reservation with proof rather than with a
 //! guess. The lifecycle rows in `schema.rs` stand alone without it.
 //!
-//! **Non-overlap of prune ranges is enforced in code, not by an exclusion
-//! constraint.** A GiST `EXCLUDE` over `(namespace..., int8range(start, end))`
-//! would need the `btree_gist` extension, and `CREATE EXTENSION` is not
-//! something boot-time DDL may assume it can run on a managed cell database.
-//! Instead every insert and merge holds the namespace row lock, which serialises
-//! the whole family, and the unique indexes on `start_sequence` and
-//! `end_sequence` catch a duplicated bound. The invariant is proved by test, not
-//! by the catalog; that trade is deliberate and is the reason this comment
-//! exists.
+//! **Non-overlap of prune ranges will be enforced in code, not by an exclusion
+//! constraint — and that code does not exist yet.** A GiST `EXCLUDE` over
+//! `(namespace..., int8range(start, end))` would need the `btree_gist`
+//! extension, and `CREATE EXTENSION` is not something boot-time DDL may assume
+//! it can run on a managed cell database. The intended design is that every
+//! insert and merge holds the namespace row lock, which serialises the whole
+//! family, with the unique indexes on `start_sequence` and `end_sequence` as a
+//! backstop against a duplicated bound.
+//!
+//! As of WP-116 Phase 2/3 this module is DDL and constants only: no
+//! insert or merge function exists, so **today the non-overlap invariant is
+//! enforced by nothing at all**. The catalog admits a general overlap that
+//! shares neither exact bound — `[1,10]` then `[5,15]` inserts cleanly — which
+//! is verified by test and is expected, not a defect. Whoever lands the merge
+//! transaction owns making the statement above true, and owns the concurrent-
+//! merge test that proves it.
 //!
 //! **The interval algebra is associative and commutative** because a range
 //! stores only namespace, epoch, the three revisions, inclusive bounds, checked
