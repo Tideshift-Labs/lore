@@ -1770,10 +1770,12 @@ fn validate_owner(owner: &VerifiedLockOwner) -> Result<(), DomainError> {
 
 fn validate_lease_duration(lease_duration: Option<Duration>) -> Result<(), DomainError> {
     if let Some(lease) = lease_duration
-        && (lease < Duration::from_millis(1) || lease > MAX_LEASE)
+        && (lease < Duration::from_millis(1)
+            || lease > MAX_LEASE
+            || lease.subsec_nanos() % 1_000_000 != 0)
     {
         return Err(DomainError::InvalidInput(format!(
-            "lease duration must be in 1ms..={}ms",
+            "lease duration must be whole milliseconds in 1ms..={}ms",
             MAX_LEASE.as_millis()
         )));
     }
