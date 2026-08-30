@@ -2107,8 +2107,9 @@ fn assert_mirrors_audit_algebra(ledger: &ProviderAttemptLedger, label: &str) {
 ///
 /// `DispatchAfterNoDispatch` never appears here: `execute` refuses before touching either seam
 /// once a no-dispatch is recorded, so every sequence-loop or terminal-action `execute` call after
-/// `preceding_no_dispatch` leaves the ledger's fingerprint exactly as it was; the state this test
-/// actually reaches for that path is `(0, 0, 1, 0, 0, "")`, not a poisoned variant.
+/// `preceding_no_dispatch` leaves the ledger's fingerprint exactly as it was; the states this test
+/// actually reaches for that path are `(0, 0, 1, 0, 0, "")` and, with `preceding_grant`,
+/// `(0, 1, 1, 0, 0, "")`, never a poisoned variant.
 ///
 /// Generated, not hand-derived: produced by sorting and printing `reachable_states` from a
 /// temporary run of the test below. Regenerate the same way after any deliberate change to

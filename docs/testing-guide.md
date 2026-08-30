@@ -216,7 +216,10 @@ will update an older check constraint or state schema.
   applying the no-dispatch only *before* the outcome sequence; generate such state matrices by
   driving the real API, and give a sequencing rule an axis on both sides of the sequence.
   `ProviderAttemptLedger::audit` calls `compaction`'s own `provider_attempt_audit_is_valid` rather
-  than restating the algebra, so a producer/encoder drift is not possible to write.
+  than restating the algebra, which removes today's duplicate; nothing stops a future restatement,
+  so keep the call. The matrix's pinned state set is a change-detector, not an oracle: it is
+  invariant under swapping the decisive/ambiguous arms, so the two tests that pin that mapping
+  directly are load-bearing rather than redundant with it.
   `validate_endpoint_host` accepts a single-label host (`minio`, `localhost`).
   Double pattern: one generic closure-scripted double per trait, `new` returning
   `(Self, Rc<Cell<u32>>)` — the double moves into the client, so the counter handle must outlive
