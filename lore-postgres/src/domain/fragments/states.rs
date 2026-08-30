@@ -82,6 +82,17 @@ impl FragmentLifecycleState {
         matches!(self, Self::Staged | Self::Remote)
     }
 
+    /// The encodings [`Self::is_readable`] accepts, for SQL that has to express
+    /// the same predicate.
+    ///
+    /// Queries bind this rather than writing `state IN (3, 4)`, so the SQL and
+    /// the Rust predicate cannot drift apart — a ninth state that is readable
+    /// would otherwise have to be remembered in two unrelated places.
+    /// `readable_bits_matches_is_readable` pins the agreement.
+    pub fn readable_bits() -> [i16; 2] {
+        [Self::Staged.bits(), Self::Remote.bits()]
+    }
+
     /// Whether the head is inside a deletion sequence, which forbids publishing
     /// a new association against it.
     pub fn is_deleting(self) -> bool {
@@ -259,6 +270,24 @@ mod tests {
             assert!(
                 !state.is_readable(),
                 "{} must not be readable",
+                state.label()
+            );
+        }
+    }
+
+    #[test]
+    fn readable_bits_matches_is_readable() {
+        // SQL binds `readable_bits()` instead of writing `state IN (3, 4)`.
+        // If the two ever disagree, the resolver and the readiness damage count
+        // would silently answer a different question from `is_readable`.
+        let bits = FragmentLifecycleState::readable_bits();
+        for encoding in 1..=8i16 {
+            let state = FragmentLifecycleState::from_bits(encoding)
+                .expect("every encoding in the CHECK range decodes");
+            assert_eq!(
+                bits.contains(&encoding),
+                state.is_readable(),
+                "{} disagrees between readable_bits and is_readable",
                 state.label()
             );
         }

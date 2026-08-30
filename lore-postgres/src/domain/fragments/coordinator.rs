@@ -39,6 +39,15 @@
 //! only route to a bucket (CR-031's no-second-client rule, checkable here by
 //! construction: this module has no S3 dependency).
 //!
+//! The structural claim is about the **intent API**: every `begin_*` returns an
+//! owned value, so no I/O phase can be holding a transaction. One method is
+//! deliberately outside it. [`PostgresFragmentCoordinator::revalidate_push_witness`]
+//! borrows the caller's `Transaction`, because it must be atomic with that
+//! push's own publication and cannot own a second one. It performs no I/O
+//! itself, and it takes no lock class earlier than `Fragments`, so it can
+//! neither span I/O nor invert F-032-3 — but it is a borrow, and the claim
+//! above is scoped around it rather than quietly contradicted by it.
+//!
 //! # Scope as of the SCHEMA-118 window
 //!
 //! Phases 2 and 3: schema, readiness, the batched resolver, and the begin/commit
@@ -163,9 +172,16 @@ impl FragmentLifecycleReadiness {
 
     /// Whether every precondition for routing fragment decisions through this
     /// coordinator holds. Fails closed on each missing piece.
+    ///
+    /// The upper schema-version bound belongs here rather than only in
+    /// [`PostgresFragmentCoordinator::enable_lifecycle`]: a Phase 5 boot gate
+    /// will consult this method, and a cell whose schema is newer than this
+    /// binary understands must route legacy rather than interpret rows written
+    /// against a revision it predates.
     pub fn ready_for_lifecycle(&self) -> bool {
         self.provisioned
             && self.schema_version >= 1
+            && self.schema_version <= schema::FRAGMENT_SCHEMA_VERSION
             && self.backfill_state == schema::BACKFILL_CUTOVER
             && self.cutover_at_present
             && self.same_database
@@ -306,7 +322,11 @@ pub enum BeginOutcome {
     /// The fragment is already readable at a current epoch. The caller performs
     /// no I/O and no write; this is the dedup short-circuit today's `put` takes
     /// at `store/immutable_store.rs:948-950`.
-    AlreadyReadable(Box<FragmentResolution>),
+    ///
+    /// Carries the head as observed under its lock, not a resolution: a begin
+    /// call knows nothing about a repository or context, so it cannot answer
+    /// the association half of the resolution contract and must not pretend to.
+    AlreadyReadable(Box<EpochWitness>),
     /// The head is inside a deletion sequence or tombstoned, so no new
     /// representation may be published against it.
     Fenced(String),
@@ -530,21 +550,28 @@ impl PostgresFragmentCoordinator {
             .map_err(|error| DomainError::from_pg("fragment fence maximum", error))?
             .get(0);
 
-        // A readable head whose current epoch has no row, or whose manifest
-        // does not match that epoch's, is unresolvable by the resolver's join.
-        // It is not a routing question; it is damage that would silently make
+        // A READABLE head whose current epoch has no row, or whose manifest does
+        // not match that epoch's, is unresolvable by the resolver's join. It is
+        // not a routing question; it is damage that would silently make
         // fragments absent.
+        //
+        // Scoped to readable states deliberately. A `PreparingStage`,
+        // `PreparingRemote`, `Missing`, or `Tombstoned` head legitimately names
+        // a `current_epoch` with no epoch row: `begin_publication` allocates the
+        // epoch before the caller's I/O, and a first write that fails
+        // validation commits `Missing` without ever inserting one. Counting
+        // those as damage would let a single in-flight write, or one bad
+        // upload, permanently block `enable_lifecycle` and flip boot readiness
+        // on a healthy cell.
         let unresolved_rows: i64 = client
             .query_one(
                 "SELECT count(*)::bigint FROM lore_fragment_lifecycle AS l \
-                  WHERE NOT EXISTS ( \
-                        SELECT 1 FROM lore_fragment_epochs AS e \
-                         WHERE e.hash = l.hash AND e.epoch = l.current_epoch) \
-                     OR (l.state IN (3, 4) AND NOT EXISTS ( \
+                  WHERE l.state = ANY($1) \
+                    AND NOT EXISTS ( \
                         SELECT 1 FROM lore_fragment_epochs AS e \
                          WHERE e.hash = l.hash AND e.epoch = l.current_epoch \
-                           AND e.manifest_id = l.manifest_id))",
-                &[],
+                           AND e.manifest_id = l.manifest_id)",
+                &[&FragmentLifecycleState::readable_bits().as_slice()],
             )
             .await
             .map_err(|error| DomainError::from_pg("fragment unresolved readiness", error))?
@@ -633,6 +660,18 @@ impl PostgresFragmentCoordinator {
     /// `Remote` epoch, the matching manifest is complete, and no newer
     /// repository generation invalidates it.
     ///
+    /// The generation clause is `<=`, not `=`, and the difference is
+    /// load-bearing. `lore_domain_repositories.generation` advances on ordinary
+    /// repository mutations including a metadata CAS, so an equality test would
+    /// make **every** fragment in a repository `Absent` the moment anyone
+    /// changed its metadata. What the association's stored generation is for is
+    /// ordering evidence: it can never legitimately be *ahead* of the
+    /// repository, and a row that is would be a delayed write against a
+    /// repository incarnation this one has already moved past. Repository
+    /// tombstone is handled by the `r.state` clause instead, which is the
+    /// permanent fence CR-031 actually relies on, since repository identities
+    /// are never reused.
+    ///
     /// **One statement, so one snapshot.** `lore-postgres` never sets an
     /// isolation level and runs at READ COMMITTED, where a single statement
     /// sees one consistent snapshot. That is exactly the coherence the contract
@@ -678,8 +717,8 @@ impl PostgresFragmentCoordinator {
                     AND a.hash          = ANY($3) \
                     AND a.state         = $4 \
                     AND r.state         = $5 \
-                    AND a.repository_generation = r.generation \
-                    AND l.state IN (3, 4) \
+                    AND a.repository_generation <= r.generation \
+                    AND l.state = ANY($7) \
                     AND l.manifest_id = e.manifest_id \
                     AND e.disposition = $6",
                 &[
@@ -689,6 +728,7 @@ impl PostgresFragmentCoordinator {
                     &schema::ASSOCIATION_LIVE,
                     &STATE_LIVE,
                     &schema::DISPOSITION_CURRENT_ELIGIBLE,
+                    &FragmentLifecycleState::readable_bits().as_slice(),
                 ],
             )
             .await
@@ -799,7 +839,7 @@ impl PostgresFragmentCoordinator {
         // epoch key is the whole reason the predecessor's bytes stay
         // untouched and diagnosable.
         let object_key = repair_epoch_key(hash, epoch);
-        set_active_operation(&tx, hash, fence).await?;
+        stamp_operation_fence(&tx, hash, fence).await?;
         classify_commit(tx.commit().await, "repair claim commit")?;
         Ok(BeginOutcome::Admitted(Box::new(FragmentIntent {
             hash: hash.to_vec(),
@@ -878,14 +918,26 @@ impl PostgresFragmentCoordinator {
                 head.state.label()
             )));
         }
+        // Promotion allocates a NEW epoch, and must.
+        //
+        // The remote object is a different representation from the staged file:
+        // different authority, different key. `lore_fragment_epochs` rows are
+        // immutable, and the publication insert is `ON CONFLICT DO NOTHING`, so
+        // reusing the staged epoch would leave the epoch row saying
+        // `authority = Staged` with the staged path while the head said
+        // `Remote`. The resolver would then hand readers a staged path that
+        // cleanup is free to delete.
+        //
+        // The staged predecessor is quarantined by the same rule every other
+        // publication uses, which is what makes its bytes reclaimable once the
+        // reader leases over it drain.
+        let epoch = next_fence(&tx).await?;
         let fence = next_fence(&tx).await?;
-        set_active_operation(&tx, hash, fence).await?;
+        stamp_operation_fence(&tx, hash, fence).await?;
         classify_commit(tx.commit().await, "promotion begin commit")?;
         Ok(BeginOutcome::Admitted(Box::new(FragmentIntent {
             hash: hash.to_vec(),
-            // Promotion republishes the SAME epoch under a new authority; it is
-            // not a new representation, so it must not consume an epoch.
-            epoch: head.current_epoch,
+            epoch,
             fence,
             object_key: legacy_hash_key(hash),
             authority: EpochAuthority::Remote,
@@ -927,6 +979,11 @@ impl PostgresFragmentCoordinator {
             .await
             .map_err(|error| DomainError::from_pg("mark missing begin", error))?;
         let mut sequence = LockSequence::new();
+        // Planned and locked BEFORE the head, because a readable-to-Missing
+        // transition writes repository rows (position 1) and the head is
+        // position 4. See `plan_lifecycle_fanout`.
+        let fanout = plan_lifecycle_fanout(&tx, &witness.hash).await?;
+        lock_lifecycle_fanout(&tx, &mut sequence, &fanout).await?;
         let Some(head) = lock_fragment_head(&tx, &mut sequence, &witness.hash).await? else {
             return Ok(CommitVerdict::Fenced);
         };
@@ -953,7 +1010,7 @@ impl PostgresFragmentCoordinator {
         if was_readable {
             // Readable to unreadable is a lifecycle transition, so every
             // live-associated repository's scalar moves atomically with it.
-            bump_lifecycle_generation(&tx, &mut sequence, &witness.hash).await?;
+            apply_lifecycle_generation(&tx, &witness.hash, &fanout).await?;
         }
         classify_commit(tx.commit().await, "mark missing commit")?;
         Ok(CommitVerdict::Published)
@@ -1077,6 +1134,11 @@ impl PostgresFragmentCoordinator {
             .await
             .map_err(|error| DomainError::from_pg("obliterate begin", error))?;
         let mut sequence = LockSequence::new();
+        // Obliterate makes a readable head unreadable and removes every live
+        // association, so both the repository fanout and the association rows
+        // are in play. Repository rows come first (position 1).
+        let fanout = plan_lifecycle_fanout(&tx, hash).await?;
+        lock_lifecycle_fanout(&tx, &mut sequence, &fanout).await?;
         let Some(head) = lock_fragment_head(&tx, &mut sequence, hash).await? else {
             return Err(DomainError::PreconditionRejected {
                 reason: "fragment_head_absent".to_owned(),
@@ -1108,7 +1170,7 @@ impl PostgresFragmentCoordinator {
         .await
         .map_err(|error| DomainError::from_pg("obliterate state update", error))?;
         if was_readable {
-            bump_lifecycle_generation(&tx, &mut sequence, hash).await?;
+            apply_lifecycle_generation(&tx, hash, &fanout).await?;
         }
         sequence.enter(LockClass::Associations)?;
         tx.execute(
@@ -1168,10 +1230,16 @@ impl PostgresFragmentCoordinator {
             return Ok(CommitVerdict::Fenced);
         }
         let fence = next_fence(&tx).await?;
+        // `diagnostic_class` is zeroed here as well as at begin. The schema's
+        // `lore_fragment_lifecycle_diagnostic_shape` CHECK allows a nonzero
+        // class only on a `Missing` head, so relying on begin having zeroed it
+        // would make this statement take a 23514 on any path that reaches
+        // tombstone from a diagnosed head.
         tx.execute(
             "UPDATE lore_fragment_lifecycle \
                 SET state = $2, manifest_id = NULL, last_fence = $3, \
-                    active_operation = NULL, updated_at = clock_timestamp() \
+                    active_operation = NULL, diagnostic_class = 0, \
+                    updated_at = clock_timestamp() \
               WHERE hash = $1",
             &[
                 &intent.hash,
@@ -1287,7 +1355,7 @@ impl PostgresFragmentCoordinator {
         // rule). One set-based query, never a row at a time, because CR-031
         // fixes that shape for the push path.
         //
-        // This deliberately differs from `bump_lifecycle_generation`, which
+        // This deliberately differs from `lock_lifecycle_fanout`, which
         // locks its rows one at a time, and the difference is worth stating
         // because it looks like an inconsistency. Postgres does not *guarantee*
         // that `ORDER BY ... FOR UPDATE` acquires locks in the sorted order:
@@ -1367,15 +1435,21 @@ impl PostgresFragmentCoordinator {
         )
         .await
         .map_err(|error| DomainError::from_pg("staged lease insert", error))?;
-        for (hash, epoch) in members {
-            tx.execute(
-                "INSERT INTO lore_fragment_staged_lease_members (lease_id, hash, epoch) \
-                 VALUES ($1, $2, $3) ON CONFLICT (lease_id, hash) DO NOTHING",
-                &[&lease_id, &hash, &epoch],
-            )
-            .await
-            .map_err(|error| DomainError::from_pg("staged lease member insert", error))?;
-        }
+        // One round trip for the whole batch, not one per member. This is the
+        // read path: a hydration of one large asset is thousands of 256 KiB
+        // fragments, and a statement each would put the per-fragment write cost
+        // back that batching the lease exists to remove.
+        let member_hashes: Vec<Vec<u8>> = members.iter().map(|(hash, _)| hash.clone()).collect();
+        let member_epochs: Vec<i64> = members.iter().map(|(_, epoch)| *epoch).collect();
+        tx.execute(
+            "INSERT INTO lore_fragment_staged_lease_members (lease_id, hash, epoch) \
+             SELECT $1, member.hash, member.epoch \
+               FROM unnest($2::bytea[], $3::bigint[]) AS member(hash, epoch) \
+             ON CONFLICT (lease_id, hash) DO NOTHING",
+            &[&lease_id, &member_hashes, &member_epochs],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("staged lease member insert", error))?;
         classify_commit(tx.commit().await, "staged lease commit")?;
         Ok(StagedReaderLease {
             lease_id: lease_id.to_vec(),
@@ -1420,12 +1494,13 @@ impl PostgresFragmentCoordinator {
             if head.state.is_readable() {
                 // The dedup short-circuit. No epoch is consumed, no fence is
                 // issued, and the caller performs no I/O.
-                return Ok(BeginOutcome::AlreadyReadable(Box::new(
-                    FragmentResolution {
-                        hash: hash.to_vec(),
-                        verdict: FragmentVerdict::Absent,
-                    },
-                )));
+                return Ok(BeginOutcome::AlreadyReadable(Box::new(EpochWitness {
+                    hash: hash.to_vec(),
+                    epoch: head.current_epoch,
+                    state: head.state,
+                    manifest_id: head.manifest_id.clone(),
+                    fence: head.last_fence,
+                })));
             }
             if head.state.is_deleting() || head.state == FragmentLifecycleState::Tombstoned {
                 return Ok(BeginOutcome::Fenced(format!(
@@ -1488,6 +1563,12 @@ impl PostgresFragmentCoordinator {
             .await
             .map_err(|error| DomainError::from_pg("publication commit begin", error))?;
         let mut sequence = LockSequence::new();
+        // Either arm below can move the head across the readable boundary, so
+        // the repository fanout is planned and locked first regardless of which
+        // one runs. Locking a superset is safe; discovering the need after the
+        // head lock is an F-032-3 inversion.
+        let fanout = plan_lifecycle_fanout(&tx, &intent.hash).await?;
+        lock_lifecycle_fanout(&tx, &mut sequence, &fanout).await?;
         let Some(head) = lock_fragment_head(&tx, &mut sequence, &intent.hash).await? else {
             return Ok(CommitVerdict::Fenced);
         };
@@ -1521,7 +1602,7 @@ impl PostgresFragmentCoordinator {
                 .await
                 .map_err(|error| DomainError::from_pg("publication missing update", error))?;
                 if was_readable {
-                    bump_lifecycle_generation(&tx, &mut sequence, &intent.hash).await?;
+                    apply_lifecycle_generation(&tx, &intent.hash, &fanout).await?;
                 }
                 classify_commit(tx.commit().await, "publication missing commit")?;
                 return Ok(CommitVerdict::Published);
@@ -1615,7 +1696,7 @@ impl PostgresFragmentCoordinator {
 
         if !was_readable {
             // Unreadable to readable is a lifecycle transition too.
-            bump_lifecycle_generation(&tx, &mut sequence, &intent.hash).await?;
+            apply_lifecycle_generation(&tx, &intent.hash, &fanout).await?;
         }
         classify_commit(tx.commit().await, "publication commit")?;
         Ok(CommitVerdict::Published)
@@ -1688,7 +1769,17 @@ async fn next_fence(tx: &Transaction<'_>) -> Result<i64, DomainError> {
         .map(|row| row.get(0))
 }
 
-async fn set_active_operation(
+/// Stamp the head with the fence this operation was issued at, so a delayed
+/// commit can tell whether anything linearized in between.
+///
+/// It deliberately does **not** write `active_operation`. That column is
+/// CR-031's "active operation" model field and stays reserved and NULL until
+/// Phase 5 plumbs the CR-029 domain operation ID down to this layer; there is
+/// no operation identity in scope here to put in it, and writing the fence
+/// there would make a diagnostic column lie about what it holds. The naming is
+/// deliberate — an earlier `set_active_operation` name claimed a write this
+/// function never made.
+async fn stamp_operation_fence(
     tx: &Transaction<'_>,
     hash: &[u8],
     fence: i64,
@@ -1699,7 +1790,7 @@ async fn set_active_operation(
         &[&hash, &fence],
     )
     .await
-    .map_err(|error| DomainError::from_pg("fragment active operation", error))?;
+    .map_err(|error| DomainError::from_pg("fragment operation fence stamp", error))?;
     Ok(())
 }
 
@@ -1735,26 +1826,24 @@ async fn bump_association_generation(
     Ok(())
 }
 
-/// Move the lifecycle scalar for **every** repository with a live association
-/// to this hash, atomically and in sorted repository order.
+/// Read, without locking, the repositories a readable/unreadable transition on
+/// this hash would have to visit, and bound the set before anything is taken.
 ///
-/// Three separate requirements are met here and each one matters:
+/// **This must run before the head is locked.** A lifecycle transition updates
+/// `lore_domain_repositories`, which is `LockClass::Repository` (position 1),
+/// while the head is `LockClass::Fragments` (position 4). Discovering the fanout
+/// after taking the head and then reaching back for repository rows is an
+/// F-032-3 inversion — and `LockSequence::enter` rejects it, so the whole
+/// transition fails rather than deadlocking. Either way the fanout has to be
+/// planned first.
 ///
-/// - **Measured before mutated.** The fanout set is read and counted first, and
-///   a set above [`MAX_LIFECYCLE_GENERATION_FANOUT`] fails admission rather
-///   than taking an unbounded row-lock set inside one transaction.
-/// - **Sorted order.** Rows are locked one at a time in ascending repository
-///   order rather than by a set-based `UPDATE ... WHERE id IN (...)`, whose
-///   lock acquisition order Postgres does not fix. Two transitions over an
-///   overlapping fanout therefore acquire the overlap in the same sequence.
-/// - **All or nothing.** The update is one statement over the already-locked
-///   set inside the caller's transaction, so a partial fanout is not
-///   representable.
-async fn bump_lifecycle_generation(
+/// The count check is CR-031's explicit admission bound: a set above
+/// [`MAX_LIFECYCLE_GENERATION_FANOUT`] fails **before** any row is locked,
+/// rather than taking an unbounded row-lock set inside one transaction.
+async fn plan_lifecycle_fanout(
     tx: &Transaction<'_>,
-    sequence: &mut LockSequence,
     hash: &[u8],
-) -> Result<(), DomainError> {
+) -> Result<Vec<Vec<u8>>, DomainError> {
     let rows = tx
         .query(
             "SELECT repository_id FROM lore_fragment_associations \
@@ -1763,17 +1852,27 @@ async fn bump_lifecycle_generation(
         )
         .await
         .map_err(|error| DomainError::from_pg("lifecycle fanout measure", error))?;
-    if rows.is_empty() {
-        return Ok(());
-    }
     if rows.len() > MAX_LIFECYCLE_GENERATION_FANOUT {
         return Err(DomainError::PreconditionRejected {
             reason: "lifecycle_generation_fanout_limit".to_owned(),
             reason_version: 1,
         });
     }
-    let repositories: Vec<Vec<u8>> = rows.iter().map(|row| row.get("repository_id")).collect();
-    for repository_id in &repositories {
+    Ok(rows.iter().map(|row| row.get("repository_id")).collect())
+}
+
+/// Lock the planned fanout's repository rows, in ascending repository order.
+///
+/// One row at a time rather than a set-based statement, because Postgres does
+/// not fix the lock acquisition order of `UPDATE ... WHERE id = ANY(...)`, and
+/// two transitions over an overlapping fanout must meet the overlap in the same
+/// sequence.
+async fn lock_lifecycle_fanout(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    repositories: &[Vec<u8>],
+) -> Result<(), DomainError> {
+    for repository_id in repositories {
         sequence.enter(LockClass::Repository)?;
         tx.execute(
             "SELECT 1 FROM lore_domain_repositories WHERE repository_id = $1 FOR UPDATE",
@@ -1782,11 +1881,45 @@ async fn bump_lifecycle_generation(
         .await
         .map_err(|error| DomainError::from_pg("lifecycle fanout repository lock", error))?;
     }
+    Ok(())
+}
+
+/// Move the lifecycle scalar for every repository in the planned fanout,
+/// atomically, after confirming the set did not grow.
+///
+/// The set is re-read under the head lock. It cannot grow from here —
+/// `create_association` takes the repository row, then the head, then the
+/// association row, so while this transaction holds the head no new association
+/// can be inserted for this hash. It *can* have grown between
+/// [`plan_lifecycle_fanout`] and the head lock, and a repository that appeared
+/// in that window is one this transaction never locked. Committing anyway would
+/// be exactly the partial fanout CR-031 forbids, so it returns retryable
+/// [`DomainError::Contention`] and the next attempt plans the larger set.
+///
+/// The update itself is one statement over the already-locked set inside the
+/// caller's transaction, so a partial fanout is not representable.
+async fn apply_lifecycle_generation(
+    tx: &Transaction<'_>,
+    hash: &[u8],
+    locked: &[Vec<u8>],
+) -> Result<(), DomainError> {
+    let current = plan_lifecycle_fanout(tx, hash).await?;
+    if current.is_empty() {
+        return Ok(());
+    }
+    if current.iter().any(|id| !locked.contains(id)) {
+        return Err(DomainError::Contention(format!(
+            "the live-association fanout for this fragment grew from {} to {} repositories \
+             between planning and the head lock; retrying plans the larger set",
+            locked.len(),
+            current.len()
+        )));
+    }
     tx.execute(
         "UPDATE lore_domain_repositories \
             SET fragment_lifecycle_generation = fragment_lifecycle_generation + 1 \
           WHERE repository_id = ANY($1)",
-        &[&repositories],
+        &[&current],
     )
     .await
     .map_err(|error| DomainError::from_pg("lifecycle generation bump", error))?;
@@ -2021,6 +2154,44 @@ mod tests {
     fn a_fenced_commit_verdict_is_not_a_publication() {
         assert!(CommitVerdict::Published.published());
         assert!(!CommitVerdict::Fenced.published());
+    }
+
+    #[test]
+    fn a_transition_locks_repository_rows_before_the_head() {
+        // The shape every transition path uses: plan the fanout unlocked, lock
+        // those repository rows (position 1), then the head (position 4), then
+        // associations (position 5).
+        let mut sequence = LockSequence::new();
+        sequence
+            .enter(LockClass::Repository)
+            .expect("fanout repository row");
+        sequence
+            .enter(LockClass::Repository)
+            .expect("a second fanout repository row");
+        sequence
+            .enter(LockClass::Fragments)
+            .expect("the lifecycle head");
+        sequence
+            .enter(LockClass::Associations)
+            .expect("association rows");
+    }
+
+    #[test]
+    fn reaching_back_for_a_repository_row_after_the_head_is_refused() {
+        // This is the inversion the first cut of this file shipped: the head
+        // was locked, and only then did the fanout reach for repository rows.
+        // `LockSequence` rejects it, so it did not deadlock — it failed every
+        // readable/unreadable transition on any fragment with a live
+        // association, which is every one that matters. Pinned here because it
+        // is invisible without a fanout, and cheap to reintroduce.
+        let mut sequence = LockSequence::new();
+        sequence
+            .enter(LockClass::Fragments)
+            .expect("the lifecycle head");
+        let error = sequence
+            .enter(LockClass::Repository)
+            .expect_err("a repository row after the head must be refused");
+        assert!(matches!(error, DomainError::Internal(_)));
     }
 
     #[test]
