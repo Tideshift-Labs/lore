@@ -9,17 +9,24 @@
 //! no filesystem or network I/O. What it owns is the algebra CR-033 D4 requires around a send:
 //!
 //! - **One boundary.** Every attempt names a [`ProviderTarget`], and the cell's configured
-//!   [`CellProviderBoundary`] must match its bucket, region, and endpoint host exactly. There is no
-//!   fallback route and no second bucket, so no attempt and no object byte can be addressed outside
-//!   the cell's region on any drain, repair, read, fallback, or operator path.
+//!   [`CellProviderBoundary`] must match its bucket, region, and endpoint host exactly, on every
+//!   drain, repair, read, fallback, and operator path alike. There is no fallback route and no
+//!   second bucket. The check bounds what this client *authorizes*: a transport that ignored
+//!   [`AuthorizedProviderAttempt::target`] and addressed something else would still escape, so
+//!   CD-6 owes a client built against the cell's one fixed endpoint, and that remains its
+//!   obligation rather than something proved here.
 //! - **Charge before send.** [`GovernedProviderClient::execute`] charges the CD-4 authority first
 //!   and only then constructs an [`AuthorizedProviderAttempt`]. That permit is the sole input to
 //!   [`ProviderTransport::issue`] and cannot be constructed outside this crate, so a transport can
 //!   never be handed an attempt that was not charged.
 //! - **One authorized attempt per grant.** A transport reports how many provider requests it
-//!   issued. Anything other than one is a fail-closed error, which is how "the SDK's automatic
-//!   retry is disabled" is enforced rather than merely declared: a retrying transport reports more
-//!   requests than it was granted and poisons the ledger instead of escaping authority.
+//!   issued, and anything other than one is a fail-closed error. This bounds what a transport may
+//!   do *and admit to*; it is not, on its own, proof that the SDK's automatic retry is off, because
+//!   a retry inside the SDK happens below the transport's one call and would be reported honestly
+//!   as one. Disabling automatic retry is CD-6's construction obligation on the real client, and
+//!   [`ProviderRetryPolicy`] is the declaration it must be built from. What this side can prove is
+//!   narrower and still worth having: a transport cannot issue several requests under one grant and
+//!   report them without closing the ledger.
 //! - **No refund.** [`ProviderAttemptLedger`] has no refund path at all. A committed grant that
 //!   never reached the provider stays charged, which is the valid, nonrefundable
 //!   grant-without-attempt window; conservative charging explicitly does not claim exact-once.
@@ -38,6 +45,14 @@
 //! module authorizes no provider traffic. The budget pin a request carries is passed through
 //! opaquely and only checked for shape and for exact echo by the grant; CD-5 does not resolve it,
 //! because resolving it is CD-4's obligation against WP-121's unpublished per-cell envelope.
+//!
+//! One CD-5 obligation is met differently from the way WP-114 words it, and the difference is
+//! deliberate. CD-5 says to charge every attempt class "including SDK-level retries". This kernel
+//! instead makes an SDK-level retry a contract violation: one grant authorizes exactly one request,
+//! and a transport that admits to more closes the ledger. Charging a retry the caller cannot
+//! enumerate in advance would need the charge to happen after the send, which is the opposite of
+//! charge-before-send. CD-6 must therefore build its client with retry disabled and re-enter this
+//! kernel for each attempt, rather than retrying inside one.
 
 use std::fmt;
 
@@ -342,7 +357,20 @@ fn validate_bucket_name(value: &str) -> Result<(), ProviderClientError> {
     {
         return Err(ProviderClientError::InvalidBucketName);
     }
+    // S3-compatible providers reject an IPv4-shaped bucket name, because it is ambiguous with a
+    // path-style endpoint address, and reject the `xn--` punycode prefix.
+    if value.starts_with("xn--") || is_ipv4_shaped(value) {
+        return Err(ProviderClientError::InvalidBucketName);
+    }
     Ok(())
+}
+
+fn is_ipv4_shaped(value: &str) -> bool {
+    let labels: Vec<&str> = value.split('.').collect();
+    labels.len() == 4
+        && labels
+            .iter()
+            .all(|label| !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn validate_region(value: &str) -> Result<(), ProviderClientError> {
@@ -365,10 +393,10 @@ fn validate_endpoint_host(value: &str) -> Result<(), ProviderClientError> {
     if bytes.is_empty() || bytes.len() > 253 {
         return Err(ProviderClientError::InvalidEndpointHost);
     }
+    // A single-label host is accepted. A dotted name is not the boundary control here: the exact
+    // bucket, region, and host match is, and requiring a dot would make the local container and
+    // loopback hosts a later tier needs unexpressible without loosening this validator then.
     let labels: Vec<&str> = value.split('.').collect();
-    if labels.len() < 2 {
-        return Err(ProviderClientError::InvalidEndpointHost);
-    }
     for label in labels {
         let label = label.as_bytes();
         if label.is_empty()
@@ -467,6 +495,11 @@ impl PutObjectPlan {
     }
 
     /// Byte range of the 1-based `part_number`, or `None` outside the plan.
+    ///
+    /// The variants' fields are public so callers can match on a plan, which means a hand-built
+    /// plan need not be one [`plan_put_object`] would mint. The arithmetic here is therefore
+    /// checked and answers `None` for a plan whose own numbers do not fit, rather than trusting
+    /// them.
     pub const fn part_range(self, part_number: u32) -> Option<(u64, u64)> {
         match self {
             Self::SingleShot { .. } => None,
@@ -479,13 +512,19 @@ impl PutObjectPlan {
                 if part_number == 0 || part_number > part_count {
                     return None;
                 }
-                let offset = (part_number as u64 - 1) * part_size_bytes;
+                let offset = match (part_number as u64 - 1).checked_mul(part_size_bytes) {
+                    Some(offset) => offset,
+                    None => return None,
+                };
                 let length = if part_number == part_count {
                     final_part_size_bytes
                 } else {
                     part_size_bytes
                 };
-                Some((offset, length))
+                match offset.checked_add(length) {
+                    Some(_) => Some((offset, length)),
+                    None => None,
+                }
             }
         }
     }
@@ -1036,7 +1075,13 @@ impl ProviderAttemptLedger {
         if let Some(error) = self.poisoned {
             return Err(error);
         }
-        if self.no_dispatch_count != 0 || self.decisive_terminal_count != 0 {
+        // A no-dispatch proof asserts that nothing reached the provider, so an issued attempt
+        // forbids it even when that attempt's outcome was ambiguous. A committed grant does not:
+        // a charge that never reached the wire is exactly the case a no-dispatch proof records.
+        if self.no_dispatch_count != 0
+            || self.decisive_terminal_count != 0
+            || self.attempt_count != 0
+        {
             return Err(ProviderClientError::NoDispatchNotPermitted);
         }
         self.no_dispatch_count = 1;
@@ -1047,6 +1092,19 @@ impl ProviderAttemptLedger {
     pub fn audit(&self) -> Result<ObjectStoreProviderAttemptAudit, ProviderClientError> {
         if let Some(error) = self.poisoned {
             return Err(error);
+        }
+        // The frozen encoder in `compaction::audit_fields` is the authority on this algebra. It is
+        // restated here so no reachable ledger state can hand it a record it would reject: a
+        // transition this crate later gets wrong fails here, at the ledger, instead of at a
+        // compact receipt far downstream. `provider_authority_refunded` is absent because there is
+        // no refund path, and false is the only value the encoder accepts.
+        if self.no_dispatch_count > 1
+            || self.attempt_count > self.committed_grant_count
+            || self.decisive_terminal_count > self.attempt_count
+            || self.ambiguous_count > self.attempt_count
+            || (self.no_dispatch_count == 1 && self.decisive_terminal_count != 0)
+        {
+            return Err(ProviderClientError::LedgerAlgebraViolation);
         }
         Ok(ObjectStoreProviderAttemptAudit {
             attempt_count: self.attempt_count,
@@ -1066,20 +1124,46 @@ impl ProviderAttemptLedger {
         error
     }
 
+    // A counter that cannot be advanced leaves the ledger understating a charge or an attempt, so
+    // every increment closes the ledger on overflow rather than returning a recoverable error.
     fn record_committed_grant(&mut self) -> Result<(), ProviderClientError> {
-        self.committed_grant_count = self
-            .committed_grant_count
-            .checked_add(1)
-            .ok_or(ProviderClientError::LedgerOverflow)?;
-        Ok(())
+        match self.committed_grant_count.checked_add(1) {
+            Some(next) => {
+                self.committed_grant_count = next;
+                Ok(())
+            }
+            None => Err(self.poison(ProviderClientError::LedgerOverflow)),
+        }
     }
 
     fn record_issued_attempt(&mut self) -> Result<(), ProviderClientError> {
-        self.attempt_count = self
-            .attempt_count
-            .checked_add(1)
-            .ok_or(ProviderClientError::LedgerOverflow)?;
-        Ok(())
+        match self.attempt_count.checked_add(1) {
+            Some(next) => {
+                self.attempt_count = next;
+                Ok(())
+            }
+            None => Err(self.poison(ProviderClientError::LedgerOverflow)),
+        }
+    }
+
+    fn record_decisive_terminal(&mut self) -> Result<(), ProviderClientError> {
+        match self.decisive_terminal_count.checked_add(1) {
+            Some(next) => {
+                self.decisive_terminal_count = next;
+                Ok(())
+            }
+            None => Err(self.poison(ProviderClientError::LedgerOverflow)),
+        }
+    }
+
+    fn record_ambiguous(&mut self) -> Result<(), ProviderClientError> {
+        match self.ambiguous_count.checked_add(1) {
+            Some(next) => {
+                self.ambiguous_count = next;
+                Ok(())
+            }
+            None => Err(self.poison(ProviderClientError::LedgerOverflow)),
+        }
     }
 }
 
@@ -1138,6 +1222,12 @@ where
         if let Some(error) = ledger.poisoned() {
             return Err(error);
         }
+        // A recorded no-dispatch proof asserts the request resolved without reaching the provider.
+        // Dispatching afterwards would contradict a durable claim, and the resulting counters are a
+        // record the frozen audit encoder rejects, so the ledger closes instead.
+        if ledger.no_dispatch_count() != 0 {
+            return Err(ledger.poison(ProviderClientError::DispatchAfterNoDispatch));
+        }
         let charge_request = self.authorize(request)?;
 
         let grant = match self.charge_authority.charge(&charge_request) {
@@ -1170,18 +1260,8 @@ where
             1 => {
                 ledger.record_issued_attempt()?;
                 match report.outcome {
-                    ProviderAttemptOutcome::Decisive => {
-                        ledger.decisive_terminal_count = ledger
-                            .decisive_terminal_count
-                            .checked_add(1)
-                            .ok_or(ProviderClientError::LedgerOverflow)?;
-                    }
-                    ProviderAttemptOutcome::Ambiguous => {
-                        ledger.ambiguous_count = ledger
-                            .ambiguous_count
-                            .checked_add(1)
-                            .ok_or(ProviderClientError::LedgerOverflow)?;
-                    }
+                    ProviderAttemptOutcome::Decisive => ledger.record_decisive_terminal()?,
+                    ProviderAttemptOutcome::Ambiguous => ledger.record_ambiguous()?,
                 }
                 Ok(report.outcome)
             }
@@ -1270,6 +1350,11 @@ where
                 if end > body.size {
                     return Err(ProviderClientError::InvalidPutPart);
                 }
+                // Only the part that ends the body may be short. Whether a part is final is
+                // derivable from the range alone, so the plan does not have to be threaded here.
+                if end < body.size && part.length < PROVIDER_MIN_PART_SIZE_BYTES {
+                    return Err(ProviderClientError::InvalidPutPart);
+                }
             }
             _ => return Err(ProviderClientError::PutBodyNotPermitted),
         }
@@ -1288,8 +1373,28 @@ impl<C, T> fmt::Debug for GovernedProviderClient<C, T> {
     }
 }
 
+/// Validates the shape of WP-121's budget-configuration revision.
+///
+/// This is narrower than the crate's general canonical identifier: a revision is a flat token, so
+/// `/` and `:` are excluded and the length is capped well below the general 256-byte bound. CD-4
+/// must confirm the charset against WP-121's actual revision spelling when the per-cell envelope is
+/// published; narrowing here is the fail-closed direction to guess in, but it is still a guess.
+fn validate_budget_revision(value: &str) -> Result<(), ProviderClientError> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 128
+        || !bytes[0].is_ascii_alphanumeric()
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(ProviderClientError::InvalidBudgetPin);
+    }
+    Ok(())
+}
+
 fn validate_budget_pin(pin: &BudgetPin) -> Result<(), ProviderClientError> {
-    validate_canonical_id(&pin.revision).map_err(|_| ProviderClientError::InvalidBudgetPin)?;
+    validate_budget_revision(&pin.revision)?;
     if pin.fence == 0 {
         return Err(ProviderClientError::InvalidBudgetPin);
     }
@@ -1380,8 +1485,14 @@ pub enum ProviderClientError {
     TransportReportInconsistent,
     #[error("cell provider transport issued more requests than were charged")]
     TransportIssuedUnauthorizedRequests,
-    #[error("provider attempt ledger already recorded a no-dispatch or decisive terminal")]
+    #[error(
+        "provider attempt ledger already recorded a no-dispatch, attempt, or decisive terminal"
+    )]
     NoDispatchNotPermitted,
+    #[error("provider attempt may not be dispatched after a no-dispatch proof was recorded")]
+    DispatchAfterNoDispatch,
+    #[error("provider attempt ledger counters violate the retained audit algebra")]
+    LedgerAlgebraViolation,
     #[error("provider attempt ledger counter overflowed")]
     LedgerOverflow,
 }

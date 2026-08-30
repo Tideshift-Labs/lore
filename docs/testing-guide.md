@@ -208,10 +208,16 @@ will update an older check constraint or state schema.
   fill in the per-variant `format!("{e}")`/`{e:?}` redaction assertions once the enum lands.
   WP-114 CD-5's provider client (`provider_client.rs`): `AuthorizedProviderAttempt` is
   crate-private-constructed, and a transport reporting `provider_requests_issued != 1` poisons the
-  ledger (this, not a declared retry policy, enforces disabled SDK auto-retry). Double pattern: one
-  generic closure-scripted double per trait, `new` returning `(Self, Rc<Cell<u32>>)` — the double
-  moves into the client, so the counter handle must outlive it. Gate:
-  `cargo test -p lore-object-dispatch --test provider_client -j 4` (53 tests, no `#[ignore]`).
+  ledger. That bounds what a transport may issue *and admit to*; it does not prove SDK auto-retry is
+  off, because an SDK retry happens below the one call and reports one honestly. Disabling it is
+  CD-6's construction obligation, and `ProviderRetryPolicy` is only the declaration. `record_no_dispatch`
+  refuses after any issued attempt regardless of outcome (decisive or ambiguous) — a hand-listed
+  audit-mirroring test missed the ambiguous case; generate such state matrices by driving the real
+  API, not by hand. `validate_endpoint_host` accepts a single-label host (`minio`, `localhost`).
+  Double pattern: one generic closure-scripted double per trait, `new` returning
+  `(Self, Rc<Cell<u32>>)` — the double moves into the client, so the counter handle must outlive
+  it. Gate: `cargo test -p lore-object-dispatch --test provider_client -j 4` (60 tests, no
+  `#[ignore]`).
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

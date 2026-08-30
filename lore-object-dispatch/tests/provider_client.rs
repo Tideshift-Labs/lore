@@ -145,6 +145,24 @@ fn durable_put_body() -> DurableProviderPutBody {
     bind_durable_put_body(&spool_layout(), &key, &ledger).expect("durable put body must bind")
 }
 
+/// A durable put body bound to the default logical/attempt/boundary identity, but with `size` set
+/// to whatever the caller needs -- used where a test needs a body large enough to host a
+/// multi-megabyte non-final part, unlike the crate-wide `DURABLE_BODY_SIZE` fixture.
+fn durable_put_body_of_size(size: u64) -> DurableProviderPutBody {
+    let key = put_spool_key(&logical_request_id(), &attempt_id());
+    let opaque_handle = spool_layout()
+        .derive_paths(&key)
+        .expect("derive paths for a valid key")
+        .opaque_handle()
+        .to_string();
+    let ledger = LedgerSpoolView::Ready {
+        opaque_handle,
+        size,
+        blake3: DURABLE_BODY_BLAKE3,
+    };
+    bind_durable_put_body(&spool_layout(), &key, &ledger).expect("durable put body must bind")
+}
+
 fn base_request(attempt_class: ProviderAttemptClass) -> ProviderAttemptRequest {
     ProviderAttemptRequest {
         traffic_class: ProviderTrafficClass::Drain,
@@ -340,7 +358,7 @@ fn cell_provider_boundary_accepts_a_realistic_do_spaces_configuration() {
 #[test]
 fn cell_provider_boundary_rejects_every_invalid_bucket_shape() {
     let too_long = "a".repeat(64);
-    let cases: [(&str, &str); 11] = [
+    let cases: [(&str, &str); 13] = [
         ("ab", "shorter than 3 bytes"),
         (too_long.as_str(), "longer than 63 bytes"),
         ("Commit0-cell", "uppercase"),
@@ -352,6 +370,8 @@ fn cell_provider_boundary_rejects_every_invalid_bucket_shape() {
         ("commit0..cell", "double dot"),
         ("commit0.-cell", "dot-dash"),
         ("commit0-.cell", "dash-dot"),
+        ("192.168.0.1", "ipv4-shaped"),
+        ("xn--commit0-cell", "xn-- punycode prefix"),
     ];
 
     for (bucket, label) in cases {
@@ -389,8 +409,10 @@ fn cell_provider_boundary_rejects_every_invalid_endpoint_host_shape() {
     let over_253_host = vec!["aa"; 85].join(".");
     assert!(over_253_host.len() > 253, "fixture must exceed 253 bytes");
 
-    let cases: [(&str, &str); 7] = [
-        ("nyc3only", "one label only"),
+    // A single-label host is no longer in this rejects list: the dot requirement is gone, and a
+    // single-label host is covered positively by
+    // `cell_provider_boundary_accepts_a_single_label_endpoint_host`.
+    let cases: [(&str, &str); 6] = [
         ("nyc3..example.com", "empty label"),
         (long_label_host.as_str(), "over-long label"),
         ("-nyc3.example.com", "leading-dash label"),
@@ -406,6 +428,25 @@ fn cell_provider_boundary_rejects_every_invalid_endpoint_host_shape() {
             "case: {label}"
         );
     }
+}
+
+#[test]
+fn cell_provider_boundary_accepts_a_single_label_endpoint_host() {
+    let boundary = CellProviderBoundary::new(BOUNDARY_ID, BUCKET, REGION, "minio")
+        .expect("single-label host must validate");
+    assert_eq!(boundary.target().endpoint_host, "minio");
+
+    // A single-label host must still be exact-matched by validate_target: the configured host
+    // matches, and a different single-label host does not.
+    let matching = boundary.target().clone();
+    assert!(boundary.validate_target(&matching).is_ok());
+
+    let mut mismatched = boundary.target().clone();
+    mismatched.endpoint_host = "other".to_string();
+    assert_eq!(
+        boundary.validate_target(&mismatched),
+        Err(ProviderClientError::EndpointOutsideCellRegion)
+    );
 }
 
 #[test]
@@ -690,6 +731,44 @@ fn plan_put_object_rejects_limits_outside_the_supported_range() {
     );
 }
 
+/// `part_range`'s variants are public, so a caller can hand it a `Multipart` plan `plan_put_object`
+/// would never mint. Its own arithmetic must be checked rather than trusted, and answer `None`
+/// for a plan whose own numbers do not fit -- not panic or silently wrap.
+#[test]
+fn part_range_returns_none_when_a_hand_built_plans_offset_multiplication_overflows() {
+    let plan = PutObjectPlan::Multipart {
+        body_size: u64::MAX,
+        part_size_bytes: u64::MAX,
+        part_count: 3,
+        final_part_size_bytes: 1,
+    };
+
+    // part_number=3: offset = (3 - 1).checked_mul(u64::MAX) overflows outright.
+    assert_eq!(plan.part_range(3), None);
+}
+
+#[test]
+fn part_range_returns_none_when_offset_plus_length_overflows() {
+    let plan = PutObjectPlan::Multipart {
+        body_size: u64::MAX,
+        part_size_bytes: u64::MAX / 2,
+        part_count: 2,
+        final_part_size_bytes: u64::MAX,
+    };
+
+    // part_number=2 is the final part: offset = (2 - 1) * (u64::MAX / 2) fits, but
+    // offset.checked_add(final_part_size_bytes) then overflows.
+    assert_eq!(plan.part_range(2), None);
+}
+
+#[test]
+fn part_range_well_formed_plans_from_plan_put_object_are_unaffected_by_the_checked_arithmetic() {
+    let limits = put_limits();
+    let body_size = limits.part_size_bytes * 4;
+    let plan = plan_put_object(body_size, &limits).expect("must plan");
+    assert_ranges_tile(plan, body_size);
+}
+
 // ---------------------------------------------------------------------------------------------
 // 4. bind_durable_put_body
 // ---------------------------------------------------------------------------------------------
@@ -887,6 +966,58 @@ fn authorize_requires_a_canonical_nonzero_budget_pin() {
     );
 }
 
+/// Budget-pin revisions go through a narrower validator than the crate's general canonical
+/// identifier: `/` and `:` are excluded, the cap is 128 bytes (not 256), and the first byte must
+/// be ASCII alphanumeric.
+#[test]
+fn authorize_rejects_budget_pin_revisions_outside_the_narrow_charset() {
+    let client = client_with(
+        ProviderCapabilities::none(),
+        UnwiredChargeAuthority,
+        UnwiredProviderTransport,
+    );
+
+    let mut with_slash = attempt_request_for(ProviderAttemptClass::Readiness);
+    with_slash.budget_pin.revision = "wp121/rev.7".to_string();
+    assert_eq!(
+        client.authorize(&with_slash),
+        Err(ProviderClientError::InvalidBudgetPin)
+    );
+
+    let mut with_colon = attempt_request_for(ProviderAttemptClass::Readiness);
+    with_colon.budget_pin.revision = "wp121:rev.7".to_string();
+    assert_eq!(
+        client.authorize(&with_colon),
+        Err(ProviderClientError::InvalidBudgetPin)
+    );
+
+    let mut over_length = attempt_request_for(ProviderAttemptClass::Readiness);
+    over_length.budget_pin.revision = "a".repeat(129);
+    assert_eq!(
+        client.authorize(&over_length),
+        Err(ProviderClientError::InvalidBudgetPin)
+    );
+
+    let mut leading_dash = attempt_request_for(ProviderAttemptClass::Readiness);
+    leading_dash.budget_pin.revision = "-wp121".to_string();
+    assert_eq!(
+        client.authorize(&leading_dash),
+        Err(ProviderClientError::InvalidBudgetPin)
+    );
+
+    let mut leading_dot = attempt_request_for(ProviderAttemptClass::Readiness);
+    leading_dot.budget_pin.revision = ".wp121".to_string();
+    assert_eq!(
+        client.authorize(&leading_dot),
+        Err(ProviderClientError::InvalidBudgetPin)
+    );
+
+    // Exactly 128 bytes is accepted; the cap is inclusive.
+    let mut at_the_128_byte_boundary = attempt_request_for(ProviderAttemptClass::Readiness);
+    at_the_128_byte_boundary.budget_pin.revision = "a".repeat(128);
+    assert!(client.authorize(&at_the_128_byte_boundary).is_ok());
+}
+
 #[test]
 fn authorize_enforces_body_presence_across_every_attempt_class() {
     let client = client_with(
@@ -1031,6 +1162,63 @@ fn authorize_validates_the_upload_part_range_against_its_body() {
         length: body_size,
     });
     assert!(client.authorize(&exact_end).is_ok());
+}
+
+/// A part is non-final exactly when `offset + length < body.size`. Only a non-final part is held
+/// to the provider's minimum part size; the final part (ending exactly at `body.size`) may be any
+/// positive length.
+#[test]
+fn authorize_requires_the_provider_minimum_for_a_non_final_upload_part_but_not_the_final_one() {
+    let client = client_with(
+        ProviderCapabilities::none(),
+        UnwiredChargeAuthority,
+        UnwiredProviderTransport,
+    );
+    // Large enough to host a non-final part right up to (and one byte short of) the provider
+    // minimum, with room left for a genuinely final byte after it.
+    let body_size = PROVIDER_MIN_PART_SIZE_BYTES * 2;
+    let body = durable_put_body_of_size(body_size);
+
+    let mut base = base_request(ProviderAttemptClass::UploadPart);
+    base.put_body = Some(body);
+
+    let mut one_byte_non_final = base.clone();
+    one_byte_non_final.put_part = Some(ProviderPutPart {
+        part_number: 1,
+        offset: 0,
+        length: 1,
+    });
+    assert_eq!(
+        client.authorize(&one_byte_non_final),
+        Err(ProviderClientError::InvalidPutPart)
+    );
+
+    let mut just_under_min_non_final = base.clone();
+    just_under_min_non_final.put_part = Some(ProviderPutPart {
+        part_number: 1,
+        offset: 0,
+        length: PROVIDER_MIN_PART_SIZE_BYTES - 1,
+    });
+    assert_eq!(
+        client.authorize(&just_under_min_non_final),
+        Err(ProviderClientError::InvalidPutPart)
+    );
+
+    let mut exactly_min_non_final = base.clone();
+    exactly_min_non_final.put_part = Some(ProviderPutPart {
+        part_number: 1,
+        offset: 0,
+        length: PROVIDER_MIN_PART_SIZE_BYTES,
+    });
+    assert!(client.authorize(&exactly_min_non_final).is_ok());
+
+    let mut one_byte_final = base;
+    one_byte_final.put_part = Some(ProviderPutPart {
+        part_number: 2,
+        offset: body_size - 1,
+        length: 1,
+    });
+    assert!(client.authorize(&one_byte_final).is_ok());
 }
 
 #[test]
@@ -1575,15 +1763,18 @@ fn execute_hands_the_transport_the_exact_authorized_permit() {
 // 8. ProviderRetryPolicy
 // ---------------------------------------------------------------------------------------------
 
-#[test]
-fn retry_policy_disabled_allows_exactly_one_attempt() {
-    // ProviderRetryPolicy has exactly one inhabitant, so this pins the *declaration* that
-    // automatic retry is disabled. Section 7's `provider_requests_issued` cases (see
-    // `execute_poisons_when_transport_issues_more_requests_than_authorized`) pin the
-    // *enforcement* of that declaration against a transport that retries anyway -- a declaration
-    // alone is not observable from this side of the seam.
-    assert_eq!(ProviderRetryPolicy::disabled().max_attempts(), 1);
-}
+// `ProviderRetryPolicy` has exactly one inhabitant -- the private-tuple-constructed
+// `ProviderRetryPolicy(())`, reachable only through `disabled()`, whose `max_attempts()` always
+// returns the const `1`. There is nothing behavioral to assert about a single-inhabitant type
+// beyond restating its own body, so no test asserts `max_attempts() == 1` here.
+//
+// The actual enforcement this type documents is narrower than "SDK retry is off": a transport
+// whose `provider_requests_issued` is anything but exactly `1` closes the ledger, regardless of
+// whether the extra requests came from an SDK-internal retry or the transport simply misreporting.
+// See the module header's corrected wording, and Section 7's
+// `execute_poisons_when_transport_issues_more_requests_than_authorized` and
+// `execute_poisons_when_transport_reports_success_with_zero_requests_issued` for the tests that
+// actually exercise this contract.
 
 // ---------------------------------------------------------------------------------------------
 // 9. ProviderAttemptLedger::record_no_dispatch and audit
@@ -1603,25 +1794,114 @@ fn record_no_dispatch_succeeds_once_then_refuses_a_second_call() {
     assert_eq!(ledger.no_dispatch_count(), 1);
 }
 
+/// The exact fail-open the reviewer found: a no-dispatch proof asserts nothing reached the
+/// provider, so ANY issued attempt forbids it -- including one whose outcome was merely
+/// `Ambiguous` rather than a decisive terminal. Recording a no-dispatch after an ambiguous attempt
+/// would let the audit claim a dispatched request never dispatched.
 #[test]
-fn record_no_dispatch_refuses_after_a_decisive_terminal() {
+fn record_no_dispatch_refuses_after_any_issued_attempt_decisive_or_ambiguous() {
+    for outcome in [
+        ProviderAttemptOutcome::Decisive,
+        ProviderAttemptOutcome::Ambiguous,
+    ] {
+        let (charge_authority, _charge_calls) =
+            ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+        let (transport, _transport_calls) = ScriptedTransport::new(move |_attempt| {
+            Ok(ProviderAttemptReport {
+                outcome,
+                provider_requests_issued: 1,
+            })
+        });
+        let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+        let mut ledger = ProviderAttemptLedger::new();
+        client
+            .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+            .unwrap_or_else(|error| panic!("{outcome:?} attempt must succeed: {error}"));
+
+        assert_eq!(
+            ledger.record_no_dispatch(&no_dispatch_proof()),
+            Err(ProviderClientError::NoDispatchNotPermitted),
+            "case: {outcome:?}"
+        );
+        assert_eq!(ledger.no_dispatch_count(), 0, "case: {outcome:?}");
+    }
+}
+
+/// A committed grant that never reached the wire is exactly the case a no-dispatch proof records
+/// -- unlike an issued attempt, it must not forbid recording one.
+#[test]
+fn record_no_dispatch_is_still_allowed_after_a_committed_grant_that_never_reached_the_wire() {
     let (charge_authority, _charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
-    let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
+    let client = client_with(
+        ProviderCapabilities::none(),
+        charge_authority,
+        UnwiredProviderTransport,
+    );
+    let mut ledger = ProviderAttemptLedger::new();
+
+    let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    assert_eq!(
+        outcome,
+        Err(ProviderClientError::TransportRefused(
+            ProviderTransportRefusal::Unwired
+        ))
+    );
+    assert_eq!(ledger.committed_grant_count(), 1);
+    assert_eq!(ledger.attempt_count(), 0);
+    assert_eq!(ledger.poisoned(), None);
+
+    ledger
+        .record_no_dispatch(&no_dispatch_proof())
+        .expect("no-dispatch must be permitted after a grant with no attempt");
+    assert_eq!(ledger.no_dispatch_count(), 1);
+
+    let audit = ledger.audit().expect("non-poisoned ledger must audit");
+    validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
+        .expect("audit must be accepted by the frozen encoder");
+}
+
+/// A recorded no-dispatch asserts the request resolved without reaching the provider. Dispatching
+/// afterwards would contradict that durable claim, so `execute` must refuse before charging or
+/// sending, and poison the ledger rather than leave it open to a later successful dispatch.
+#[test]
+fn execute_refuses_after_a_recorded_no_dispatch_and_poisons_the_ledger() {
+    let mut ledger = ProviderAttemptLedger::new();
+    ledger
+        .record_no_dispatch(&no_dispatch_proof())
+        .expect("record no dispatch on a fresh ledger");
+
+    let (charge_authority, charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-    let mut ledger = ProviderAttemptLedger::new();
-    client
-        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
-        .expect("decisive attempt must succeed");
 
+    let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+
+    assert_eq!(outcome, Err(ProviderClientError::DispatchAfterNoDispatch));
     assert_eq!(
-        ledger.record_no_dispatch(&no_dispatch_proof()),
-        Err(ProviderClientError::NoDispatchNotPermitted)
+        ledger.poisoned(),
+        Some(ProviderClientError::DispatchAfterNoDispatch)
+    );
+    assert_eq!(ledger.no_dispatch_count(), 1);
+    assert_eq!(ledger.attempt_count(), 0);
+    assert_eq!(ledger.committed_grant_count(), 0);
+    assert_eq!(ledger.decisive_terminal_count(), 0);
+    assert_eq!(ledger.ambiguous_count(), 0);
+    assert_eq!(
+        charge_calls.get(),
+        0,
+        "charge authority must not be called after a recorded no-dispatch"
+    );
+    assert_eq!(
+        transport_calls.get(),
+        0,
+        "transport must not be called after a recorded no-dispatch"
     );
 }
 
@@ -1653,110 +1933,207 @@ fn record_no_dispatch_and_audit_return_the_poison_on_a_poisoned_ledger() {
     );
 }
 
-#[test]
-fn every_non_poisoned_ledger_audit_is_accepted_by_the_frozen_compact_encoder() {
-    let fresh = ProviderAttemptLedger::new();
+// `ProviderClientError::LedgerAlgebraViolation` restates the frozen encoder's own algebra at the
+// ledger, so a transition this crate later gets wrong fails at the ledger instead of downstream.
+// Every increment path the public API can reach (`record_committed_grant`,
+// `record_issued_attempt`, `record_decisive_terminal`, `record_ambiguous`, and
+// `record_no_dispatch`'s own preconditions) keeps `attempt_count <= committed_grant_count`,
+// `decisive_terminal_count + ambiguous_count <= attempt_count`, `no_dispatch_count <= 1`, and
+// `no_dispatch_count == 1` only while `decisive_terminal_count == 0`. As far as this suite can
+// determine, no sequence of public `execute`/`record_no_dispatch` calls can violate that algebra,
+// so `LedgerAlgebraViolation` is not reachable through the public API today -- this is stated
+// honestly rather than fabricated by poking private fields. What the matrix below proves instead
+// is the *mirroring* property the variant exists to guard: for every ledger state reachable
+// through the real API, `audit()` returns `Ok`, and the frozen encoder accepts that value.
 
-    let mut no_dispatch_only = ProviderAttemptLedger::new();
-    no_dispatch_only
-        .record_no_dispatch(&no_dispatch_proof())
-        .expect("record no dispatch");
-
-    let mut one_decisive = ProviderAttemptLedger::new();
-    {
-        let (charge_authority, _charge_calls) =
-            ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
-        let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
-            Ok(ProviderAttemptReport {
-                outcome: ProviderAttemptOutcome::Decisive,
-                provider_requests_issued: 1,
-            })
-        });
-        let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-        client
-            .execute(
-                &mut one_decisive,
-                &base_request(ProviderAttemptClass::Readiness),
-            )
-            .expect("decisive attempt must succeed");
-    }
-
-    let mut one_ambiguous = ProviderAttemptLedger::new();
-    {
-        let (charge_authority, _charge_calls) =
-            ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
-        let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
-            Ok(ProviderAttemptReport {
-                outcome: ProviderAttemptOutcome::Ambiguous,
-                provider_requests_issued: 1,
-            })
-        });
-        let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-        client
-            .execute(
-                &mut one_ambiguous,
-                &base_request(ProviderAttemptClass::Readiness),
-            )
-            .expect("ambiguous attempt must succeed");
-    }
-
-    let mut grant_without_attempt = ProviderAttemptLedger::new();
-    {
-        let (charge_authority, _charge_calls) =
-            ScriptedChargeAuthority::new(|_request| Err(ProviderChargeError::AmbiguousCommit));
-        let (transport, _transport_calls) =
-            ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
-        let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-        let outcome = client.execute(
-            &mut grant_without_attempt,
-            &base_request(ProviderAttemptClass::Readiness),
-        );
-        assert_eq!(outcome, Err(ProviderClientError::ChargeAmbiguous));
-    }
-
-    let mut accumulated = ProviderAttemptLedger::new();
-    for outcome in [
-        ProviderAttemptOutcome::Decisive,
-        ProviderAttemptOutcome::Decisive,
-        ProviderAttemptOutcome::Decisive,
-        ProviderAttemptOutcome::Ambiguous,
-    ] {
-        let (charge_authority, _charge_calls) =
-            ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
-        let (transport, _transport_calls) = ScriptedTransport::new(move |_attempt| {
-            Ok(ProviderAttemptReport {
-                outcome,
-                provider_requests_issued: 1,
-            })
-        });
-        let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-        client
-            .execute(
-                &mut accumulated,
-                &base_request(ProviderAttemptClass::Readiness),
-            )
-            .expect("attempt must succeed");
-    }
-
-    for (label, ledger) in [
-        ("fresh", &fresh),
-        ("no_dispatch_only", &no_dispatch_only),
-        ("one_decisive", &one_decisive),
-        ("one_ambiguous", &one_ambiguous),
-        ("grant_without_attempt", &grant_without_attempt),
-        ("accumulated", &accumulated),
-    ] {
-        let audit = ledger.audit().unwrap_or_else(|error| {
-            panic!("case {label}: non-poisoned ledger must audit: {error}")
-        });
-        // ProviderAttemptLedger has no refund method at all, so this must always be false.
-        assert!(!audit.provider_authority_refunded, "case {label}");
-        validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
-            .unwrap_or_else(|error| {
-                panic!("case {label}: audit must validate: {error:?}: {audit:?}")
+/// Every terminal error path `execute` can take, applied to `ledger`'s current state through the
+/// real public API. `"none"` performs no action. Used only by the systematic matrix below.
+fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) {
+    match label {
+        "none" => {}
+        "charge_ambiguous_commit" => {
+            let (charge_authority, _calls) =
+                ScriptedChargeAuthority::new(|_request| Err(ProviderChargeError::AmbiguousCommit));
+            let (transport, _calls2) =
+                ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
+            let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+            let _ = client.execute(ledger, &base_request(ProviderAttemptClass::Readiness));
+        }
+        "grant_mismatch" => {
+            let (charge_authority, _calls) = ScriptedChargeAuthority::new(|request| {
+                let mut grant = binding_grant(request);
+                grant.attempt_ordinal += 1;
+                Ok(grant)
             });
+            let (transport, _calls2) =
+                ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
+            let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+            let _ = client.execute(ledger, &base_request(ProviderAttemptClass::Readiness));
+        }
+        "transport_refused" => {
+            let (charge_authority, _calls) =
+                ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+            let client = client_with(
+                ProviderCapabilities::none(),
+                charge_authority,
+                UnwiredProviderTransport,
+            );
+            let _ = client.execute(ledger, &base_request(ProviderAttemptClass::Readiness));
+        }
+        "transport_report_inconsistent" => {
+            let (charge_authority, _calls) =
+                ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+            let (transport, _calls2) = ScriptedTransport::new(|_attempt| {
+                Ok(ProviderAttemptReport {
+                    outcome: ProviderAttemptOutcome::Decisive,
+                    provider_requests_issued: 0,
+                })
+            });
+            let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+            let _ = client.execute(ledger, &base_request(ProviderAttemptClass::Readiness));
+        }
+        "transport_issued_unauthorized" => {
+            let (charge_authority, _calls) =
+                ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+            let (transport, _calls2) = ScriptedTransport::new(|_attempt| {
+                Ok(ProviderAttemptReport {
+                    outcome: ProviderAttemptOutcome::Decisive,
+                    provider_requests_issued: 2,
+                })
+            });
+            let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+            let _ = client.execute(ledger, &base_request(ProviderAttemptClass::Readiness));
+        }
+        other => panic!("unknown terminal action: {other}"),
     }
 }
+
+const TERMINAL_ACTIONS: [&str; 6] = [
+    "none",
+    "charge_ambiguous_commit",
+    "grant_mismatch",
+    "transport_refused",
+    "transport_report_inconsistent",
+    "transport_issued_unauthorized",
+];
+
+/// Every sequence of 0..=3 successful attempts, with every combination of `Decisive`/`Ambiguous`
+/// outcomes at each position (1 + 2 + 4 + 8 = 15 sequences).
+fn outcome_sequences() -> Vec<Vec<ProviderAttemptOutcome>> {
+    let mut sequences = Vec::new();
+    for length in 0..=3usize {
+        for mask in 0..(1usize << length) {
+            let sequence = (0..length)
+                .map(|bit| {
+                    if (mask >> bit) & 1 == 0 {
+                        ProviderAttemptOutcome::Decisive
+                    } else {
+                        ProviderAttemptOutcome::Ambiguous
+                    }
+                })
+                .collect();
+            sequences.push(sequence);
+        }
+    }
+    sequences
+}
+
+/// Rebuilds `every_non_poisoned_ledger_audit_is_accepted_by_the_frozen_compact_encoder` (removed):
+/// that test asserted the mirroring property over a hand-listed set of 6 states and missed the one
+/// that failed (no-dispatch recorded after an ambiguous, not just a decisive, attempt). This
+/// version generates every ledger state from a systematic matrix driven entirely through the real
+/// public API -- every 0-3-attempt outcome sequence, every terminal error path, with and without a
+/// preceding no-dispatch, with and without a preceding grant-without-attempt -- and asserts the
+/// mirroring property on each: a non-poisoned ledger's `audit()` is `Ok` and the frozen encoder
+/// accepts it, or the ledger is poisoned and `audit()` returns that same poison.
+#[test]
+fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_audit_algebra() {
+    let mut case_count = 0usize;
+
+    for preceding_grant in [false, true] {
+        for preceding_no_dispatch in [false, true] {
+            for sequence in outcome_sequences() {
+                for terminal in TERMINAL_ACTIONS {
+                    let mut ledger = ProviderAttemptLedger::new();
+                    let label = format!(
+                        "preceding_grant={preceding_grant} preceding_no_dispatch=\
+                         {preceding_no_dispatch} sequence={sequence:?} terminal={terminal}"
+                    );
+
+                    if preceding_grant {
+                        let (charge_authority, _calls) =
+                            ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+                        let client = client_with(
+                            ProviderCapabilities::none(),
+                            charge_authority,
+                            UnwiredProviderTransport,
+                        );
+                        let _ = client
+                            .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+                    }
+
+                    if preceding_no_dispatch {
+                        let _ = ledger.record_no_dispatch(&no_dispatch_proof());
+                    }
+
+                    for outcome in &sequence {
+                        let outcome = *outcome;
+                        let (charge_authority, _calls) =
+                            ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+                        let (transport, _calls2) = ScriptedTransport::new(move |_attempt| {
+                            Ok(ProviderAttemptReport {
+                                outcome,
+                                provider_requests_issued: 1,
+                            })
+                        });
+                        let client =
+                            client_with(ProviderCapabilities::none(), charge_authority, transport);
+                        let _ = client
+                            .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+                    }
+
+                    apply_terminal_action(terminal, &mut ledger);
+
+                    match ledger.poisoned() {
+                        Some(poison) => {
+                            assert_eq!(ledger.audit(), Err(poison), "case: {label}");
+                        }
+                        None => {
+                            let audit = ledger.audit().unwrap_or_else(|error| {
+                                panic!("case {label}: non-poisoned ledger must audit: {error}")
+                            });
+                            // ProviderAttemptLedger has no refund method at all, so this must
+                            // always be false.
+                            assert!(!audit.provider_authority_refunded, "case: {label}");
+                            validate_and_encode_object_store_provider_attempt_audit(
+                                &audit,
+                                &compact_receipt_limits(),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "case {label}: audit must be accepted by the frozen encoder: \
+                                     {error:?}: {audit:?}"
+                                )
+                            });
+                        }
+                    }
+                    case_count += 1;
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        case_count,
+        2 * 2 * outcome_sequences().len() * TERMINAL_ACTIONS.len(),
+        "matrix must enumerate every combination"
+    );
+}
+
+// `ProviderClientError::LedgerOverflow` is not reachable through the public API either: every
+// counter is `u64`, so closing the ledger on overflow needs 2^64 successful `execute` calls (or
+// committed grants) against one ledger -- not something a test can drive. Noted rather than
+// fabricated by any means other than the public API.
 
 // ---------------------------------------------------------------------------------------------
 // 10. Redaction
