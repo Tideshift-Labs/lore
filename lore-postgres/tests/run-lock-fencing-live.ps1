@@ -48,6 +48,7 @@ $expectedCases = @(
     'backfill_proves_fence_sequence_headroom_before_cutover',
     'push_witness_capture_and_transaction_local_revalidation_detect_change'
 )
+$migrationParityCase = 'migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs'
 
 $results = @(
     foreach ($testName in $expectedCases) {
@@ -61,6 +62,14 @@ $results = @(
         }
     }
 )
+$results += [pscustomobject]@{
+    Target = 'domain_migration_parity'
+    Test   = $migrationParityCase
+    Status = 'NOT RUN'
+    Passed = 0
+    Failed = 0
+    Ran    = 0
+}
 
 $priorPgUrl = [Environment]::GetEnvironmentVariable('LORE_TEST_PG_URL', 'Process')
 
@@ -111,6 +120,36 @@ function Get-LockFencingTestCatalog {
     )
 }
 
+function Get-MigrationParityTestCatalog {
+    Push-Location $loreRoot
+    $priorErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $listArgs = @(
+            'test', '-p', 'lore-postgres', '--test', 'domain_migration_parity', '--',
+            '--ignored', '--list'
+        )
+        $output = & cargo @listArgs 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $priorErrorAction
+        Pop-Location
+    }
+    if ($exitCode -ne 0) {
+        throw "migration-parity test catalog failed:`n$output"
+    }
+
+    return @(
+        foreach ($line in ($output -split "`r?`n")) {
+            $match = [regex]::Match($line, '^(?<name>[A-Za-z0-9_]+): test$')
+            if ($match.Success) {
+                $match.Groups['name'].Value
+            }
+        }
+    )
+}
+
 function Assert-ExpectedCatalog {
     $catalog = @(Get-LockFencingTestCatalog)
     $missing = @($expectedCases | Where-Object { $_ -notin $catalog })
@@ -119,6 +158,11 @@ function Assert-ExpectedCatalog {
         $message = "expected exactly $($expectedCases.Count) lock-fencing tests; catalog has $($catalog.Count). " +
             "Missing=[$($missing -join ', ')]; unexpected=[$($unexpected -join ', ')]"
         throw $message
+    }
+
+    $parityCatalog = @(Get-MigrationParityTestCatalog)
+    if ($parityCatalog.Count -ne 1 -or $migrationParityCase -notin $parityCatalog) {
+        throw "expected exactly the migration parity case '$migrationParityCase'; catalog=[$($parityCatalog -join ', ')]"
     }
 }
 
@@ -263,7 +307,7 @@ try {
     }
 
     $passCount = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
-    if ($passCount -eq $expectedCases.Count) {
+    if ($passCount -eq $results.Count) {
         $runPassed = $true
     }
 }
@@ -304,7 +348,7 @@ $results | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
 $passCount = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
 $failCount = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
 $notRunCount = @($results | Where-Object { $_.Status -eq 'NOT RUN' }).Count
-Write-Host "Summary: PASS=$passCount FAIL=$failCount NOT RUN=$notRunCount EXPECTED=$($expectedCases.Count)"
+Write-Host "Summary: PASS=$passCount FAIL=$failCount NOT RUN=$notRunCount EXPECTED=$($results.Count)"
 
 if ($null -ne $setupError) {
     Write-Warning "Setup failed: $setupError"
