@@ -1081,13 +1081,20 @@ impl PostgresFragmentCoordinator {
         )
         .await
         .map_err(|error| DomainError::from_pg("mark missing update", error))?;
-        // Confirmed unconditionally, before the readability branch: the growth
-        // check is about whether this transaction locked what it is about to
-        // affect, which is a question every path has to answer (INV-EF P1-1).
-        let confirmed = confirm_lifecycle_fanout(&tx, &witness.hash, &fanout).await?;
         if was_readable {
             // Readable to unreadable is a lifecycle transition, so every
-            // live-associated repository's scalar moves atomically with it.
+            // live-associated repository's scalar moves atomically with it —
+            // and the growth check runs exactly here, because "did this
+            // transaction lock what it is about to affect" only has force when
+            // it is about to affect something. `mark_missing` on an already
+            // non-readable head moves no scalar and touches no association, so
+            // confirming would only manufacture a spurious `Contention` under
+            // unrelated concurrent churn.
+            //
+            // `begin_obliterate` is the one path that confirms unconditionally,
+            // because it retires associations whether or not the head was
+            // readable, so it always affects something (INV-EF P1-1).
+            let confirmed = confirm_lifecycle_fanout(&tx, &witness.hash, &fanout).await?;
             apply_lifecycle_generation(&tx, &confirmed).await?;
         }
         classify_commit(tx.commit().await, "mark missing commit")?;

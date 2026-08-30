@@ -80,8 +80,12 @@ $inventory = @(
             'commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tombstones_the_head',
             'commit_obliterate_fences_a_stale_intent_and_mutates_nothing',
             'enable_lifecycle_refuses_on_a_not_ready_cell_and_succeeds_once_ready',
+            'enable_lifecycle_refuses_with_the_roll_forward_diagnostic_when_schema_version_exceeds_the_binary',
             'abandon_promotion_leaves_the_head_staged_and_readable_and_moves_no_repository_lifecycle_generation',
-            'a_successful_repair_quarantines_the_predecessor_epoch_and_marks_the_successor_current_eligible'
+            'a_successful_repair_quarantines_the_predecessor_epoch_and_marks_the_successor_current_eligible',
+            # INV-EF P1-1: the begin_obliterate fanout race (fixed at 76033cb).
+            'a_concurrent_create_association_landing_between_the_plan_and_the_head_lock_is_refused_with_zero_mutation',
+            'begin_obliterate_on_a_non_readable_head_moves_the_association_scalar_for_every_live_associated_repository'
         )
     },
     [pscustomobject]@{

@@ -1860,9 +1860,21 @@ async fn revalidate_push_witness_aborts_when_a_required_fragments_epoch_advanced
 /// P1-2 item 1d: the 4,097-synthetic-fragment refusal. `MAX_PUSH_FRAGMENT_REVALIDATIONS`
 /// is a count check on the caller's slice, reachable with fabricated hashes
 /// that were never inserted -- this is the case INV-EF's own record wrongly
-/// attributed to needing real upload traffic. Proven both behaviorally
-/// (`Aborted`) and structurally: the refusal happens before `LockClass::Fragments`
-/// is ever entered, and the push witness is unchanged afterward.
+/// attributed to needing real upload traffic. Proven behaviorally (`Aborted`)
+/// and structurally: the refusal happens before `LockClass::Fragments` is
+/// ever entered.
+///
+/// **No push-witness before/after comparison here on purpose.**
+/// `revalidate_push_witness` has no code path, in this or any other verdict,
+/// that writes to `lore_domain_repositories` -- it only ever reads that table
+/// and, past the count check, takes `FOR UPDATE` locks on
+/// `lore_fragment_lifecycle`. A witness-unchanged assertion would therefore
+/// hold no matter what this function did, which is the same
+/// cannot-fail-regardless-of-behavior shape INV-EF's own P2-11 flagged
+/// elsewhere -- caught here by a reviewer pass rather than shipped. The
+/// `LockClass::Repository` re-entry below is the one proof that actually
+/// discriminates: it could not succeed if `Fragments` had already been
+/// entered.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn revalidate_push_witness_refuses_over_the_revalidation_limit_before_locking_any_fragment_row()
@@ -1922,11 +1934,6 @@ async fn revalidate_push_witness_refuses_over_the_revalidation_limit_before_lock
             .expect("mark missing"),
         CommitVerdict::Published
     );
-    let witness_before_call = coordinator
-        .capture_push_witness(&repository_id)
-        .await
-        .expect("capture witness before the oversized call")
-        .expect("repository must exist");
 
     // 4,097 synthetic RequiredFragment values: fabricated hashes, never
     // inserted anywhere, one over the frozen limit.
@@ -1965,15 +1972,7 @@ async fn revalidate_push_witness_refuses_over_the_revalidation_limit_before_lock
         "the revalidation-limit refusal must return before locking any fragment row; if \
          LockClass::Fragments had been entered, this would be a lock-order violation",
     );
-    drop(tx); // never committed, so nothing this transaction touched persists
-
-    // And behaviorally: a refused push provably mutated nothing.
-    let witness_after_call = coordinator
-        .capture_push_witness(&repository_id)
-        .await
-        .expect("capture witness after the oversized call")
-        .expect("repository must exist");
-    assert_eq!(witness_after_call, witness_before_call);
+    drop(tx); // never committed; the function made no writes to roll back
 }
 
 /// P1-2 item 2: `acquire_staged_leases`/`release_staged_lease` round trip over
@@ -2247,14 +2246,18 @@ async fn commit_obliterate_fences_a_stale_intent_and_mutates_nothing() {
         CommitVerdict::Published
     );
 
-    let state_after_win: i16 = direct
+    let head_after_win = direct
         .query_one(
-            "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+            "SELECT state, last_fence FROM lore_fragment_lifecycle WHERE hash = $1",
             &[&hash],
         )
         .await
-        .expect("read head after winner")
-        .get(0);
+        .expect("read head after winner");
+    let state_after_win: i16 = head_after_win.get(0);
+    // `commit_obliterate` stamps a FRESH fence of its own on commit (not
+    // `winning_intent.fence`, which was allocated at begin) -- captured here
+    // only as the known-good baseline the stale attempt must not overwrite.
+    let last_fence_after_win: i64 = head_after_win.get(1);
     assert_eq!(state_after_win, FragmentLifecycleState::Tombstoned.bits());
     let disposition_after_win: i16 = direct
         .query_one(
@@ -2275,17 +2278,29 @@ async fn commit_obliterate_fences_a_stale_intent_and_mutates_nothing() {
         "a fence moved between the stale begin and its commit"
     );
 
-    let state_after_stale: i16 = direct
+    let head_after_stale = direct
         .query_one(
-            "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+            "SELECT state, last_fence FROM lore_fragment_lifecycle WHERE hash = $1",
             &[&hash],
         )
         .await
-        .expect("read head after stale attempt")
-        .get(0);
+        .expect("read head after stale attempt");
+    let state_after_stale: i16 = head_after_stale.get(0);
+    let last_fence_after_stale: i64 = head_after_stale.get(1);
     assert_eq!(
         state_after_stale, state_after_win,
         "a fenced obliterate commit must leave the head exactly as the winner published it"
+    );
+    // The load-bearing check: `state`/`disposition` alone cannot discriminate
+    // a wrongly-proceeding stale commit from the winner's, because a stale
+    // commit that incorrectly proceeded would obliterate the SAME epoch to
+    // the SAME Tombstoned/PURGED values. `last_fence` is the one field a
+    // wrongly-proceeding loser would overwrite with its own freshly allocated
+    // fence -- so an unchanged `last_fence` is what actually proves the stale
+    // commit's UPDATE never ran.
+    assert_eq!(
+        last_fence_after_stale, last_fence_after_win,
+        "a fenced obliterate commit must not stamp its own fence over the winner's"
     );
     let disposition_after_stale: i16 = direct
         .query_one(
@@ -2359,6 +2374,68 @@ async fn enable_lifecycle_refuses_on_a_not_ready_cell_and_succeeds_once_ready() 
         .expect("read lifecycle_enabled")
         .get(0);
     assert!(enabled);
+}
+
+/// P2-1 (reviewer follow-up): the newer-schema diagnostic was moved ahead of
+/// the general `ready_for_lifecycle()` verdict specifically so it becomes
+/// reachable -- behind that verdict it was dead code, since
+/// `ready_for_lifecycle()` already folds the same upper bound in. Stages a
+/// cell that is otherwise fully ready (cutover, residue, headroom all
+/// satisfied) except `schema_version` is one past what this binary compiles
+/// against, and asserts the specific "roll the binary forward" diagnostic
+/// fires -- not just any `NotReady`, which the general verdict would also
+/// produce and which would leave the reordering unfalsifiable.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn enable_lifecycle_refuses_with_the_roll_forward_diagnostic_when_schema_version_exceeds_the_binary()
+ {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+
+    direct
+        .execute(
+            "UPDATE lore_fragment_schema_state \
+                SET backfill_state = $1, cutover_at = clock_timestamp(), \
+                    residue_classified = true, sequence_headroom_fence = 1, \
+                    schema_version = $2 \
+              WHERE id = 1",
+            &[
+                &schema::BACKFILL_CUTOVER,
+                &(schema::FRAGMENT_SCHEMA_VERSION + 1),
+            ],
+        )
+        .await
+        .expect("stage an otherwise-ready cell one schema version ahead of the binary");
+
+    let refusal = coordinator
+        .enable_lifecycle()
+        .await
+        .expect_err("a cell ahead of the binary must refuse, not silently enable");
+    let DomainError::NotReady(message) = refusal else {
+        panic!("expected the typed NotReady error, got {refusal:?}");
+    };
+    assert!(
+        message.contains("roll the binary forward"),
+        "an otherwise-ready cell one schema version ahead of the binary must surface the \
+         roll-forward diagnostic specifically, not the general readiness dump: {message:?}"
+    );
+
+    let enabled: bool = direct
+        .query_one(
+            "SELECT lifecycle_enabled FROM lore_fragment_schema_state WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("read lifecycle_enabled")
+        .get(0);
+    assert!(
+        !enabled,
+        "a refused enable_lifecycle must not flip the flag"
+    );
 }
 
 /// P1-2 item 5: a promotion whose I/O comes back `Unusable` must leave the
@@ -2600,4 +2677,274 @@ async fn a_successful_repair_quarantines_the_predecessor_epoch_and_marks_the_suc
         schema::DISPOSITION_CURRENT_ELIGIBLE,
         "the successor epoch must be current-eligible"
     );
+}
+
+// ---------------------------------------------------------------------------
+// INV-EF P1-1 regression: begin_obliterate's fanout race (fixed at 76033cb).
+// ---------------------------------------------------------------------------
+
+/// P1-1: a `create_association` landing between `begin_obliterate`'s unlocked
+/// plan read and its head lock must not be silently tombstoned by a
+/// transaction that never locked its repository row and moved no scalar for
+/// it. `confirm_lifecycle_fanout` now runs unconditionally (not just
+/// `if was_readable`) and detects the growth, so the whole obliterate
+/// transaction refuses with retryable `Contention` and mutates nothing.
+///
+/// Deterministic interleaving, not timing: repository R is already
+/// associated (so it IS in the planned fanout, giving `lock_lifecycle_fanout`
+/// something to block on), and this test holds R's row locked externally for
+/// exactly as long as it takes the racing `create_association` -- to a
+/// DIFFERENT repository, R2, outside the plan -- to commit. `begin_obliterate`
+/// cannot pass R until that external lock releases, and by then R2's
+/// association, and the head lock `create_association` itself took and
+/// released, are already durably committed -- so `begin_obliterate` resumes
+/// straight into the window the finding describes.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn a_concurrent_create_association_landing_between_the_plan_and_the_head_lock_is_refused_with_zero_mutation()
+ {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let repository_r = create_repository(&store).await;
+    let repository_r2 = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+
+    // A non-readable head: Missing, from a failed first write.
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, "p1-1-race/key")
+        .await
+        .expect("begin")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(&intent, IoObservation::Unusable(MissingDiagnostic::Absent))
+            .await
+            .expect("commit missing"),
+        CommitVerdict::Published
+    );
+    // R is associated BEFORE the race, so it is in begin_obliterate's planned
+    // fanout and its lock_lifecycle_fanout loop must take R's row lock.
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_r, &context)
+            .await
+            .expect("associate R"),
+        CommitVerdict::Published
+    );
+
+    let witness_r_before = coordinator
+        .capture_push_witness(&repository_r)
+        .await
+        .expect("capture R witness before")
+        .expect("repository R must exist");
+    let witness_r2_before = coordinator
+        .capture_push_witness(&repository_r2)
+        .await
+        .expect("capture R2 witness before")
+        .expect("repository R2 must exist");
+
+    // Hold R's row lock externally, on its own connection/transaction, so
+    // begin_obliterate's lock_lifecycle_fanout blocks on it deterministically.
+    let mut lock_client = own_transaction_client(&url).await;
+    let lock_tx = lock_client
+        .transaction()
+        .await
+        .expect("open external repository-lock transaction");
+    lock_tx
+        .execute(
+            "SELECT 1 FROM lore_domain_repositories WHERE repository_id = $1 FOR UPDATE",
+            &[&repository_r.as_slice()],
+        )
+        .await
+        .expect("lock repository R externally");
+
+    let obliterate_task = async { coordinator.begin_obliterate(&hash).await };
+    let race_task = async {
+        // begin_obliterate is blocked on R's external lock regardless of this
+        // delay -- it exists only to give it a moment to actually reach and
+        // start waiting on R before the race proceeds.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            coordinator
+                .create_association(&hash, &repository_r2, &context)
+                .await
+                .expect("racing create_association must not error"),
+            CommitVerdict::Published,
+            "the racing association to R2 (outside the plan) must land"
+        );
+        // R2's association -- and the head lock create_association itself
+        // took and released -- are now durably committed. Only now release
+        // R, letting begin_obliterate resume straight into the window.
+        lock_tx
+            .commit()
+            .await
+            .expect("release the external repository lock");
+    };
+    let (obliterate_result, ()) = tokio::join!(obliterate_task, race_task);
+
+    let error = obliterate_result.expect_err(
+        "a fanout that grew between the plan and the head lock must refuse, not silently \
+         tombstone the racing association",
+    );
+    assert!(
+        matches!(error, DomainError::Contention(_)),
+        "expected Contention, got {error:?}"
+    );
+    assert!(error.is_retryable(), "Contention must be retryable");
+
+    // Zero mutation: the whole obliterate transaction rolled back.
+    let head_state: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read head after the refused obliterate")
+        .get(0);
+    assert_eq!(
+        head_state,
+        FragmentLifecycleState::Missing.bits(),
+        "a refused obliterate must not move the head out of Missing"
+    );
+
+    let r2_association_state: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_associations \
+              WHERE hash = $1 AND repository_id = $2 AND context = $3",
+            &[&hash, &repository_r2.as_slice(), &context],
+        )
+        .await
+        .expect("read R2's association state")
+        .get(0);
+    assert_eq!(
+        r2_association_state,
+        schema::ASSOCIATION_LIVE,
+        "the racing association must not have been silently tombstoned"
+    );
+
+    let witness_r_after = coordinator
+        .capture_push_witness(&repository_r)
+        .await
+        .expect("capture R witness after")
+        .expect("repository R must exist");
+    let witness_r2_after = coordinator
+        .capture_push_witness(&repository_r2)
+        .await
+        .expect("capture R2 witness after")
+        .expect("repository R2 must exist");
+    assert_eq!(
+        witness_r_after, witness_r_before,
+        "R's scalars must be exactly as they were: it was never locked by the refused \
+         obliterate and moved nothing attributable to it"
+    );
+    // R2's own `create_association` legitimately bumps its association scalar
+    // by one -- that mutation is real and expected. What must NOT have
+    // happened is a second movement from the refused obliterate (which would
+    // show as +2, or any lifecycle-scalar movement at all).
+    assert_eq!(
+        witness_r2_after.content_association_generation,
+        witness_r2_before.content_association_generation + 1,
+        "R2's association scalar must move exactly once, from its own successful \
+         create_association -- not a second time from a tombstone that never happened"
+    );
+    assert_eq!(
+        witness_r2_after.fragment_lifecycle_generation,
+        witness_r2_before.fragment_lifecycle_generation,
+        "R2's lifecycle scalar must not move: the refused obliterate rolled back entirely"
+    );
+}
+
+/// P1-1 companion (non-racy): the growth check inside `confirm_lifecycle_fanout`
+/// now runs on every `begin_obliterate`, not only `if was_readable`. A plain,
+/// non-concurrent obliterate of a `Missing` head with two live associations
+/// would have caught the original defect on its own: the association scalar
+/// must move for exactly the associated repositories even though the head was
+/// never readable and no lifecycle-generation scalar moves at all.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn begin_obliterate_on_a_non_readable_head_moves_the_association_scalar_for_every_live_associated_repository()
+ {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository_a = create_repository(&store).await;
+    let repository_b = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, "p1-1-nonrace/key")
+        .await
+        .expect("begin")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(&intent, IoObservation::Unusable(MissingDiagnostic::Absent))
+            .await
+            .expect("commit missing"),
+        CommitVerdict::Published
+    );
+    for repository_id in [&repository_a, &repository_b] {
+        assert_eq!(
+            coordinator
+                .create_association(&hash, repository_id, &context)
+                .await
+                .expect("associate"),
+            CommitVerdict::Published
+        );
+    }
+
+    let before_a = coordinator
+        .capture_push_witness(&repository_a)
+        .await
+        .expect("capture A before")
+        .expect("repository A must exist");
+    let before_b = coordinator
+        .capture_push_witness(&repository_b)
+        .await
+        .expect("capture B before")
+        .expect("repository B must exist");
+
+    let BeginOutcome::Admitted(_obliterate_intent) = coordinator
+        .begin_obliterate(&hash)
+        .await
+        .expect("begin obliterate on a Missing head with live associations")
+    else {
+        panic!("a non-tombstoned head must admit begin_obliterate");
+    };
+
+    let after_a = coordinator
+        .capture_push_witness(&repository_a)
+        .await
+        .expect("capture A after")
+        .expect("repository A must exist");
+    let after_b = coordinator
+        .capture_push_witness(&repository_b)
+        .await
+        .expect("capture B after")
+        .expect("repository B must exist");
+
+    for (before, after, label) in [(before_a, after_a, "A"), (before_b, after_b, "B")] {
+        assert_eq!(
+            after.content_association_generation,
+            before.content_association_generation + 1,
+            "repository {label}'s association scalar must move exactly once"
+        );
+        assert_eq!(
+            after.fragment_lifecycle_generation, before.fragment_lifecycle_generation,
+            "a head that was never readable crosses no readability boundary, so repository \
+             {label}'s lifecycle scalar must not move"
+        );
+    }
 }
