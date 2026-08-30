@@ -566,6 +566,106 @@ async fn same_subject_under_different_issuers_is_foreign_for_every_owner_operati
 
 #[tokio::test]
 #[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn acquire_result_boundary_is_rejected_before_lock_mutation() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.lock_coordinator();
+    let direct = client(&url).await;
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let lock_owner = owner("https://issuer.example", "receipt-boundary");
+
+    let mut last_valid = None;
+    let first_oversized = (1..=512)
+        .find_map(|count| {
+            let resources = (0..count)
+                .map(|index| {
+                    let mut hash = [0u8; 32];
+                    hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                    resource(hash, None)
+                })
+                .collect();
+            let input = acquire_input(
+                &repository_id,
+                &branch_id,
+                lock_owner.clone(),
+                resources,
+                None,
+            );
+            match acquire_or_renew_binding(&input) {
+                Ok(_) => {
+                    last_valid = Some(input);
+                    None
+                }
+                Err(DomainError::InvalidInput(message))
+                    if message.contains("public-result limit") =>
+                {
+                    Some(input)
+                }
+                Err(error) => panic!("unexpected boundary validation error: {error}"),
+            }
+        })
+        .expect("the frozen 4096-byte receipt limit must bound a batch below 512 resources");
+    let last_valid = last_valid.expect("at least one lock result must fit");
+
+    let operation = prepare_bound_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&last_valid).expect("boundary-sized valid binding"),
+    )
+    .await;
+    let committed = coordinator
+        .acquire_or_renew(&operation, &last_valid)
+        .await
+        .expect("largest discovered valid batch commits");
+    assert_eq!(committed.locks.len(), last_valid.resources.len());
+    let replay = coordinator
+        .acquire_or_renew(&operation, &last_valid)
+        .await
+        .expect("boundary-sized result replays");
+    assert!(replay.replayed);
+    assert_eq!(replay.locks, committed.locks);
+
+    let before: i64 = direct
+        .query_one(
+            "SELECT count(*) FROM lore_locks WHERE repository = $1 AND branch = $2",
+            &[&repository_id.as_slice(), &branch_id.as_slice()],
+        )
+        .await
+        .expect("count boundary locks")
+        .get(0);
+    let oversized = coordinator
+        .acquire_or_renew(&operation, &first_oversized)
+        .await;
+    assert!(
+        matches!(oversized, Err(DomainError::InvalidInput(message)) if message.contains("public-result limit"))
+    );
+    let after: i64 = direct
+        .query_one(
+            "SELECT count(*) FROM lore_locks WHERE repository = $1 AND branch = $2",
+            &[&repository_id.as_slice(), &branch_id.as_slice()],
+        )
+        .await
+        .expect("recount boundary locks")
+        .get(0);
+    assert_eq!(after, before, "oversized intent must not mutate lock rows");
+
+    let sub_millisecond = AcquireOrRenewInput {
+        lease_duration: Some(Duration::from_nanos(999_999)),
+        resources: vec![resource(rand::random(), None)],
+        ..last_valid
+    };
+    assert!(matches!(
+        acquire_or_renew_binding(&sub_millisecond),
+        Err(DomainError::InvalidInput(message)) if message.contains("1ms")
+    ));
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
 async fn stale_release_renew_force_and_cleanup_cannot_touch_a_successor() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")

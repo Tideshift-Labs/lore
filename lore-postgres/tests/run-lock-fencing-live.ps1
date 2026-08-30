@@ -36,6 +36,7 @@ $expectedCases = @(
     'two_coordinators_racing_one_resource_choose_exactly_one_owner_pair',
     'racing_batches_are_all_or_nothing',
     'same_subject_under_different_issuers_is_foreign_for_every_owner_operation',
+    'acquire_result_boundary_is_rejected_before_lock_mutation',
     'stale_release_renew_force_and_cleanup_cannot_touch_a_successor',
     'obsolete_repository_and_branch_generations_make_rows_logically_absent',
     'lease_clock_is_captured_after_the_namespace_lock_wait',

@@ -1248,8 +1248,10 @@ mod tests {
     use lore_base::types::Fragment;
     use lore_base::types::Partition;
     use lore_postgres::domain::PostgresDomainStore;
+    use lore_postgres::domain::receipts::ReceiptKey;
     use lore_postgres::pool::TlsConfig;
     use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
+    use lore_revision::lock::LockStore;
     use lore_revision::node::Node;
     use lore_revision::node::ROOT_NODE;
     use lore_storage::ImmutableStore;
@@ -1272,12 +1274,15 @@ mod tests {
     use tonic::Request;
     use tonic::metadata::MetadataValue;
     use tonic::transport::server::TcpConnectInfo;
+    use uuid::Uuid;
 
     use super::*;
+    use crate::grpc::domain_operation_metadata::DomainOperationMetadata;
     use crate::grpc::get_write_token;
     use crate::grpc::server::RevisionListAcceleration;
     use crate::hooks::Hook;
     use crate::hooks::HookError;
+    use crate::lock::store::LocalLockStore;
     use crate::notification::testing::MockNotificationSender;
     use crate::store::test_store_create;
 
@@ -1371,32 +1376,47 @@ mod tests {
             coordinator.clone(),
         ));
 
-        // CR-019 disabled: no legacy guard is supplied, yet capture executes.
+        // CR-019 disabled: a missing namespace remains observable before the
+        // admitted-none legacy return. Moving capture below that return would
+        // make this incorrectly succeed with None.
+        let missing_branch: BranchId = random();
         let disabled = prepare_governed_push(
             Some(&context),
             None,
             repository_id,
-            branch_id,
+            missing_branch,
             random(),
             false,
             false,
         )
-        .await
-        .expect("capture with CR-019 disabled");
-        assert!(disabled.is_none());
+        .await;
+        let disabled = match disabled {
+            Err(status) => status,
+            Ok(_) => panic!("missing namespace must fail before the CR-019-disabled bypass"),
+        };
+        assert_eq!(disabled.code(), Code::FailedPrecondition);
 
-        // CR-019's no-foreign-lock early return: its query is empty, but a
-        // second call still executes the real capture path first.
-        assert!(
-            coordinator
-                .query(&repository_bytes, Some(&branch_bytes), None)
-                .await
-                .expect("query empty lock namespace")
-                .is_empty()
-        );
-        let early_return = prepare_governed_push(
+        // Capture a concrete witness, then drive the real CR-019 no-foreign-
+        // locks guard. The bogus revision and absent local branch would fail
+        // if that guard tried to diff instead of taking its early return.
+        let operation_id = Uuid::now_v7();
+        let admitted = crate::domain::AdmittedOperation {
+            key: ReceiptKey {
+                verified_issuer: "https://issuer.example".to_owned(),
+                authenticated_subject: "wp117-pusher".to_owned(),
+                tenant_scope_key: vec![7; 16],
+                operation_id,
+            },
+            carried: DomainOperationMetadata {
+                operation_id,
+                fingerprint_version: 1,
+                fingerprint: vec![8; 32],
+                prepare_token: [9; 32],
+            },
+        };
+        let governed = prepare_governed_push(
             Some(&context),
-            None,
+            Some(admitted),
             repository_id,
             branch_id,
             random(),
@@ -1404,8 +1424,38 @@ mod tests {
             false,
         )
         .await
-        .expect("capture before CR-019 empty-query return");
-        assert!(early_return.is_none());
+        .expect("capture before CR-019 empty-query return")
+        .expect("admitted push carries its witness");
+        assert_eq!(governed.lock_witness.repository_lock_generation, 1);
+        assert_eq!(governed.lock_witness.branch_lock_generation, 1);
+        assert_eq!(
+            governed
+                .lock_witness
+                .branch_lock_namespace_last_applied_fence,
+            0
+        );
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("create CR-019 stores");
+        let repository = Arc::new(RepositoryContext::new_server_context(
+            immutable_store,
+            mutable_store,
+            repository_id,
+        ));
+        let lock_store: Arc<dyn LockStore> = Arc::new(LocalLockStore::default());
+        let bogus_revision = Hash::hash_buffer(b"never serialized for wp117 bypass fixture");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            crate::grpc::handlers::push_lock_guard::enforce_push_locks(
+                repository,
+                &lock_store,
+                branch_id,
+                bogus_revision,
+                "wp117-pusher",
+            )
+            .await
+            .expect("real CR-019 empty-lock guard must take its early return");
+        }))
+        .await;
     }
 
     impl InstrumentProvider for RecordingInstrumentProvider {
