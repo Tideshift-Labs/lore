@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Plugin traits for compile-time pluggable storage and topology backends.
 //!
@@ -15,6 +16,7 @@ use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::error::PluginNotFound;
 use lore_error_set::prelude::*;
+use lore_postgres::domain::bypass::DomainEnforcement;
 use lore_revision::cluster::topology::Topology;
 use lore_revision::lock::LockStore;
 use lore_revision::notification::NotificationSender;
@@ -112,6 +114,7 @@ pub trait MutableStorePluginFactory: Send + Sync {
         &self,
         config: &toml::Value,
         immutable_store: Arc<dyn ImmutableStore>,
+        context: &MutableStorePluginContext,
     ) -> Result<Arc<dyn MutableStore>, PluginError>;
 
     /// Returns the unique name of this plugin.
@@ -119,6 +122,18 @@ pub trait MutableStorePluginFactory: Send + Sync {
     /// This name is used to identify the plugin in configuration files
     /// and error messages.
     fn name(&self) -> &'static str;
+}
+
+/// Server-only construction inputs for a mutable-store plugin.
+///
+/// The Postgres backend consumes the CR-029 enforcement handle before its
+/// concrete store is erased behind `Arc<dyn MutableStore>`. Other backends
+/// ignore it. Keeping this in `lore-server` avoids changing the client-shipped
+/// `MutableStore` trait.
+#[derive(Clone, Default)]
+pub struct MutableStorePluginContext {
+    /// Shared fail-closed fence armed by domain readiness resolution.
+    pub domain_enforcement: Option<DomainEnforcement>,
 }
 
 /// Factory trait for creating topology discovery instances.

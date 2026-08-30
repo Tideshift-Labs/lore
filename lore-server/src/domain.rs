@@ -33,6 +33,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use anyhow::anyhow;
 use lore_postgres::domain::DomainSchemaState;
+use lore_postgres::domain::bypass::DomainEnforcement;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
 use lore_postgres::domain::receipts::OperationBinding;
@@ -307,9 +308,20 @@ pub fn reject_unwired_governed_operation(admitted: &AdmittedOperation, method: &
 /// enforcement on. Aborting adds no new availability failure mode either: the
 /// three CR-007 stores connect to the same database at boot and already fail
 /// hard, so a cell that cannot reach this database cannot serve anyway.
-pub async fn configure_domain_context(settings: &Settings) -> Result<Option<Arc<DomainContext>>> {
+pub struct ConfiguredDomainContext {
+    /// Coordinator exposed to governed handlers and the private receipt rail.
+    pub context: Option<Arc<DomainContext>>,
+    /// Handle that must be installed into the concrete Postgres mutable store
+    /// before the store is published behind its trait object.
+    pub mutable_enforcement: Option<DomainEnforcement>,
+}
+
+pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredDomainContext> {
     if settings.mutable_store.mode != POSTGRES_MODE {
-        return Ok(None);
+        return Ok(ConfiguredDomainContext {
+            context: None,
+            mutable_enforcement: None,
+        });
     }
 
     let Some(domain_config) =
@@ -376,11 +388,15 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<Option<Arc<
         .await
         .map_err(|e| anyhow!("Failed to read the domain schema state: {e}"))?;
     let enforcement = resolve_enforcement(&state)?;
+    let mutable_enforcement = DomainEnforcement::disabled();
+    if enforcement {
+        mutable_enforcement.enable();
+    }
 
-    Ok(Some(Arc::new(DomainContext::new(
-        Arc::new(store),
-        enforcement,
-    ))))
+    Ok(ConfiguredDomainContext {
+        context: Some(Arc::new(DomainContext::new(Arc::new(store), enforcement))),
+        mutable_enforcement: Some(mutable_enforcement),
+    })
 }
 
 /// Decide whether this cell may enforce, refusing readiness rather than
@@ -424,6 +440,12 @@ pub(crate) mod test_support {
 
     use async_trait::async_trait;
     use lore_postgres::domain::DomainError;
+    use lore_postgres::domain::PostgresDomainStore;
+    use lore_postgres::domain::backfill::BranchFacts;
+    use lore_postgres::domain::backfill::DomainBackfill;
+    use lore_postgres::domain::backfill::DomainBackfillSource;
+    use lore_postgres::domain::backfill::OrphanKey;
+    use lore_postgres::domain::backfill::RepositoryFacts;
     use lore_postgres::domain::coordinator::BranchPushCommitInput;
     use lore_postgres::domain::coordinator::BranchSnapshot;
     use lore_postgres::domain::coordinator::MetadataCasInput;
@@ -444,10 +466,96 @@ pub(crate) mod test_support {
     use lore_postgres::domain::receipts::PrepareResult;
     use lore_postgres::domain::receipts::ReceiptKey;
     use lore_postgres::domain::receipts::ReceiptLookup;
+    use lore_postgres::pool::TlsConfig;
+    use lore_postgres::store::mutable_store::PostgresMutableStore;
 
     use super::DomainContext;
     use super::DomainTransactionStore;
     use super::GovernedOperation;
+    use crate::settings::Settings;
+
+    struct EmptyBackfillSource;
+
+    #[async_trait]
+    impl DomainBackfillSource for EmptyBackfillSource {
+        async fn list_repositories(&self) -> Result<Vec<RepositoryFacts>, DomainError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_branches(
+            &self,
+            _repository_id: &[u8],
+        ) -> Result<Vec<BranchFacts>, DomainError> {
+            Ok(Vec::new())
+        }
+
+        async fn snapshot_token(&self, _repository_id: &[u8]) -> Result<Vec<u8>, DomainError> {
+            Ok(Vec::new())
+        }
+
+        async fn orphan_projection_keys(&self) -> Result<Vec<OrphanKey>, DomainError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Construct an enforcing context through the real Postgres readiness and
+    /// settings path. Callers must remain `#[ignore]` live-Postgres tests.
+    pub(crate) async fn configured_enforcing_context() -> Option<Arc<DomainContext>> {
+        let Ok(url) = std::env::var("LORE_TEST_PG_URL") else {
+            eprintln!("LORE_TEST_PG_URL unset; live construction-path test cannot run");
+            return None;
+        };
+        let store = PostgresDomainStore::connect(&url, 2, &TlsConfig::default())
+            .await
+            .expect("bootstrap disposable domain schema");
+        let _mutable_store = PostgresMutableStore::connect(&url, 2, &TlsConfig::default())
+            .await
+            .expect("bootstrap disposable mutable projection schema");
+        let state = store
+            .schema_state()
+            .await
+            .expect("read domain schema state");
+        if !state.ready_for_enforcement() {
+            let source = EmptyBackfillSource;
+            let backfill = DomainBackfill::for_store(&store, &source);
+            backfill
+                .run()
+                .await
+                .expect("run empty disposable-cell domain backfill");
+            let report = backfill
+                .verify()
+                .await
+                .expect("verify empty disposable-cell domain backfill");
+            backfill
+                .complete(&report)
+                .await
+                .expect("complete empty disposable-cell domain cutover");
+        }
+        if !store
+            .schema_state()
+            .await
+            .expect("re-read domain schema state")
+            .enforcement_enabled
+        {
+            store
+                .enable_enforcement()
+                .await
+                .expect("enable through the production schema-state API");
+        }
+
+        let mut settings: Settings = toml::from_str(include_str!("../config/default.toml"))
+            .expect("built-in settings fixture must deserialize");
+        settings.mutable_store.mode = "postgres".to_string();
+        settings.plugins.insert(
+            "postgres".to_string(),
+            toml::from_str(&format!("url = {url:?}\npool_max = 2\ndomain_pool_max = 2"))
+                .expect("Postgres plugin fixture config"),
+        );
+        super::configure_domain_context(&settings)
+            .await
+            .expect("real domain-context construction path")
+            .context
+    }
 
     /// A coordinator whose methods are never reached: `DomainContext::admit`
     /// only runs the entry gate, never a coordinator call. Every method is

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -18,6 +19,10 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::domain::DomainContext;
+use crate::domain::GovernedScope;
+use crate::domain::admit_at_entry;
+use crate::domain::reject_unwired_governed_operation;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -94,7 +99,10 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     enforce_write_permission: bool,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<BranchMetadataSetResponse>, Status> {
+    let request_metadata = request.metadata().clone();
+    let request_authorization = crate::grpc::get_authorization_optional(request.extensions());
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
@@ -103,6 +111,20 @@ pub async fn handler(
     // deserialized.
     let extensions = request.extensions().clone();
     let req = request.into_inner();
+
+    if let Some(admitted) = admit_at_entry(
+        domain_context,
+        &request_metadata,
+        request_authorization.as_ref(),
+        GovernedScope::TargetRepository {
+            repository_id: repository_id.data(),
+        },
+    )? {
+        return Err(reject_unwired_governed_operation(
+            &admitted,
+            "lore.RevisionService/BranchMetadataSet",
+        ));
+    }
 
     let branch_id = BranchId::from(req.branch_id);
     if branch_id == BranchId::default() {
@@ -248,6 +270,31 @@ mod test {
         request
     }
 
+    #[tokio::test]
+    #[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
+    async fn enforcing_cell_rejects_before_legacy_metadata_cas_body() {
+        let Some(domain) = crate::domain::test_support::configured_enforcing_context().await else {
+            return;
+        };
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, _) = test_store_create().await.expect("test stores");
+        let error = handler(
+            make_request(
+                repository,
+                BranchId::default(),
+                Hash::default(),
+                Hash::default(),
+            ),
+            immutable_store,
+            mutable_store,
+            false,
+            Some(&domain),
+        )
+        .await
+        .expect_err("enforcement must reject missing operation carriage at entry");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
     /// Create a branch and return its metadata hash.
     async fn create_branch(repository: Arc<RepositoryContext>, branch_id: BranchId) -> Hash {
         let write_token = get_write_token();
@@ -306,7 +353,7 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let response = handler(request, immutable_store, mutable_store, false)
+            let response = handler(request, immutable_store, mutable_store, false, None)
                 .await
                 .expect("Handler failed");
 
@@ -343,7 +390,7 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let result = handler(request, immutable_store, mutable_store, false).await;
+            let result = handler(request, immutable_store, mutable_store, false, None).await;
 
             assert!(result.is_err());
             let status = result.unwrap_err();
@@ -377,7 +424,7 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let result = handler(request, immutable_store, mutable_store, false).await;
+            let result = handler(request, immutable_store, mutable_store, false, None).await;
 
             assert!(result.is_err());
             let status = result.unwrap_err();
@@ -413,7 +460,7 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let response = handler(request, immutable_store, mutable_store, false)
+            let response = handler(request, immutable_store, mutable_store, false, None)
                 .await
                 .expect("Handler failed — protect should be writable");
 
@@ -449,7 +496,7 @@ mod test {
             // Use a bogus expected hash
             let stale_hash = Hash::from(random::<[u8; 32]>());
             let request = make_request(repository_id, branch_id, stale_hash, new_hash);
-            let result = handler(request, immutable_store, mutable_store, false).await;
+            let result = handler(request, immutable_store, mutable_store, false, None).await;
 
             // CAS should fail because expected_hash doesn't match (it can't be deserialized)
             assert!(result.is_err());
@@ -470,7 +517,7 @@ mod test {
             Hash::default(),
             Hash::default(),
         );
-        let result = handler(request, immutable_store, mutable_store, false).await;
+        let result = handler(request, immutable_store, mutable_store, false, None).await;
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
@@ -502,7 +549,7 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let result = handler(request, immutable_store, mutable_store, false).await;
+            let result = handler(request, immutable_store, mutable_store, false, None).await;
 
             assert!(result.is_err());
             let status = result.unwrap_err();

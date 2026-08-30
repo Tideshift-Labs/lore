@@ -23,6 +23,7 @@ use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::errors::DomainError;
 use lore_postgres::domain::errors::DomainOutcome;
 use lore_postgres::domain::receipts::AuthorizationWitness;
+use lore_postgres::domain::receipts::ConsumeResult;
 use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::PREPARED_HARD_TTL_EXPIRED_V1;
 use lore_postgres::domain::receipts::PrepareResult;
@@ -621,8 +622,10 @@ async fn consume_is_single_use_once_the_receipt_is_terminal() {
     let tx = client.transaction().await.expect("begin consume+commit tx");
     let admission = consume(&tx, &key, &b, &token)
         .await
-        .expect("consume must not error")
-        .expect("first consume must succeed");
+        .expect("consume must not error");
+    let ConsumeResult::Admitted(admission) = admission else {
+        panic!("first consume must admit");
+    };
     commit_terminal(
         &tx,
         &key,
@@ -643,8 +646,8 @@ async fn consume_is_single_use_once_the_receipt_is_terminal() {
         .expect("roll back read-only second attempt");
 
     assert!(
-        second.is_none(),
-        "consume must return None once the receipt is terminal"
+        matches!(second, ConsumeResult::Committed(DomainOutcome::Applied)),
+        "consume must replay the committed outcome once the receipt is terminal"
     );
 }
 
@@ -681,7 +684,7 @@ async fn consume_rejects_a_token_presented_for_the_wrong_key_or_binding() {
         .expect("consume must not error");
     tx.rollback().await.expect("rollback");
     assert!(
-        result.is_none(),
+        matches!(result, ConsumeResult::Rejected),
         "a token for key_a must not consume against key_b"
     );
 
@@ -693,7 +696,7 @@ async fn consume_rejects_a_token_presented_for_the_wrong_key_or_binding() {
         .expect("consume must not error");
     tx.rollback().await.expect("rollback");
     assert!(
-        result.is_none(),
+        matches!(result, ConsumeResult::Rejected),
         "the right key with the wrong binding must not consume"
     );
 
@@ -706,7 +709,7 @@ async fn consume_rejects_a_token_presented_for_the_wrong_key_or_binding() {
         .expect("consume must not error");
     tx.rollback().await.expect("rollback");
     assert!(
-        result.is_none(),
+        matches!(result, ConsumeResult::Rejected),
         "the right key and binding with the wrong token must not consume"
     );
 
@@ -719,7 +722,7 @@ async fn consume_rejects_a_token_presented_for_the_wrong_key_or_binding() {
         .await
         .expect("rollback (do not actually terminalize)");
     assert!(
-        result.is_some(),
+        matches!(result, ConsumeResult::Admitted(_)),
         "the original token/key/binding combination must still consume"
     );
 }
@@ -773,7 +776,7 @@ async fn consume_and_receipt_get_reject_changed_canonical_intent() {
         .expect("mismatched consume must not error");
     tx.rollback().await.expect("rollback mismatched consume");
     assert!(
-        consumed.is_none(),
+        matches!(consumed, ConsumeResult::Rejected),
         "changed canonical intent must not consume the prepared receipt"
     );
 
@@ -786,7 +789,7 @@ async fn consume_and_receipt_get_reject_changed_canonical_intent() {
         .expect("exact consume must not error");
     tx.rollback().await.expect("rollback exact consume control");
     assert!(
-        exact.is_some(),
+        matches!(exact, ConsumeResult::Admitted(_)),
         "mismatched lookup and consume must leave the original token usable"
     );
 }
@@ -860,9 +863,15 @@ async fn consume_expires_a_past_ttl_prepared_row() {
         .expect("consume must not error");
     tx.commit().await.expect("commit");
 
-    assert!(
-        result.is_none(),
-        "consume of a past-TTL row must return None"
+    assert_eq!(
+        match result {
+            ConsumeResult::Committed(outcome) => outcome,
+            _ => panic!("consume of a past-TTL row must return its committed outcome"),
+        },
+        DomainOutcome::NotApplied {
+            reason_version: 1,
+            reason: PREPARED_HARD_TTL_EXPIRED_V1.to_string(),
+        }
     );
     let persisted = fetch_receipt(&client, &key).await;
     assert_eq!(
@@ -1284,11 +1293,12 @@ async fn prepare_accepts_an_authorization_witness() {
     let key = isolated_key(uuid_v7_at(clock));
     let b = binding("lore.domain.v1.test/WithWitness");
     let witness = AuthorizationWitness {
-        authorization_id: rand::random::<[u8; 16]>().to_vec(),
+        authorization_id: key.operation_id.as_bytes().to_vec(),
         authorization_revision: 1,
         verification_nonce: rand::random::<[u8; 32]>().to_vec(),
         bound_fields_digest: rand::random::<[u8; 32]>().to_vec(),
         consumed_ticket_sha256: rand::random::<[u8; 32]>().to_vec(),
+        expected_claim_identity_digest: rand::random::<[u8; 32]>().to_vec(),
     };
 
     let tx = client.transaction().await.expect("begin tx");

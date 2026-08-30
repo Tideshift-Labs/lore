@@ -16,6 +16,7 @@ use domain_maintenance_live_proxy::DomainMaintenanceFaultProxy;
 use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::errors::DomainError;
+use lore_postgres::domain::errors::DomainOutcome;
 use lore_postgres::domain::maintenance::ProofNamespaceKey;
 use lore_postgres::domain::maintenance::ProofNamespaceMaterializeInput;
 use lore_postgres::domain::maintenance::ProofNamespaceMaterializeStatus;
@@ -29,8 +30,13 @@ use lore_postgres::domain::maintenance::VerifiedStaleFinalizeInput;
 use lore_postgres::domain::maintenance::VerifiedStaleFinalizeStatus;
 use lore_postgres::domain::maintenance::proof_namespace_final_range_set_digest;
 use lore_postgres::domain::receipts::AuthorizationWitness;
+use lore_postgres::domain::receipts::ConsumeResult;
 use lore_postgres::domain::receipts::OperationBinding;
+use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptKey;
+use lore_postgres::domain::receipts::admission_clock;
+use lore_postgres::domain::receipts::commit_terminal;
+use lore_postgres::domain::receipts::consume;
 use lore_postgres::pool::TlsConfig;
 use tokio_postgres::Client;
 use uuid::NoContext;
@@ -82,6 +88,8 @@ fn uuid_v7_at(time: SystemTime) -> Uuid {
 }
 
 fn stale_input(clock: SystemTime) -> VerifiedStaleFinalizeInput {
+    let operation_id = uuid_v7_at(clock - Duration::from_secs(366 * 24 * 60 * 60));
+    let expected_claim_identity_digest = rand::random::<[u8; 32]>().to_vec();
     VerifiedStaleFinalizeInput {
         key: ReceiptKey {
             verified_issuer: format!(
@@ -90,7 +98,7 @@ fn stale_input(clock: SystemTime) -> VerifiedStaleFinalizeInput {
             ),
             authenticated_subject: "svc:maintenance-test".into(),
             tenant_scope_key: rand::random::<[u8; 16]>().to_vec(),
-            operation_id: uuid_v7_at(clock - Duration::from_secs(366 * 24 * 60 * 60)),
+            operation_id,
         },
         binding: OperationBinding {
             method: "lore.domain.v1.test/Maintenance".into(),
@@ -100,13 +108,14 @@ fn stale_input(clock: SystemTime) -> VerifiedStaleFinalizeInput {
             canonical_intent_digest: rand::random::<[u8; 32]>().to_vec(),
         },
         witness: AuthorizationWitness {
-            authorization_id: rand::random::<[u8; 16]>().to_vec(),
+            authorization_id: operation_id.as_bytes().to_vec(),
             authorization_revision: 7,
             verification_nonce: rand::random::<[u8; 32]>().to_vec(),
             bound_fields_digest: rand::random::<[u8; 32]>().to_vec(),
             consumed_ticket_sha256: rand::random::<[u8; 32]>().to_vec(),
+            expected_claim_identity_digest: expected_claim_identity_digest.clone(),
         },
-        expected_claim_identity_digest: rand::random::<[u8; 32]>().to_vec(),
+        expected_claim_identity_digest,
         stale_finalize_permit: rand::random::<[u8; 32]>().to_vec(),
         stale_finalize_permit_revision: 11,
         permit_verification_digest: rand::random::<[u8; 32]>().to_vec(),
@@ -125,37 +134,95 @@ fn namespace_key() -> ProofNamespaceKey {
     }
 }
 
-async fn seed_matching_dispatch_fence(client: &Client, input: &VerifiedStaleFinalizeInput) {
-    client
-        .execute(
-            "INSERT INTO lore_domain_operation_dispatch_possibility_fences (\
-                verified_issuer, authenticated_subject, tenant_scope_key, operation_id, \
-                method, scope, fingerprint_version, fingerprint, canonical_intent_digest, \
-                authorization_id, authorization_revision, verification_nonce, \
-                bound_fields_digest, consumed_ticket_sha256, expected_claim_identity_digest, \
-                created_revision, created_at, safe_prune_after) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,1, \
-                     clock_timestamp(), clock_timestamp() + interval '400 days')",
-            &[
-                &input.key.verified_issuer,
-                &input.key.authenticated_subject,
-                &input.key.tenant_scope_key,
-                &input.key.operation_id.as_bytes().as_slice(),
-                &input.binding.method,
-                &input.binding.scope,
-                &input.binding.fingerprint_version,
-                &input.binding.fingerprint,
-                &input.binding.canonical_intent_digest,
-                &input.witness.authorization_id,
-                &input.witness.authorization_revision,
-                &input.witness.verification_nonce,
-                &input.witness.bound_fields_digest,
-                &input.witness.consumed_ticket_sha256,
-                &input.expected_claim_identity_digest,
-            ],
-        )
+async fn prepare_terminal_fixture_by_the_rail(
+    store: &PostgresDomainStore,
+    client: &mut Client,
+    stale: &VerifiedStaleFinalizeInput,
+) -> Vec<u8> {
+    let tx = client.transaction().await.expect("begin rail fixture tx");
+    let clock = admission_clock(&tx).await.expect("read admission clock");
+    tx.rollback().await.expect("finish clock sample");
+
+    let current_operation_id = uuid_v7_at(clock);
+    let mut current_key = stale.key.clone();
+    current_key.operation_id = current_operation_id;
+    let mut current_witness = stale.witness.clone();
+    current_witness.authorization_id = current_operation_id.as_bytes().to_vec();
+    current_witness.expected_claim_identity_digest = stale.expected_claim_identity_digest.clone();
+    let prepared = store
+        .domain_operation_prepare(&current_key, &stale.binding, Some(&current_witness))
         .await
-        .expect("seed matching dispatch fence");
+        .expect("rail prepares the terminal fixture");
+    let PrepareResult::Prepared { token, .. } = prepared else {
+        panic!("rail terminal fixture must prepare, got {prepared:?}");
+    };
+
+    let public_result = b"rail-produced-applied-receipt-v1".to_vec();
+    let tx = client.transaction().await.expect("begin rail terminal tx");
+    let consumed = consume(&tx, &current_key, &stale.binding, &token)
+        .await
+        .expect("consume rail fixture");
+    let ConsumeResult::Admitted(consumed) = consumed else {
+        panic!("prepared fixture must be consumable");
+    };
+    commit_terminal(
+        &tx,
+        &current_key,
+        &DomainOutcome::Applied,
+        Some(&public_result),
+        consumed.admission_clock,
+    )
+    .await
+    .expect("terminalize rail fixture");
+    tx.commit().await.expect("commit rail terminal fixture");
+
+    let stale_operation_id = stale.key.operation_id.as_bytes().as_slice();
+    let current_operation_id = current_operation_id.as_bytes().as_slice();
+    let stale_authorization_id = stale.witness.authorization_id.as_slice();
+    let current_authorization_id = current_witness.authorization_id.as_slice();
+    let tx = client
+        .transaction()
+        .await
+        .expect("begin deterministic aging tx");
+    tx.execute(
+        "UPDATE lore_domain_operation_receipts \
+            SET operation_id=$1, authorization_id=$2, \
+                uuid_timestamp=clock_timestamp()-interval '366 days' \
+          WHERE verified_issuer=$3 AND authenticated_subject=$4 \
+            AND tenant_scope_key=$5 AND operation_id=$6 AND authorization_id=$7",
+        &[
+            &stale_operation_id,
+            &stale_authorization_id,
+            &stale.key.verified_issuer,
+            &stale.key.authenticated_subject,
+            &stale.key.tenant_scope_key,
+            &current_operation_id,
+            &current_authorization_id,
+        ],
+    )
+    .await
+    .expect("age the rail receipt identity without hand-seeding it");
+    tx.execute(
+        "UPDATE lore_domain_operation_dispatch_possibility_fences \
+            SET operation_id=$1, authorization_id=$2 \
+          WHERE verified_issuer=$3 AND authenticated_subject=$4 \
+            AND tenant_scope_key=$5 AND operation_id=$6 AND authorization_id=$7",
+        &[
+            &stale_operation_id,
+            &stale_authorization_id,
+            &stale.key.verified_issuer,
+            &stale.key.authenticated_subject,
+            &stale.key.tenant_scope_key,
+            &current_operation_id,
+            &current_authorization_id,
+        ],
+    )
+    .await
+    .expect("age the prepare-created fence identity without hand-seeding it");
+    tx.commit()
+        .await
+        .expect("commit deterministic fixture aging");
+    public_result
 }
 
 fn terminal_phase1_input(
@@ -168,7 +235,7 @@ fn terminal_phase1_input(
         authorization_revision: stale.witness.authorization_revision,
         claim_id: rand::random::<[u8; 16]>().to_vec(),
         claim_revision: 17,
-        terminal_outcome: 1,
+        terminal_outcome: 0,
         terminal_receipt_sha256: ring::digest::digest(&ring::digest::SHA256, public_result)
             .as_ref()
             .to_vec(),
@@ -204,8 +271,8 @@ fn completion_marker_digest(
     use ring::digest::SHA256;
 
     let mut digest = Context::new(&SHA256);
-    digest.update(b"domain-tombstone-release-completion-marker-v1\0");
     for part in [
+        b"domain-tombstone-release-completion-marker-v1\0".as_slice(),
         input.key.verified_issuer.as_bytes(),
         input.key.authenticated_subject.as_bytes(),
         input.key.tenant_scope_key.as_slice(),
@@ -239,21 +306,49 @@ fn completion_marker_digest(
             .unwrap_or_default(),
         input.request_digest.as_slice(),
     ] {
+        let length = u32::try_from(part.len())
+            .expect("completion-marker test field must fit the canonical u32 frame");
+        digest.update(&length.to_be_bytes());
         digest.update(part);
     }
     digest.finish().as_ref().to_vec()
 }
 
-async fn capacity_pair(client: &Client) -> (i64, i64) {
+async fn provision_capacity(client: &Client, org_uuid: &[u8]) -> (i64, i64) {
+    let counter_revision = 7_i64;
+    let quota_revision = 7_i32;
     client
-        .query_opt(
+        .execute(
+            "INSERT INTO lore_domain_proof_global_counters (id, counter_revision, quota_revision, \
+                represented_namespace_rows, retained_marker_count, outstanding_proof_claims, \
+                fragment_count, fragment_bytes, marker_bytes, updated_at) \
+             VALUES (1,$1,$2,0,0,0,0,0,0,clock_timestamp())",
+            &[&counter_revision, &quota_revision],
+        )
+        .await
+        .expect("provision global proof capacity authority");
+    client
+        .execute(
+            "INSERT INTO lore_domain_proof_org_counters (org_uuid, counter_revision, quota_revision, \
+                represented_namespace_rows, retained_marker_count, fragment_count, fragment_bytes, \
+                marker_bytes, updated_at) VALUES ($1,$2,$3,0,0,0,0,0,clock_timestamp())",
+            &[&org_uuid, &counter_revision, &quota_revision],
+        )
+        .await
+        .expect("provision organization proof capacity authority");
+    (counter_revision, i64::from(quota_revision))
+}
+
+async fn capacity_pair(client: &Client) -> (i64, i64) {
+    let row = client
+        .query_one(
             "SELECT counter_revision, quota_revision::bigint AS quota_revision \
              FROM lore_domain_proof_global_counters WHERE id=1",
             &[],
         )
         .await
-        .expect("read proof capacity")
-        .map_or((7, 7), |row| (row.get(0), row.get(1)))
+        .expect("read provisioned proof capacity");
+    (row.get(0), row.get(1))
 }
 
 async fn completion_state(
@@ -569,15 +664,11 @@ async fn terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tom
         return;
     };
     let store = store(&url).await;
-    let direct = client(&url).await;
+    let mut direct = client(&url).await;
     let clock = store.domain_operation_clock_get().await.expect("DB clock");
     let stale = stale_input(clock);
-    let finalized = store
-        .domain_operation_verified_stale_finalize(&stale)
-        .await
-        .expect("seed terminal receipt");
-    seed_matching_dispatch_fence(&direct, &stale).await;
-    let phase1 = terminal_phase1_input(&stale, &finalized.committed_receipt_canonical);
+    let public_result = prepare_terminal_fixture_by_the_rail(&store, &mut direct, &stale).await;
+    let phase1 = terminal_phase1_input(&stale, &public_result);
 
     let pending = store
         .domain_operation_terminal_status_attach(&phase1)
@@ -642,6 +733,45 @@ async fn terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tom
         "tombstone replay must preserve exact ack"
     );
 
+    let stale_after_tombstone = store
+        .domain_operation_verified_stale_finalize(&stale)
+        .await
+        .expect("tombstone must decide stale-finalize replay");
+    assert_eq!(
+        stale_after_tombstone.status,
+        VerifiedStaleFinalizeStatus::IneligibleReceiptOrDispatchPossible,
+        "an exact tombstone proves prior terminal lifecycle before UUID staleness"
+    );
+    let mut stale_tombstone_mismatch = stale.clone();
+    stale_tombstone_mismatch.binding.scope[0] ^= 0xff;
+    let stale_tombstone_mismatch = store
+        .domain_operation_verified_stale_finalize(&stale_tombstone_mismatch)
+        .await
+        .expect("tombstone binding mismatch is decisive");
+    assert_eq!(
+        stale_tombstone_mismatch.status,
+        VerifiedStaleFinalizeStatus::Mismatch
+    );
+    let receipt_count: i64 = direct
+        .query_one(
+            "SELECT count(*) FROM lore_domain_operation_receipts \
+              WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+                AND tenant_scope_key=$3 AND operation_id=$4",
+            &[
+                &stale.key.verified_issuer,
+                &stale.key.authenticated_subject,
+                &stale.key.tenant_scope_key,
+                &stale.key.operation_id.as_bytes().as_slice(),
+            ],
+        )
+        .await
+        .expect("count receipts after tombstone stale-finalize probes")
+        .get(0);
+    assert_eq!(
+        receipt_count, 0,
+        "neither tombstone result may manufacture a stale NOT_APPLIED receipt"
+    );
+
     let row = direct
         .query_one(
             "SELECT \
@@ -666,17 +796,14 @@ async fn terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tom
         (0, 0, 1)
     );
 
-    let (counter, quota) = capacity_pair(&direct).await;
-    let materialize = materialize_input(
-        ProofNamespaceKey {
-            verified_issuer: stale.key.verified_issuer.clone(),
-            authenticated_subject: stale.key.authenticated_subject.clone(),
-            org_uuid: rand::random::<[u8; 16]>().to_vec(),
-            tenant_scope_key: stale.key.tenant_scope_key.clone(),
-        },
-        counter,
-        quota,
-    );
+    let namespace = ProofNamespaceKey {
+        verified_issuer: stale.key.verified_issuer.clone(),
+        authenticated_subject: stale.key.authenticated_subject.clone(),
+        org_uuid: rand::random::<[u8; 16]>().to_vec(),
+        tenant_scope_key: stale.key.tenant_scope_key.clone(),
+    };
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let materialize = materialize_input(namespace, counter, quota);
     let materialized = store
         .domain_operation_proof_namespace_materialize(&materialize)
         .await
@@ -893,6 +1020,60 @@ async fn terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tom
 
     direct
         .execute(
+            "DELETE FROM lore_domain_operation_reserve_release_tombstones \
+              WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+                AND tenant_scope_key=$3 AND operation_id=$4",
+            &[
+                &stale.key.verified_issuer,
+                &stale.key.authenticated_subject,
+                &stale.key.tenant_scope_key,
+                &stale.key.operation_id.as_bytes().as_slice(),
+            ],
+        )
+        .await
+        .expect("isolate completion-marker stale-finalize evidence");
+    let stale_after_completion = store
+        .domain_operation_verified_stale_finalize(&stale)
+        .await
+        .expect("completion marker must decide stale-finalize replay");
+    assert_eq!(
+        stale_after_completion.status,
+        VerifiedStaleFinalizeStatus::IneligibleReceiptOrDispatchPossible,
+        "an exact completion marker proves prior terminal lifecycle before UUID staleness"
+    );
+    let mut stale_completion_changed_binding = stale.clone();
+    stale_completion_changed_binding.binding.fingerprint[0] ^= 0xff;
+    let stale_completion_changed_binding = store
+        .domain_operation_verified_stale_finalize(&stale_completion_changed_binding)
+        .await
+        .expect("completion-marker existence remains decisive");
+    assert_eq!(
+        stale_completion_changed_binding.status,
+        VerifiedStaleFinalizeStatus::IneligibleReceiptOrDispatchPossible,
+        "the marker retains proof identity, not reconstructable method/scope/fingerprint binding"
+    );
+    let receipt_count: i64 = direct
+        .query_one(
+            "SELECT count(*) FROM lore_domain_operation_receipts \
+              WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+                AND tenant_scope_key=$3 AND operation_id=$4",
+            &[
+                &stale.key.verified_issuer,
+                &stale.key.authenticated_subject,
+                &stale.key.tenant_scope_key,
+                &stale.key.operation_id.as_bytes().as_slice(),
+            ],
+        )
+        .await
+        .expect("count receipts after completion-marker stale-finalize probes")
+        .get(0);
+    assert_eq!(
+        receipt_count, 0,
+        "neither completion-marker result may manufacture a stale NOT_APPLIED receipt"
+    );
+
+    direct
+        .execute(
             "UPDATE lore_domain_operation_tombstone_release_completion_markers \
              SET created_at=clock_timestamp()-interval '2 seconds', \
                  retain_until=clock_timestamp()-interval '1 second' \
@@ -935,6 +1116,113 @@ async fn terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tom
 
 #[tokio::test]
 #[ignore = "needs live Postgres env; run this test target serially with -- --ignored --test-threads=1"]
+async fn terminal_phase1_mismatch_leaves_the_dispatch_fence_untouched() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let mut direct = client(&url).await;
+    let clock = store.domain_operation_clock_get().await.expect("DB clock");
+    let stale = stale_input(clock);
+    let public_result = prepare_terminal_fixture_by_the_rail(&store, &mut direct, &stale).await;
+    let phase1 = terminal_phase1_input(&stale, &public_result);
+    let key = &[
+        &stale.key.verified_issuer as &(dyn tokio_postgres::types::ToSql + Sync),
+        &stale.key.authenticated_subject,
+        &stale.key.tenant_scope_key,
+        &stale.key.operation_id.as_bytes().as_slice(),
+    ];
+    direct
+        .execute(
+            "UPDATE lore_domain_operation_receipts \
+             SET compact_expires_at=clock_timestamp()-interval '1 second' \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+               AND tenant_scope_key=$3 AND operation_id=$4",
+            key,
+        )
+        .await
+        .expect("age receipt retention");
+
+    direct
+        .execute(
+            "CREATE TABLE wp116_saved_receipt AS \
+         SELECT * FROM lore_domain_operation_receipts \
+         WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+           AND tenant_scope_key=$3 AND operation_id=$4",
+            key,
+        )
+        .await
+        .expect("save receipt before exchange");
+    direct
+        .execute(
+            "CREATE TABLE wp116_saved_fence AS \
+         SELECT * FROM lore_domain_operation_dispatch_possibility_fences \
+         WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+           AND tenant_scope_key=$3 AND operation_id=$4",
+            key,
+        )
+        .await
+        .expect("save fence before exchange");
+    let ready = store
+        .domain_operation_terminal_status_attach(&phase1)
+        .await
+        .expect("create a real conflicting tombstone");
+    assert_eq!(
+        ready.status,
+        TerminalStatusAttachStatus::Phase1TombstoneReady
+    );
+    direct
+        .execute(
+            "INSERT INTO lore_domain_operation_receipts SELECT * FROM wp116_saved_receipt",
+            &[],
+        )
+        .await
+        .expect("restore saved receipt");
+    direct
+        .execute(
+            "INSERT INTO lore_domain_operation_dispatch_possibility_fences \
+         SELECT * FROM wp116_saved_fence",
+            &[],
+        )
+        .await
+        .expect("restore saved fence without an acknowledgement");
+    direct
+        .execute(
+            "UPDATE lore_domain_operation_reserve_release_tombstones \
+         SET claim_revision=claim_revision+1 \
+         WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+           AND tenant_scope_key=$3 AND operation_id=$4",
+            key,
+        )
+        .await
+        .expect("make the real tombstone conflict non-exact");
+
+    let mismatch = store
+        .domain_operation_terminal_status_attach(&phase1)
+        .await
+        .expect("conflicting tombstone is decisive");
+    assert_eq!(mismatch.status, TerminalStatusAttachStatus::Mismatch);
+    let fence = direct
+        .query_one(
+            "SELECT terminal_status_ack_digest, terminal_status_revision, terminal_status_ack_at \
+             FROM lore_domain_operation_dispatch_possibility_fences \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+               AND tenant_scope_key=$3 AND operation_id=$4",
+            key,
+        )
+        .await
+        .expect("read restored fence after mismatch");
+    assert!(
+        fence.get::<_, Option<Vec<u8>>>(0).is_none()
+            && fence.get::<_, Option<i64>>(1).is_none()
+            && fence.get::<_, Option<SystemTime>>(2).is_none(),
+        "Mismatch must not acknowledge or otherwise mutate the dispatch fence"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs live Postgres env; run this test target serially with -- --ignored --test-threads=1"]
 async fn materialize_replay_preserves_receipt_and_changed_claim_mismatches() {
     let Some(url) = pg_url() else {
         eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
@@ -942,8 +1230,9 @@ async fn materialize_replay_preserves_receipt_and_changed_claim_mismatches() {
     };
     let store = store(&url).await;
     let direct = client(&url).await;
-    let (counter, quota) = capacity_pair(&direct).await;
-    let input = materialize_input(namespace_key(), counter, quota);
+    let namespace = namespace_key();
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let input = materialize_input(namespace, counter, quota);
 
     let first = store
         .domain_operation_proof_namespace_materialize(&input)
@@ -1012,6 +1301,50 @@ async fn materialize_replay_preserves_receipt_and_changed_claim_mismatches() {
 
 #[tokio::test]
 #[ignore = "needs live Postgres env; run this test target serially with -- --ignored --test-threads=1"]
+async fn materialize_replay_with_a_null_receipt_is_mismatch_not_a_panic() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping nullable materialization receipt test");
+        return;
+    };
+    let store = store(&url).await;
+    let direct = client(&url).await;
+    let namespace = namespace_key();
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let input = materialize_input(namespace, counter, quota);
+    let first = store
+        .domain_operation_proof_namespace_materialize(&input)
+        .await
+        .expect("materialize setup namespace");
+    assert_eq!(first.status, ProofNamespaceMaterializeStatus::Materialized);
+
+    direct
+        .execute(
+            "UPDATE lore_domain_proof_namespaces SET materialization_receipt=NULL \
+              WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+                AND tenant_scope_key=$3 AND epoch=$4",
+            &[
+                &input.key.verified_issuer,
+                &input.key.authenticated_subject,
+                &input.key.tenant_scope_key,
+                &input.namespace_epoch,
+            ],
+        )
+        .await
+        .expect("exercise the schema-permitted nullable receipt state");
+
+    let replay = store
+        .domain_operation_proof_namespace_materialize(&input)
+        .await
+        .expect("nullable receipt must be handled without Row::get panic");
+    assert_eq!(
+        replay.status,
+        ProofNamespaceMaterializeStatus::Mismatch,
+        "a matching row with no canonical receipt cannot claim a replay"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs live Postgres env; run this test target serially with -- --ignored --test-threads=1"]
 async fn materialize_capacity_revision_mismatch_writes_no_namespace() {
     let Some(url) = pg_url() else {
         eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
@@ -1019,15 +1352,18 @@ async fn materialize_capacity_revision_mismatch_writes_no_namespace() {
     };
     let store = store(&url).await;
     let direct = client(&url).await;
-    let (initial_counter, initial_quota) = capacity_pair(&direct).await;
-    let seed = materialize_input(namespace_key(), initial_counter, initial_quota);
+    let seed_key = namespace_key();
+    let (initial_counter, initial_quota) = provision_capacity(&direct, &seed_key.org_uuid).await;
+    let seed = materialize_input(seed_key, initial_counter, initial_quota);
     let seeded = store
         .domain_operation_proof_namespace_materialize(&seed)
         .await
         .expect("seed the capacity counter");
     assert_eq!(seeded.status, ProofNamespaceMaterializeStatus::Materialized);
     let (counter, quota) = capacity_pair(&direct).await;
-    let input = materialize_input(namespace_key(), counter + 1, quota);
+    let mut input_key = namespace_key();
+    input_key.org_uuid = seed.key.org_uuid.clone();
+    let input = materialize_input(input_key, counter + 1, quota);
     let blocked = store
         .domain_operation_proof_namespace_materialize(&input)
         .await
@@ -1053,6 +1389,51 @@ async fn materialize_capacity_revision_mismatch_writes_no_namespace() {
 }
 
 #[tokio::test]
+#[ignore = "needs a fresh disposable live Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn fresh_cell_materialize_requires_preprovisioned_capacity_counters() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let direct = client(&url).await;
+    let input = materialize_input(namespace_key(), 1, 1);
+
+    let blocked = store
+        .domain_operation_proof_namespace_materialize(&input)
+        .await
+        .expect("missing capacity authority is a decisive result");
+    assert_eq!(
+        blocked.status,
+        ProofNamespaceMaterializeStatus::CapacityBlocked
+    );
+
+    let global_rows: i64 = direct
+        .query_one(
+            "SELECT count(*) FROM lore_domain_proof_global_counters",
+            &[],
+        )
+        .await
+        .expect("count global counters")
+        .get(0);
+    let org_rows: i64 = direct
+        .query_one("SELECT count(*) FROM lore_domain_proof_org_counters", &[])
+        .await
+        .expect("count organization counters")
+        .get(0);
+    let namespace_rows: i64 = direct
+        .query_one("SELECT count(*) FROM lore_domain_proof_namespaces", &[])
+        .await
+        .expect("count proof namespaces")
+        .get(0);
+    assert_eq!(
+        (global_rows, org_rows, namespace_rows),
+        (0, 0, 0),
+        "a caller revision must never bootstrap authority counters or claim a namespace"
+    );
+}
+
+#[tokio::test]
 #[ignore = "needs live Postgres env; run this test target serially with -- --ignored --test-threads=1"]
 async fn retire_is_atomic_replays_absence_and_rejects_expired_permit() {
     let Some(url) = pg_url() else {
@@ -1061,8 +1442,9 @@ async fn retire_is_atomic_replays_absence_and_rejects_expired_permit() {
     };
     let store = store(&url).await;
     let direct = client(&url).await;
-    let (counter, quota) = capacity_pair(&direct).await;
-    let materialize = materialize_input(namespace_key(), counter, quota);
+    let namespace = namespace_key();
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let materialize = materialize_input(namespace, counter, quota);
     store
         .domain_operation_proof_namespace_materialize(&materialize)
         .await
@@ -1149,8 +1531,9 @@ async fn retire_requires_exact_fence_generation_and_final_range_digest() {
     };
     let store = store(&url).await;
     let direct = client(&url).await;
-    let (counter, quota) = capacity_pair(&direct).await;
-    let materialize = materialize_input(namespace_key(), counter, quota);
+    let namespace = namespace_key();
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let materialize = materialize_input(namespace, counter, quota);
     store
         .domain_operation_proof_namespace_materialize(&materialize)
         .await
@@ -1186,8 +1569,9 @@ async fn retire_rejects_nonquiescent_namespace_and_changed_epoch_claim_without_m
     };
     let store = store(&url).await;
     let direct = client(&url).await;
-    let (counter, quota) = capacity_pair(&direct).await;
-    let materialize = materialize_input(namespace_key(), counter, quota);
+    let namespace = namespace_key();
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let materialize = materialize_input(namespace, counter, quota);
     store
         .domain_operation_proof_namespace_materialize(&materialize)
         .await

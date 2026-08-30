@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Plugin registry for managing plugin factories.
 //!
@@ -22,6 +23,7 @@ use tracing::info;
 
 use crate::plugins::traits::ImmutableStorePluginFactory;
 use crate::plugins::traits::LockStorePluginFactory;
+use crate::plugins::traits::MutableStorePluginContext;
 use crate::plugins::traits::MutableStorePluginFactory;
 use crate::plugins::traits::NotificationPlugin;
 use crate::plugins::traits::NotificationPluginContext;
@@ -308,18 +310,21 @@ impl PluginRegistry {
         plugin_name: &str,
         config: &toml::Value,
         immutable_store: Arc<dyn ImmutableStore>,
+        context: &MutableStorePluginContext,
     ) -> Result<Arc<dyn MutableStore>, PluginError> {
         if let Some(factory) = self.mutable_store_factories.get(plugin_name) {
-            factory.create(config, immutable_store).inspect_err(|e| {
-                let available = self.list_mutable_store_plugins();
-                error!(
-                    plugin_name = plugin_name,
-                    plugin_type = "mutable_store",
-                    error = %e,
-                    available_plugins = ?available,
-                    "Failed to create mutable store plugin"
-                );
-            })
+            factory
+                .create(config, immutable_store, context)
+                .inspect_err(|e| {
+                    let available = self.list_mutable_store_plugins();
+                    error!(
+                        plugin_name = plugin_name,
+                        plugin_type = "mutable_store",
+                        error = %e,
+                        available_plugins = ?available,
+                        "Failed to create mutable store plugin"
+                    );
+                })
         } else {
             let available = self.list_mutable_store_plugins();
             error!(
@@ -1184,6 +1189,7 @@ mod tests {
             &self,
             config: &toml::Value,
             _immutable_store: Arc<dyn ImmutableStore>,
+            _context: &MutableStorePluginContext,
         ) -> Result<Arc<dyn MutableStore>, PluginError> {
             if self.should_fail_config {
                 return Err(PluginConfigError {
@@ -1499,7 +1505,12 @@ mod tests {
         registry.register_mutable_store_plugin(Box::new(MockMutableStoreFactory::new("test")));
 
         let config = toml::Value::Table(toml::map::Map::new());
-        let result = registry.create_mutable_store("test", &config, Arc::new(MockImmutableStore));
+        let result = registry.create_mutable_store(
+            "test",
+            &config,
+            Arc::new(MockImmutableStore),
+            &MutableStorePluginContext::default(),
+        );
         assert!(result.is_ok());
     }
 
@@ -1509,8 +1520,12 @@ mod tests {
         registry.register_mutable_store_plugin(Box::new(MockMutableStoreFactory::new("other")));
 
         let config = toml::Value::Table(toml::map::Map::new());
-        let result =
-            registry.create_mutable_store("missing", &config, Arc::new(MockImmutableStore));
+        let result = registry.create_mutable_store(
+            "missing",
+            &config,
+            Arc::new(MockImmutableStore),
+            &MutableStorePluginContext::default(),
+        );
 
         let Err(e) = result else {
             panic!("expected error");
@@ -1528,7 +1543,12 @@ mod tests {
         ));
 
         let config = toml::Value::Table(toml::map::Map::new());
-        let result = registry.create_mutable_store("test", &config, Arc::new(MockImmutableStore));
+        let result = registry.create_mutable_store(
+            "test",
+            &config,
+            Arc::new(MockImmutableStore),
+            &MutableStorePluginContext::default(),
+        );
 
         let Err(e) = result else {
             panic!("expected error");
@@ -1547,7 +1567,12 @@ mod tests {
         ));
 
         let config = toml::Value::Table(toml::map::Map::new());
-        let result = registry.create_mutable_store("test", &config, Arc::new(MockImmutableStore));
+        let result = registry.create_mutable_store(
+            "test",
+            &config,
+            Arc::new(MockImmutableStore),
+            &MutableStorePluginContext::default(),
+        );
 
         let Err(e) = result else {
             panic!("expected error");

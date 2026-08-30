@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -20,6 +21,10 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::domain::DomainContext;
+use crate::domain::GovernedScope;
+use crate::domain::admit_at_entry;
+use crate::domain::reject_unwired_governed_operation;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -47,7 +52,10 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     enforce_write_permission: bool,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<BranchMetadataSetResponse>, Status> {
+    let request_metadata = request.metadata().clone();
+    let request_authorization = crate::grpc::get_authorization_optional(request.extensions());
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
@@ -56,6 +64,20 @@ pub async fn handler(
     // deserialized.
     let extensions = request.extensions().clone();
     let req = request.into_inner();
+
+    if let Some(admitted) = admit_at_entry(
+        domain_context,
+        &request_metadata,
+        request_authorization.as_ref(),
+        GovernedScope::TargetRepository {
+            repository_id: repository_id.data(),
+        },
+    )? {
+        return Err(reject_unwired_governed_operation(
+            &admitted,
+            "lore.revision.v1.RevisionService/BranchMetadataSet",
+        ));
+    }
 
     let branch_id = BranchId::from(req.id);
     if branch_id == BranchId::default() {
@@ -216,6 +238,31 @@ mod test {
         request
     }
 
+    #[tokio::test]
+    #[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
+    async fn enforcing_cell_rejects_before_v1_metadata_cas_body() {
+        let Some(domain) = crate::domain::test_support::configured_enforcing_context().await else {
+            return;
+        };
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, _) = test_store_create().await.expect("test stores");
+        let error = handler(
+            make_request(
+                repository,
+                BranchId::default(),
+                Hash::default(),
+                Hash::default(),
+            ),
+            immutable_store,
+            mutable_store,
+            false,
+            Some(&domain),
+        )
+        .await
+        .expect_err("enforcement must reject missing operation carriage at entry");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
     /// Create a branch and return its current metadata pointer.
     async fn create_branch(repository: Arc<RepositoryContext>, branch_id: BranchId) -> Hash {
         let write_token = get_write_token();
@@ -274,6 +321,7 @@ mod test {
                 immutable_store,
                 mutable_store,
                 false,
+                None,
             )
             .await
             .expect("CAS hit should succeed");
@@ -321,6 +369,7 @@ mod test {
                 immutable_store,
                 mutable_store,
                 false,
+                None,
             )
             .await
             .expect("CAS miss should still return Ok");
@@ -361,6 +410,7 @@ mod test {
                 immutable_store,
                 mutable_store,
                 false,
+                None,
             )
             .await
             .expect_err("read-only name modification must fail");
@@ -398,6 +448,7 @@ mod test {
                 immutable_store,
                 mutable_store,
                 false,
+                None,
             )
             .await
             .expect_err("read-only category modification must fail");
@@ -433,6 +484,7 @@ mod test {
                 immutable_store,
                 mutable_store,
                 false,
+                None,
             )
             .await
             .expect_err("removal of read-only creator must fail");
@@ -470,6 +522,7 @@ mod test {
                 immutable_store,
                 mutable_store,
                 false,
+                None,
             )
             .await
             .expect("protect toggle must succeed");
@@ -491,6 +544,7 @@ mod test {
                 immutable_store,
                 mutable_store,
                 false,
+                None,
             )
             .await
             .expect_err("unknown branch must fail");
@@ -593,6 +647,7 @@ mod test {
                 immutable_store,
                 mutable_store,
                 false,
+                None,
             )
             .await
             .expect("CAS on deleted branch must succeed");
@@ -625,6 +680,7 @@ mod test {
                 immutable_store,
                 mutable_store,
                 false,
+                None,
             )
             .await
             .expect_err("garbage updated hash must fail to deserialize");
@@ -663,6 +719,7 @@ mod test {
                 immutable_store,
                 mutable_store,
                 false,
+                None,
             )
             .await
             .expect_err("garbage expected hash must fail to deserialize");
@@ -704,6 +761,7 @@ mod test {
                 immutable_store,
                 mutable_store,
                 false,
+                None,
             )
             .await
             .expect_err("dangling address reference must fail");
@@ -729,6 +787,7 @@ mod test {
             immutable_store,
             mutable_store,
             false,
+            None,
         )
         .await
         .expect_err("zero branch id must fail");
@@ -746,7 +805,7 @@ mod test {
             expected: Hash::default().into(),
             updated: Hash::default().into(),
         });
-        let err = handler(request, immutable_store, mutable_store, false)
+        let err = handler(request, immutable_store, mutable_store, false, None)
             .await
             .expect_err("missing repository must fail");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -811,7 +870,7 @@ mod test {
                 repository_id,
                 &["read", "write"],
             );
-            let err = handler(request, immutable_store, mutable_store, true)
+            let err = handler(request, immutable_store, mutable_store, true, None)
                 .await
                 .expect_err("toggling protect requires admin");
             assert_eq!(err.code(), tonic::Code::PermissionDenied);
@@ -840,7 +899,7 @@ mod test {
                 repository_id,
                 &["read", "write", "admin"],
             );
-            let response = handler(request, immutable_store, mutable_store, true)
+            let response = handler(request, immutable_store, mutable_store, true, None)
                 .await
                 .expect("admin may toggle protect");
             assert_eq!(Hash::from(response.into_inner().metadata), updated);
@@ -875,7 +934,7 @@ mod test {
                 repository_id,
                 &["read", "write"],
             );
-            let response = handler(request, immutable_store, mutable_store, true)
+            let response = handler(request, immutable_store, mutable_store, true, None)
                 .await
                 .expect("a write token may set non-protect metadata");
             assert_eq!(Hash::from(response.into_inner().metadata), updated);
@@ -910,7 +969,7 @@ mod test {
                 repository_id,
                 &["read"],
             );
-            let err = handler(request, immutable_store, mutable_store, true)
+            let err = handler(request, immutable_store, mutable_store, true, None)
                 .await
                 .expect_err("a read-only token must not write metadata");
             assert_eq!(err.code(), tonic::Code::PermissionDenied);
@@ -941,7 +1000,7 @@ mod test {
                 repository_id,
                 &["read"],
             );
-            let response = handler(request, immutable_store, mutable_store, false)
+            let response = handler(request, immutable_store, mutable_store, false, None)
                 .await
                 .expect("enforcement disabled lets any token through");
             assert_eq!(Hash::from(response.into_inner().metadata), updated);

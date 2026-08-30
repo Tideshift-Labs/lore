@@ -146,6 +146,10 @@ pub struct VerifyRepositoryOperationAuthorizationResponse {
     pub verified_issuer: ::prost::alloc::string::String,
     #[prost(string, tag = "15")]
     pub authenticated_subject: ::prost::alloc::string::String,
+    /// Frozen claim-identity digest minted by the platform verify CAS and bound
+    /// into the first PREPARED fence.
+    #[prost(bytes = "bytes", tag = "16")]
+    pub expected_claim_identity_digest: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DomainOperationMaintenanceVerificationRequest {

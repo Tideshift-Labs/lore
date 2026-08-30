@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::future::Future;
@@ -92,6 +93,16 @@ type GrpcRouter = tonic::transport::server::Router<
         >,
     >,
 >;
+
+/// Whether the private domain-operation service is mounted and may be
+/// advertised through `ServerInfo`.
+pub(crate) fn domain_operation_service_available(
+    has_domain_context: bool,
+    auth_url: Option<&str>,
+    auth_enabled: bool,
+) -> bool {
+    has_domain_context && auth_url.is_some() && auth_enabled
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct GrpcServiceSettings {
@@ -447,6 +458,7 @@ impl GrpcServerBuilder<WantsAdminEndpoints> {
             self.0.mutable_store.clone(),
             self.0.notification_sender.clone(),
             self.0.hook_dispatcher.clone(),
+            self.0.domain_context.clone(),
         );
         GrpcServerBuilder(WantsHttp2Config {
             environment: self.0.environment,
@@ -601,6 +613,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             rpc_timeout,
             enforce_write_permission,
             push_lock_enforcement.clone(),
+            self.0.domain_context.clone(),
         ));
         let revision_v1_svc = LoreRevisionV1Service::new(
             self.0.immutable_store.clone(),
@@ -613,6 +626,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             rpc_timeout,
             enforce_write_permission,
             push_lock_enforcement,
+            self.0.domain_context.clone(),
         );
         let revision_diff_config = crate::grpc::thinclient::v1::revision_diff::RevisionDiffConfig {
             source_cap: self.0.feature.revision_diff_source_cap.unwrap_or(
@@ -649,19 +663,30 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         // auth-grpc verifier URL. It is registered below only in the auth-ON
         // branch through JWTAuthnInterceptor. A partial configuration exposes
         // no endpoint and advertises no v2 capability.
-        let domain_operation_svc = self.0.domain_context.clone().and_then(|domain| {
+        let auth_url = self
+            .0
+            .environment
+            .endpoint
+            .as_ref()
+            .and_then(|endpoint| endpoint.auth_url.clone());
+        let domain_operation_svc = if domain_operation_service_available(
+            self.0.domain_context.is_some(),
+            auth_url.as_deref(),
+            jwt_verifier.is_some(),
+        ) {
             self.0
-                .environment
-                .endpoint
-                .as_ref()
-                .and_then(|endpoint| endpoint.auth_url.clone())
-                .map(|auth_url| {
+                .domain_context
+                .clone()
+                .zip(auth_url)
+                .map(|(domain, auth_url)| {
                     LoreDomainOperationV1Service::new(
                         domain,
                         Arc::new(GrpcRepositoryOperationAuthorizationVerifier::new(auth_url)),
                     )
                 })
-        });
+        } else {
+            None
+        };
 
         let environment_svc = LoreEnvironmentService::new(self.0.environment.clone());
         let environment_v1_svc = LoreEnvironmentV1Service::new(self.0.environment);

@@ -33,6 +33,7 @@ use crate::domain::lock_order::lock_branch;
 use crate::domain::lock_order::lock_repository;
 use crate::domain::outbox;
 use crate::domain::receipts;
+use crate::domain::receipts::ConsumeResult;
 use crate::domain::retry::classify_commit;
 use crate::domain::schema;
 use crate::domain::store::PostgresDomainStore;
@@ -45,7 +46,15 @@ async fn apply_projection(
     tx: &Transaction<'_>,
     writes: &[ProjectionWrite],
 ) -> Result<(), DomainError> {
-    for w in writes {
+    let mut ordered = writes.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        (&left.partition, left.key_type, &left.key).cmp(&(
+            &right.partition,
+            right.key_type,
+            &right.key,
+        ))
+    });
+    for w in ordered {
         match &w.value {
             Some(value) => {
                 tx.execute(
@@ -126,8 +135,7 @@ impl PostgresDomainStore {
         client: &'a mut deadpool_postgres::Client,
         operation: &GovernedOperation,
         sequence: &mut LockSequence,
-    ) -> Result<Option<(deadpool_postgres::Transaction<'a>, std::time::SystemTime)>, DomainError>
-    {
+    ) -> Result<BeginAdmitted<'a>, DomainError> {
         let tx = client
             .transaction()
             .await
@@ -141,11 +149,15 @@ impl PostgresDomainStore {
         )
         .await?;
         match admitted {
-            Some(a) => Ok(Some((tx, a.admission_clock))),
-            None => {
+            ConsumeResult::Admitted(a) => Ok(BeginAdmitted::Admitted(tx, a.admission_clock)),
+            ConsumeResult::Committed(outcome) => {
+                classify_commit(tx.commit().await, "domain admission replay commit")?;
+                Ok(BeginAdmitted::Committed(outcome))
+            }
+            ConsumeResult::Rejected => {
                 // Nothing was mutated, so rolling back is the honest close.
                 drop(tx);
-                Ok(None)
+                Ok(BeginAdmitted::Rejected)
             }
         }
     }
@@ -155,6 +167,20 @@ impl PostgresDomainStore {
             .get()
             .await
             .map_err(|e| DomainError::from_pool("domain coordinator pool", e))
+    }
+}
+
+enum BeginAdmitted<'a> {
+    Admitted(deadpool_postgres::Transaction<'a>, std::time::SystemTime),
+    Committed(DomainOutcome),
+    Rejected,
+}
+
+fn replayed_mutation(outcome: DomainOutcome) -> MutationResult {
+    MutationResult {
+        outcome,
+        repository_generation: None,
+        branch_generation: None,
     }
 }
 
@@ -352,11 +378,15 @@ impl DomainTransactionStore for PostgresDomainStore {
             .start("repository_create", self.pool().status());
         let mut client = self.checkout().await?;
         let mut sequence = LockSequence::new();
-        let Some((tx, clock)) = self
+        let (tx, clock) = match self
             .begin_admitted(&mut client, operation, &mut sequence)
             .await?
-        else {
-            return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
+        {
+            BeginAdmitted::Admitted(tx, clock) => (tx, clock),
+            BeginAdmitted::Committed(outcome) => return Ok(replayed_mutation(outcome)),
+            BeginAdmitted::Rejected => {
+                return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
+            }
         };
 
         // An exact create retry must return the durable original record; the
@@ -399,23 +429,6 @@ impl DomainTransactionStore for PostgresDomainStore {
             return Ok(result);
         }
 
-        // The name row is the live-ownership claim. A live owner already holding
-        // it is a decisive rejection, not a conflict to retry.
-        let name_taken = tx
-            .query_opt(
-                "SELECT repository_id FROM lore_domain_repository_names WHERE name = $1 FOR UPDATE",
-                &[&input.name],
-            )
-            .await
-            .map_err(|e| DomainError::from_pg("repository name claim", e))?
-            .is_some();
-        if name_taken {
-            let result = MutationResult::rejected(NAME_TAKEN_V1);
-            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
-            classify_commit(tx.commit().await, "repository create name-taken commit")?;
-            return Ok(result);
-        }
-
         tx.execute(
             "INSERT INTO lore_domain_repositories ( \
                  repository_id, state, generation, name, metadata_hash, default_branch_id, \
@@ -435,14 +448,32 @@ impl DomainTransactionStore for PostgresDomainStore {
         .await
         .map_err(|e| DomainError::from_pg("repository insert", e))?;
 
-        tx.execute(
-            "INSERT INTO lore_domain_repository_names \
-                 (name, repository_id, repository_generation, created_at) \
-             VALUES ($1, $2, 1, $3)",
-            &[&input.name, &input.repository_id, &clock],
-        )
-        .await
-        .map_err(|e| DomainError::from_pg("repository name insert", e))?;
+        // Claim the absent name with the write itself. The name row references
+        // the repository, so create the repository first, then remove that
+        // still-private row if another repository already owns the name. Both
+        // writes remain inside this transaction and no projection/event has
+        // been published yet.
+        let name_inserted = tx
+            .execute(
+                "INSERT INTO lore_domain_repository_names \
+                     (name, repository_id, repository_generation, created_at) \
+                 VALUES ($1, $2, 1, $3) ON CONFLICT (name) DO NOTHING",
+                &[&input.name, &input.repository_id, &clock],
+            )
+            .await
+            .map_err(|e| DomainError::from_pg("repository name claim", e))?;
+        if name_inserted == 0 {
+            tx.execute(
+                "DELETE FROM lore_domain_repositories WHERE repository_id = $1",
+                &[&input.repository_id],
+            )
+            .await
+            .map_err(|e| DomainError::from_pg("repository name-conflict cleanup", e))?;
+            let result = MutationResult::rejected(NAME_TAKEN_V1);
+            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
+            classify_commit(tx.commit().await, "repository create name-taken commit")?;
+            return Ok(result);
+        }
 
         sequence.enter(LockClass::Branch)?;
         tx.execute(
@@ -513,11 +544,15 @@ impl DomainTransactionStore for PostgresDomainStore {
             .start("repository_delete", self.pool().status());
         let mut client = self.checkout().await?;
         let mut sequence = LockSequence::new();
-        let Some((tx, clock)) = self
+        let (tx, clock) = match self
             .begin_admitted(&mut client, operation, &mut sequence)
             .await?
-        else {
-            return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
+        {
+            BeginAdmitted::Admitted(tx, clock) => (tx, clock),
+            BeginAdmitted::Committed(outcome) => return Ok(replayed_mutation(outcome)),
+            BeginAdmitted::Rejected => {
+                return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
+            }
         };
 
         let Some(existing) = lock_repository(&tx, &mut sequence, &input.repository_id).await?
@@ -634,11 +669,15 @@ impl DomainTransactionStore for PostgresDomainStore {
             .start("metadata_cas", self.pool().status());
         let mut client = self.checkout().await?;
         let mut sequence = LockSequence::new();
-        let Some((tx, clock)) = self
+        let (tx, clock) = match self
             .begin_admitted(&mut client, operation, &mut sequence)
             .await?
-        else {
-            return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
+        {
+            BeginAdmitted::Admitted(tx, clock) => (tx, clock),
+            BeginAdmitted::Committed(outcome) => return Ok(replayed_mutation(outcome)),
+            BeginAdmitted::Rejected => {
+                return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
+            }
         };
 
         let Some(repository) = lock_repository(&tx, &mut sequence, &input.repository_id).await?
@@ -754,11 +793,15 @@ impl DomainTransactionStore for PostgresDomainStore {
             .start("branch_push_commit", self.pool().status());
         let mut client = self.checkout().await?;
         let mut sequence = LockSequence::new();
-        let Some((tx, clock)) = self
+        let (tx, clock) = match self
             .begin_admitted(&mut client, operation, &mut sequence)
             .await?
-        else {
-            return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
+        {
+            BeginAdmitted::Admitted(tx, clock) => (tx, clock),
+            BeginAdmitted::Committed(outcome) => return Ok(replayed_mutation(outcome)),
+            BeginAdmitted::Rejected => {
+                return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
+            }
         };
 
         let Some(repository) = lock_repository(&tx, &mut sequence, &input.repository_id).await?
@@ -860,11 +903,15 @@ impl DomainTransactionStore for PostgresDomainStore {
             .start("begin_obliterate", self.pool().status());
         let mut client = self.checkout().await?;
         let mut sequence = LockSequence::new();
-        let Some((tx, clock)) = self
+        let (tx, clock) = match self
             .begin_admitted(&mut client, operation, &mut sequence)
             .await?
-        else {
-            return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
+        {
+            BeginAdmitted::Admitted(tx, clock) => (tx, clock),
+            BeginAdmitted::Committed(outcome) => return Ok(replayed_mutation(outcome)),
+            BeginAdmitted::Rejected => {
+                return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
+            }
         };
 
         let Some(repository) = lock_repository(&tx, &mut sequence, repository_id).await? else {

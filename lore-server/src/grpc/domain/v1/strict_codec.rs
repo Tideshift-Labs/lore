@@ -80,7 +80,7 @@ fn validate_raw_fields(
     raw: &[u8],
     rules: &[RawField],
     required_mask: u64,
-) -> Result<(u64, [u64; 31]), Status> {
+) -> Result<(u64, [u64; 64]), Status> {
     if raw.len() > MAX_RAW_REQUEST_LEN {
         return Err(Status::invalid_argument(
             "protobuf request exceeds 16384 bytes",
@@ -88,7 +88,7 @@ fn validate_raw_fields(
     }
     let mut offset = 0usize;
     let mut seen = 0u64;
-    let mut values = [0u64; 31];
+    let mut values = [0u64; 64];
     while offset < raw.len() {
         let key = read_raw_varint(raw, &mut offset)?;
         let tag = u32::try_from(key >> 3)
@@ -803,4 +803,19 @@ pub(super) fn validate_proof_namespace_retire(
         MAX_SIGNED_JWT_LEN,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod raw_field_tests {
+    use super::*;
+
+    #[test]
+    fn varint_rule_above_tag_thirty_cannot_index_panic() {
+        // tag 63, wire type 0 => key 504 => canonical varint f8 03.
+        let raw = [0xf8, 0x03, 0x01];
+        let (seen, values) = validate_raw_fields(&raw, &[varint(63)], 1u64 << 63)
+            .expect("a declared high varint tag must validate without indexing past the array");
+        assert_eq!(seen, 1u64 << 63);
+        assert_eq!(values[63], 1);
+    }
 }

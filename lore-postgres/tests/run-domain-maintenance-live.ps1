@@ -3,13 +3,13 @@
 
 <#
 .SYNOPSIS
-Provisions an owned disposable PostgreSQL 16 instance and runs CR-029's eight maintenance tests.
+Provisions an owned disposable PostgreSQL 16 instance and runs CR-029's fixed maintenance inventory.
 
 .DESCRIPTION
 The Rust cases remain `#[ignore]`. This runner opts in to each case by exact name, one at a time,
 and reports PASS, FAIL, and NOT RUN separately. Before Docker starts, it checks the compiled
-`domain_maintenance` catalog against the fixed eight-case inventory. A renamed, removed, or added
-case is a hard setup failure, not a silent zero-test success.
+catalogs against the fixed cross-target inventory. A renamed, removed, or added case is a hard
+setup failure, not a silent zero-test success.
 
 The container is labelled with a random run id and the owning PowerShell process. Each exact case
 gets a distinct database inside that container, which is dropped after the case. Teardown ownership
@@ -35,21 +35,30 @@ $containerCreationAttempted = $false
 $runPassed = $false
 $setupError = $null
 
-$expectedTests = @(
-    'stale_finalize_commits_once_replays_exactly_and_isolates_binding',
-    'stale_finalize_lost_commit_ack_is_unknown_then_authoritative_replay_adopts_commit',
-    'terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tombstone',
-    'materialize_replay_preserves_receipt_and_changed_claim_mismatches',
-    'materialize_capacity_revision_mismatch_writes_no_namespace',
-    'retire_is_atomic_replays_absence_and_rejects_expired_permit',
-    'retire_requires_exact_fence_generation_and_final_range_digest',
-    'retire_rejects_nonquiescent_namespace_and_changed_epoch_claim_without_mutation'
+$expectedCases = @(
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'stale_finalize_commits_once_replays_exactly_and_isolates_binding' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'stale_finalize_lost_commit_ack_is_unknown_then_authoritative_replay_adopts_commit' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tombstone' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'terminal_phase1_mismatch_leaves_the_dispatch_fence_untouched' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'materialize_replay_preserves_receipt_and_changed_claim_mismatches' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'materialize_replay_with_a_null_receipt_is_mismatch_not_a_panic' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'materialize_capacity_revision_mismatch_writes_no_namespace' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'fresh_cell_materialize_requires_preprovisioned_capacity_counters' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'retire_is_atomic_replays_absence_and_rejects_expired_permit' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'retire_requires_exact_fence_generation_and_final_range_digest' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'retire_rejects_nonquiescent_namespace_and_changed_epoch_claim_without_mutation' },
+    [pscustomobject]@{ Target = 'domain_coordinator_regressions'; Test = 'prepare_creates_the_dispatch_fence_with_the_exact_verified_binding' },
+    [pscustomobject]@{ Target = 'domain_coordinator_regressions'; Test = 'repository_create_exact_replay_returns_the_committed_outcome' },
+    [pscustomobject]@{ Target = 'domain_coordinator_regressions'; Test = 'expired_prepare_terminalization_survives_the_coordinator_return' },
+    [pscustomobject]@{ Target = 'domain_coordinator_regressions'; Test = 'concurrent_repository_create_name_conflict_is_decisive_name_taken' },
+    [pscustomobject]@{ Target = 'domain_claim_identity_digest'; Test = 'every_one_field_digest_mutation_is_refused_against_the_prepared_fence' }
 )
 
 $results = @(
-    foreach ($name in $expectedTests) {
+    foreach ($case in $expectedCases) {
         [pscustomobject]@{
-            Test   = $name
+            Target = $case.Target
+            Test   = $case.Test
             Status = 'NOT RUN'
             Passed = 0
             Failed = 0
@@ -75,10 +84,14 @@ function Invoke-Checked {
 }
 
 function Get-MaintenanceTestCatalog {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Target
+    )
     Push-Location $loreRoot
     try {
         $listArgs = @(
-            'test', '-p', 'lore-postgres', '--test', 'domain_maintenance', '--',
+            'test', '-p', 'lore-postgres', '--test', $Target, '--',
             '--ignored', '--list'
         )
         $output = & cargo @listArgs 2>&1 | Out-String
@@ -102,13 +115,16 @@ function Get-MaintenanceTestCatalog {
 }
 
 function Assert-ExpectedCatalog {
-    $catalog = @(Get-MaintenanceTestCatalog)
-    $missing = @($expectedTests | Where-Object { $_ -notin $catalog })
-    $unexpected = @($catalog | Where-Object { $_ -notin $expectedTests })
-    if ($catalog.Count -ne 8 -or $missing.Count -ne 0 -or $unexpected.Count -ne 0) {
-        $message = "expected exactly 8 domain-maintenance tests; catalog has $($catalog.Count). " +
-            "Missing=[$($missing -join ', ')]; unexpected=[$($unexpected -join ', ')]"
-        throw $message
+    foreach ($target in @($expectedCases.Target | Sort-Object -Unique)) {
+        $expected = @($expectedCases | Where-Object { $_.Target -eq $target } | ForEach-Object { $_.Test })
+        $catalog = @(Get-MaintenanceTestCatalog -Target $target)
+        $missing = @($expected | Where-Object { $_ -notin $catalog })
+        $unexpected = @($catalog | Where-Object { $_ -notin $expected })
+        if ($catalog.Count -ne $expected.Count -or $missing.Count -ne 0 -or $unexpected.Count -ne 0) {
+            $message = "expected exactly $($expected.Count) tests in $target; catalog has $($catalog.Count). " +
+                "Missing=[$($missing -join ', ')]; unexpected=[$($unexpected -join ', ')]"
+            throw $message
+        }
     }
 }
 
@@ -196,7 +212,7 @@ try {
             Write-Host "Running $($result.Test)..."
             try {
                 $cargoArgs = @(
-                    'test', '-p', 'lore-postgres', '--test', 'domain_maintenance', '--',
+                    'test', '-p', 'lore-postgres', '--test', $result.Target, '--',
                     '--ignored', '--exact', $result.Test, '--test-threads=1'
                 )
                 $output = & cargo @cargoArgs 2>&1 | Out-String
@@ -248,7 +264,7 @@ try {
     }
 
     $passCount = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
-    if ($passCount -eq 8) {
+    if ($passCount -eq $expectedCases.Count) {
         $runPassed = $true
     }
 }
@@ -278,7 +294,7 @@ $results | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
 $passCount = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
 $failCount = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
 $notRunCount = @($results | Where-Object { $_.Status -eq 'NOT RUN' }).Count
-Write-Host "Summary: PASS=$passCount FAIL=$failCount NOT RUN=$notRunCount EXPECTED=8"
+Write-Host "Summary: PASS=$passCount FAIL=$failCount NOT RUN=$notRunCount EXPECTED=$($expectedCases.Count)"
 
 if ($null -ne $setupError) {
     Write-Warning "Setup failed: $setupError"

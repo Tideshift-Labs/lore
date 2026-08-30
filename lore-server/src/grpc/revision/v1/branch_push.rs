@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -24,6 +25,10 @@ use tracing::debug;
 use tracing::info;
 use tracing::span;
 
+use crate::domain::DomainContext;
+use crate::domain::GovernedScope;
+use crate::domain::admit_at_entry;
+use crate::domain::reject_unwired_governed_operation;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
@@ -61,7 +66,10 @@ pub async fn handler(
     acceleration: crate::grpc::server::RevisionListAcceleration,
     instrument_provider: &impl InstrumentProvider,
     lock_enforcement: Option<&Arc<dyn lore_revision::lock::LockStore>>,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<BranchPushResponse>, Status> {
+    let request_metadata = request.metadata().clone();
+    let request_authorization = crate::grpc::get_authorization_optional(request.extensions());
     let user_info = get_authorization(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
@@ -77,6 +85,20 @@ pub async fn handler(
 
     let client_ip: Option<String> = extract_client_ip(&request).map(|ip| ip.to_string());
     let req = request.into_inner();
+
+    if let Some(admitted) = admit_at_entry(
+        domain_context,
+        &request_metadata,
+        request_authorization.as_ref(),
+        GovernedScope::TargetRepository {
+            repository_id: repository_id.data(),
+        },
+    )? {
+        return Err(reject_unwired_governed_operation(
+            &admitted,
+            "lore.revision.v1.RevisionService/BranchPush",
+        ));
+    }
     let branch_id = BranchId::from(req.id);
     let revision = Hash::from(req.revision_signature);
     let force = req.force;
@@ -516,6 +538,40 @@ mod test {
         request
     }
 
+    #[tokio::test]
+    #[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
+    async fn enforcing_cell_rejects_before_v1_branch_push_body() {
+        let Some(domain) = crate::domain::test_support::configured_enforcing_context().await else {
+            return;
+        };
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, _) = test_store_create().await.expect("test stores");
+        let notification = Arc::new(MockNotificationSender::new());
+        let hooks = HookDispatcher::empty();
+        let instruments = TestInstrumentProvider {};
+        let error = handler(
+            make_request(
+                repository,
+                BranchId::default(),
+                Hash::default(),
+                false,
+                false,
+            ),
+            immutable_store,
+            mutable_store,
+            notification,
+            &hooks,
+            DEFAULT_HISTORY_STEP_SIZE,
+            crate::grpc::server::RevisionListAcceleration::default(),
+            &instruments,
+            None,
+            Some(&domain),
+        )
+        .await
+        .expect_err("enforcement must reject missing operation carriage at entry");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
     fn make_service_account_request(
         repository: RepositoryId,
         branch: BranchId,
@@ -565,6 +621,7 @@ mod test {
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
                 None,
+                None,
             )
             .await
             .expect("Request failed");
@@ -604,6 +661,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
                 None,
             )
             .await
@@ -647,6 +705,7 @@ mod test {
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
                 None,
+                None,
             )
             .await
             .expect("first push should succeed");
@@ -663,6 +722,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
                 None,
             )
             .await
@@ -706,6 +766,7 @@ mod test {
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
                 None,
+                None,
             )
             .await
             .expect("first push should succeed");
@@ -720,6 +781,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
                 None,
             )
             .await
@@ -771,6 +833,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
                 None,
             )
             .await
@@ -824,6 +887,7 @@ mod test {
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
                 None,
+                None,
             )
             .await
             .expect("first push should succeed");
@@ -846,6 +910,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
                 None,
             )
             .await
@@ -899,6 +964,7 @@ mod test {
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
                 None,
+                None,
             )
             .await
             .expect_err("unknown branch should fail");
@@ -942,6 +1008,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
                 None,
             )
             .await
@@ -988,6 +1055,7 @@ mod test {
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
                 None,
+                None,
             )
             .await
             .expect("seed push should succeed");
@@ -1019,6 +1087,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
                 None,
             )
             .await
@@ -1067,6 +1136,7 @@ mod test {
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
                 None,
+                None,
             )
             .await
             .expect("seed push should succeed");
@@ -1090,6 +1160,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
                 None,
             )
             .await
@@ -1137,6 +1208,7 @@ mod test {
                     crate::grpc::server::RevisionListAcceleration::default(),
                     &instrument_provider,
                     None,
+                    None,
                 )
                 .await
                 .expect("seed push should succeed");
@@ -1158,6 +1230,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &instrument_provider,
+                None,
                 None,
             )
             .await

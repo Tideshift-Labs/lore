@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Build script for lore-server that:
 //! 1. Auto-generates `mod.rs` files for `plugins/` and `hooks/` directories
@@ -267,6 +268,7 @@ fn generate_plugins_mod() -> Result<(), Box<dyn Error>> {
     writeln!(content, "pub use registry::PluginRegistry;")?;
     writeln!(content, "pub use traits::ImmutableStorePluginFactory;")?;
     writeln!(content, "pub use traits::LockStorePluginFactory;")?;
+    writeln!(content, "pub use traits::MutableStorePluginContext;")?;
     writeln!(content, "pub use traits::MutableStorePluginFactory;")?;
     writeln!(content, "pub use traits::NotificationPlugin;")?;
     writeln!(content, "pub use traits::NotificationPluginContext;")?;

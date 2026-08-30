@@ -93,6 +93,7 @@ temp-env = { workspace = true }
 # would otherwise need real multi-second sleeps to cross DRAIN_TICK/stall
 # windows.
 tokio = { workspace = true, features = ["test-util"] }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 
 [features]
 default = []

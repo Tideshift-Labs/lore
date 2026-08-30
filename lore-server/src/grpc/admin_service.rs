@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use tracing::warn;
 use super::handlers::obliterate;
 use super::timeout_grpc;
 use crate::auth::jwt::JwtVerifier;
+use crate::domain::DomainContext;
 use crate::hooks::HookDispatcher;
 
 pub struct LoreAdminService {
@@ -33,6 +35,7 @@ pub struct LoreAdminService {
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     rpc_timeout: Duration,
+    domain_context: Option<Arc<DomainContext>>,
 }
 
 impl LoreAdminService {
@@ -43,6 +46,7 @@ impl LoreAdminService {
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         notification: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
+        domain_context: Option<Arc<DomainContext>>,
     ) -> Self {
         let mut sys =
             sysinfo::System::new_with_specifics(RefreshKind::everything().without_processes());
@@ -85,6 +89,7 @@ impl LoreAdminService {
             notification,
             hook_dispatcher,
             rpc_timeout: Duration::from_secs(60),
+            domain_context,
         }
     }
 
@@ -127,6 +132,7 @@ impl AdminService for LoreAdminService {
                 self.notification.clone(),
                 &self.hook_dispatcher,
                 &self.jwt_verifier,
+                self.domain_context.as_ref(),
             ),
         )
         .await

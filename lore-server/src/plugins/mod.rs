@@ -95,6 +95,7 @@ pub mod postgres;
 pub use registry::PluginRegistry;
 pub use traits::ImmutableStorePluginFactory;
 pub use traits::LockStorePluginFactory;
+pub use traits::MutableStorePluginContext;
 pub use traits::MutableStorePluginFactory;
 pub use traits::NotificationPlugin;
 pub use traits::NotificationPluginContext;

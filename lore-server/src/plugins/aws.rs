@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! AWS store plugin factories.
 //!
@@ -375,6 +376,7 @@ impl MutableStorePluginFactory for AwsMutableStorePluginFactory {
         &self,
         config: &toml::Value,
         immutable_store: Arc<dyn ImmutableStore>,
+        _context: &crate::plugins::MutableStorePluginContext,
     ) -> Result<Arc<dyn MutableStore>, PluginError> {
         let plugin_name = self.name();
 

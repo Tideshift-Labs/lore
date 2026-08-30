@@ -40,11 +40,15 @@ use lore_proto::lore::domain::v1::DomainOperationOutcome;
 use lore_proto::lore::domain::v1::DomainOperationPrepareRequest;
 use lore_proto::lore::domain::v1::DomainOperationPrepareStatus;
 use lore_proto::lore::domain::v1::DomainOperationProofNamespaceMaterializeRequestV1;
+use lore_proto::lore::domain::v1::DomainOperationProofNamespaceMaterializeStatusV1;
 use lore_proto::lore::domain::v1::DomainOperationProofNamespaceRetireRequestV1;
+use lore_proto::lore::domain::v1::DomainOperationProofNamespaceRetireStatusV1;
 use lore_proto::lore::domain::v1::DomainOperationReceiptGetRequest;
 use lore_proto::lore::domain::v1::DomainOperationReceiptStatus;
 use lore_proto::lore::domain::v1::DomainOperationTerminalStatusAttachRequest;
+use lore_proto::lore::domain::v1::DomainOperationTerminalStatusAttachmentStatusV1;
 use lore_proto::lore::domain::v1::DomainOperationVerifiedStaleFinalizeRequest;
+use lore_proto::lore::domain::v1::DomainOperationVerifiedStaleFinalizeStatus;
 use lore_proto::lore::domain::v1::TerminalStatusAttachPhase2ActionV1;
 use lore_proto::lore::domain::v1::TerminalStatusAttachPhaseV1;
 use lore_proto::lore::domain::v1::domain_operation_service_server::DomainOperationService;
@@ -79,8 +83,6 @@ use crate::grpc::domain_operation_metadata::scope_key_mediated_namespace;
 
 const AUTHORIZATION_REVISION: u64 = 7;
 const CLOCK_MILLIS: u64 = 1_800_000_000_000;
-const SERVER_ENTRY_SOURCE: &str = include_str!("../../../server.rs");
-
 #[derive(Clone)]
 struct RecordedPrepare {
     key: ReceiptKey,
@@ -92,6 +94,10 @@ struct RecordingStore {
     clock_calls: AtomicUsize,
     prepare_calls: AtomicUsize,
     receipt_calls: AtomicUsize,
+    stale_finalize_calls: AtomicUsize,
+    terminal_attach_calls: AtomicUsize,
+    materialize_calls: AtomicUsize,
+    retire_calls: AtomicUsize,
     fail_prepare_outcome_unknown: AtomicBool,
     prepare_result: Mutex<PrepareResult>,
     receipt_result: Mutex<ReceiptLookup>,
@@ -104,6 +110,10 @@ impl RecordingStore {
             clock_calls: AtomicUsize::new(0),
             prepare_calls: AtomicUsize::new(0),
             receipt_calls: AtomicUsize::new(0),
+            stale_finalize_calls: AtomicUsize::new(0),
+            terminal_attach_calls: AtomicUsize::new(0),
+            materialize_calls: AtomicUsize::new(0),
+            retire_calls: AtomicUsize::new(0),
             fail_prepare_outcome_unknown: AtomicBool::new(false),
             prepare_result: Mutex::new(PrepareResult::Prepared {
                 token: [0xA5; 32],
@@ -117,6 +127,13 @@ impl RecordingStore {
             }),
             recorded_prepare: Mutex::new(None),
         }
+    }
+
+    fn maintenance_calls(&self) -> usize {
+        self.stale_finalize_calls.load(Ordering::SeqCst)
+            + self.terminal_attach_calls.load(Ordering::SeqCst)
+            + self.materialize_calls.load(Ordering::SeqCst)
+            + self.retire_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -158,30 +175,70 @@ impl DomainTransactionStore for RecordingStore {
 
     async fn domain_operation_verified_stale_finalize(
         &self,
-        _input: &VerifiedStaleFinalizeInput,
+        input: &VerifiedStaleFinalizeInput,
     ) -> Result<VerifiedStaleFinalizeResult, DomainError> {
-        unreachable!("receipt-rail tests do not call stale finalize yet")
+        self.stale_finalize_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(VerifiedStaleFinalizeResult {
+            status: lore_postgres::domain::maintenance::VerifiedStaleFinalizeStatus::Mismatch,
+            stale_finalize_permit_revision: input.stale_finalize_permit_revision,
+            committed_receipt_canonical: Vec::new(),
+            stale_finalize_clock: None,
+            response_digest: vec![0x71; 32],
+        })
     }
 
     async fn domain_operation_terminal_status_attach(
         &self,
-        _input: &TerminalStatusAttachInput,
+        input: &TerminalStatusAttachInput,
     ) -> Result<TerminalStatusAttachmentAck, DomainError> {
-        unreachable!("receipt-rail tests do not call terminal attach yet")
+        self.terminal_attach_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(TerminalStatusAttachmentAck {
+            status: lore_postgres::domain::maintenance::TerminalStatusAttachStatus::Mismatch,
+            fields: std::array::from_fn(|_| None),
+            times: std::array::from_fn(|_| None),
+            completion_marker_sequence: input.completion_marker_sequence,
+            range: None,
+            informational_high_water: None,
+            response_digest: vec![0x72; 32],
+        })
     }
 
     async fn domain_operation_proof_namespace_materialize(
         &self,
-        _input: &ProofNamespaceMaterializeInput,
+        input: &ProofNamespaceMaterializeInput,
     ) -> Result<ProofNamespaceMaterializeReceipt, DomainError> {
-        unreachable!("receipt-rail tests do not call materialize yet")
+        self.materialize_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ProofNamespaceMaterializeReceipt {
+            status: lore_postgres::domain::maintenance::ProofNamespaceMaterializeStatus::Mismatch,
+            namespace_epoch: input.namespace_epoch.clone(),
+            namespace_claim_revision: input.namespace_claim_revision,
+            namespace_claim_nonce: input.namespace_claim_nonce.clone(),
+            lore_namespace_revision: 1,
+            lore_global_counter_revision: 1,
+            lore_org_counter_revision: 1,
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_millis(1),
+            materialization_receipt_digest: vec![0x73; 32],
+            response_digest: vec![0x74; 32],
+        })
     }
 
     async fn domain_operation_proof_namespace_retire(
         &self,
-        _input: &ProofNamespaceRetireInput,
+        input: &ProofNamespaceRetireInput,
     ) -> Result<ProofNamespaceRetireAck, DomainError> {
-        unreachable!("receipt-rail tests do not call retire yet")
+        self.retire_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ProofNamespaceRetireAck {
+            status: lore_postgres::domain::maintenance::ProofNamespaceRetireStatus::Mismatch,
+            namespace_epoch: input.namespace_epoch.clone(),
+            retirement_fence_generation: input.retirement_fence_generation,
+            quota_revision: input.quota_revision,
+            final_range_set_digest: input.final_range_set_digest.clone(),
+            final_high_water: input.final_high_water,
+            retired_at: None,
+            namespace_claim_revision: input.namespace_claim_revision,
+            namespace_claim_nonce: input.namespace_claim_nonce.clone(),
+            response_digest: vec![0x75; 32],
+        })
     }
 
     async fn repository_snapshot(
@@ -350,6 +407,7 @@ impl RepositoryOperationAuthorizationVerifier for EchoVerifier {
             canonical_intent_digest: request.canonical_intent_digest,
             verified_issuer: request.verified_issuer,
             authenticated_subject: request.authenticated_subject,
+            expected_claim_identity_digest: Bytes::from_static(&[0x33; 32]),
         })
     }
 
@@ -839,82 +897,142 @@ fn maintenance_decoded_validators_enforce_exact_lengths_revisions_and_times() {
 }
 
 #[tokio::test]
-async fn maintenance_handlers_are_unimplemented_before_identity_verifier_and_store() {
-    let (service, _store, verifier) = service();
+async fn maintenance_auth_binding_stops_before_verifier_and_store() {
+    let (service, store, verifier) = service();
 
     let mut finalize = valid_stale_finalize();
     finalize.verified_issuer = "https://different-issuer.example".into();
     let error = service
         .domain_operation_verified_stale_finalize(authenticated(finalize))
         .await
-        .expect_err("stale-finalize must remain guarded");
-    assert_eq!(error.code(), Code::Unimplemented);
+        .expect_err("stale-finalize must reject a divergent authenticated issuer");
+    assert_eq!(error.code(), Code::PermissionDenied);
 
     let mut attach = valid_terminal_attach_phase1();
     attach.authenticated_subject = "different-subject".into();
     let error = service
         .domain_operation_terminal_status_attach(authenticated(attach))
         .await
-        .expect_err("terminal-attach must remain guarded");
-    assert_eq!(error.code(), Code::Unimplemented);
+        .expect_err("terminal-attach must reject a divergent authenticated subject");
+    assert_eq!(error.code(), Code::PermissionDenied);
 
     let mut materialize = valid_materialize();
     materialize.verified_issuer = "https://different-issuer.example".into();
     let error = service
         .domain_operation_proof_namespace_materialize(authenticated(materialize))
         .await
-        .expect_err("materialize must remain guarded");
-    assert_eq!(error.code(), Code::Unimplemented);
+        .expect_err("materialize must reject a divergent authenticated issuer");
+    assert_eq!(error.code(), Code::PermissionDenied);
 
     let mut retire = valid_retire();
     retire.authenticated_subject = "different-subject".into();
     let error = service
         .domain_operation_proof_namespace_retire(authenticated(retire))
         .await
-        .expect_err("retire must remain guarded");
-    assert_eq!(error.code(), Code::Unimplemented);
+        .expect_err("retire must reject a divergent authenticated subject");
+    assert_eq!(error.code(), Code::PermissionDenied);
 
     assert_eq!(
         verifier.calls.load(Ordering::SeqCst),
         0,
-        "guarded maintenance handlers must stop before every verifier port"
+        "request identity must be exact before any maintenance verifier call"
     );
+    assert_eq!(store.maintenance_calls(), 0);
 }
 
 #[tokio::test]
-async fn guarded_maintenance_handlers_do_not_consult_verifier_bindings() {
-    let (service, _store, verifier) = service();
+async fn maintenance_verifier_binding_stops_before_store() {
+    let (service, store, verifier) = service();
     verifier.mismatch_echo.store(true, Ordering::SeqCst);
 
     let error = service
         .domain_operation_verified_stale_finalize(authenticated(valid_stale_finalize()))
         .await
-        .expect_err("stale-finalize must remain guarded");
-    assert_eq!(error.code(), Code::Unimplemented);
+        .expect_err("stale-finalize must reject a divergent verifier echo");
+    assert_eq!(error.code(), Code::PermissionDenied);
     let error = service
         .domain_operation_terminal_status_attach(authenticated(valid_terminal_attach_phase1()))
         .await
-        .expect_err("terminal-attach must remain guarded");
-    assert_eq!(error.code(), Code::Unimplemented);
+        .expect_err("terminal-attach must reject a divergent verifier echo");
+    assert_eq!(error.code(), Code::PermissionDenied);
     let mut materialize = valid_materialize();
     materialize.materialization_jwt = "service-token".into();
     let error = service
         .domain_operation_proof_namespace_materialize(authenticated(materialize))
         .await
-        .expect_err("materialize must remain guarded");
-    assert_eq!(error.code(), Code::Unimplemented);
+        .expect_err("materialize must reject a divergent verifier echo");
+    assert_eq!(error.code(), Code::PermissionDenied);
     let mut retire = valid_retire();
     retire.retirement_permit_jwt = "service-token".into();
     let error = service
         .domain_operation_proof_namespace_retire(authenticated(retire))
         .await
-        .expect_err("retire must remain guarded");
-    assert_eq!(error.code(), Code::Unimplemented);
+        .expect_err("retire must reject a divergent verifier echo");
+    assert_eq!(error.code(), Code::PermissionDenied);
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 4);
     assert_eq!(
-        verifier.calls.load(Ordering::SeqCst),
+        store.maintenance_calls(),
         0,
-        "guarded handlers must not consult maintenance verifier bindings"
+        "no maintenance store call may precede exact verifier echo validation"
     );
+}
+
+#[tokio::test]
+async fn maintenance_handlers_reach_verifier_then_store_and_map_responses() {
+    let (service, store, verifier) = service();
+
+    let finalize = service
+        .domain_operation_verified_stale_finalize(authenticated(valid_stale_finalize()))
+        .await
+        .expect("stale-finalize verifier and store succeed")
+        .into_inner();
+    assert_eq!(
+        finalize.status,
+        DomainOperationVerifiedStaleFinalizeStatus::Mismatch as i32
+    );
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.stale_finalize_calls.load(Ordering::SeqCst), 1);
+
+    let attach = service
+        .domain_operation_terminal_status_attach(authenticated(valid_terminal_attach_phase1()))
+        .await
+        .expect("terminal-attach verifier and store succeed")
+        .into_inner();
+    assert_eq!(
+        attach.status,
+        DomainOperationTerminalStatusAttachmentStatusV1::Mismatch as i32
+    );
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(store.terminal_attach_calls.load(Ordering::SeqCst), 1);
+
+    let mut materialize_request = valid_materialize();
+    materialize_request.materialization_jwt = "service-token".into();
+    let materialize = service
+        .domain_operation_proof_namespace_materialize(authenticated(materialize_request))
+        .await
+        .expect("materialize verifier and store succeed")
+        .into_inner();
+    assert_eq!(
+        materialize.status,
+        DomainOperationProofNamespaceMaterializeStatusV1::Mismatch as i32
+    );
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(store.materialize_calls.load(Ordering::SeqCst), 1);
+
+    let mut retire_request = valid_retire();
+    retire_request.retirement_permit_jwt = "service-token".into();
+    let retire = service
+        .domain_operation_proof_namespace_retire(authenticated(retire_request))
+        .await
+        .expect("retire verifier and store succeed")
+        .into_inner();
+    assert_eq!(
+        retire.status,
+        DomainOperationProofNamespaceRetireStatusV1::Mismatch as i32
+    );
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(store.retire_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.maintenance_calls(), 4);
 }
 
 #[tokio::test]
@@ -1106,17 +1224,4 @@ async fn missing_or_nonservice_identity_cannot_reach_the_private_rail() {
         .expect_err("human token must fail");
     assert_eq!(denied.code(), Code::PermissionDenied);
     assert_eq!(store.clock_calls.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn incomplete_lifecycle_rail_does_not_advertise_v2_capabilities() {
-    for deferred_capability in [
-        "domain_operation_receipt_v2",
-        "domain_operation_proof_namespace_lifecycle_v1",
-    ] {
-        assert!(
-            !SERVER_ENTRY_SOURCE.contains(deferred_capability),
-            "incomplete lifecycle rail must not advertise {deferred_capability}"
-        );
-    }
 }

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::pin::Pin;
 use std::sync::Arc;
@@ -37,6 +38,7 @@ use super::branch_metadata_get;
 use super::branch_metadata_set;
 use super::branch_push;
 use super::revision_list;
+use crate::domain::DomainContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::get_repository;
 use crate::grpc::require_permission;
@@ -82,6 +84,7 @@ pub struct LoreRevisionV1Service {
     /// `Some` only when `enforce_locks_on_push` is on AND a lock store exists;
     /// see `LoreRevisionService::push_lock_enforcement`.
     push_lock_enforcement: Option<Arc<dyn lore_revision::lock::LockStore>>,
+    domain_context: Option<Arc<DomainContext>>,
     instrument_provider: RevisionServiceInstrumentProvider,
     revision_list_instruments: RevisionListInstruments,
 }
@@ -99,6 +102,7 @@ impl LoreRevisionV1Service {
         rpc_timeout: Duration,
         enforce_write_permission: bool,
         push_lock_enforcement: Option<Arc<dyn lore_revision::lock::LockStore>>,
+        domain_context: Option<Arc<DomainContext>>,
     ) -> Self {
         let instrument_provider = RevisionServiceInstrumentProvider;
         let seconds_in_one_day = 86400f64;
@@ -132,6 +136,7 @@ impl LoreRevisionV1Service {
             rpc_timeout,
             enforce_write_permission,
             push_lock_enforcement,
+            domain_context,
             instrument_provider,
             revision_list_instruments,
         }
@@ -266,6 +271,7 @@ impl RevisionService for LoreRevisionV1Service {
                 self.acceleration,
                 &self.instrument_provider,
                 self.push_lock_enforcement.as_ref(),
+                self.domain_context.as_ref(),
             ),
         )
         .await
@@ -297,6 +303,7 @@ impl RevisionService for LoreRevisionV1Service {
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.enforce_write_permission,
+                self.domain_context.as_ref(),
             ),
         )
         .await
@@ -364,6 +371,7 @@ mod tests {
             None,
             Duration::from_secs(60),
             enforce,
+            None,
             None,
         )
     }

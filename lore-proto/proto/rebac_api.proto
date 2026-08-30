@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
+// SPDX-License-Identifier: MIT
+
 syntax = "proto3";
 
 package ucs.auth;
@@ -114,6 +117,9 @@ message VerifyRepositoryOperationAuthorizationResponse {
   bytes canonical_intent_digest = 13;
   string verified_issuer = 14;
   string authenticated_subject = 15;
+  // FORK-LOCAL (Tideshift, CR-029): frozen claim-identity digest minted by
+  // the platform verify CAS and bound into the first PREPARED fence.
+  bytes expected_claim_identity_digest = 16;
 }
 
 // Closed method discriminator for the four CR-029 maintenance verifier ports.

@@ -3,9 +3,11 @@
 //! CR-029 private receipt/proof-namespace maintenance transactions.
 //!
 //! The caller performs strict wire and auth-grpc verification before entering
-//! these functions. Every function still exact-checks the immutable database
-//! binding under its first row lock. A verifier response is evidence, not a
-//! replacement for the database predicate.
+//! these functions. Receipt-keyed operations exact-check their immutable
+//! binding under the receipt-key lock; namespace operations instead take the
+//! documented counter/namespace lock order before checking the namespace
+//! binding. A verifier response is evidence, not a replacement for either
+//! database predicate.
 
 use std::time::SystemTime;
 
@@ -241,15 +243,14 @@ fn canonical_digest(domain: &[u8], parts: &[&[u8]]) -> Result<Vec<u8>, DomainErr
 }
 
 fn sha256_digest(domain: &[u8], parts: &[&[u8]]) -> Result<Vec<u8>, DomainError> {
-    use ring::digest::Context;
     use ring::digest::SHA256;
 
-    let mut digest = Context::new(&SHA256);
-    digest.update(domain);
+    let mut canonical = Vec::new();
+    append_part(&mut canonical, domain)?;
     for part in parts {
-        digest.update(part);
+        append_part(&mut canonical, part)?;
     }
-    Ok(digest.finish().as_ref().to_vec())
+    Ok(ring::digest::digest(&SHA256, &canonical).as_ref().to_vec())
 }
 
 fn completion_request_binding(input: &TerminalStatusAttachInput) -> Result<Vec<u8>, DomainError> {
@@ -493,6 +494,17 @@ fn receipt_binding_matches(row: &tokio_postgres::Row, input: &VerifiedStaleFinal
         && row.get::<_, Vec<u8>>("canonical_intent_digest") == input.binding.canonical_intent_digest
 }
 
+fn dispatch_fence_matches(row: &tokio_postgres::Row, input: &VerifiedStaleFinalizeInput) -> bool {
+    receipt_binding_matches(row, input)
+        && row.get::<_, Vec<u8>>("authorization_id") == input.witness.authorization_id
+        && row.get::<_, i64>("authorization_revision") == input.witness.authorization_revision
+        && row.get::<_, Vec<u8>>("verification_nonce") == input.witness.verification_nonce
+        && row.get::<_, Vec<u8>>("bound_fields_digest") == input.witness.bound_fields_digest
+        && row.get::<_, Vec<u8>>("consumed_ticket_sha256") == input.witness.consumed_ticket_sha256
+        && row.get::<_, Vec<u8>>("expected_claim_identity_digest")
+            == input.expected_claim_identity_digest
+}
+
 fn stale_finalize_execution_witness(
     input: &VerifiedStaleFinalizeInput,
 ) -> Result<Vec<u8>, DomainError> {
@@ -593,6 +605,23 @@ pub async fn verified_stale_finalize(
         )
         .await
         .map_err(|e| DomainError::from_pg("stale finalize receipt lock", e))?;
+    let fence = tx
+        .query_opt(
+            "SELECT method, scope, fingerprint_version, fingerprint, canonical_intent_digest, \
+                    authorization_id, authorization_revision, verification_nonce, \
+                    bound_fields_digest, consumed_ticket_sha256, expected_claim_identity_digest \
+             FROM lore_domain_operation_dispatch_possibility_fences \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+               AND tenant_scope_key=$3 AND operation_id=$4 FOR UPDATE",
+            &[
+                &input.key.verified_issuer,
+                &input.key.authenticated_subject,
+                &input.key.tenant_scope_key,
+                &operation_id,
+            ],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("stale finalize fence lock", e))?;
     if let Some(row) = existing {
         if !receipt_binding_matches(&row, input) {
             return finalize_result(
@@ -625,6 +654,17 @@ pub async fn verified_stale_finalize(
                 committed_at,
             );
         }
+        if fence
+            .as_ref()
+            .is_some_and(|row| !dispatch_fence_matches(row, input))
+        {
+            return finalize_result(
+                input,
+                VerifiedStaleFinalizeStatus::Mismatch,
+                Vec::new(),
+                None,
+            );
+        }
         return finalize_result(
             input,
             VerifiedStaleFinalizeStatus::IneligibleReceiptOrDispatchPossible,
@@ -633,12 +673,28 @@ pub async fn verified_stale_finalize(
         );
     }
 
-    let fence = tx
+    if let Some(row) = fence {
+        let exact = dispatch_fence_matches(&row, input);
+        return finalize_result(
+            input,
+            if exact {
+                VerifiedStaleFinalizeStatus::IneligibleReceiptOrDispatchPossible
+            } else {
+                VerifiedStaleFinalizeStatus::Mismatch
+            },
+            Vec::new(),
+            None,
+        );
+    }
+
+    // Phase 1 replaces the ordinary receipt and dispatch fence atomically with
+    // a tombstone. A stale-finalize retry must therefore consult that durable
+    // successor under the same receipt-key lock before making a time decision.
+    let tombstone = tx
         .query_opt(
             "SELECT method, scope, fingerprint_version, fingerprint, canonical_intent_digest, \
-                    authorization_id, authorization_revision, verification_nonce, \
-                    bound_fields_digest, consumed_ticket_sha256, expected_claim_identity_digest \
-             FROM lore_domain_operation_dispatch_possibility_fences \
+                    authorization_id, authorization_revision \
+             FROM lore_domain_operation_reserve_release_tombstones \
              WHERE verified_issuer=$1 AND authenticated_subject=$2 \
                AND tenant_scope_key=$3 AND operation_id=$4 FOR UPDATE",
             &[
@@ -649,8 +705,8 @@ pub async fn verified_stale_finalize(
             ],
         )
         .await
-        .map_err(|e| DomainError::from_pg("stale finalize fence lock", e))?;
-    if let Some(row) = fence {
+        .map_err(|e| DomainError::from_pg("stale finalize tombstone lock", e))?;
+    if let Some(row) = tombstone {
         let exact = row.get::<_, String>("method") == input.binding.method
             && row.get::<_, Vec<u8>>("scope") == input.binding.scope
             && row.get::<_, i32>("fingerprint_version") == input.binding.fingerprint_version
@@ -658,13 +714,7 @@ pub async fn verified_stale_finalize(
             && row.get::<_, Vec<u8>>("canonical_intent_digest")
                 == input.binding.canonical_intent_digest
             && row.get::<_, Vec<u8>>("authorization_id") == input.witness.authorization_id
-            && row.get::<_, i64>("authorization_revision") == input.witness.authorization_revision
-            && row.get::<_, Vec<u8>>("verification_nonce") == input.witness.verification_nonce
-            && row.get::<_, Vec<u8>>("bound_fields_digest") == input.witness.bound_fields_digest
-            && row.get::<_, Vec<u8>>("consumed_ticket_sha256")
-                == input.witness.consumed_ticket_sha256
-            && row.get::<_, Vec<u8>>("expected_claim_identity_digest")
-                == input.expected_claim_identity_digest;
+            && row.get::<_, i64>("authorization_revision") == input.witness.authorization_revision;
         return finalize_result(
             input,
             if exact {
@@ -672,6 +722,34 @@ pub async fn verified_stale_finalize(
             } else {
                 VerifiedStaleFinalizeStatus::Mismatch
             },
+            Vec::new(),
+            None,
+        );
+    }
+
+    // Completion markers intentionally retain only the proof identity, not the
+    // original operation binding. Existence under the exact receipt key is
+    // nevertheless decisive evidence that dispatch and terminalization were
+    // possible, so it can never be converted into a fresh NOT_APPLIED receipt.
+    let completion_marker = tx
+        .query_opt(
+            "SELECT marker_digest \
+             FROM lore_domain_operation_tombstone_release_completion_markers \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+               AND tenant_scope_key=$3 AND operation_id=$4 FOR UPDATE",
+            &[
+                &input.key.verified_issuer,
+                &input.key.authenticated_subject,
+                &input.key.tenant_scope_key,
+                &operation_id,
+            ],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("stale finalize completion marker lock", e))?;
+    if completion_marker.is_some() {
+        return finalize_result(
+            input,
+            VerifiedStaleFinalizeStatus::IneligibleReceiptOrDispatchPossible,
             Vec::new(),
             None,
         );
@@ -869,31 +947,8 @@ pub async fn proof_namespace_materialize(
             "proof namespace organization UUID must be 16 bytes".to_owned(),
         ));
     }
-    tx.execute(
-        "INSERT INTO lore_domain_proof_global_counters (id, counter_revision, quota_revision, \
-             represented_namespace_rows, retained_marker_count, outstanding_proof_claims, \
-             fragment_count, fragment_bytes, marker_bytes, updated_at) \
-         VALUES (1,$1,$2,0,0,0,0,0,0,$3) ON CONFLICT (id) DO NOTHING",
-        &[&input.lore_local_capacity_revision, &quota_revision, &clock],
-    )
-    .await
-    .map_err(|e| DomainError::from_pg("proof namespace global counter bootstrap", e))?;
-    tx.execute(
-        "INSERT INTO lore_domain_proof_org_counters (org_uuid, counter_revision, quota_revision, \
-             represented_namespace_rows, retained_marker_count, fragment_count, fragment_bytes, \
-             marker_bytes, updated_at) VALUES ($1,$2,$3,0,0,0,0,0,$4) \
-         ON CONFLICT (org_uuid) DO NOTHING",
-        &[
-            &input.key.org_uuid,
-            &input.lore_local_capacity_revision,
-            &quota_revision,
-            &clock,
-        ],
-    )
-    .await
-    .map_err(|e| DomainError::from_pg("proof namespace org counter bootstrap", e))?;
     let counter = tx
-        .query_one(
+        .query_opt(
             "SELECT counter_revision, quota_revision, represented_namespace_rows \
              FROM lore_domain_proof_global_counters \
              WHERE id=1 FOR UPDATE",
@@ -901,17 +956,37 @@ pub async fn proof_namespace_materialize(
         )
         .await
         .map_err(|e| DomainError::from_pg("proof namespace global counter lock", e))?;
+    let Some(counter) = counter else {
+        return materialize_receipt(
+            input,
+            ProofNamespaceMaterializeStatus::CapacityBlocked,
+            0,
+            0,
+            0,
+            clock,
+        );
+    };
     let current_revision: i64 = counter.get("counter_revision");
     let current_quota_revision: i32 = counter.get("quota_revision");
     let global_rows: i64 = counter.get("represented_namespace_rows");
     let org_counter = tx
-        .query_one(
+        .query_opt(
             "SELECT counter_revision, quota_revision, represented_namespace_rows \
              FROM lore_domain_proof_org_counters WHERE org_uuid=$1 FOR UPDATE",
             &[&input.key.org_uuid],
         )
         .await
         .map_err(|e| DomainError::from_pg("proof namespace org counter lock", e))?;
+    let Some(org_counter) = org_counter else {
+        return materialize_receipt(
+            input,
+            ProofNamespaceMaterializeStatus::CapacityBlocked,
+            0,
+            current_revision,
+            0,
+            clock,
+        );
+    };
     let current_org_revision: i64 = org_counter.get("counter_revision");
     let current_org_quota_revision: i32 = org_counter.get("quota_revision");
     let org_rows: i64 = org_counter.get("represented_namespace_rows");
@@ -955,6 +1030,21 @@ pub async fn proof_namespace_materialize(
                 clock,
             );
         }
+        let materialization_receipt_digest =
+            row.get::<_, Option<Vec<u8>>>("materialization_receipt");
+        let response_digest = row.get::<_, Option<Vec<u8>>>("materialization_response_digest");
+        let (Some(materialization_receipt_digest), Some(response_digest)) =
+            (materialization_receipt_digest, response_digest)
+        else {
+            return materialize_receipt(
+                input,
+                ProofNamespaceMaterializeStatus::Mismatch,
+                0,
+                current_revision,
+                current_org_revision,
+                clock,
+            );
+        };
         return Ok(ProofNamespaceMaterializeReceipt {
             status: ProofNamespaceMaterializeStatus::Materialized,
             namespace_epoch: input.namespace_epoch.clone(),
@@ -964,8 +1054,8 @@ pub async fn proof_namespace_materialize(
             lore_global_counter_revision: row.get("materialized_global_counter_revision"),
             lore_org_counter_revision: row.get("materialized_org_counter_revision"),
             created_at: row.get("created_at"),
-            materialization_receipt_digest: row.get("materialization_receipt"),
-            response_digest: row.get("materialization_response_digest"),
+            materialization_receipt_digest,
+            response_digest,
         });
     }
     if current_revision != input.lore_local_capacity_revision
@@ -1889,29 +1979,32 @@ pub async fn terminal_status_attach(
         let terminal_ack = ring::digest::digest(&ring::digest::SHA256, &terminal_ack_canonical)
             .as_ref()
             .to_vec();
-        if let Some(existing) = fence.get::<_, Option<Vec<u8>>>("terminal_status_ack_digest") {
-            if existing != terminal_ack
+        if let Some(existing) = fence.get::<_, Option<Vec<u8>>>("terminal_status_ack_digest")
+            && (existing != terminal_ack
                 || fence.get::<_, Option<i64>>("terminal_status_revision")
-                    != Some(input.platform_terminal_status_revision)
-            {
-                return finish_terminal_ack(
-                    input,
-                    empty_terminal_ack(TerminalStatusAttachStatus::Mismatch),
-                );
-            }
-        } else {
-            tx.execute(
-                "UPDATE lore_domain_operation_dispatch_possibility_fences SET \
-                    terminal_status_ack_digest=$5, terminal_status_revision=$6, terminal_status_ack_at=$7 \
-                 WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4",
-                &[key[0], key[1], key[2], key[3], &terminal_ack, &input.platform_terminal_status_revision,
-                  &acknowledged_at],
-            ).await.map_err(|e| DomainError::from_pg("terminal attachment acknowledgement", e))?;
+                    != Some(input.platform_terminal_status_revision))
+        {
+            return finish_terminal_ack(
+                input,
+                empty_terminal_ack(TerminalStatusAttachStatus::Mismatch),
+            );
         }
         let prune_after: SystemTime = receipt
             .get::<_, Option<SystemTime>>("compact_expires_at")
             .unwrap_or(fence.get("safe_prune_after"));
         if clock < prune_after {
+            if fence
+                .get::<_, Option<Vec<u8>>>("terminal_status_ack_digest")
+                .is_none()
+            {
+                tx.execute(
+                    "UPDATE lore_domain_operation_dispatch_possibility_fences SET \
+                        terminal_status_ack_digest=$5, terminal_status_revision=$6, terminal_status_ack_at=$7 \
+                     WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4",
+                    &[key[0], key[1], key[2], key[3], &terminal_ack,
+                      &input.platform_terminal_status_revision, &acknowledged_at],
+                ).await.map_err(|e| DomainError::from_pg("terminal attachment acknowledgement", e))?;
+            }
             let mut ack = empty_terminal_ack(TerminalStatusAttachStatus::Phase1PendingRetention);
             ack.fields[0] = Some(terminal_ack_canonical);
             ack.fields[1] = Some(terminal_ack);
@@ -2042,6 +2135,18 @@ pub async fn terminal_status_attach(
                     empty_terminal_ack(TerminalStatusAttachStatus::Mismatch),
                 );
             }
+        }
+        if fence
+            .get::<_, Option<Vec<u8>>>("terminal_status_ack_digest")
+            .is_none()
+        {
+            tx.execute(
+                "UPDATE lore_domain_operation_dispatch_possibility_fences SET \
+                    terminal_status_ack_digest=$5, terminal_status_revision=$6, terminal_status_ack_at=$7 \
+                 WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4",
+                &[key[0], key[1], key[2], key[3], &terminal_ack,
+                  &input.platform_terminal_status_revision, &acknowledged_at],
+            ).await.map_err(|e| DomainError::from_pg("terminal attachment acknowledgement", e))?;
         }
         tx.execute("DELETE FROM lore_domain_operation_receipts WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4", key)
             .await.map_err(|e| DomainError::from_pg("terminal attachment receipt prune", e))?;

@@ -447,6 +447,17 @@ pub struct ConsumedAdmission {
     pub admission_clock: SystemTime,
 }
 
+/// Result of locking the admission row for a governed mutation.
+pub enum ConsumeResult {
+    /// A live PREPARED token was consumed and the transaction may mutate.
+    Admitted(ConsumedAdmission),
+    /// The operation already has a durable decisive outcome. This includes a
+    /// PREPARED row terminalized by the hard-TTL check in this transaction.
+    Committed(DomainOutcome),
+    /// Missing, mismatched, or invalid-token admission. Nothing was mutated.
+    Rejected,
+}
+
 /// `domain_operation_prepare`.
 ///
 /// Runs in its own transaction, ahead of the mutation transaction. Creates or
@@ -580,6 +591,9 @@ pub struct AuthorizationWitness {
     /// SHA-256 commitment to the consumed preclaim ticket. The ticket secret is
     /// never persisted anywhere.
     pub consumed_ticket_sha256: Vec<u8>,
+    /// Frozen BLAKE3-256 claim-identity digest minted by the platform verify
+    /// CAS. Lore stores and exact-matches these bytes; it never derives them.
+    pub expected_claim_identity_digest: Vec<u8>,
 }
 
 /// Mint a 256-bit consume token from the OS CSPRNG.
@@ -649,6 +663,57 @@ async fn insert_prepared(
     )
     .await
     .map_err(|e| DomainError::from_pg("receipt prepare insert", e))?;
+
+    if let Some(witness) = witness {
+        insert_dispatch_possibility_fence(tx, key, binding, witness, prepared_at).await?;
+    }
+    Ok(())
+}
+
+async fn insert_dispatch_possibility_fence(
+    tx: &Transaction<'_>,
+    key: &ReceiptKey,
+    binding: &OperationBinding,
+    witness: &AuthorizationWitness,
+    created_at: SystemTime,
+) -> Result<(), DomainError> {
+    if witness.expected_claim_identity_digest.len() != 32 {
+        return Err(DomainError::InvalidInput(
+            "expected claim identity digest must be exactly 32 bytes".to_owned(),
+        ));
+    }
+    let safe_prune_after = later_of_compact_deadline(created_at, key)?;
+    tx.execute(
+        "INSERT INTO lore_domain_operation_dispatch_possibility_fences ( \
+             verified_issuer, authenticated_subject, tenant_scope_key, operation_id, \
+             method, scope, fingerprint_version, fingerprint, canonical_intent_digest, \
+             authorization_id, authorization_revision, verification_nonce, \
+             bound_fields_digest, consumed_ticket_sha256, expected_claim_identity_digest, \
+             created_revision, created_at, safe_prune_after \
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
+        &[
+            &key.verified_issuer,
+            &key.authenticated_subject,
+            &key.tenant_scope_key,
+            &key.operation_id.as_bytes().as_slice(),
+            &binding.method,
+            &binding.scope,
+            &binding.fingerprint_version,
+            &binding.fingerprint,
+            &binding.canonical_intent_digest,
+            &witness.authorization_id,
+            &witness.authorization_revision,
+            &witness.verification_nonce,
+            &witness.bound_fields_digest,
+            &witness.consumed_ticket_sha256,
+            &witness.expected_claim_identity_digest,
+            &witness.authorization_revision,
+            &created_at,
+            &safe_prune_after,
+        ],
+    )
+    .await
+    .map_err(|e| DomainError::from_pg("dispatch possibility fence insert", e))?;
     Ok(())
 }
 
@@ -832,26 +897,33 @@ pub async fn consume(
     key: &ReceiptKey,
     binding: &OperationBinding,
     token: &[u8; 32],
-) -> Result<Option<ConsumedAdmission>, DomainError> {
+) -> Result<ConsumeResult, DomainError> {
     let clock = admission_clock(tx).await?;
     let Some(row) = lock_receipt_row(tx, key).await? else {
-        return Ok(None);
+        return Ok(ConsumeResult::Rejected);
     };
-    if !row.matches(binding) || row.state != schema::RECEIPT_STATE_PREPARED {
-        return Ok(None);
+    if !row.matches(binding) {
+        return Ok(ConsumeResult::Rejected);
+    }
+    if row.state == schema::RECEIPT_STATE_COMMITTED {
+        return Ok(ConsumeResult::Committed(row.committed_outcome()?));
+    }
+    if row.state != schema::RECEIPT_STATE_PREPARED {
+        return Ok(ConsumeResult::Rejected);
     }
     let Some(stored) = row.consume_token.as_deref() else {
-        return Ok(None);
+        return Ok(ConsumeResult::Rejected);
     };
     if !tokens_match(stored, token) {
-        return Ok(None);
+        return Ok(ConsumeResult::Rejected);
     }
     if clock >= row.hard_expires_at {
         // Expiry performs the same terminal transition with no domain effect.
-        expire_prepared(tx, key, clock).await?;
-        return Ok(None);
+        return Ok(ConsumeResult::Committed(
+            expire_prepared(tx, key, clock).await?,
+        ));
     }
-    Ok(Some(ConsumedAdmission {
+    Ok(ConsumeResult::Admitted(ConsumedAdmission {
         key: key.clone(),
         admission_clock: clock,
     }))

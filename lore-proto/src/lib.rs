@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 // The included files do not pass this lint
 #![allow(clippy::doc_markdown)]
@@ -37,8 +38,8 @@ pub use rpc::admin_service_server::AdminServiceServer;
 pub use urc::model::*;
 
 /// Prost codec for the private domain-operation service. Its decoder validates
-/// the original protobuf message bytes for the four receipt-v2 maintenance
-/// requests before Prost can discard unknown or duplicate singular fields.
+/// the original protobuf message bytes for every receipt-v2 request before
+/// Prost can discard unknown or duplicate singular fields.
 #[derive(Debug, Clone, Default)]
 pub struct DomainOperationV2StrictCodec<T, U>(std::marker::PhantomData<(T, U)>);
 
@@ -155,7 +156,7 @@ fn domain_validate_fields(
     raw: &[u8],
     rules: &[DomainRawField],
     required: u64,
-) -> Result<(u64, [u64; 31]), tonic::Status> {
+) -> Result<(u64, [u64; 64]), tonic::Status> {
     if raw.len() > 16 * 1024 {
         return Err(tonic::Status::invalid_argument(
             "protobuf request exceeds 16384 bytes",
@@ -163,7 +164,7 @@ fn domain_validate_fields(
     }
     let mut offset = 0;
     let mut seen = 0u64;
-    let mut values = [0u64; 31];
+    let mut values = [0u64; 64];
     while offset < raw.len() {
         let key = domain_read_varint(raw, &mut offset)?;
         let tag = u32::try_from(key >> 3)
@@ -224,8 +225,7 @@ fn domain_validate_fields(
     Ok((seen, values))
 }
 
-/// Validate an original maintenance request payload by generated Prost name.
-/// Other messages in the seven-method service are decoded normally.
+/// Validate an original receipt-v2 request payload by generated Prost name.
 pub fn validate_domain_operation_v2_raw(name: &str, raw: &[u8]) -> Result<(), tonic::Status> {
     const I: usize = 256;
     const U: usize = 16;
@@ -235,6 +235,32 @@ pub fn validate_domain_operation_v2_raw(name: &str, raw: &[u8]) -> Result<(), to
     const S: usize = 4096;
     const J: usize = 8192;
     match name {
+        "DomainOperationClockGetRequest" if !raw.is_empty() => {
+            return Err(tonic::Status::invalid_argument(
+                "clock-get request must use the canonical empty frame",
+            ));
+        }
+        "DomainOperationClockGetRequest" => {}
+        "DomainOperationPrepareRequest" | "DomainOperationReceiptGetRequest" => {
+            let fields = [
+                domain_ld(1, U),
+                domain_ld(2, P),
+                domain_ld(3, U),
+                domain_ld(4, M),
+                domain_ld(5, S),
+                domain_varint(6),
+                domain_ld(7, D),
+                domain_ld(8, D),
+                domain_ld(9, U),
+                domain_varint(10),
+                domain_ld(11, D),
+            ];
+            domain_validate_fields(
+                raw,
+                &fields,
+                domain_field_mask(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+            )?;
+        }
         "DomainOperationVerifiedStaleFinalizeRequest" => {
             let fields = [
                 domain_ld(1, I),

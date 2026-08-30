@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Postgres store plugin factories (CR-007).
 //!
@@ -323,10 +324,15 @@ impl MutableStorePluginFactory for PostgresMutableStorePluginFactory {
         parse_config(self.name(), config).map(|_| ())
     }
 
+    // Plugin construction is a synchronous startup-only trait method. The
+    // runtime handoff is bounded to this one connection setup and cannot be
+    // expressed as async through the plugin factory contract.
+    #[allow(clippy::disallowed_methods)]
     fn create(
         &self,
         config: &toml::Value,
         _immutable_store: Arc<dyn ImmutableStore>,
+        context: &crate::plugins::MutableStorePluginContext,
     ) -> Result<Arc<dyn MutableStore>, PluginError> {
         // The Postgres mutable store is standalone (branch-tip CAS needs no
         // fragment storage), so the immutable-store dependency is unused.
@@ -334,9 +340,14 @@ impl MutableStorePluginFactory for PostgresMutableStorePluginFactory {
         let cfg = parse_config(plugin_name, config)?;
         let tls = build_tls(plugin_name, &cfg)?;
 
-        // Plugin construction is a synchronous trait method. It runs once at
-        // startup, one plugin at a time, so at most one core is handed off.
-        #[allow(clippy::disallowed_methods)]
+        let enforcement = context.domain_enforcement.clone().ok_or_else(|| {
+            PluginError::from(PluginInitError {
+                plugin_name: plugin_name.to_string(),
+                message:
+                    "Postgres mutable store requires the domain-enforcement construction handle"
+                        .to_owned(),
+            })
+        })?;
         let store = tokio::task::block_in_place(|| {
             runtime().block_on(PostgresMutableStore::connect(&cfg.url, cfg.pool_max, &tls))
         })
@@ -345,7 +356,8 @@ impl MutableStorePluginFactory for PostgresMutableStorePluginFactory {
                 plugin_name: plugin_name.to_string(),
                 message: format!("Failed to create Postgres mutable store: {e}"),
             })
-        })?;
+        })?
+        .with_domain_enforcement(enforcement);
 
         Ok(Arc::new(store))
     }
@@ -399,7 +411,28 @@ pub fn register(registry: &mut PluginRegistry) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use lore_base::types::KeyType;
+    use lore_storage::Hash;
+    use lore_storage::ImmutableStore;
+    use lore_storage::Partition;
+
     use super::*;
+    use crate::plugins::MutableStorePluginContext;
+    use crate::settings::Settings;
+
+    async fn direct_client(url: &str) -> tokio_postgres::Client {
+        let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+            .await
+            .expect("connect direct schema-state client");
+        lore_base::lore_spawn!(async move {
+            if let Err(error) = connection.await {
+                eprintln!("direct postgres connection error: {error}");
+            }
+        });
+        client
+    }
 
     // `domain_pool_max` is deliberately its own knob, not inherited from
     // `pool_max` — see the field's own doc comment. These three pin that
@@ -443,5 +476,92 @@ mod tests {
             parsed.domain_pool_max, 4,
             "domain_pool_max must not inherit pool_max"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
+    async fn configured_domain_enforcement_reaches_the_published_postgres_mutable_store() {
+        let Ok(url) = std::env::var("LORE_TEST_PG_URL") else {
+            eprintln!("LORE_TEST_PG_URL unset; skipping real construction-path enforcement test");
+            return;
+        };
+        let domain_store = PostgresDomainStore::connect(&url, 2, &TlsConfig::default())
+            .await
+            .expect("bootstrap domain schema");
+        let direct = direct_client(&url).await;
+        direct
+            .execute(
+                "UPDATE lore_domain_schema_state SET \
+                    backfill_state=3, residue_classified=true, \
+                    cutover_at=clock_timestamp(), enforcement_enabled=false, \
+                    updated_at=clock_timestamp() WHERE id=1",
+                &[],
+            )
+            .await
+            .expect("make the disposable cell ready for enforcement");
+        domain_store
+            .enable_enforcement()
+            .await
+            .expect("enable enforcement through the production schema-state API");
+
+        let mut settings: Settings = toml::from_str(include_str!("../../config/default.toml"))
+            .expect("built-in settings fixture must deserialize");
+        settings.mutable_store.mode = PLUGIN_NAME.to_string();
+        settings.plugins.insert(
+            PLUGIN_NAME.to_string(),
+            toml::from_str(&format!("url = {url:?}\npool_max = 2\ndomain_pool_max = 2"))
+                .expect("Postgres plugin fixture config"),
+        );
+        let configured = crate::domain::configure_domain_context(&settings)
+            .await
+            .expect("real domain-context construction path");
+        assert!(
+            configured.context.is_some(),
+            "Postgres cell has a coordinator"
+        );
+        let plugin_context = MutableStorePluginContext {
+            domain_enforcement: configured.mutable_enforcement,
+        };
+        let immutable: Arc<dyn ImmutableStore> = lore_storage::LocalImmutableStore::new(
+            None,
+            lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create unused immutable-store dependency");
+        let mutable = PostgresMutableStorePluginFactory
+            .create(
+                settings
+                    .plugins
+                    .get(PLUGIN_NAME)
+                    .expect("Postgres plugin fixture exists"),
+                immutable,
+                &plugin_context,
+            )
+            .expect("real Postgres mutable plugin factory");
+
+        let error = mutable
+            .store(
+                Partition::default(),
+                Hash::from(rand::random::<[u8; 32]>()),
+                Hash::from(rand::random::<[u8; 32]>()),
+                KeyType::BranchLatestPointer,
+            )
+            .await
+            .expect_err(
+                "the published mutable store must share configure_domain_context's armed fence",
+            );
+        assert!(
+            error.to_string().contains("BranchLatestPointer"),
+            "fail-closed rejection must name the governed key type: {error}"
+        );
+
+        direct
+            .execute(
+                "UPDATE lore_domain_schema_state SET enforcement_enabled=false, \
+                    updated_at=clock_timestamp() WHERE id=1",
+                &[],
+            )
+            .await
+            .expect("restore disposable schema-state enforcement flag");
     }
 }

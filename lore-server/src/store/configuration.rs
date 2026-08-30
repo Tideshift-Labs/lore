@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Store configuration helpers using the plugin system.
 //!
@@ -35,6 +36,7 @@ use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use tracing::info;
 
+use crate::plugins::MutableStorePluginContext;
 use crate::plugins::PluginRegistry;
 
 /// Error type for store configuration.
@@ -132,10 +134,11 @@ pub fn create_mutable_store_with_registry(
     mode: &str,
     plugin_config: &toml::Value,
     immutable_store: Arc<dyn ImmutableStore>,
+    context: &MutableStorePluginContext,
 ) -> Result<Arc<dyn MutableStore>, StoreConfigError> {
     info!(mode, "Creating mutable store via plugin system");
     registry
-        .create_mutable_store(mode, plugin_config, immutable_store)
+        .create_mutable_store(mode, plugin_config, immutable_store, context)
         .forward("creating mutable store")
 }
 

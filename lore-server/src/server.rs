@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Server entry point for Lore Server.
 //!
@@ -83,6 +84,7 @@ use crate::http::security_headers::ContentTypePolicy;
 use crate::http::server::LoreHttpServerSettings;
 use crate::http::server::PresignSettings;
 use crate::plugins;
+use crate::plugins::MutableStorePluginContext;
 use crate::plugins::PluginRegistry;
 use crate::plugins::traits::NotificationPluginContext;
 use crate::protocol::attribute_map::AttributeMap;
@@ -474,11 +476,9 @@ async fn launch_quinn_server(
     .await
 }
 
-/// Returns the names of the optional cargo features this server binary was
-/// compiled with. Reported through the `ServerInfo` RPC so clients and tests
-/// can detect capabilities that are only present in some builds (for example
-/// `failure_generator`, which enables fault-injection used by smoke tests).
-fn compiled_features() -> Vec<String> {
+/// Returns the optional build features and active runtime capabilities exposed
+/// through `ServerInfo`.
+fn compiled_features(domain_operation_service_available: bool) -> Vec<String> {
     let mut features = Vec::new();
     if cfg!(feature = "failure_generator") {
         features.push("failure_generator".to_string());
@@ -488,6 +488,10 @@ fn compiled_features() -> Vec<String> {
     }
     if cfg!(feature = "seeding") {
         features.push("seeding".to_string());
+    }
+    if domain_operation_service_available {
+        features.push("domain_operation_receipt_v2".to_string());
+        features.push("domain_operation_proof_namespace_lifecycle_v1".to_string());
     }
     features
 }
@@ -535,10 +539,20 @@ async fn launch_grpc_server(
     );
 
     // The settings map has no relevant entries to surface yet, so it stays empty.
-    // The features list reports the cargo features the binary was compiled with so
-    // clients and tests can detect optional capabilities (e.g. failure_generator).
+    // ServerInfo reports both optional build features (for example
+    // failure_generator) and runtime capabilities whose services are mounted.
     let settings_map: HashMap<String, String> = HashMap::new();
-    let features_list = compiled_features();
+    let domain_operation_service_available =
+        crate::grpc::server::domain_operation_service_available(
+            domain_context.is_some(),
+            settings
+                .environment
+                .as_ref()
+                .and_then(|environment| environment.endpoint.as_ref())
+                .and_then(|endpoint| endpoint.auth_url.as_deref()),
+            jwt_verifier.is_some(),
+        );
+    let features_list = compiled_features(domain_operation_service_available);
 
     let (cert_path, key_path, cert_chain_path) =
         if let Some(cert_settings) = grpc_settings.certificate {
@@ -1024,6 +1038,7 @@ async fn configure_mutable_store_via_plugin(
     registry: &PluginRegistry,
     settings: &Settings,
     immutable_store: Arc<dyn ImmutableStore>,
+    context: &MutableStorePluginContext,
 ) -> Result<Arc<dyn MutableStore>> {
     let mode = &settings.mutable_store.mode;
 
@@ -1059,7 +1074,7 @@ async fn configure_mutable_store_via_plugin(
             info!(mode, "Creating mutable store via plugin system");
 
             registry
-                .create_mutable_store(mode, &plugin_config, immutable_store)
+                .create_mutable_store(mode, &plugin_config, immutable_store, context)
                 .map_err(|e| anyhow!("Failed to create mutable store plugin '{mode}': {e}"))
         }
     }
@@ -1893,16 +1908,26 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     let immutable_store =
         configure_immutable_store_via_plugin(&plugin_registry, &settings, topology.clone()).await?;
 
-    let mutable_store =
-        configure_mutable_store_via_plugin(&plugin_registry, &settings, immutable_store.clone())
-            .await?;
-
-    let lock_store = configure_lock_store_via_plugin(&plugin_registry, &settings)?;
-
     // CR-029: the domain coordinator is built here, not inside the gRPC launch
     // task, so a readiness refusal over an incomplete backfill aborts startup
     // instead of being logged from a spawned task.
-    let domain_context = crate::domain::configure_domain_context(&settings).await?;
+    // It is deliberately built before the mutable store: readiness arms the
+    // one enforcement handle that the concrete Postgres store must receive
+    // before publication behind `Arc<dyn MutableStore>`.
+    let configured_domain = crate::domain::configure_domain_context(&settings).await?;
+    let mutable_context = MutableStorePluginContext {
+        domain_enforcement: configured_domain.mutable_enforcement.clone(),
+    };
+    let mutable_store = configure_mutable_store_via_plugin(
+        &plugin_registry,
+        &settings,
+        immutable_store.clone(),
+        &mutable_context,
+    )
+    .await?;
+
+    let lock_store = configure_lock_store_via_plugin(&plugin_registry, &settings)?;
+    let domain_context = configured_domain.context;
     // The internal forwarding endpoint reaches the same repository handlers, so
     // it gets the same coordinator handle rather than an ungoverned bypass.
     let internal_domain_context = domain_context.clone();
@@ -2368,6 +2393,66 @@ fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, mess
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compiled_features_advertise_domain_rails_only_when_service_is_available() {
+        let enabled = super::compiled_features(true);
+        let disabled = super::compiled_features(false);
+
+        for capability in [
+            "domain_operation_receipt_v2",
+            "domain_operation_proof_namespace_lifecycle_v1",
+        ] {
+            assert_eq!(
+                enabled
+                    .iter()
+                    .filter(|feature| *feature == capability)
+                    .count(),
+                1,
+                "active domain capability must be advertised exactly once: {capability}"
+            );
+            assert!(
+                !disabled.iter().any(|feature| feature == capability),
+                "unavailable domain service must not advertise {capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn domain_operation_service_availability_requires_every_runtime_dependency() {
+        use crate::grpc::server::domain_operation_service_available;
+
+        for (name, has_domain_context, auth_url, auth_enabled, expected) in [
+            (
+                "enabled",
+                true,
+                Some("https://auth-grpc.example"),
+                true,
+                true,
+            ),
+            (
+                "missing domain context",
+                false,
+                Some("https://auth-grpc.example"),
+                true,
+                false,
+            ),
+            ("missing auth URL", true, None, true, false),
+            (
+                "authentication disabled",
+                true,
+                Some("https://auth-grpc.example"),
+                false,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                domain_operation_service_available(has_domain_context, auth_url, auth_enabled),
+                expected,
+                "availability mismatch for {name}"
+            );
+        }
+    }
+
     /// Covers the `[server.http]` to `LoreHttpServerSettings` mapping, the one seam
     /// between config deserialization and the HTTP server's own settings.
     mod http_settings_mapping {

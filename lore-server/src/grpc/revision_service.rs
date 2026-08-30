@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +27,7 @@ use super::handlers::revision_describe;
 use super::handlers::revision_diff;
 use super::handlers::revision_state_history;
 use super::handlers::revision_tree;
+use crate::domain::DomainContext;
 use crate::grpc::get_repository;
 use crate::grpc::handlers::revision_list;
 use crate::grpc::require_permission;
@@ -63,6 +65,7 @@ pub struct LoreRevisionService {
     /// lock store is configured; the push handler enforces advisory locks when
     /// present, and behaves as stock Lore (no enforcement) when `None`.
     push_lock_enforcement: Option<Arc<dyn lore_revision::lock::LockStore>>,
+    domain_context: Option<Arc<DomainContext>>,
 
     instrument_provider: RevisionServiceInstrumentProvider,
     revision_list_instruments: RevisionListInstruments,
@@ -80,6 +83,7 @@ impl LoreRevisionService {
         rpc_timeout: Duration,
         enforce_write_permission: bool,
         push_lock_enforcement: Option<Arc<dyn lore_revision::lock::LockStore>>,
+        domain_context: Option<Arc<DomainContext>>,
     ) -> Self {
         let instrument_provider = RevisionServiceInstrumentProvider {};
         let seconds_in_one_day = 86400f64;
@@ -112,6 +116,7 @@ impl LoreRevisionService {
             rpc_timeout,
             enforce_write_permission,
             push_lock_enforcement,
+            domain_context,
             instrument_provider,
             revision_list_instruments,
         }
@@ -238,6 +243,7 @@ impl RevisionService for LoreRevisionService {
                 self.acceleration,
                 &self.instrument_provider,
                 self.push_lock_enforcement.as_ref(),
+                self.domain_context.as_ref(),
             ),
         )
         .await
@@ -381,6 +387,7 @@ impl RevisionService for LoreRevisionService {
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.enforce_write_permission,
+                self.domain_context.as_ref(),
             ),
         )
         .await
@@ -458,6 +465,7 @@ mod tests {
             crate::grpc::server::RevisionListAcceleration::default(),
             Duration::from_secs(60),
             enforce,
+            None,
             None,
         )
     }

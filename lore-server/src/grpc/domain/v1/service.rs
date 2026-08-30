@@ -75,13 +75,6 @@ use crate::grpc::map_domain_error_to_status;
 
 const WITNESS_FIELD_LEN: usize = 32;
 const CONTROL_PLANE_SERVICE_SUBJECT: &str = "lorehub-control-plane";
-const MAINTENANCE_RAIL_DISABLED: &str =
-    "Domain-operation maintenance rail is not available in this build";
-
-fn maintenance_rail_unimplemented() -> Result<(), Status> {
-    Err(Status::unimplemented(MAINTENANCE_RAIL_DISABLED))
-}
-
 /// Private service. Construction requires both the domain store and a verifier
 /// dependency, so no method can silently fall back to unverified caller input.
 pub struct LoreDomainOperationV1Service {
@@ -202,6 +195,10 @@ fn exact_echo(
             "consumed_ticket_sha256",
             response.consumed_ticket_sha256.as_ref(),
         ),
+        (
+            "expected_claim_identity_digest",
+            response.expected_claim_identity_digest.as_ref(),
+        ),
     ] {
         if bytes.len() != WITNESS_FIELD_LEN {
             return Err(Status::permission_denied(format!(
@@ -217,6 +214,7 @@ fn exact_echo(
         verification_nonce: response.verification_nonce.to_vec(),
         bound_fields_digest: response.bound_fields_digest.to_vec(),
         consumed_ticket_sha256: response.consumed_ticket_sha256.to_vec(),
+        expected_claim_identity_digest: response.expected_claim_identity_digest.to_vec(),
     })
 }
 
@@ -249,8 +247,7 @@ fn require_request_identity(
     Ok(())
 }
 
-// Kept behind the fail-closed maintenance guard so the frozen verifier envelope
-// remains reviewable while the complete transaction rail is implemented.
+// Builds the exact verifier envelope for the active private maintenance rail.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn maintenance_verifier_request<M: Message>(
     token: &AuthorizationToken,
@@ -644,7 +641,6 @@ impl DomainOperationService for LoreDomainOperationV1Service {
         &self,
         request: Request<DomainOperationVerifiedStaleFinalizeRequest>,
     ) -> Result<Response<DomainOperationVerifiedStaleFinalizeResponse>, Status> {
-        maintenance_rail_unimplemented()?;
         let token = authenticated_service(&request)?;
         let authorization = extract_authorization_header(&request)
             .ok_or_else(|| Status::unauthenticated("Authorization header required"))?;
@@ -752,6 +748,7 @@ impl DomainOperationService for LoreDomainOperationV1Service {
                 verification_nonce: request.verification_nonce.to_vec(),
                 bound_fields_digest: request.bound_fields_digest.to_vec(),
                 consumed_ticket_sha256: request.consumed_ticket_sha256.to_vec(),
+                expected_claim_identity_digest: request.expected_claim_identity_digest.to_vec(),
             },
             expected_claim_identity_digest: request.expected_claim_identity_digest.to_vec(),
             stale_finalize_permit: request.stale_finalize_permit.to_vec(),
@@ -808,7 +805,6 @@ impl DomainOperationService for LoreDomainOperationV1Service {
         &self,
         request: Request<DomainOperationTerminalStatusAttachRequest>,
     ) -> Result<Response<DomainOperationTerminalStatusAttachmentAckV1>, Status> {
-        maintenance_rail_unimplemented()?;
         let token = authenticated_service(&request)?;
         let authorization = extract_authorization_header(&request)
             .ok_or_else(|| Status::unauthenticated("Authorization header required"))?;
@@ -979,7 +975,6 @@ impl DomainOperationService for LoreDomainOperationV1Service {
         &self,
         request: Request<DomainOperationProofNamespaceMaterializeRequestV1>,
     ) -> Result<Response<DomainOperationProofNamespaceMaterializeReceiptV1>, Status> {
-        maintenance_rail_unimplemented()?;
         let token = authenticated_service(&request)?;
         let authorization = extract_authorization_header(&request)
             .ok_or_else(|| Status::unauthenticated("Authorization header required"))?;
@@ -1078,7 +1073,6 @@ impl DomainOperationService for LoreDomainOperationV1Service {
         &self,
         request: Request<DomainOperationProofNamespaceRetireRequestV1>,
     ) -> Result<Response<DomainOperationProofNamespaceRetireAckV1>, Status> {
-        maintenance_rail_unimplemented()?;
         let token = authenticated_service(&request)?;
         let authorization = extract_authorization_header(&request)
             .ok_or_else(|| Status::unauthenticated("Authorization header required"))?;

@@ -447,6 +447,32 @@ fn strict_transport_frames() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
             b"principal-v1\0fixture".as_slice().into(),
         )
     };
+    let prepare = DomainOperationPrepareRequest {
+        org_uuid: vec![0x01; 16].into(),
+        initiating_principal_namespace: b"principal-v1\0fixture".as_slice().into(),
+        operation_id: vec![0x02; 16].into(),
+        method: "lore.domain.v1.test/Prepare".into(),
+        scope: b"scope".as_slice().into(),
+        fingerprint_version: 1,
+        fingerprint: vec![0x03; 32].into(),
+        canonical_intent_digest: vec![0x04; 32].into(),
+        authorization_id: vec![0x02; 16].into(),
+        authorization_revision: 1,
+        preclaim_ticket: vec![0x05; 32].into(),
+    };
+    let receipt_get = DomainOperationReceiptGetRequest {
+        org_uuid: vec![0x11; 16].into(),
+        initiating_principal_namespace: b"principal-v1\0fixture".as_slice().into(),
+        operation_id: vec![0x12; 16].into(),
+        method: "lore.domain.v1.test/ReceiptGet".into(),
+        scope: b"scope".as_slice().into(),
+        fingerprint_version: 1,
+        fingerprint: vec![0x13; 32].into(),
+        canonical_intent_digest: vec![0x14; 32].into(),
+        authorization_id: vec![0x12; 16].into(),
+        authorization_revision: 1,
+        consumed_ticket_sha256: vec![0x15; 32].into(),
+    };
     let (verified_issuer, authenticated_subject, org_uuid, principal) = identity();
     let finalize = DomainOperationVerifiedStaleFinalizeRequest {
         verified_issuer,
@@ -538,6 +564,17 @@ fn strict_transport_frames() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
         namespace_claim_nonce: vec![0x45; 32].into(),
     };
     vec![
+        ("DomainOperationClockGetRequest", Vec::new(), Vec::new()),
+        (
+            "DomainOperationPrepareRequest",
+            prepare.encode_to_vec(),
+            vec![0x0a, 0x01, b'x'],
+        ),
+        (
+            "DomainOperationReceiptGetRequest",
+            receipt_get.encode_to_vec(),
+            vec![0x0a, 0x01, b'x'],
+        ),
         (
             "DomainOperationVerifiedStaleFinalizeRequest",
             finalize.encode_to_vec(),
@@ -571,6 +608,12 @@ fn transport_strict_validator_rejects_original_malformed_frames_for_each_wire() 
         unknown.extend_from_slice(&[0xfa, 0x01, 0x00]);
         assert!(validate_domain_operation_v2_raw(name, &unknown).is_err());
 
+        if name == "DomainOperationClockGetRequest" {
+            assert!(validate_domain_operation_v2_raw(name, &[0x08, 0x01]).is_err());
+            assert!(validate_domain_operation_v2_raw(name, &vec![0; 16 * 1024 + 1]).is_err());
+            continue;
+        }
+
         let mut duplicate = valid;
         duplicate.extend_from_slice(&duplicate_field);
         assert!(validate_domain_operation_v2_raw(name, &duplicate).is_err());
@@ -592,6 +635,33 @@ fn transport_strict_validator_rejects_original_malformed_frames_for_each_wire() 
         );
         assert!(validate_domain_operation_v2_raw(name, &[0x0a, 0x05, b'x']).is_err());
         assert!(validate_domain_operation_v2_raw(name, &vec![0; 16 * 1024 + 1]).is_err());
+    }
+}
+
+#[test]
+fn live_prepare_and_receipt_get_reject_noncanonical_keys_and_high_unknown_tags() {
+    for (name, valid, _) in strict_transport_frames()
+        .into_iter()
+        .filter(|(name, _, _)| {
+            matches!(
+                *name,
+                "DomainOperationPrepareRequest" | "DomainOperationReceiptGetRequest"
+            )
+        })
+    {
+        let mut noncanonical = vec![0x8a, 0x00];
+        noncanonical.extend_from_slice(&valid[1..]);
+        let error = validate_domain_operation_v2_raw(name, &noncanonical)
+            .expect_err("the original noncanonical key must be rejected before Prost");
+        assert!(error.message().contains("noncanonical protobuf varint"));
+
+        for unknown_high_tag in [[0xfa, 0x01, 0x00], [0xfa, 0x03, 0x00]] {
+            let mut raw = valid.clone();
+            raw.extend_from_slice(&unknown_high_tag);
+            let error = validate_domain_operation_v2_raw(name, &raw)
+                .expect_err("unknown tag 31/63 must reject without indexing outside the table");
+            assert!(error.message().contains("unknown protobuf field"));
+        }
     }
 }
 

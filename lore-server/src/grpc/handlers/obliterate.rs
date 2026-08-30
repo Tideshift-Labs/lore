@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -18,6 +19,10 @@ use tracing::warn;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_interceptor::extract_bearer_token;
+use crate::domain::DomainContext;
+use crate::domain::GovernedScope;
+use crate::domain::admit_at_entry;
+use crate::domain::reject_unwired_governed_operation;
 use crate::grpc::can_obliterate;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -51,6 +56,7 @@ pub async fn handler(
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: &HookDispatcher,
     jwt_verifier: &Arc<Option<JwtVerifier>>,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<ObliterateResponse>, Status> {
     if let Some(verifier) = &**jwt_verifier {
         let authorization = authenticate_request(request.metadata(), verifier).await?;
@@ -58,10 +64,26 @@ pub async fn handler(
     }
 
     let repository = get_repository(request.metadata())?;
+    let request_metadata = request.metadata().clone();
+    let request_authorization = crate::grpc::get_authorization_optional(request.extensions());
     let extensions = request.extensions().clone();
     let user_id = get_user_id(&extensions);
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
+
+    if let Some(admitted) = admit_at_entry(
+        domain_context,
+        &request_metadata,
+        request_authorization.as_ref(),
+        GovernedScope::TargetRepository {
+            repository_id: repository.data(),
+        },
+    )? {
+        return Err(reject_unwired_governed_operation(
+            &admitted,
+            "lore.AdminService/Obliterate",
+        ));
+    }
     let address = Address::from(req.address.unwrap_or_default());
 
     let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
@@ -254,6 +276,31 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
+    async fn enforcing_cell_rejects_before_obliterate_body() {
+        let Some(domain) = crate::domain::test_support::configured_enforcing_context().await else {
+            return;
+        };
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, _) = test_store_create().await.expect("test stores");
+        let mut notification = MockNotificationSender::new();
+        notification.expect_obliterate().never();
+        let hooks = HookDispatcher::empty();
+        let error = handler(
+            make_request(repository, None),
+            immutable_store,
+            mutable_store,
+            Arc::new(notification),
+            &hooks,
+            &Arc::new(None),
+            Some(&domain),
+        )
+        .await
+        .expect_err("enforcement must reject missing operation carriage at entry");
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn proceeds_without_auth_when_no_verifier_configured() {
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, _) = test_store_create().await.unwrap();
@@ -269,6 +316,7 @@ mod tests {
             notification,
             &hook_dispatcher,
             &None.into(),
+            None,
         )
         .await
         .unwrap_err();
@@ -292,6 +340,7 @@ mod tests {
             notification,
             &hook_dispatcher,
             &Some(verifier).into(),
+            None,
         )
         .await
         .unwrap_err();
@@ -314,6 +363,7 @@ mod tests {
             notification,
             &hook_dispatcher,
             &Some(verifier).into(),
+            None,
         )
         .await
         .unwrap_err();
@@ -341,6 +391,7 @@ mod tests {
             notification,
             &hook_dispatcher,
             &Some(verifier).into(),
+            None,
         )
         .await
         .unwrap_err();
@@ -370,6 +421,7 @@ mod tests {
             notification,
             &hook_dispatcher,
             &Some(verifier).into(),
+            None,
         )
         .await
         .unwrap_err();
@@ -444,6 +496,7 @@ mod tests {
             notification,
             &hook_dispatcher,
             &Some(verifier).into(),
+            None,
         )
         .await
         .expect("handler should succeed");
