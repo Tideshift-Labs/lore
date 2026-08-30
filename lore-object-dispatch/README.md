@@ -38,7 +38,8 @@ are deferred and not installed, alongside the pure compact-receipt, full-to-comp
 compact-prune planners in `compaction.rs`, `full_to_compact.rs`, and `compact_prune.rs`: correct,
 tested, sized for the former global ledger's row volume, and uncalled until CR-033 D5's cell-scale
 retention sizing lands. Runtime never auto-installs any migration; a migrator role installs out of
-band.
+band, through the concrete `cell-schema-install` binary described below (WP-114 CD-1), not by
+hand.
 
 `local_authority_schema::LOCAL_AUTHORITY_MIGRATION_V1` embeds the exact 42,294-byte source-dark
 local authority core migration. Its BLAKE3-256 is
@@ -234,7 +235,7 @@ What `install` does, and what it refuses:
 one transaction and cannot be made one: each frozen artifact carries its own `BEGIN`/`COMMIT`, so an
 outer transaction would be ended by the first artifact rather than wrapping it. Artifacts that
 already committed stay committed. Every later run then refuses that database, which is the intended
-behaviour — forward migrations are one-shot, so there is no safe "continue from step k". CD-1
+behaviour. Forward migrations are one-shot, so there is no safe "continue from step k". CD-1
 installs into a fresh cell database, so drop-and-retry is the recovery; a database that already
 holds data is an operator decision, not an installer one.
 
@@ -323,8 +324,12 @@ re-migrates nor moves the catalog, refusal on a truncated chain with the schema 
 found, refusal on seven distinct catalog drift classes each caught in its own manifest section, and
 the revoke-after-replacement path restoring the exact pinned ACL state. Verified 5/5 PASS.
 
-Limitations that stand regardless of path: `object_store_retention_read_state_v1` (0003's
-readback) has no live caller among the nine. Migrations 0012-0017 have no `read_state` procedure
-and are attested behaviourally by their own tests, not catalog readback. Every cell-authority
-procedure the typed client calls (WP-114 CD-3) still needs a live case here before it counts as
+Limitations, updated at CD-1: `object_store_retention_read_state_v1` (0003's readback) still has
+no live caller among CD-2's nine `local_authority_*` tests, but `cell-schema-install attest` above
+is now a live caller. The first of WP-114 CD-1's two named readback gaps is closed. The second is
+not: migrations 0012-0017 still have no `read_state` procedure, and on a fully installed cell
+0011's existing put-reservation readback fails closed (`55000`) rather than merely omitting them,
+alongside 0011's outright revoke of the 0008 readback (`42501`). The Rust attester carries those
+layers instead, behaviourally, not through catalog readback. Every cell-authority procedure the
+typed client calls (WP-114 CD-3) still needs a live case in CD-2's harness before it counts as
 evidence; the harness existing does not by itself supply that coverage.
