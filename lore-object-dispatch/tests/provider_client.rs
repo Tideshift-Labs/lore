@@ -1269,10 +1269,55 @@ fn authorize_rejects_a_put_body_bound_to_a_different_request_or_boundary() {
     );
 }
 
-/// Captures the `&ProviderChargeRequest` a `ProviderChargeAuthority` double receives during a real
-/// `execute` call, cloning it out into a `RefCell` the caller retains a handle to. The double
-/// always refuses with `Unwired` after capturing, so no grant is ever committed and no ledger state
-/// needs cleanup between iterations -- only the request that reached the authority matters here.
+/// The fields of a `ProviderChargeRequest` a `ProviderChargeAuthority` double can assert on,
+/// copied out of the real (borrowed) value at the moment the authority receives it.
+///
+/// `ProviderChargeRequest` is deliberately not `Clone` (WP-114 CD-5 round 4 / INV-EJ P2): an
+/// authority implementation that could retain a copy past the `charge()` call could charge again
+/// later, outside any ledger, producing a committed grant the audit reports as zero in a shape the
+/// frozen encoder accepts. A capture double must therefore read what it needs out of the borrow it
+/// is handed and copy only those fields into a plain struct of our own -- never retain the value
+/// itself. `debug_output` is the one exception a plain field-copy cannot substitute for: it is
+/// captured with `format!("{request:?}")` while the real value is still alive, so a redaction test
+/// can still inspect `ProviderChargeRequest`'s own `Debug` impl through this same capture path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedChargeRequest {
+    provider_boundary_id: String,
+    traffic_class: ProviderTrafficClass,
+    attempt_class: ProviderAttemptClass,
+    attempt_units: u64,
+    budget_pin_revision: String,
+    budget_pin_fence: u64,
+    logical_request_id: String,
+    attempt_id: String,
+    attempt_ordinal: u32,
+    cap_classes: Vec<ProviderCapClass>,
+    debug_output: String,
+}
+
+impl CapturedChargeRequest {
+    fn from_request(request: &ProviderChargeRequest) -> Self {
+        Self {
+            provider_boundary_id: request.provider_boundary_id().to_string(),
+            traffic_class: request.traffic_class(),
+            attempt_class: request.attempt_class(),
+            attempt_units: request.attempt_units(),
+            budget_pin_revision: request.budget_pin().revision.clone(),
+            budget_pin_fence: request.budget_pin().fence,
+            logical_request_id: request.logical_request_id().to_string(),
+            attempt_id: request.attempt_id().to_string(),
+            attempt_ordinal: request.attempt_ordinal(),
+            cap_classes: request.cap_classes(),
+            debug_output: format!("{request:?}"),
+        }
+    }
+}
+
+/// Captures the fields of the `&ProviderChargeRequest` a `ProviderChargeAuthority` double receives
+/// during a real `execute` call, copying them into a [`CapturedChargeRequest`] the caller retains.
+/// The double always refuses with `Unwired` after capturing, so no grant is ever committed and no
+/// ledger state needs cleanup between iterations -- only the request that reached the authority
+/// matters here.
 ///
 /// `authorize`/its `ProviderChargeRequest` return value are no longer public (WP-114 CD-5's ledger
 /// binding fix made the constructor crate-private, because handing the charge request to a caller
@@ -1284,11 +1329,12 @@ fn capture_charge_request_with_boundary(
     capabilities: ProviderCapabilities,
     request: &ProviderAttemptRequest,
     label: &str,
-) -> ProviderChargeRequest {
-    let captured: Rc<RefCell<Option<ProviderChargeRequest>>> = Rc::new(RefCell::new(None));
+) -> CapturedChargeRequest {
+    let captured: Rc<RefCell<Option<CapturedChargeRequest>>> = Rc::new(RefCell::new(None));
     let captured_for_closure = captured.clone();
     let (charge_authority, _calls) = ScriptedChargeAuthority::new(move |charge_request| {
-        *captured_for_closure.borrow_mut() = Some(charge_request.clone());
+        *captured_for_closure.borrow_mut() =
+            Some(CapturedChargeRequest::from_request(charge_request));
         Err(ProviderChargeError::Unwired)
     });
     let provider_boundary_id = boundary.provider_boundary_id().to_string();
@@ -1313,7 +1359,7 @@ fn capture_charge_request_with_boundary(
         .unwrap_or_else(|| panic!("{label}: charge authority must have been called"))
 }
 
-fn capture_charge_request(request: &ProviderAttemptRequest, label: &str) -> ProviderChargeRequest {
+fn capture_charge_request(request: &ProviderAttemptRequest, label: &str) -> CapturedChargeRequest {
     capture_charge_request_with_boundary(
         boundary(),
         ProviderCapabilities::none().with_listing(),
@@ -1328,22 +1374,24 @@ fn execute_charges_a_request_that_echoes_the_attempt_and_charges_one_unit() {
         let request = attempt_request_for(class);
         let charge = capture_charge_request(&request, &format!("{class:?}"));
 
-        assert_eq!(charge.attempt_units(), 1, "{class:?}");
-        assert_eq!(charge.provider_boundary_id(), BOUNDARY_ID, "{class:?}");
-        assert_eq!(charge.traffic_class(), request.traffic_class, "{class:?}");
-        assert_eq!(charge.attempt_class(), request.attempt_class, "{class:?}");
+        assert_eq!(charge.attempt_units, 1, "{class:?}");
+        assert_eq!(charge.provider_boundary_id, BOUNDARY_ID, "{class:?}");
+        assert_eq!(charge.traffic_class, request.traffic_class, "{class:?}");
+        assert_eq!(charge.attempt_class, request.attempt_class, "{class:?}");
         assert_eq!(
-            charge.logical_request_id(),
-            request.logical_request_id,
+            charge.logical_request_id, request.logical_request_id,
             "{class:?}"
         );
-        assert_eq!(charge.attempt_id(), request.attempt_id, "{class:?}");
+        assert_eq!(charge.attempt_id, request.attempt_id, "{class:?}");
+        assert_eq!(charge.attempt_ordinal, request.attempt_ordinal, "{class:?}");
         assert_eq!(
-            charge.attempt_ordinal(),
-            request.attempt_ordinal,
+            charge.budget_pin_revision, request.budget_pin.revision,
             "{class:?}"
         );
-        assert_eq!(charge.budget_pin(), &request.budget_pin, "{class:?}");
+        assert_eq!(
+            charge.budget_pin_fence, request.budget_pin.fence,
+            "{class:?}"
+        );
     }
 }
 
@@ -1358,7 +1406,7 @@ fn cap_classes_always_start_with_the_shared_budget_and_include_exactly_the_match
             let mut request = attempt_request_for(attempt_class);
             request.traffic_class = traffic_class;
             let charge = capture_charge_request(&request, &format!("{attempt_class:?}"));
-            let caps = charge.cap_classes();
+            let caps = &charge.cap_classes;
 
             assert_eq!(caps.first(), Some(&ProviderCapClass::SharedPhysicalBudget));
             assert!(caps.contains(&traffic_class.cap_class()));
@@ -1586,7 +1634,9 @@ fn execute_reports_transport_refusal_while_keeping_the_grant_charged() {
     assert_eq!(ledger.attempt_count(), 0);
     assert_eq!(ledger.poisoned(), None);
 
-    let audit = ledger.audit().expect("non-poisoned ledger must audit");
+    let audit = ledger
+        .audit_for(&logical_request_id())
+        .expect("non-poisoned ledger must audit its own bound request");
     assert_eq!(audit.committed_grant_count, 1);
     assert_eq!(audit.attempt_count, 0);
 }
@@ -1910,12 +1960,19 @@ fn a_ledger_that_completed_one_request_refuses_to_accumulate_a_second_requests_a
     assert_eq!(ledger.logical_request_id(), request_a.logical_request_id);
 
     let audit = ledger
-        .audit()
+        .audit_for(&request_a.logical_request_id)
         .expect("ledger must still audit request A only");
     assert_eq!(audit.attempt_count, 1);
     assert_eq!(audit.decisive_terminal_count, 1);
     validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
         .expect("request A's audit must still be accepted by the frozen encoder");
+
+    // The audit binding (not only execute's) refuses request B's id too: naming B never gets a
+    // receipt attached to A's counters.
+    assert_eq!(
+        ledger.audit_for(&request_b.logical_request_id),
+        Err(ProviderClientError::LedgerRequestMismatch)
+    );
 }
 
 #[test]
@@ -1948,7 +2005,9 @@ fn execute_refuses_an_attempt_naming_a_different_logical_request_than_the_ledger
     assert_eq!(charge_calls.get(), 0, "charge authority must not be called");
     assert_eq!(transport_calls.get(), 0, "transport must not be called");
 
-    let audit = ledger.audit().expect("unpoisoned ledger must still audit");
+    let audit = ledger
+        .audit_for(&logical_request_id())
+        .expect("unpoisoned ledger must still audit its own bound request");
     validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
         .expect("audit must be accepted by the frozen encoder");
 }
@@ -1981,7 +2040,9 @@ fn execute_refuses_an_attempt_when_the_ledger_is_bound_to_a_different_boundary_t
     assert_eq!(charge_calls.get(), 0, "charge authority must not be called");
     assert_eq!(transport_calls.get(), 0, "transport must not be called");
 
-    let audit = ledger.audit().expect("unpoisoned ledger must still audit");
+    let audit = ledger
+        .audit_for(&logical_request_id())
+        .expect("unpoisoned ledger must still audit its own bound request");
     validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
         .expect("audit must be accepted by the frozen encoder");
 }
@@ -2039,6 +2100,39 @@ fn execute_refuses_the_ledger_mismatch_before_authorize_even_when_the_request_wo
     assert_eq!(charge_calls.get(), 0);
     assert_eq!(transport_calls.get(), 0);
     assert_eq!(ledger.poisoned(), None);
+}
+
+/// Guard order (INV-EJ round 5): the ledger/request identity check now precedes the
+/// `DispatchAfterNoDispatch` check, so an attempt naming a *different* logical request than a
+/// no-dispatch-recorded ledger reports the mismatch it actually has, not a sequencing fault it
+/// does not have. Paired with `execute_refuses_after_a_recorded_no_dispatch_without_poisoning_the_ledger`
+/// (Section 9), which pins the other direction on the same kind of ledger: an attempt naming the
+/// ledger's *own* request after the same no-dispatch still reports `DispatchAfterNoDispatch`.
+#[test]
+fn execute_reports_the_ledger_mismatch_before_dispatch_after_no_dispatch_on_a_no_dispatch_ledger() {
+    let mut ledger = new_ledger();
+    ledger
+        .record_no_dispatch(&no_dispatch_proof())
+        .expect("record no dispatch on a fresh ledger");
+
+    let mut request = base_request(ProviderAttemptClass::Readiness);
+    request.logical_request_id = other_logical_request_id();
+
+    let (charge_authority, charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, transport_calls) =
+        ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+
+    let outcome = client.execute(&mut ledger, &request);
+
+    assert_eq!(outcome, Err(ProviderClientError::LedgerRequestMismatch));
+    assert_eq!(ledger.poisoned(), None);
+    assert_eq!(ledger.no_dispatch_count(), 1);
+    assert_eq!(ledger.attempt_count(), 0);
+    assert_eq!(ledger.committed_grant_count(), 0);
+    assert_eq!(charge_calls.get(), 0, "charge authority must not be called");
+    assert_eq!(transport_calls.get(), 0, "transport must not be called");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2138,7 +2232,9 @@ fn record_no_dispatch_is_still_allowed_after_a_committed_grant_that_never_reache
         .expect("no-dispatch must be permitted after a grant with no attempt");
     assert_eq!(ledger.no_dispatch_count(), 1);
 
-    let audit = ledger.audit().expect("non-poisoned ledger must audit");
+    let audit = ledger
+        .audit_for(&logical_request_id())
+        .expect("non-poisoned ledger must audit its own bound request");
     validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
         .expect("audit must be accepted by the frozen encoder");
 }
@@ -2190,9 +2286,9 @@ fn execute_refuses_after_a_recorded_no_dispatch_without_poisoning_the_ledger() {
         "transport must not be called after a recorded no-dispatch"
     );
 
-    let audit = ledger
-        .audit()
-        .expect("the refused-but-unpoisoned ledger must still produce an audit");
+    let audit = ledger.audit_for(&logical_request_id()).expect(
+        "the refused-but-unpoisoned ledger must still produce an audit for its own bound request",
+    );
     assert_eq!(audit.no_dispatch_count, 1);
     assert_eq!(audit.attempt_count, 0);
     validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
@@ -2200,7 +2296,7 @@ fn execute_refuses_after_a_recorded_no_dispatch_without_poisoning_the_ledger() {
 }
 
 #[test]
-fn record_no_dispatch_and_audit_return_the_poison_on_a_poisoned_ledger() {
+fn record_no_dispatch_and_audit_for_return_the_poison_on_a_poisoned_ledger() {
     let (charge_authority, _charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
     let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
@@ -2221,9 +2317,79 @@ fn record_no_dispatch_and_audit_return_the_poison_on_a_poisoned_ledger() {
         ledger.record_no_dispatch(&no_dispatch_proof()),
         Err(ProviderClientError::TransportReportInconsistent)
     );
+    // The poison wins over the identity check both ways: a matching id and a mismatching id both
+    // report the poison, never `LedgerRequestMismatch`.
     assert_eq!(
-        ledger.audit(),
+        ledger.audit_for(&logical_request_id()),
         Err(ProviderClientError::TransportReportInconsistent)
+    );
+    assert_eq!(
+        ledger.audit_for(&other_logical_request_id()),
+        Err(ProviderClientError::TransportReportInconsistent)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 9b. ProviderAttemptLedger::audit_for identity binding (INV-EJ round 5)
+// ---------------------------------------------------------------------------------------------
+//
+// Binding `execute`'s input (Section 7b) was only half of INV-EJ B1: the audit itself carried
+// bare counters, so a correctly accumulated audit could still be attached to another request's
+// compact receipt, and the frozen encoder would accept that shape because it validates counters
+// without knowing whose they are. `audit_for` closes that half by requiring the caller to name the
+// request, and refusing unless it is exactly the ledger's own bound request.
+
+#[test]
+fn audit_for_the_bound_request_id_returns_ok_with_the_expected_counters() {
+    let (charge_authority, _calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, _calls2) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let mut ledger = new_ledger();
+    client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .expect("attempt must succeed");
+
+    let audit = ledger
+        .audit_for(&logical_request_id())
+        .expect("the ledger's own bound request id must audit");
+    assert_eq!(audit.attempt_count, 1);
+    assert_eq!(audit.committed_grant_count, 1);
+    assert_eq!(audit.decisive_terminal_count, 1);
+    assert_eq!(audit.ambiguous_count, 0);
+    assert_eq!(audit.no_dispatch_count, 0);
+}
+
+#[test]
+fn audit_for_a_different_valid_uuidv7_request_id_is_a_ledger_request_mismatch() {
+    let ledger = new_ledger();
+
+    assert_eq!(
+        ledger.audit_for(&other_logical_request_id()),
+        Err(ProviderClientError::LedgerRequestMismatch)
+    );
+}
+
+#[test]
+fn audit_for_a_malformed_request_id_is_a_ledger_request_mismatch_not_a_validation_error() {
+    let ledger = new_ledger();
+
+    // audit_for compares the caller-supplied id against the ledger's own bound id by equality; it
+    // does not re-validate the caller's string as canonical UUIDv7. A malformed id is therefore
+    // still a mismatch -- the same error a well-formed-but-different id gets -- never
+    // `InvalidRequestIdentity`.
+    assert_eq!(
+        ledger.audit_for("not-a-uuid"),
+        Err(ProviderClientError::LedgerRequestMismatch)
+    );
+    assert_eq!(
+        ledger.audit_for(""),
+        Err(ProviderClientError::LedgerRequestMismatch)
     );
 }
 
@@ -2238,7 +2404,8 @@ fn record_no_dispatch_and_audit_return_the_poison_on_a_poisoned_ledger() {
 // so `LedgerAlgebraViolation` is not reachable through the public API today -- this is stated
 // honestly rather than fabricated by poking private fields. What the matrix below proves instead
 // is the *mirroring* property the variant exists to guard: for every ledger state reachable
-// through the real API, `audit()` returns `Ok`, and the frozen encoder accepts that value.
+// through the real API, `audit_for` the ledger's own bound request returns `Ok`, and the frozen
+// encoder accepts that value.
 
 /// Every terminal error path `execute` can take, applied to `ledger`'s current state through the
 /// real public API. `"none"` performs no action. Used only by the systematic matrix below.
@@ -2351,15 +2518,21 @@ fn ledger_state_fingerprint(ledger: &ProviderAttemptLedger) -> (u64, u64, u64, u
 }
 
 /// Asserts the mirroring property `LedgerAlgebraViolation` exists to guard: a poisoned ledger's
-/// `audit()` returns exactly that poison, and a non-poisoned ledger's `audit()` is `Ok` and
-/// accepted by the frozen encoder.
+/// `audit_for` (called with the ledger's own bound request id, so only the poison/non-poison arm
+/// is under test here, never the identity check) returns exactly that poison, and a non-poisoned
+/// ledger's `audit_for` is `Ok` and accepted by the frozen encoder.
 fn assert_mirrors_audit_algebra(ledger: &ProviderAttemptLedger, label: &str) {
+    let bound_request_id = ledger.logical_request_id().to_string();
     match ledger.poisoned() {
         Some(poison) => {
-            assert_eq!(ledger.audit(), Err(poison), "case: {label}");
+            assert_eq!(
+                ledger.audit_for(&bound_request_id),
+                Err(poison),
+                "case: {label}"
+            );
         }
         None => {
-            let audit = ledger.audit().unwrap_or_else(|error| {
+            let audit = ledger.audit_for(&bound_request_id).unwrap_or_else(|error| {
                 panic!("case {label}: non-poisoned ledger must audit: {error}")
             });
             // ProviderAttemptLedger has no refund method at all, so this must always be false.
@@ -2644,8 +2817,11 @@ fn expected_reachable_states() -> HashSet<(u64, u64, u64, u64, u64, String)> {
 /// no-dispatch attempted immediately after the outcome sequence (closing the gap a prior version of
 /// this comment claimed was covered but was not: `record_no_dispatch` was previously only ever
 /// called *before* the sequence in this matrix) -- and asserts the mirroring property on every
-/// resulting state: a non-poisoned ledger's `audit()` is `Ok` and the frozen encoder accepts it, or
-/// the ledger is poisoned and `audit()` returns that same poison.
+/// resulting state: `audit_for` the ledger's own bound request is `Ok` on a non-poisoned ledger
+/// and the frozen encoder accepts it, or the ledger is poisoned and `audit_for` returns that same
+/// poison. Every ledger in this matrix is `new_ledger()`, so it is always called with the id it is
+/// actually bound to -- this matrix exercises the poison/counter algebra `audit_for` restates from
+/// `LedgerAlgebraViolation`, not its identity check, which Section 9b pins on its own.
 ///
 /// Most of the matrix's raw combinations collapse into the poison branch, and the loop bounds alone
 /// say nothing about how many distinct audited states that actually reaches, so this test does not
@@ -2815,9 +2991,11 @@ fn debug_output_never_leaks_sensitive_fields() {
         UnwiredChargeAuthority,
         UnwiredProviderTransport,
     );
-    // authorize()'s ProviderChargeRequest is crate-private now (WP-114 CD-5), so it is captured
-    // through a real execute() call the same way Section 5's charge-request tests do, rather than
-    // called directly.
+    // authorize()'s ProviderChargeRequest is crate-private now (WP-114 CD-5) and not `Clone`
+    // (INV-EJ P2 round 4), so it is captured through a real execute() call the same way Section
+    // 5's charge-request tests do, rather than called or retained directly. The captured struct's
+    // `debug_output` is `ProviderChargeRequest`'s own `Debug` output, taken while the value was
+    // still alive, which is what lets this fixture still exercise its real redaction below.
     let charge_request = capture_charge_request_with_boundary(
         boundary.clone(),
         ProviderCapabilities::none(),
@@ -2826,13 +3004,16 @@ fn debug_output_never_leaks_sensitive_fields() {
     );
     let grant = ProviderChargeGrant {
         grant_id: sentinel_grant_id.clone(),
-        traffic_class: charge_request.traffic_class(),
-        attempt_class: charge_request.attempt_class(),
-        charged_units: charge_request.attempt_units(),
-        budget_pin: charge_request.budget_pin().clone(),
-        logical_request_id: charge_request.logical_request_id().to_string(),
-        attempt_id: charge_request.attempt_id().to_string(),
-        attempt_ordinal: charge_request.attempt_ordinal(),
+        traffic_class: charge_request.traffic_class,
+        attempt_class: charge_request.attempt_class,
+        charged_units: charge_request.attempt_units,
+        budget_pin: BudgetPin {
+            revision: charge_request.budget_pin_revision.clone(),
+            fence: charge_request.budget_pin_fence,
+        },
+        logical_request_id: charge_request.logical_request_id.clone(),
+        attempt_id: charge_request.attempt_id.clone(),
+        attempt_ordinal: charge_request.attempt_ordinal,
         granted_at_database_unix_ms: 1_000,
     };
 
@@ -2853,7 +3034,7 @@ fn debug_output_never_leaks_sensitive_fields() {
         format!("{put_body:?}"),
         format!("{budget_pin:?}"),
         format!("{request:?}"),
-        format!("{charge_request:?}"),
+        charge_request.debug_output.clone(),
         format!("{grant:?}"),
         format!("{sentinel_client:?}"),
     ];
@@ -2865,17 +3046,15 @@ fn debug_output_never_leaks_sensitive_fields() {
     }
 }
 
-/// INV-EJ finding, reported rather than fixed here (test ownership does not include `src/`):
-/// `ProviderAttemptLedger` is the only identity-bearing type in this module whose `Debug` is
-/// `#[derive]`d rather than hand-written to redact. Every sibling type that carries a boundary or
-/// request identity (`ProviderTarget`, `CellProviderBoundary`, `DurableProviderPutBody`,
-/// `ProviderAttemptRequest`, `ProviderChargeRequest`, `ProviderChargeGrant`, `BudgetPin`) has a
-/// custom `fmt::Debug` that prints `"[REDACTED]"` for exactly these fields. `ProviderAttemptLedger`
-/// gained `provider_boundary_id`/`logical_request_id` in this same fix and kept its derived
-/// `#[derive(Clone, Debug, PartialEq, Eq)]`, so `{ledger:?}` now prints both identity strings in
-/// clear text. This test is expected to fail against the current `src/provider_client.rs` -- it
-/// pins the same no-leak contract every other identity-bearing type in this file already meets, so
-/// a future redaction fix in `src/` should turn it green rather than needing a rewrite.
+/// Regression guard for a defect the INV-EJ fix round introduced and the same round fixed.
+///
+/// Binding the ledger to an identity gave `ProviderAttemptLedger` a `provider_boundary_id` and a
+/// `logical_request_id` while it still carried a derived `Debug`, so `{ledger:?}` printed both in
+/// clear text -- the one identity-bearing type in this module without the hand-written redacting
+/// `Debug` its siblings (`ProviderTarget`, `CellProviderBoundary`, `DurableProviderPutBody`,
+/// `ProviderAttemptRequest`, `ProviderChargeRequest`, `ProviderChargeGrant`, `BudgetPin`) all have.
+/// This test was written red and turned green by that impl. Adding a field to the ledger without
+/// extending the impl reopens it, which is what this guards.
 #[test]
 fn ledger_debug_output_must_not_leak_the_boundary_or_request_identity() {
     let sentinel_boundary_id = "cell.sentinel.ledger-redact.7e2";
@@ -2930,8 +3109,66 @@ fn provider_client_error_display_never_contains_sensitive_values() {
         ProviderClientError::TransportReportInconsistent,
         ProviderClientError::TransportIssuedUnauthorizedRequests,
         ProviderClientError::NoDispatchNotPermitted,
+        ProviderClientError::DispatchAfterNoDispatch,
+        ProviderClientError::LedgerRequestMismatch,
+        ProviderClientError::LedgerAlgebraViolation,
         ProviderClientError::LedgerOverflow,
     ];
+    // The match below forces a new *arm*, which a `_ => {}` would satisfy without adding the
+    // variant to the array these tests actually sweep. Pinning the length is what makes adding a
+    // variant fail here rather than pass unswept -- the same shape as
+    // `cell_schema_install.rs`'s `every_error_variant`. This is a change-detector, not proof the
+    // array is complete on its own: it only catches the *next* new variant, which is exactly the
+    // failure mode INV-EJ round 5 found (`LedgerRequestMismatch`, `DispatchAfterNoDispatch`, and
+    // `LedgerAlgebraViolation` were all missing from this sweep).
+    assert_eq!(
+        errors.len(),
+        36,
+        "a new ProviderClientError variant must be added to this array, not only to the match \
+         below"
+    );
+    for error in &errors {
+        // No wildcard: this is the compile-time exhaustiveness check.
+        match error {
+            ProviderClientError::InvalidProviderBoundaryId
+            | ProviderClientError::InvalidBucketName
+            | ProviderClientError::InvalidRegion
+            | ProviderClientError::InvalidEndpointHost
+            | ProviderClientError::BucketOutsideCellBoundary
+            | ProviderClientError::RegionOutsideCell
+            | ProviderClientError::EndpointOutsideCellRegion
+            | ProviderClientError::ListCapabilityNotGranted
+            | ProviderClientError::InvalidRequestIdentity
+            | ProviderClientError::InvalidAttemptOrdinal
+            | ProviderClientError::InvalidBudgetPin
+            | ProviderClientError::InvalidPutLimits
+            | ProviderClientError::MultipartPartCountExceeded
+            | ProviderClientError::InvalidSpoolKind
+            | ProviderClientError::InvalidSpoolKey
+            | ProviderClientError::PutBodyNotDurable
+            | ProviderClientError::PutBodyHandleMismatch
+            | ProviderClientError::PutBodyBoundaryMismatch
+            | ProviderClientError::PutBodyRequestMismatch
+            | ProviderClientError::PutBodyRequired
+            | ProviderClientError::PutBodyNotPermitted
+            | ProviderClientError::SinglePutBodyTooLarge
+            | ProviderClientError::PutPartRequired
+            | ProviderClientError::PutPartNotPermitted
+            | ProviderClientError::InvalidPutPart
+            | ProviderClientError::ChargeRefused(_)
+            | ProviderClientError::ChargeAmbiguous
+            | ProviderClientError::GrantDoesNotBindAttempt
+            | ProviderClientError::TransportRefused(_)
+            | ProviderClientError::TransportReportInconsistent
+            | ProviderClientError::TransportIssuedUnauthorizedRequests
+            | ProviderClientError::NoDispatchNotPermitted
+            | ProviderClientError::DispatchAfterNoDispatch
+            | ProviderClientError::LedgerRequestMismatch
+            | ProviderClientError::LedgerAlgebraViolation
+            | ProviderClientError::LedgerOverflow => {}
+        }
+    }
+
     let sentinels = [
         "sentinel-redact-bucket-9f3",
         "sentinel-redact-region-2b7",

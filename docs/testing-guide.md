@@ -231,10 +231,12 @@ will update an older check constraint or state schema.
   `authorize` and unpoisoned — one ledger can no longer accumulate two requests' attempts.
   `authorize` is crate-private now; `validate_attempt` (`Result<(), _>`) is its public replacement,
   so a test asserting the `ProviderChargeRequest` an authority receives needs the capture-closure
-  pattern above during a real `execute()` call, not a direct call. Unfixed finding: `ProviderAttemptLedger`'s
-  `#[derive]`d `Debug` leaks both identity strings, unlike every sibling identity-bearing type in
-  this module, which hand-write a redacting one. Gate: `cargo test -p lore-object-dispatch --test
-  provider_client -j 4` (67 tests, no `#[ignore]`; one intentionally red pending that `src/` fix).
+  pattern above during a real `execute()` call, not a direct call. `audit_for(logical_request_id)`
+  replaced `audit()` for the same reason the input is bound: bare counters could be attached to
+  another request's receipt. Adding an identity field to a type whose `Debug` is `#[derive]`d is how
+  this module's redaction regressed once — the ledger leaked both strings until the same round gave
+  it the hand-written impl its siblings already had, and a test now guards it. Gate: `cargo test -p
+  lore-object-dispatch --test provider_client -j 4` (no `#[ignore]`).
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

@@ -730,7 +730,13 @@ impl fmt::Debug for ProviderAttemptRequest {
 ///
 /// Constructed only by [`GovernedProviderClient::execute`], after the boundary, capability, and
 /// body checks pass, so a charge request always describes an attempt this cell may make.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// Deliberately not `Clone`, and deliberately without a public constructor. This value is the only
+/// thing a [`ProviderChargeAuthority`] will charge, so an implementation that could retain a copy
+/// past the call could charge again later, outside any ledger, producing a committed grant the
+/// audit reports as zero in a shape the frozen encoder accepts. An implementation receives a borrow
+/// that ends with the call and can keep nothing chargeable from it.
+#[derive(PartialEq, Eq)]
 pub struct ProviderChargeRequest {
     provider_boundary_id: String,
     traffic_class: ProviderTrafficClass,
@@ -1154,10 +1160,23 @@ impl ProviderAttemptLedger {
         Ok(())
     }
 
-    /// The retained provider-attempt audit for this request.
-    pub fn audit(&self) -> Result<ObjectStoreProviderAttemptAudit, ProviderClientError> {
+    /// The retained provider-attempt audit, for the logical request the caller is attaching it to.
+    ///
+    /// The caller must name that request, and it must be the one this ledger is bound to. Binding
+    /// `execute`'s input was only half the problem INV-EJ found: the audit itself carries bare
+    /// counters, so a caller could still take a correctly accumulated audit and attach it to
+    /// another request's compact receipt, and the frozen encoder would accept it. Requiring the
+    /// identity here means an audit cannot be obtained at all without naming the request it
+    /// describes.
+    pub fn audit_for(
+        &self,
+        logical_request_id: &str,
+    ) -> Result<ObjectStoreProviderAttemptAudit, ProviderClientError> {
         if let Some(error) = self.poisoned {
             return Err(error);
+        }
+        if logical_request_id != self.logical_request_id {
+            return Err(ProviderClientError::LedgerRequestMismatch);
         }
         let audit = ObjectStoreProviderAttemptAudit {
             attempt_count: self.attempt_count,
@@ -1301,6 +1320,17 @@ where
         if let Some(error) = ledger.poisoned() {
             return Err(error);
         }
+        // Identity first: "is this even my ledger" precedes any question about its state, so a
+        // mismatched request on a no-dispatch ledger reports the mismatch rather than a sequencing
+        // fault it does not have. The audit this ledger produces is attached to a compact receipt
+        // that carries its own request identity, and the frozen encoder validates the counters
+        // without knowing whose they are, so the binding has to be checked here or nowhere.
+        // Refused before anything is charged or sent, and so without closing the ledger.
+        if ledger.provider_boundary_id() != self.boundary.provider_boundary_id
+            || ledger.logical_request_id() != request.logical_request_id
+        {
+            return Err(ProviderClientError::LedgerRequestMismatch);
+        }
         // A recorded no-dispatch proof asserts the request resolved without reaching the provider,
         // so dispatching afterwards would contradict a durable claim. The refusal happens before
         // anything is charged or sent, which makes it the same class of caller-sequencing fault
@@ -1309,15 +1339,6 @@ where
         // effect.
         if ledger.no_dispatch_count() != 0 {
             return Err(ProviderClientError::DispatchAfterNoDispatch);
-        }
-        // The audit this ledger produces is attached to a compact receipt that carries its own
-        // request identity, and the frozen encoder validates the counters without knowing whose
-        // they are. So the binding has to be checked here or nowhere. Refused before anything is
-        // charged or sent, and so, like the guard above, without closing the ledger.
-        if ledger.provider_boundary_id() != self.boundary.provider_boundary_id
-            || ledger.logical_request_id() != request.logical_request_id
-        {
-            return Err(ProviderClientError::LedgerRequestMismatch);
         }
         let charge_request = self.authorize(request)?;
 
@@ -1372,13 +1393,14 @@ where
     /// [`ProviderChargeRequest`], because that value is the only thing a
     /// [`ProviderChargeAuthority`] will charge, and a caller holding both it and the authority
     /// could charge outside any ledger — producing a committed grant the audit reports as zero,
-    /// in a shape the frozen encoder accepts. Keeping the constructor inside the crate makes that
-    /// unreachable rather than merely discouraged.
+    /// in a shape the frozen encoder accepts. Together with that type having no public constructor
+    /// and no `Clone`, charging outside a ledger is unreachable rather than merely discouraged.
     pub fn validate_attempt(
         &self,
         request: &ProviderAttemptRequest,
     ) -> Result<(), ProviderClientError> {
-        self.authorize(request).map(|_| ())
+        self.authorize(request)?;
+        Ok(())
     }
 
     /// Validates a request against the cell boundary, the capability gate, and the body rules, and
@@ -1487,9 +1509,8 @@ impl<C, T> fmt::Debug for GovernedProviderClient<C, T> {
 /// must confirm the charset against WP-121's actual revision spelling when the per-cell envelope is
 /// published; narrowing here is the fail-closed direction to guess in, but it is still a guess.
 ///
-/// The caller's `fence == 0` rejection is the same kind of guess and needs the same confirmation:
-/// it assumes WP-121's monotonic generation starts at one, and a 0-based first generation would
-/// hard-fail at admission.
+/// [`validate_budget_pin`]'s `fence == 0` rejection is the same kind of guess and needs the same
+/// confirmation; the note is repeated there.
 fn validate_budget_revision(value: &str) -> Result<(), ProviderClientError> {
     let bytes = value.as_bytes();
     if bytes.is_empty()
@@ -1506,6 +1527,9 @@ fn validate_budget_revision(value: &str) -> Result<(), ProviderClientError> {
 
 fn validate_budget_pin(pin: &BudgetPin) -> Result<(), ProviderClientError> {
     validate_budget_revision(&pin.revision)?;
+    // Rejecting fence 0 assumes WP-121's monotonic generation starts at one. Like the revision
+    // charset, that is a fail-closed guess at an unpublished envelope: a 0-based first generation
+    // would hard-fail at admission. CD-4 confirms both against the published envelope.
     if pin.fence == 0 {
         return Err(ProviderClientError::InvalidBudgetPin);
     }
