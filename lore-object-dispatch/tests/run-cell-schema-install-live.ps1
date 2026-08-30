@@ -70,6 +70,10 @@ $gateTests = @(
         EnvVar   = 'LORE_TEST_CELL_SCHEMA_CLEAN_PG_URL'
         Name     = 'live_postgres_cell_schema_installs_clean_and_attests'
         Database = 'cell_schema_clean'
+        # A second URL onto the SAME database, authenticated as a non-migrator, so the test can
+        # prove every entry point refuses one. `postgres` is deliberate: a superuser can read every
+        # digest, so refusing it proves a real boundary rather than an incidental privilege gap.
+        ExtraEnv = @{ 'LORE_TEST_CELL_SCHEMA_CLEAN_OUTSIDER_PG_URL' = 'postgres' }
     },
     @{
         EnvVar   = 'LORE_TEST_CELL_SCHEMA_IDEMPOTENT_PG_URL'
@@ -111,6 +115,11 @@ else {
 $knownTests = @($gateTests) + @($measureTest)
 
 $environmentNames = @($knownTests | ForEach-Object { $_.EnvVar })
+foreach ($known in $knownTests) {
+    if ($known.ContainsKey('ExtraEnv')) {
+        $environmentNames += @($known.ExtraEnv.Keys)
+    }
+}
 $priorEnvironment = @{}
 foreach ($name in $environmentNames) {
     $priorEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -302,6 +311,15 @@ GRANT object_dispatch_retention_owner TO object_dispatch_retention_migrator
             "postgresql://object_dispatch_retention_migrator@localhost:$port/$($t.Database)",
             'Process'
         )
+        if ($t.ContainsKey('ExtraEnv')) {
+            foreach ($extra in $t.ExtraEnv.GetEnumerator()) {
+                [Environment]::SetEnvironmentVariable(
+                    $extra.Key,
+                    "postgresql://$($extra.Value)@localhost:$port/$($t.Database)",
+                    'Process'
+                )
+            }
+        }
     }
 
     $results = @()

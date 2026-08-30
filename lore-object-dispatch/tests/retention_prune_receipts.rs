@@ -283,13 +283,10 @@ fn prune_v2_entrypoints_remain_confined_to_the_maintenance_client() {
         ] {
             if is_cell_installer {
                 // WP-114 CD-1's attester names the deferred 0006 procedures only to assert they are
-                // ABSENT from a cell. Hold it to the stronger rule rather than exempting it: the
-                // bare name may appear in its inventory, but a schema-qualified reference -- the
-                // only form that can execute one -- may not.
-                assert!(
-                    !source.contains(&format!("object_store_retention.{identifier}")),
-                    "the cell schema installer must never reference {identifier} in callable form"
-                );
+                // ABSENT from a cell, which is the opposite of calling one. The stronger, use-based
+                // rule for that file lives in
+                // `deferred_0006_prune_v2_names_are_only_listed_by_the_cell_installer` below, which
+                // also proves itself against planted calls.
                 continue;
             }
             assert!(
@@ -298,5 +295,69 @@ fn prune_v2_entrypoints_remain_confined_to_the_maintenance_client() {
                 source_path.display()
             );
         }
+    }
+}
+
+/// The cell schema installer may *list* a deferred procedure name; it may not *use* one.
+///
+/// Spelling is not the invariant, and a guard on spelling is the wrong guard. The installer builds
+/// every callable reference by interpolation, `format!("...{CELL_AUTHORITY_SCHEMA}.{}...", name)`,
+/// so forbidding only the literal `object_store_retention.<name>` misses the exact form this module
+/// emits. The rule here is positional instead: a deferred name may appear only inside the
+/// `CELL_DEFERRED_PROCEDURES` array literal, which is an inventory of procedures that must be
+/// ABSENT from a cell. Anywhere else in the file is a use.
+///
+/// Returns `Err` rather than asserting, so the identical rule can be run against a planted negative
+/// control and not only against the real source.
+fn deferred_name_is_only_listed(source: &str, name: &str) -> Result<(), String> {
+    const INVENTORY: &str = "pub const CELL_DEFERRED_PROCEDURES: [&str; 6] = [";
+    let start = source
+        .find(INVENTORY)
+        .ok_or_else(|| "CELL_DEFERRED_PROCEDURES inventory not found".to_owned())?;
+    let after = start + INVENTORY.len();
+    let end = source[after..]
+        .find("];")
+        .ok_or_else(|| "unterminated CELL_DEFERRED_PROCEDURES inventory".to_owned())?;
+    let mut outside = String::with_capacity(source.len());
+    outside.push_str(&source[..start]);
+    outside.push_str(&source[after + end..]);
+    if outside.contains(name) {
+        return Err(format!(
+            "{name} appears outside the inventory, which is a use, not a listing"
+        ));
+    }
+    Ok(())
+}
+
+/// Prove the rule above rejects the two shapes a real call takes, not just the literal one.
+///
+/// Without this, the guard could be vacuous and nobody would know.
+fn assert_deferred_name_rule_catches_real_call_shapes(source: &str, name: &str) {
+    let interpolated =
+        format!("{source}\nlet sql = format!(\"SELECT {{CELL_AUTHORITY_SCHEMA}}.{name}()\");\n");
+    assert!(
+        deferred_name_is_only_listed(&interpolated, name).is_err(),
+        "the rule must reject the interpolated call form the installer's own idiom uses"
+    );
+    let literal = format!(
+        "{source}\nclient.batch_execute(\"SELECT object_store_retention.{name}()\").await;\n"
+    );
+    assert!(
+        deferred_name_is_only_listed(&literal, name).is_err(),
+        "the rule must reject the schema-qualified literal call form"
+    );
+}
+
+#[test]
+fn deferred_0006_prune_v2_names_are_only_listed_by_the_cell_installer() {
+    let installer = include_str!("../src/cell_schema_install.rs");
+    for name in [
+        "object_store_retention_read_prune_v2",
+        "object_store_retention_apply_prune_v2",
+    ] {
+        if let Err(violation) = deferred_name_is_only_listed(installer, name) {
+            panic!("cell_schema_install.rs: {violation}");
+        }
+        assert_deferred_name_rule_catches_real_call_shapes(installer, name);
     }
 }

@@ -5,11 +5,14 @@
 //!
 //! Every test here is `#[ignore]` and gated on its own `LORE_TEST_CELL_SCHEMA_*_PG_URL`, which must
 //! name a **fresh disposable** database whose connection authenticates as
-//! `object_dispatch_retention_migrator`. An `--ignored` run with no environment set exits early
-//! with zero tests run; that is NOT RUN, never passing evidence.
+//! `object_dispatch_retention_migrator`.
 //!
-//! `tests/run-cell-schema-install-live.ps1` provisions all of it and reports PASS, FAIL and NOT RUN
-//! as three distinct states.
+//! An `--ignored` run with the environment unset **panics in `connect` and reports FAIL**. It does
+//! not exit early with zero tests run. That is deliberate and is the safer of the two: a missing
+//! fixture is louder as a failure than as a silent skip. NOT RUN here means the filter matched no
+//! test at all, which is what `tests/run-cell-schema-install-live.ps1` detects and reports as its
+//! own third state. Do not restate the older tiers' "exits early with zero tests run" sentence for
+//! this suite; it is not true here.
 
 use lore_object_dispatch::cell_schema_install::CELL_INSTALL_SET;
 use lore_object_dispatch::cell_schema_install::CELL_OWNER_ROLE;
@@ -32,8 +35,25 @@ struct LiveCell {
 }
 
 async fn connect(variable: &str) -> LiveCell {
-    let url = std::env::var(variable)
-        .unwrap_or_else(|_| panic!("{variable} must name a fresh disposable database"));
+    connect_as(
+        variable,
+        "a fresh disposable database",
+        Some("object_dispatch_retention_migrator"),
+    )
+    .await
+}
+
+/// Open one connection and, when `expected_session_user` is given, pin who it authenticated as.
+///
+/// The migrator-role tests must fail loudly if the runner ever hands them a differently
+/// authenticated URL, because every refusal they assert would then be trivially satisfied for the
+/// wrong reason.
+async fn connect_as(
+    variable: &str,
+    purpose: &str,
+    expected_session_user: Option<&str>,
+) -> LiveCell {
+    let url = std::env::var(variable).unwrap_or_else(|_| panic!("{variable} must name {purpose}"));
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
         .await
         .expect("connect disposable cell database");
@@ -45,10 +65,17 @@ async fn connect(variable: &str) -> LiveCell {
         .await
         .expect("read session_user")
         .get(0);
-    assert_eq!(
-        session_user, "object_dispatch_retention_migrator",
-        "{variable} must authenticate as the migrator role; the installer refuses otherwise"
-    );
+    if let Some(expected) = expected_session_user {
+        assert_eq!(
+            session_user, expected,
+            "{variable} must authenticate as {expected}; the installer refuses otherwise"
+        );
+    } else {
+        assert_ne!(
+            session_user, "object_dispatch_retention_migrator",
+            "{variable} must NOT authenticate as the migrator, or it proves nothing"
+        );
+    }
     LiveCell {
         client,
         _connection: handle,
@@ -122,16 +149,43 @@ async fn live_postgres_cell_schema_installs_clean_and_attests() {
     // Both dispatch-layer readbacks are retired at full chain depth, for two different reasons:
     // 0011 revokes the authority entrypoint (42501), and 0011's whole-schema catalog manifest no
     // longer matches once 0012-0017 add functions (55000). This is the executed proof of that
-    // consequence; the offline suite can only observe the SQL that causes it.
+    // consequence; the offline suite can only observe the SQL that causes it. The exact code per
+    // layer is asserted, not merely "both are retired": four records claim the two modes apart, so
+    // accepting either code for either layer would leave that distinction unproven.
     assert_eq!(
         report.attestation.retired_readbacks,
-        vec!["authority", "put_reservation"]
+        vec![("authority", "42501"), ("put_reservation", "55000")]
     );
     assert_eq!(report.attestation.replaced_functions_revoked, 2);
     assert_eq!(report.attestation.inert_tables_present, 4);
 
     // The install set is 13 artifacts; nothing outside it may have been applied.
     assert_eq!(CELL_INSTALL_SET.len(), 13);
+
+    // An installed cell holds ZERO `pg_default_acl` rows, cluster-wide. Measured, not assumed, and
+    // it is not what reading 0002 suggests: 0002:12-17 issues three `ALTER DEFAULT PRIVILEGES ...
+    // REVOKE ... FROM PUBLIC` statements, and none of them leaves a catalog row. PostgreSQL stores
+    // a default-ACL row only when the result differs from the built-in default, and revoking a
+    // privilege PUBLIC does not hold by default is a no-op.
+    //
+    // Two consequences. The schema's function posture is carried by each migration's own explicit
+    // `REVOKE ALL ON ALL FUNCTIONS ... FROM PUBLIC` after it creates functions, not by 0002's
+    // default privileges. And because the correct baseline is empty, ANY default-ACL entry on an
+    // installed cell is drift by definition, which is what the `default_acls` manifest section
+    // pins. Assert the baseline here so a future change to it cannot pass as normal.
+    let cluster_default_acls: i64 = cell
+        .client
+        .query_one(
+            "SELECT count(*)::bigint FROM pg_catalog.pg_default_acl",
+            &[],
+        )
+        .await
+        .expect("count default ACLs")
+        .get(0);
+    assert_eq!(
+        cluster_default_acls, 0,
+        "an installed cell holds no default-privilege entries"
+    );
 
     // A layer identity tuple is all-absent or all-valid. Nulling one layer's whole tuple, which the
     // table constraint does permit, must be refused as a partial install rather than read as "this
@@ -162,6 +216,35 @@ async fn live_postgres_cell_schema_installs_clean_and_attests() {
     attest_cell_schema(&cell.client)
         .await
         .expect("attestation holds again after rollback");
+
+    // The migrator-role boundary is documented for every entry point, not only install. Prove it
+    // for attestation with a real second login on the same database. A superuser is the strongest
+    // case: it can read every digest, so nothing here is fail-open, and refusing it anyway is what
+    // makes the documented boundary a true statement rather than an aspiration.
+    let outsider = connect_as(
+        "LORE_TEST_CELL_SCHEMA_CLEAN_OUTSIDER_PG_URL",
+        "the non-migrator login used to prove attest refuses",
+        None,
+    )
+    .await;
+    assert_eq!(
+        attest_cell_schema(&outsider.client).await,
+        Err(CellSchemaError::Precondition(
+            "session_user is not migrator"
+        ))
+    );
+    assert_eq!(
+        measure_catalog_manifest(&outsider.client).await,
+        Err(CellSchemaError::Precondition(
+            "session_user is not migrator"
+        ))
+    );
+    assert_eq!(
+        revoke_replaced_function_privileges(&outsider.client).await,
+        Err(CellSchemaError::Precondition(
+            "session_user is not migrator"
+        ))
+    );
 }
 
 #[tokio::test]
@@ -321,6 +404,41 @@ async fn live_postgres_cell_schema_refuses_a_drifted_catalog() {
         (
             "function_acls",
             "GRANT EXECUTE ON FUNCTION object_store_retention.clock_unix_ms_v1()
+             TO object_dispatch_retention_runtime;",
+        ),
+        (
+            // The case that motivated the section. 0002 writes three default-privilege entries as
+            // part of the security posture; before this section existed, this statement changed no
+            // digest at all, attested clean, and made every future owner-created function
+            // runtime-executable.
+            "default_acls",
+            "ALTER DEFAULT PRIVILEGES FOR ROLE object_dispatch_retention_owner
+             IN SCHEMA object_store_retention
+             GRANT EXECUTE ON FUNCTIONS TO object_dispatch_retention_runtime;",
+        ),
+        (
+            // A built-in trigger function, so this adds no row to pg_proc and cannot be caught one
+            // section earlier by `functions`.
+            "triggers",
+            "CREATE TRIGGER drift_trigger
+             BEFORE UPDATE ON object_store_retention.object_dispatch_spool_objects
+             FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger();",
+        ),
+        (
+            // Creating a policy does not enable row security, so `relations` stays identical and
+            // this isolates pg_policy.
+            "rules_and_policies",
+            "CREATE POLICY drift_policy ON object_store_retention.object_dispatch_spool_objects
+             USING (true);",
+        ),
+        (
+            "schema",
+            "REVOKE USAGE ON SCHEMA object_store_retention
+             FROM object_dispatch_retention_runtime;",
+        ),
+        (
+            "types",
+            "GRANT USAGE ON TYPE object_store_retention.uint64
              TO object_dispatch_retention_runtime;",
         ),
     ] {

@@ -511,7 +511,7 @@ fn replacement_inventory_is_complete() {
             }
             other => panic!("unexpected CELL_REPLACED_FUNCTIONS name in test fixture: {other}"),
         };
-        assert_eq!(replaced.identity_arguments, expected_identity_arguments);
+        assert_eq!(replaced.argument_types, expected_identity_arguments);
 
         let revoke_signature = format!(
             "REVOKE ALL ON FUNCTION object_store_retention.{}(",
@@ -622,7 +622,17 @@ fn inert_state_inventory_is_exact() {
 
 #[test]
 fn catalog_manifest_sql_is_a_single_hygienic_read_only_statement() {
-    assert_eq!(CELL_CATALOG_MANIFEST_SECTIONS.len(), 9);
+    assert_eq!(CELL_CATALOG_MANIFEST_SECTIONS.len(), 12);
+
+    // The four catalogs a privilege change can hide in when only relation and function ACLs are
+    // manifested. `pg_default_acl` is the one migration 0002 actually writes, so its absence was a
+    // live widening path, not a hypothetical one.
+    for required_catalog in ["pg_default_acl", "pg_trigger", "pg_policy", "pg_rewrite"] {
+        assert!(
+            CELL_CATALOG_MANIFEST_SQL.contains(required_catalog),
+            "the manifest must read {required_catalog}"
+        );
+    }
 
     let sql = CELL_CATALOG_MANIFEST_SQL.trim();
     assert!(
@@ -700,6 +710,14 @@ fn every_error_variant() -> Vec<CellSchemaError> {
         CellSchemaError::RefusedUnattestedSchema("catalog drift"),
         CellSchemaError::UnexpectedInstallResult,
     ];
+    // The match below forces a new *arm*, which a `=> {}` satisfies without adding the variant to
+    // the vec these tests actually sweep. Pinning the length is what makes adding a variant fail
+    // here rather than pass unswept.
+    assert_eq!(
+        variants.len(),
+        11,
+        "a new CellSchemaError variant must be added to this vec, not only to the match below"
+    );
     for variant in &variants {
         // No wildcard: this is the compile-time exhaustiveness check.
         match variant {

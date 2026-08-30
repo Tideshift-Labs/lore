@@ -7,23 +7,35 @@
 //! 0003, then 0007 through 0017. Retention migrations 0004 through 0006 are deferred and are never
 //! installed; migration 0001 does not exist.
 //!
-//! Five properties this module owns, and nothing else in the crate does:
+//! Six properties this module owns, and nothing else in the crate does:
 //!
-//! 1. **Migrator-role install, out of band.** Every step runs on a connection whose `session_user`
-//!    is `object_dispatch_retention_migrator`. Runtime never installs a migration; no other module
-//!    in this crate references this one, and the crate is not linked into loreserver.
+//! 1. **Migrator-role install, out of band.** Every public entry point here refuses unless the
+//!    connection's `session_user` is `object_dispatch_retention_migrator`: install, attestation, the
+//!    manifest measurement, and the revoke pass alike. `session_user` rather than `current_user`,
+//!    because `SET ROLE` cannot forge it. Runtime never installs a migration; no other module in
+//!    this crate references this one, and the crate is not linked into loreserver.
 //! 2. **Namespace separation.** Everything lives in the `object_store_retention` schema under the
 //!    four `object_dispatch_retention_*` roles. This bootstrap never installs `lore-postgres`'s
 //!    schema and never assumes `lore-postgres`'s `ensure_schema` advisory-lock bootstrap has run.
 //! 3. **All-absent-or-all-valid identity tuples.** Each added schema layer is attested as one
 //!    tuple, not per object. A partial tuple is refused, never repaired.
-//! 4. **Live catalog readback.** An installed-migration digest does not attest the live PostgreSQL
-//!    catalog, so attestation digests a canonical manifest over the schema's relations, columns,
-//!    constraints, indexes, types, function definitions, security attributes, and ACLs
-//!    (`prosecdef`, `proconfig`, `proacl`, `relacl`, `attacl`, row-security flags). After any
-//!    function replacement, prior service-role privileges are explicitly revoked and then attested
-//!    as absent.
-//! 5. **Inert state.** Four of the five tables 0002 creates are present but unwritable while 0004
+//! 4. **One transaction discipline, stated rather than assumed.** [`attest_cell_schema`] is safe
+//!    to call from inside a caller's open transaction and is savepoint-guarded where it must be.
+//!    [`install_cell_schema`] is not, and refuses rather than corrupting the caller: it cannot be,
+//!    because every frozen artifact carries its own `BEGIN`/`COMMIT` and every layer install
+//!    procedure requires `SERIALIZABLE`.
+//! 5. **Live catalog readback.** An installed-migration digest does not attest the live PostgreSQL
+//!    catalog, so attestation digests a canonical twelve-section manifest over the schema:
+//!    relations, columns, constraints, indexes, types, function definitions with their security
+//!    attributes (`prosecdef`, `proconfig`), function ACLs, relation and column ACLs (`relacl`,
+//!    `attacl`, row-security flags), **default privileges** (`pg_default_acl`), triggers, and rules
+//!    and policies. Default privileges earn their section by measurement, not by theory: an
+//!    installed cell holds zero `pg_default_acl` rows, so any entry is drift by definition, and an
+//!    `ALTER DEFAULT PRIVILEGES ... GRANT EXECUTE ON FUNCTIONS TO <service role>` would otherwise
+//!    make every future owner-created function service-executable while every section digest stayed
+//!    identical. After any function replacement, prior service-role privileges are explicitly
+//!    revoked and then attested as absent.
+//! 6. **Inert state.** Four of the five tables 0002 creates are present but unwritable while 0004
 //!    through 0006 are uninstalled. That is the expected state and is asserted, not "fixed".
 //!
 //! What this module is **not**: it is not a service, a dispatcher, a daemon, or an RPC surface. The
@@ -246,6 +258,20 @@ pub struct CellSchemaLayer {
     pub read_state_function: &'static str,
     /// `Some(n)` when installing migration `n` retires this readback for a fully installed cell.
     pub read_state_retired_after: Option<u16>,
+    /// The exact SQLSTATE the retired readback must raise, when it is retired.
+    ///
+    /// The two layers retire for different reasons and must fail differently: `42501` when the
+    /// EXECUTE privilege was revoked, `55000` when the entrypoint survives but its own catalog
+    /// manifest no longer matches. Accepting either code for either layer would let one failure
+    /// mode silently stand in for the other.
+    pub read_state_retired_sqlstate: Option<&'static str>,
+    /// `Some(n)` when installing migration `n` also makes this layer's install procedure unusable.
+    ///
+    /// Today this matches `read_state_retired_after` for both dispatch layers, but the two are
+    /// independent facts: 0011 revokes the 0008 install entrypoint outright, while the
+    /// put-reservation install entrypoint keeps its grant and instead fails through the catalog
+    /// assert its own projection runs. A future layer could retire one and not the other.
+    pub install_retired_after: Option<u16>,
     /// The four schema-state columns that form this layer's all-absent-or-all-valid tuple.
     pub identity_columns: [&'static str; 4],
     /// The DDL migration after which this layer's install procedure must run.
@@ -263,6 +289,8 @@ pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 3] = [
         install_function: "object_store_retention_install_v1",
         read_state_function: "object_store_retention_read_state_v1",
         read_state_retired_after: None,
+        read_state_retired_sqlstate: None,
+        install_retired_after: None,
         identity_columns: [
             "schema_revision",
             "migration_blake3",
@@ -281,6 +309,8 @@ pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 3] = [
         read_state_function: "object_store_dispatch_authority_read_state_v1",
         // 0011 revokes EXECUTE on both 0008 entrypoints from every role that held them.
         read_state_retired_after: Some(11),
+        read_state_retired_sqlstate: Some("42501"),
+        install_retired_after: Some(11),
         identity_columns: [
             "local_authority_schema_revision",
             "local_authority_migration_blake3",
@@ -300,6 +330,10 @@ pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 3] = [
         // 0011's catalog manifest covers every function in the schema with no name filter, and
         // 0012 adds one. The readback therefore fails closed once 0012 lands.
         read_state_retired_after: Some(12),
+        // The entrypoint keeps its grant; its projection runs 0011's catalog assert, which 0012
+        // invalidates. Same for the install procedure, which projects through the same assert.
+        read_state_retired_sqlstate: Some("55000"),
+        install_retired_after: Some(12),
         identity_columns: [
             "put_reservation_schema_revision",
             "put_reservation_migration_blake3",
@@ -319,8 +353,13 @@ pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 3] = [
 pub struct ReplacedFunction {
     /// Bare function name.
     pub name: &'static str,
-    /// `pg_get_function_identity_arguments` form of the signature.
-    pub identity_arguments: &'static str,
+    /// The argument-TYPE list, as a `REVOKE ALL ON FUNCTION name(...)` statement spells it.
+    ///
+    /// Deliberately not `pg_get_function_identity_arguments` output, which also carries parameter
+    /// names. This is the form the revoke statement needs, and resolution against the live catalog
+    /// goes through `regprocedure`, which parses exactly this form. Naming it after the catalog
+    /// function it is not cost one failed live run.
+    pub argument_types: &'static str,
     /// Migration that first created it.
     pub introduced_by: u16,
     /// Migration that replaced its body.
@@ -341,13 +380,13 @@ const RESERVED_PUT_PROJECTION_ARGUMENTS: &str =
 pub const CELL_REPLACED_FUNCTIONS: [ReplacedFunction; 3] = [
     ReplacedFunction {
         name: "local_put_reservation_record_v1",
-        identity_arguments: PUT_RESERVATION_RECORD_V1_ARGUMENTS,
+        argument_types: PUT_RESERVATION_RECORD_V1_ARGUMENTS,
         introduced_by: 12,
         replaced_by: 14,
     },
     ReplacedFunction {
         name: "project_dispatch_reserved_put_v1",
-        identity_arguments: RESERVED_PUT_PROJECTION_ARGUMENTS,
+        argument_types: RESERVED_PUT_PROJECTION_ARGUMENTS,
         introduced_by: 13,
         replaced_by: 14,
     },
@@ -356,7 +395,7 @@ pub const CELL_REPLACED_FUNCTIONS: [ReplacedFunction; 3] = [
     // first defined this signature.
     ReplacedFunction {
         name: "project_dispatch_reserved_put_v1",
-        identity_arguments: RESERVED_PUT_PROJECTION_ARGUMENTS,
+        argument_types: RESERVED_PUT_PROJECTION_ARGUMENTS,
         introduced_by: 13,
         replaced_by: 16,
     },
@@ -411,7 +450,7 @@ pub fn cell_install_plan() -> Vec<CellInstallStep> {
 }
 
 /// Ordered section names of the live catalog manifest.
-pub const CELL_CATALOG_MANIFEST_SECTIONS: [&str; 9] = [
+pub const CELL_CATALOG_MANIFEST_SECTIONS: [&str; 12] = [
     "schema",
     "relations",
     "columns",
@@ -421,6 +460,9 @@ pub const CELL_CATALOG_MANIFEST_SECTIONS: [&str; 9] = [
     "functions",
     "function_acls",
     "relation_acls",
+    "default_acls",
+    "triggers",
+    "rules_and_policies",
 ];
 
 /// One read-only statement producing the nine manifest sections, in
@@ -585,13 +627,60 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
        AND attribute.attnum > 0
        AND NOT attribute.attisdropped
        AND attribute.attacl IS NOT NULL
-  ), '[]') AS relation_acls";
+  ), '[]') AS relation_acls,
+  COALESCE((
+    SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
+      pg_catalog.pg_get_userbyid(default_acl.defaclrole),
+      default_acl.defaclobjtype,
+      CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
+           ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
+      entry.privilege_type, entry.is_grantable
+    ) ORDER BY default_acl.defaclrole, default_acl.defaclobjtype,
+               entry.grantee, entry.privilege_type)::text
+      FROM pg_catalog.pg_default_acl AS default_acl
+      JOIN pg_catalog.pg_namespace AS space ON space.oid = default_acl.defaclnamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(default_acl.defaclacl) AS entry
+     WHERE space.nspname = 'object_store_retention'
+  ), '[]') AS default_acls,
+  COALESCE((
+    SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
+      relation.relname, trigger_state.tgname, trigger_state.tgenabled,
+      pg_catalog.pg_get_triggerdef(trigger_state.oid)
+    ) ORDER BY relation.relname, trigger_state.tgname)::text
+      FROM pg_catalog.pg_trigger AS trigger_state
+      JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger_state.tgrelid
+      JOIN pg_catalog.pg_namespace AS space ON space.oid = relation.relnamespace
+     WHERE space.nspname = 'object_store_retention'
+       AND NOT trigger_state.tgisinternal
+  ), '[]') AS triggers,
+  COALESCE((
+    SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
+      relation.relname, rule_state.rulename,
+      pg_catalog.pg_get_ruledef(rule_state.oid)
+    ) ORDER BY relation.relname, rule_state.rulename)::text
+      FROM pg_catalog.pg_rewrite AS rule_state
+      JOIN pg_catalog.pg_class AS relation ON relation.oid = rule_state.ev_class
+      JOIN pg_catalog.pg_namespace AS space ON space.oid = relation.relnamespace
+     WHERE space.nspname = 'object_store_retention'
+  ), '[]') || '|' || COALESCE((
+    SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
+      relation.relname, policy.polname, policy.polcmd, policy.polpermissive,
+      pg_catalog.pg_get_expr(policy.polqual, policy.polrelid, false),
+      pg_catalog.pg_get_expr(policy.polwithcheck, policy.polrelid, false),
+      (SELECT pg_catalog.jsonb_agg(pg_catalog.pg_get_userbyid(role_oid) ORDER BY role_oid)
+         FROM pg_catalog.unnest(policy.polroles) AS role_oid)
+    ) ORDER BY relation.relname, policy.polname)::text
+      FROM pg_catalog.pg_policy AS policy
+      JOIN pg_catalog.pg_class AS relation ON relation.oid = policy.polrelid
+      JOIN pg_catalog.pg_namespace AS space ON space.oid = relation.relnamespace
+     WHERE space.nspname = 'object_store_retention'
+  ), '[]') AS rules_and_policies";
 
 /// Pinned per-section BLAKE3-256 digests of the fully installed cell catalog, PostgreSQL 16.
 ///
 /// Sections are in [`CELL_CATALOG_MANIFEST_SECTIONS`] order. Measured, not derived: see
 /// `tests/run-cell-schema-install-live.ps1`.
-pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 9] = [
+pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
     hex32("ad659e388e49dc7666f006ca9f7b598f59f133ff8e9c4d61a90f6d01cbd265a7"),
     hex32("bacb6cf9f7b75490162883a1d628341aebb9d77bbbf48e2cee84e5f21ef6c8cf"),
     hex32("e926ee2b4c879aa706209b29c9a2e9e0a5e664cdce60c5b7f0b6757d0915b709"),
@@ -601,6 +690,9 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 9] = [
     hex32("e0089845a21d0fa195350ecbe39d1410c05823eec9081f3e8b1c025f17f7377b"),
     hex32("c7829d074938d6ceec64c83640576b1f163fe731e9b4e3eec2939f6b35183e54"),
     hex32("8a807de8704f40f36bf4102d9576523afab0359da8bf32b607c8955c1b39fadb"),
+    hex32("d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab"),
+    hex32("d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab"),
+    hex32("d51a543740627c0260abd1ea027bf7afd18eb9dff372c5857f2b8683f4ca4b7b"),
 ];
 
 /// Pinned BLAKE3-256 of the complete manifest of a fully installed cell, PostgreSQL 16.
@@ -609,7 +701,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 9] = [
 /// whose exact rendering is a server-version property. A different major version is expected to
 /// fail closed here and needs a re-measured pin, not a relaxed check.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_V1: [u8; 32] =
-    hex32("981ef0a0c4f3573c1955d374242f0c6e0306769a9e802347f847711a30478827");
+    hex32("560d0e9412459e94e500e2af79e66219983412293fe3cc7f4c81a1a3c9f0f2b2");
 
 /// Const hex decoder for the pinned digests above.
 const fn hex32(text: &str) -> [u8; 32] {
@@ -761,13 +853,13 @@ pub struct CellAttestation {
     /// Each layer's identity tuple, in [`CELL_SCHEMA_LAYERS`] order.
     pub layers: [(CellSchemaLayerId, LayerIdentity); 3],
     /// Per-section live catalog digests, in [`CELL_CATALOG_MANIFEST_SECTIONS`] order.
-    pub catalog_sections: [[u8; 32]; 9],
+    pub catalog_sections: [[u8; 32]; 12],
     /// BLAKE3-256 over the whole manifest.
     pub catalog_blake3: [u8; 32],
     /// Result code returned by 0003's readback. This module is its first live caller.
     pub retention_read_state_result: String,
-    /// Readback entrypoints confirmed retired, by layer label.
-    pub retired_readbacks: Vec<&'static str>,
+    /// Readback entrypoints confirmed retired: the layer label and the exact SQLSTATE it raised.
+    pub retired_readbacks: Vec<(&'static str, &'static str)>,
     /// Distinct replaced-function signatures proven unreachable by every service role.
     pub replaced_functions_revoked: usize,
     /// Count of present-but-inert 0002 tables.
@@ -878,17 +970,38 @@ const RETIRED_PROBE_SAVEPOINT_SQL: &str = "SAVEPOINT cell_schema_retired_probe";
 const RETIRED_PROBE_RELEASE_SQL: &str = "ROLLBACK TO SAVEPOINT cell_schema_retired_probe; \
      RELEASE SAVEPOINT cell_schema_retired_probe";
 
-const RESIDUAL_PRIVILEGE_SQL: &str = "SELECT count(*)::bigint
+// Matched on name AND identity arguments, as a pair. Matching on name alone would silently exempt a
+// same-name overload with a different signature, which is exactly the object a replacement is most
+// likely to leave behind.
+// One array of rendered `name(identity arguments)` signatures rather than two parallel arrays: the
+// two-argument form of `unnest` is a special FROM-clause construct that cannot be schema-qualified,
+// and this module qualifies every catalog reference. Comparing the rendered signature keeps the
+// match on name AND arguments.
+// Resolution goes through `regprocedure`, which is the same parser `REVOKE ALL ON FUNCTION` uses.
+// That is the point: the signature strings here and the revoke statements are then guaranteed to
+// name the same functions, and cannot drift into naming different ones. A signature that does not
+// resolve raises 42883 and fails closed rather than silently matching nothing.
+//
+// Returns two counts, and both matter. `matched` is how many frozen signatures actually exist in
+// the live schema; without it, this check could inspect nothing and report success. `residual` is
+// the finding itself.
+const RESIDUAL_PRIVILEGE_SQL: &str = "SELECT
+  (SELECT count(*)::bigint
      FROM pg_catalog.pg_proc AS procedure
-     JOIN pg_catalog.pg_namespace AS space ON space.oid = procedure.pronamespace
+    WHERE procedure.oid = ANY(ARRAY(
+      SELECT signature::regprocedure FROM pg_catalog.unnest($1::text[]) AS signature))
+  ) AS matched,
+  (SELECT count(*)::bigint
+     FROM pg_catalog.pg_proc AS procedure
      CROSS JOIN LATERAL pg_catalog.aclexplode(
        COALESCE(procedure.proacl, pg_catalog.acldefault('f', procedure.proowner))
      ) AS entry
-    WHERE space.nspname = 'object_store_retention'
-      AND procedure.proname = ANY($1)
+    WHERE procedure.oid = ANY(ARRAY(
+      SELECT signature::regprocedure FROM pg_catalog.unnest($1::text[]) AS signature))
       AND entry.privilege_type = 'EXECUTE'
       AND entry.grantee <> 0
-      AND pg_catalog.pg_get_userbyid(entry.grantee) = ANY($2)";
+      AND pg_catalog.pg_get_userbyid(entry.grantee) = ANY($2)
+  ) AS residual";
 
 /// Install the cell authority schema out of band, under the migrator role.
 ///
@@ -958,7 +1071,7 @@ pub async fn apply_cell_install_plan(
             .await
             .map_err(|error| CellSchemaError::RefusedUnattestedSchema(error.reason()))?;
         for (index, layer) in CELL_SCHEMA_LAYERS.iter().enumerate() {
-            layer_outcomes[index].1 = if layer.read_state_retired_after.is_some() {
+            layer_outcomes[index].1 = if layer.install_retired_after.is_some() {
                 LayerInstallOutcome::AttestedOnly
             } else {
                 call_layer_install(client, layer).await?
@@ -1000,24 +1113,15 @@ pub async fn apply_cell_install_plan(
 pub async fn revoke_replaced_function_privileges(
     client: &Client,
 ) -> Result<usize, CellSchemaError> {
+    assert_migrator_session(client).await?;
     let mut statements = String::new();
     let mut issued = 0;
-    for (index, replaced) in CELL_REPLACED_FUNCTIONS.iter().enumerate() {
-        if CELL_REPLACED_FUNCTIONS[..index]
-            .iter()
-            .any(|earlier| earlier.name == replaced.name)
-        {
-            continue;
-        }
+    for (name, arguments) in distinct_replaced_signatures() {
         // Signatures come from this module's frozen inventory, never from caller input.
         if writeln!(
             statements,
-            "REVOKE ALL ON FUNCTION {CELL_AUTHORITY_SCHEMA}.{}({}) FROM {}, {}, {};",
-            replaced.name,
-            replaced.identity_arguments,
-            CELL_SERVICE_ROLES[0],
-            CELL_SERVICE_ROLES[1],
-            CELL_SERVICE_ROLES[2]
+            "REVOKE ALL ON FUNCTION {CELL_AUTHORITY_SCHEMA}.{name}({arguments}) FROM {}, {}, {};",
+            CELL_SERVICE_ROLES[0], CELL_SERVICE_ROLES[1], CELL_SERVICE_ROLES[2]
         )
         .is_err()
         {
@@ -1045,6 +1149,7 @@ pub async fn revoke_replaced_function_privileges(
 /// residual service-role privilege on a replaced function, missing inert state, or a retired
 /// readback entrypoint that is still reachable.
 pub async fn attest_cell_schema(client: &Client) -> Result<CellAttestation, CellSchemaError> {
+    assert_migrator_session(client).await?;
     let layers = read_layer_identities(client).await?;
     for (index, (id, identity)) in layers.iter().enumerate() {
         if *identity == LayerIdentity::Absent {
@@ -1088,17 +1193,62 @@ pub async fn attest_cell_schema(client: &Client) -> Result<CellAttestation, Cell
 /// Returns [`CellSchemaError`] if the manifest cannot be read or has an unexpected shape.
 pub async fn measure_catalog_manifest(
     client: &Client,
-) -> Result<([[u8; 32]; 9], [u8; 32]), CellSchemaError> {
+) -> Result<([[u8; 32]; 12], [u8; 32]), CellSchemaError> {
+    assert_migrator_session(client).await?;
     read_catalog_manifest(client).await
 }
 
-async fn assert_install_preconditions(client: &Client) -> Result<(), CellSchemaError> {
+/// Every entry point starts here.
+///
+/// `session_user` is the right check rather than `current_user`: `SET ROLE` cannot forge it, so a
+/// caller cannot borrow the migrator identity. It is enforced by attestation and by the revoke pass
+/// too, not only by install. Attestation reads privileged state, the revoke pass writes ACLs, and a
+/// documented "this refuses unless you are the migrator" boundary that only one of the three
+/// enforces is a false statement rather than a weak one.
+async fn assert_migrator_session(client: &Client) -> Result<(), CellSchemaError> {
     let session_user: String = query_one_value(client, SESSION_USER_SQL).await?;
     if session_user != CELL_MIGRATOR_ROLE {
         return Err(CellSchemaError::Precondition(
             "session_user is not migrator",
         ));
     }
+    Ok(())
+}
+
+/// Refuse if the caller already has a transaction open.
+///
+/// Install is not transaction-safe and cannot be made so: each frozen artifact carries its own
+/// `BEGIN`/`COMMIT`, and every layer install procedure requires `SERIALIZABLE`, which cannot be
+/// entered from inside another transaction. Running it inside a caller's transaction would end that
+/// transaction at the first artifact and commit the caller's uncommitted work with it. PostgreSQL
+/// answers "is a transaction open" through `SAVEPOINT`, which raises 25P01 when there is none.
+async fn assert_no_open_transaction(client: &Client) -> Result<(), CellSchemaError> {
+    match client.batch_execute(RETIRED_PROBE_SAVEPOINT_SQL).await {
+        Ok(()) => {
+            client
+                .batch_execute(RETIRED_PROBE_RELEASE_SQL)
+                .await
+                .map_err(CellSchemaError::postgres)?;
+            Err(CellSchemaError::Precondition(
+                "install must not run inside an open transaction",
+            ))
+        }
+        Err(error) => {
+            let Some(database_error) = error.as_db_error() else {
+                return Err(CellSchemaError::Postgres);
+            };
+            if database_error.code().code() == "25P01" {
+                Ok(())
+            } else {
+                Err(CellSchemaError::Postgres)
+            }
+        }
+    }
+}
+
+async fn assert_install_preconditions(client: &Client) -> Result<(), CellSchemaError> {
+    assert_migrator_session(client).await?;
+    assert_no_open_transaction(client).await?;
     let roles_present: i64 = query_one_value(client, ROLES_PRESENT_SQL).await?;
     if roles_present != 4 {
         return Err(CellSchemaError::Precondition("authority roles"));
@@ -1116,6 +1266,21 @@ async fn assert_install_preconditions(client: &Client) -> Result<(), CellSchemaE
     let owner_can_create: bool = query_one_value(client, OWNER_CREATE_SQL).await?;
     if !owner_can_create {
         return Err(CellSchemaError::Precondition("owner CREATE on database"));
+    }
+
+    // `INHERIT FALSE` is only half the grant this needs; `SET TRUE` is the other half, and no
+    // catalog predicate reports it directly. Probe it. Without this, a `SET FALSE` grant passes
+    // every check above and then fails at the first artifact's `SET LOCAL ROLE` as an opaque
+    // database error with no carried reason, which is exactly the misleading-failure mode this
+    // module's own `INHERIT FALSE` precondition exists to prevent.
+    if client
+        .batch_execute(&format!("SET ROLE {CELL_OWNER_ROLE}; RESET ROLE;"))
+        .await
+        .is_err()
+    {
+        return Err(CellSchemaError::Precondition(
+            "owner membership must be WITH SET TRUE",
+        ));
     }
     Ok(())
 }
@@ -1268,12 +1433,12 @@ fn read_layer_identity(
 
 async fn read_catalog_manifest(
     client: &Client,
-) -> Result<([[u8; 32]; 9], [u8; 32]), CellSchemaError> {
+) -> Result<([[u8; 32]; 12], [u8; 32]), CellSchemaError> {
     let row = client
         .query_one(CELL_CATALOG_MANIFEST_SQL, &[])
         .await
         .map_err(CellSchemaError::postgres)?;
-    let mut sections = [[0u8; 32]; 9];
+    let mut sections = [[0u8; 32]; 12];
     let mut whole = blake3::Hasher::new();
     for (index, name) in CELL_CATALOG_MANIFEST_SECTIONS.iter().enumerate() {
         let text: String = row
@@ -1288,25 +1453,51 @@ async fn read_catalog_manifest(
     Ok((sections, *whole.finalize().as_bytes()))
 }
 
-async fn assert_no_residual_service_privilege(client: &Client) -> Result<usize, CellSchemaError> {
-    let mut names: Vec<&str> = Vec::with_capacity(CELL_REPLACED_FUNCTIONS.len());
+/// The distinct replaced signatures, deduplicated by name **and** identity arguments.
+///
+/// `project_dispatch_reserved_put_v1` is replaced twice, by 0014 and again by 0016, at the same
+/// signature. That is one signature to revoke, not two. A same-name overload at a different
+/// signature would be a separate entry, which is the case name-only dedup would drop.
+fn distinct_replaced_signatures() -> Vec<(&'static str, &'static str)> {
+    let mut signatures: Vec<(&'static str, &'static str)> =
+        Vec::with_capacity(CELL_REPLACED_FUNCTIONS.len());
     for replaced in CELL_REPLACED_FUNCTIONS {
-        if !names.contains(&replaced.name) {
-            names.push(replaced.name);
+        let signature = (replaced.name, replaced.argument_types);
+        if !signatures.contains(&signature) {
+            signatures.push(signature);
         }
     }
+    signatures
+}
+
+async fn assert_no_residual_service_privilege(client: &Client) -> Result<usize, CellSchemaError> {
+    let signatures = distinct_replaced_signatures();
+    let rendered: Vec<String> = signatures
+        .iter()
+        .map(|(name, arguments)| format!("{CELL_AUTHORITY_SCHEMA}.{name}({arguments})"))
+        .collect();
     let roles: Vec<&str> = CELL_SERVICE_ROLES.to_vec();
     let row = client
-        .query_one(RESIDUAL_PRIVILEGE_SQL, &[&names, &roles])
+        .query_one(RESIDUAL_PRIVILEGE_SQL, &[&rendered, &roles])
         .await
         .map_err(CellSchemaError::postgres)?;
-    let residual: i64 = row
+    let matched: i64 = row
         .try_get(0)
+        .map_err(|_| CellSchemaError::InvalidResponse("matched signature count"))?;
+    let residual: i64 = row
+        .try_get(1)
         .map_err(|_| CellSchemaError::InvalidResponse("residual privilege count"))?;
+    if usize::try_from(matched).unwrap_or(usize::MAX) != signatures.len() {
+        // Every frozen signature must resolve to exactly one live function. If one does not, this
+        // check silently inspected nothing, which is worse than reporting drift.
+        return Err(CellSchemaError::InvalidResponse(
+            "replaced signature does not resolve",
+        ));
+    }
     if residual != 0 {
         return Err(CellSchemaError::ResidualServicePrivilege);
     }
-    Ok(names.len())
+    Ok(signatures.len())
 }
 
 async fn assert_inert_state(client: &Client) -> Result<usize, CellSchemaError> {
@@ -1353,15 +1544,17 @@ async fn read_retention_state(client: &Client) -> Result<String, CellSchemaError
     Ok(code)
 }
 
-async fn assert_retired_readbacks(client: &Client) -> Result<Vec<&'static str>, CellSchemaError> {
+async fn assert_retired_readbacks(
+    client: &Client,
+) -> Result<Vec<(&'static str, &'static str)>, CellSchemaError> {
     let mut retired = Vec::new();
     for layer in CELL_SCHEMA_LAYERS {
-        let Some(retiring_migration) = layer.read_state_retired_after else {
-            continue;
-        };
-        if cell_migration_for(retiring_migration).is_none() {
+        if layer.read_state_retired_after.is_none() {
             continue;
         }
+        let Some(expected_sqlstate) = layer.read_state_retired_sqlstate else {
+            return Err(CellSchemaError::InvalidResponse("retirement sqlstate"));
+        };
         let sql = format!(
             "SELECT ({CELL_AUTHORITY_SCHEMA}.{}('{}')).result_code",
             layer.read_state_function, layer.api_revision
@@ -1402,13 +1595,17 @@ async fn assert_retired_readbacks(client: &Client) -> Result<Vec<&'static str>, 
                 let Some(database_error) = error.as_db_error() else {
                     return Err(CellSchemaError::Postgres);
                 };
-                // 42501: the entrypoint's EXECUTE privilege was revoked (authority layer).
-                // 55000: the entrypoint survives but its catalog manifest no longer matches a
-                // fully installed cell (put-reservation layer).
-                match database_error.code().code() {
-                    "42501" | "55000" => retired.push(layer.id.label()),
-                    _ => return Err(CellSchemaError::Postgres),
+                // The exact code per layer, not either code for either layer. 42501 means the
+                // EXECUTE privilege was revoked; 55000 means the entrypoint survives but its own
+                // catalog manifest no longer matches. Accepting both everywhere would let one
+                // retirement mode silently stand in for the other, and the records claim the two
+                // apart.
+                if database_error.code().code() != expected_sqlstate {
+                    return Err(CellSchemaError::RetiredEntrypointReachable(
+                        layer.id.label(),
+                    ));
                 }
+                retired.push((layer.id.label(), expected_sqlstate));
             }
         }
     }

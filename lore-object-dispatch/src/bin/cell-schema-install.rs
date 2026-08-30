@@ -17,9 +17,16 @@
 //! cell-schema-install measure    # print the live catalog manifest digests
 //! ```
 //!
-//! The connection **must** authenticate as `object_dispatch_retention_migrator`; the command
-//! refuses otherwise. The URL is read only from the environment so it never appears in a process
-//! argument list, and it is never echoed, including on failure.
+//! The connection **must** authenticate as `object_dispatch_retention_migrator`; every action
+//! refuses otherwise, `attest` and `measure` included, and so does the revoke pass inside `install`.
+//! The check is on `session_user`, which `SET ROLE` cannot forge. The URL is read only from the
+//! environment so it never appears in a process argument list, and it is never echoed, including on
+//! failure.
+//!
+//! `install` additionally requires that no transaction is already open on the connection, which for
+//! this binary is always true. It cannot run inside one: every frozen artifact carries its own
+//! `BEGIN`/`COMMIT`, and every layer install procedure requires `SERIALIZABLE`. Only `attest` is
+//! safe to call from inside a caller's transaction.
 //!
 //! Exit codes: `0` success, `1` refused or drifted, `2` misuse or missing environment.
 
@@ -166,10 +173,12 @@ fn print_attestation(attestation: &CellAttestation) {
         "  retention readback: {}",
         attestation.retention_read_state_result
     );
-    println!(
-        "  retired readbacks: {}",
-        attestation.retired_readbacks.join(", ")
-    );
+    let retired: Vec<String> = attestation
+        .retired_readbacks
+        .iter()
+        .map(|(layer, sqlstate)| format!("{layer}({sqlstate})"))
+        .collect();
+    println!("  retired readbacks: {}", retired.join(", "));
     println!(
         "  replaced functions revoked: {}",
         attestation.replaced_functions_revoked
