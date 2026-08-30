@@ -29,8 +29,26 @@ use lore_postgres::store::lock_store::PostgresLockStore;
 /// itself fails to build, not just this test.
 const MIGRATIONS_0001: &str = include_str!("../migrations/0001_init.sql");
 
-fn pg_url() -> Option<String> {
-    std::env::var("LORE_TEST_PG_URL").ok()
+/// The relations only `migrations/0001_init.sql` (or the isolated test fixture)
+/// creates. `lore_locks` is excluded: the legacy plugin creates that one.
+const SCHEMA_117_RELATIONS: [&str; 4] = [
+    "lore_domain_lock_schema_state",
+    "lore_domain_lock_namespaces",
+    "lore_domain_lock_backfill_quarantine",
+    "lore_domain_lock_fence_seq",
+];
+
+fn pg_url() -> String {
+    std::env::var("LORE_TEST_PG_URL")
+        .expect("LORE_TEST_PG_URL must be set; a skipped live case is NOT RUN, never a pass")
+}
+
+async fn relation_exists(client: &tokio_postgres::Client, relation: &str) -> bool {
+    client
+        .query_one("SELECT to_regclass($1) IS NOT NULL", &[&relation])
+        .await
+        .expect("probe relation existence")
+        .get(0)
 }
 
 async fn pg_client(url: &str) -> tokio_postgres::Client {
@@ -230,17 +248,22 @@ async fn domain_catalog_snapshot(client: &tokio_postgres::Client) -> Vec<String>
     snapshot
 }
 
-/// The Phase 2 gate: `migrations/0001_init.sql` applied wholesale to an empty
-/// database must produce the identical `lore_domain_*`/`lore_outbox_*`
-/// catalog shape as `PostgresDomainStore::connect`'s boot-time path on a
-/// second empty database.
+/// The Phase 2 gate, in the order production actually runs.
+///
+/// The runtime side boots exactly as `lore-server/src/server.rs` does — the
+/// domain store first, the legacy lock-store plugin second — and the test
+/// first asserts what that boot does *not* create: every SCHEMA-117 relation is
+/// still absent, because CR-030 N-7 keeps that DDL migration-owned. Skipping
+/// straight to `bootstrap()` proved parity against a fixture production never
+/// executes and hid the fact that a booted cell has no fenced schema at all
+/// (INV-EE P0-1).
+///
+/// Only then does it install `LOCK_SCHEMA` through the isolated fixture and
+/// compare the full catalogs, which is the "two declarations, one shape" claim.
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
 async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs() {
-    let Some(admin_url) = pg_url() else {
-        eprintln!("LORE_TEST_PG_URL unset; skipping migration/runtime parity test");
-        return;
-    };
+    let admin_url = pg_url();
 
     let (migration_db, migration_url) = create_throwaway_database(&admin_url, "migration").await;
     let (runtime_db, runtime_url) = create_throwaway_database(&admin_url, "runtime").await;
@@ -251,18 +274,38 @@ async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_cat
         .await
         .expect("apply migrations/0001_init.sql wholesale to the migration-side database");
 
-    let _runtime_lock_store = PostgresLockStore::connect(&runtime_url, 2, &TlsConfig::default())
-        .await
-        .expect("boot legacy lock store before SCHEMA-117 migration fixture");
+    // Production boot order: the domain coordinator is built before the lock
+    // store plugin connects (`server.rs`), so nothing has created `lore_locks`
+    // when the coordinator first reads its readiness.
     let runtime_store = PostgresDomainStore::connect(&runtime_url, 2, &TlsConfig::default())
         .await
         .expect("boot PostgresDomainStore against the runtime-side database");
+    let runtime_client = pg_client(&runtime_url).await;
+    for relation in SCHEMA_117_RELATIONS {
+        assert!(
+            !relation_exists(&runtime_client, relation).await,
+            "the boot-time ensure_schema path must not create the migration-owned \
+             SCHEMA-117 relation {relation}"
+        );
+    }
+    // Fenced readiness must be answerable on exactly that state, and must
+    // answer "not provisioned" rather than erroring.
+    let readiness = runtime_store
+        .lock_coordinator()
+        .readiness()
+        .await
+        .expect("readiness on a cell the migration has not reached must not error");
+    assert!(!readiness.provisioned);
+    assert!(!readiness.fencing_enabled);
+
+    let _runtime_lock_store = PostgresLockStore::connect(&runtime_url, 2, &TlsConfig::default())
+        .await
+        .expect("boot the legacy lock store, as the plugin does after the domain store");
     runtime_store
         .lock_coordinator()
         .bootstrap()
         .await
         .expect("install SCHEMA-117 through the isolated runtime fixture");
-    let runtime_client = pg_client(&runtime_url).await;
 
     let migration_snapshot = domain_catalog_snapshot(&migration_client).await;
     let runtime_snapshot = domain_catalog_snapshot(&runtime_client).await;

@@ -10,6 +10,33 @@
 /// First server-only lock-fencing schema revision.
 pub const LOCK_SCHEMA_VERSION: i64 = 1;
 
+/// Whether WP-120's public lock mutation contract exists on this build.
+///
+/// This is the arming gate for fenced routing, and it is deliberately a
+/// compile-time constant rather than configuration: no operator action may
+/// reach the armed state before the code that makes it serviceable exists.
+///
+/// While it is false, fenced routing is a one-way door. Cutover converts every
+/// legacy lock into a live fenced row with `expires_at = NULL`
+/// (`coordinator::backfill`), `resolve_lock_fencing` refuses finite leases
+/// before WP-120, and `cleanup_exact` never deletes a current NULL-expiry row —
+/// so those rows are permanent. Meanwhile fenced `Lock`/`Unlock`/`AdminLock`
+/// return `FAILED_PRECONDITION` (`lore-server/src/grpc/lock_service.rs`) and
+/// `release`/`force_release` have no wire caller, so nothing can release them,
+/// while readiness reports fully green. The result is a cell whose pushes are
+/// blocked by unreleasable locks (INV-EE P0-2).
+///
+/// WP-120 flips this in the same change that opens the public mutation wire.
+pub const PUBLIC_MUTATION_CONTRACT_AVAILABLE: bool = false;
+
+/// The reason `enable_fencing` gives while [`PUBLIC_MUTATION_CONTRACT_AVAILABLE`]
+/// is false. Named so a test can assert the refusal rather than match prose.
+pub const PUBLIC_MUTATION_CONTRACT_MISSING: &str = concat!(
+    "fenced lock routing cannot be armed until WP-120 publishes the public lock mutation ",
+    "contract: fenced Lock/Unlock/AdminLock return FAILED_PRECONDITION and cutover-converted ",
+    "rows would have no release path"
+);
+
 /// Backfill has not started.
 pub const BACKFILL_NOT_STARTED: i16 = 0;
 /// Backfill is resumable but incomplete.

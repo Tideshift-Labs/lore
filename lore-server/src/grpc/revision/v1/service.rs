@@ -83,7 +83,7 @@ pub struct LoreRevisionV1Service {
     enforce_write_permission: bool,
     /// `Some` only when `enforce_locks_on_push` is on AND a lock store exists;
     /// see `LoreRevisionService::push_lock_enforcement`.
-    push_lock_enforcement: Option<Arc<dyn lore_revision::lock::LockStore>>,
+    push_lock_enforcement: Option<crate::grpc::handlers::push_lock_guard::PushLockEnforcement>,
     domain_context: Option<Arc<DomainContext>>,
     instrument_provider: RevisionServiceInstrumentProvider,
     revision_list_instruments: RevisionListInstruments,
@@ -101,7 +101,7 @@ impl LoreRevisionV1Service {
         forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
         enforce_write_permission: bool,
-        push_lock_enforcement: Option<Arc<dyn lore_revision::lock::LockStore>>,
+        push_lock_enforcement: Option<crate::grpc::handlers::push_lock_guard::PushLockEnforcement>,
         domain_context: Option<Arc<DomainContext>>,
     ) -> Self {
         let instrument_provider = RevisionServiceInstrumentProvider;

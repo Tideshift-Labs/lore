@@ -586,20 +586,60 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             .unwrap_or(DEFAULT_HISTORY_STEP_SIZE);
         let acceleration = RevisionListAcceleration::from_feature(&self.0.feature);
         let rpc_timeout = self.0.request_handler_timeout;
-        // Push-time advisory-lock enforcement (CR-019): `Some(store)` only when
-        // the opt-in feature is on AND a lock store is configured; otherwise
-        // `None` → the push handler behaves as stock Lore (no enforcement).
+        // Push-time advisory-lock enforcement (CR-019): `Some(..)` only when the
+        // opt-in feature is on AND a lock store is configured AND a JWT verifier
+        // exists to make lock ownership a verified pair; otherwise `None` → the
+        // push handler behaves as stock Lore (no enforcement).
+        use crate::grpc::handlers::push_lock_guard::LockOwnerIssuerPolicy;
+        use crate::grpc::handlers::push_lock_guard::PushLockEnforcement;
         let push_lock_enforcement = if self.0.feature.enforce_locks_on_push.unwrap_or(false) {
-            if self.0.lock_store.is_none() {
-                // Flag on but no lock store: enforcement silently cannot run.
-                // Warn loudly so this misconfiguration is not mistaken for
-                // "enforcement active".
-                warn!(
-                    "[feature] enforce_locks_on_push is true but no lock_store is configured; \
-                     push-lock enforcement is INACTIVE. Configure a lock_store or unset the flag."
-                );
+            match (self.0.lock_store.clone(), jwt_verifier.as_ref()) {
+                (None, _) => {
+                    // Flag on but no lock store: enforcement silently cannot
+                    // run. Warn loudly so this misconfiguration is not mistaken
+                    // for "enforcement active".
+                    warn!(
+                        "[feature] enforce_locks_on_push is true but no lock_store is \
+                         configured; push-lock enforcement is INACTIVE. Configure a lock_store \
+                         or unset the flag."
+                    );
+                    None
+                }
+                (Some(_), None) => {
+                    // Lock ownership is a verified issuer/subject pair (CR-030).
+                    // With no JWT verifier there is no verified identity at all:
+                    // every caller is the same `"<unknown>"` display subject, so
+                    // the guard could only ever decide that every lock belongs to
+                    // everyone. Refuse to pretend it is enforcing.
+                    warn!(
+                        "[feature] enforce_locks_on_push is true but no JWT verifier is \
+                         configured; push-lock enforcement is INACTIVE because lock ownership \
+                         cannot be a verified issuer/subject pair without one."
+                    );
+                    None
+                }
+                (Some(lock_store), Some(verifier)) => {
+                    let issuer_policy = LockOwnerIssuerPolicy::from_configured_issuer(
+                        verifier.jwt_issuer.as_deref(),
+                    );
+                    if issuer_policy == LockOwnerIssuerPolicy::Unprovable {
+                        // Any issuer the JWK service can verify is accepted, so a
+                        // stored subject-only owner names no provable pair and the
+                        // guard must fail closed on every lock it finds — including
+                        // the pusher's own.
+                        warn!(
+                            "[feature] enforce_locks_on_push is true but [server.auth] \
+                             jwt_issuer is unset; lock ownership cannot be proved to be a \
+                             verified issuer/subject pair, so EVERY lock on a changed path \
+                             will block the push. Set jwt_issuer."
+                        );
+                    }
+                    Some(PushLockEnforcement {
+                        lock_store,
+                        issuer_policy,
+                    })
+                }
             }
-            self.0.lock_store.clone()
         } else {
             None
         };

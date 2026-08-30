@@ -48,6 +48,25 @@ pub struct VerifiedLockOwner {
     pub authenticated_subject: String,
 }
 
+impl VerifiedLockOwner {
+    /// Compare both authority fields without an early-exit byte scan.
+    ///
+    /// Owner identity decides release, renew, and push authority, so it gets
+    /// the same treatment as the ownership token rather than `PartialEq`'s
+    /// short-circuiting `==`. Both halves are always evaluated.
+    pub fn ct_matches(&self, other: &Self) -> bool {
+        let issuer = self
+            .verified_issuer
+            .as_bytes()
+            .ct_eq(other.verified_issuer.as_bytes());
+        let subject = self
+            .authenticated_subject
+            .as_bytes()
+            .ct_eq(other.authenticated_subject.as_bytes());
+        bool::from(issuer & subject)
+    }
+}
+
 /// One resource in a sorted, atomic lock mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockResourceInput {
@@ -191,6 +210,12 @@ pub struct BackfillReport {
 /// Readiness projection used by server construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockFencingReadiness {
+    /// Whether the migration-owned SCHEMA-117 objects exist in this database.
+    ///
+    /// False is a routing answer, not an error: CR-030 N-7 keeps the fenced
+    /// DDL migration-owned, so a cell the migration has not reached is simply
+    /// a cell that has not been cut over, and it boots on the legacy route.
+    pub provisioned: bool,
     /// Schema revision stored in the database.
     pub schema_version: i64,
     /// Backfill state.
@@ -207,6 +232,27 @@ pub struct LockFencingReadiness {
     pub quarantined_rows: i64,
     /// Legacy rows that still lack fenced authority columns.
     pub unfenced_rows: i64,
+}
+
+impl LockFencingReadiness {
+    /// The verdict for a database the SCHEMA-117 migration has not reached.
+    ///
+    /// Every field reads as "no fenced evidence" so a caller that only checks
+    /// `fencing_enabled`, or that checks the full evidence set, reaches the
+    /// same legacy-route conclusion.
+    pub fn not_provisioned() -> Self {
+        Self {
+            provisioned: false,
+            schema_version: 0,
+            backfill_state: schema::BACKFILL_NOT_STARTED,
+            fencing_enabled: false,
+            lease_enabled: false,
+            same_database: false,
+            sequence_headroom: false,
+            quarantined_rows: 0,
+            unfenced_rows: 0,
+        }
+    }
 }
 
 /// Postgres-only CR-030 coordinator, sharing CR-029's pool.
@@ -358,8 +404,10 @@ impl PostgresLockCoordinator {
         if let Some(actor) = &input.acting_owner {
             validate_owner(actor)?;
         }
-        let lease_enabled = self.readiness().await?.lease_enabled;
-        if input.lease_duration.is_some() && !lease_enabled {
+        // `readiness()` is five round trips, two of them unindexed `lore_locks`
+        // scans. Only the finite-lease question needs it, and finite leases stay
+        // off until WP-120, so a tokenless acquire must not pay for it.
+        if input.lease_duration.is_some() && !self.readiness().await?.lease_enabled {
             return Err(DomainError::NotReady(
                 "finite lock leases are disabled until token-capable clients are active".to_owned(),
             ));
@@ -442,7 +490,7 @@ impl PostgresLockCoordinator {
             if let Some(row) = existing.as_ref()
                 && row_is_current(row, &namespace, clock)
             {
-                if row.owner != input.owner {
+                if !row.owner.ct_matches(&input.owner) {
                     return commit_rejection(
                         tx,
                         operation,
@@ -677,7 +725,7 @@ impl PostgresLockCoordinator {
             let expected = resource.expected_ownership_token.as_ref().ok_or_else(|| {
                 DomainError::InvalidInput("release token vanished after validation".to_owned())
             })?;
-            if row.owner != *target || !token_matches(&row.ownership_token, expected) {
+            if !row.owner.ct_matches(target) || !token_matches(&row.ownership_token, expected) {
                 return commit_rejection(
                     tx,
                     operation,
@@ -811,36 +859,78 @@ impl PostgresLockCoordinator {
         branch_id: &[u8],
         resource_hash: &[u8],
     ) -> Result<Option<FencedLock>, DomainError> {
+        Ok(self
+            .status_many(repository_id, &[(branch_id, resource_hash)])
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Return the current rows for a batch of exact `(branch, hash)` pairs.
+    ///
+    /// One pool checkout and one query for the whole batch, matching what the
+    /// legacy store does for the same wire call. Absent and obsolete resources
+    /// are simply missing from the result; order follows the stored key, not
+    /// the request, exactly as the legacy projection does.
+    pub async fn status_many(
+        &self,
+        repository_id: &[u8],
+        resources: &[(&[u8], &[u8])],
+    ) -> Result<Vec<FencedLock>, DomainError> {
         validate_id("repository_id", repository_id)?;
-        validate_id("branch_id", branch_id)?;
-        validate_hash(resource_hash)?;
+        for (branch_id, resource_hash) in resources {
+            validate_id("branch_id", branch_id)?;
+            validate_hash(resource_hash)?;
+        }
+        if resources.is_empty() {
+            return Ok(Vec::new());
+        }
+        let branches = resources
+            .iter()
+            .map(|(branch_id, _)| *branch_id)
+            .collect::<Vec<_>>();
+        let hashes = resources
+            .iter()
+            .map(|(_, resource_hash)| *resource_hash)
+            .collect::<Vec<_>>();
         let client = self.checkout().await?;
-        client
-            .query_opt(
+        let rows = client
+            .query(
                 "SELECT locks.branch, locks.hash, locks.description, locks.owner_issuer, \
                         locks.owner_subject, locks.ownership_token, locks.acquired_at, \
                         locks.fence, locks.repository_lock_generation, locks.branch_lock_generation, \
                         locks.expires_at \
-                   FROM lore_locks AS locks \
+                   FROM unnest($2::bytea[], $3::bytea[]) AS requested(branch, hash) \
+                   JOIN lore_locks AS locks \
+                     ON locks.branch = requested.branch AND locks.hash = requested.hash \
                    JOIN lore_domain_lock_namespaces AS namespace \
                      ON namespace.repository_id = locks.repository \
                     AND namespace.branch_id = locks.branch \
-                  WHERE locks.repository = $1 AND locks.branch = $2 AND locks.hash = $3 \
+                  WHERE locks.repository = $1 \
                     AND locks.repository_lock_generation = namespace.repository_lock_generation \
                     AND locks.branch_lock_generation = namespace.branch_lock_generation \
                     AND locks.owner_issuer IS NOT NULL AND locks.owner_subject IS NOT NULL \
                     AND locks.ownership_token IS NOT NULL AND locks.fence IS NOT NULL \
                     AND locks.acquired_at IS NOT NULL AND locks.renewed_at IS NOT NULL \
-                    AND (locks.expires_at IS NULL OR locks.expires_at > clock_timestamp())",
-                &[&repository_id, &branch_id, &resource_hash],
+                    AND (locks.expires_at IS NULL OR locks.expires_at > clock_timestamp()) \
+                  ORDER BY locks.branch, locks.hash",
+                &[&repository_id, &branches, &hashes],
             )
             .await
-            .map_err(|error| DomainError::from_pg("fenced lock status", error))?
-            .map(fenced_lock_from_row)
-            .transpose()
+            .map_err(|error| DomainError::from_pg("fenced lock status", error))?;
+        rows.into_iter().map(fenced_lock_from_row).collect()
     }
 
     /// Advisory cleanup that can delete only the exact observed stale row.
+    ///
+    /// Deliberately does not bump `last_applied_fence`, and the push-witness
+    /// contract depends on that: a fence bump here would invalidate every
+    /// in-flight preflight witness for the branch on a purely advisory delete.
+    /// It is sound only because the `WHERE` clause restricts the delete to a
+    /// *logically absent* row — obsolete generations or an expired lease — which
+    /// no reader can observe as a live lock anyway, so removing it changes
+    /// nothing a witness reports. Widening that predicate to any current row
+    /// would break the witness contract, not merely this method.
     pub async fn cleanup_exact(
         &self,
         repository_id: &[u8],
@@ -1097,7 +1187,38 @@ impl PostgresLockCoordinator {
     }
 
     /// Enable fenced routing only after all schema evidence passes.
+    ///
+    /// Refuses outright until WP-120's public mutation contract exists: see
+    /// [`schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE`] for why arming first
+    /// produces a cell whose locks are unreleasable while readiness is green.
+    /// The check is first so no evidence query can be read as permission.
     pub async fn enable_fencing(&self, lease_enabled: bool) -> Result<(), DomainError> {
+        if !schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE {
+            return Err(DomainError::NotReady(
+                schema::PUBLIC_MUTATION_CONTRACT_MISSING.to_owned(),
+            ));
+        }
+        self.arm_fenced_routing(lease_enabled).await
+    }
+
+    /// Arm fenced routing for an isolated component fixture, skipping only the
+    /// WP-120 public-contract gate.
+    ///
+    /// Every schema, backfill, quarantine, database-identity, and sequence-
+    /// headroom check still runs, so a fixture proves the same evidence a real
+    /// cutover would. This exists because the armed state must stay reachable
+    /// under test while [`enable_fencing`](Self::enable_fencing) refuses it in
+    /// production; `lore-server/tests/wp117_push_witness_wiring.rs` asserts no
+    /// non-test source calls it.
+    #[doc(hidden)]
+    pub async fn enable_fencing_for_component_fixture(
+        &self,
+        lease_enabled: bool,
+    ) -> Result<(), DomainError> {
+        self.arm_fenced_routing(lease_enabled).await
+    }
+
+    async fn arm_fenced_routing(&self, lease_enabled: bool) -> Result<(), DomainError> {
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
@@ -1165,22 +1286,45 @@ impl PostgresLockCoordinator {
     }
 
     /// Current database-backed readiness evidence.
+    ///
+    /// This runs on the mandatory startup path, before the legacy lock-store
+    /// plugin has connected, so it must tolerate two absences that are normal
+    /// rather than exceptional: a database the SCHEMA-117 migration has not
+    /// reached at all (CR-030 N-7 keeps that DDL migration-owned), and a
+    /// `lore_locks` table the legacy plugin has not created yet. Both answer
+    /// "not provisioned, use the legacy route" — reading them as errors aborted
+    /// startup on every unmigrated cell (INV-EE P0-1).
     pub async fn readiness(&self) -> Result<LockFencingReadiness, DomainError> {
         let client = self.checkout().await?;
-        let row = client
-            .query_one(
+        if !fenced_schema_present(&client).await? {
+            return Ok(LockFencingReadiness::not_provisioned());
+        }
+        let Some(row) = client
+            .query_opt(
                 "SELECT schema_version, backfill_state, fencing_enabled, lease_enabled, \
                         database_identity, sequence_headroom_fence \
                    FROM lore_domain_lock_schema_state WHERE id = 1",
                 &[],
             )
             .await
-            .map_err(|error| DomainError::from_pg("lock fencing readiness", error))?;
+            .map_err(|error| DomainError::from_pg("lock fencing readiness", error))?
+        else {
+            return Ok(LockFencingReadiness::not_provisioned());
+        };
+        // The legacy lock store creates `lore_locks` after this call in the
+        // boot order, so its absence contributes no fences and no legacy rows.
+        let legacy_locks_present = relation_present(&client, "lore_locks").await?;
         let max_fence: i64 = client
             .query_one(
-                "SELECT GREATEST( \
-                    COALESCE((SELECT max(fence) FROM lore_locks), 0), \
-                    COALESCE((SELECT max(last_applied_fence) FROM lore_domain_lock_namespaces), 0))",
+                if legacy_locks_present {
+                    "SELECT GREATEST( \
+                        COALESCE((SELECT max(fence) FROM lore_locks), 0), \
+                        COALESCE((SELECT max(last_applied_fence) \
+                                    FROM lore_domain_lock_namespaces), 0))"
+                } else {
+                    "SELECT COALESCE((SELECT max(last_applied_fence) \
+                                        FROM lore_domain_lock_namespaces), 0)"
+                },
                 &[],
             )
             .await
@@ -1194,19 +1338,23 @@ impl PostgresLockCoordinator {
             .await
             .map_err(|error| DomainError::from_pg("lock quarantine readiness", error))?
             .get(0);
-        let unfenced_rows: i64 = client
-            .query_one(
-                "SELECT count(*)::bigint FROM lore_locks \
-                  WHERE repository_lock_generation IS NULL \
-                     OR branch_lock_generation IS NULL \
-                     OR owner_issuer IS NULL OR owner_subject IS NULL \
-                     OR ownership_token IS NULL OR fence IS NULL \
-                     OR acquired_at IS NULL OR renewed_at IS NULL",
-                &[],
-            )
-            .await
-            .map_err(|error| DomainError::from_pg("unfenced lock readiness", error))?
-            .get(0);
+        let unfenced_rows: i64 = if legacy_locks_present {
+            client
+                .query_one(
+                    "SELECT count(*)::bigint FROM lore_locks \
+                      WHERE repository_lock_generation IS NULL \
+                         OR branch_lock_generation IS NULL \
+                         OR owner_issuer IS NULL OR owner_subject IS NULL \
+                         OR ownership_token IS NULL OR fence IS NULL \
+                         OR acquired_at IS NULL OR renewed_at IS NULL",
+                    &[],
+                )
+                .await
+                .map_err(|error| DomainError::from_pg("unfenced lock readiness", error))?
+                .get(0)
+        } else {
+            0
+        };
         let evidence: Option<i64> = row.get("sequence_headroom_fence");
         let sequence = client
             .query_one(
@@ -1223,6 +1371,7 @@ impl PostgresLockCoordinator {
             Some(last_value)
         };
         Ok(LockFencingReadiness {
+            provisioned: true,
             schema_version: row.get("schema_version"),
             backfill_state: row.get("backfill_state"),
             fencing_enabled: row.get("fencing_enabled"),
@@ -1241,6 +1390,39 @@ impl PostgresLockCoordinator {
             .await
             .map_err(|error| DomainError::from_pool("lock coordinator pool", error))
     }
+}
+
+/// The migration-owned SCHEMA-117 relations `readiness` reads, excluding the
+/// legacy `lore_locks` table the lock-store plugin creates later in boot.
+const FENCED_SCHEMA_RELATIONS: [&str; 4] = [
+    "lore_domain_lock_schema_state",
+    "lore_domain_lock_namespaces",
+    "lore_domain_lock_backfill_quarantine",
+    "lore_domain_lock_fence_seq",
+];
+
+async fn relation_present(
+    client: &deadpool_postgres::Client,
+    relation: &str,
+) -> Result<bool, DomainError> {
+    client
+        .query_one("SELECT to_regclass($1) IS NOT NULL", &[&relation])
+        .await
+        .map_err(|error| DomainError::from_pg("lock relation probe", error))
+        .map(|row| row.get(0))
+}
+
+async fn fenced_schema_present(client: &deadpool_postgres::Client) -> Result<bool, DomainError> {
+    let present: i64 = client
+        .query_one(
+            "SELECT count(*)::bigint FROM unnest($1::text[]) AS relation \
+              WHERE to_regclass(relation) IS NOT NULL",
+            &[&FENCED_SCHEMA_RELATIONS.as_slice()],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("fenced lock schema probe", error))?
+        .get(0);
+    Ok(present == FENCED_SCHEMA_RELATIONS.len() as i64)
 }
 
 enum BeginAdmitted<'a> {

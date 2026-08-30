@@ -793,6 +793,145 @@ pub(crate) mod test_support {
     pub(crate) fn context(enforcement: bool) -> DomainContext {
         DomainContext::new(Arc::new(UnreachableDomainStore), enforcement)
     }
+
+    /// A scriptable coordinator for `branch_push.rs`'s `GovernedPushCommit::publish`
+    /// tests (INV-EE P1-5): records every `branch_push_commit` call's input and
+    /// returns a caller-supplied scripted [`MutationResult`] for it. Every other
+    /// method is `unreachable!()`, mirroring [`UnreachableDomainStore`] so a
+    /// signature drift fails to compile rather than silently inheriting a body.
+    pub(crate) struct ScriptedDomainStore {
+        result: MutationResult,
+        calls: std::sync::Mutex<Vec<BranchPushCommitInput>>,
+    }
+
+    impl ScriptedDomainStore {
+        /// Every scripted `branch_push_commit` call returns a clone of `result`.
+        pub(crate) fn new(result: MutationResult) -> Self {
+            Self {
+                result,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Every `branch_push_commit` input recorded so far, in call order.
+        pub(crate) fn recorded_branch_push_commit_calls(&self) -> Vec<BranchPushCommitInput> {
+            self.calls
+                .lock()
+                .expect("scripted store mutex poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl DomainTransactionStore for ScriptedDomainStore {
+        async fn domain_operation_clock_get(&self) -> Result<std::time::SystemTime, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn domain_operation_prepare(
+            &self,
+            _key: &ReceiptKey,
+            _binding: &OperationBinding,
+            _witness: Option<&AuthorizationWitness>,
+        ) -> Result<PrepareResult, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn domain_operation_receipt_get(
+            &self,
+            _key: &ReceiptKey,
+            _binding: &OperationBinding,
+        ) -> Result<ReceiptLookup, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn domain_operation_verified_stale_finalize(
+            &self,
+            _input: &VerifiedStaleFinalizeInput,
+        ) -> Result<VerifiedStaleFinalizeResult, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn domain_operation_terminal_status_attach(
+            &self,
+            _input: &TerminalStatusAttachInput,
+        ) -> Result<TerminalStatusAttachmentAck, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn domain_operation_proof_namespace_materialize(
+            &self,
+            _input: &ProofNamespaceMaterializeInput,
+        ) -> Result<ProofNamespaceMaterializeReceipt, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn domain_operation_proof_namespace_retire(
+            &self,
+            _input: &ProofNamespaceRetireInput,
+        ) -> Result<ProofNamespaceRetireAck, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn repository_snapshot(
+            &self,
+            _repository_id: &[u8],
+        ) -> Result<Option<RepositorySnapshot>, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn branch_snapshot(
+            &self,
+            _repository_id: &[u8],
+            _branch_id: &[u8],
+        ) -> Result<Option<BranchSnapshot>, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn repository_create(
+            &self,
+            _operation: &GovernedOperation,
+            _input: &RepositoryCreateInput,
+        ) -> Result<MutationResult, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn repository_delete(
+            &self,
+            _operation: &GovernedOperation,
+            _input: &RepositoryDeleteInput,
+        ) -> Result<MutationResult, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn metadata_compare_and_swap(
+            &self,
+            _operation: &GovernedOperation,
+            _input: &MetadataCasInput,
+        ) -> Result<MutationResult, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn branch_push_commit(
+            &self,
+            _operation: &GovernedOperation,
+            input: &BranchPushCommitInput,
+        ) -> Result<MutationResult, DomainError> {
+            self.calls
+                .lock()
+                .expect("scripted store mutex poisoned")
+                .push(input.clone());
+            Ok(self.result.clone())
+        }
+
+        async fn begin_obliterate(
+            &self,
+            _operation: &GovernedOperation,
+            _repository_id: &[u8],
+        ) -> Result<MutationResult, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1166,6 +1305,7 @@ mod tests {
 
     fn lock_ready() -> LockFencingReadiness {
         LockFencingReadiness {
+            provisioned: true,
             schema_version: lore_postgres::domain::locks::schema::LOCK_SCHEMA_VERSION,
             backfill_state: lore_postgres::domain::locks::schema::BACKFILL_COMPLETE,
             fencing_enabled: true,
@@ -1263,5 +1403,45 @@ mod tests {
         for readiness in cases {
             assert!(resolve_lock_fencing(&readiness, &settings).is_err());
         }
+    }
+
+    // --- 8. Boot against a cell the SCHEMA-117 migration never touched ------
+
+    /// A Postgres-mode cell that has never had the SCHEMA-117 migration
+    /// applied must still boot, on the legacy lock route.
+    ///
+    /// `configure_domain_context` runs before `configure_lock_store_via_plugin`
+    /// (`server.rs`), so when it reads lock readiness neither the fenced tables
+    /// nor `lore_locks` itself exists yet. Nothing in the runtime creates them:
+    /// CR-030 N-7 keeps `LOCK_SCHEMA` migration-owned, and `bootstrap()` is a
+    /// fixture-only method production never calls. Every other test reaching
+    /// this path calls `bootstrap()` first — a state the production rail never
+    /// produces — so this case boots the way an unmigrated cell actually boots.
+    #[tokio::test]
+    #[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+    async fn a_never_migrated_postgres_cell_boots_on_the_legacy_lock_route() {
+        let url = std::env::var("LORE_TEST_PG_URL")
+            .expect("LORE_TEST_PG_URL must be set; a skipped live case is NOT RUN, never a pass");
+
+        let mut settings: Settings = toml::from_str(include_str!("../config/default.toml"))
+            .expect("built-in settings fixture must deserialize");
+        settings.mutable_store.mode = POSTGRES_MODE.to_owned();
+        settings.plugins.insert(
+            "postgres".to_owned(),
+            toml::from_str(&format!("url = {url:?}\npool_max = 2\ndomain_pool_max = 2"))
+                .expect("Postgres plugin fixture config"),
+        );
+
+        let configured = configure_domain_context(&settings)
+            .await
+            .expect("an unmigrated cell must boot rather than abort on SQLSTATE 42P01");
+
+        let context = configured
+            .context
+            .expect("a Postgres-mode cell always gets a domain context");
+        assert!(
+            context.lock_coordinator().is_none(),
+            "a cell without the SCHEMA-117 migration must stay on the legacy lock route"
+        );
     }
 }

@@ -64,7 +64,7 @@ pub struct LoreRevisionService {
     /// `Some` only when the `enforce_locks_on_push` feature is enabled AND a
     /// lock store is configured; the push handler enforces advisory locks when
     /// present, and behaves as stock Lore (no enforcement) when `None`.
-    push_lock_enforcement: Option<Arc<dyn lore_revision::lock::LockStore>>,
+    push_lock_enforcement: Option<crate::grpc::handlers::push_lock_guard::PushLockEnforcement>,
     domain_context: Option<Arc<DomainContext>>,
 
     instrument_provider: RevisionServiceInstrumentProvider,
@@ -82,7 +82,7 @@ impl LoreRevisionService {
         acceleration: crate::grpc::server::RevisionListAcceleration,
         rpc_timeout: Duration,
         enforce_write_permission: bool,
-        push_lock_enforcement: Option<Arc<dyn lore_revision::lock::LockStore>>,
+        push_lock_enforcement: Option<crate::grpc::handlers::push_lock_guard::PushLockEnforcement>,
         domain_context: Option<Arc<DomainContext>>,
     ) -> Self {
         let instrument_provider = RevisionServiceInstrumentProvider {};

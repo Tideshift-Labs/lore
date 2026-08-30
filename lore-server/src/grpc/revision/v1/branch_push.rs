@@ -38,6 +38,7 @@ use crate::grpc::handlers::branch_push::dispatch_response_message;
 use crate::grpc::handlers::branch_push::extract_client_ip;
 use crate::grpc::handlers::branch_push::prepare_governed_push;
 use crate::grpc::handlers::branch_push::push_with_governance;
+use crate::grpc::handlers::push_lock_guard;
 use crate::grpc::hook_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -65,7 +66,7 @@ pub async fn handler(
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     instrument_provider: &impl InstrumentProvider,
-    lock_enforcement: Option<&Arc<dyn lore_revision::lock::LockStore>>,
+    lock_enforcement: Option<&crate::grpc::handlers::push_lock_guard::PushLockEnforcement>,
     domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<BranchPushResponse>, Status> {
     let request_metadata = request.metadata().clone();
@@ -99,6 +100,17 @@ pub async fn handler(
     let force = req.force;
     let fast_forward_merge = req.fast_forward_merge;
 
+    // Request validation precedes witness capture: a zero-revision request is
+    // malformed, not a CR-019 bypass, and must not pay for a database read
+    // before it is rejected (INV-EE P2-10).
+    if revision.is_zero() {
+        info!("Invalid branch push request, revision_signature is zero");
+        return Err(Status::invalid_argument(
+            "revision_signature must be non-zero",
+        ));
+    }
+
+    let fenced_coordinator = domain_context.and_then(|domain| domain.lock_coordinator().cloned());
     let governed_push = prepare_governed_push(
         domain_context,
         admitted,
@@ -109,13 +121,6 @@ pub async fn handler(
         fast_forward_merge,
     )
     .await?;
-
-    if revision.is_zero() {
-        info!("Invalid branch push request, revision_signature is zero");
-        return Err(Status::invalid_argument(
-            "revision_signature must be non-zero",
-        ));
-    }
 
     debug!(
         {REVISION} = %revision,
@@ -156,21 +161,31 @@ pub async fn handler(
 
             ensure_branch_pushable(repository.clone(), branch_id).await?;
 
-            if let Some(governed) = governed_push.as_ref() {
-                governed
-                    .enforce_fenced_locks(repository.clone(), branch_id, revision)
-                    .await?;
-            }
-
-            // Opt-in advisory-lock enforcement (CR-019); `Some` only when the
-            // feature is on AND a lock store exists. See the shared handler.
-            if let Some(lock_store) = lock_enforcement {
-                crate::grpc::handlers::push_lock_guard::enforce_push_locks(
+            // On a fenced cell the coordinator checks every push, governed or
+            // not, because it is the only authority holding a lock's verified
+            // owner pair; off a fenced cell CR-019's opt-in guard applies.
+            // See the shared v0 handler.
+            if let Some(coordinator) = fenced_coordinator.as_ref() {
+                let pusher = match governed_push.as_ref() {
+                    Some(governed) => governed.owner.clone(),
+                    None => push_lock_guard::verified_push_owner(request_authorization.as_ref())?,
+                };
+                crate::grpc::handlers::branch_push::enforce_fenced_locks(
+                    coordinator,
                     repository.clone(),
-                    lock_store,
                     branch_id,
                     revision,
-                    &user_id,
+                    &pusher,
+                )
+                .await?;
+            } else if let Some(enforcement) = lock_enforcement {
+                let pusher = push_lock_guard::verified_push_owner(request_authorization.as_ref())?;
+                push_lock_guard::enforce_push_locks(
+                    repository.clone(),
+                    enforcement,
+                    branch_id,
+                    revision,
+                    &pusher,
                 )
                 .await?;
             }

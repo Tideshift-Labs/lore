@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use lore_base::types::Hash;
+use lore_postgres::domain::locks::VerifiedLockOwner;
 use lore_revision::branch::load_latest;
 use lore_revision::change::NodeChange;
 use lore_revision::diff::diff_revision_paths;
@@ -37,11 +38,81 @@ use tonic::Status;
 use tracing::debug;
 use tracing::warn;
 
+/// The verified owner pair a push is authorized under.
+///
+/// Push-lock authority is the `(verified_issuer, authenticated_subject)` pair
+/// (CR-030), so an enforcing cell has nothing to compare against when the
+/// request carries no verified token, and must refuse rather than fall back to
+/// the shared `"<unknown>"` display subject.
+pub(crate) fn verified_push_owner(
+    authorization: Option<&crate::auth::jwt::AuthorizationToken>,
+) -> Result<VerifiedLockOwner, Status> {
+    let token = authorization.ok_or_else(|| {
+        Status::unauthenticated("Push-lock enforcement requires a verified caller")
+    })?;
+    Ok(VerifiedLockOwner {
+        verified_issuer: token.issuer.clone(),
+        authenticated_subject: token.user_id.clone(),
+    })
+}
+
 /// A single lock that blocks the push: the changed path and who holds the lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockConflict {
     pub path: String,
     pub owner: String,
+}
+
+/// How this cell resolves the verified issuer behind a stored lock owner.
+///
+/// The legacy `LockStore` records an owner as a bare subject string, which is
+/// display data, never authority (CR-030). Turning it back into the verified
+/// `(issuer, subject)` pair the comparison needs is only possible when the cell
+/// pins one issuer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockOwnerIssuerPolicy {
+    /// The cell pins one verified issuer, so every token it accepts — and
+    /// therefore every lock row it admitted — carries exactly this issuer. A
+    /// stored subject plus this issuer is a provable owner pair.
+    Pinned(String),
+    /// The cell accepts any issuer its JWK service can verify, so a stored
+    /// subject names no provable pair: `mallory` under issuer B and `mallory`
+    /// under issuer A are indistinguishable in storage. Nothing can be proved
+    /// to be the pusher's own lock, so every lock on a changed path blocks.
+    Unprovable,
+}
+
+impl LockOwnerIssuerPolicy {
+    /// Derive the policy from the verifier's configured `jwt_issuer`.
+    pub fn from_configured_issuer(issuer: Option<&str>) -> Self {
+        match issuer {
+            Some(issuer) if !issuer.is_empty() => Self::Pinned(issuer.to_owned()),
+            _ => Self::Unprovable,
+        }
+    }
+
+    /// Whether a stored owner subject provably names the pushing owner pair.
+    ///
+    /// Under `Pinned` the issuer half is proved by configuration rather than by
+    /// storage: the verifier rejects every token from another issuer, so a row
+    /// this cell admitted cannot have been acquired under one.
+    fn proves_own(&self, stored_owner: &str, pusher: &VerifiedLockOwner) -> bool {
+        match self {
+            Self::Pinned(issuer) => {
+                stored_owner == pusher.authenticated_subject
+                    && issuer.as_str() == pusher.verified_issuer.as_str()
+            }
+            Self::Unprovable => false,
+        }
+    }
+}
+
+/// The legacy push-lock authority: a lock store plus the issuer policy needed
+/// to read its subject-only owners as verified pairs.
+#[derive(Clone)]
+pub struct PushLockEnforcement {
+    pub lock_store: Arc<dyn LockStore>,
+    pub issuer_policy: LockOwnerIssuerPolicy,
 }
 
 /// Map an internal engine error to a `Status::internal` that fails the push
@@ -62,19 +133,20 @@ fn to_internal<E: std::error::Error>(error: &E, message: &'static str) -> Status
 /// would still be caught.
 pub async fn enforce_push_locks(
     repository: Arc<RepositoryContext>,
-    lock_store: &Arc<dyn LockStore>,
+    enforcement: &PushLockEnforcement,
     branch: BranchId,
     new_revision: Hash,
-    pusher_user_id: &str,
+    pusher: &VerifiedLockOwner,
 ) -> Result<(), Status> {
     let repository_id = repository.id;
     let conflicts = collect_push_lock_conflicts(
         repository,
-        lock_store,
+        &enforcement.lock_store,
         repository_id,
         branch,
         new_revision,
-        pusher_user_id,
+        pusher,
+        &enforcement.issuer_policy,
     )
     .await?;
 
@@ -85,13 +157,26 @@ pub async fn enforce_push_locks(
             conflict_count = conflicts.len(),
             "Rejecting push: changed path is locked by another user",
         );
-        return Err(Status::permission_denied(format!(
-            "push blocked: {} file(s) changed are locked by another user; \
-             e.g. '{}' is locked by {}",
-            conflicts.len(),
-            first.path,
-            first.owner,
-        )));
+        return Err(Status::permission_denied(
+            match &enforcement.issuer_policy {
+                LockOwnerIssuerPolicy::Pinned(_) => format!(
+                    "push blocked: {} file(s) changed are locked by another user; \
+                 e.g. '{}' is locked by {}",
+                    conflicts.len(),
+                    first.path,
+                    first.owner,
+                ),
+                LockOwnerIssuerPolicy::Unprovable => format!(
+                    "push blocked: {} file(s) changed are locked and this cell cannot prove who \
+                 holds them; e.g. '{}' is locked by subject '{}' under an unverified issuer. \
+                 Set [server.auth] jwt_issuer so lock ownership is a verified issuer/subject \
+                 pair.",
+                    conflicts.len(),
+                    first.path,
+                    first.owner,
+                ),
+            },
+        ));
     }
 
     Ok(())
@@ -100,19 +185,24 @@ pub async fn enforce_push_locks(
 /// The pure core: compute the set of changed paths on this push that are locked
 /// by a different user. Split out from `enforce_push_locks` so the conflict
 /// computation is unit-testable without the tonic `Status` mapping.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the owner pair and the issuer policy that proves it travel together"
+)]
 pub(crate) async fn collect_push_lock_conflicts(
     repository: Arc<RepositoryContext>,
     lock_store: &Arc<dyn LockStore>,
     repository_id: RepositoryId,
     branch: BranchId,
     new_revision: Hash,
-    pusher_user_id: &str,
+    pusher: &VerifiedLockOwner,
+    issuer_policy: &LockOwnerIssuerPolicy,
 ) -> Result<Vec<LockConflict>, Status> {
     // Locks held by OTHERS on this branch, keyed by resource hash. If nobody
     // else holds a lock on this branch, there is nothing to enforce — skip the
     // (potentially expensive) revision diff entirely.
     let other_locks =
-        others_locks_by_hash(lock_store, repository_id, branch, pusher_user_id).await?;
+        others_locks_by_hash(lock_store, repository_id, branch, pusher, issuer_policy).await?;
     if other_locks.is_empty() {
         debug!(%branch, "No foreign locks on branch; skipping push-lock diff");
         return Ok(Vec::new());
@@ -124,26 +214,47 @@ pub(crate) async fn collect_push_lock_conflicts(
 
     let changed_paths = changed_paths(repository, prior_tip, new_revision).await?;
 
+    Ok(conflicts_for_changed_paths(changed_paths, branch, |hash| {
+        other_locks.get(hash).cloned()
+    }))
+}
+
+/// Map changed paths onto the locks that block them.
+///
+/// `owner_of` answers "who holds the lock on this resource, if anyone" for
+/// whichever lock authority the caller consulted — the legacy `LockStore` here,
+/// the fenced coordinator in `branch_push`. Sharing this keeps the two callers
+/// from drifting on path-to-resource mapping, which is the part that must
+/// agree with what a client used to acquire the lock.
+pub(crate) fn conflicts_for_changed_paths(
+    changed_paths: Vec<String>,
+    branch: BranchId,
+    owner_of: impl Fn(&Hash) -> Option<String>,
+) -> Vec<LockConflict> {
     let mut conflicts = Vec::new();
     for path in changed_paths {
         let resource = assemble_resource_for_path(&path, branch);
-        if let Some(owner) = other_locks.get(&resource.hash) {
-            conflicts.push(LockConflict {
-                path,
-                owner: owner.clone(),
-            });
+        if let Some(owner) = owner_of(&resource.hash) {
+            conflicts.push(LockConflict { path, owner });
         }
     }
-    Ok(conflicts)
+    conflicts
 }
 
-/// Map of `resource.hash -> owner` for every lock on `branch` held by a user
-/// other than `pusher_user_id`.
+/// Map of `resource.hash -> owner` for every lock on `branch` this cell cannot
+/// prove belongs to the pushing owner pair.
+///
+/// The old comparison was `lock.owner != pusher_user_id` — a bare subject
+/// against a bare subject, which reads `mallory` under two different issuers as
+/// one owner and lets the second push over the first's lock (CR-030's named
+/// fail-open). A lock is now the pusher's own only when the issuer policy can
+/// prove the pair; anything unprovable stays foreign.
 async fn others_locks_by_hash(
     lock_store: &Arc<dyn LockStore>,
     repository_id: RepositoryId,
     branch: BranchId,
-    pusher_user_id: &str,
+    pusher: &VerifiedLockOwner,
+    issuer_policy: &LockOwnerIssuerPolicy,
 ) -> Result<HashMap<Hash, String>, Status> {
     let locks = lock_store
         .query_locks(LockQuery::RepositoryBranch(repository_id, branch))
@@ -152,13 +263,13 @@ async fn others_locks_by_hash(
 
     Ok(locks
         .into_iter()
-        .filter(|lock| lock.owner != pusher_user_id)
+        .filter(|lock| !issuer_policy.proves_own(&lock.owner, pusher))
         .map(|lock| (lock.resource.hash, lock.owner))
         .collect())
 }
 
 /// The set of file paths that differ between `source` and `target` revisions.
-async fn changed_paths(
+pub(crate) async fn changed_paths(
     repository: Arc<RepositoryContext>,
     source: Hash,
     target: Hash,
@@ -212,6 +323,22 @@ mod tests {
     use crate::grpc::handlers::branch_push;
     use crate::lock::store::LocalLockStore;
     use crate::store::test_store_create;
+
+    /// The issuer this cell's verifier is configured to accept.
+    const ISSUER_A: &str = "https://issuer-a.example";
+    /// A second issuer the same cell would accept with no issuer policy set.
+    const ISSUER_B: &str = "https://issuer-b.example";
+
+    fn owner(issuer: &str, subject: &str) -> VerifiedLockOwner {
+        VerifiedLockOwner {
+            verified_issuer: issuer.to_owned(),
+            authenticated_subject: subject.to_owned(),
+        }
+    }
+
+    fn pinned() -> LockOwnerIssuerPolicy {
+        LockOwnerIssuerPolicy::Pinned(ISSUER_A.to_owned())
+    }
 
     async fn store_with_lock(
         owner: &str,
@@ -353,9 +480,15 @@ mod tests {
 
         // A different user (bob) sees alice's lock, keyed by the SAME hash the
         // client used to acquire it — proving the server-side recompute matches.
-        let others = others_locks_by_hash(&lock_store, repository, branch, "bob")
-            .await
-            .expect("query others' locks");
+        let others = others_locks_by_hash(
+            &lock_store,
+            repository,
+            branch,
+            &owner(ISSUER_A, "bob"),
+            &pinned(),
+        )
+        .await
+        .expect("query others' locks");
         let expected_hash = assemble_resource_for_path(path, branch).hash;
         assert_eq!(
             others.get(&expected_hash).map(String::as_str),
@@ -363,12 +496,84 @@ mod tests {
         );
 
         // The lock holder (alice) pushing her own change sees no foreign lock.
-        let self_view = others_locks_by_hash(&lock_store, repository, branch, "alice")
-            .await
-            .expect("query self locks");
+        let self_view = others_locks_by_hash(
+            &lock_store,
+            repository,
+            branch,
+            &owner(ISSUER_A, "alice"),
+            &pinned(),
+        )
+        .await
+        .expect("query self locks");
         assert!(
             self_view.is_empty(),
             "a pusher's own lock must not block their push"
+        );
+    }
+
+    /// CR-030's named fail-open regression: the guard compared bare subjects,
+    /// so `mallory` authenticated by issuer B counted as the owner of a lock
+    /// `mallory` acquired under issuer A, and pushed straight over it.
+    #[tokio::test]
+    async fn same_subject_under_a_different_issuer_stays_foreign() {
+        let repository: RepositoryId = random();
+        let branch: BranchId = random();
+        let path = "Art/Hero.uasset";
+        let lock_store = store_with_lock("mallory", path, branch, repository).await;
+        let expected_hash = assemble_resource_for_path(path, branch).hash;
+
+        let foreign_issuer = others_locks_by_hash(
+            &lock_store,
+            repository,
+            branch,
+            &owner(ISSUER_B, "mallory"),
+            &pinned(),
+        )
+        .await
+        .expect("query with a foreign issuer");
+        assert_eq!(
+            foreign_issuer.get(&expected_hash).map(String::as_str),
+            Some("mallory"),
+            "the same subject under another issuer is another owner, not the lock holder"
+        );
+
+        // The genuine holder, under the pinned issuer, still owns it.
+        let holder = others_locks_by_hash(
+            &lock_store,
+            repository,
+            branch,
+            &owner(ISSUER_A, "mallory"),
+            &pinned(),
+        )
+        .await
+        .expect("query as the genuine holder");
+        assert!(holder.is_empty());
+    }
+
+    /// With no issuer policy the cell accepts any issuer its JWK service can
+    /// verify, so a stored subject proves nothing. Fail closed: every lock on
+    /// a changed path blocks, including one the pusher believes is their own.
+    #[tokio::test]
+    async fn an_unprovable_issuer_policy_leaves_every_lock_foreign() {
+        let repository: RepositoryId = random();
+        let branch: BranchId = random();
+        let path = "Art/Hero.uasset";
+        let lock_store = store_with_lock("alice", path, branch, repository).await;
+
+        let view = others_locks_by_hash(
+            &lock_store,
+            repository,
+            branch,
+            &owner(ISSUER_A, "alice"),
+            &LockOwnerIssuerPolicy::Unprovable,
+        )
+        .await
+        .expect("query without an issuer policy");
+        assert_eq!(
+            view.get(&assemble_resource_for_path(path, branch).hash)
+                .map(String::as_str),
+            Some("alice"),
+            "an unprovable owner pair must not be read as the pusher's own lock"
         );
     }
 
@@ -381,9 +586,15 @@ mod tests {
 
         // The lock is on `branch`; a query for a different branch sees nothing
         // (locks are branch-scoped — the cross-branch case is a client concern).
-        let on_other = others_locks_by_hash(&lock_store, repository, other_branch, "bob")
-            .await
-            .expect("query other branch");
+        let on_other = others_locks_by_hash(
+            &lock_store,
+            repository,
+            other_branch,
+            &owner(ISSUER_A, "bob"),
+            &pinned(),
+        )
+        .await
+        .expect("query other branch");
         assert!(on_other.is_empty());
     }
 
@@ -424,7 +635,8 @@ mod tests {
                     repository_id,
                     branch_id,
                     new_revision,
-                    "bob",
+                    &owner(ISSUER_A, "bob"),
+                    &pinned(),
                 )
                 .await
                 .expect("collect conflicts");
@@ -464,7 +676,8 @@ mod tests {
                     repository_id,
                     branch_id,
                     new_revision,
-                    "alice",
+                    &owner(ISSUER_A, "alice"),
+                    &pinned(),
                 )
                 .await
                 .expect("collect conflicts");
@@ -509,7 +722,8 @@ mod tests {
                     repository_id,
                     branch_id,
                     bogus_revision,
-                    "bob",
+                    &owner(ISSUER_A, "bob"),
+                    &pinned(),
                 )
                 .await
                 .expect("no foreign locks should short-circuit to Ok, not attempt a diff");
@@ -548,7 +762,8 @@ mod tests {
                     repository_id,
                     branch_id,
                     new_revision,
-                    "bob",
+                    &owner(ISSUER_A, "bob"),
+                    &pinned(),
                 )
                 .await
                 .expect("collect conflicts");
@@ -590,7 +805,8 @@ mod tests {
                     repository_id,
                     branch_id,
                     first_revision,
-                    "bob",
+                    &owner(ISSUER_A, "bob"),
+                    &pinned(),
                 )
                 .await
                 .expect("collect conflicts");
@@ -652,7 +868,8 @@ mod tests {
                     repository_id,
                     branch_id,
                     renamed,
-                    "bob",
+                    &owner(ISSUER_A, "bob"),
+                    &pinned(),
                 )
                 .await
                 .expect("collect conflicts");
@@ -660,6 +877,62 @@ mod tests {
                 assert_eq!(conflicts.len(), 1);
                 assert_eq!(conflicts[0].path, old_path);
                 assert_eq!(conflicts[0].owner, "alice");
+            }))
+            .await;
+        }
+
+        /// The same discriminating case, end to end through the handler seam:
+        /// `mallory` under issuer B must not push over the lock `mallory`
+        /// acquired under issuer A, and the genuine holder still may.
+        #[tokio::test]
+        async fn same_subject_under_a_different_issuer_cannot_push_over_the_lock() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let repository_id: RepositoryId = random();
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store,
+                    mutable_store,
+                    repository_id,
+                ));
+                let branch_id = create_root_branch(&repository, "main").await;
+                let root = serialize_empty_revision(&repository, Hash::default(), 1).await;
+                push_revision(&repository, branch_id, root).await;
+
+                let path = "hero.uasset";
+                let lock_store = store_with_lock("mallory", path, branch_id, repository_id).await;
+                let new_revision = serialize_file_revision(&repository, root, 2, path).await;
+
+                let foreign = collect_push_lock_conflicts(
+                    repository.clone(),
+                    &lock_store,
+                    repository_id,
+                    branch_id,
+                    new_revision,
+                    &owner(ISSUER_B, "mallory"),
+                    &pinned(),
+                )
+                .await
+                .expect("collect conflicts");
+                assert_eq!(foreign.len(), 1);
+                assert_eq!(foreign[0].path, path);
+
+                let holder = collect_push_lock_conflicts(
+                    repository.clone(),
+                    &lock_store,
+                    repository_id,
+                    branch_id,
+                    new_revision,
+                    &owner(ISSUER_A, "mallory"),
+                    &pinned(),
+                )
+                .await
+                .expect("collect conflicts");
+                assert!(
+                    holder.is_empty(),
+                    "the genuine holder must still push over their own lock"
+                );
             }))
             .await;
         }

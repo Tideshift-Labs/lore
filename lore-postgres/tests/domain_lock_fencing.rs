@@ -714,7 +714,7 @@ async fn stale_release_renew_force_and_cleanup_cannot_touch_a_successor() {
         .await
         .expect("empty backfill");
     coordinator
-        .enable_fencing(true)
+        .enable_fencing_for_component_fixture(true)
         .await
         .expect("enable finite leases in test fixture");
     let owner_a = owner("https://issuer.example", "lease-a");
@@ -935,7 +935,7 @@ async fn lease_clock_is_captured_after_the_namespace_lock_wait() {
         .await
         .expect("empty backfill");
     coordinator
-        .enable_fencing(true)
+        .enable_fencing_for_component_fixture(true)
         .await
         .expect("enable finite leases");
     let lock_owner = owner("https://issuer.example", "wait-owner");
@@ -1230,6 +1230,61 @@ async fn missing_and_repeated_release_are_not_found_and_empty_list_is_ok() {
     assert_eq!(empty_result.rejection, None);
 }
 
+/// The cutover entry point must refuse while the state it produces is
+/// unserviceable.
+///
+/// Arming converts every legacy lock into a live fenced row with no expiry,
+/// while fenced `Lock`/`Unlock`/`AdminLock` return `FAILED_PRECONDITION` and
+/// `release`/`force_release` have no wire caller — so the cell's pushes are
+/// blocked by locks nothing can release, and readiness reports green
+/// throughout (INV-EE P0-2). The refusal is the WP-120 gate and nothing else:
+/// the same evidence arms successfully through the fixture path.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn arming_is_refused_until_the_public_mutation_contract_exists() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.lock_coordinator();
+    let (_repository_id, _branch_id) = create_repository(&store).await;
+    coordinator
+        .backfill(&BackfillIssuerMap::new())
+        .await
+        .expect("complete empty backfill");
+
+    let refused = coordinator.enable_fencing(false).await;
+    match refused {
+        Err(DomainError::NotReady(reason)) => assert_eq!(
+            reason,
+            lore_postgres::domain::locks::schema::PUBLIC_MUTATION_CONTRACT_MISSING,
+            "the refusal must name the missing WP-120 contract, not an evidence gap"
+        ),
+        other => panic!("arming must be refused before WP-120, got {other:?}"),
+    }
+    assert!(
+        !coordinator
+            .readiness()
+            .await
+            .expect("readiness after a refused arming")
+            .fencing_enabled,
+        "a refused arming must leave the cell on the legacy route"
+    );
+
+    // Every evidence check passed; only the contract gate refused.
+    coordinator
+        .enable_fencing_for_component_fixture(false)
+        .await
+        .expect("the same evidence must arm through the fixture path");
+    assert!(
+        coordinator
+            .readiness()
+            .await
+            .expect("readiness after fixture arming")
+            .fencing_enabled
+    );
+}
+
 #[tokio::test]
 #[ignore = "run with tests/run-lock-fencing-live.ps1"]
 async fn readiness_rejects_each_missing_fenced_precondition() {
@@ -1247,7 +1302,7 @@ async fn readiness_rejects_each_missing_fenced_precondition() {
         .await
         .expect("complete empty backfill");
     coordinator
-        .enable_fencing(false)
+        .enable_fencing_for_component_fixture(false)
         .await
         .expect("enable fencing");
     let ready = coordinator.readiness().await.expect("ready projection");
@@ -1277,7 +1332,9 @@ async fn readiness_rejects_each_missing_fenced_precondition() {
             .is_none()
     );
     assert!(matches!(
-        coordinator.enable_fencing(false).await,
+        coordinator
+            .enable_fencing_for_component_fixture(false)
+            .await,
         Err(DomainError::NotReady(_))
     ));
     direct
@@ -1362,7 +1419,10 @@ async fn same_database_identity_accepts_only_the_domain_authority_database() {
         .await
         .expect("read mismatched identity");
     assert!(!readiness.same_database);
-    let enabled = store.lock_coordinator().enable_fencing(false).await;
+    let enabled = store
+        .lock_coordinator()
+        .enable_fencing_for_component_fixture(false)
+        .await;
     assert!(matches!(enabled, Err(DomainError::NotReady(_))));
 }
 

@@ -10,6 +10,11 @@ The Rust cases remain `#[ignore]`. This runner opts in to each case by exact nam
 and reports PASS, FAIL, and NOT RUN separately. It verifies the compiled catalog before Docker
 starts. A renamed, removed, added, or filtered-to-zero case is a setup failure.
 
+The inventory spans four compiled targets: the fenced-lock coordinator suite, migration/runtime
+parity, the obliterate-fence regression (which needs SCHEMA-117 for its push case), and the
+`lore-server` library's live boot, witness-bypass, and fenced-push cases. A case that is not in
+this inventory is NOT RUN, however green a plain `cargo test` looks.
+
 Each case gets a fresh database in one owned disposable container. Cleanup checks both the random
 run label and the owning PowerShell process before removing the container and anonymous volume.
 #>
@@ -32,57 +37,82 @@ $containerCreationAttempted = $false
 $runPassed = $false
 $setupError = $null
 
-$expectedCases = @(
-    'two_coordinators_racing_one_resource_choose_exactly_one_owner_pair',
-    'racing_batches_are_all_or_nothing',
-    'same_subject_under_different_issuers_is_foreign_for_every_owner_operation',
-    'acquire_result_boundary_is_rejected_before_lock_mutation',
-    'stale_release_renew_force_and_cleanup_cannot_touch_a_successor',
-    'obsolete_repository_and_branch_generations_make_rows_logically_absent',
-    'lease_clock_is_captured_after_the_namespace_lock_wait',
-    'lock_operations_reuse_cr029_receipt_bands_markers_and_quota',
-    'lock_mutations_take_the_receipt_before_domain_and_namespace_rows',
-    'missing_and_repeated_release_are_not_found_and_empty_list_is_ok',
-    'readiness_rejects_each_missing_fenced_precondition',
-    'same_database_identity_accepts_only_the_domain_authority_database',
-    'lock_backfill_is_restartable_and_quarantines_ambiguous_legacy_owners',
-    'backfill_proves_fence_sequence_headroom_before_cutover',
-    'push_witness_capture_and_transaction_local_revalidation_detect_change'
+# Each entry is one compiled target plus the exact cases this runner owns.
+# `Exact` means the target may hold no other ignored case, so a case added
+# without updating this list is a setup failure rather than a silent skip. The
+# `lore-server` library also holds ignored cases owned by other packages, so it
+# is pinned by presence instead.
+$inventory = @(
+    [pscustomobject]@{
+        Package = 'lore-postgres'
+        Target  = 'domain_lock_fencing'
+        Exact   = $true
+        Cases   = @(
+            'two_coordinators_racing_one_resource_choose_exactly_one_owner_pair',
+            'racing_batches_are_all_or_nothing',
+            'same_subject_under_different_issuers_is_foreign_for_every_owner_operation',
+            'acquire_result_boundary_is_rejected_before_lock_mutation',
+            'stale_release_renew_force_and_cleanup_cannot_touch_a_successor',
+            'obsolete_repository_and_branch_generations_make_rows_logically_absent',
+            'lease_clock_is_captured_after_the_namespace_lock_wait',
+            'lock_operations_reuse_cr029_receipt_bands_markers_and_quota',
+            'lock_mutations_take_the_receipt_before_domain_and_namespace_rows',
+            'missing_and_repeated_release_are_not_found_and_empty_list_is_ok',
+            'arming_is_refused_until_the_public_mutation_contract_exists',
+            'readiness_rejects_each_missing_fenced_precondition',
+            'same_database_identity_accepts_only_the_domain_authority_database',
+            'lock_backfill_is_restartable_and_quarantines_ambiguous_legacy_owners',
+            'backfill_proves_fence_sequence_headroom_before_cutover',
+            'push_witness_capture_and_transaction_local_revalidation_detect_change'
+        )
+    },
+    [pscustomobject]@{
+        Package = 'lore-postgres'
+        Target  = 'domain_migration_parity'
+        Exact   = $true
+        Cases   = @('migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs')
+    },
+    [pscustomobject]@{
+        Package = 'lore-postgres'
+        Target  = 'domain_obliterate_fence'
+        Exact   = $true
+        Cases   = @(
+            'begin_obliterate_advances_live_generation_and_refuses_a_tombstoned_repository',
+            'begin_obliterate_and_branch_push_commit_agree_on_the_repository_generation'
+        )
+    },
+    [pscustomobject]@{
+        Package = 'lore-server'
+        Target  = 'lib'
+        Exact   = $false
+        Cases   = @(
+            'domain::tests::a_never_migrated_postgres_cell_boots_on_the_legacy_lock_route',
+            'grpc::handlers::branch_push::tests::real_witness_capture_precedes_both_cr019_bypass_conditions',
+            'grpc::handlers::branch_push::governed_tests::enforce_fenced_locks_blocks_a_push_from_a_foreign_owner_pair',
+            'grpc::handlers::branch_push::governed_tests::enforce_fenced_locks_does_not_block_the_lock_holders_own_push',
+            'grpc::handlers::branch_push::governed_tests::enforce_fenced_locks_treats_same_subject_under_a_different_issuer_as_foreign',
+            'grpc::handlers::branch_push::governed_tests::enforce_fenced_locks_blocks_a_push_touching_the_locked_old_path_of_a_rename',
+            'grpc::handlers::branch_push::governed_tests::enforce_fenced_locks_does_not_block_a_foreign_lock_on_an_untouched_path',
+            'grpc::handlers::branch_push::governed_tests::missing_lock_namespace_row_leaves_the_branch_permanently_unpushable'
+        )
+    }
 )
-$migrationParityCase = 'migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs'
-$pushBypassCase = 'grpc::handlers::branch_push::tests::real_witness_capture_precedes_both_cr019_bypass_conditions'
 
 $results = @(
-    foreach ($testName in $expectedCases) {
-        [pscustomobject]@{
-            Package = 'lore-postgres'
-            Target = 'domain_lock_fencing'
-            Test   = $testName
-            Status = 'NOT RUN'
-            Passed = 0
-            Failed = 0
-            Ran    = 0
+    foreach ($target in $inventory) {
+        foreach ($testName in $target.Cases) {
+            [pscustomobject]@{
+                Package = $target.Package
+                Target  = $target.Target
+                Test    = $testName
+                Status  = 'NOT RUN'
+                Passed  = 0
+                Failed  = 0
+                Ran     = 0
+            }
         }
     }
 )
-$results += [pscustomobject]@{
-    Package = 'lore-postgres'
-    Target = 'domain_migration_parity'
-    Test   = $migrationParityCase
-    Status = 'NOT RUN'
-    Passed = 0
-    Failed = 0
-    Ran    = 0
-}
-$results += [pscustomobject]@{
-    Package = 'lore-server'
-    Target = 'lib'
-    Test   = $pushBypassCase
-    Status = 'NOT RUN'
-    Passed = 0
-    Failed = 0
-    Ran    = 0
-}
 
 $priorPgUrl = [Environment]::GetEnvironmentVariable('LORE_TEST_PG_URL', 'Process')
 
@@ -100,7 +130,14 @@ function Invoke-Checked {
     }
 }
 
-function Get-LockFencingTestCatalog {
+function Get-TestCatalog {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Package,
+        [Parameter(Mandatory)]
+        [string]$Target
+    )
+
     Push-Location $loreRoot
     $priorErrorAction = $ErrorActionPreference
     try {
@@ -108,67 +145,14 @@ function Get-LockFencingTestCatalog {
         # warnings are evidence output, not runner setup failures; the native exit code remains the
         # authority for success.
         $ErrorActionPreference = 'Continue'
-        $listArgs = @(
-            'test', '-p', 'lore-postgres', '--test', 'domain_lock_fencing', '--',
-            '--ignored', '--list'
-        )
-        $output = & cargo @listArgs 2>&1 | Out-String
-        $exitCode = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $priorErrorAction
-        Pop-Location
-    }
-    if ($exitCode -ne 0) {
-        throw "lock-fencing test catalog failed:`n$output"
-    }
-
-    return @(
-        foreach ($line in ($output -split "`r?`n")) {
-            $match = [regex]::Match($line, '^(?<name>[A-Za-z0-9_]+): test$')
-            if ($match.Success) {
-                $match.Groups['name'].Value
-            }
+        $listArgs = @('test', '-p', $Package)
+        if ($Target -eq 'lib') {
+            $listArgs += '--lib'
         }
-    )
-}
-
-function Get-MigrationParityTestCatalog {
-    Push-Location $loreRoot
-    $priorErrorAction = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $listArgs = @(
-            'test', '-p', 'lore-postgres', '--test', 'domain_migration_parity', '--',
-            '--ignored', '--list'
-        )
-        $output = & cargo @listArgs 2>&1 | Out-String
-        $exitCode = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $priorErrorAction
-        Pop-Location
-    }
-    if ($exitCode -ne 0) {
-        throw "migration-parity test catalog failed:`n$output"
-    }
-
-    return @(
-        foreach ($line in ($output -split "`r?`n")) {
-            $match = [regex]::Match($line, '^(?<name>[A-Za-z0-9_]+): test$')
-            if ($match.Success) {
-                $match.Groups['name'].Value
-            }
+        else {
+            $listArgs += @('--test', $Target)
         }
-    )
-}
-
-function Get-PushBypassTestCatalog {
-    Push-Location $loreRoot
-    $priorErrorAction = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $listArgs = @('test', '-p', 'lore-server', '--lib', '--', '--ignored', '--list')
+        $listArgs += @('--', '--ignored', '--list')
         $output = & cargo @listArgs 2>&1 | Out-String
         $exitCode = $LASTEXITCODE
     }
@@ -177,8 +161,9 @@ function Get-PushBypassTestCatalog {
         Pop-Location
     }
     if ($exitCode -ne 0) {
-        throw "push-bypass test catalog failed:`n$output"
+        throw "$Package/$Target test catalog failed:`n$output"
     }
+
     return @(
         foreach ($line in ($output -split "`r?`n")) {
             $match = [regex]::Match($line, '^(?<name>[A-Za-z0-9_:]+): test$')
@@ -190,22 +175,25 @@ function Get-PushBypassTestCatalog {
 }
 
 function Assert-ExpectedCatalog {
-    $catalog = @(Get-LockFencingTestCatalog)
-    $missing = @($expectedCases | Where-Object { $_ -notin $catalog })
-    $unexpected = @($catalog | Where-Object { $_ -notin $expectedCases })
-    if ($catalog.Count -ne $expectedCases.Count -or $missing.Count -ne 0 -or $unexpected.Count -ne 0) {
-        $message = "expected exactly $($expectedCases.Count) lock-fencing tests; catalog has $($catalog.Count). " +
-            "Missing=[$($missing -join ', ')]; unexpected=[$($unexpected -join ', ')]"
-        throw $message
-    }
-
-    $parityCatalog = @(Get-MigrationParityTestCatalog)
-    if ($parityCatalog.Count -ne 1 -or $migrationParityCase -notin $parityCatalog) {
-        throw "expected exactly the migration parity case '$migrationParityCase'; catalog=[$($parityCatalog -join ', ')]"
-    }
-    $pushCatalog = @(Get-PushBypassTestCatalog)
-    if (@($pushCatalog | Where-Object { $_ -eq $pushBypassCase }).Count -ne 1) {
-        throw "expected the executable push-bypass case '$pushBypassCase' exactly once"
+    foreach ($target in $inventory) {
+        $catalog = @(Get-TestCatalog -Package $target.Package -Target $target.Target)
+        $label = "$($target.Package)/$($target.Target)"
+        $missing = @($target.Cases | Where-Object { $_ -notin $catalog })
+        if ($missing.Count -ne 0) {
+            throw "$label is missing pinned cases: [$($missing -join ', ')]"
+        }
+        foreach ($case in $target.Cases) {
+            if (@($catalog | Where-Object { $_ -eq $case }).Count -ne 1) {
+                throw "$label must contain the pinned case '$case' exactly once"
+            }
+        }
+        if ($target.Exact) {
+            $unexpected = @($catalog | Where-Object { $_ -notin $target.Cases })
+            if ($catalog.Count -ne $target.Cases.Count -or $unexpected.Count -ne 0) {
+                throw ("$label must hold exactly $($target.Cases.Count) ignored cases; catalog has " +
+                    "$($catalog.Count). Unexpected=[$($unexpected -join ', ')]")
+            }
+        }
     }
 }
 

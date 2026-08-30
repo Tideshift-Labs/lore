@@ -11,6 +11,7 @@ use lore_base::types::Hash;
 use lore_postgres::domain::coordinator::BranchPushCommitInput;
 use lore_postgres::domain::coordinator::ProjectionWrite;
 use lore_postgres::domain::errors::DomainOutcome;
+use lore_postgres::domain::locks::PostgresLockCoordinator;
 use lore_postgres::domain::locks::PushLockWitness;
 use lore_postgres::domain::locks::VerifiedLockOwner;
 use lore_proto::BranchPushRequest;
@@ -22,9 +23,6 @@ use lore_revision::branch::PROTECT;
 use lore_revision::branch::load_latest;
 use lore_revision::branch::metadata;
 use lore_revision::branch::push;
-use lore_revision::change::NodeChange;
-use lore_revision::diff::diff_revision_paths;
-use lore_revision::lock::util::assemble_resource_for_path;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::notification::NotificationSender;
@@ -32,7 +30,6 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
 use lore_revision::state::State;
-use lore_revision::util::collect_stream::collect_stream_with_summary;
 use lore_storage::StoreError;
 use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
@@ -50,6 +47,8 @@ use tracing::instrument;
 use tracing::span;
 use tracing::warn;
 
+use super::push_lock_guard;
+use super::push_lock_guard::PushLockEnforcement;
 use crate::cache;
 use crate::domain::AdmittedOperation;
 use crate::domain::DomainContext;
@@ -69,6 +68,9 @@ use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
 use crate::util::setup_execution;
+
+#[cfg(test)]
+mod governed_tests;
 
 pub(crate) fn extract_client_ip<T>(request: &Request<T>) -> Option<IpAddr> {
     // try to get the LAST entry from XFF metadata header (injected by ALB)
@@ -98,7 +100,7 @@ pub async fn handler(
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     instrument_provider: &impl InstrumentProvider,
-    lock_enforcement: Option<&Arc<dyn lore_revision::lock::LockStore>>,
+    lock_enforcement: Option<&PushLockEnforcement>,
     domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<BranchPushResponse>, Status> {
     let request_metadata = request.metadata().clone();
@@ -134,6 +136,15 @@ pub async fn handler(
     let force = req.force;
     let fast_forward_merge = req.fast_forward_merge;
 
+    // Request validation precedes witness capture: a zero-revision request is
+    // malformed, not a CR-019 bypass, and must not pay for a database read
+    // before it is rejected (INV-EE P2-10).
+    if revision.is_zero() {
+        warn!("Invalid branch push request, revision is zero");
+        return Err(Status::invalid_argument("Invalid revision"));
+    }
+
+    let fenced_coordinator = domain_context.and_then(|domain| domain.lock_coordinator().cloned());
     let governed_push = prepare_governed_push(
         domain_context,
         admitted,
@@ -144,11 +155,6 @@ pub async fn handler(
         fast_forward_merge,
     )
     .await?;
-
-    if revision.is_zero() {
-        warn!("Invalid branch push request, revision is zero");
-        return Err(Status::invalid_argument("Invalid revision"));
-    }
 
     debug!({REVISION} = %revision, bypass_protection, {BRANCH_ID} = %branch, force, fast_forward_merge,
         "Handling branch push request",
@@ -184,23 +190,27 @@ pub async fn handler(
                 .dispatch_pre(HookPoint::BranchPush, &hook_ctx)
                 .map_err(hook_error_to_status)?;
 
-            if let Some(governed) = governed_push.as_ref() {
-                governed
-                    .enforce_fenced_locks(repository.clone(), branch, revision)
-                    .await?;
-            }
-
-            // Opt-in advisory-lock enforcement (CR-019): reject if a changed
-            // path is locked by another user on this branch. `Some` only when
+            // On a fenced cell the coordinator is the only authority that can
+            // read a lock's verified owner pair, so it checks every push,
+            // governed or not, and the legacy subject-only guard is skipped.
+            // Off a fenced cell CR-019's opt-in guard applies: `Some` only when
             // the `enforce_locks_on_push` feature is on AND a lock store exists;
             // absent → no behavior change (Lore's default advisory semantics).
-            if let Some(lock_store) = lock_enforcement {
-                crate::grpc::handlers::push_lock_guard::enforce_push_locks(
+            if let Some(coordinator) = fenced_coordinator.as_ref() {
+                let pusher = match governed_push.as_ref() {
+                    Some(governed) => governed.owner.clone(),
+                    None => push_lock_guard::verified_push_owner(request_authorization.as_ref())?,
+                };
+                enforce_fenced_locks(coordinator, repository.clone(), branch, revision, &pusher)
+                    .await?;
+            } else if let Some(enforcement) = lock_enforcement {
+                let pusher = push_lock_guard::verified_push_owner(request_authorization.as_ref())?;
+                push_lock_guard::enforce_push_locks(
                     repository.clone(),
-                    lock_store,
+                    enforcement,
                     branch,
                     revision,
-                    &user_id,
+                    &pusher,
                 )
                 .await?;
             }
@@ -333,6 +343,7 @@ pub(crate) async fn dispatch_response_message(
         .message
 }
 
+#[derive(Debug)]
 pub struct PushResult {
     pub success: bool,
     /// Whether this call moved the branch head. A successful push of the
@@ -351,7 +362,7 @@ pub(crate) struct GovernedPushCommit {
     branch_generation: i64,
     expected_latest_hash: Vec<u8>,
     lock_witness: PushLockWitness,
-    owner: VerifiedLockOwner,
+    pub(crate) owner: VerifiedLockOwner,
 }
 
 /// Capture SCHEMA-117's witness independently of CR-019 and prepare the
@@ -438,67 +449,65 @@ pub(crate) async fn prepare_governed_push(
     }))
 }
 
-impl GovernedPushCommit {
-    pub(crate) async fn enforce_fenced_locks(
-        &self,
-        repository: Arc<RepositoryContext>,
-        branch: BranchId,
-        new_revision: Hash,
-    ) -> Result<(), Status> {
-        let coordinator = self.domain.lock_coordinator().ok_or_else(|| {
-            Status::failed_precondition("Fenced lock coordinator became unavailable")
-        })?;
-        let foreign_locks = coordinator
-            .query(repository.id.as_ref(), Some(branch.as_ref()), None)
-            .await
-            .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?
-            .into_iter()
-            .filter(|lock| lock.owner != self.owner)
-            .collect::<Vec<_>>();
-        if foreign_locks.is_empty() {
-            return Ok(());
-        }
-
-        let prior_tip = load_latest(repository.clone(), branch)
-            .await
-            .map_err(|error| Status::internal(format!("failed to load branch tip: {error}")))?;
-        let source = State::deserialize(repository.clone(), prior_tip)
-            .await
-            .map_err(|error| Status::internal(format!("failed to read branch tip: {error}")))?;
-        let target = State::deserialize(repository.clone(), new_revision)
-            .await
-            .map_err(|error| {
-                Status::internal(format!("failed to read pushed revision: {error}"))
-            })?;
-        let (_, changes): (_, Vec<NodeChange>) = collect_stream_with_summary(|tx| {
-            diff_revision_paths(repository.clone(), source, target, None, tx)
-        })
+/// Reject a push that touches a resource locked by another verified owner pair.
+///
+/// A free function rather than a method on [`GovernedPushCommit`] because it
+/// must also run for an *ungoverned* push on a fenced cell: a client that
+/// carries no domain-operation headers still gets no licence to push over a
+/// foreign lock (INV-EE P1-1). The legacy `push_lock_guard` cannot serve a
+/// fenced cell — it reads subject-only owners from the legacy store — so on a
+/// fenced cell this is the only push-lock comparison, and it is unconditional
+/// with respect to CR-019's `enforce_locks_on_push` (CR-030 F-030-2 amendment).
+pub(crate) async fn enforce_fenced_locks(
+    coordinator: &PostgresLockCoordinator,
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    new_revision: Hash,
+    pusher: &VerifiedLockOwner,
+) -> Result<(), Status> {
+    let foreign_locks = coordinator
+        .query(repository.id.as_ref(), Some(branch.as_ref()), None)
         .await
-        .map_err(|error| Status::internal(format!("failed to diff pushed revision: {error}")))?;
-
-        for change in changes {
-            let mut paths = vec![change.path.as_str()];
-            if let Some(from_path) = change.from_path.as_ref()
-                && from_path.as_str() != change.path.as_str()
-            {
-                paths.push(from_path.as_str());
-            }
-            for path in paths {
-                let resource_hash = assemble_resource_for_path(path, branch).hash;
-                if let Some(lock) = foreign_locks
-                    .iter()
-                    .find(|lock| lock.resource_hash.as_slice() == resource_hash.as_ref())
-                {
-                    return Err(Status::permission_denied(format!(
-                        "push blocked: '{path}' is locked by another verified owner ({})",
-                        lock.owner.authenticated_subject
-                    )));
-                }
-            }
-        }
-        Ok(())
+        .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?
+        .into_iter()
+        .filter(|lock| !lock.owner.ct_matches(pusher))
+        .collect::<Vec<_>>();
+    if foreign_locks.is_empty() {
+        return Ok(());
     }
 
+    let prior_tip = load_latest(repository.clone(), branch)
+        .await
+        .map_err(|error| Status::internal(format!("failed to load branch tip: {error}")))?;
+    // Shared with the legacy guard so the two authorities cannot drift on the
+    // rename-endpoint expansion or the path-to-resource-hash mapping, which is
+    // the part that must agree with what a client used to acquire the lock.
+    let changed = push_lock_guard::changed_paths(repository, prior_tip, new_revision).await?;
+    let conflicts = push_lock_guard::conflicts_for_changed_paths(changed, branch, |hash| {
+        foreign_locks
+            .iter()
+            .find(|lock| lock.resource_hash.as_slice() == hash.as_ref())
+            .map(|lock| lock.owner.authenticated_subject.clone())
+    });
+
+    if let Some(first) = conflicts.first() {
+        warn!(
+            path = %first.path,
+            conflict_count = conflicts.len(),
+            "Rejecting push: changed path is locked by another verified owner pair",
+        );
+        return Err(Status::permission_denied(format!(
+            "push blocked: {} file(s) changed are locked by another verified owner; \
+             e.g. '{}' is locked by {}",
+            conflicts.len(),
+            first.path,
+            first.owner,
+        )));
+    }
+    Ok(())
+}
+
+impl GovernedPushCommit {
     async fn publish(
         &self,
         repository: &RepositoryContext,
@@ -1251,7 +1260,6 @@ mod tests {
     use lore_postgres::domain::receipts::ReceiptKey;
     use lore_postgres::pool::TlsConfig;
     use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
-    use lore_revision::lock::LockStore;
     use lore_revision::node::Node;
     use lore_revision::node::ROOT_NODE;
     use lore_storage::ImmutableStore;
@@ -1442,15 +1450,24 @@ mod tests {
             mutable_store,
             repository_id,
         ));
-        let lock_store: Arc<dyn LockStore> = Arc::new(LocalLockStore::default());
+        let enforcement = PushLockEnforcement {
+            lock_store: Arc::new(LocalLockStore::default()),
+            issuer_policy: push_lock_guard::LockOwnerIssuerPolicy::Pinned(
+                "https://issuer.example".to_owned(),
+            ),
+        };
+        let pusher = VerifiedLockOwner {
+            verified_issuer: "https://issuer.example".to_owned(),
+            authenticated_subject: "wp117-pusher".to_owned(),
+        };
         let bogus_revision = Hash::hash_buffer(b"never serialized for wp117 bypass fixture");
         Box::pin(LORE_CONTEXT.scope(execution, async move {
-            crate::grpc::handlers::push_lock_guard::enforce_push_locks(
+            push_lock_guard::enforce_push_locks(
                 repository,
-                &lock_store,
+                &enforcement,
                 branch_id,
                 bogus_revision,
-                "wp117-pusher",
+                &pusher,
             )
             .await
             .expect("real CR-019 empty-lock guard must take its early return");

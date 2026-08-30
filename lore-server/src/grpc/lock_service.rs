@@ -390,20 +390,21 @@ impl LoreLockService {
         if let Some(coordinator) = &self.fenced_coordinator {
             let _authorization = fenced_authorization
                 .ok_or_else(|| Status::unauthenticated("Missing authorization"))?;
-            let mut locks = Vec::new();
-            for resource in &status_request.resources {
-                if let Some(lock) = coordinator
-                    .status(
-                        repository.as_ref(),
-                        resource.branch.as_ref(),
-                        resource.hash.as_ref(),
-                    )
-                    .await
-                    .map_err(|error| super::map_domain_error_to_status(&error))?
-                {
-                    locks.push(fenced_lock_to_wire(lock)?);
-                }
-            }
+            // One checkout and one query for the batch, as the legacy store
+            // does. A resource-at-a-time loop took a pool checkout per entry
+            // off the shared CR-029 domain pool (INV-EE P1-8).
+            let requested = status_request
+                .resources
+                .iter()
+                .map(|resource| (resource.branch.as_ref(), resource.hash.as_ref()))
+                .collect::<Vec<_>>();
+            let locks = coordinator
+                .status_many(repository.as_ref(), &requested)
+                .await
+                .map_err(|error| super::map_domain_error_to_status(&error))?
+                .into_iter()
+                .map(fenced_lock_to_wire)
+                .collect::<Result<Vec<_>, _>>()?;
             return Ok(Response::new(StatusResponse { locks }));
         }
 

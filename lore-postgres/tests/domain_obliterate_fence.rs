@@ -14,8 +14,15 @@
 //! pre-obliteration generation is refused and one holding the post-
 //! obliteration generation succeeds.
 //!
-//! Gated on `LORE_TEST_PG_URL`; skipped when unset. Isolated per test by a
-//! random repository/branch identity since the domain tables are shared.
+//! Both cases install SCHEMA-117 before creating any domain row:
+//! `branch_push_commit` revalidates CR-030's push witness, and the namespace
+//! row it reads is written by an after-insert trigger on
+//! `lore_domain_branches`.
+//!
+//! Gated on `LORE_TEST_PG_URL` and pinned in
+//! `lore-postgres/tests/run-lock-fencing-live.ps1`'s fixed inventory. An unset
+//! env panics rather than returning: a case that quietly does nothing is NOT
+//! RUN, and must never be countable as a pass.
 
 use std::time::SystemTime;
 
@@ -38,8 +45,29 @@ use uuid::NoContext;
 use uuid::Timestamp;
 use uuid::Uuid;
 
-fn pg_url() -> Option<String> {
-    std::env::var("LORE_TEST_PG_URL").ok()
+fn pg_url() -> String {
+    std::env::var("LORE_TEST_PG_URL")
+        .expect("LORE_TEST_PG_URL must be set; a skipped live case is NOT RUN, never a pass")
+}
+
+/// Connect and install SCHEMA-117 before any domain row exists.
+///
+/// `branch_push_commit` now revalidates CR-030's push witness against
+/// `lore_domain_lock_namespaces`, and that row is created by an after-insert
+/// trigger on `lore_domain_branches`. So the lock schema must be present
+/// *before* the repository is created, not merely before the push — connecting
+/// without it made the push case panic on SQLSTATE 42P01 on any clean database
+/// (INV-EE P1-3).
+async fn connect_with_lock_schema(url: &str) -> PostgresDomainStore {
+    let store = PostgresDomainStore::connect(url, 2, &TlsConfig::default())
+        .await
+        .expect("connect domain store");
+    store
+        .lock_coordinator()
+        .bootstrap()
+        .await
+        .expect("install SCHEMA-117 before any domain row exists");
+    store
 }
 
 async fn pg_client(url: &str) -> tokio_postgres::Client {
@@ -146,13 +174,8 @@ fn repository_create_input(
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
 async fn begin_obliterate_advances_live_generation_and_refuses_a_tombstoned_repository() {
-    let Some(url) = pg_url() else {
-        eprintln!("LORE_TEST_PG_URL unset; skipping begin_obliterate tombstone test");
-        return;
-    };
-    let store = PostgresDomainStore::connect(&url, 2, &TlsConfig::default())
-        .await
-        .expect("connect domain store");
+    let url = pg_url();
+    let store = connect_with_lock_schema(&url).await;
 
     let repository_id: [u8; 16] = rand::random();
     let branch_id: [u8; 16] = rand::random();
@@ -242,13 +265,8 @@ async fn begin_obliterate_advances_live_generation_and_refuses_a_tombstoned_repo
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
 async fn begin_obliterate_and_branch_push_commit_agree_on_the_repository_generation() {
-    let Some(url) = pg_url() else {
-        eprintln!("LORE_TEST_PG_URL unset; skipping obliterate/push generation-agreement test");
-        return;
-    };
-    let store = PostgresDomainStore::connect(&url, 2, &TlsConfig::default())
-        .await
-        .expect("connect domain store");
+    let url = pg_url();
+    let store = connect_with_lock_schema(&url).await;
 
     let repository_id: [u8; 16] = rand::random();
     let branch_id: [u8; 16] = rand::random();
