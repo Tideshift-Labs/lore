@@ -1284,7 +1284,23 @@ impl PostgresFragmentCoordinator {
         sequence.enter(LockClass::Fragments)?;
         // Sorted hash order, so two transactions over an overlapping required
         // set acquire the overlap in the same sequence (F-032-3's within-class
-        // rule). One set-based query, never a row at a time.
+        // rule). One set-based query, never a row at a time, because CR-031
+        // fixes that shape for the push path.
+        //
+        // This deliberately differs from `bump_lifecycle_generation`, which
+        // locks its rows one at a time, and the difference is worth stating
+        // because it looks like an inconsistency. Postgres does not *guarantee*
+        // that `ORDER BY ... FOR UPDATE` acquires locks in the sorted order:
+        // under a concurrent update it can re-fetch a row and emit it later.
+        // Here that is acceptable, because every transaction reaching this
+        // statement scans the same primary-key index ascending over its own
+        // subset, so two overlapping sets still meet the overlap in the same
+        // relative order; and the only other lock class this transaction may
+        // still take is the outbox insert, which is last. The fanout path has
+        // neither property — it locks `lore_domain_repositories`, a class that
+        // sits *earlier* in F-032-3 than the fragment rows a concurrent
+        // transition may already hold — so it cannot rely on executor order and
+        // takes its rows explicitly instead.
         let mut sorted: Vec<&RequiredFragment> = required.iter().collect();
         sorted.sort_by(|left, right| left.hash.cmp(&right.hash));
         let hashes: Vec<Vec<u8>> = sorted.iter().map(|item| item.hash.clone()).collect();
