@@ -1,1 +1,14 @@
 lore-object-dispatch/migrations/*.sql text eol=lf
+
+# A migration's bytes reach PostgreSQL verbatim, and PL/pgSQL function bodies
+# are stored as text. On a CRLF checkout every trigger body installed from a
+# migration file carries carriage returns that the same DDL declared as a Rust
+# string literal does not, so `pg_get_functiondef` reports two schemas as
+# different when only their line endings differ — and the difference is
+# invisible in the failure output. That is what broke
+# `domain_migration_parity`'s catalog comparison on Windows.
+#
+# Table, column, constraint, and index definitions are parsed and normalised by
+# the server, so only function and trigger bodies expose this. A migration file
+# that declares none can be CRLF for years and look fine.
+lore-postgres/migrations/*.sql text eol=lf
