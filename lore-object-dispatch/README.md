@@ -182,6 +182,19 @@ These functions perform no database, spool, clock, provider, or network access; 
 authority client and drain workers call them, and call the retained PostgreSQL procedures for the
 durable admission, ReservePut, and spool-ready transitions themselves.
 
+## Governed provider client (WP-114 CD-5)
+
+`provider_client.rs` is the crate's only place a provider attempt may be authorized: the cell
+boundary binding, the PUT execution plan, and the charge-before-send kernel. It ships **no provider
+SDK, no credential, no endpoint route, no database connection, and no lock**, and performs no
+filesystem or network I/O. The two seams CR-033 D4 needs around a send — the charge authority and
+the S3 transport — are traits with exactly one shipped implementation each,
+`UnwiredChargeAuthority` and `UnwiredProviderTransport`, and both **fail closed on every call**.
+Compiling or testing this module authorizes no provider traffic; it is not activation evidence.
+`compaction.rs` exposes `pub(crate) provider_attempt_audit_is_valid` so the ledger calls the one
+frozen audit predicate instead of restating it. See `WP-114`'s CD-5 section and CR-033 D4 for the
+governing spec and disposition; this file states only the module's boundary.
+
 ## Out-of-band cell schema install (WP-114 CD-1)
 
 `cell_schema_install.rs` and the one-shot `cell-schema-install` binary are the production install
