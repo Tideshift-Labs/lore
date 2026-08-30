@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Tideshift Labs
+// Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Transactional implementation of CR-030's fenced lock authority.
 
@@ -22,6 +22,7 @@ use crate::domain::lock_order::lock_repository;
 use crate::domain::outbox;
 use crate::domain::receipts;
 use crate::domain::receipts::ConsumeResult;
+use crate::domain::receipts::OperationBinding;
 use crate::domain::retry::classify_commit;
 use crate::domain::store::PostgresDomainStore;
 
@@ -203,6 +204,8 @@ pub struct LockFencingReadiness {
     pub sequence_headroom: bool,
     /// Quarantine row count.
     pub quarantined_rows: i64,
+    /// Legacy rows that still lack fenced authority columns.
+    pub unfenced_rows: i64,
 }
 
 /// Postgres-only CR-030 coordinator, sharing CR-029's pool.
@@ -236,6 +239,71 @@ pub fn lock_tenant_scope_key(
     out.extend_from_slice(&16u32.to_be_bytes());
     out.extend_from_slice(branch_id);
     Ok(out)
+}
+
+/// Build the exact receipt binding for an acquire, renew, or dark admin acquire.
+pub fn acquire_or_renew_binding(
+    input: &AcquireOrRenewInput,
+) -> Result<OperationBinding, DomainError> {
+    let ordered = sorted_resources(&input.resources)?;
+    let has_tokens = ordered
+        .iter()
+        .filter(|resource| resource.expected_ownership_token.is_some())
+        .count();
+    let method = if input.acting_owner.is_some() {
+        if has_tokens != 0 {
+            return Err(DomainError::InvalidInput(
+                "dark admin acquire cannot renew an existing token".to_owned(),
+            ));
+        }
+        "lock.admin_acquire"
+    } else if has_tokens == 0 {
+        "lock.acquire"
+    } else if has_tokens == ordered.len() {
+        "lock.renew"
+    } else {
+        return Err(DomainError::InvalidInput(
+            "an acquire/renew batch cannot mix tokenless and token-bearing resources".to_owned(),
+        ));
+    };
+    lock_binding(
+        method,
+        &input.repository_id,
+        &input.branch_id,
+        &input.owner,
+        input.acting_owner.as_ref(),
+        &ordered,
+        input.lease_duration,
+        false,
+    )
+}
+
+/// Build the exact receipt binding for a normal release.
+pub fn release_binding(input: &ReleaseInput) -> Result<OperationBinding, DomainError> {
+    lock_binding(
+        "lock.release",
+        &input.repository_id,
+        &input.branch_id,
+        &input.owner,
+        None,
+        &sorted_resources_allow_empty(&input.resources)?,
+        None,
+        false,
+    )
+}
+
+/// Build the exact receipt binding for the dark force-release method.
+pub fn force_release_binding(input: &ForceReleaseInput) -> Result<OperationBinding, DomainError> {
+    lock_binding(
+        "lock.force_release",
+        &input.repository_id,
+        &input.branch_id,
+        &input.target_owner,
+        Some(&input.acting_owner),
+        &sorted_resources(&input.resources)?,
+        None,
+        true,
+    )
 }
 
 impl PostgresLockCoordinator {
@@ -272,6 +340,11 @@ impl PostgresLockCoordinator {
         operation: &GovernedOperation,
         input: &AcquireOrRenewInput,
     ) -> Result<LockMutationResult, DomainError> {
+        validate_operation_binding(
+            operation,
+            &acquire_or_renew_binding(input)?,
+            input.acting_owner.as_ref().unwrap_or(&input.owner),
+        )?;
         validate_common(
             operation,
             &input.repository_id,
@@ -302,7 +375,15 @@ impl PostgresLockCoordinator {
         let begun = begin_admitted(&mut client, operation, &mut sequence).await?;
         let (tx, admission_clock) = match begun {
             BeginAdmitted::Admitted(tx, clock) => (tx, clock),
-            BeginAdmitted::Committed(outcome) => return Ok(replayed(outcome)),
+            BeginAdmitted::Committed(outcome, public_result) => {
+                let locks = match public_result {
+                    Some(bytes) if matches!(outcome, DomainOutcome::Applied) => {
+                        decode_canonical_result(&bytes)?
+                    }
+                    _ => Vec::new(),
+                };
+                return Ok(replayed(outcome, locks));
+            }
             BeginAdmitted::Rejected => return Ok(admission_rejected()),
         };
         let Some(repository) = lock_repository(&tx, &mut sequence, &input.repository_id).await?
@@ -446,7 +527,7 @@ impl PostgresLockCoordinator {
         )
         .await?;
         let outcome = DomainOutcome::Applied;
-        let public = canonical_result(&committed);
+        let public = canonical_result(&committed)?;
         receipts::commit_terminal(
             &tx,
             &operation.key,
@@ -470,6 +551,7 @@ impl PostgresLockCoordinator {
         operation: &GovernedOperation,
         input: &ReleaseInput,
     ) -> Result<LockMutationResult, DomainError> {
+        validate_operation_binding(operation, &release_binding(input)?, &input.owner)?;
         self.release_inner(
             operation,
             &input.repository_id,
@@ -488,6 +570,11 @@ impl PostgresLockCoordinator {
         operation: &GovernedOperation,
         input: &ForceReleaseInput,
     ) -> Result<LockMutationResult, DomainError> {
+        validate_operation_binding(
+            operation,
+            &force_release_binding(input)?,
+            &input.acting_owner,
+        )?;
         validate_owner(&input.acting_owner)?;
         self.release_inner(
             operation,
@@ -520,7 +607,7 @@ impl PostgresLockCoordinator {
             let mut client = self.checkout().await?;
             let mut sequence = LockSequence::new();
             return match begin_admitted(&mut client, operation, &mut sequence).await? {
-                BeginAdmitted::Committed(outcome) => Ok(replayed(outcome)),
+                BeginAdmitted::Committed(outcome, _) => Ok(replayed(outcome, Vec::new())),
                 BeginAdmitted::Rejected => Ok(admission_rejected()),
                 BeginAdmitted::Admitted(tx, clock) => {
                     let outcome = DomainOutcome::Applied;
@@ -556,7 +643,7 @@ impl PostgresLockCoordinator {
         let begun = begin_admitted(&mut client, operation, &mut sequence).await?;
         let (tx, admission_clock) = match begun {
             BeginAdmitted::Admitted(tx, clock) => (tx, clock),
-            BeginAdmitted::Committed(outcome) => return Ok(replayed(outcome)),
+            BeginAdmitted::Committed(outcome, _) => return Ok(replayed(outcome, Vec::new())),
             BeginAdmitted::Rejected => return Ok(admission_rejected()),
         };
         let Some(repository) = lock_repository(&tx, &mut sequence, repository_id).await? else {
@@ -704,6 +791,9 @@ impl PostgresLockCoordinator {
                     AND ($5::text IS NULL OR locks.description = $5) \
                     AND locks.repository_lock_generation = namespace.repository_lock_generation \
                     AND locks.branch_lock_generation = namespace.branch_lock_generation \
+                    AND locks.owner_issuer IS NOT NULL AND locks.owner_subject IS NOT NULL \
+                    AND locks.ownership_token IS NOT NULL AND locks.fence IS NOT NULL \
+                    AND locks.acquired_at IS NOT NULL AND locks.renewed_at IS NOT NULL \
                     AND (locks.expires_at IS NULL OR locks.expires_at > clock_timestamp()) \
                   ORDER BY locks.branch, locks.hash",
                 &[
@@ -743,6 +833,9 @@ impl PostgresLockCoordinator {
                   WHERE locks.repository = $1 AND locks.branch = $2 AND locks.hash = $3 \
                     AND locks.repository_lock_generation = namespace.repository_lock_generation \
                     AND locks.branch_lock_generation = namespace.branch_lock_generation \
+                    AND locks.owner_issuer IS NOT NULL AND locks.owner_subject IS NOT NULL \
+                    AND locks.ownership_token IS NOT NULL AND locks.fence IS NOT NULL \
+                    AND locks.acquired_at IS NOT NULL AND locks.renewed_at IS NOT NULL \
                     AND (locks.expires_at IS NULL OR locks.expires_at > clock_timestamp())",
                 &[&repository_id, &branch_id, &resource_hash],
             )
@@ -1052,6 +1145,19 @@ impl PostgresLockCoordinator {
                 "{quarantined} legacy lock rows remain quarantined"
             )));
         }
+        let unfenced: i64 = tx
+            .query_one(
+                "SELECT count(*)::bigint FROM lore_locks WHERE owner_issuer IS NULL",
+                &[],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("lock fencing unfenced-row check", error))?
+            .get(0);
+        if unfenced != 0 {
+            return Err(DomainError::NotReady(format!(
+                "{unfenced} legacy lock rows remain unfenced"
+            )));
+        }
         let headroom = reserve_sequence_headroom(&tx).await?;
         tx.execute(
             "UPDATE lore_domain_lock_schema_state SET fencing_enabled = true, lease_enabled = $1, \
@@ -1093,6 +1199,19 @@ impl PostgresLockCoordinator {
             .await
             .map_err(|error| DomainError::from_pg("lock quarantine readiness", error))?
             .get(0);
+        let unfenced_rows: i64 = client
+            .query_one(
+                "SELECT count(*)::bigint FROM lore_locks \
+                  WHERE repository_lock_generation IS NULL \
+                     OR branch_lock_generation IS NULL \
+                     OR owner_issuer IS NULL OR owner_subject IS NULL \
+                     OR ownership_token IS NULL OR fence IS NULL \
+                     OR acquired_at IS NULL OR renewed_at IS NULL",
+                &[],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("unfenced lock readiness", error))?
+            .get(0);
         let evidence: Option<i64> = row.get("sequence_headroom_fence");
         let sequence = client
             .query_one(
@@ -1117,6 +1236,7 @@ impl PostgresLockCoordinator {
             sequence_headroom: evidence.is_some()
                 && next_value.is_some_and(|value| value > max_fence),
             quarantined_rows,
+            unfenced_rows,
         })
     }
 
@@ -1130,7 +1250,7 @@ impl PostgresLockCoordinator {
 
 enum BeginAdmitted<'a> {
     Admitted(deadpool_postgres::Transaction<'a>, SystemTime),
-    Committed(DomainOutcome),
+    Committed(DomainOutcome, Option<Vec<u8>>),
     Rejected,
 }
 
@@ -1155,9 +1275,12 @@ async fn begin_admitted<'a>(
         ConsumeResult::Admitted(admitted) => {
             Ok(BeginAdmitted::Admitted(tx, admitted.admission_clock))
         }
-        ConsumeResult::Committed(outcome) => {
+        ConsumeResult::Committed {
+            outcome,
+            public_result,
+        } => {
             classify_commit(tx.commit().await, "lock admission replay commit")?;
-            Ok(BeginAdmitted::Committed(outcome))
+            Ok(BeginAdmitted::Committed(outcome, public_result))
         }
         ConsumeResult::Rejected => {
             drop(tx);
@@ -1477,10 +1600,10 @@ fn rejection_reason(rejection: LockRejection) -> &'static str {
     }
 }
 
-fn replayed(outcome: DomainOutcome) -> LockMutationResult {
+fn replayed(outcome: DomainOutcome, locks: Vec<FencedLock>) -> LockMutationResult {
     LockMutationResult {
         outcome,
-        locks: Vec::new(),
+        locks,
         rejection: None,
         replayed: true,
     }
@@ -1523,6 +1646,113 @@ fn validate_lock_target(
             "lock receipt tenant scope does not match the target repository/branch".to_owned(),
         ));
     }
+    Ok(())
+}
+
+fn validate_operation_binding(
+    operation: &GovernedOperation,
+    expected: &OperationBinding,
+    principal: &VerifiedLockOwner,
+) -> Result<(), DomainError> {
+    if operation.key.verified_issuer != principal.verified_issuer
+        || operation.key.authenticated_subject != principal.authenticated_subject
+    {
+        return Err(DomainError::InvalidInput(
+            "lock receipt principal does not match the acting verified owner".to_owned(),
+        ));
+    }
+    if operation.binding.method != expected.method
+        || operation.binding.scope != expected.scope
+        || operation.binding.fingerprint_version != expected.fingerprint_version
+        || operation.binding.fingerprint != expected.fingerprint
+        || operation.binding.canonical_intent_digest != expected.canonical_intent_digest
+    {
+        return Err(DomainError::InvalidInput(
+            "lock receipt binding does not match the typed lock intent".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lock_binding(
+    method: &str,
+    repository_id: &[u8],
+    branch_id: &[u8],
+    target_owner: &VerifiedLockOwner,
+    acting_owner: Option<&VerifiedLockOwner>,
+    resources: &[LockResourceInput],
+    lease_duration: Option<Duration>,
+    force: bool,
+) -> Result<OperationBinding, DomainError> {
+    validate_id("repository_id", repository_id)?;
+    validate_id("branch_id", branch_id)?;
+    validate_owner(target_owner)?;
+    if let Some(actor) = acting_owner {
+        validate_owner(actor)?;
+    }
+    let scope = lock_tenant_scope_key(repository_id, branch_id)?;
+    let mut body = Vec::new();
+    append_framed(&mut body, method.as_bytes())?;
+    append_framed(&mut body, &scope)?;
+    append_framed(&mut body, target_owner.verified_issuer.as_bytes())?;
+    append_framed(&mut body, target_owner.authenticated_subject.as_bytes())?;
+    match acting_owner {
+        Some(actor) => {
+            body.push(1);
+            append_framed(&mut body, actor.verified_issuer.as_bytes())?;
+            append_framed(&mut body, actor.authenticated_subject.as_bytes())?;
+        }
+        None => body.push(0),
+    }
+    body.push(u8::from(force));
+    body.extend_from_slice(
+        &lease_duration
+            .map(|duration| u64::try_from(duration.as_millis()))
+            .transpose()
+            .map_err(|_| DomainError::InvalidInput("lease milliseconds exceed u64".to_owned()))?
+            .unwrap_or(0)
+            .to_be_bytes(),
+    );
+    body.extend_from_slice(
+        &u32::try_from(resources.len())
+            .map_err(|_| DomainError::InvalidInput("too many lock resources".to_owned()))?
+            .to_be_bytes(),
+    );
+    for resource in resources {
+        append_framed(&mut body, &resource.resource_hash)?;
+        append_framed(&mut body, resource.description.as_bytes())?;
+        match resource.expected_ownership_token {
+            Some(token) => {
+                body.push(1);
+                body.extend_from_slice(&token);
+            }
+            None => body.push(0),
+        }
+    }
+    let fingerprint = blake3::hash(&[b"lock-fingerprint-v1\0".as_slice(), &body].concat())
+        .as_bytes()
+        .to_vec();
+    let canonical_intent_digest =
+        blake3::hash(&[b"lock-canonical-intent-v1\0".as_slice(), &body].concat())
+            .as_bytes()
+            .to_vec();
+    Ok(OperationBinding {
+        method: method.to_owned(),
+        scope,
+        fingerprint_version: 1,
+        fingerprint,
+        canonical_intent_digest,
+    })
+}
+
+fn append_framed(target: &mut Vec<u8>, value: &[u8]) -> Result<(), DomainError> {
+    target.extend_from_slice(
+        &u32::try_from(value.len())
+            .map_err(|_| DomainError::InvalidInput("lock binding field exceeds u32".to_owned()))?
+            .to_be_bytes(),
+    );
+    target.extend_from_slice(value);
     Ok(())
 }
 
@@ -1592,22 +1822,199 @@ fn sorted_resources(
     Ok(ordered)
 }
 
+fn sorted_resources_allow_empty(
+    resources: &[LockResourceInput],
+) -> Result<Vec<LockResourceInput>, DomainError> {
+    if resources.is_empty() {
+        Ok(Vec::new())
+    } else {
+        sorted_resources(resources)
+    }
+}
+
 fn token_matches(stored: &[u8], expected: &[u8; 32]) -> bool {
     stored.len() == 32 && bool::from(stored.ct_eq(expected.as_slice()))
 }
 
-fn canonical_result(locks: &[FencedLock]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(16 + locks.len() * 112);
+fn canonical_result(locks: &[FencedLock]) -> Result<Vec<u8>, DomainError> {
+    let mut bytes = Vec::with_capacity(16 + locks.len() * 192);
     bytes.extend_from_slice(b"lock-result-v1\0");
     bytes.extend_from_slice(&(locks.len() as u32).to_be_bytes());
     for lock in locks {
+        append_result_field(&mut bytes, &lock.branch_id);
         bytes.extend_from_slice(&lock.resource_hash);
+        append_result_field(&mut bytes, lock.description.as_bytes());
+        append_result_field(&mut bytes, lock.owner.verified_issuer.as_bytes());
+        append_result_field(&mut bytes, lock.owner.authenticated_subject.as_bytes());
         bytes.extend_from_slice(&lock.ownership_token);
         bytes.extend_from_slice(&lock.fence.to_be_bytes());
         bytes.extend_from_slice(&lock.repository_lock_generation.to_be_bytes());
         bytes.extend_from_slice(&lock.branch_lock_generation.to_be_bytes());
+        append_system_time(&mut bytes, lock.acquired_at)?;
+        match lock.expires_at {
+            Some(expires_at) => {
+                bytes.push(1);
+                append_system_time(&mut bytes, expires_at)?;
+            }
+            None => bytes.push(0),
+        }
     }
-    bytes
+    Ok(bytes)
+}
+
+fn append_result_field(target: &mut Vec<u8>, value: &[u8]) {
+    target.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    target.extend_from_slice(value);
+}
+
+fn append_system_time(target: &mut Vec<u8>, value: SystemTime) -> Result<(), DomainError> {
+    let duration = value
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| DomainError::Internal("database lock timestamp predates epoch".to_owned()))?;
+    target.extend_from_slice(&duration.as_secs().to_be_bytes());
+    target.extend_from_slice(&duration.subsec_nanos().to_be_bytes());
+    Ok(())
+}
+
+fn decode_canonical_result(bytes: &[u8]) -> Result<Vec<FencedLock>, DomainError> {
+    let mut reader = ResultReader::new(bytes);
+    reader.expect_bytes(b"lock-result-v1\0")?;
+    let count = usize::try_from(reader.u32()?)
+        .map_err(|_| DomainError::Internal("stored lock result count exceeds usize".to_owned()))?;
+    if count > MAX_BATCH_RESOURCES {
+        return Err(DomainError::Internal(format!(
+            "stored lock result count {count} exceeds {MAX_BATCH_RESOURCES}"
+        )));
+    }
+    let mut locks = Vec::with_capacity(count);
+    for _ in 0..count {
+        let branch_id = reader.field(16)?;
+        let resource_hash = reader.exact(RESOURCE_HASH_BYTES)?.to_vec();
+        let description = reader.string(MAX_DESCRIPTION_BYTES)?;
+        let verified_issuer = reader.string(MAX_IDENTITY_BYTES)?;
+        let authenticated_subject = reader.string(MAX_IDENTITY_BYTES)?;
+        let ownership_token = reader
+            .exact(32)?
+            .try_into()
+            .map_err(|_| DomainError::Internal("stored lock token width changed".to_owned()))?;
+        let fence = reader.i64()?;
+        let repository_lock_generation = reader.i64()?;
+        let branch_lock_generation = reader.i64()?;
+        let acquired_at = reader.system_time()?;
+        let expires_at = match reader.byte()? {
+            0 => None,
+            1 => Some(reader.system_time()?),
+            value => {
+                return Err(DomainError::Internal(format!(
+                    "stored lock expiry presence is {value}, expected 0 or 1"
+                )));
+            }
+        };
+        locks.push(FencedLock {
+            branch_id,
+            resource_hash,
+            description,
+            owner: VerifiedLockOwner {
+                verified_issuer,
+                authenticated_subject,
+            },
+            ownership_token,
+            fence,
+            repository_lock_generation,
+            branch_lock_generation,
+            acquired_at,
+            expires_at,
+        });
+    }
+    if !reader.is_empty() {
+        return Err(DomainError::Internal(
+            "stored lock result has trailing bytes".to_owned(),
+        ));
+    }
+    Ok(locks)
+}
+
+struct ResultReader<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> ResultReader<'a> {
+    fn new(remaining: &'a [u8]) -> Self {
+        Self { remaining }
+    }
+
+    fn exact(&mut self, len: usize) -> Result<&'a [u8], DomainError> {
+        if self.remaining.len() < len {
+            return Err(DomainError::Internal(
+                "stored lock result is truncated".to_owned(),
+            ));
+        }
+        let (value, remaining) = self.remaining.split_at(len);
+        self.remaining = remaining;
+        Ok(value)
+    }
+
+    fn expect_bytes(&mut self, expected: &[u8]) -> Result<(), DomainError> {
+        if self.exact(expected.len())? != expected {
+            return Err(DomainError::Internal(
+                "stored lock result has an unsupported version".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn byte(&mut self) -> Result<u8, DomainError> {
+        Ok(self.exact(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, DomainError> {
+        Ok(u32::from_be_bytes(self.exact(4)?.try_into().map_err(
+            |_| DomainError::Internal("stored lock u32 is truncated".to_owned()),
+        )?))
+    }
+
+    fn i64(&mut self) -> Result<i64, DomainError> {
+        Ok(i64::from_be_bytes(self.exact(8)?.try_into().map_err(
+            |_| DomainError::Internal("stored lock i64 is truncated".to_owned()),
+        )?))
+    }
+
+    fn system_time(&mut self) -> Result<SystemTime, DomainError> {
+        let secs = u64::from_be_bytes(self.exact(8)?.try_into().map_err(|_| {
+            DomainError::Internal("stored lock timestamp seconds are truncated".to_owned())
+        })?);
+        let nanos = u32::from_be_bytes(self.exact(4)?.try_into().map_err(|_| {
+            DomainError::Internal("stored lock timestamp nanos are truncated".to_owned())
+        })?);
+        if nanos >= 1_000_000_000 {
+            return Err(DomainError::Internal(
+                "stored lock timestamp nanos are out of range".to_owned(),
+            ));
+        }
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::new(secs, nanos))
+            .ok_or_else(|| DomainError::Internal("stored lock timestamp overflows".to_owned()))
+    }
+
+    fn field(&mut self, max: usize) -> Result<Vec<u8>, DomainError> {
+        let len = usize::try_from(self.u32()?)
+            .map_err(|_| DomainError::Internal("stored lock field exceeds usize".to_owned()))?;
+        if len > max {
+            return Err(DomainError::Internal(format!(
+                "stored lock field length {len} exceeds {max}"
+            )));
+        }
+        Ok(self.exact(len)?.to_vec())
+    }
+
+    fn string(&mut self, max: usize) -> Result<String, DomainError> {
+        String::from_utf8(self.field(max)?)
+            .map_err(|_| DomainError::Internal("stored lock string is not UTF-8".to_owned()))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining.is_empty()
+    }
 }
 
 fn witness_from_row(row: &tokio_postgres::Row) -> PushLockWitness {

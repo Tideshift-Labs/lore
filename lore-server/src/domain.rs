@@ -483,16 +483,18 @@ fn resolve_lock_fencing(readiness: &LockFencingReadiness, settings: &Settings) -
         || !readiness.same_database
         || !readiness.sequence_headroom
         || readiness.quarantined_rows != 0
+        || readiness.unfenced_rows != 0
     {
         return Err(anyhow!(
             "Lock fencing is enabled without complete SCHEMA-117 evidence \
              (schema_version={}, backfill_state={}, same_database={}, sequence_headroom={}, \
-              quarantined_rows={})",
+              quarantined_rows={}, unfenced_rows={})",
             readiness.schema_version,
             readiness.backfill_state,
             readiness.same_database,
             readiness.sequence_headroom,
-            readiness.quarantined_rows
+            readiness.quarantined_rows,
+            readiness.unfenced_rows
         ));
     }
     if readiness.lease_enabled {
@@ -1171,6 +1173,7 @@ mod tests {
             same_database: true,
             sequence_headroom: true,
             quarantined_rows: 0,
+            unfenced_rows: 0,
         }
     }
 

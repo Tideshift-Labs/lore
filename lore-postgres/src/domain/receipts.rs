@@ -246,7 +246,7 @@ async fn lock_receipt_row(
         .query_opt(
             "SELECT state, consume_token, outcome, not_applied_reason_version, \
                     not_applied_reason, method, scope, fingerprint_version, fingerprint, \
-                    canonical_intent_digest, \
+                    canonical_intent_digest, public_result, \
                     prepared_at, hard_expires_at, committed_at, full_result_expires_at, \
                     compact_expires_at, compacted \
              FROM lore_domain_operation_receipts \
@@ -274,6 +274,7 @@ async fn lock_receipt_row(
         fingerprint_version: r.get("fingerprint_version"),
         fingerprint: r.get("fingerprint"),
         canonical_intent_digest: r.get("canonical_intent_digest"),
+        public_result: r.get("public_result"),
         prepared_at: r.get("prepared_at"),
         hard_expires_at: r.get("hard_expires_at"),
         committed_at: r.get("committed_at"),
@@ -292,6 +293,7 @@ struct ReceiptRow {
     fingerprint_version: i32,
     fingerprint: Vec<u8>,
     canonical_intent_digest: Vec<u8>,
+    public_result: Option<Vec<u8>>,
     prepared_at: SystemTime,
     hard_expires_at: SystemTime,
     committed_at: Option<SystemTime>,
@@ -453,7 +455,12 @@ pub enum ConsumeResult {
     Admitted(ConsumedAdmission),
     /// The operation already has a durable decisive outcome. This includes a
     /// PREPARED row terminalized by the hard-TTL check in this transaction.
-    Committed(DomainOutcome),
+    Committed {
+        /// Durable terminal outcome.
+        outcome: DomainOutcome,
+        /// Retained opaque method result, when the operation stored one.
+        public_result: Option<Vec<u8>>,
+    },
     /// Missing, mismatched, or invalid-token admission. Nothing was mutated.
     Rejected,
 }
@@ -906,7 +913,10 @@ pub async fn consume(
         return Ok(ConsumeResult::Rejected);
     }
     if row.state == schema::RECEIPT_STATE_COMMITTED {
-        return Ok(ConsumeResult::Committed(row.committed_outcome()?));
+        return Ok(ConsumeResult::Committed {
+            outcome: row.committed_outcome()?,
+            public_result: row.public_result,
+        });
     }
     if row.state != schema::RECEIPT_STATE_PREPARED {
         return Ok(ConsumeResult::Rejected);
@@ -919,9 +929,10 @@ pub async fn consume(
     }
     if clock >= row.hard_expires_at {
         // Expiry performs the same terminal transition with no domain effect.
-        return Ok(ConsumeResult::Committed(
-            expire_prepared(tx, key, clock).await?,
-        ));
+        return Ok(ConsumeResult::Committed {
+            outcome: expire_prepared(tx, key, clock).await?,
+            public_result: None,
+        });
     }
     Ok(ConsumeResult::Admitted(ConsumedAdmission {
         key: key.clone(),

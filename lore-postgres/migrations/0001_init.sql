@@ -371,7 +371,7 @@ BEGIN
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'lore_domain_repository_lock_generation_after') THEN
         CREATE TRIGGER lore_domain_repository_lock_generation_after
-        AFTER UPDATE OF lock_generation ON lore_domain_repositories
+        AFTER UPDATE ON lore_domain_repositories
         FOR EACH ROW EXECUTE FUNCTION lore_domain_repository_lock_generation_after_update();
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'lore_domain_branch_lock_namespace_insert') THEN
@@ -386,7 +386,7 @@ BEGIN
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'lore_domain_branch_lock_generation_after') THEN
         CREATE TRIGGER lore_domain_branch_lock_generation_after
-        AFTER UPDATE OF lock_generation ON lore_domain_branches
+        AFTER UPDATE ON lore_domain_branches
         FOR EACH ROW EXECUTE FUNCTION lore_domain_branch_lock_generation_after_update();
     END IF;
 END

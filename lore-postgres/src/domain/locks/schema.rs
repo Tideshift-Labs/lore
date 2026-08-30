@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Tideshift Labs
+// Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Migration-owned schema for CR-030's fenced Postgres lock authority.
 //!
@@ -237,7 +237,7 @@ BEGIN
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'lore_domain_repository_lock_generation_after') THEN
         CREATE TRIGGER lore_domain_repository_lock_generation_after
-        AFTER UPDATE OF lock_generation ON lore_domain_repositories
+        AFTER UPDATE ON lore_domain_repositories
         FOR EACH ROW EXECUTE FUNCTION lore_domain_repository_lock_generation_after_update();
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'lore_domain_branch_lock_namespace_insert') THEN
@@ -252,7 +252,7 @@ BEGIN
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'lore_domain_branch_lock_generation_after') THEN
         CREATE TRIGGER lore_domain_branch_lock_generation_after
-        AFTER UPDATE OF lock_generation ON lore_domain_branches
+        AFTER UPDATE ON lore_domain_branches
         FOR EACH ROW EXECUTE FUNCTION lore_domain_branch_lock_generation_after_update();
     END IF;
 END

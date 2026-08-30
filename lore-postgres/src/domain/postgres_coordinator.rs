@@ -149,7 +149,7 @@ impl PostgresDomainStore {
         .await?;
         match admitted {
             ConsumeResult::Admitted(a) => Ok(BeginAdmitted::Admitted(tx, a.admission_clock)),
-            ConsumeResult::Committed(outcome) => {
+            ConsumeResult::Committed { outcome, .. } => {
                 classify_commit(tx.commit().await, "domain admission replay commit")?;
                 Ok(BeginAdmitted::Committed(outcome))
             }

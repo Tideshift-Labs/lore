@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Tideshift Labs
+// Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! CR-030 server-only lock ownership, leases, fencing, and push witnesses.
 //!
@@ -24,4 +24,7 @@ pub use coordinator::PostgresLockCoordinator;
 pub use coordinator::PushLockWitness;
 pub use coordinator::ReleaseInput;
 pub use coordinator::VerifiedLockOwner;
+pub use coordinator::acquire_or_renew_binding;
+pub use coordinator::force_release_binding;
 pub use coordinator::lock_tenant_scope_key;
+pub use coordinator::release_binding;
