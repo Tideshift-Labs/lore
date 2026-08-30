@@ -31,7 +31,9 @@
 //! `domain/locks/` is the separately owned lock-fencing package (CR-030),
 //! nested here only so it can reuse this coordinator's pool, receipt rail, and
 //! lock order. WP-116 owns only the transaction-local call site into it from
-//! the final-push coordinator. `domain/outbox/` is the CR-032 base only,
+//! the final-push coordinator. `domain/fragments/` is the equivalent carve-out
+//! for CR-031's fragment lifecycle coordinator (WP-118), yielded for the
+//! serialized `SCHEMA-118` window. `domain/outbox/` is the CR-032 base only,
 //! and transfers to the relay package at `SCHEMA-119`.
 //!
 //! # What is here as of Phase 2
@@ -44,6 +46,7 @@ pub mod backfill;
 pub mod bypass;
 pub mod coordinator;
 pub mod errors;
+pub mod fragments;
 pub mod lock_order;
 pub mod locks;
 pub mod maintenance;

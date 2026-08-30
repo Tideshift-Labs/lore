@@ -47,6 +47,20 @@ lore-revision = { workspace = true }
 lore-storage = { workspace = true }
 lore-telemetry = { workspace = true }
 
+[features]
+# CR-031: whether this build can DECODE an Oodle2-compressed payload.
+#
+# The lifecycle coordinator has to tell "these bytes are damaged" from "these
+# bytes are fine and this binary has no codec for them" — the first is
+# repairable in band, the second needs a differently-built binary, and reporting
+# the second as corruption sends an operator hunting for damage that is not
+# there. That distinction is a build property, so it forwards to the crate that
+# actually owns the codec rather than being declared locally.
+#
+# The chain is lore-storage/oodle -> lore-revision -> lore-server, and building
+# it needs OODLE_LIB_DIR. Off by default, matching every other crate here.
+oodle = ["lore-storage/oodle"]
+
 [dev-dependencies]
 serial_test = { workspace = true }
 tokio-util = { workspace = true }
