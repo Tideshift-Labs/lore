@@ -799,14 +799,13 @@ mod tests {
 
     use lore_postgres::domain::schema::BACKFILL_CUTOVER;
     use lore_postgres::domain::schema::BACKFILL_NOT_STARTED;
-    use crate::auth::jwk::JWKServiceSettings;
-    use crate::settings::AuthSettings;
     use tonic::Code;
     use tonic::metadata::BinaryMetadataValue;
     use uuid::Uuid;
 
     use super::test_support::context;
     use super::*;
+    use crate::auth::jwk::JWKServiceSettings;
     use crate::grpc::domain_operation_metadata::FINGERPRINT_KEY;
     use crate::grpc::domain_operation_metadata::FINGERPRINT_V1_LEN;
     use crate::grpc::domain_operation_metadata::FINGERPRINT_VERSION_V1;
@@ -814,6 +813,7 @@ mod tests {
     use crate::grpc::domain_operation_metadata::PREPARE_TOKEN_KEY;
     use crate::grpc::domain_operation_metadata::PREPARE_TOKEN_LEN;
     use crate::grpc::domain_operation_metadata::SCOPE_PRINCIPAL_NAMESPACE_V1;
+    use crate::settings::AuthSettings;
 
     // --- shared helpers ------------------------------------------------
 

@@ -229,6 +229,12 @@ pub struct BranchPushCommitInput {
     pub expected_repository_generation: i64,
     /// Branch generation the preflight observed.
     pub expected_branch_generation: i64,
+    /// Repository lock generation captured by SCHEMA-117 preflight.
+    pub expected_repository_lock_generation: i64,
+    /// Branch lock generation captured by SCHEMA-117 preflight.
+    pub expected_branch_lock_generation: i64,
+    /// Namespace fence captured by SCHEMA-117 preflight.
+    pub expected_branch_lock_namespace_last_applied_fence: i64,
     /// Tip the caller believes is current.
     pub expected_latest_hash: Vec<u8>,
     /// Tip to publish.

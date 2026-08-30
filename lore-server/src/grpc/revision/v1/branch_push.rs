@@ -28,7 +28,6 @@ use tracing::span;
 use crate::domain::DomainContext;
 use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
-use crate::domain::reject_unwired_governed_operation;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
@@ -37,7 +36,8 @@ use crate::grpc::get_user_id;
 use crate::grpc::handlers::branch_push::PushResult;
 use crate::grpc::handlers::branch_push::dispatch_response_message;
 use crate::grpc::handlers::branch_push::extract_client_ip;
-use crate::grpc::handlers::branch_push::push;
+use crate::grpc::handlers::branch_push::prepare_governed_push;
+use crate::grpc::handlers::branch_push::push_with_governance;
 use crate::grpc::hook_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -86,23 +86,29 @@ pub async fn handler(
     let client_ip: Option<String> = extract_client_ip(&request).map(|ip| ip.to_string());
     let req = request.into_inner();
 
-    if let Some(admitted) = admit_at_entry(
+    let admitted = admit_at_entry(
         domain_context,
         &request_metadata,
         request_authorization.as_ref(),
         GovernedScope::TargetRepository {
             repository_id: repository_id.data(),
         },
-    )? {
-        return Err(reject_unwired_governed_operation(
-            &admitted,
-            "lore.revision.v1.RevisionService/BranchPush",
-        ));
-    }
+    )?;
     let branch_id = BranchId::from(req.id);
     let revision = Hash::from(req.revision_signature);
     let force = req.force;
     let fast_forward_merge = req.fast_forward_merge;
+
+    let governed_push = prepare_governed_push(
+        domain_context,
+        admitted,
+        repository_id,
+        branch_id,
+        revision,
+        force,
+        fast_forward_merge,
+    )
+    .await?;
 
     if revision.is_zero() {
         info!("Invalid branch push request, revision_signature is zero");
@@ -150,6 +156,12 @@ pub async fn handler(
 
             ensure_branch_pushable(repository.clone(), branch_id).await?;
 
+            if let Some(governed) = governed_push.as_ref() {
+                governed
+                    .enforce_fenced_locks(repository.clone(), branch_id, revision)
+                    .await?;
+            }
+
             // Opt-in advisory-lock enforcement (CR-019); `Some` only when the
             // feature is on AND a lock store exists. See the shared handler.
             if let Some(lock_store) = lock_enforcement {
@@ -169,7 +181,7 @@ pub async fn handler(
                 fast_forward_merged,
                 revision: resulting_revision,
                 revision_number,
-            } = push(
+            } = push_with_governance(
                 repository.clone(),
                 branch_id,
                 revision,
@@ -178,6 +190,7 @@ pub async fn handler(
                 fast_forward_merge,
                 history_step_size,
                 acceleration,
+                governed_push.as_ref(),
             )
             .await?;
 

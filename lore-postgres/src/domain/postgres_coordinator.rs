@@ -856,6 +856,31 @@ impl DomainTransactionStore for PostgresDomainStore {
             return Ok(result);
         }
 
+        crate::domain::locks::PostgresLockCoordinator::revalidate_push_witness(
+            &tx,
+            &mut sequence,
+            &input.repository_id,
+            &input.branch_id,
+            &crate::domain::locks::PushLockWitness {
+                repository_lock_generation: input.expected_repository_lock_generation,
+                branch_lock_generation: input.expected_branch_lock_generation,
+                branch_lock_namespace_last_applied_fence: input
+                    .expected_branch_lock_namespace_last_applied_fence,
+            },
+        )
+        .await?;
+
+        if branch.latest_hash == input.new_latest_hash {
+            let outcome = DomainOutcome::Applied;
+            receipts::commit_terminal(&tx, &operation.key, &outcome, None, clock).await?;
+            classify_commit(tx.commit().await, "push current-head no-op commit")?;
+            return Ok(MutationResult {
+                outcome,
+                repository_generation: Some(repository.generation),
+                branch_generation: Some(branch.generation),
+            });
+        }
+
         let branch_generation = next_generation(branch.generation)?;
         tx.execute(
             "UPDATE lore_domain_branches \

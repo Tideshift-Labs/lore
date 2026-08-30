@@ -8,6 +8,11 @@ use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Hash;
+use lore_postgres::domain::coordinator::BranchPushCommitInput;
+use lore_postgres::domain::coordinator::ProjectionWrite;
+use lore_postgres::domain::errors::DomainOutcome;
+use lore_postgres::domain::locks::PushLockWitness;
+use lore_postgres::domain::locks::VerifiedLockOwner;
 use lore_proto::BranchPushRequest;
 use lore_proto::BranchPushResponse;
 use lore_revision::branch;
@@ -17,6 +22,9 @@ use lore_revision::branch::PROTECT;
 use lore_revision::branch::load_latest;
 use lore_revision::branch::metadata;
 use lore_revision::branch::push;
+use lore_revision::change::NodeChange;
+use lore_revision::diff::diff_revision_paths;
+use lore_revision::lock::util::assemble_resource_for_path;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::notification::NotificationSender;
@@ -24,6 +32,7 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
 use lore_revision::state::State;
+use lore_revision::util::collect_stream::collect_stream_with_summary;
 use lore_storage::StoreError;
 use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
@@ -42,6 +51,7 @@ use tracing::span;
 use tracing::warn;
 
 use crate::cache;
+use crate::domain::AdmittedOperation;
 use crate::domain::DomainContext;
 use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
@@ -111,23 +121,29 @@ pub async fn handler(
     let client_ip: Option<String> = extract_client_ip(&request).map(|ip_addr| ip_addr.to_string());
     let req = request.into_inner();
 
-    if let Some(admitted) = admit_at_entry(
+    let admitted = admit_at_entry(
         domain_context,
         &request_metadata,
         request_authorization.as_ref(),
         GovernedScope::TargetRepository {
             repository_id: repository.data(),
         },
-    )? {
-        return Err(reject_unwired_governed_operation(
-            &admitted,
-            "lore.RevisionService/BranchPush",
-        ));
-    }
+    )?;
     let branch = BranchId::from(req.branch);
     let revision = Hash::from(req.revision);
     let force = req.force;
     let fast_forward_merge = req.fast_forward_merge;
+
+    let governed_push = prepare_governed_push(
+        domain_context,
+        admitted,
+        repository,
+        branch,
+        revision,
+        force,
+        fast_forward_merge,
+    )
+    .await?;
 
     if revision.is_zero() {
         warn!("Invalid branch push request, revision is zero");
@@ -168,6 +184,12 @@ pub async fn handler(
                 .dispatch_pre(HookPoint::BranchPush, &hook_ctx)
                 .map_err(hook_error_to_status)?;
 
+            if let Some(governed) = governed_push.as_ref() {
+                governed
+                    .enforce_fenced_locks(repository.clone(), branch, revision)
+                    .await?;
+            }
+
             // Opt-in advisory-lock enforcement (CR-019): reject if a changed
             // path is locked by another user on this branch. `Some` only when
             // the `enforce_locks_on_push` feature is on AND a lock store exists;
@@ -189,7 +211,7 @@ pub async fn handler(
                 fast_forward_merged,
                 revision,
                 revision_number,
-            } = push(
+            } = push_with_governance(
                 repository.clone(),
                 branch,
                 revision,
@@ -198,6 +220,7 @@ pub async fn handler(
                 fast_forward_merge,
                 history_step_size,
                 acceleration,
+                governed_push.as_ref(),
             )
             .await?;
 
@@ -320,6 +343,216 @@ pub struct PushResult {
     pub revision_number: u64,
 }
 
+/// Preflight state consumed exactly once at the final publication boundary.
+pub(crate) struct GovernedPushCommit {
+    domain: Arc<DomainContext>,
+    operation: lore_postgres::domain::coordinator::GovernedOperation,
+    repository_generation: i64,
+    branch_generation: i64,
+    expected_latest_hash: Vec<u8>,
+    lock_witness: PushLockWitness,
+    owner: VerifiedLockOwner,
+}
+
+/// Capture SCHEMA-117's witness independently of CR-019 and prepare the
+/// governed final-push call when operation identity is present.
+pub(crate) async fn prepare_governed_push(
+    domain: Option<&Arc<DomainContext>>,
+    admitted: Option<AdmittedOperation>,
+    repository_id: RepositoryId,
+    branch_id: BranchId,
+    requested_revision: Hash,
+    force: bool,
+    fast_forward_merge: bool,
+) -> Result<Option<GovernedPushCommit>, Status> {
+    let Some(domain) = domain else {
+        if let Some(admitted) = admitted.as_ref() {
+            return Err(reject_unwired_governed_operation(
+                admitted,
+                "branch_push_commit",
+            ));
+        }
+        return Ok(None);
+    };
+    let Some(lock_coordinator) = domain.lock_coordinator() else {
+        if let Some(admitted) = admitted.as_ref() {
+            return Err(reject_unwired_governed_operation(
+                admitted,
+                "branch_push_commit",
+            ));
+        }
+        return Ok(None);
+    };
+
+    // This read is unconditional whenever fenced routing is present. It is
+    // deliberately before either CR-019's feature gate or its no-change early
+    // return, as required by F-030-2's amendment.
+    let lock_witness = lock_coordinator
+        .capture_push_witness(repository_id.as_ref(), branch_id.as_ref())
+        .await
+        .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?;
+    let Some(admitted) = admitted else {
+        return Ok(None);
+    };
+
+    let repository = domain
+        .store()
+        .repository_snapshot(repository_id.as_ref())
+        .await
+        .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?
+        .filter(|snapshot| snapshot.live)
+        .ok_or_else(|| Status::not_found("Repository not found"))?;
+    let branch = domain
+        .store()
+        .branch_snapshot(repository_id.as_ref(), branch_id.as_ref())
+        .await
+        .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?
+        .filter(|snapshot| snapshot.live)
+        .ok_or_else(|| Status::not_found("Branch not found"))?;
+
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"lore-branch-push-intent-v1\0");
+    for value in [
+        repository_id.as_ref(),
+        branch_id.as_ref(),
+        requested_revision.as_ref(),
+    ] {
+        digest.update(&(value.len() as u32).to_be_bytes());
+        digest.update(value);
+    }
+    digest.update(&[u8::from(force), u8::from(fast_forward_merge)]);
+
+    let owner = VerifiedLockOwner {
+        verified_issuer: admitted.key.verified_issuer.clone(),
+        authenticated_subject: admitted.key.authenticated_subject.clone(),
+    };
+    Ok(Some(GovernedPushCommit {
+        domain: domain.clone(),
+        operation: admitted
+            .into_governed("branch_push_commit", digest.finalize().as_bytes().to_vec()),
+        repository_generation: repository.generation,
+        branch_generation: branch.generation,
+        expected_latest_hash: branch.latest_hash,
+        lock_witness,
+        owner,
+    }))
+}
+
+impl GovernedPushCommit {
+    pub(crate) async fn enforce_fenced_locks(
+        &self,
+        repository: Arc<RepositoryContext>,
+        branch: BranchId,
+        new_revision: Hash,
+    ) -> Result<(), Status> {
+        let coordinator = self.domain.lock_coordinator().ok_or_else(|| {
+            Status::failed_precondition("Fenced lock coordinator became unavailable")
+        })?;
+        let foreign_locks = coordinator
+            .query(repository.id.as_ref(), Some(branch.as_ref()), None)
+            .await
+            .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?
+            .into_iter()
+            .filter(|lock| lock.owner != self.owner)
+            .collect::<Vec<_>>();
+        if foreign_locks.is_empty() {
+            return Ok(());
+        }
+
+        let prior_tip = load_latest(repository.clone(), branch)
+            .await
+            .map_err(|error| Status::internal(format!("failed to load branch tip: {error}")))?;
+        let source = State::deserialize(repository.clone(), prior_tip)
+            .await
+            .map_err(|error| Status::internal(format!("failed to read branch tip: {error}")))?;
+        let target = State::deserialize(repository.clone(), new_revision)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("failed to read pushed revision: {error}"))
+            })?;
+        let (_, changes): (_, Vec<NodeChange>) = collect_stream_with_summary(|tx| {
+            diff_revision_paths(repository.clone(), source, target, None, tx)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("failed to diff pushed revision: {error}")))?;
+
+        for change in changes {
+            let mut paths = vec![change.path.as_str()];
+            if let Some(from_path) = change.from_path.as_ref()
+                && from_path.as_str() != change.path.as_str()
+            {
+                paths.push(from_path.as_str());
+            }
+            for path in paths {
+                let resource_hash = assemble_resource_for_path(path, branch).hash;
+                if let Some(lock) = foreign_locks
+                    .iter()
+                    .find(|lock| lock.resource_hash.as_slice() == resource_hash.as_ref())
+                {
+                    return Err(Status::permission_denied(format!(
+                        "push blocked: '{path}' is locked by another verified owner ({})",
+                        lock.owner.authenticated_subject
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn publish(
+        &self,
+        repository: &RepositoryContext,
+        branch: BranchId,
+        current_head: Hash,
+        new_head: Hash,
+    ) -> Result<Hash, Status> {
+        if self.expected_latest_hash.as_slice() != current_head.as_ref() {
+            return Err(Status::aborted("Branch preflight changed; rerun preflight"));
+        }
+        let (key, key_type) = branch::mutable_key(repository.salt(), LATEST, repository.id, branch);
+        let input = BranchPushCommitInput {
+            repository_id: repository.id.as_ref().to_vec(),
+            branch_id: branch.as_ref().to_vec(),
+            expected_repository_generation: self.repository_generation,
+            expected_branch_generation: self.branch_generation,
+            expected_repository_lock_generation: self.lock_witness.repository_lock_generation,
+            expected_branch_lock_generation: self.lock_witness.branch_lock_generation,
+            expected_branch_lock_namespace_last_applied_fence: self
+                .lock_witness
+                .branch_lock_namespace_last_applied_fence,
+            expected_latest_hash: current_head.as_ref().to_vec(),
+            new_latest_hash: new_head.as_ref().to_vec(),
+            projection: vec![ProjectionWrite {
+                partition: repository.id.as_ref().to_vec(),
+                key_type: key_type as i16,
+                key: key.as_ref().to_vec(),
+                value: Some(new_head.as_ref().to_vec()),
+            }],
+            event: None,
+        };
+        let result = self
+            .domain
+            .store()
+            .branch_push_commit(&self.operation, &input)
+            .await
+            .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?;
+        match result.outcome {
+            DomainOutcome::Applied => Ok(new_head),
+            DomainOutcome::NotApplied { reason, .. } => match reason.as_str() {
+                lore_postgres::domain::coordinator::TOMBSTONED_V1
+                | lore_postgres::domain::coordinator::NOT_FOUND_V1 => {
+                    Err(Status::not_found("Branch not found"))
+                }
+                lore_postgres::domain::coordinator::GENERATION_MISMATCH_V1
+                | lore_postgres::domain::coordinator::CAS_MISMATCH_V1 => {
+                    Err(Status::aborted("Branch preflight changed; rerun preflight"))
+                }
+                _ => Err(Status::failed_precondition(reason)),
+            },
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all, fields(branch))]
 pub async fn push(
@@ -331,6 +564,32 @@ pub async fn push(
     fast_forward_merge: bool,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+) -> Result<PushResult, Status> {
+    push_with_governance(
+        repository,
+        branch,
+        latest,
+        bypass_protection,
+        force,
+        fast_forward_merge,
+        history_step_size,
+        acceleration,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn push_with_governance(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+    bypass_protection: bool,
+    force: bool,
+    fast_forward_merge: bool,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+    governed: Option<&GovernedPushCommit>,
 ) -> Result<PushResult, Status> {
     // Zero hash is never valid to push as latest pointer
     if latest.is_zero() {
@@ -384,6 +643,11 @@ pub async fn push(
 
     // If the incoming revision is already the latest revision the push is a no-op
     if current_head == latest {
+        if let Some(governed) = governed {
+            governed
+                .publish(repository.as_ref(), branch, current_head, current_head)
+                .await?;
+        }
         return Ok(PushResult {
             success: true,
             advanced: false,
@@ -422,6 +686,7 @@ pub async fn push(
                 current_head,
                 history_step_size,
                 acceleration,
+                governed,
             )
             .await;
         }
@@ -465,11 +730,18 @@ pub async fn push(
                 })?;
         }
 
-        let previous_head = try_store_latest(repository.clone(), branch, current_head, new_head)
-            .await
-            .warn_map_err(|err| {
-                Status::internal(format!("Failed to store new latest pointer: {err}"))
-            })?;
+        let previous_head = if let Some(governed) = governed {
+            governed
+                .publish(repository.as_ref(), branch, current_head, new_head)
+                .await?;
+            current_head
+        } else {
+            try_store_latest(repository.clone(), branch, current_head, new_head)
+                .await
+                .warn_map_err(|err| {
+                    Status::internal(format!("Failed to store new latest pointer: {err}"))
+                })?
+        };
 
         // Check if the compare-and-swap was successful by checking match with expected value
         if previous_head == current_head {
@@ -523,6 +795,7 @@ async fn try_fast_forward_merge(
     mut current_head: Hash,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    governed: Option<&GovernedPushCommit>,
 ) -> Result<PushResult, Status> {
     let incoming_revision = incoming_state.revision();
     let original_base = incoming_state.parent_self();
@@ -676,12 +949,18 @@ async fn try_fast_forward_merge(
             })?;
 
         // CAS: attempt to set the new revision as branch head
-        let previous_head =
+        let previous_head = if let Some(governed) = governed {
+            governed
+                .publish(repository.as_ref(), branch, current_head, new_revision)
+                .await?;
+            current_head
+        } else {
             try_store_latest(repository.clone(), branch, current_head, new_revision)
                 .await
                 .warn_map_err(|err| {
                     Status::internal(format!("Failed to store fast-forward merge latest: {err}"))
-                })?;
+                })?
+        };
 
         if previous_head == current_head {
             // CAS succeeded
