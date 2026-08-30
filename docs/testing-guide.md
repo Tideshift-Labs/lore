@@ -558,12 +558,27 @@ mismatch an earlier revision of this section argued against.** The reasoning
 error is worth more than the bug.
 
 `domain_migration_parity.rs`'s `migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs`
-failed at the plain baseline (`b5a0877`, no CR-031 present, reproduced in a
-clean detached worktree) over five SCHEMA-117 lock-trigger functions
+failed over five SCHEMA-117 lock-trigger functions
 (`lore_domain_repository_lock_generation_*`,
 `lore_domain_branch_lock_generation_*`,
 `lore_domain_branch_lock_namespace_after_insert`) that printed as identical
 text on both sides of its diff.
+
+**Second correction, same section: it was not pre-existing, and a worktree
+reproduction cannot show that it was.** `core.autocrlf=true` means a *checkout*
+produces CRLF for a path with no `eol=lf` rule — but the last writer of
+`0001_init.sql` had been an agent Write/Edit (LF), and Git normalises on
+comparison, so `git status` stayed clean and the gate stayed green. INV-EE's
+`run-lock-fencing-live.ps1` 29/29 at `b5a0877` was sound. WP-118's
+migration-mirror step then armed it, by appending with Python's
+`read_text`/`write_text` pair, which rewrites the whole file through
+`os.linesep` (verified: 0 CRs before, 4 after, on a three-line LF fixture).
+Running the case at `b5a0877` in a fresh `git worktree` then "reproduced" the
+failure — but `git worktree add` is a checkout, so it manufactured the very
+condition under test. **A reproduction at an older SHA proves nothing if
+reaching that SHA required a checkout and the checkout introduces the
+condition.** Never rewrite a whole file to append to it; open with `newline=""`
+or use an editor tool.
 
 The real cause: `.gitattributes` pinned `lore-object-dispatch/migrations/*.sql`
 to `eol=lf` but nothing for `lore-postgres/migrations/`, so `0001_init.sql`
