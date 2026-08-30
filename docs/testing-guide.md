@@ -551,29 +551,49 @@ set is empty. `lore-postgres/tests/domain_fragment_lifecycle.rs`'s
 `a_readable_to_unreadable_transition_bumps_every_live_associated_repository_atomically`
 is that case.
 
-### A catalog-parity test's "only in X" / "only in Y" printed blocks can be byte-identical — the diff format itself is then lying about what differs
+### Never hash two blocks of program output to rule out a whitespace difference — the pipeline you hashed through may have removed it
+
+**RESOLVED 2026-08-30 (Lore `6dfcd32`). The cause was exactly the line-ending
+mismatch an earlier revision of this section argued against.** The reasoning
+error is worth more than the bug.
 
 `domain_migration_parity.rs`'s `migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs`
-fails at the plain baseline (`b5a0877`, no CR-031 present, reproduced in a
+failed at the plain baseline (`b5a0877`, no CR-031 present, reproduced in a
 clean detached worktree) over five SCHEMA-117 lock-trigger functions
 (`lore_domain_repository_lock_generation_*`,
 `lore_domain_branch_lock_generation_*`,
-`lore_domain_branch_lock_namespace_after_insert`) that print as identical text
-on both sides of the diff — confirmed by MD5 over both printed blocks. **Do
-not conclude a text/whitespace mismatch (e.g. CRLF from a missing `eol=lf`
-`.gitattributes` rule) from a diff shaped like this without hashing both
-sides**; a first pass here mistook line-ending conversion of
-`migrations/0001_init.sql` (real on this Windows checkout, confirmed with
-`file`) for the cause, but MD5-identical blocks rule out a per-line text
-difference — the mismatch is in something the `.filter(|l| !other.contains(l))`
-set-difference can surface without the printed lines themselves differing
-(duplicate/count divergence, not content). Root cause not yet found as of
-this note; pre-existing, unrelated to CR-031/SCHEMA-118 (independently
-verified: applying `FRAGMENT_SCHEMA` and its migration block to separate
-databases and comparing every `lore_fragment_*` relation plus
-`lore_domain_repositories`'s two added columns showed zero differences). Owned
-by WP-116/WP-117, not fixed here. If you hit this test failing, do not chase
-it as a WP-118 regression.
+`lore_domain_branch_lock_namespace_after_insert`) that printed as identical
+text on both sides of its diff.
+
+The real cause: `.gitattributes` pinned `lore-object-dispatch/migrations/*.sql`
+to `eol=lf` but nothing for `lore-postgres/migrations/`, so `0001_init.sql`
+checked out CRLF while the Rust DDL string literals stayed LF. A migration's
+bytes reach PostgreSQL verbatim and PL/pgSQL bodies are stored as text, so
+every trigger installed from the file carried carriage returns the same DDL
+declared as a Rust const did not. **Only function and trigger bodies expose
+this** — tables, columns, constraints, and indexes are parsed and normalised by
+the server — which is why exactly the five trigger functions differed and every
+other object matched, and why a migration declaring no functions can be CRLF
+for years and look fine.
+
+**The trap.** An earlier pass took MD5 over both printed blocks, found them
+identical, and concluded a per-line text difference was ruled out — so it
+explicitly steered the next reader away from CRLF. But the hash was taken
+*downstream* of a pipeline (cargo's captured output, a redirect, `sed` line
+extraction under MSYS) that had already normalised the carriage returns away.
+Hashing proved the blocks were equal **after normalisation**, which says nothing
+about the values the test actually compared. A whitespace difference is the one
+class of difference that output-and-hash cannot see, so it is the one class you
+must never rule out that way.
+
+**What to do instead.** Ask the authority directly, in the value's own storage,
+with a query that cannot normalise: here,
+`SELECT proname, position(chr(13) in prosrc) FROM pg_proc WHERE ...` returned
+`1` for all five functions in one line. `file <path>` on the inputs is the
+cheap prior check, and a `text eol=lf` rule for every `migrations/*.sql` path is
+the fix. Generalised: when two things that should be byte-identical are reported
+different but print the same, compare them where they live, never where they
+were rendered.
 
 ### Poisoning a persisted `State`/`Tree` field for a fault-injection test
 
