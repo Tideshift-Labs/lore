@@ -101,12 +101,20 @@ enum DomainRawWire {
 struct DomainRawField {
     tag: u32,
     wire: DomainRawWire,
+    presence: DomainRawPresence,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DomainRawPresence {
+    Required,
+    MayBeImplicitlyAbsent,
 }
 
 const fn domain_ld(tag: u32, maximum: usize) -> DomainRawField {
     DomainRawField {
         tag,
         wire: DomainRawWire::LengthDelimited(maximum),
+        presence: DomainRawPresence::Required,
     }
 }
 
@@ -114,6 +122,23 @@ const fn domain_varint(tag: u32) -> DomainRawField {
     DomainRawField {
         tag,
         wire: DomainRawWire::Varint,
+        presence: DomainRawPresence::Required,
+    }
+}
+
+const fn domain_optional_ld(tag: u32, maximum: usize) -> DomainRawField {
+    DomainRawField {
+        tag,
+        wire: DomainRawWire::LengthDelimited(maximum),
+        presence: DomainRawPresence::MayBeImplicitlyAbsent,
+    }
+}
+
+const fn domain_implicit_varint(tag: u32) -> DomainRawField {
+    DomainRawField {
+        tag,
+        wire: DomainRawWire::Varint,
+        presence: DomainRawPresence::MayBeImplicitlyAbsent,
     }
 }
 
@@ -155,7 +180,6 @@ fn domain_read_varint(raw: &[u8], offset: &mut usize) -> Result<u64, tonic::Stat
 fn domain_validate_fields(
     raw: &[u8],
     rules: &[DomainRawField],
-    required: u64,
 ) -> Result<(u64, [u64; 64]), tonic::Status> {
     if raw.len() > 16 * 1024 {
         return Err(tonic::Status::invalid_argument(
@@ -217,6 +241,13 @@ fn domain_validate_fields(
             }
         }
     }
+    let required = rules.iter().fold(0_u64, |required, rule| {
+        if rule.presence == DomainRawPresence::Required {
+            required | (1_u64 << rule.tag)
+        } else {
+            required
+        }
+    });
     if seen & required != required {
         return Err(tonic::Status::invalid_argument(
             "protobuf request is missing required field presence",
@@ -255,11 +286,7 @@ pub fn validate_domain_operation_v2_raw(name: &str, raw: &[u8]) -> Result<(), to
                 domain_varint(10),
                 domain_ld(11, D),
             ];
-            domain_validate_fields(
-                raw,
-                &fields,
-                domain_field_mask(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
-            )?;
+            domain_validate_fields(raw, &fields)?;
         }
         "DomainOperationVerifiedStaleFinalizeRequest" => {
             let fields = [
@@ -270,25 +297,19 @@ pub fn validate_domain_operation_v2_raw(name: &str, raw: &[u8]) -> Result<(), to
                 domain_ld(5, U),
                 domain_ld(6, M),
                 domain_ld(7, S),
-                domain_varint(8),
+                domain_implicit_varint(8),
                 domain_ld(9, D),
                 domain_ld(10, D),
                 domain_ld(11, U),
-                domain_varint(12),
+                domain_implicit_varint(12),
                 domain_ld(13, D),
                 domain_ld(14, D),
                 domain_ld(15, D),
                 domain_ld(16, D),
                 domain_ld(17, D),
-                domain_varint(18),
+                domain_implicit_varint(18),
             ];
-            domain_validate_fields(
-                raw,
-                &fields,
-                domain_field_mask(&[
-                    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
-                ]),
-            )?;
+            domain_validate_fields(raw, &fields)?;
         }
         "DomainOperationTerminalStatusAttachRequest" => {
             let fields = [
@@ -298,35 +319,32 @@ pub fn validate_domain_operation_v2_raw(name: &str, raw: &[u8]) -> Result<(), to
                 domain_ld(4, P),
                 domain_ld(5, U),
                 domain_ld(6, U),
-                domain_varint(7),
+                domain_implicit_varint(7),
                 domain_ld(8, U),
-                domain_varint(9),
+                domain_implicit_varint(9),
                 domain_varint(10),
                 domain_ld(11, D),
-                domain_varint(12),
-                domain_varint(13),
+                domain_implicit_varint(12),
+                domain_implicit_varint(13),
                 domain_varint(14),
-                domain_varint(15),
+                domain_implicit_varint(15),
                 domain_ld(16, D),
-                domain_varint(17),
-                domain_ld(18, D),
-                domain_varint(19),
-                domain_ld(20, D),
-                domain_varint(21),
+                domain_implicit_varint(17),
+                domain_optional_ld(18, D),
+                domain_implicit_varint(19),
+                domain_optional_ld(20, D),
+                domain_implicit_varint(21),
                 domain_ld(22, D),
-                domain_ld(23, D),
-                domain_varint(24),
-                domain_ld(25, D),
-                domain_varint(26),
+                domain_optional_ld(23, D),
+                domain_implicit_varint(24),
+                domain_optional_ld(25, D),
+                domain_implicit_varint(26),
                 domain_ld(27, D),
-                domain_varint(28),
-                domain_ld(29, D),
+                domain_implicit_varint(28),
+                domain_optional_ld(29, D),
                 domain_ld(30, D),
             ];
-            let base = domain_field_mask(&[
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 21, 22, 26, 27, 28, 30,
-            ]);
-            let (seen, values) = domain_validate_fields(raw, &fields, base)?;
+            let (seen, values) = domain_validate_fields(raw, &fields)?;
             match values[14] {
                 1 if seen & domain_field_mask(&[17, 18, 19, 20, 23, 24, 25, 29]) == 0 => {}
                 2 if seen & domain_field_mask(&[17, 18, 19, 20])
@@ -360,16 +378,12 @@ pub fn validate_domain_operation_v2_raw(name: &str, raw: &[u8]) -> Result<(), to
                 domain_ld(6, U),
                 domain_varint(7),
                 domain_ld(8, D),
-                domain_varint(9),
-                domain_varint(10),
+                domain_implicit_varint(9),
+                domain_implicit_varint(10),
                 domain_ld(11, D),
                 domain_ld(12, J),
             ];
-            domain_validate_fields(
-                raw,
-                &fields,
-                domain_field_mask(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
-            )?;
+            domain_validate_fields(raw, &fields)?;
         }
         "DomainOperationProofNamespaceRetireRequestV1" => {
             let fields = [
@@ -381,7 +395,7 @@ pub fn validate_domain_operation_v2_raw(name: &str, raw: &[u8]) -> Result<(), to
                 domain_ld(6, U),
                 domain_varint(7),
                 domain_ld(8, D),
-                domain_varint(9),
+                domain_implicit_varint(9),
                 domain_varint(10),
                 domain_varint(11),
                 domain_varint(12),
@@ -392,13 +406,7 @@ pub fn validate_domain_operation_v2_raw(name: &str, raw: &[u8]) -> Result<(), to
                 domain_varint(17),
                 domain_ld(18, D),
             ];
-            domain_validate_fields(
-                raw,
-                &fields,
-                domain_field_mask(&[
-                    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
-                ]),
-            )?;
+            domain_validate_fields(raw, &fields)?;
         }
         _ => {}
     }

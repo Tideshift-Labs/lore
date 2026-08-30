@@ -11,6 +11,7 @@
 
 use std::time::SystemTime;
 
+use subtle::ConstantTimeEq;
 use tokio_postgres::Transaction;
 
 use crate::domain::errors::DomainError;
@@ -494,15 +495,33 @@ fn receipt_binding_matches(row: &tokio_postgres::Row, input: &VerifiedStaleFinal
         && row.get::<_, Vec<u8>>("canonical_intent_digest") == input.binding.canonical_intent_digest
 }
 
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    bool::from(left.ct_eq(right))
+}
+
 fn dispatch_fence_matches(row: &tokio_postgres::Row, input: &VerifiedStaleFinalizeInput) -> bool {
     receipt_binding_matches(row, input)
-        && row.get::<_, Vec<u8>>("authorization_id") == input.witness.authorization_id
+        && constant_time_equal(
+            &row.get::<_, Vec<u8>>("authorization_id"),
+            &input.witness.authorization_id,
+        )
         && row.get::<_, i64>("authorization_revision") == input.witness.authorization_revision
-        && row.get::<_, Vec<u8>>("verification_nonce") == input.witness.verification_nonce
-        && row.get::<_, Vec<u8>>("bound_fields_digest") == input.witness.bound_fields_digest
-        && row.get::<_, Vec<u8>>("consumed_ticket_sha256") == input.witness.consumed_ticket_sha256
-        && row.get::<_, Vec<u8>>("expected_claim_identity_digest")
-            == input.expected_claim_identity_digest
+        && constant_time_equal(
+            &row.get::<_, Vec<u8>>("verification_nonce"),
+            &input.witness.verification_nonce,
+        )
+        && constant_time_equal(
+            &row.get::<_, Vec<u8>>("bound_fields_digest"),
+            &input.witness.bound_fields_digest,
+        )
+        && constant_time_equal(
+            &row.get::<_, Vec<u8>>("consumed_ticket_sha256"),
+            &input.witness.consumed_ticket_sha256,
+        )
+        && constant_time_equal(
+            &row.get::<_, Vec<u8>>("expected_claim_identity_digest"),
+            &input.expected_claim_identity_digest,
+        )
 }
 
 fn stale_finalize_execution_witness(
@@ -790,6 +809,9 @@ pub async fn verified_stale_finalize(
         })?;
     let inserted = tx
         .query_opt(
+        // This is the only valid receipt-without-fence exception: the permit
+        // verifier has proved the UUID is stale and no dispatch was possible,
+        // so this transaction terminalizes directly instead of preparing.
         "INSERT INTO lore_domain_operation_receipts ( \
              verified_issuer, authenticated_subject, tenant_scope_key, operation_id, \
              method, scope, fingerprint_version, fingerprint, canonical_intent_digest, \
@@ -969,6 +991,34 @@ pub async fn proof_namespace_materialize(
     let current_revision: i64 = counter.get("counter_revision");
     let current_quota_revision: i32 = counter.get("quota_revision");
     let global_rows: i64 = counter.get("represented_namespace_rows");
+    if current_revision == input.lore_local_capacity_revision
+        && current_quota_revision == quota_revision
+    {
+        tx.execute(
+            "INSERT INTO lore_domain_proof_org_counters ( \
+                 org_uuid, counter_revision, quota_revision, represented_namespace_rows, \
+                 retained_marker_count, fragment_count, fragment_bytes, marker_bytes, updated_at \
+             ) SELECT $1,0,$2,0,0,0,0,0,$3 \
+               WHERE NOT EXISTS ( \
+                 SELECT 1 FROM lore_domain_proof_namespaces \
+                 WHERE state <> $4 AND ( \
+                   org_uuid=$1 OR (verified_issuer=$5 AND authenticated_subject=$6 \
+                     AND tenant_scope_key=$7) \
+                 ) \
+               ) ON CONFLICT (org_uuid) DO NOTHING",
+            &[
+                &input.key.org_uuid,
+                &current_quota_revision,
+                &clock,
+                &schema_mediated::NAMESPACE_STATE_RETIRED,
+                &input.key.verified_issuer,
+                &input.key.authenticated_subject,
+                &input.key.tenant_scope_key,
+            ],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("proof namespace org counter provision", e))?;
+    }
     let org_counter = tx
         .query_opt(
             "SELECT counter_revision, quota_revision, represented_namespace_rows \
@@ -977,19 +1027,9 @@ pub async fn proof_namespace_materialize(
         )
         .await
         .map_err(|e| DomainError::from_pg("proof namespace org counter lock", e))?;
-    let Some(org_counter) = org_counter else {
-        return materialize_receipt(
-            input,
-            ProofNamespaceMaterializeStatus::CapacityBlocked,
-            0,
-            current_revision,
-            0,
-            clock,
-        );
-    };
-    let current_org_revision: i64 = org_counter.get("counter_revision");
-    let current_org_quota_revision: i32 = org_counter.get("quota_revision");
-    let org_rows: i64 = org_counter.get("represented_namespace_rows");
+    let current_org_revision = org_counter
+        .as_ref()
+        .map_or(0, |row| row.get("counter_revision"));
     let existing = tx
         .query_opt(
             "SELECT epoch, org_uuid, protocol_revision, quota_revision, claim_revision, claim_nonce, \
@@ -1020,7 +1060,7 @@ pub async fn proof_namespace_materialize(
             && row.get::<_, Vec<u8>>("materialization_verification_digest")
                 == input.verification_digest
             && row.get::<_, i16>("state") == schema_mediated::NAMESPACE_STATE_ACTIVE;
-        if !exact {
+        if !exact || org_counter.is_none() {
             return materialize_receipt(
                 input,
                 ProofNamespaceMaterializeStatus::Mismatch,
@@ -1058,6 +1098,18 @@ pub async fn proof_namespace_materialize(
             response_digest,
         });
     }
+    let Some(org_counter) = org_counter else {
+        return materialize_receipt(
+            input,
+            ProofNamespaceMaterializeStatus::CapacityBlocked,
+            0,
+            current_revision,
+            0,
+            clock,
+        );
+    };
+    let current_org_quota_revision: i32 = org_counter.get("quota_revision");
+    let org_rows: i64 = org_counter.get("represented_namespace_rows");
     if current_revision != input.lore_local_capacity_revision
         || current_quota_revision != quota_revision
         || current_org_quota_revision != quota_revision
@@ -1337,14 +1389,10 @@ pub async fn proof_namespace_retire(
         return retire_ack(input, ProofNamespaceRetireStatus::NotQuiescent, None);
     }
     let Some(global_counter) = global_counter else {
-        return Err(DomainError::Internal(
-            "proof namespace exists without global counter".to_owned(),
-        ));
+        return retire_ack(input, ProofNamespaceRetireStatus::Mismatch, None);
     };
     let Some(org_counter) = org_counter else {
-        return Err(DomainError::Internal(
-            "proof namespace exists without organization counter".to_owned(),
-        ));
+        return retire_ack(input, ProofNamespaceRetireStatus::Mismatch, None);
     };
     let next_global_revision = global_counter
         .get::<_, i64>("counter_revision")

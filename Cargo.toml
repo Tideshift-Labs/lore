@@ -114,6 +114,7 @@ reqwest = { version = "0.12.23", default-features = false, features = [
     "macos-system-configuration",
 ] }
 ring = "0.17.14"
+subtle = "2.6.1"
 # We configure rustls to not bring in aws-lc-sys, which seems to have build issues on Windows.
 rustls = { version = "0.23.31", default-features = false, features = [
     "std",

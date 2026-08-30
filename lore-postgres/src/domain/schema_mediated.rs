@@ -339,6 +339,14 @@ CREATE TABLE IF NOT EXISTS lore_domain_proof_global_counters (
                           + represented_namespace_rows
     )
 );
+-- Boot-time mediated-schema installation makes the advertised lifecycle
+-- surface usable on a fresh cell. Re-running setup preserves live counters.
+INSERT INTO lore_domain_proof_global_counters (
+    id, counter_revision, quota_revision, represented_namespace_rows,
+    retained_marker_count, outstanding_proof_claims, fragment_count,
+    fragment_bytes, marker_bytes, reconciled_at, updated_at
+) VALUES (1, 0, 1, 0, 0, 0, 0, 0, 0, NULL, clock_timestamp())
+ON CONFLICT (id) DO NOTHING;
 
 -- Lore-local organization counters are independent from the global counter.
 -- A namespace materialization increments both exactly once; retirement

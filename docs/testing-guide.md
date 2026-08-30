@@ -358,11 +358,11 @@ will update an older check constraint or state schema.
   --test domain_bypass --test domain_receipts_lifecycle --test domain_obliterate_fence \
   -- --ignored` under `LORE_TEST_PG_URL`.
   Migration-parity and backfill each create a throwaway database because their whole-catalog scans
-  cannot isolate shared fixtures. Most other cases use random identities in one database. The eight
-  maintenance cases instead use `tests/run-domain-maintenance-live.ps1`, which creates and drops a
-  distinct database per exact case. On a fresh database, the first materialization bootstraps the
-  global counter, so a capacity-revision rejection case must seed it, reread its revision, then
-  submit the mismatched revision; a guessed absent-row fallback can accidentally be admissible.
+  cannot isolate shared fixtures. Most other cases use random identities in one database. The 20
+  maintenance cases use `tests/run-domain-maintenance-live.ps1`, with a distinct database per case.
+  Mediated-schema setup seeds the singleton global counter at revision 0/quota 1; first
+  materialization provisions the org row at revision/count 0 and atomically charges both. A
+  capacity-revision rejection case must reread the seeded revision before submitting a mismatch.
 - **CR-029 WP-116 Phase 4, gRPC metadata carriage, status mapping, and the admission gate
   [SERVER]**: offline, no Postgres. `domain_operation_metadata.rs`'s `extract`/`require` (R-BLOCK-2's
   one-reader header contract) and `scope_key_*` (R-BLOCK-5) are pinned in an inline `tests` module:

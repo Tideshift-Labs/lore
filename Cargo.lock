@@ -2877,6 +2877,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pemfile",
  "serial_test",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",

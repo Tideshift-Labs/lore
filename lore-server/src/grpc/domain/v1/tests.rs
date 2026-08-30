@@ -302,6 +302,7 @@ struct EchoVerifier {
     mismatch_echo: AtomicBool,
     mismatch_revision: AtomicBool,
     mismatch_commitment: AtomicBool,
+    omit_claim_identity_digest: AtomicBool,
     forwarded_authorization: Mutex<Option<String>>,
 }
 
@@ -312,6 +313,7 @@ impl EchoVerifier {
             mismatch_echo: AtomicBool::new(false),
             mismatch_revision: AtomicBool::new(false),
             mismatch_commitment: AtomicBool::new(false),
+            omit_claim_identity_digest: AtomicBool::new(false),
             forwarded_authorization: Mutex::new(None),
         }
     }
@@ -407,7 +409,14 @@ impl RepositoryOperationAuthorizationVerifier for EchoVerifier {
             canonical_intent_digest: request.canonical_intent_digest,
             verified_issuer: request.verified_issuer,
             authenticated_subject: request.authenticated_subject,
-            expected_claim_identity_digest: Bytes::from_static(&[0x33; 32]),
+            expected_claim_identity_digest: if self
+                .omit_claim_identity_digest
+                .load(Ordering::SeqCst)
+            {
+                Bytes::new()
+            } else {
+                Bytes::from_static(&[0x33; 32])
+            },
         })
     }
 
@@ -609,8 +618,12 @@ fn valid_retire() -> DomainOperationProofNamespaceRetireRequestV1 {
 }
 
 fn authenticated<T>(message: T) -> Request<T> {
+    authenticated_as(message, service_token())
+}
+
+fn authenticated_as<T>(message: T, token: AuthorizationToken) -> Request<T> {
     let mut request = Request::new(message);
-    request.extensions_mut().insert(service_token());
+    request.extensions_mut().insert(token);
     request.metadata_mut().insert(
         "authorization",
         "Bearer service-token"
@@ -721,11 +734,118 @@ fn length_delimited_field(tag: u8, value: &[u8]) -> Vec<u8> {
     encoded
 }
 
+fn encode_raw_varint(mut value: u64) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        encoded.push(byte);
+        if value == 0 {
+            return encoded;
+        }
+    }
+}
+
+fn raw_varint_field(tag: u32, value: u64) -> Vec<u8> {
+    let mut encoded = encode_raw_varint(u64::from(tag) << 3);
+    encoded.extend_from_slice(&encode_raw_varint(value));
+    encoded
+}
+
+fn raw_empty_length_delimited_field(tag: u32) -> Vec<u8> {
+    let mut encoded = encode_raw_varint((u64::from(tag) << 3) | 2);
+    encoded.push(0);
+    encoded
+}
+
+fn assert_implicit_zero_fields_keep_strict_wire_checks(
+    name: &str,
+    raw: &[u8],
+    tags: &[u32],
+    validate: RawValidator,
+) {
+    validate(raw).unwrap_or_else(|error| panic!("{name} rejected implicit zero fields: {error}"));
+    for tag in tags {
+        let explicit = raw_varint_field(*tag, 0);
+        let mut one_explicit_zero = raw.to_vec();
+        one_explicit_zero.extend_from_slice(&explicit);
+        validate(&one_explicit_zero).unwrap_or_else(|error| {
+            panic!("{name} rejected one explicit zero for tag {tag}: {error}")
+        });
+
+        let mut duplicate = one_explicit_zero;
+        duplicate.extend_from_slice(&explicit);
+        assert!(
+            validate(&duplicate).is_err(),
+            "{name} accepted duplicate implicit-zero tag {tag}"
+        );
+
+        let mut wrong_wire = raw.to_vec();
+        wrong_wire.extend_from_slice(&raw_empty_length_delimited_field(*tag));
+        assert!(
+            validate(&wrong_wire).is_err(),
+            "{name} accepted wrong wire type for implicit-zero tag {tag}"
+        );
+    }
+}
+
 #[test]
 fn strict_raw_validators_accept_each_complete_frozen_wire() {
     for (name, raw, validate) in strict_raw_cases() {
         validate(&raw).unwrap_or_else(|error| panic!("valid {name} frame rejected: {error}"));
     }
+}
+
+#[test]
+fn strict_raw_validators_accept_only_the_frozen_implicit_zero_scalar_set() {
+    let mut retire = valid_retire();
+    retire.final_high_water = 0;
+    assert_implicit_zero_fields_keep_strict_wire_checks(
+        "namespace retire",
+        &retire.encode_to_vec(),
+        &[9],
+        validate_proof_namespace_retire_raw,
+    );
+
+    let mut materialize = valid_materialize();
+    materialize.platform_capacity_revision = 0;
+    materialize.lore_local_capacity_revision = 0;
+    assert_implicit_zero_fields_keep_strict_wire_checks(
+        "namespace materialize",
+        &materialize.encode_to_vec(),
+        &[9, 10],
+        validate_proof_namespace_materialize_raw,
+    );
+
+    let mut finalize = valid_stale_finalize();
+    finalize.fingerprint_version = 0;
+    finalize.authorization_revision = 0;
+    finalize.stale_finalize_permit_revision = 0;
+    assert_implicit_zero_fields_keep_strict_wire_checks(
+        "stale finalize",
+        &finalize.encode_to_vec(),
+        &[8, 12, 18],
+        validate_verified_stale_finalize_raw,
+    );
+
+    let mut attach = valid_terminal_attach_phase1();
+    attach.authorization_revision = 0;
+    attach.claim_revision = 0;
+    attach.platform_terminal_status_revision = 0;
+    attach.acknowledged_at_unix_millis = 0;
+    attach.reserve_charge_revision = 0;
+    attach.tombstone_reservation_revision = 0;
+    attach.release_proof_reservation_revision = 0;
+    attach.completion_marker_sequence = 0;
+    assert_implicit_zero_fields_keep_strict_wire_checks(
+        "terminal attach",
+        &attach.encode_to_vec(),
+        &[7, 9, 12, 13, 15, 21, 26, 28],
+        validate_terminal_status_attach_raw,
+    );
 }
 
 #[test]
@@ -975,6 +1095,93 @@ async fn maintenance_verifier_binding_stops_before_store() {
         0,
         "no maintenance store call may precede exact verifier echo validation"
     );
+}
+
+#[tokio::test]
+async fn missing_claim_identity_digest_is_reported_as_verifier_version_skew() {
+    let (service, store, verifier) = service();
+    verifier
+        .omit_claim_identity_digest
+        .store(true, Ordering::SeqCst);
+
+    let error = service
+        .domain_operation_prepare(authenticated(valid_prepare()))
+        .await
+        .expect_err("a verifier without tag 16 must fail closed");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(
+        error.message().contains("claim-identity digest") && error.message().contains("verifier"),
+        "version-skew error must identify the missing verifier carriage: {error}"
+    );
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.prepare_calls.load(Ordering::SeqCst),
+        0,
+        "missing verifier carriage must reject before receipt persistence"
+    );
+}
+
+#[tokio::test]
+async fn jwt_identity_bounds_reject_before_verifier_and_receipt_store() {
+    for (field, token) in [
+        (
+            "issuer",
+            AuthorizationToken {
+                issuer: "i".repeat(257),
+                ..service_token()
+            },
+        ),
+        (
+            "subject",
+            AuthorizationToken {
+                user_id: "s".repeat(257),
+                ..service_token()
+            },
+        ),
+    ] {
+        let (service, store, verifier) = service();
+        let error = service
+            .domain_operation_prepare(authenticated_as(valid_prepare(), token))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("oversized JWT {field} must reject"));
+        assert_eq!(error.code(), Code::InvalidArgument, "JWT {field}");
+        assert_eq!(
+            verifier.calls.load(Ordering::SeqCst),
+            0,
+            "JWT {field} must reject before verifier I/O"
+        );
+        assert_eq!(
+            store.prepare_calls.load(Ordering::SeqCst),
+            0,
+            "JWT {field} must reject before receipt-key SQL"
+        );
+    }
+}
+
+#[tokio::test]
+async fn zero_high_water_retirement_decodes_and_reaches_the_handler_boundary() {
+    let (service, store, verifier) = service();
+    let mut request = valid_retire();
+    request.final_high_water = 0;
+    request.retirement_permit_jwt = "service-token".into();
+    let raw = request.encode_to_vec();
+    validate_proof_namespace_retire_raw(&raw)
+        .expect("implicit absence of zero-valued final_high_water must be canonical");
+    let decoded = DomainOperationProofNamespaceRetireRequestV1::decode(raw.as_slice())
+        .expect("prost decodes the strict frame");
+
+    let response = service
+        .domain_operation_proof_namespace_retire(authenticated(decoded))
+        .await
+        .expect("zero high-water retirement reaches the store")
+        .into_inner();
+    assert_eq!(
+        response.status,
+        DomainOperationProofNamespaceRetireStatusV1::Mismatch as i32
+    );
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.retire_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

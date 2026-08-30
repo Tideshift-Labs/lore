@@ -322,7 +322,11 @@ async fn provision_capacity(client: &Client, org_uuid: &[u8]) -> (i64, i64) {
             "INSERT INTO lore_domain_proof_global_counters (id, counter_revision, quota_revision, \
                 represented_namespace_rows, retained_marker_count, outstanding_proof_claims, \
                 fragment_count, fragment_bytes, marker_bytes, updated_at) \
-             VALUES (1,$1,$2,0,0,0,0,0,0,clock_timestamp())",
+             VALUES (1,$1,$2,0,0,0,0,0,0,clock_timestamp()) \
+             ON CONFLICT (id) DO UPDATE SET counter_revision=EXCLUDED.counter_revision, \
+                quota_revision=EXCLUDED.quota_revision, represented_namespace_rows=0, \
+                retained_marker_count=0, outstanding_proof_claims=0, fragment_count=0, \
+                fragment_bytes=0, marker_bytes=0, updated_at=EXCLUDED.updated_at",
             &[&counter_revision, &quota_revision],
         )
         .await
@@ -331,7 +335,11 @@ async fn provision_capacity(client: &Client, org_uuid: &[u8]) -> (i64, i64) {
         .execute(
             "INSERT INTO lore_domain_proof_org_counters (org_uuid, counter_revision, quota_revision, \
                 represented_namespace_rows, retained_marker_count, fragment_count, fragment_bytes, \
-                marker_bytes, updated_at) VALUES ($1,$2,$3,0,0,0,0,0,clock_timestamp())",
+                marker_bytes, updated_at) VALUES ($1,$2,$3,0,0,0,0,0,clock_timestamp()) \
+             ON CONFLICT (org_uuid) DO UPDATE SET counter_revision=EXCLUDED.counter_revision, \
+                quota_revision=EXCLUDED.quota_revision, represented_namespace_rows=0, \
+                retained_marker_count=0, fragment_count=0, fragment_bytes=0, marker_bytes=0, \
+                updated_at=EXCLUDED.updated_at",
             &[&org_uuid, &counter_revision, &quota_revision],
         )
         .await
@@ -1390,7 +1398,173 @@ async fn materialize_capacity_revision_mismatch_writes_no_namespace() {
 
 #[tokio::test]
 #[ignore = "needs a fresh disposable live Postgres database; run via run-domain-maintenance-live.ps1"]
-async fn fresh_cell_materialize_requires_preprovisioned_capacity_counters() {
+async fn fresh_cell_seeds_global_counter_and_first_materialize_provisions_org_counter() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let direct = client(&url).await;
+    let global = direct
+        .query_one(
+            "SELECT counter_revision, quota_revision, represented_namespace_rows, \
+                    retained_marker_count, outstanding_proof_claims, fragment_count, \
+                    fragment_bytes, marker_bytes \
+             FROM lore_domain_proof_global_counters WHERE id=1",
+            &[],
+        )
+        .await
+        .expect("mediated schema setup must seed the singleton global proof counter");
+    assert_eq!(global.get::<_, i64>(0), 0);
+    assert_eq!(global.get::<_, i32>(1), 1);
+    for column in 2..8 {
+        assert_eq!(
+            global.get::<_, i64>(column),
+            0,
+            "fresh global proof counter column {column} must start at zero"
+        );
+    }
+    let org_rows: i64 = direct
+        .query_one("SELECT count(*) FROM lore_domain_proof_org_counters", &[])
+        .await
+        .expect("count organization counters")
+        .get(0);
+    assert_eq!(org_rows, 0, "fresh setup must not invent organization rows");
+
+    let input = materialize_input(namespace_key(), 0, 1);
+    let materialized = store
+        .domain_operation_proof_namespace_materialize(&input)
+        .await
+        .expect("first-use organization provisioning and materialization succeed");
+    assert_eq!(
+        materialized.status,
+        ProofNamespaceMaterializeStatus::Materialized
+    );
+    let org = direct
+        .query_one(
+            "SELECT counter_revision, quota_revision, represented_namespace_rows, \
+                    retained_marker_count, fragment_count, fragment_bytes, marker_bytes \
+             FROM lore_domain_proof_org_counters WHERE org_uuid=$1",
+            &[&input.key.org_uuid],
+        )
+        .await
+        .expect("first materialization must create the organization counter");
+    assert_eq!(
+        (
+            org.get::<_, i64>(0),
+            org.get::<_, i32>(1),
+            org.get::<_, i64>(2)
+        ),
+        (1, 1, 1),
+        "the first charge must advance the authoritative zero revision/count exactly once"
+    );
+    for column in 3..7 {
+        assert_eq!(
+            org.get::<_, i64>(column),
+            0,
+            "new organization counter column {column} must retain its zero baseline"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a fresh disposable live Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn materialize_changed_org_replay_mismatches_without_provisioning_wrong_org() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let direct = client(&url).await;
+    let input = materialize_input(namespace_key(), 0, 1);
+    let materialized = store
+        .domain_operation_proof_namespace_materialize(&input)
+        .await
+        .expect("first materialization succeeds");
+    assert_eq!(
+        materialized.status,
+        ProofNamespaceMaterializeStatus::Materialized
+    );
+
+    let mut changed_org = input.clone();
+    changed_org.key.org_uuid = rand::random::<[u8; 16]>().to_vec();
+    changed_org.lore_local_capacity_revision = materialized.lore_global_counter_revision;
+    assert_ne!(changed_org.key.org_uuid, input.key.org_uuid);
+    let state = |row: tokio_postgres::Row| {
+        (
+            row.get::<_, i64>(0),
+            row.get::<_, i64>(1),
+            row.get::<_, i64>(2),
+            row.get::<_, i64>(3),
+            row.get::<_, i64>(4),
+            row.get::<_, i64>(5),
+        )
+    };
+    let state_query = "SELECT \
+            (SELECT counter_revision FROM lore_domain_proof_global_counters WHERE id=1), \
+            (SELECT represented_namespace_rows FROM lore_domain_proof_global_counters WHERE id=1), \
+            (SELECT counter_revision FROM lore_domain_proof_org_counters WHERE org_uuid=$1), \
+            (SELECT represented_namespace_rows FROM lore_domain_proof_org_counters WHERE org_uuid=$1), \
+            (SELECT count(*) FROM lore_domain_proof_org_counters), \
+            (SELECT count(*) FROM lore_domain_proof_namespaces \
+             WHERE verified_issuer=$2 AND authenticated_subject=$3 AND tenant_scope_key=$4)";
+    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+        &input.key.org_uuid,
+        &input.key.verified_issuer,
+        &input.key.authenticated_subject,
+        &input.key.tenant_scope_key,
+    ];
+    let before = state(
+        direct
+            .query_one(state_query, params)
+            .await
+            .expect("read pre-mismatch namespace and counter state"),
+    );
+
+    let mismatch = store
+        .domain_operation_proof_namespace_materialize(&changed_org)
+        .await
+        .expect("changed organization is a decisive mismatch");
+    assert_eq!(mismatch.status, ProofNamespaceMaterializeStatus::Mismatch);
+
+    let after = state(
+        direct
+            .query_one(state_query, params)
+            .await
+            .expect("read post-mismatch namespace and counter state"),
+    );
+    assert_eq!(after, before, "mismatch must not mutate original authority");
+    let changed_org_rows: i64 = direct
+        .query_one(
+            "SELECT count(*) FROM lore_domain_proof_org_counters WHERE org_uuid=$1",
+            &[&changed_org.key.org_uuid],
+        )
+        .await
+        .expect("count wrong-organization counters")
+        .get(0);
+    assert_eq!(
+        changed_org_rows, 0,
+        "a changed-org replay must not provision a zero counter for the wrong organization"
+    );
+    let stored_org: Vec<u8> = direct
+        .query_one(
+            "SELECT org_uuid FROM lore_domain_proof_namespaces \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3",
+            &[
+                &input.key.verified_issuer,
+                &input.key.authenticated_subject,
+                &input.key.tenant_scope_key,
+            ],
+        )
+        .await
+        .expect("read immutable namespace organization")
+        .get(0);
+    assert_eq!(stored_org, input.key.org_uuid);
+}
+
+#[tokio::test]
+#[ignore = "needs a fresh disposable live Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn fresh_org_stale_capacity_revision_blocks_without_provisioning_org_counter() {
     let Some(url) = pg_url() else {
         eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
         return;
@@ -1402,35 +1576,106 @@ async fn fresh_cell_materialize_requires_preprovisioned_capacity_counters() {
     let blocked = store
         .domain_operation_proof_namespace_materialize(&input)
         .await
-        .expect("missing capacity authority is a decisive result");
+        .expect("stale Lore-local revision is a decisive capacity result");
     assert_eq!(
         blocked.status,
         ProofNamespaceMaterializeStatus::CapacityBlocked
     );
-
-    let global_rows: i64 = direct
+    let state = direct
         .query_one(
-            "SELECT count(*) FROM lore_domain_proof_global_counters",
+            "SELECT \
+                (SELECT counter_revision FROM lore_domain_proof_global_counters WHERE id=1), \
+                (SELECT quota_revision FROM lore_domain_proof_global_counters WHERE id=1), \
+                (SELECT represented_namespace_rows FROM lore_domain_proof_global_counters WHERE id=1), \
+                (SELECT count(*) FROM lore_domain_proof_org_counters WHERE org_uuid=$1), \
+                (SELECT count(*) FROM lore_domain_proof_namespaces \
+                 WHERE verified_issuer=$2 AND authenticated_subject=$3 AND tenant_scope_key=$4)",
+            &[
+                &input.key.org_uuid,
+                &input.key.verified_issuer,
+                &input.key.authenticated_subject,
+                &input.key.tenant_scope_key,
+            ],
+        )
+        .await
+        .expect("read capacity rejection state");
+    assert_eq!(state.get::<_, i64>(0), 0);
+    assert_eq!(state.get::<_, i32>(1), 1);
+    assert_eq!(state.get::<_, i64>(2), 0);
+    assert_eq!(
+        state.get::<_, i64>(3),
+        0,
+        "a stale caller revision must not provision a fresh organization counter"
+    );
+    assert_eq!(
+        state.get::<_, i64>(4),
+        0,
+        "capacity rejection must not claim a namespace"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a fresh disposable live Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn retire_with_missing_org_counter_returns_mismatch_not_internal() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let direct = client(&url).await;
+    let namespace = namespace_key();
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let materialize = materialize_input(namespace, counter, quota);
+    let result = store
+        .domain_operation_proof_namespace_materialize(&materialize)
+        .await
+        .expect("materialize setup");
+    assert_eq!(result.status, ProofNamespaceMaterializeStatus::Materialized);
+    direct
+        .execute(
+            "DELETE FROM lore_domain_proof_org_counters WHERE org_uuid=$1",
+            &[&materialize.key.org_uuid],
+        )
+        .await
+        .expect("remove organization counter to exercise corruption posture");
+
+    let outcome = store
+        .domain_operation_proof_namespace_retire(&retire_input(&materialize))
+        .await
+        .expect("missing organization counter must be a decisive domain status");
+    assert_eq!(outcome.status, ProofNamespaceRetireStatus::Mismatch);
+}
+
+#[tokio::test]
+#[ignore = "needs a fresh disposable live Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn retire_with_missing_global_counter_returns_mismatch_not_internal() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let direct = client(&url).await;
+    let namespace = namespace_key();
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let materialize = materialize_input(namespace, counter, quota);
+    let result = store
+        .domain_operation_proof_namespace_materialize(&materialize)
+        .await
+        .expect("materialize setup");
+    assert_eq!(result.status, ProofNamespaceMaterializeStatus::Materialized);
+    direct
+        .execute(
+            "DELETE FROM lore_domain_proof_global_counters WHERE id=1",
             &[],
         )
         .await
-        .expect("count global counters")
-        .get(0);
-    let org_rows: i64 = direct
-        .query_one("SELECT count(*) FROM lore_domain_proof_org_counters", &[])
+        .expect("remove global counter to exercise corruption posture");
+
+    let outcome = store
+        .domain_operation_proof_namespace_retire(&retire_input(&materialize))
         .await
-        .expect("count organization counters")
-        .get(0);
-    let namespace_rows: i64 = direct
-        .query_one("SELECT count(*) FROM lore_domain_proof_namespaces", &[])
-        .await
-        .expect("count proof namespaces")
-        .get(0);
-    assert_eq!(
-        (global_rows, org_rows, namespace_rows),
-        (0, 0, 0),
-        "a caller revision must never bootstrap authority counters or claim a namespace"
-    );
+        .expect("missing global counter must be a decisive domain status");
+    assert_eq!(outcome.status, ProofNamespaceRetireStatus::Mismatch);
 }
 
 #[tokio::test]

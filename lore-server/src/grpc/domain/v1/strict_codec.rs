@@ -33,12 +33,20 @@ enum RawWire {
 struct RawField {
     tag: u32,
     wire: RawWire,
+    presence: RawPresence,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RawPresence {
+    Required,
+    MayBeImplicitlyAbsent,
 }
 
 const fn ld(tag: u32, maximum: usize) -> RawField {
     RawField {
         tag,
         wire: RawWire::LengthDelimited(maximum),
+        presence: RawPresence::Required,
     }
 }
 
@@ -46,6 +54,23 @@ const fn varint(tag: u32) -> RawField {
     RawField {
         tag,
         wire: RawWire::Varint,
+        presence: RawPresence::Required,
+    }
+}
+
+const fn optional_ld(tag: u32, maximum: usize) -> RawField {
+    RawField {
+        tag,
+        wire: RawWire::LengthDelimited(maximum),
+        presence: RawPresence::MayBeImplicitlyAbsent,
+    }
+}
+
+const fn implicit_varint(tag: u32) -> RawField {
+    RawField {
+        tag,
+        wire: RawWire::Varint,
+        presence: RawPresence::MayBeImplicitlyAbsent,
     }
 }
 
@@ -76,11 +101,7 @@ fn read_raw_varint(raw: &[u8], offset: &mut usize) -> Result<u64, Status> {
     Err(Status::invalid_argument("overflow protobuf varint"))
 }
 
-fn validate_raw_fields(
-    raw: &[u8],
-    rules: &[RawField],
-    required_mask: u64,
-) -> Result<(u64, [u64; 64]), Status> {
+fn validate_raw_fields(raw: &[u8], rules: &[RawField]) -> Result<(u64, [u64; 64]), Status> {
     if raw.len() > MAX_RAW_REQUEST_LEN {
         return Err(Status::invalid_argument(
             "protobuf request exceeds 16384 bytes",
@@ -138,6 +159,13 @@ fn validate_raw_fields(
             }
         }
     }
+    let required_mask = rules.iter().fold(0_u64, |required, rule| {
+        if rule.presence == RawPresence::Required {
+            required | (1_u64 << rule.tag)
+        } else {
+            required
+        }
+    });
     if seen & required_mask != required_mask {
         return Err(Status::invalid_argument(
             "protobuf request is missing required field presence",
@@ -164,29 +192,23 @@ const FINALIZE_FIELDS: &[RawField] = &[
     ld(5, UUID_LEN),
     ld(6, MAX_METHOD_LEN),
     ld(7, MAX_SCOPE_LEN),
-    varint(8),
+    implicit_varint(8),
     ld(9, DIGEST_LEN),
     ld(10, DIGEST_LEN),
     ld(11, UUID_LEN),
-    varint(12),
+    implicit_varint(12),
     ld(13, DIGEST_LEN),
     ld(14, DIGEST_LEN),
     ld(15, DIGEST_LEN),
     ld(16, DIGEST_LEN),
     ld(17, DIGEST_LEN),
-    varint(18),
+    implicit_varint(18),
 ];
 
 /// Reject malformed stale-finalize raw bytes before Prost can discard unknown
 /// or duplicate singular fields and before auth-grpc can claim a permit.
 pub(super) fn validate_verified_stale_finalize_raw(raw: &[u8]) -> Result<(), Status> {
-    validate_raw_fields(
-        raw,
-        FINALIZE_FIELDS,
-        field_mask(&[
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
-        ]),
-    )?;
+    validate_raw_fields(raw, FINALIZE_FIELDS)?;
     Ok(())
 }
 
@@ -197,38 +219,35 @@ const ATTACH_FIELDS: &[RawField] = &[
     ld(4, MAX_PRINCIPAL_NAMESPACE_LEN),
     ld(5, UUID_LEN),
     ld(6, UUID_LEN),
-    varint(7),
+    implicit_varint(7),
     ld(8, UUID_LEN),
-    varint(9),
+    implicit_varint(9),
     varint(10),
     ld(11, DIGEST_LEN),
-    varint(12),
-    varint(13),
+    implicit_varint(12),
+    implicit_varint(13),
     varint(14),
-    varint(15),
+    implicit_varint(15),
     ld(16, DIGEST_LEN),
-    varint(17),
-    ld(18, DIGEST_LEN),
-    varint(19),
-    ld(20, DIGEST_LEN),
-    varint(21),
+    implicit_varint(17),
+    optional_ld(18, DIGEST_LEN),
+    implicit_varint(19),
+    optional_ld(20, DIGEST_LEN),
+    implicit_varint(21),
     ld(22, DIGEST_LEN),
-    ld(23, DIGEST_LEN),
-    varint(24),
-    ld(25, DIGEST_LEN),
-    varint(26),
+    optional_ld(23, DIGEST_LEN),
+    implicit_varint(24),
+    optional_ld(25, DIGEST_LEN),
+    implicit_varint(26),
     ld(27, DIGEST_LEN),
-    varint(28),
-    ld(29, DIGEST_LEN),
+    implicit_varint(28),
+    optional_ld(29, DIGEST_LEN),
     ld(30, DIGEST_LEN),
 ];
 
 /// Strict raw validation for the two-phase terminal-status attachment request.
 pub(super) fn validate_terminal_status_attach_raw(raw: &[u8]) -> Result<(), Status> {
-    const BASE: u64 = field_mask(&[
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 21, 22, 26, 27, 28, 30,
-    ]);
-    let (seen, values) = validate_raw_fields(raw, ATTACH_FIELDS, BASE)?;
+    let (seen, values) = validate_raw_fields(raw, ATTACH_FIELDS)?;
     match values[14] {
         1 => {
             let forbidden = field_mask(&[17, 18, 19, 20, 23, 24, 25, 29]);
@@ -278,19 +297,15 @@ const MATERIALIZE_FIELDS: &[RawField] = &[
     ld(6, UUID_LEN),
     varint(7),
     ld(8, DIGEST_LEN),
-    varint(9),
-    varint(10),
+    implicit_varint(9),
+    implicit_varint(10),
     ld(11, DIGEST_LEN),
     ld(12, MAX_SIGNED_JWT_LEN),
 ];
 
 /// Strict raw validation for proof-namespace materialization.
 pub(super) fn validate_proof_namespace_materialize_raw(raw: &[u8]) -> Result<(), Status> {
-    validate_raw_fields(
-        raw,
-        MATERIALIZE_FIELDS,
-        field_mask(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
-    )?;
+    validate_raw_fields(raw, MATERIALIZE_FIELDS)?;
     Ok(())
 }
 
@@ -303,7 +318,7 @@ const RETIRE_FIELDS: &[RawField] = &[
     ld(6, UUID_LEN),
     varint(7),
     ld(8, DIGEST_LEN),
-    varint(9),
+    implicit_varint(9),
     varint(10),
     varint(11),
     varint(12),
@@ -317,13 +332,7 @@ const RETIRE_FIELDS: &[RawField] = &[
 
 /// Strict raw validation for proof-namespace retirement.
 pub(super) fn validate_proof_namespace_retire_raw(raw: &[u8]) -> Result<(), Status> {
-    validate_raw_fields(
-        raw,
-        RETIRE_FIELDS,
-        field_mask(&[
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
-        ]),
-    )?;
+    validate_raw_fields(raw, RETIRE_FIELDS)?;
     Ok(())
 }
 
@@ -813,7 +822,7 @@ mod raw_field_tests {
     fn varint_rule_above_tag_thirty_cannot_index_panic() {
         // tag 63, wire type 0 => key 504 => canonical varint f8 03.
         let raw = [0xf8, 0x03, 0x01];
-        let (seen, values) = validate_raw_fields(&raw, &[varint(63)], 1u64 << 63)
+        let (seen, values) = validate_raw_fields(&raw, &[varint(63)])
             .expect("a declared high varint tag must validate without indexing past the array");
         assert_eq!(seen, 1u64 << 63);
         assert_eq!(values[63], 1);

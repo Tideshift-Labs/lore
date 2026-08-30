@@ -124,12 +124,11 @@ fn next_generation(current: i64) -> Result<i64, DomainError> {
 }
 
 impl PostgresDomainStore {
-    /// Steps 1-2, shared by every mutation: open a transaction and consume the
-    /// admission row.
+    /// Opens the governed transaction and resolves the prepared receipt.
     ///
-    /// Returns `Ok(None)` when admission fails, which the caller turns into a
-    /// decisive `NOT_APPLIED(ADMISSION_REJECTED_V1)` — never into an error, and
-    /// never into a silent success.
+    /// A matching PREPARED row admits the mutation. A committed row returns its
+    /// durable outcome for replay, and an invalid or expired token is rejected
+    /// before any domain mutation runs.
     async fn begin_admitted<'a>(
         &self,
         client: &'a mut deadpool_postgres::Client,

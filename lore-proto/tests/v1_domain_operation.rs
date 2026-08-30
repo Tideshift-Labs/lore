@@ -598,6 +598,139 @@ fn strict_transport_frames() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
     ]
 }
 
+fn encode_test_varint(mut value: u64) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        encoded.push(byte);
+        if value == 0 {
+            return encoded;
+        }
+    }
+}
+
+fn test_varint_field(tag: u32) -> Vec<u8> {
+    let mut encoded = encode_test_varint(u64::from(tag) << 3);
+    encoded.push(0);
+    encoded
+}
+
+fn test_empty_length_delimited_field(tag: u32) -> Vec<u8> {
+    let mut encoded = encode_test_varint((u64::from(tag) << 3) | 2);
+    encoded.push(0);
+    encoded
+}
+
+fn assert_transport_implicit_zero_fields_remain_strict(name: &str, raw: &[u8], tags: &[u32]) {
+    validate_domain_operation_v2_raw(name, raw)
+        .unwrap_or_else(|error| panic!("{name} rejected implicit zero fields: {error}"));
+    for tag in tags {
+        let explicit = test_varint_field(*tag);
+        let mut one_explicit_zero = raw.to_vec();
+        one_explicit_zero.extend_from_slice(&explicit);
+        validate_domain_operation_v2_raw(name, &one_explicit_zero).unwrap_or_else(|error| {
+            panic!("{name} rejected one explicit zero for tag {tag}: {error}")
+        });
+
+        let mut duplicate = one_explicit_zero;
+        duplicate.extend_from_slice(&explicit);
+        assert!(
+            validate_domain_operation_v2_raw(name, &duplicate).is_err(),
+            "{name} accepted duplicate implicit-zero tag {tag}"
+        );
+
+        let mut wrong_wire = raw.to_vec();
+        wrong_wire.extend_from_slice(&test_empty_length_delimited_field(*tag));
+        assert!(
+            validate_domain_operation_v2_raw(name, &wrong_wire).is_err(),
+            "{name} accepted wrong wire type for implicit-zero tag {tag}"
+        );
+    }
+}
+
+#[test]
+fn transport_strict_validator_accepts_only_the_frozen_implicit_zero_scalar_set() {
+    let frames = strict_transport_frames();
+
+    let mut retire = DomainOperationProofNamespaceRetireRequestV1::decode(
+        frames
+            .iter()
+            .find(|(name, _, _)| *name == "DomainOperationProofNamespaceRetireRequestV1")
+            .expect("retire frame")
+            .1
+            .as_slice(),
+    )
+    .expect("decode retire fixture");
+    retire.final_high_water = 0;
+    assert_transport_implicit_zero_fields_remain_strict(
+        "DomainOperationProofNamespaceRetireRequestV1",
+        &retire.encode_to_vec(),
+        &[9],
+    );
+
+    let mut materialize = DomainOperationProofNamespaceMaterializeRequestV1::decode(
+        frames
+            .iter()
+            .find(|(name, _, _)| *name == "DomainOperationProofNamespaceMaterializeRequestV1")
+            .expect("materialize frame")
+            .1
+            .as_slice(),
+    )
+    .expect("decode materialize fixture");
+    materialize.platform_capacity_revision = 0;
+    materialize.lore_local_capacity_revision = 0;
+    assert_transport_implicit_zero_fields_remain_strict(
+        "DomainOperationProofNamespaceMaterializeRequestV1",
+        &materialize.encode_to_vec(),
+        &[9, 10],
+    );
+
+    let mut finalize = DomainOperationVerifiedStaleFinalizeRequest::decode(
+        frames
+            .iter()
+            .find(|(name, _, _)| *name == "DomainOperationVerifiedStaleFinalizeRequest")
+            .expect("stale-finalize frame")
+            .1
+            .as_slice(),
+    )
+    .expect("decode stale-finalize fixture");
+    finalize.fingerprint_version = 0;
+    finalize.authorization_revision = 0;
+    finalize.stale_finalize_permit_revision = 0;
+    assert_transport_implicit_zero_fields_remain_strict(
+        "DomainOperationVerifiedStaleFinalizeRequest",
+        &finalize.encode_to_vec(),
+        &[8, 12, 18],
+    );
+
+    let mut attach = DomainOperationTerminalStatusAttachRequest::decode(
+        frames
+            .iter()
+            .find(|(name, _, _)| *name == "DomainOperationTerminalStatusAttachRequest")
+            .expect("terminal-attach frame")
+            .1
+            .as_slice(),
+    )
+    .expect("decode terminal-attach fixture");
+    attach.authorization_revision = 0;
+    attach.claim_revision = 0;
+    attach.platform_terminal_status_revision = 0;
+    attach.acknowledged_at_unix_millis = 0;
+    attach.reserve_charge_revision = 0;
+    attach.tombstone_reservation_revision = 0;
+    attach.release_proof_reservation_revision = 0;
+    attach.completion_marker_sequence = 0;
+    assert_transport_implicit_zero_fields_remain_strict(
+        "DomainOperationTerminalStatusAttachRequest",
+        &attach.encode_to_vec(),
+        &[7, 9, 12, 13, 15, 21, 26, 28],
+    );
+}
+
 #[test]
 fn transport_strict_validator_rejects_original_malformed_frames_for_each_wire() {
     for (name, valid, duplicate_field) in strict_transport_frames() {

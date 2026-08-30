@@ -74,6 +74,7 @@ use crate::grpc::extract_authorization_header;
 use crate::grpc::map_domain_error_to_status;
 
 const WITNESS_FIELD_LEN: usize = 32;
+const MAX_RECEIPT_IDENTITY_LEN: usize = 256;
 const CONTROL_PLANE_SERVICE_SUBJECT: &str = "lorehub-control-plane";
 /// Private service. Construction requires both the domain store and a verifier
 /// dependency, so no method can silently fall back to unverified caller input.
@@ -97,6 +98,13 @@ fn authenticated_service<T>(request: &Request<T>) -> Result<AuthorizationToken, 
         .get::<AuthorizationToken>()
         .cloned()
         .ok_or_else(|| Status::unauthenticated("Verified service identity required"))?;
+    if token.issuer.len() > MAX_RECEIPT_IDENTITY_LEN
+        || token.user_id.len() > MAX_RECEIPT_IDENTITY_LEN
+    {
+        return Err(Status::invalid_argument(
+            "Verified JWT issuer or subject exceeds the receipt identity bound",
+        ));
+    }
     if token.is_service_account != Some(true)
         || token.issuer.is_empty()
         || token.user_id != CONTROL_PLANE_SERVICE_SUBJECT
@@ -168,6 +176,11 @@ fn exact_echo(
     expected_revision: u64,
     expected_consumed_ticket_sha256: &[u8],
 ) -> Result<AuthorizationWitness, Status> {
+    if response.expected_claim_identity_digest.is_empty() {
+        return Err(Status::failed_precondition(
+            "Authorization verifier omitted claim-identity digest tag 16; control-plane version skew",
+        ));
+    }
     let exact = response.authorization_id.as_ref() == binding.authorization_id
         && response.org_uuid.as_ref() == binding.org_uuid
         && response.initiating_principal_namespace.as_ref()
