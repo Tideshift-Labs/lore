@@ -870,8 +870,10 @@ impl PostgresLockCoordinator {
     ///
     /// One pool checkout and one query for the whole batch, matching what the
     /// legacy store does for the same wire call. Absent and obsolete resources
-    /// are simply missing from the result; order follows the stored key, not
-    /// the request, exactly as the legacy projection does.
+    /// are simply missing from the result, and a duplicate requested pair
+    /// yields a duplicate row, as the per-resource loop did. Order is by stored
+    /// key rather than request order; the wire contract carries no ordering
+    /// promise for Status.
     pub async fn status_many(
         &self,
         repository_id: &[u8],
@@ -1296,8 +1298,22 @@ impl PostgresLockCoordinator {
     /// startup on every unmigrated cell (INV-EE P0-1).
     pub async fn readiness(&self) -> Result<LockFencingReadiness, DomainError> {
         let client = self.checkout().await?;
-        if !fenced_schema_present(&client).await? {
-            return Ok(LockFencingReadiness::not_provisioned());
+        match fenced_schema_presence(&client).await? {
+            FencedSchemaPresence::Absent => {
+                return Ok(LockFencingReadiness::not_provisioned());
+            }
+            // A migration never produces a half-installed schema, and neither
+            // does a rollback (CR-030 forbids dropping fenced authority). So
+            // this is damage, and routing around it would silently return an
+            // armed cell to the subject-only legacy comparison.
+            FencedSchemaPresence::Partial { present } => {
+                return Err(DomainError::NotReady(format!(
+                    "SCHEMA-117 is partially present ({present} of {} relations); a migration \
+                     never produces this state, so it is refused rather than routed around",
+                    FENCED_SCHEMA_RELATIONS.len()
+                )));
+            }
+            FencedSchemaPresence::Complete => {}
         }
         let Some(row) = client
             .query_opt(
@@ -1309,7 +1325,11 @@ impl PostgresLockCoordinator {
             .await
             .map_err(|error| DomainError::from_pg("lock fencing readiness", error))?
         else {
-            return Ok(LockFencingReadiness::not_provisioned());
+            return Err(DomainError::NotReady(
+                "SCHEMA-117 relations exist but their singleton schema-state row is absent; \
+                 the installation is incomplete"
+                    .to_owned(),
+            ));
         };
         // The legacy lock store creates `lore_locks` after this call in the
         // boot order, so its absence contributes no fences and no legacy rows.
@@ -1412,7 +1432,20 @@ async fn relation_present(
         .map(|row| row.get(0))
 }
 
-async fn fenced_schema_present(client: &deadpool_postgres::Client) -> Result<bool, DomainError> {
+/// How much of the migration-owned SCHEMA-117 schema this database holds.
+enum FencedSchemaPresence {
+    /// The migration has not reached this database. A routing answer.
+    Absent,
+    /// Some relations exist and some do not — never a migration's output.
+    Partial {
+        present: i64,
+    },
+    Complete,
+}
+
+async fn fenced_schema_presence(
+    client: &deadpool_postgres::Client,
+) -> Result<FencedSchemaPresence, DomainError> {
     let present: i64 = client
         .query_one(
             "SELECT count(*)::bigint FROM unnest($1::text[]) AS relation \
@@ -1422,7 +1455,13 @@ async fn fenced_schema_present(client: &deadpool_postgres::Client) -> Result<boo
         .await
         .map_err(|error| DomainError::from_pg("fenced lock schema probe", error))?
         .get(0);
-    Ok(present == FENCED_SCHEMA_RELATIONS.len() as i64)
+    Ok(if present == 0 {
+        FencedSchemaPresence::Absent
+    } else if present == FENCED_SCHEMA_RELATIONS.len() as i64 {
+        FencedSchemaPresence::Complete
+    } else {
+        FencedSchemaPresence::Partial { present }
+    })
 }
 
 enum BeginAdmitted<'a> {

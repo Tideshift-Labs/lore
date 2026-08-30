@@ -1230,8 +1230,77 @@ async fn missing_and_repeated_release_are_not_found_and_empty_list_is_ok() {
     assert_eq!(empty_result.rejection, None);
 }
 
+/// Absent SCHEMA-117 is a routing answer; half-present SCHEMA-117 is damage.
+///
+/// A cell the migration never reached must boot on the legacy route (INV-EE
+/// P0-1). But a *partially* installed schema is a state no migration and no
+/// permitted rollback produces, so routing around it would silently return an
+/// armed cell to the subject-only legacy comparison. The two must not answer
+/// the same.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn an_absent_schema_routes_legacy_but_a_partial_one_is_refused() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    // Deliberately not the bootstrapping `store()` helper: this case needs the
+    // state a booting cell actually finds before any migration has run.
+    let bare = PostgresDomainStore::connect(&url, 4, &TlsConfig::default())
+        .await
+        .expect("connect domain store without SCHEMA-117");
+    let readiness = bare
+        .lock_coordinator()
+        .readiness()
+        .await
+        .expect("an unmigrated database must answer, not error");
+    assert!(!readiness.provisioned && !readiness.fencing_enabled);
+
+    bare.lock_coordinator()
+        .bootstrap()
+        .await
+        .expect("install SCHEMA-117");
+    let direct = client(&url).await;
+
+    // One relation missing: partially installed.
+    direct
+        .execute("DROP TABLE lore_domain_lock_backfill_quarantine", &[])
+        .await
+        .expect("drop one fenced relation");
+    assert!(
+        matches!(
+            bare.lock_coordinator().readiness().await,
+            Err(DomainError::NotReady(_))
+        ),
+        "a half-installed SCHEMA-117 must be refused, never reported as unprovisioned"
+    );
+
+    // All relations present, singleton state row gone: also incomplete.
+    bare.lock_coordinator()
+        .bootstrap()
+        .await
+        .expect("reinstall SCHEMA-117");
+    direct
+        .execute(
+            "DELETE FROM lore_domain_lock_schema_state WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("remove the singleton schema-state row");
+    assert!(
+        matches!(
+            bare.lock_coordinator().readiness().await,
+            Err(DomainError::NotReady(_))
+        ),
+        "a missing singleton schema-state row must be refused, not reported as unprovisioned"
+    );
+}
+
 /// The cutover entry point must refuse while the state it produces is
 /// unserviceable.
+///
+/// This case is a tripwire on `PUBLIC_MUTATION_CONTRACT_AVAILABLE`: it fails
+/// the day WP-120 flips that constant, which is when its first assertion stops
+/// describing the contract and must be rewritten rather than deleted.
 ///
 /// Arming converts every legacy lock into a live fenced row with no expiry,
 /// while fenced `Lock`/`Unlock`/`AdminLock` return `FAILED_PRECONDITION` and

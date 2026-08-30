@@ -185,10 +185,6 @@ pub async fn enforce_push_locks(
 /// The pure core: compute the set of changed paths on this push that are locked
 /// by a different user. Split out from `enforce_push_locks` so the conflict
 /// computation is unit-testable without the tonic `Status` mapping.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the owner pair and the issuer policy that proves it travel together"
-)]
 pub(crate) async fn collect_push_lock_conflicts(
     repository: Arc<RepositoryContext>,
     lock_store: &Arc<dyn LockStore>,

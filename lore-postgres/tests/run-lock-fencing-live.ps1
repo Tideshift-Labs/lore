@@ -39,15 +39,19 @@ $setupError = $null
 
 # Each entry is one compiled target plus the exact cases this runner owns.
 # `Exact` means the target may hold no other ignored case, so a case added
-# without updating this list is a setup failure rather than a silent skip. The
-# `lore-server` library also holds ignored cases owned by other packages, so it
-# is pinned by presence instead.
+# without updating this list is a setup failure rather than a silent skip.
+#
+# The `lore-server` library also holds ignored cases owned by other packages, so
+# it cannot be exact wholesale. `ExactPrefix` narrows the same guarantee to the
+# module this runner owns: a live case added under `governed_tests` without
+# joining this inventory is a setup failure, not a silent NOT RUN.
 $inventory = @(
     [pscustomobject]@{
-        Package = 'lore-postgres'
-        Target  = 'domain_lock_fencing'
-        Exact   = $true
-        Cases   = @(
+        Package     = 'lore-postgres'
+        Target      = 'domain_lock_fencing'
+        Exact       = $true
+        ExactPrefix = $null
+        Cases       = @(
             'two_coordinators_racing_one_resource_choose_exactly_one_owner_pair',
             'racing_batches_are_all_or_nothing',
             'same_subject_under_different_issuers_is_foreign_for_every_owner_operation',
@@ -58,6 +62,7 @@ $inventory = @(
             'lock_operations_reuse_cr029_receipt_bands_markers_and_quota',
             'lock_mutations_take_the_receipt_before_domain_and_namespace_rows',
             'missing_and_repeated_release_are_not_found_and_empty_list_is_ok',
+            'an_absent_schema_routes_legacy_but_a_partial_one_is_refused',
             'arming_is_refused_until_the_public_mutation_contract_exists',
             'readiness_rejects_each_missing_fenced_precondition',
             'same_database_identity_accepts_only_the_domain_authority_database',
@@ -67,25 +72,28 @@ $inventory = @(
         )
     },
     [pscustomobject]@{
-        Package = 'lore-postgres'
-        Target  = 'domain_migration_parity'
-        Exact   = $true
-        Cases   = @('migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs')
+        Package     = 'lore-postgres'
+        Target      = 'domain_migration_parity'
+        Exact       = $true
+        ExactPrefix = $null
+        Cases       = @('migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs')
     },
     [pscustomobject]@{
-        Package = 'lore-postgres'
-        Target  = 'domain_obliterate_fence'
-        Exact   = $true
-        Cases   = @(
+        Package     = 'lore-postgres'
+        Target      = 'domain_obliterate_fence'
+        Exact       = $true
+        ExactPrefix = $null
+        Cases       = @(
             'begin_obliterate_advances_live_generation_and_refuses_a_tombstoned_repository',
             'begin_obliterate_and_branch_push_commit_agree_on_the_repository_generation'
         )
     },
     [pscustomobject]@{
-        Package = 'lore-server'
-        Target  = 'lib'
-        Exact   = $false
-        Cases   = @(
+        Package     = 'lore-server'
+        Target      = 'lib'
+        Exact       = $false
+        ExactPrefix = 'grpc::handlers::branch_push::governed_tests::'
+        Cases       = @(
             'domain::tests::a_never_migrated_postgres_cell_boots_on_the_legacy_lock_route',
             'grpc::handlers::branch_push::tests::real_witness_capture_precedes_both_cr019_bypass_conditions',
             'grpc::handlers::branch_push::governed_tests::enforce_fenced_locks_blocks_a_push_from_a_foreign_owner_pair',
@@ -192,6 +200,14 @@ function Assert-ExpectedCatalog {
             if ($catalog.Count -ne $target.Cases.Count -or $unexpected.Count -ne 0) {
                 throw ("$label must hold exactly $($target.Cases.Count) ignored cases; catalog has " +
                     "$($catalog.Count). Unexpected=[$($unexpected -join ', ')]")
+            }
+        }
+        elseif ($null -ne $target.ExactPrefix) {
+            $scoped = @($catalog | Where-Object { $_.StartsWith($target.ExactPrefix) })
+            $unexpected = @($scoped | Where-Object { $_ -notin $target.Cases })
+            if ($unexpected.Count -ne 0) {
+                throw ("$label has ignored cases under '$($target.ExactPrefix)' that this runner " +
+                    "does not execute, so they are NOT RUN: [$($unexpected -join ', ')]")
             }
         }
     }

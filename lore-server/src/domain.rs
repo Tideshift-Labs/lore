@@ -444,6 +444,7 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
 fn resolve_lock_fencing(readiness: &LockFencingReadiness, settings: &Settings) -> Result<bool> {
     if !readiness.fencing_enabled {
         info!(
+            provisioned = readiness.provisioned,
             schema_version = readiness.schema_version,
             backfill_state = readiness.backfill_state,
             "Fenced lock routing is off; the public lock service remains on its legacy store"

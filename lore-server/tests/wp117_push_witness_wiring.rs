@@ -121,7 +121,7 @@ fn a_fenced_cell_checks_every_push_and_never_falls_back_to_the_legacy_guard() {
 /// Request validation precedes the witness read on both generations (P2-10).
 #[test]
 fn a_zero_revision_is_rejected_before_any_witness_capture() {
-    for (generation, handler) in [("v0", V0_HANDLER), ("v1", V1_HANDLER)] {
+    for handler in [V0_HANDLER, V1_HANDLER] {
         let request_path = between(
             handler,
             "let admitted = admit_at_entry(",
@@ -132,18 +132,19 @@ fn a_zero_revision_is_rejected_before_any_witness_capture() {
             "if revision.is_zero()",
             "let governed_push = prepare_governed_push(",
         );
-        assert!(
-            !request_path.is_empty(),
-            "{generation} request path must be readable"
-        );
     }
 }
 
 /// The WP-120 arming gate has exactly one bypass, and only tests use it.
 ///
 /// `enable_fencing_for_component_fixture` skips the public-contract refusal so
-/// the armed state stays reachable under test. If production code ever calls
-/// it, the refusal in `enable_fencing` is decorative.
+/// the armed state stays reachable under test. If production code ever named
+/// it, the refusal in `enable_fencing` would be decorative.
+///
+/// Matching the whole identifier rather than a `.method(` call shape is
+/// deliberate: UFCS (`PostgresLockCoordinator::enable_fencing_for_component_fixture(..)`),
+/// a function-pointer binding, and a call split across lines all reach the
+/// bypass without ever writing `.name(`.
 #[test]
 fn only_tests_bypass_the_public_mutation_contract_gate() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -151,34 +152,65 @@ fn only_tests_bypass_the_public_mutation_contract_gate() {
         .expect("lore-server must sit inside the workspace root");
     let mut offenders = Vec::new();
     for crate_name in ["lore-server", "lore-postgres"] {
-        collect_fixture_arming_callers(&workspace.join(crate_name).join("src"), &mut offenders);
+        collect_fixture_arming_references(&workspace.join(crate_name).join("src"), &mut offenders);
     }
     assert!(
         offenders.is_empty(),
-        "enable_fencing_for_component_fixture is a test-only bypass, but it is called from: {}",
+        "enable_fencing_for_component_fixture is a test-only bypass, but non-test source names \
+         it at: {}",
         offenders.join(", ")
     );
 }
 
-fn collect_fixture_arming_callers(directory: &Path, offenders: &mut Vec<String>) {
+/// The detector must actually detect. Without this, a matcher that silently
+/// stops matching reads as "no offenders" forever.
+#[test]
+fn the_bypass_detector_flags_every_spelling_of_a_call() {
+    for planted in [
+        "    coordinator.enable_fencing_for_component_fixture(false).await?;",
+        "    PostgresLockCoordinator::enable_fencing_for_component_fixture(&coordinator, false);",
+        "    let arm = PostgresLockCoordinator::enable_fencing_for_component_fixture;",
+        "    coordinator\n        .enable_fencing_for_component_fixture(false)\n        .await?;",
+    ] {
+        assert_eq!(
+            fixture_arming_reference_count(planted),
+            1,
+            "the detector missed a real call spelled as: {planted}"
+        );
+    }
+    // The definition site and its documentation are not call sites.
+    let definition = "/// See [`enable_fencing`](Self::enable_fencing).\n\
+                      #[doc(hidden)]\n\
+                      pub async fn enable_fencing_for_component_fixture(\n";
+    assert_eq!(fixture_arming_reference_count(definition), 0);
+}
+
+/// Lines that name the bypass, excluding its own definition and documentation.
+fn fixture_arming_reference_count(source: &str) -> usize {
+    source
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("//")
+                && !trimmed.starts_with("pub async fn enable_fencing_for_component_fixture")
+                && line.contains("enable_fencing_for_component_fixture")
+        })
+        .count()
+}
+
+fn collect_fixture_arming_references(directory: &Path, offenders: &mut Vec<String>) {
     let entries = std::fs::read_dir(directory).expect("source directory must be readable");
     for entry in entries {
         let path = entry.expect("directory entry must be readable").path();
         if path.is_dir() {
-            collect_fixture_arming_callers(&path, offenders);
+            collect_fixture_arming_references(&path, offenders);
             continue;
         }
         if path.extension().is_none_or(|extension| extension != "rs") {
             continue;
         }
         let source = std::fs::read_to_string(&path).expect("source file must be readable");
-        // The definition itself, its doc comment, and this fixture's own name
-        // are not call sites.
-        let calls = source
-            .lines()
-            .filter(|line| line.contains(".enable_fencing_for_component_fixture("))
-            .count();
-        if calls != 0 {
+        if fixture_arming_reference_count(&source) != 0 {
             offenders.push(path.display().to_string());
         }
     }
