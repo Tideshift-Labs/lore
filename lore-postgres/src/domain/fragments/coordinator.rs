@@ -633,6 +633,12 @@ impl PostgresFragmentCoordinator {
         // never be emitted (INV-EF P2-1, INV-EE's dead-fallback class). An
         // operator whose cell is ahead of the binary needs to be told to roll
         // the binary forward, not handed a field dump.
+        //
+        // The `provisioned` conjunct is defence, not load-bearing: an
+        // unprovisioned readiness reports `schema_version: 0`, which cannot
+        // exceed the compiled version anyway. It stays so the arm reads as
+        // "a provisioned cell is ahead of us" rather than relying on that
+        // arithmetic remaining true if the sentinel ever changes.
         if readiness.provisioned && readiness.schema_version > schema::FRAGMENT_SCHEMA_VERSION {
             return Err(DomainError::NotReady(format!(
                 "cell fragment schema_version {} is newer than this binary's {}; \
@@ -1686,9 +1692,24 @@ impl PostgresFragmentCoordinator {
             return Ok(CommitVerdict::Fenced);
         }
         let was_readable = head.state.is_readable();
-        // Confirmed once, before either arm branches, so both arms move scalars
-        // over a set this transaction has proved it holds.
-        let confirmed = confirm_lifecycle_fanout(&tx, &intent.hash, &fanout).await?;
+        // Confirmed once, before either arm branches, so whichever arm runs moves
+        // scalars over a set this transaction has proved it holds.
+        //
+        // Scoped to a readability *crossing* rather than run unconditionally.
+        // Both arms below move a scalar only when they cross the boundary, and
+        // an operation that moves no scalar has no repository rows to have
+        // locked — so confirming anyway would turn a grown fanout into a
+        // spurious retryable refusal on exactly the widely-shared-hash path that
+        // never needed the check. A `Staged`->`Remote` promotion is the case
+        // that bites: both states are readable, it crosses nothing, and an
+        // unconditional confirm made it fail under unrelated concurrent
+        // association churn.
+        let will_be_readable = matches!(observation, IoObservation::Valid(_));
+        let confirmed = if was_readable == will_be_readable {
+            Vec::new()
+        } else {
+            confirm_lifecycle_fanout(&tx, &intent.hash, &fanout).await?
+        };
 
         let manifest = match observation {
             IoObservation::Unusable(diagnostic) => {
@@ -2124,12 +2145,21 @@ async fn apply_lifecycle_generation(
 /// `FOR UPDATE`**, which for its one caller means passing the set returned by
 /// [`confirm_lifecycle_fanout`] and nothing else.
 ///
-/// Takes no `LockSequence::enter` for the same reason as
-/// [`bump_association_generation`]: `begin_obliterate` reaches it after
-/// `lock_lifecycle_fanout` has already entered `LockClass::Repository`, and a
-/// second entry is harmless only because same-class repeats are allowed —
-/// but it would still be registering a lock this function does not take. The
-/// guard therefore does not cover this write; the precondition does.
+/// Takes no `LockSequence::enter`, and — as with
+/// [`bump_association_generation`] — registering would be rejected rather than
+/// merely redundant. `begin_obliterate` reaches this *after* `lock_fragment_head`
+/// has advanced the sequence to `LockClass::Fragments` (position 4), so
+/// `enter(Repository)` at position 1 would be a downward move and
+/// `LockSequence` would fail the transaction. The rows were locked earlier, by
+/// `lock_lifecycle_fanout`, before the head.
+///
+/// An earlier revision of this comment said a second entry would be "harmless
+/// because same-class repeats are allowed". That was wrong — by this point the
+/// sequence is no longer on `Repository` — and it is the same
+/// claim-not-checked-against-the-code failure INV-EF raised as P1-3, committed
+/// inside the comment written to close P2-4.
+///
+/// The guard therefore does not cover this write; the precondition does.
 async fn bump_association_generation_many(
     tx: &Transaction<'_>,
     repositories: &[Vec<u8>],

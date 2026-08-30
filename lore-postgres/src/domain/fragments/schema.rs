@@ -308,22 +308,49 @@ mod tests {
     /// raw SQL with a literal. The migration/runtime parity test compares
     /// catalog *shape*, not row contents, so nothing else would notice a bump
     /// applied to one and not the other (INV-EF P2-9).
-    #[test]
-    fn seed_schema_version_matches_the_constant() {
-        let marker = "AS schema_version";
-        let line = FRAGMENT_SCHEMA
+    /// Pull the aliased `schema_version` literal out of one DDL body.
+    fn seeded_schema_version(ddl: &str, source: &str) -> i64 {
+        let line = ddl
             .lines()
-            .find(|line| line.contains(marker))
-            .expect("the seed must alias its schema_version literal so this test can find it");
-        let literal: i64 = line
-            .split_whitespace()
+            .find(|line| line.contains("AS schema_version"))
+            .unwrap_or_else(|| {
+                panic!("{source} must alias its schema_version literal so this test can find it")
+            });
+        line.split_whitespace()
             .next()
             .and_then(|token| token.parse().ok())
-            .expect("the aliased schema_version column must lead with a bare integer literal");
+            .unwrap_or_else(|| {
+                panic!("{source}'s aliased schema_version column must lead with an integer literal")
+            })
+    }
+
+    #[test]
+    fn seed_schema_version_matches_the_constant() {
+        let literal = seeded_schema_version(FRAGMENT_SCHEMA, "the FRAGMENT_SCHEMA seed");
         assert_eq!(
             literal, FRAGMENT_SCHEMA_VERSION,
             "the FRAGMENT_SCHEMA seed writes schema_version {literal} but bootstrap() binds \
              FRAGMENT_SCHEMA_VERSION = {FRAGMENT_SCHEMA_VERSION}; bump both or neither"
+        );
+    }
+
+    /// The Rust-side pin above is only half the guard.
+    ///
+    /// **Three** places carry this version: `bootstrap()` binds the constant,
+    /// [`FRAGMENT_SCHEMA`] seeds a literal, and `migrations/0001_init.sql`
+    /// carries its own copy of that seed. Migration/runtime parity compares
+    /// catalog *shape*, not row contents, so a bump applied to the Rust const
+    /// alone would still diverge from the migration silently — which is the
+    /// risk INV-EF P2-9 actually named, and which pinning only the const leaves
+    /// open.
+    #[test]
+    fn the_migration_seeds_the_same_schema_version_as_the_runtime_const() {
+        let migration = include_str!("../../../migrations/0001_init.sql");
+        assert_eq!(
+            seeded_schema_version(migration, "migrations/0001_init.sql"),
+            FRAGMENT_SCHEMA_VERSION,
+            "the migration's fragment schema-state seed has drifted from \
+             FRAGMENT_SCHEMA_VERSION; a schema change is two edits in one commit"
         );
     }
 
