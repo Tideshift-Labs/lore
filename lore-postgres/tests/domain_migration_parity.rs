@@ -21,6 +21,7 @@
 
 use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::pool::TlsConfig;
+use lore_postgres::store::lock_store::PostgresLockStore;
 
 /// The migration file WP-116 Phase 2 keeps in lockstep with the three
 /// `domain/*schema*.rs` DDL consts. A real file (not a moving in-flight
@@ -145,14 +146,15 @@ async fn table_snapshot(client: &tokio_postgres::Client, table: &str) -> Vec<Str
     lines
 }
 
-/// The full catalog snapshot: every `lore_domain_*`/`lore_outbox_*` table plus
-/// its columns/constraints/indexes, as one sorted, diffable set of lines.
+/// The full catalog snapshot: every domain/outbox table plus the legacy lock
+/// table extended by SCHEMA-117, and all domain sequences/functions/triggers.
 async fn domain_catalog_snapshot(client: &tokio_postgres::Client) -> Vec<String> {
     let tables = client
         .query(
             "SELECT table_name FROM information_schema.tables \
              WHERE table_schema = 'public' \
-               AND (table_name LIKE 'lore_domain_%' OR table_name LIKE 'lore_outbox_%') \
+               AND (table_name LIKE 'lore_domain_%' OR table_name LIKE 'lore_outbox_%' \
+                    OR table_name = 'lore_locks') \
              ORDER BY table_name",
             &[],
         )
@@ -167,6 +169,62 @@ async fn domain_catalog_snapshot(client: &tokio_postgres::Client) -> Vec<String>
     for row in tables {
         let name: String = row.get("table_name");
         snapshot.extend(table_snapshot(client, &name).await);
+    }
+
+    let sequences = client
+        .query(
+            "SELECT sequencename, start_value, min_value, max_value, increment_by, cycle \
+               FROM pg_sequences WHERE schemaname = 'public' \
+                AND sequencename LIKE 'lore_domain_%' ORDER BY sequencename",
+            &[],
+        )
+        .await
+        .expect("list domain sequences");
+    for row in sequences {
+        let name: String = row.get("sequencename");
+        let start: i64 = row.get("start_value");
+        let min: i64 = row.get("min_value");
+        let max: i64 = row.get("max_value");
+        let increment: i64 = row.get("increment_by");
+        let cycle: bool = row.get("cycle");
+        snapshot.push(format!(
+            "sequence::{name}::start={start}::min={min}::max={max}::increment={increment}::cycle={cycle}"
+        ));
+    }
+
+    let functions = client
+        .query(
+            "SELECT p.proname, pg_get_functiondef(p.oid) AS def \
+               FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace \
+              WHERE n.nspname = 'public' AND p.proname LIKE 'lore_domain_%' \
+              ORDER BY p.proname, p.oid",
+            &[],
+        )
+        .await
+        .expect("list domain functions");
+    for row in functions {
+        let name: String = row.get("proname");
+        let definition: String = row.get("def");
+        snapshot.push(format!("function::{name}::{definition}"));
+    }
+
+    let triggers = client
+        .query(
+            "SELECT c.relname, t.tgname, pg_get_triggerdef(t.oid, true) AS def \
+               FROM pg_trigger AS t JOIN pg_class AS c ON c.oid = t.tgrelid \
+               JOIN pg_namespace AS n ON n.oid = c.relnamespace \
+              WHERE n.nspname = 'public' AND NOT t.tgisinternal \
+                AND (c.relname LIKE 'lore_domain_%' OR c.relname = 'lore_locks') \
+              ORDER BY c.relname, t.tgname",
+            &[],
+        )
+        .await
+        .expect("list domain triggers");
+    for row in triggers {
+        let table: String = row.get("relname");
+        let name: String = row.get("tgname");
+        let definition: String = row.get("def");
+        snapshot.push(format!("trigger::{table}::{name}::{definition}"));
     }
     snapshot.sort();
     snapshot
@@ -193,6 +251,9 @@ async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_cat
         .await
         .expect("apply migrations/0001_init.sql wholesale to the migration-side database");
 
+    let _runtime_lock_store = PostgresLockStore::connect(&runtime_url, 2, &TlsConfig::default())
+        .await
+        .expect("boot legacy lock store before SCHEMA-117 migration fixture");
     let runtime_store = PostgresDomainStore::connect(&runtime_url, 2, &TlsConfig::default())
         .await
         .expect("boot PostgresDomainStore against the runtime-side database");

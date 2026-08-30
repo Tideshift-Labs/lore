@@ -646,7 +646,13 @@ async fn consume_is_single_use_once_the_receipt_is_terminal() {
         .expect("roll back read-only second attempt");
 
     assert!(
-        matches!(second, ConsumeResult::Committed(DomainOutcome::Applied)),
+        matches!(
+            second,
+            ConsumeResult::Committed {
+                outcome: DomainOutcome::Applied,
+                ..
+            }
+        ),
         "consume must replay the committed outcome once the receipt is terminal"
     );
 }
@@ -865,7 +871,7 @@ async fn consume_expires_a_past_ttl_prepared_row() {
 
     assert_eq!(
         match result {
-            ConsumeResult::Committed(outcome) => outcome,
+            ConsumeResult::Committed { outcome, .. } => outcome,
             _ => panic!("consume of a past-TTL row must return its committed outcome"),
         },
         DomainOutcome::NotApplied {

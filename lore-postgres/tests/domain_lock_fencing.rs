@@ -13,6 +13,7 @@ use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
 use lore_postgres::domain::coordinator::RepositoryCreateInput;
+use lore_postgres::domain::coordinator::RepositoryDeleteInput;
 use lore_postgres::domain::errors::DomainError;
 use lore_postgres::domain::errors::DomainOutcome;
 use lore_postgres::domain::lock_order::LockClass;
@@ -27,7 +28,10 @@ use lore_postgres::domain::locks::LockResourceInput;
 use lore_postgres::domain::locks::PostgresLockCoordinator;
 use lore_postgres::domain::locks::ReleaseInput;
 use lore_postgres::domain::locks::VerifiedLockOwner;
+use lore_postgres::domain::locks::acquire_or_renew_binding;
+use lore_postgres::domain::locks::force_release_binding;
 use lore_postgres::domain::locks::lock_tenant_scope_key;
+use lore_postgres::domain::locks::release_binding;
 use lore_postgres::domain::receipts::MARKER_SAFETY_EPSILON;
 use lore_postgres::domain::receipts::NORMAL_FUTURE_SKEW;
 use lore_postgres::domain::receipts::OperationBinding;
@@ -108,6 +112,16 @@ async fn prepare_operation(
     branch_id: &[u8],
     method: &str,
 ) -> GovernedOperation {
+    prepare_bound_operation(store, owner, repository_id, branch_id, binding(method)).await
+}
+
+async fn prepare_bound_operation(
+    store: &PostgresDomainStore,
+    owner: &VerifiedLockOwner,
+    repository_id: &[u8],
+    branch_id: &[u8],
+    binding: OperationBinding,
+) -> GovernedOperation {
     let clock = store
         .domain_operation_clock_get()
         .await
@@ -119,7 +133,6 @@ async fn prepare_operation(
             .expect("canonical lock tenant scope"),
         operation_id: uuid_v7_at(clock),
     };
-    let binding = binding(method);
     let prepared = store
         .domain_operation_prepare(&key, &binding, None)
         .await
@@ -222,26 +235,24 @@ async fn acquire_one(
     hash: [u8; 32],
     lease: Option<Duration>,
 ) -> lore_postgres::domain::locks::FencedLock {
-    let operation = prepare_operation(
+    let input = acquire_input(
+        repository_id,
+        branch_id,
+        lock_owner.clone(),
+        vec![resource(hash, None)],
+        lease,
+    );
+    let operation = prepare_bound_operation(
         store,
         lock_owner,
         repository_id,
         branch_id,
-        "lock.acquire_or_renew",
+        acquire_or_renew_binding(&input).expect("valid acquire binding"),
     )
     .await;
     let result = store
         .lock_coordinator()
-        .acquire_or_renew(
-            &operation,
-            &acquire_input(
-                repository_id,
-                branch_id,
-                lock_owner.clone(),
-                vec![resource(hash, None)],
-                lease,
-            ),
-        )
+        .acquire_or_renew(&operation, &input)
         .await
         .expect("acquire lock");
     assert_eq!(result.outcome, DomainOutcome::Applied);
@@ -269,22 +280,6 @@ async fn two_coordinators_racing_one_resource_choose_exactly_one_owner_pair() {
     let owner_a = owner("https://issuer-a.example", "shared-subject");
     let owner_b = owner("https://issuer-b.example", "shared-subject");
     let hash: [u8; 32] = rand::random();
-    let operation_a = prepare_operation(
-        &store_a,
-        &owner_a,
-        &repository_id,
-        &branch_id,
-        "lock.race.a",
-    )
-    .await;
-    let operation_b = prepare_operation(
-        &store_b,
-        &owner_b,
-        &repository_id,
-        &branch_id,
-        "lock.race.b",
-    )
-    .await;
     let input_a = acquire_input(
         &repository_id,
         &branch_id,
@@ -299,6 +294,22 @@ async fn two_coordinators_racing_one_resource_choose_exactly_one_owner_pair() {
         vec![resource(hash, None)],
         None,
     );
+    let operation_a = prepare_bound_operation(
+        &store_a,
+        &owner_a,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&input_a).expect("race A binding"),
+    )
+    .await;
+    let operation_b = prepare_bound_operation(
+        &store_b,
+        &owner_b,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&input_b).expect("race B binding"),
+    )
+    .await;
     let coordinator_a = store_a.lock_coordinator();
     let coordinator_b = store_b.lock_coordinator();
 
@@ -338,22 +349,6 @@ async fn racing_batches_are_all_or_nothing() {
     let common: [u8; 32] = rand::random();
     let only_a: [u8; 32] = rand::random();
     let only_b: [u8; 32] = rand::random();
-    let operation_a = prepare_operation(
-        &store_a,
-        &owner_a,
-        &repository_id,
-        &branch_id,
-        "lock.batch.a",
-    )
-    .await;
-    let operation_b = prepare_operation(
-        &store_b,
-        &owner_b,
-        &repository_id,
-        &branch_id,
-        "lock.batch.b",
-    )
-    .await;
     let input_a = acquire_input(
         &repository_id,
         &branch_id,
@@ -368,6 +363,22 @@ async fn racing_batches_are_all_or_nothing() {
         vec![resource(common, None), resource(only_b, None)],
         None,
     );
+    let operation_a = prepare_bound_operation(
+        &store_a,
+        &owner_a,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&input_a).expect("batch A binding"),
+    )
+    .await;
+    let operation_b = prepare_bound_operation(
+        &store_b,
+        &owner_b,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&input_b).expect("batch B binding"),
+    )
+    .await;
     let coordinator_a = store_a.lock_coordinator();
     let coordinator_b = store_b.lock_coordinator();
 
@@ -420,71 +431,65 @@ async fn same_subject_under_different_issuers_is_foreign_for_every_owner_operati
     let hash: [u8; 32] = rand::random();
     let held = acquire_one(&store, &owner_a, &repository_id, &branch_id, hash, None).await;
 
-    let acquire_op = prepare_operation(
+    let foreign_acquire_input = acquire_input(
+        &repository_id,
+        &branch_id,
+        owner_b.clone(),
+        vec![resource(hash, None)],
+        None,
+    );
+    let acquire_op = prepare_bound_operation(
         &store,
         &owner_b,
         &repository_id,
         &branch_id,
-        "lock.foreign.acquire",
+        acquire_or_renew_binding(&foreign_acquire_input).expect("foreign acquire binding"),
     )
     .await;
     let acquire = coordinator
-        .acquire_or_renew(
-            &acquire_op,
-            &acquire_input(
-                &repository_id,
-                &branch_id,
-                owner_b.clone(),
-                vec![resource(hash, None)],
-                None,
-            ),
-        )
+        .acquire_or_renew(&acquire_op, &foreign_acquire_input)
         .await
         .expect("foreign acquire result");
     assert_rejection(&acquire, LockRejection::ForeignOwner);
 
-    let renew_op = prepare_operation(
+    let renew_input = acquire_input(
+        &repository_id,
+        &branch_id,
+        owner_b.clone(),
+        vec![resource(hash, Some(held.ownership_token))],
+        None,
+    );
+    let renew_op = prepare_bound_operation(
         &store,
         &owner_b,
         &repository_id,
         &branch_id,
-        "lock.foreign.renew",
+        acquire_or_renew_binding(&renew_input).expect("foreign renew binding"),
     )
     .await;
     let renew = coordinator
-        .acquire_or_renew(
-            &renew_op,
-            &acquire_input(
-                &repository_id,
-                &branch_id,
-                owner_b.clone(),
-                vec![resource(hash, Some(held.ownership_token))],
-                None,
-            ),
-        )
+        .acquire_or_renew(&renew_op, &renew_input)
         .await
         .expect("foreign renew result");
     assert_rejection(&renew, LockRejection::ForeignOwner);
 
-    let release_op = prepare_operation(
+    let release_input = ReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        owner: owner_b.clone(),
+        resources: vec![resource(hash, Some(held.ownership_token))],
+        event: None,
+    };
+    let release_op = prepare_bound_operation(
         &store,
         &owner_b,
         &repository_id,
         &branch_id,
-        "lock.foreign.release",
+        release_binding(&release_input).expect("foreign release binding"),
     )
     .await;
     let release = coordinator
-        .release(
-            &release_op,
-            &ReleaseInput {
-                repository_id: repository_id.to_vec(),
-                branch_id: branch_id.to_vec(),
-                owner: owner_b.clone(),
-                resources: vec![resource(hash, Some(held.ownership_token))],
-                event: None,
-            },
-        )
+        .release(&release_op, &release_input)
         .await
         .expect("foreign release result");
     assert_rejection(&release, LockRejection::AuthorityMismatch);
@@ -517,6 +522,46 @@ async fn same_subject_under_different_issuers_is_foreign_for_every_owner_operati
             .owner,
         owner_a
     );
+
+    let replay_hash: [u8; 32] = rand::random();
+    let replay_input = acquire_input(
+        &repository_id,
+        &branch_id,
+        owner_b.clone(),
+        vec![resource(replay_hash, None)],
+        None,
+    );
+    let replay_operation = prepare_bound_operation(
+        &store,
+        &owner_b,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&replay_input).expect("replay binding"),
+    )
+    .await;
+    let first = coordinator
+        .acquire_or_renew(&replay_operation, &replay_input)
+        .await
+        .expect("first replay-shaped acquire");
+    let replay = coordinator
+        .acquire_or_renew(&replay_operation, &replay_input)
+        .await
+        .expect("exact acquire replay");
+    assert!(replay.replayed);
+    assert_eq!(replay.outcome, first.outcome);
+    assert_eq!(
+        replay.locks, first.locks,
+        "replay must retain token and fence"
+    );
+
+    let mut mismatched_input = replay_input.clone();
+    mismatched_input.resources[0]
+        .description
+        .push_str("-changed");
+    let mismatch = coordinator
+        .acquire_or_renew(&replay_operation, &mismatched_input)
+        .await;
+    assert!(matches!(mismatch, Err(DomainError::InvalidInput(_))));
 }
 
 #[tokio::test]
@@ -560,72 +605,66 @@ async fn stale_release_renew_force_and_cleanup_cannot_touch_a_successor() {
     )
     .await;
 
-    let stale_release_op = prepare_operation(
+    let stale_release_input = ReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        owner: owner_a.clone(),
+        resources: vec![resource(hash, Some(predecessor.ownership_token))],
+        event: None,
+    };
+    let stale_release_op = prepare_bound_operation(
         &store,
         &owner_a,
         &repository_id,
         &branch_id,
-        "lock.stale.release",
+        release_binding(&stale_release_input).expect("stale release binding"),
     )
     .await;
     let stale_release = coordinator
-        .release(
-            &stale_release_op,
-            &ReleaseInput {
-                repository_id: repository_id.to_vec(),
-                branch_id: branch_id.to_vec(),
-                owner: owner_a.clone(),
-                resources: vec![resource(hash, Some(predecessor.ownership_token))],
-                event: None,
-            },
-        )
+        .release(&stale_release_op, &stale_release_input)
         .await
         .expect("stale release result");
     assert_rejection(&stale_release, LockRejection::AuthorityMismatch);
 
-    let stale_renew_op = prepare_operation(
+    let stale_renew_input = acquire_input(
+        &repository_id,
+        &branch_id,
+        owner_a.clone(),
+        vec![resource(hash, Some(predecessor.ownership_token))],
+        Some(Duration::from_secs(2)),
+    );
+    let stale_renew_op = prepare_bound_operation(
         &store,
         &owner_a,
         &repository_id,
         &branch_id,
-        "lock.stale.renew",
+        acquire_or_renew_binding(&stale_renew_input).expect("stale renew binding"),
     )
     .await;
     let stale_renew = coordinator
-        .acquire_or_renew(
-            &stale_renew_op,
-            &acquire_input(
-                &repository_id,
-                &branch_id,
-                owner_a.clone(),
-                vec![resource(hash, Some(predecessor.ownership_token))],
-                Some(Duration::from_secs(2)),
-            ),
-        )
+        .acquire_or_renew(&stale_renew_op, &stale_renew_input)
         .await
         .expect("stale renew result");
     assert_rejection(&stale_renew, LockRejection::ForeignOwner);
 
-    let stale_force_op = prepare_operation(
+    let stale_force_input = ForceReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        target_owner: owner_a,
+        acting_owner: admin.clone(),
+        resources: vec![resource(hash, Some(predecessor.ownership_token))],
+        event: None,
+    };
+    let stale_force_op = prepare_bound_operation(
         &store,
         &admin,
         &repository_id,
         &branch_id,
-        "lock.stale.force",
+        force_release_binding(&stale_force_input).expect("stale force binding"),
     )
     .await;
     let stale_force = coordinator
-        .force_release(
-            &stale_force_op,
-            &ForceReleaseInput {
-                repository_id: repository_id.to_vec(),
-                branch_id: branch_id.to_vec(),
-                target_owner: owner_a,
-                acting_owner: admin,
-                resources: vec![resource(hash, Some(predecessor.ownership_token))],
-                event: None,
-            },
-        )
+        .force_release(&stale_force_op, &stale_force_input)
         .await
         .expect("stale force result");
     assert_rejection(&stale_force, LockRejection::AuthorityMismatch);
@@ -661,13 +700,36 @@ async fn obsolete_repository_and_branch_generations_make_rows_logically_absent()
     };
     let store = store(&url).await;
     let coordinator = store.lock_coordinator();
-    let direct = client(&url).await;
     let (repository_id, branch_id) = create_repository(&store).await;
     let lock_owner = owner("https://issuer.example", "generation-owner");
     let hash: [u8; 32] = rand::random();
     let old = acquire_one(&store, &lock_owner, &repository_id, &branch_id, hash, None).await;
+    let initial_witness = coordinator
+        .capture_push_witness(&repository_id, &branch_id)
+        .await
+        .expect("initial lock witness");
 
-    direct.execute("UPDATE lore_domain_repositories SET lock_generation = lock_generation + 1 WHERE repository_id = $1", &[&repository_id.as_slice()]).await.expect("invalidate repository lock generation");
+    let obliterate_operation = prepare_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        "begin_obliterate",
+    )
+    .await;
+    let obliterate = store
+        .begin_obliterate(&obliterate_operation, &repository_id)
+        .await
+        .expect("begin real repository obliteration");
+    assert_eq!(obliterate.outcome, DomainOutcome::Applied);
+    let obliterate_witness = coordinator
+        .capture_push_witness(&repository_id, &branch_id)
+        .await
+        .expect("post-obliteration lock witness");
+    assert!(
+        obliterate_witness.repository_lock_generation > initial_witness.repository_lock_generation,
+        "the real begin_obliterate generation update must propagate to the namespace"
+    );
     assert!(
         coordinator
             .status(&repository_id, &branch_id, &hash)
@@ -679,7 +741,41 @@ async fn obsolete_repository_and_branch_generations_make_rows_logically_absent()
         acquire_one(&store, &lock_owner, &repository_id, &branch_id, hash, None).await;
     assert!(replacement.fence > old.fence);
 
-    direct.execute("UPDATE lore_domain_branches SET lock_generation = lock_generation + 1 WHERE repository_id = $1 AND branch_id = $2", &[&repository_id.as_slice(), &branch_id.as_slice()]).await.expect("invalidate branch lock generation");
+    let delete_operation = prepare_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        "repository_delete",
+    )
+    .await;
+    let deleted = store
+        .repository_delete(
+            &delete_operation,
+            &RepositoryDeleteInput {
+                repository_id: repository_id.to_vec(),
+                expected_generation: obliterate.repository_generation,
+                delete_proof: rand::random::<[u8; 32]>().to_vec(),
+                projection: Vec::new(),
+                event: None,
+            },
+        )
+        .await
+        .expect("tombstone real repository and branch rows");
+    assert_eq!(deleted.outcome, DomainOutcome::Applied);
+    let tombstone_witness = coordinator
+        .capture_push_witness(&repository_id, &branch_id)
+        .await
+        .expect("post-tombstone lock witness");
+    assert!(
+        tombstone_witness.repository_lock_generation
+            > obliterate_witness.repository_lock_generation,
+        "the real repository tombstone must propagate its lock generation"
+    );
+    assert!(
+        tombstone_witness.branch_lock_generation > obliterate_witness.branch_lock_generation,
+        "the branch tombstone written by repository_delete must propagate its lock generation"
+    );
     assert!(
         coordinator
             .status(&repository_id, &branch_id, &hash)
@@ -687,8 +783,6 @@ async fn obsolete_repository_and_branch_generations_make_rows_logically_absent()
             .expect("status after branch invalidation")
             .is_none()
     );
-    let newest = acquire_one(&store, &lock_owner, &repository_id, &branch_id, hash, None).await;
-    assert!(newest.fence > replacement.fence);
 }
 
 #[tokio::test]
@@ -710,14 +804,6 @@ async fn lease_clock_is_captured_after_the_namespace_lock_wait() {
         .expect("enable finite leases");
     let lock_owner = owner("https://issuer.example", "wait-owner");
     let hash: [u8; 32] = rand::random();
-    let operation = prepare_operation(
-        &store,
-        &lock_owner,
-        &repository_id,
-        &branch_id,
-        "lock.wait.clock",
-    )
-    .await;
     let input = acquire_input(
         &repository_id,
         &branch_id,
@@ -725,6 +811,14 @@ async fn lease_clock_is_captured_after_the_namespace_lock_wait() {
         vec![resource(hash, None)],
         Some(Duration::from_millis(250)),
     );
+    let operation = prepare_bound_operation(
+        &store,
+        &input.owner,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&input).expect("wait binding"),
+    )
+    .await;
 
     let mut blocker = client(&url).await;
     let blocker_tx = blocker
@@ -837,14 +931,6 @@ async fn lock_mutations_take_the_receipt_before_domain_and_namespace_rows() {
     let (repository_id, branch_id) = create_repository(&store).await;
     let lock_owner = owner("https://issuer.example", "order-owner");
     let hash: [u8; 32] = rand::random();
-    let operation = prepare_operation(
-        &store,
-        &lock_owner,
-        &repository_id,
-        &branch_id,
-        "lock.order",
-    )
-    .await;
     let input = acquire_input(
         &repository_id,
         &branch_id,
@@ -852,6 +938,14 @@ async fn lock_mutations_take_the_receipt_before_domain_and_namespace_rows() {
         vec![resource(hash, None)],
         None,
     );
+    let operation = prepare_bound_operation(
+        &store,
+        &input.owner,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&input).expect("lock-order binding"),
+    )
+    .await;
 
     let mut blocker = client(&url).await;
     let blocker_tx = blocker
@@ -911,94 +1005,88 @@ async fn missing_and_repeated_release_are_not_found_and_empty_list_is_ok() {
     let (repository_id, branch_id) = create_repository(&store).await;
     let lock_owner = owner("https://issuer.example", "release-owner");
     let missing_hash: [u8; 32] = rand::random();
-    let missing_op = prepare_operation(
+    let missing_input = ReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        owner: lock_owner.clone(),
+        resources: vec![resource(missing_hash, Some(rand::random()))],
+        event: None,
+    };
+    let missing_op = prepare_bound_operation(
         &store,
         &lock_owner,
         &repository_id,
         &branch_id,
-        "lock.release.missing",
+        release_binding(&missing_input).expect("missing release binding"),
     )
     .await;
     let missing = coordinator
-        .release(
-            &missing_op,
-            &ReleaseInput {
-                repository_id: repository_id.to_vec(),
-                branch_id: branch_id.to_vec(),
-                owner: lock_owner.clone(),
-                resources: vec![resource(missing_hash, Some(rand::random()))],
-                event: None,
-            },
-        )
+        .release(&missing_op, &missing_input)
         .await
         .expect("missing release");
     assert_rejection(&missing, LockRejection::NotFound);
 
     let hash: [u8; 32] = rand::random();
     let held = acquire_one(&store, &lock_owner, &repository_id, &branch_id, hash, None).await;
-    let release_op = prepare_operation(
+    let release_input = ReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        owner: lock_owner.clone(),
+        resources: vec![resource(hash, Some(held.ownership_token))],
+        event: None,
+    };
+    let release_op = prepare_bound_operation(
         &store,
         &lock_owner,
         &repository_id,
         &branch_id,
-        "lock.release.first",
+        release_binding(&release_input).expect("first release binding"),
     )
     .await;
     let released = coordinator
-        .release(
-            &release_op,
-            &ReleaseInput {
-                repository_id: repository_id.to_vec(),
-                branch_id: branch_id.to_vec(),
-                owner: lock_owner.clone(),
-                resources: vec![resource(hash, Some(held.ownership_token))],
-                event: None,
-            },
-        )
+        .release(&release_op, &release_input)
         .await
         .expect("first release");
     assert_eq!(released.outcome, DomainOutcome::Applied);
-    let repeat_op = prepare_operation(
+    let repeat_input = ReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        owner: lock_owner.clone(),
+        resources: vec![resource(hash, Some(held.ownership_token))],
+        event: None,
+    };
+    let repeat_op = prepare_bound_operation(
         &store,
         &lock_owner,
         &repository_id,
         &branch_id,
-        "lock.release.repeat",
+        release_binding(&repeat_input).expect("repeat release binding"),
     )
     .await;
     let repeated = coordinator
-        .release(
-            &repeat_op,
-            &ReleaseInput {
-                repository_id: repository_id.to_vec(),
-                branch_id: branch_id.to_vec(),
-                owner: lock_owner,
-                resources: vec![resource(hash, Some(held.ownership_token))],
-                event: None,
-            },
-        )
+        .release(&repeat_op, &repeat_input)
         .await
         .expect("repeated release");
     assert_rejection(&repeated, LockRejection::NotFound);
 
+    let empty_owner = owner("https://issuer.example", "empty");
+    let empty_input = ReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        owner: empty_owner.clone(),
+        resources: Vec::new(),
+        event: None,
+    };
+    let empty_operation = prepare_bound_operation(
+        &store,
+        &empty_owner,
+        &repository_id,
+        &branch_id,
+        release_binding(&empty_input).expect("empty release binding"),
+    )
+    .await;
     let empty_result = coordinator
-        .release(
-            &prepare_operation(
-                &store,
-                &owner("https://issuer.example", "empty"),
-                &repository_id,
-                &branch_id,
-                "lock.release.empty",
-            )
-            .await,
-            &ReleaseInput {
-                repository_id: repository_id.to_vec(),
-                branch_id: branch_id.to_vec(),
-                owner: owner("https://issuer.example", "empty"),
-                resources: Vec::new(),
-                event: None,
-            },
-        )
+        .release(&empty_operation, &empty_input)
         .await
         .expect("empty release");
     assert_eq!(empty_result.outcome, DomainOutcome::Applied);
@@ -1032,7 +1120,41 @@ async fn readiness_rejects_each_missing_fenced_precondition() {
             && ready.same_database
             && ready.sequence_headroom
             && ready.quarantined_rows == 0
+            && ready.unfenced_rows == 0
     );
+
+    let late_legacy_hash: [u8; 32] = rand::random();
+    direct.execute("INSERT INTO lore_locks(repository,branch,hash,owner,description,locked_at) VALUES($1,$2,$3,'legacy-late','late legacy row',0)", &[&repository_id.as_slice(), &branch_id.as_slice(), &late_legacy_hash.as_slice()]).await.expect("insert late legacy row");
+    assert_eq!(
+        coordinator
+            .readiness()
+            .await
+            .expect("late legacy readiness")
+            .unfenced_rows,
+        1
+    );
+    assert!(
+        coordinator
+            .status(&repository_id, &branch_id, &late_legacy_hash)
+            .await
+            .expect("late legacy status must not panic")
+            .is_none()
+    );
+    assert!(matches!(
+        coordinator.enable_fencing(false).await,
+        Err(DomainError::NotReady(_))
+    ));
+    direct
+        .execute(
+            "DELETE FROM lore_locks WHERE repository=$1 AND branch=$2 AND hash=$3",
+            &[
+                &repository_id.as_slice(),
+                &branch_id.as_slice(),
+                &late_legacy_hash.as_slice(),
+            ],
+        )
+        .await
+        .expect("remove late legacy row");
 
     let identity: String = direct
         .query_one(

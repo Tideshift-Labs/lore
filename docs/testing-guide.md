@@ -357,7 +357,8 @@ will update an older check constraint or state schema.
   materialization provisions the org row at revision/count 0 and atomically charges both. A
   capacity-revision rejection case must reread the seeded revision before submitting a mismatch.
 - **CR-030 lock fencing [SERVER, WP-117]**: the runner pins 14 ignored cases in
-  `domain_lock_fencing.rs` plus the migration/runtime parity case, each in a fresh database. Batch tests need distinct earlier-sorted keys
+  `domain_lock_fencing.rs`, the migration/runtime parity case, and an executable loreserver
+  component fixture for both CR-019 bypasses, each in a fresh database. Batch tests need distinct earlier-sorted keys
   plus a shared later key (three rows expose a committed loser). Receipt-first tests block the repo
   row and expect SQLSTATE 55P03 from a receipt `FOR UPDATE NOWAIT`; lease tests hold the namespace
   lock past the lease, then require a full lease. Only `tests/run-lock-fencing-live.ps1` is evidence.

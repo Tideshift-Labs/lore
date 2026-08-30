@@ -49,10 +49,12 @@ $expectedCases = @(
     'push_witness_capture_and_transaction_local_revalidation_detect_change'
 )
 $migrationParityCase = 'migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs'
+$pushBypassCase = 'grpc::handlers::branch_push::tests::real_witness_capture_precedes_both_cr019_bypass_conditions'
 
 $results = @(
     foreach ($testName in $expectedCases) {
         [pscustomobject]@{
+            Package = 'lore-postgres'
             Target = 'domain_lock_fencing'
             Test   = $testName
             Status = 'NOT RUN'
@@ -63,8 +65,18 @@ $results = @(
     }
 )
 $results += [pscustomobject]@{
+    Package = 'lore-postgres'
     Target = 'domain_migration_parity'
     Test   = $migrationParityCase
+    Status = 'NOT RUN'
+    Passed = 0
+    Failed = 0
+    Ran    = 0
+}
+$results += [pscustomobject]@{
+    Package = 'lore-server'
+    Target = 'lib'
+    Test   = $pushBypassCase
     Status = 'NOT RUN'
     Passed = 0
     Failed = 0
@@ -150,6 +162,32 @@ function Get-MigrationParityTestCatalog {
     )
 }
 
+function Get-PushBypassTestCatalog {
+    Push-Location $loreRoot
+    $priorErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $listArgs = @('test', '-p', 'lore-server', '--lib', '--', '--ignored', '--list')
+        $output = & cargo @listArgs 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $priorErrorAction
+        Pop-Location
+    }
+    if ($exitCode -ne 0) {
+        throw "push-bypass test catalog failed:`n$output"
+    }
+    return @(
+        foreach ($line in ($output -split "`r?`n")) {
+            $match = [regex]::Match($line, '^(?<name>[A-Za-z0-9_:]+): test$')
+            if ($match.Success) {
+                $match.Groups['name'].Value
+            }
+        }
+    )
+}
+
 function Assert-ExpectedCatalog {
     $catalog = @(Get-LockFencingTestCatalog)
     $missing = @($expectedCases | Where-Object { $_ -notin $catalog })
@@ -163,6 +201,10 @@ function Assert-ExpectedCatalog {
     $parityCatalog = @(Get-MigrationParityTestCatalog)
     if ($parityCatalog.Count -ne 1 -or $migrationParityCase -notin $parityCatalog) {
         throw "expected exactly the migration parity case '$migrationParityCase'; catalog=[$($parityCatalog -join ', ')]"
+    }
+    $pushCatalog = @(Get-PushBypassTestCatalog)
+    if (@($pushCatalog | Where-Object { $_ -eq $pushBypassCase }).Count -ne 1) {
+        throw "expected the executable push-bypass case '$pushBypassCase' exactly once"
     }
 }
 
@@ -257,10 +299,14 @@ try {
             $priorErrorAction = $ErrorActionPreference
             try {
                 $ErrorActionPreference = 'Continue'
-                $cargoArgs = @(
-                    'test', '-p', 'lore-postgres', '--test', $result.Target, '--',
-                    '--ignored', '--exact', $result.Test, '--test-threads=1'
-                )
+                $cargoArgs = @('test', '-p', $result.Package)
+                if ($result.Target -eq 'lib') {
+                    $cargoArgs += '--lib'
+                }
+                else {
+                    $cargoArgs += @('--test', $result.Target)
+                }
+                $cargoArgs += @('--', '--ignored', '--exact', $result.Test, '--test-threads=1')
                 $output = & cargo @cargoArgs 2>&1 | Out-String
                 $exitCode = $LASTEXITCODE
             }

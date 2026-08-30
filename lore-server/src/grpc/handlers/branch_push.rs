@@ -1247,6 +1247,8 @@ mod tests {
     use lore_base::types::Context;
     use lore_base::types::Fragment;
     use lore_base::types::Partition;
+    use lore_postgres::domain::PostgresDomainStore;
+    use lore_postgres::pool::TlsConfig;
     use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
     use lore_revision::node::Node;
     use lore_revision::node::ROOT_NODE;
@@ -1323,6 +1325,87 @@ mod tests {
             );
             values[0]
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "run with lore-postgres/tests/run-lock-fencing-live.ps1"]
+    async fn real_witness_capture_precedes_both_cr019_bypass_conditions() {
+        let url = std::env::var("LORE_TEST_PG_URL")
+            .expect("the checked-in live runner must provide PostgreSQL");
+        let store = Arc::new(
+            PostgresDomainStore::connect(&url, 2, &TlsConfig::default())
+                .await
+                .expect("connect domain store"),
+        );
+        let coordinator = Arc::new(store.lock_coordinator());
+        coordinator
+            .bootstrap()
+            .await
+            .expect("install isolated SCHEMA-117 fixture");
+
+        let (direct, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("connect direct fixture client");
+        lore_base::lore_spawn!(async move {
+            if let Err(error) = connection.await {
+                eprintln!("push witness fixture connection error: {error}");
+            }
+        });
+        let repository_id: RepositoryId = random();
+        let branch_id: BranchId = random();
+        let repository_bytes = repository_id.as_ref().to_vec();
+        let branch_bytes = branch_id.as_ref().to_vec();
+        let hash = random::<[u8; 32]>().to_vec();
+        direct.execute(
+            "INSERT INTO lore_domain_repositories(repository_id,state,generation,name,metadata_hash,default_branch_id,creation_fingerprint_version,creation_fingerprint,created_at) VALUES($1,0,1,'witness-fixture',$2,$3,1,$4,clock_timestamp())",
+            &[&repository_bytes, &hash, &branch_bytes, &hash],
+        ).await.expect("insert repository fixture");
+        direct.execute(
+            "INSERT INTO lore_domain_branches(repository_id,branch_id,repository_generation,state,generation,name,metadata_hash,latest_hash,creation_fingerprint_version,creation_fingerprint,created_at) VALUES($1,$2,1,0,1,'main',$3,$3,1,$3,clock_timestamp())",
+            &[&repository_bytes, &branch_bytes, &hash],
+        ).await.expect("insert branch fixture and namespace");
+
+        let context = Arc::new(DomainContext::new_with_lock_coordinator(
+            store,
+            false,
+            coordinator.clone(),
+        ));
+
+        // CR-019 disabled: no legacy guard is supplied, yet capture executes.
+        let disabled = prepare_governed_push(
+            Some(&context),
+            None,
+            repository_id,
+            branch_id,
+            random(),
+            false,
+            false,
+        )
+        .await
+        .expect("capture with CR-019 disabled");
+        assert!(disabled.is_none());
+
+        // CR-019's no-foreign-lock early return: its query is empty, but a
+        // second call still executes the real capture path first.
+        assert!(
+            coordinator
+                .query(&repository_bytes, Some(&branch_bytes), None)
+                .await
+                .expect("query empty lock namespace")
+                .is_empty()
+        );
+        let early_return = prepare_governed_push(
+            Some(&context),
+            None,
+            repository_id,
+            branch_id,
+            random(),
+            false,
+            false,
+        )
+        .await
+        .expect("capture before CR-019 empty-query return");
+        assert!(early_return.is_none());
     }
 
     impl InstrumentProvider for RecordingInstrumentProvider {
