@@ -1022,6 +1022,10 @@ CREATE TABLE IF NOT EXISTS lore_fragment_lifecycle (
     manifest_id      bytea       CHECK (manifest_id IS NULL
                                         OR octet_length(manifest_id) = 32),
     last_fence       bigint      NOT NULL CHECK (last_fence >= 1),
+    -- RESERVED, always NULL until Phase 5. CR-031's model names an active
+    -- operation, but no CR-029 domain operation ID reaches this layer yet, and
+    -- nothing writes this column. The shape is declared now so adding it later
+    -- is not an ALTER under ensure_schema on a populated cell.
     active_operation bytea       CHECK (active_operation IS NULL
                                         OR octet_length(active_operation) = 16),
     diagnostic_class smallint    NOT NULL DEFAULT 0 CHECK (diagnostic_class BETWEEN 0 AND 5),

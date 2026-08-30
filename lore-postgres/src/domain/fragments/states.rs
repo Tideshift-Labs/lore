@@ -42,7 +42,7 @@ pub enum FragmentLifecycleState {
 
 impl FragmentLifecycleState {
     /// Stored encoding.
-    pub fn bits(self) -> i16 {
+    pub const fn bits(self) -> i16 {
         match self {
             Self::PreparingStage => 1,
             Self::PreparingRemote => 2,
@@ -89,7 +89,7 @@ impl FragmentLifecycleState {
     /// the Rust predicate cannot drift apart — a ninth state that is readable
     /// would otherwise have to be remembered in two unrelated places.
     /// `readable_bits_matches_is_readable` pins the agreement.
-    pub fn readable_bits() -> [i16; 2] {
+    pub const fn readable_bits() -> [i16; 2] {
         [Self::Staged.bits(), Self::Remote.bits()]
     }
 

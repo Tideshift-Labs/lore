@@ -56,6 +56,7 @@
 //! purge, backfill) wait on WP-114's CD-1/CD-3/CD-4/CD-5 and are not here.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use deadpool_postgres::Pool;
@@ -340,12 +341,24 @@ pub enum CommitVerdict {
     /// A witness moved. **No mutation was made**, and the caller's I/O result
     /// must be discarded. Obliterate or a repair successor won the race.
     Fenced,
+    /// The I/O failed, but the representation the head already names is still
+    /// authoritative, so nothing changed and nothing was demoted.
+    ///
+    /// Only promotion produces this. It is deliberately not `Fenced` (no
+    /// witness moved) and deliberately not a `Missing` publication (the staged
+    /// file is still good — only the upload failed).
+    Abandoned,
 }
 
 impl CommitVerdict {
     /// Whether the operation published.
     pub fn published(self) -> bool {
         matches!(self, Self::Published)
+    }
+
+    /// Whether the fragment's readability is unchanged by this outcome.
+    pub fn left_representation_intact(self) -> bool {
+        matches!(self, Self::Fenced | Self::Abandoned)
     }
 }
 
@@ -952,13 +965,62 @@ impl PostgresFragmentCoordinator {
     }
 
     /// Switch a promoted head to `Remote` after exact object verification.
+    ///
+    /// Promotion does **not** share the other commits' failure handling, and the
+    /// difference is the point. Everywhere else, an unusable observation means
+    /// the representation the head names is gone, so committing `Missing` is
+    /// the honest answer. In promotion the head names a `Staged` file that is
+    /// still there and still good; only the *upload* failed. Routing this
+    /// through the shared path would let a transient provider error demote a
+    /// perfectly readable fragment and move every associated repository's
+    /// lifecycle generation with it.
+    ///
+    /// It also needs no repository fanout: `Staged` and `Remote` are both
+    /// readable, so a successful promotion crosses no readability boundary and
+    /// moves no lifecycle scalar.
     pub async fn commit_promotion(
         &self,
         intent: &FragmentIntent,
         observation: IoObservation,
     ) -> Result<CommitVerdict, DomainError> {
-        self.commit_publication(intent, observation, EpochAuthority::Remote)
+        let manifest = match observation {
+            IoObservation::Valid(manifest) => manifest,
+            IoObservation::Unusable(_) => {
+                return self.abandon_promotion(intent).await;
+            }
+        };
+        self.commit_publication(
+            intent,
+            IoObservation::Valid(manifest),
+            EpochAuthority::Remote,
+        )
+        .await
+    }
+
+    /// Give up on a promotion without touching the staged representation.
+    ///
+    /// A new fence is stamped so the abandoned intent cannot commit later, and
+    /// the head stays exactly where it was.
+    async fn abandon_promotion(
+        &self,
+        intent: &FragmentIntent,
+    ) -> Result<CommitVerdict, DomainError> {
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
             .await
+            .map_err(|error| DomainError::from_pg("promotion abandon begin", error))?;
+        let mut sequence = LockSequence::new();
+        let Some(head) = lock_fragment_head(&tx, &mut sequence, &intent.hash).await? else {
+            return Ok(CommitVerdict::Fenced);
+        };
+        if head.last_fence != intent.fence {
+            return Ok(CommitVerdict::Fenced);
+        }
+        let fence = next_fence(&tx).await?;
+        stamp_operation_fence(&tx, &intent.hash, fence).await?;
+        classify_commit(tx.commit().await, "promotion abandon commit")?;
+        Ok(CommitVerdict::Abandoned)
     }
 
     /// Commit durable `Missing` evidence for a fragment whose authority was
@@ -1172,6 +1234,12 @@ impl PostgresFragmentCoordinator {
         if was_readable {
             apply_lifecycle_generation(&tx, hash, &fanout).await?;
         }
+        // Retiring associations moves the association scalar too, for every
+        // repository that loses one. Obliterate previously moved only the
+        // lifecycle scalar, so a push whose preflight predated an obliterate of
+        // content it referenced could see an unchanged association generation
+        // and take the fast path. The rows are already locked by the fanout.
+        bump_association_generation_many(&tx, &fanout).await?;
         sequence.enter(LockClass::Associations)?;
         tx.execute(
             "UPDATE lore_fragment_associations \
@@ -1441,9 +1509,17 @@ impl PostgresFragmentCoordinator {
         // back that batching the lease exists to remove.
         let member_hashes: Vec<Vec<u8>> = members.iter().map(|(hash, _)| hash.clone()).collect();
         let member_epochs: Vec<i64> = members.iter().map(|(_, epoch)| *epoch).collect();
+        // The `$1::bytea` cast is defensive, not load-bearing. A review flagged
+        // an uncast `$1` in an `INSERT ... SELECT` target list as a certain
+        // 42P08; preparing both forms against PostgreSQL 16 shows it is not —
+        // both infer `{bytea, bytea[], bigint[]}` from the target column. The
+        // cast is kept because it matches this crate's convention and states
+        // the intended type at the call site, but it fixed no defect and the
+        // note is here so a later reader does not re-derive the same wrong
+        // conclusion.
         tx.execute(
             "INSERT INTO lore_fragment_staged_lease_members (lease_id, hash, epoch) \
-             SELECT $1, member.hash, member.epoch \
+             SELECT $1::bytea, member.hash, member.epoch \
                FROM unnest($2::bytea[], $3::bigint[]) AS member(hash, epoch) \
              ON CONFLICT (lease_id, hash) DO NOTHING",
             &[&lease_id, &member_hashes, &member_epochs],
@@ -1874,12 +1950,30 @@ async fn lock_lifecycle_fanout(
 ) -> Result<(), DomainError> {
     for repository_id in repositories {
         sequence.enter(LockClass::Repository)?;
-        tx.execute(
-            "SELECT 1 FROM lore_domain_repositories WHERE repository_id = $1 FOR UPDATE",
-            &[&repository_id],
-        )
-        .await
-        .map_err(|error| DomainError::from_pg("lifecycle fanout repository lock", error))?;
+        let locked = tx
+            .execute(
+                "SELECT 1 FROM lore_domain_repositories WHERE repository_id = $1 FOR UPDATE",
+                &[&repository_id],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("lifecycle fanout repository lock", error))?;
+        if locked == 0 {
+            // `FOR UPDATE` over zero rows locks nothing, silently. Letting that
+            // pass would mean the later set-based update touches fewer rows
+            // than were planned, which is precisely the partial fanout CR-031
+            // forbids — and the "all or nothing" claim would be false without
+            // anything failing.
+            //
+            // This is damage, not a race: `create_association` refuses when the
+            // repository row is absent, and repository identities are
+            // tombstoned rather than deleted, so a live association to a
+            // nonexistent repository cannot arise from ordinary operation.
+            return Err(DomainError::Internal(format!(
+                "a live fragment association names repository {} which has no domain row; \
+                 the fanout cannot be taken atomically",
+                hex_lower(repository_id)
+            )));
+        }
     }
     Ok(())
 }
@@ -1903,11 +1997,26 @@ async fn apply_lifecycle_generation(
     hash: &[u8],
     locked: &[Vec<u8>],
 ) -> Result<(), DomainError> {
-    let current = plan_lifecycle_fanout(tx, hash).await?;
+    let current = match plan_lifecycle_fanout(tx, hash).await {
+        Ok(current) => current,
+        // The re-plan crossing the admission bound is a race, not a caller
+        // error: the first plan was under the limit, so the operation was
+        // legitimately admitted and the set grew underneath it. Returning the
+        // non-retryable `PreconditionRejected` the initial plan uses would turn
+        // a retryable window into a hard refusal.
+        Err(DomainError::PreconditionRejected { reason, .. }) => {
+            return Err(DomainError::Contention(format!(
+                "the live-association fanout for this fragment crossed the admission bound \
+                 between planning and the head lock ({reason}); retrying re-admits it"
+            )));
+        }
+        Err(other) => return Err(other),
+    };
     if current.is_empty() {
         return Ok(());
     }
-    if current.iter().any(|id| !locked.contains(id)) {
+    let held: BTreeSet<&Vec<u8>> = locked.iter().collect();
+    if current.iter().any(|id| !held.contains(id)) {
         return Err(DomainError::Contention(format!(
             "the live-association fanout for this fragment grew from {} to {} repositories \
              between planning and the head lock; retrying plans the larger set",
@@ -1915,14 +2024,40 @@ async fn apply_lifecycle_generation(
             current.len()
         )));
     }
+    // Bound by `locked`, which this has just proved is a superset of `current`.
+    // Writing the already-locked set makes "one statement over rows this
+    // transaction holds" literally true rather than true by inference.
     tx.execute(
         "UPDATE lore_domain_repositories \
             SET fragment_lifecycle_generation = fragment_lifecycle_generation + 1 \
           WHERE repository_id = ANY($1)",
-        &[&current],
+        &[&locked],
     )
     .await
     .map_err(|error| DomainError::from_pg("lifecycle generation bump", error))?;
+    Ok(())
+}
+
+/// Move the association scalar for a whole locked fanout at once.
+///
+/// Used where one operation retires many associations, so every affected
+/// repository's push witness moves with the removal rather than only the
+/// caller's own.
+async fn bump_association_generation_many(
+    tx: &Transaction<'_>,
+    repositories: &[Vec<u8>],
+) -> Result<(), DomainError> {
+    if repositories.is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE lore_domain_repositories \
+            SET content_association_generation = content_association_generation + 1 \
+          WHERE repository_id = ANY($1)",
+        &[&repositories],
+    )
+    .await
+    .map_err(|error| DomainError::from_pg("association generation bump", error))?;
     Ok(())
 }
 
