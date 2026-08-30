@@ -707,6 +707,7 @@ fn every_error_variant() -> Vec<CellSchemaError> {
         CellSchemaError::ResidualServicePrivilege,
         CellSchemaError::InertStateMismatch("inert tables"),
         CellSchemaError::RetiredEntrypointReachable("authority"),
+        CellSchemaError::RetiredEntrypointUnexpectedFailure("put_reservation"),
         CellSchemaError::RefusedUnattestedSchema("catalog drift"),
         CellSchemaError::UnexpectedInstallResult,
     ];
@@ -715,7 +716,7 @@ fn every_error_variant() -> Vec<CellSchemaError> {
     // here rather than pass unswept.
     assert_eq!(
         variants.len(),
-        11,
+        12,
         "a new CellSchemaError variant must be added to this vec, not only to the match below"
     );
     for variant in &variants {
@@ -730,6 +731,7 @@ fn every_error_variant() -> Vec<CellSchemaError> {
             | CellSchemaError::ResidualServicePrivilege
             | CellSchemaError::InertStateMismatch(_)
             | CellSchemaError::RetiredEntrypointReachable(_)
+            | CellSchemaError::RetiredEntrypointUnexpectedFailure(_)
             | CellSchemaError::RefusedUnattestedSchema(_)
             | CellSchemaError::UnexpectedInstallResult => {}
         }

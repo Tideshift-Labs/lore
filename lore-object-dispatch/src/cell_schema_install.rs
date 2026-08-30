@@ -631,16 +631,27 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
   COALESCE((
     SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
       pg_catalog.pg_get_userbyid(default_acl.defaclrole),
+      COALESCE(space.nspname, ''),
       default_acl.defaclobjtype,
       CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
            ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
       entry.privilege_type, entry.is_grantable
-    ) ORDER BY default_acl.defaclrole, default_acl.defaclobjtype,
-               entry.grantee, entry.privilege_type)::text
+    ) ORDER BY pg_catalog.pg_get_userbyid(default_acl.defaclrole),
+               COALESCE(space.nspname, ''),
+               default_acl.defaclobjtype,
+               CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
+                    ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
+               entry.privilege_type)::text
       FROM pg_catalog.pg_default_acl AS default_acl
-      JOIN pg_catalog.pg_namespace AS space ON space.oid = default_acl.defaclnamespace
+      -- LEFT JOIN, and schema-less entries are in scope. defaclnamespace is 0 for a
+      -- default-privilege statement written without an IN SCHEMA clause, and no namespace has oid
+      -- 0, so an inner join silently drops exactly the statement this section exists to catch: a
+      -- schema-less default EXECUTE privilege for a service role reaches functions created in
+      -- object_store_retention just the same, and would otherwise attest clean.
+      LEFT JOIN pg_catalog.pg_namespace AS space ON space.oid = default_acl.defaclnamespace
       CROSS JOIN LATERAL pg_catalog.aclexplode(default_acl.defaclacl) AS entry
-     WHERE space.nspname = 'object_store_retention'
+     WHERE default_acl.defaclnamespace = 0
+        OR space.nspname = 'object_store_retention'
   ), '[]') AS default_acls,
   COALESCE((
     SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
@@ -667,8 +678,13 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
       relation.relname, policy.polname, policy.polcmd, policy.polpermissive,
       pg_catalog.pg_get_expr(policy.polqual, policy.polrelid, false),
       pg_catalog.pg_get_expr(policy.polwithcheck, policy.polrelid, false),
-      (SELECT pg_catalog.jsonb_agg(pg_catalog.pg_get_userbyid(role_oid) ORDER BY role_oid)
-         FROM pg_catalog.unnest(policy.polroles) AS role_oid)
+      -- By rendered name, not OID: OIDs are creation-order dependent across clusters, and
+      -- pg_get_userbyid(0) renders an unknown-OID placeholder rather than the PUBLIC pseudo-role
+      -- that polroles uses 0 to mean.
+      (SELECT pg_catalog.jsonb_agg(name ORDER BY name)
+         FROM (SELECT CASE WHEN role_oid = 0 THEN 'PUBLIC'
+                           ELSE pg_catalog.pg_get_userbyid(role_oid) END AS name
+                 FROM pg_catalog.unnest(policy.polroles) AS role_oid) AS policy_role)
     ) ORDER BY relation.relname, policy.polname)::text
       FROM pg_catalog.pg_policy AS policy
       JOIN pg_catalog.pg_class AS relation ON relation.oid = policy.polrelid
@@ -778,6 +794,14 @@ pub enum CellSchemaError {
     /// A provisioning entrypoint that must be retired was still reachable.
     #[error("a retired provisioning entrypoint is still reachable: {0}")]
     RetiredEntrypointReachable(&'static str),
+    /// A retired entrypoint failed, but not the way its retirement mode requires.
+    ///
+    /// Distinct from [`CellSchemaError::RetiredEntrypointReachable`] because the outcomes differ:
+    /// reachable means the boundary is gone, while this means the boundary may hold for some other
+    /// reason entirely, such as the function having been dropped (`42883`). Reporting the second as
+    /// the first would name the wrong problem.
+    #[error("a retired provisioning entrypoint failed with an unexpected sqlstate: {0}")]
+    RetiredEntrypointUnexpectedFailure(&'static str),
     /// The schema is present but does not attest; the installer refuses to touch it.
     ///
     /// Carries the attestation's own reason, so a refusal says which surface disagreed rather than
@@ -803,6 +827,7 @@ impl CellSchemaError {
             Self::ResidualServicePrivilege => "residual service privilege",
             Self::InertStateMismatch(_) => "inert state",
             Self::RetiredEntrypointReachable(_) => "retired entrypoint reachable",
+            Self::RetiredEntrypointUnexpectedFailure(_) => "retired entrypoint sqlstate",
             Self::RefusedUnattestedSchema(_) => "unattested schema",
             Self::UnexpectedInstallResult => "install result",
         }
@@ -965,10 +990,10 @@ const INERT_TABLE_WRITABLE_SQL: &str = "SELECT count(*)::bigint
       'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'
     )";
 
-const RETIRED_PROBE_SAVEPOINT_SQL: &str = "SAVEPOINT cell_schema_retired_probe";
+const TRANSACTION_PROBE_SAVEPOINT_SQL: &str = "SAVEPOINT cell_schema_transaction_probe";
 
-const RETIRED_PROBE_RELEASE_SQL: &str = "ROLLBACK TO SAVEPOINT cell_schema_retired_probe; \
-     RELEASE SAVEPOINT cell_schema_retired_probe";
+const TRANSACTION_PROBE_RELEASE_SQL: &str = "ROLLBACK TO SAVEPOINT cell_schema_transaction_probe; \
+     RELEASE SAVEPOINT cell_schema_transaction_probe";
 
 // Matched on name AND identity arguments, as a pair. Matching on name alone would silently exempt a
 // same-name overload with a different signature, which is exactly the object a replacement is most
@@ -1223,12 +1248,12 @@ async fn assert_migrator_session(client: &Client) -> Result<(), CellSchemaError>
 /// transaction at the first artifact and commit the caller's uncommitted work with it. PostgreSQL
 /// answers "is a transaction open" through `SAVEPOINT`, which raises 25P01 when there is none.
 async fn assert_no_open_transaction(client: &Client) -> Result<(), CellSchemaError> {
-    match client.batch_execute(RETIRED_PROBE_SAVEPOINT_SQL).await {
+    match client.batch_execute(TRANSACTION_PROBE_SAVEPOINT_SQL).await {
         Ok(()) => {
-            client
-                .batch_execute(RETIRED_PROBE_RELEASE_SQL)
-                .await
-                .map_err(CellSchemaError::postgres)?;
+            // The savepoint succeeded, so a transaction is open and the install is already
+            // refused. Tidy up on a best-effort basis, but report the precondition either way: a
+            // failure to release is less informative than the finding it would otherwise mask.
+            let _ = client.batch_execute(TRANSACTION_PROBE_RELEASE_SQL).await;
             Err(CellSchemaError::Precondition(
                 "install must not run inside an open transaction",
             ))
@@ -1564,7 +1589,7 @@ async fn assert_retired_readbacks(
         // runs under a savepoint when there is one to attach to. PostgreSQL itself answers whether
         // there is: `SAVEPOINT` outside a transaction block raises 25P01, which is the one
         // reliable signal available to a client here.
-        let guarded = match client.batch_execute(RETIRED_PROBE_SAVEPOINT_SQL).await {
+        let guarded = match client.batch_execute(TRANSACTION_PROBE_SAVEPOINT_SQL).await {
             Ok(()) => true,
             Err(error) => {
                 let Some(database_error) = error.as_db_error() else {
@@ -1580,7 +1605,7 @@ async fn assert_retired_readbacks(
         let probe = client.query_one(&sql, &[]).await;
         if guarded {
             client
-                .batch_execute(RETIRED_PROBE_RELEASE_SQL)
+                .batch_execute(TRANSACTION_PROBE_RELEASE_SQL)
                 .await
                 .map_err(CellSchemaError::postgres)?;
         }
@@ -1601,7 +1626,7 @@ async fn assert_retired_readbacks(
                 // retirement mode silently stand in for the other, and the records claim the two
                 // apart.
                 if database_error.code().code() != expected_sqlstate {
-                    return Err(CellSchemaError::RetiredEntrypointReachable(
+                    return Err(CellSchemaError::RetiredEntrypointUnexpectedFailure(
                         layer.id.label(),
                     ));
                 }

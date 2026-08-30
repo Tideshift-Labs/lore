@@ -417,6 +417,16 @@ async fn live_postgres_cell_schema_refuses_a_drifted_catalog() {
              GRANT EXECUTE ON FUNCTIONS TO object_dispatch_retention_runtime;",
         ),
         (
+            // The same widening written WITHOUT `IN SCHEMA`. It reaches functions created in
+            // `object_store_retention` exactly the same way, but PostgreSQL stores it with
+            // `defaclnamespace = 0`, so a section that inner-joins pg_namespace drops the row and
+            // attests clean. That is the fail-open the first version of this section shipped with;
+            // this case is why the section now treats a schema-less entry as in scope.
+            "default_acls",
+            "ALTER DEFAULT PRIVILEGES FOR ROLE object_dispatch_retention_owner
+             GRANT EXECUTE ON FUNCTIONS TO object_dispatch_retention_runtime;",
+        ),
+        (
             // A built-in trigger function, so this adds no row to pg_proc and cannot be caught one
             // section earlier by `functions`.
             "triggers",
