@@ -3,6 +3,7 @@
 //! Transactional implementation of CR-030's fenced lock authority.
 
 use std::collections::BTreeMap;
+use std::mem::size_of;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -246,6 +247,8 @@ pub fn acquire_or_renew_binding(
     input: &AcquireOrRenewInput,
 ) -> Result<OperationBinding, DomainError> {
     let ordered = sorted_resources(&input.resources)?;
+    validate_lease_duration(input.lease_duration)?;
+    validate_canonical_result_capacity(input, &ordered)?;
     let has_tokens = ordered
         .iter()
         .filter(|resource| resource.expected_ownership_token.is_some())
@@ -354,14 +357,6 @@ impl PostgresLockCoordinator {
         )?;
         if let Some(actor) = &input.acting_owner {
             validate_owner(actor)?;
-        }
-        if let Some(lease) = input.lease_duration
-            && (lease.is_zero() || lease > MAX_LEASE)
-        {
-            return Err(DomainError::InvalidInput(format!(
-                "lease duration must be in 1ms..={}ms",
-                MAX_LEASE.as_millis()
-            )));
         }
         let lease_enabled = self.readiness().await?.lease_enabled;
         if input.lease_duration.is_some() && !lease_enabled {
@@ -1773,6 +1768,56 @@ fn validate_owner(owner: &VerifiedLockOwner) -> Result<(), DomainError> {
     Ok(())
 }
 
+fn validate_lease_duration(lease_duration: Option<Duration>) -> Result<(), DomainError> {
+    if let Some(lease) = lease_duration
+        && (lease < Duration::from_millis(1) || lease > MAX_LEASE)
+    {
+        return Err(DomainError::InvalidInput(format!(
+            "lease duration must be in 1ms..={}ms",
+            MAX_LEASE.as_millis()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_canonical_result_capacity(
+    input: &AcquireOrRenewInput,
+    resources: &[LockResourceInput],
+) -> Result<(), DomainError> {
+    let mut size = b"lock-result-v1\0".len() + size_of::<u32>();
+    let expiry_size = if input.lease_duration.is_some() {
+        12
+    } else {
+        0
+    };
+    for resource in resources {
+        let fixed = 4
+            + input.branch_id.len()
+            + RESOURCE_HASH_BYTES
+            + 4
+            + 4
+            + 4
+            + 32
+            + 3 * size_of::<i64>()
+            + 12
+            + 1
+            + expiry_size;
+        size = size
+            .checked_add(fixed)
+            .and_then(|value| value.checked_add(resource.description.len()))
+            .and_then(|value| value.checked_add(input.owner.verified_issuer.len()))
+            .and_then(|value| value.checked_add(input.owner.authenticated_subject.len()))
+            .ok_or_else(|| DomainError::InvalidInput("lock result size overflows".to_owned()))?;
+    }
+    if size > receipts::PUBLIC_RESULT_MAX_BYTES {
+        return Err(DomainError::InvalidInput(format!(
+            "encoded lock result would exceed the receipt public-result limit of {} bytes",
+            receipts::PUBLIC_RESULT_MAX_BYTES
+        )));
+    }
+    Ok(())
+}
+
 fn validate_id(field: &str, value: &[u8]) -> Result<(), DomainError> {
     if value.len() != 16 {
         return Err(DomainError::InvalidInput(format!(
@@ -1858,6 +1903,12 @@ fn canonical_result(locks: &[FencedLock]) -> Result<Vec<u8>, DomainError> {
             }
             None => bytes.push(0),
         }
+    }
+    if bytes.len() > receipts::PUBLIC_RESULT_MAX_BYTES {
+        return Err(DomainError::InvalidInput(format!(
+            "encoded lock result exceeds the receipt public-result limit of {} bytes",
+            receipts::PUBLIC_RESULT_MAX_BYTES
+        )));
     }
     Ok(bytes)
 }

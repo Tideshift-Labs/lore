@@ -47,6 +47,8 @@ pub const PREPARED_HARD_TTL: Duration = Duration::from_secs(15 * 60);
 pub const STALE_HORIZON: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 /// Extra retention on a compact marker past the stale horizon.
 pub const MARKER_SAFETY_EPSILON: Duration = Duration::from_secs(24 * 60 * 60);
+/// Maximum replay result retained by the frozen CR-029 receipt schema.
+pub const PUBLIC_RESULT_MAX_BYTES: usize = 4096;
 /// Full receipts remain for 30 days; compact evidence outlives them.
 pub const FULL_RESULT_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
@@ -357,6 +359,11 @@ pub async fn commit_terminal(
     public_result: Option<&[u8]>,
     admission_clock: SystemTime,
 ) -> Result<(), DomainError> {
+    if public_result.is_some_and(|result| result.len() > PUBLIC_RESULT_MAX_BYTES) {
+        return Err(DomainError::InvalidInput(format!(
+            "receipt public result exceeds {PUBLIC_RESULT_MAX_BYTES} bytes"
+        )));
+    }
     let (outcome_code, reason_version, reason) = match outcome {
         DomainOutcome::Applied => (schema::RECEIPT_OUTCOME_APPLIED, None, None),
         DomainOutcome::NotApplied {
