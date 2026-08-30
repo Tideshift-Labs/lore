@@ -223,8 +223,18 @@ will update an older check constraint or state schema.
   `validate_endpoint_host` accepts a single-label host (`minio`, `localhost`).
   Double pattern: one generic closure-scripted double per trait, `new` returning
   `(Self, Rc<Cell<u32>>)` — the double moves into the client, so the counter handle must outlive
-  it. Gate: `cargo test -p lore-object-dispatch --test provider_client -j 4` (60 tests, no
-  `#[ignore]`).
+  it; to capture a value the double *receives* rather than just count calls, close over an
+  `Rc<RefCell<Option<T>>>` in the same closure instead of a bespoke struct. INV-EJ P1 (round 4):
+  `ProviderAttemptLedger::new` now takes `(provider_boundary_id, logical_request_id) ->
+  Result<Self, _>` (no `Default`), and `execute` refuses a request naming a different
+  boundary/logical-request than the ledger is bound to with `LedgerRequestMismatch`, checked before
+  `authorize` and unpoisoned — one ledger can no longer accumulate two requests' attempts.
+  `authorize` is crate-private now; `validate_attempt` (`Result<(), _>`) is its public replacement,
+  so a test asserting the `ProviderChargeRequest` an authority receives needs the capture-closure
+  pattern above during a real `execute()` call, not a direct call. Unfixed finding: `ProviderAttemptLedger`'s
+  `#[derive]`d `Debug` leaks both identity strings, unlike every sibling identity-bearing type in
+  this module, which hand-write a redacting one. Gate: `cargo test -p lore-object-dispatch --test
+  provider_client -j 4` (67 tests, no `#[ignore]`; one intentionally red pending that `src/` fix).
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

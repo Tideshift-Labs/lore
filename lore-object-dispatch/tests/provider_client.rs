@@ -7,6 +7,7 @@
 //! (`ProviderChargeAuthority`, `ProviderTransport`); no provider SDK, no database, no filesystem.
 
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -221,6 +222,16 @@ where
         charge_authority,
         transport,
     )
+}
+
+/// A ledger bound to the default boundary and logical request identity every fixture in this file
+/// uses (`base_request`/`put_object_request`/`upload_part_request`/`attempt_request_for` all leave
+/// `logical_request_id` at its default). Tests that deliberately bind a ledger to a *different*
+/// identity to exercise WP-114 CD-5's ledger/request binding construct
+/// `ProviderAttemptLedger::new` directly instead of using this helper.
+fn new_ledger() -> ProviderAttemptLedger {
+    ProviderAttemptLedger::new(BOUNDARY_ID, &logical_request_id())
+        .expect("default boundary and request identity must construct a valid ledger")
 }
 
 /// A grant that binds `request` exactly: every echoed field matches, the grant ID is canonical
@@ -890,8 +901,8 @@ fn authorize_gates_listing_classes_on_the_capability_and_leaves_others_unaffecte
 
     for class in ProviderAttemptClass::ALL {
         let request = attempt_request_for(class);
-        let result_without = without_listing.authorize(&request);
-        let result_with = with_listing.authorize(&request);
+        let result_without = without_listing.validate_attempt(&request);
+        let result_with = with_listing.validate_attempt(&request);
 
         if class.is_listing() {
             assert_eq!(
@@ -918,21 +929,21 @@ fn authorize_requires_canonical_uuid_v7_identities_and_a_positive_ordinal() {
     let mut bad_logical = attempt_request_for(ProviderAttemptClass::Readiness);
     bad_logical.logical_request_id = "not-a-uuid".to_string();
     assert_eq!(
-        client.authorize(&bad_logical),
+        client.validate_attempt(&bad_logical),
         Err(ProviderClientError::InvalidRequestIdentity)
     );
 
     let mut bad_attempt = attempt_request_for(ProviderAttemptClass::Readiness);
     bad_attempt.attempt_id = "not-a-uuid".to_string();
     assert_eq!(
-        client.authorize(&bad_attempt),
+        client.validate_attempt(&bad_attempt),
         Err(ProviderClientError::InvalidRequestIdentity)
     );
 
     let mut bad_ordinal = attempt_request_for(ProviderAttemptClass::Readiness);
     bad_ordinal.attempt_ordinal = 0;
     assert_eq!(
-        client.authorize(&bad_ordinal),
+        client.validate_attempt(&bad_ordinal),
         Err(ProviderClientError::InvalidAttemptOrdinal)
     );
 }
@@ -948,21 +959,21 @@ fn authorize_requires_a_canonical_nonzero_budget_pin() {
     let mut non_canonical = attempt_request_for(ProviderAttemptClass::Readiness);
     non_canonical.budget_pin.revision = "not canonical!".to_string();
     assert_eq!(
-        client.authorize(&non_canonical),
+        client.validate_attempt(&non_canonical),
         Err(ProviderClientError::InvalidBudgetPin)
     );
 
     let mut empty_revision = attempt_request_for(ProviderAttemptClass::Readiness);
     empty_revision.budget_pin.revision = String::new();
     assert_eq!(
-        client.authorize(&empty_revision),
+        client.validate_attempt(&empty_revision),
         Err(ProviderClientError::InvalidBudgetPin)
     );
 
     let mut zero_fence = attempt_request_for(ProviderAttemptClass::Readiness);
     zero_fence.budget_pin.fence = 0;
     assert_eq!(
-        client.authorize(&zero_fence),
+        client.validate_attempt(&zero_fence),
         Err(ProviderClientError::InvalidBudgetPin)
     );
 }
@@ -981,42 +992,42 @@ fn authorize_rejects_budget_pin_revisions_outside_the_narrow_charset() {
     let mut with_slash = attempt_request_for(ProviderAttemptClass::Readiness);
     with_slash.budget_pin.revision = "wp121/rev.7".to_string();
     assert_eq!(
-        client.authorize(&with_slash),
+        client.validate_attempt(&with_slash),
         Err(ProviderClientError::InvalidBudgetPin)
     );
 
     let mut with_colon = attempt_request_for(ProviderAttemptClass::Readiness);
     with_colon.budget_pin.revision = "wp121:rev.7".to_string();
     assert_eq!(
-        client.authorize(&with_colon),
+        client.validate_attempt(&with_colon),
         Err(ProviderClientError::InvalidBudgetPin)
     );
 
     let mut over_length = attempt_request_for(ProviderAttemptClass::Readiness);
     over_length.budget_pin.revision = "a".repeat(129);
     assert_eq!(
-        client.authorize(&over_length),
+        client.validate_attempt(&over_length),
         Err(ProviderClientError::InvalidBudgetPin)
     );
 
     let mut leading_dash = attempt_request_for(ProviderAttemptClass::Readiness);
     leading_dash.budget_pin.revision = "-wp121".to_string();
     assert_eq!(
-        client.authorize(&leading_dash),
+        client.validate_attempt(&leading_dash),
         Err(ProviderClientError::InvalidBudgetPin)
     );
 
     let mut leading_dot = attempt_request_for(ProviderAttemptClass::Readiness);
     leading_dot.budget_pin.revision = ".wp121".to_string();
     assert_eq!(
-        client.authorize(&leading_dot),
+        client.validate_attempt(&leading_dot),
         Err(ProviderClientError::InvalidBudgetPin)
     );
 
     // Exactly 128 bytes is accepted; the cap is inclusive.
     let mut at_the_128_byte_boundary = attempt_request_for(ProviderAttemptClass::Readiness);
     at_the_128_byte_boundary.budget_pin.revision = "a".repeat(128);
-    assert!(client.authorize(&at_the_128_byte_boundary).is_ok());
+    assert!(client.validate_attempt(&at_the_128_byte_boundary).is_ok());
 }
 
 #[test]
@@ -1032,7 +1043,7 @@ fn authorize_enforces_body_presence_across_every_attempt_class() {
             let mut missing = attempt_request_for(class);
             missing.put_body = None;
             assert_eq!(
-                client.authorize(&missing),
+                client.validate_attempt(&missing),
                 Err(ProviderClientError::PutBodyRequired),
                 "{class:?}"
             );
@@ -1040,7 +1051,7 @@ fn authorize_enforces_body_presence_across_every_attempt_class() {
             let mut extra = attempt_request_for(class);
             extra.put_body = Some(durable_put_body());
             assert_eq!(
-                client.authorize(&extra),
+                client.validate_attempt(&extra),
                 Err(ProviderClientError::PutBodyNotPermitted),
                 "{class:?}"
             );
@@ -1059,7 +1070,7 @@ fn authorize_requires_a_part_range_only_for_upload_part() {
     let mut missing_part = attempt_request_for(ProviderAttemptClass::UploadPart);
     missing_part.put_part = None;
     assert_eq!(
-        client.authorize(&missing_part),
+        client.validate_attempt(&missing_part),
         Err(ProviderClientError::PutPartRequired)
     );
 
@@ -1074,7 +1085,7 @@ fn authorize_requires_a_part_range_only_for_upload_part() {
             length: 1,
         });
         assert_eq!(
-            client.authorize(&request),
+            client.validate_attempt(&request),
             Err(ProviderClientError::PutPartNotPermitted),
             "{class:?}"
         );
@@ -1097,7 +1108,7 @@ fn authorize_validates_the_upload_part_range_against_its_body() {
         length: 1,
     });
     assert_eq!(
-        client.authorize(&zero_part_number),
+        client.validate_attempt(&zero_part_number),
         Err(ProviderClientError::InvalidPutPart)
     );
 
@@ -1108,7 +1119,7 @@ fn authorize_validates_the_upload_part_range_against_its_body() {
         length: 1,
     });
     assert_eq!(
-        client.authorize(&over_max_part_number),
+        client.validate_attempt(&over_max_part_number),
         Err(ProviderClientError::InvalidPutPart)
     );
 
@@ -1119,7 +1130,7 @@ fn authorize_validates_the_upload_part_range_against_its_body() {
         length: 0,
     });
     assert_eq!(
-        client.authorize(&zero_length),
+        client.validate_attempt(&zero_length),
         Err(ProviderClientError::InvalidPutPart)
     );
 
@@ -1130,7 +1141,7 @@ fn authorize_validates_the_upload_part_range_against_its_body() {
         length: PROVIDER_MAX_PART_SIZE_BYTES + 1,
     });
     assert_eq!(
-        client.authorize(&over_max_length),
+        client.validate_attempt(&over_max_length),
         Err(ProviderClientError::InvalidPutPart)
     );
 
@@ -1141,7 +1152,7 @@ fn authorize_validates_the_upload_part_range_against_its_body() {
         length: 1,
     });
     assert_eq!(
-        client.authorize(&overflowing),
+        client.validate_attempt(&overflowing),
         Err(ProviderClientError::InvalidPutPart)
     );
 
@@ -1152,7 +1163,7 @@ fn authorize_validates_the_upload_part_range_against_its_body() {
         length: body_size + 1,
     });
     assert_eq!(
-        client.authorize(&past_body),
+        client.validate_attempt(&past_body),
         Err(ProviderClientError::InvalidPutPart)
     );
 
@@ -1162,7 +1173,7 @@ fn authorize_validates_the_upload_part_range_against_its_body() {
         offset: 0,
         length: body_size,
     });
-    assert!(client.authorize(&exact_end).is_ok());
+    assert!(client.validate_attempt(&exact_end).is_ok());
 }
 
 /// A part is non-final exactly when `offset + length < body.size`. Only a non-final part is held
@@ -1190,7 +1201,7 @@ fn authorize_requires_the_provider_minimum_for_a_non_final_upload_part_but_not_t
         length: 1,
     });
     assert_eq!(
-        client.authorize(&one_byte_non_final),
+        client.validate_attempt(&one_byte_non_final),
         Err(ProviderClientError::InvalidPutPart)
     );
 
@@ -1201,7 +1212,7 @@ fn authorize_requires_the_provider_minimum_for_a_non_final_upload_part_but_not_t
         length: PROVIDER_MIN_PART_SIZE_BYTES - 1,
     });
     assert_eq!(
-        client.authorize(&just_under_min_non_final),
+        client.validate_attempt(&just_under_min_non_final),
         Err(ProviderClientError::InvalidPutPart)
     );
 
@@ -1211,7 +1222,7 @@ fn authorize_requires_the_provider_minimum_for_a_non_final_upload_part_but_not_t
         offset: 0,
         length: PROVIDER_MIN_PART_SIZE_BYTES,
     });
-    assert!(client.authorize(&exactly_min_non_final).is_ok());
+    assert!(client.validate_attempt(&exactly_min_non_final).is_ok());
 
     let mut one_byte_final = base;
     one_byte_final.put_part = Some(ProviderPutPart {
@@ -1219,7 +1230,7 @@ fn authorize_requires_the_provider_minimum_for_a_non_final_upload_part_but_not_t
         offset: body_size - 1,
         length: 1,
     });
-    assert!(client.authorize(&one_byte_final).is_ok());
+    assert!(client.validate_attempt(&one_byte_final).is_ok());
 }
 
 #[test]
@@ -1238,7 +1249,7 @@ fn authorize_rejects_a_put_body_bound_to_a_different_request_or_boundary() {
     let mut mismatched_request = put_object_request();
     mismatched_request.put_body = Some(other_request_body);
     assert_eq!(
-        client.authorize(&mismatched_request),
+        client.validate_attempt(&mismatched_request),
         Err(ProviderClientError::PutBodyRequestMismatch)
     );
 
@@ -1253,24 +1264,69 @@ fn authorize_rejects_a_put_body_bound_to_a_different_request_or_boundary() {
     let mut mismatched_boundary = put_object_request();
     mismatched_boundary.put_body = Some(other_boundary_body);
     assert_eq!(
-        client.authorize(&mismatched_boundary),
+        client.validate_attempt(&mismatched_boundary),
         Err(ProviderClientError::PutBodyBoundaryMismatch)
     );
 }
 
-#[test]
-fn authorize_returns_a_charge_request_that_echoes_the_attempt_and_charges_one_unit() {
-    let client = client_with(
-        ProviderCapabilities::none().with_listing(),
-        UnwiredChargeAuthority,
+/// Captures the `&ProviderChargeRequest` a `ProviderChargeAuthority` double receives during a real
+/// `execute` call, cloning it out into a `RefCell` the caller retains a handle to. The double
+/// always refuses with `Unwired` after capturing, so no grant is ever committed and no ledger state
+/// needs cleanup between iterations -- only the request that reached the authority matters here.
+///
+/// `authorize`/its `ProviderChargeRequest` return value are no longer public (WP-114 CD-5's ledger
+/// binding fix made the constructor crate-private, because handing the charge request to a caller
+/// let it charge outside any ledger). Asserting what the authority actually receives through a real
+/// `execute` call is better coverage than asserting a helper's return value: it proves the request
+/// reaches the authority, not merely that some function computed it.
+fn capture_charge_request_with_boundary(
+    boundary: CellProviderBoundary,
+    capabilities: ProviderCapabilities,
+    request: &ProviderAttemptRequest,
+    label: &str,
+) -> ProviderChargeRequest {
+    let captured: Rc<RefCell<Option<ProviderChargeRequest>>> = Rc::new(RefCell::new(None));
+    let captured_for_closure = captured.clone();
+    let (charge_authority, _calls) = ScriptedChargeAuthority::new(move |charge_request| {
+        *captured_for_closure.borrow_mut() = Some(charge_request.clone());
+        Err(ProviderChargeError::Unwired)
+    });
+    let provider_boundary_id = boundary.provider_boundary_id().to_string();
+    let client = GovernedProviderClient::new(
+        boundary,
+        capabilities,
+        ProviderRetryPolicy::disabled(),
+        charge_authority,
         UnwiredProviderTransport,
     );
+    let mut ledger = ProviderAttemptLedger::new(&provider_boundary_id, &request.logical_request_id)
+        .expect("request's own logical_request_id must be a valid ledger identity");
 
+    match client.execute(&mut ledger, request) {
+        Err(ProviderClientError::ChargeRefused(ProviderChargeError::Unwired)) => {}
+        other => panic!("{label}: expected the scripted Unwired refusal, got {other:?}"),
+    }
+
+    captured
+        .borrow_mut()
+        .take()
+        .unwrap_or_else(|| panic!("{label}: charge authority must have been called"))
+}
+
+fn capture_charge_request(request: &ProviderAttemptRequest, label: &str) -> ProviderChargeRequest {
+    capture_charge_request_with_boundary(
+        boundary(),
+        ProviderCapabilities::none().with_listing(),
+        request,
+        label,
+    )
+}
+
+#[test]
+fn execute_charges_a_request_that_echoes_the_attempt_and_charges_one_unit() {
     for class in ProviderAttemptClass::ALL {
         let request = attempt_request_for(class);
-        let charge = client
-            .authorize(&request)
-            .unwrap_or_else(|error| panic!("{class:?} must authorize: {error:?}"));
+        let charge = capture_charge_request(&request, &format!("{class:?}"));
 
         assert_eq!(charge.attempt_units(), 1, "{class:?}");
         assert_eq!(charge.provider_boundary_id(), BOUNDARY_ID, "{class:?}");
@@ -1297,19 +1353,11 @@ fn authorize_returns_a_charge_request_that_echoes_the_attempt_and_charges_one_un
 
 #[test]
 fn cap_classes_always_start_with_the_shared_budget_and_include_exactly_the_matching_caps() {
-    let client = client_with(
-        ProviderCapabilities::none().with_listing(),
-        UnwiredChargeAuthority,
-        UnwiredProviderTransport,
-    );
-
     for traffic_class in ProviderTrafficClass::ALL {
         for attempt_class in ProviderAttemptClass::ALL {
             let mut request = attempt_request_for(attempt_class);
             request.traffic_class = traffic_class;
-            let charge = client
-                .authorize(&request)
-                .unwrap_or_else(|error| panic!("{attempt_class:?} must authorize: {error:?}"));
+            let charge = capture_charge_request(&request, &format!("{attempt_class:?}"));
             let caps = charge.cap_classes();
 
             assert_eq!(caps.first(), Some(&ProviderCapClass::SharedPhysicalBudget));
@@ -1351,7 +1399,7 @@ fn execute_refuses_every_charge_error_before_touching_the_ledger_or_transport() 
         let (transport, transport_calls) =
             ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
         let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-        let mut ledger = ProviderAttemptLedger::new();
+        let mut ledger = new_ledger();
 
         let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
 
@@ -1378,7 +1426,7 @@ fn unwired_charge_authority_and_transport_are_the_shipped_fail_closed_guards() {
         UnwiredChargeAuthority,
         UnwiredProviderTransport,
     );
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
 
     let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
 
@@ -1400,7 +1448,7 @@ fn execute_counts_an_ambiguous_commit_as_a_charged_grant_without_an_attempt() {
     let (transport, transport_calls) =
         ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
 
     let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
 
@@ -1494,7 +1542,7 @@ fn execute_poisons_the_ledger_when_the_grant_does_not_bind_the_attempt() {
         let (transport, transport_calls) =
             ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
         let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-        let mut ledger = ProviderAttemptLedger::new();
+        let mut ledger = new_ledger();
 
         let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
 
@@ -1524,7 +1572,7 @@ fn execute_reports_transport_refusal_while_keeping_the_grant_charged() {
         charge_authority,
         UnwiredProviderTransport,
     );
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
 
     let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
 
@@ -1554,7 +1602,7 @@ fn execute_poisons_when_transport_reports_success_with_zero_requests_issued() {
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
 
     let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
 
@@ -1582,7 +1630,7 @@ fn execute_poisons_when_transport_issues_more_requests_than_authorized() {
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
 
     let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
 
@@ -1609,7 +1657,7 @@ fn execute_records_one_decisive_attempt() {
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
 
     let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
 
@@ -1634,7 +1682,7 @@ fn execute_records_one_ambiguous_attempt() {
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
 
     let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
 
@@ -1650,7 +1698,7 @@ fn execute_records_one_ambiguous_attempt() {
 
 #[test]
 fn execute_accumulates_counters_across_several_successful_attempts() {
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
     for outcome in [
         ProviderAttemptOutcome::Decisive,
         ProviderAttemptOutcome::Decisive,
@@ -1690,7 +1738,7 @@ fn execute_returns_the_same_poison_and_calls_neither_seam_again() {
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
 
     let first = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
     assert_eq!(first, Err(ProviderClientError::TransportReportInconsistent));
@@ -1752,12 +1800,245 @@ fn execute_hands_the_transport_the_exact_authorized_permit() {
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
 
     let outcome = client.execute(&mut ledger, &request);
 
     assert_eq!(outcome, Ok(ProviderAttemptOutcome::Decisive));
     assert_eq!(transport_calls.get(), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 7b. ProviderAttemptLedger::new and execute's ledger/request binding (INV-EJ P1)
+// ---------------------------------------------------------------------------------------------
+//
+// Before this fix, `ProviderAttemptLedger` carried five counters and no identity, and `execute`
+// never compared the request it was given to anything: one ledger could accumulate two different
+// logical requests' attempts and then be attached to one request's compact receipt, and the frozen
+// encoder would accept that shape because it validates counters without knowing whose they are.
+// `ProviderAttemptLedger::new` now takes and validates the boundary/request identity, and `execute`
+// refuses any attempt naming a different logical request or boundary than the ledger is bound to,
+// checked after the poison/no-dispatch guards and before `authorize`, the charge, and the
+// transport -- so, like `DispatchAfterNoDispatch`, the refusal never poisons the ledger.
+
+#[test]
+fn ledger_new_validates_boundary_and_request_identity_and_exposes_them() {
+    let ledger = ProviderAttemptLedger::new(BOUNDARY_ID, &logical_request_id())
+        .expect("valid boundary and request identity must construct");
+    assert_eq!(ledger.provider_boundary_id(), BOUNDARY_ID);
+    assert_eq!(ledger.logical_request_id(), logical_request_id());
+
+    assert_eq!(
+        ProviderAttemptLedger::new("", &logical_request_id()),
+        Err(ProviderClientError::InvalidProviderBoundaryId)
+    );
+    assert_eq!(
+        ProviderAttemptLedger::new(BOUNDARY_ID, "not-a-uuid"),
+        Err(ProviderClientError::InvalidRequestIdentity)
+    );
+}
+
+/// The reviewer's exact finding: drive one ledger through a successful attempt for request A, then
+/// attempt request B on the same ledger. Request B must be refused, and the ledger's counters must
+/// still describe only request A -- the two-request accumulation the finding reported is no longer
+/// possible.
+#[test]
+fn a_ledger_that_completed_one_request_refuses_to_accumulate_a_second_requests_attempts() {
+    let request_a = base_request(ProviderAttemptClass::Readiness);
+    let mut ledger = ProviderAttemptLedger::new(BOUNDARY_ID, &request_a.logical_request_id)
+        .expect("valid ledger identity for request A");
+
+    let (charge_authority_a, _calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport_a, _calls2) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+        })
+    });
+    let client_a = client_with(
+        ProviderCapabilities::none(),
+        charge_authority_a,
+        transport_a,
+    );
+    client_a
+        .execute(&mut ledger, &request_a)
+        .expect("request A's attempt must succeed");
+
+    assert_eq!(ledger.attempt_count(), 1);
+    assert_eq!(ledger.committed_grant_count(), 1);
+    assert_eq!(ledger.decisive_terminal_count(), 1);
+
+    let mut request_b = base_request(ProviderAttemptClass::Readiness);
+    request_b.logical_request_id = other_logical_request_id();
+    request_b.attempt_id = other_attempt_id();
+
+    let (charge_authority_b, charge_calls_b) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport_b, transport_calls_b) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+        })
+    });
+    let client_b = client_with(
+        ProviderCapabilities::none(),
+        charge_authority_b,
+        transport_b,
+    );
+
+    let outcome = client_b.execute(&mut ledger, &request_b);
+
+    assert_eq!(outcome, Err(ProviderClientError::LedgerRequestMismatch));
+    assert_eq!(
+        charge_calls_b.get(),
+        0,
+        "request B must never reach the charge authority"
+    );
+    assert_eq!(
+        transport_calls_b.get(),
+        0,
+        "request B must never reach the transport"
+    );
+
+    assert_eq!(ledger.attempt_count(), 1);
+    assert_eq!(ledger.committed_grant_count(), 1);
+    assert_eq!(ledger.decisive_terminal_count(), 1);
+    assert_eq!(ledger.ambiguous_count(), 0);
+    assert_eq!(ledger.no_dispatch_count(), 0);
+    assert_eq!(ledger.poisoned(), None);
+    assert_eq!(ledger.logical_request_id(), request_a.logical_request_id);
+
+    let audit = ledger
+        .audit()
+        .expect("ledger must still audit request A only");
+    assert_eq!(audit.attempt_count, 1);
+    assert_eq!(audit.decisive_terminal_count, 1);
+    validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
+        .expect("request A's audit must still be accepted by the frozen encoder");
+}
+
+#[test]
+fn execute_refuses_an_attempt_naming_a_different_logical_request_than_the_ledger_is_bound_to() {
+    let mut ledger = ProviderAttemptLedger::new(BOUNDARY_ID, &logical_request_id())
+        .expect("valid ledger identity");
+
+    let mut request = base_request(ProviderAttemptClass::Readiness);
+    request.logical_request_id = other_logical_request_id();
+
+    let (charge_authority, charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+
+    let outcome = client.execute(&mut ledger, &request);
+
+    assert_eq!(outcome, Err(ProviderClientError::LedgerRequestMismatch));
+    assert_eq!(ledger.poisoned(), None);
+    assert_eq!(ledger.attempt_count(), 0);
+    assert_eq!(ledger.committed_grant_count(), 0);
+    assert_eq!(ledger.no_dispatch_count(), 0);
+    assert_eq!(ledger.decisive_terminal_count(), 0);
+    assert_eq!(ledger.ambiguous_count(), 0);
+    assert_eq!(charge_calls.get(), 0, "charge authority must not be called");
+    assert_eq!(transport_calls.get(), 0, "transport must not be called");
+
+    let audit = ledger.audit().expect("unpoisoned ledger must still audit");
+    validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
+        .expect("audit must be accepted by the frozen encoder");
+}
+
+#[test]
+fn execute_refuses_an_attempt_when_the_ledger_is_bound_to_a_different_boundary_than_the_client() {
+    let mut ledger = ProviderAttemptLedger::new("cell.other.primary", &logical_request_id())
+        .expect("valid ledger identity for a different boundary");
+
+    // Otherwise entirely valid, and its logical_request_id matches the ledger's -- only the
+    // boundary differs, isolating that half of the binding check.
+    let request = base_request(ProviderAttemptClass::Readiness);
+
+    let (charge_authority, charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+
+    let outcome = client.execute(&mut ledger, &request);
+
+    assert_eq!(outcome, Err(ProviderClientError::LedgerRequestMismatch));
+    assert_eq!(ledger.poisoned(), None);
+    assert_eq!(ledger.attempt_count(), 0);
+    assert_eq!(ledger.committed_grant_count(), 0);
+    assert_eq!(charge_calls.get(), 0, "charge authority must not be called");
+    assert_eq!(transport_calls.get(), 0, "transport must not be called");
+
+    let audit = ledger.audit().expect("unpoisoned ledger must still audit");
+    validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
+        .expect("audit must be accepted by the frozen encoder");
+}
+
+/// Regression guard that the binding check is not over-tight: a ledger bound to exactly the
+/// attempt's request and boundary still works end to end.
+#[test]
+fn execute_succeeds_when_the_ledger_is_bound_to_exactly_the_attempts_request_and_boundary() {
+    let request = base_request(ProviderAttemptClass::Readiness);
+    let mut ledger = ProviderAttemptLedger::new(BOUNDARY_ID, &request.logical_request_id)
+        .expect("valid ledger identity matching the request");
+
+    let (charge_authority, _calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, _calls2) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+
+    let outcome = client.execute(&mut ledger, &request);
+
+    assert_eq!(outcome, Ok(ProviderAttemptOutcome::Decisive));
+    assert_eq!(ledger.attempt_count(), 1);
+    assert_eq!(ledger.committed_grant_count(), 1);
+    assert_eq!(ledger.decisive_terminal_count(), 1);
+    assert_eq!(ledger.poisoned(), None);
+}
+
+/// A listing class with no listing capability granted would independently fail `authorize`'s
+/// capability gate. Binding the ledger to a different logical request than the attempt proves the
+/// ledger/request binding wins: it is checked before `authorize`, not merely whichever error a
+/// combined check happens to sort first.
+#[test]
+fn execute_refuses_the_ledger_mismatch_before_authorize_even_when_the_request_would_also_fail_validation()
+ {
+    let mut ledger = ProviderAttemptLedger::new(BOUNDARY_ID, &other_logical_request_id())
+        .expect("valid ledger identity for a different request");
+
+    // Default logical_request_id (mismatched with the ledger above); a listing class with no
+    // listing capability granted on the client below.
+    let request = base_request(ProviderAttemptClass::ListObjectsV2);
+
+    let (charge_authority, charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, transport_calls) =
+        ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+
+    let outcome = client.execute(&mut ledger, &request);
+
+    assert_eq!(outcome, Err(ProviderClientError::LedgerRequestMismatch));
+    assert_eq!(charge_calls.get(), 0);
+    assert_eq!(transport_calls.get(), 0);
+    assert_eq!(ledger.poisoned(), None);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1783,7 +2064,7 @@ fn execute_hands_the_transport_the_exact_authorized_permit() {
 
 #[test]
 fn record_no_dispatch_succeeds_once_then_refuses_a_second_call() {
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
 
     assert!(ledger.record_no_dispatch(&no_dispatch_proof()).is_ok());
     assert_eq!(ledger.no_dispatch_count(), 1);
@@ -1814,7 +2095,7 @@ fn record_no_dispatch_refuses_after_any_issued_attempt_decisive_or_ambiguous() {
             })
         });
         let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-        let mut ledger = ProviderAttemptLedger::new();
+        let mut ledger = new_ledger();
         client
             .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
             .unwrap_or_else(|error| panic!("{outcome:?} attempt must succeed: {error}"));
@@ -1839,7 +2120,7 @@ fn record_no_dispatch_is_still_allowed_after_a_committed_grant_that_never_reache
         charge_authority,
         UnwiredProviderTransport,
     );
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
 
     let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
     assert_eq!(
@@ -1869,7 +2150,7 @@ fn record_no_dispatch_is_still_allowed_after_a_committed_grant_that_never_reache
 /// `{no_dispatch: 1, attempt: 0}` audit finalizable rather than destroying it.
 #[test]
 fn execute_refuses_after_a_recorded_no_dispatch_without_poisoning_the_ledger() {
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
     ledger
         .record_no_dispatch(&no_dispatch_proof())
         .expect("record no dispatch on a fresh ledger");
@@ -1929,7 +2210,7 @@ fn record_no_dispatch_and_audit_return_the_poison_on_a_poisoned_ledger() {
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-    let mut ledger = ProviderAttemptLedger::new();
+    let mut ledger = new_ledger();
     let _ = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
     assert_eq!(
         ledger.poisoned(),
@@ -2377,7 +2658,7 @@ fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_audit_
     for preceding_grant in [false, true] {
         for preceding_no_dispatch in [false, true] {
             for sequence in outcome_sequences() {
-                let mut base_ledger = ProviderAttemptLedger::new();
+                let mut base_ledger = new_ledger();
                 let base_label = format!(
                     "preceding_grant={preceding_grant} preceding_no_dispatch=\
                      {preceding_no_dispatch} sequence={sequence:?}"
@@ -2534,9 +2815,15 @@ fn debug_output_never_leaks_sensitive_fields() {
         UnwiredChargeAuthority,
         UnwiredProviderTransport,
     );
-    let charge_request = sentinel_client
-        .authorize(&request)
-        .expect("sentinel request must authorize");
+    // authorize()'s ProviderChargeRequest is crate-private now (WP-114 CD-5), so it is captured
+    // through a real execute() call the same way Section 5's charge-request tests do, rather than
+    // called directly.
+    let charge_request = capture_charge_request_with_boundary(
+        boundary.clone(),
+        ProviderCapabilities::none(),
+        &request,
+        "sentinel redaction fixture",
+    );
     let grant = ProviderChargeGrant {
         grant_id: sentinel_grant_id.clone(),
         traffic_class: charge_request.traffic_class(),
@@ -2576,6 +2863,36 @@ fn debug_output_never_leaks_sensitive_fields() {
             assert!(!output.contains(sentinel), "leaked {sentinel} in {output}");
         }
     }
+}
+
+/// INV-EJ finding, reported rather than fixed here (test ownership does not include `src/`):
+/// `ProviderAttemptLedger` is the only identity-bearing type in this module whose `Debug` is
+/// `#[derive]`d rather than hand-written to redact. Every sibling type that carries a boundary or
+/// request identity (`ProviderTarget`, `CellProviderBoundary`, `DurableProviderPutBody`,
+/// `ProviderAttemptRequest`, `ProviderChargeRequest`, `ProviderChargeGrant`, `BudgetPin`) has a
+/// custom `fmt::Debug` that prints `"[REDACTED]"` for exactly these fields. `ProviderAttemptLedger`
+/// gained `provider_boundary_id`/`logical_request_id` in this same fix and kept its derived
+/// `#[derive(Clone, Debug, PartialEq, Eq)]`, so `{ledger:?}` now prints both identity strings in
+/// clear text. This test is expected to fail against the current `src/provider_client.rs` -- it
+/// pins the same no-leak contract every other identity-bearing type in this file already meets, so
+/// a future redaction fix in `src/` should turn it green rather than needing a rewrite.
+#[test]
+fn ledger_debug_output_must_not_leak_the_boundary_or_request_identity() {
+    let sentinel_boundary_id = "cell.sentinel.ledger-redact.7e2";
+    let sentinel_logical_request_id = uuid_v7(9_999, "dddddddddddd");
+    let ledger = ProviderAttemptLedger::new(sentinel_boundary_id, &sentinel_logical_request_id)
+        .expect("sentinel identity must validate");
+
+    let rendered = format!("{ledger:?}");
+
+    assert!(
+        !rendered.contains(sentinel_boundary_id),
+        "leaked boundary id in {rendered}"
+    );
+    assert!(
+        !rendered.contains(sentinel_logical_request_id.as_str()),
+        "leaked logical request id in {rendered}"
+    );
 }
 
 #[test]

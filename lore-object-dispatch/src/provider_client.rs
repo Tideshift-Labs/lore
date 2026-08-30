@@ -591,6 +591,12 @@ impl DurableProviderPutBody {
         &self.logical_request_id
     }
 
+    /// The spool attempt that wrote this body, which is deliberately *not* the provider attempt
+    /// that sends it and is deliberately not checked by
+    /// [`GovernedProviderClient::validate_attempt`]. One spooled body is written once and then
+    /// serves every part attempt of a multipart upload, so requiring it to equal the sending
+    /// attempt's id would forbid multipart entirely. The binding that does the work is to the
+    /// logical request and the boundary, both of which are checked.
     pub fn spool_attempt_id(&self) -> &str {
         &self.spool_attempt_id
     }
@@ -865,6 +871,13 @@ pub enum ProviderChargeError {
 /// physical budget and each subordinate cap in [`ProviderChargeRequest::cap_classes`] atomically in
 /// one transaction, and must fail closed when the budget configuration cannot be resolved rather
 /// than falling back to an unbounded rate.
+///
+/// **An error claims nothing was committed.** [`GovernedProviderClient::execute`] counts a grant
+/// against the ledger for `Ok` and for [`ProviderChargeError::AmbiguousCommit`], and for no other
+/// error. So an implementation that maps a connection drop around `COMMIT` to, say,
+/// [`ProviderChargeError::AuthorityUnavailable`] makes the audit under-report a charge that may
+/// have committed. Any outcome an implementation cannot prove uncommitted must be reported as
+/// `AmbiguousCommit`, which is the conservative, nonrefundable arm.
 pub trait ProviderChargeAuthority {
     fn charge(
         &self,
@@ -1028,11 +1041,25 @@ impl ProviderTransport for UnwiredProviderTransport {
 /// The attempt accounting one logical request accumulates, and the source of its retained
 /// provider-attempt audit.
 ///
+/// A ledger is bound to one boundary and one logical request at construction, and
+/// [`GovernedProviderClient::execute`] refuses an attempt that names anything else. The audit this
+/// produces is durable evidence attached to a compact receipt that carries its own
+/// `logical_request_id`, and the frozen encoder validates only the counters, never whose counters
+/// they are. Without the binding, one ledger could accumulate two requests' attempts and be
+/// attached to one of them, and nothing anywhere would reject it.
+///
 /// There is no refund method. `provider_authority_refunded` is therefore always false, which is
 /// also the only value [`crate::compaction::validate_and_encode_object_store_provider_attempt_audit`]
 /// accepts.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// `Clone` exists for callers that want to explore a hypothetical continuation, such as a test
+/// matrix branching one prefix into several suffixes. A clone is a separate accumulator that no
+/// longer tracks the original: never finalize a request from a clone, only from the ledger the
+/// request's own attempts were recorded on.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderAttemptLedger {
+    provider_boundary_id: String,
+    logical_request_id: String,
     attempt_count: u64,
     committed_grant_count: u64,
     no_dispatch_count: u64,
@@ -1042,8 +1069,36 @@ pub struct ProviderAttemptLedger {
 }
 
 impl ProviderAttemptLedger {
-    pub fn new() -> Self {
-        Self::default()
+    /// Opens a ledger bound to one boundary and one logical request.
+    ///
+    /// There is deliberately no `Default`: an unbound ledger is exactly the artifact this binding
+    /// exists to prevent.
+    pub fn new(
+        provider_boundary_id: &str,
+        logical_request_id: &str,
+    ) -> Result<Self, ProviderClientError> {
+        validate_canonical_id(provider_boundary_id)
+            .map_err(|_| ProviderClientError::InvalidProviderBoundaryId)?;
+        canonical_uuid_v7_timestamp(logical_request_id)
+            .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
+        Ok(Self {
+            provider_boundary_id: provider_boundary_id.to_string(),
+            logical_request_id: logical_request_id.to_string(),
+            attempt_count: 0,
+            committed_grant_count: 0,
+            no_dispatch_count: 0,
+            decisive_terminal_count: 0,
+            ambiguous_count: 0,
+            poisoned: None,
+        })
+    }
+
+    pub fn provider_boundary_id(&self) -> &str {
+        &self.provider_boundary_id
+    }
+
+    pub fn logical_request_id(&self) -> &str {
+        &self.logical_request_id
     }
 
     pub fn attempt_count(&self) -> u64 {
@@ -1075,6 +1130,12 @@ impl ProviderAttemptLedger {
     ///
     /// A validated proof is required, and the retained audit algebra admits at most one no-dispatch
     /// record and none once a decisive terminal has been counted.
+    ///
+    /// The proof is required but not bound to this ledger's request, and cannot be:
+    /// [`crate::no_dispatch::NoDispatchProofFields`] carries no request identity, so request A's
+    /// ledger can still be finalized with a validated proof minted for request B. The ledger's own
+    /// binding narrows this to the proof alone; closing it needs a request identity in the proof
+    /// record, and CD-6 owns that producer.
     pub fn record_no_dispatch(
         &mut self,
         _proof: &CanonicalNoDispatchProof,
@@ -1167,6 +1228,24 @@ impl ProviderAttemptLedger {
     }
 }
 
+impl fmt::Debug for ProviderAttemptLedger {
+    // Binding the ledger to an identity gave it two fields that must not reach a diagnostic
+    // surface, so the derive it used to carry no longer suffices.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderAttemptLedger")
+            .field("provider_boundary_id", &"[REDACTED]")
+            .field("logical_request_id", &"[REDACTED]")
+            .field("attempt_count", &self.attempt_count)
+            .field("committed_grant_count", &self.committed_grant_count)
+            .field("no_dispatch_count", &self.no_dispatch_count)
+            .field("decisive_terminal_count", &self.decisive_terminal_count)
+            .field("ambiguous_count", &self.ambiguous_count)
+            .field("poisoned", &self.poisoned)
+            .finish()
+    }
+}
+
 /// The cell's one governed provider client.
 pub struct GovernedProviderClient<C, T> {
     boundary: CellProviderBoundary,
@@ -1231,6 +1310,15 @@ where
         if ledger.no_dispatch_count() != 0 {
             return Err(ProviderClientError::DispatchAfterNoDispatch);
         }
+        // The audit this ledger produces is attached to a compact receipt that carries its own
+        // request identity, and the frozen encoder validates the counters without knowing whose
+        // they are. So the binding has to be checked here or nowhere. Refused before anything is
+        // charged or sent, and so, like the guard above, without closing the ledger.
+        if ledger.provider_boundary_id() != self.boundary.provider_boundary_id
+            || ledger.logical_request_id() != request.logical_request_id
+        {
+            return Err(ProviderClientError::LedgerRequestMismatch);
+        }
         let charge_request = self.authorize(request)?;
 
         let grant = match self.charge_authority.charge(&charge_request) {
@@ -1277,9 +1365,25 @@ where
         }
     }
 
+    /// Validates a request against the cell boundary, the capability gate, and the body rules,
+    /// without charging or sending anything.
+    ///
+    /// This is the public half of [`Self::authorize`]. It deliberately does not hand back the
+    /// [`ProviderChargeRequest`], because that value is the only thing a
+    /// [`ProviderChargeAuthority`] will charge, and a caller holding both it and the authority
+    /// could charge outside any ledger — producing a committed grant the audit reports as zero,
+    /// in a shape the frozen encoder accepts. Keeping the constructor inside the crate makes that
+    /// unreachable rather than merely discouraged.
+    pub fn validate_attempt(
+        &self,
+        request: &ProviderAttemptRequest,
+    ) -> Result<(), ProviderClientError> {
+        self.authorize(request).map(|_| ())
+    }
+
     /// Validates a request against the cell boundary, the capability gate, and the body rules, and
     /// returns the charge it implies. Charges nothing and sends nothing.
-    pub fn authorize(
+    fn authorize(
         &self,
         request: &ProviderAttemptRequest,
     ) -> Result<ProviderChargeRequest, ProviderClientError> {
@@ -1382,6 +1486,10 @@ impl<C, T> fmt::Debug for GovernedProviderClient<C, T> {
 /// `/` and `:` are excluded and the length is capped well below the general 256-byte bound. CD-4
 /// must confirm the charset against WP-121's actual revision spelling when the per-cell envelope is
 /// published; narrowing here is the fail-closed direction to guess in, but it is still a guess.
+///
+/// The caller's `fence == 0` rejection is the same kind of guess and needs the same confirmation:
+/// it assumes WP-121's monotonic generation starts at one, and a 0-based first generation would
+/// hard-fail at admission.
 fn validate_budget_revision(value: &str) -> Result<(), ProviderClientError> {
     let bytes = value.as_bytes();
     if bytes.is_empty()
@@ -1494,6 +1602,8 @@ pub enum ProviderClientError {
     NoDispatchNotPermitted,
     #[error("provider attempt may not be dispatched after a no-dispatch proof was recorded")]
     DispatchAfterNoDispatch,
+    #[error("provider attempt ledger is bound to another boundary or logical request")]
+    LedgerRequestMismatch,
     #[error("provider attempt ledger counters violate the retained audit algebra")]
     LedgerAlgebraViolation,
     #[error("provider attempt ledger counter overflowed")]

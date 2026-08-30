@@ -43,6 +43,14 @@ impl TryFrom<u32> for NoDispatchReason {
     }
 }
 
+/// The fields a no-dispatch proof commits to.
+///
+/// **Open, handed to CD-6 (INV-EJ B1, 2026-08-30): there is no request identity here.** A proof
+/// therefore attests that *some* request resolved without dispatch, not which one, so
+/// [`crate::provider_client::ProviderAttemptLedger::record_no_dispatch`] cannot check the proof it
+/// is handed against the request its ledger is bound to. Adding a logical request identity is a
+/// change to this record's canonical preimage and its paired vectors, so it belongs with the
+/// producer CD-6 builds, not with a consumer-side check.
 #[derive(Clone, PartialEq, Eq)]
 pub struct NoDispatchProofFields {
     pub reason: NoDispatchReason,
