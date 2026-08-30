@@ -576,6 +576,18 @@ For a method borrowing the caller's `Transaction<'_>` instead of owning one
 `deadpool-postgres` is a normal (non-dev) dependency, so `deadpool_postgres`
 is `use`-able from `tests/*.rs` the same way `tokio_postgres` already is here.
 
+**Reproducing an unlocked-plan-to-locked-head race deterministically needs a row
+already IN the fanout to block on, not a test-only injection hook** (a hook
+would be a second code path to keep correct). Associate repository R with the
+hash beforehand so `lock_lifecycle_fanout` must take its row; hold R locked
+externally on a second connection; race the operation under test against a
+mutation to a DIFFERENT repository R2 (outside the plan) via `tokio::join!`
+(plain `#[tokio::test]` genuinely interleaves two I/O-bound futures, no
+`tokio::spawn` needed); let the race commit, THEN release R. Revert-check
+against the pre-fix source (`git show <sha>:<path> > <file>`, rerun,
+`git checkout -- <file>`) — INV-EF P1-1's case was confirmed RED (silently
+`Admitted` instead of refusing) this way.
+
 ### Never hash two blocks of program output to rule out a whitespace difference — the pipeline you hashed through may have removed it
 
 Symptom: `domain_migration_parity.rs`'s catalog-parity test failed over five SCHEMA-117
@@ -673,6 +685,19 @@ not a hand-poked `State`), asserting the expected non-empty result AND the absen
 event. Revert-check it the same way as the negative guards -- narrowing the success gate (or
 dropping the loop body) should turn it red while the negative controls stay green, proving it
 covers a gap they don't.
+
+**A relative "assert X unchanged" version of this trap (INV-EF P2-11) needs its own check**: before
+comparing a value before/after a call, confirm the code path under test can even reach a write to
+it -- if it structurally cannot, every implementation passes and the assertion adds nothing; drop
+it and keep only a proof that discriminates (`lore-postgres/tests/domain_fragment_lifecycle.rs`'s
+`revalidate_push_witness_refuses_over_the_revalidation_limit_before_locking_any_fragment_row` --
+`revalidate_push_witness`'s abort arms only `SELECT`, never write `lore_domain_repositories`). A
+second shape: two outcomes you mean to distinguish (correctly fenced vs. wrongly proceeded) can
+both write the SAME idempotent value to the field you assert on (re-obliterating one epoch always
+ends `Tombstoned`/`PURGED` either way) -- assert a field the wrong path would independently
+re-derive and thus change, such as a freshly allocated fence, not one both converge on (same
+file's `commit_obliterate_fences_a_stale_intent_and_mutates_nothing`, asserting `last_fence`
+rather than `state`/`disposition` alone).
 
 ### Public multi-path stage concurrency needs a real multi-worker lifecycle test
 
@@ -780,21 +805,20 @@ current-thread/one-worker runs and event or stage-end counts do not prove topolo
   result.
 - Runtime-specific I/O backends and real QUIC drain behavior remain platform/live tiers; record the
   omission rather than representing a portable unit run as full coverage.
-- **Never source a candidate port from `bind(0)` when the port must be free for BOTH TCP and UDP,
-  and never "fix" the resulting failure by raising the retry count.** `scripts/test`'s
-  `allocate_free_port` (gRPC and QUIC share one number) did exactly that and hard-failed all 20
-  attempts on Windows with `WSAEACCES`/`WinError 10013`, persistently rather than flakily. Windows
-  keeps SEPARATE per-protocol exclusion lists (`netsh interface ipv4 show excludedportrange
-  protocol=udp` vs `protocol=tcp`), so a port can be TCP-free and UDP-reserved; measured on a dev
-  box 2026-08-11, ~1,860 of the 16,384-port dynamic range was UDP-excluded in bands of 60-500
-  consecutive ports, disjoint from the TCP exclusions. `bind(0)` hands out ports strictly
-  sequentially from a machine-global cursor (+1 per call, measured: 20 binds spanned 19 ports), so
-  the retry loop probed 20 ADJACENT numbers. Every band being wider than that span means landing in
-  one fails all attempts, and each failure advances the cursor by only 1, so escaping a 100-port
-  band would need ~100 retries. Fixed by sampling candidates at random from 49152-65535 and probing
-  both protocols with both sockets held at once. Guard:
-  `scripts/test/test_allocate_free_port.py` asserts the candidates are not sequential (revert-checked
-  RED against the old `bind(0)` source, failing with `span 11 across 12 calls`).
+- **Never source a candidate port from `bind(0)` when the port must be free for BOTH TCP and UDP;
+  never "fix" the resulting failure by raising the retry count.** `scripts/test`'s
+  `allocate_free_port` (gRPC and QUIC share one number) hard-failed all 20 attempts on Windows with
+  `WSAEACCES`/`WinError 10013`, persistently not flakily. Windows keeps SEPARATE per-protocol
+  exclusion lists (`netsh interface ipv4 show excludedportrange protocol=udp` vs `protocol=tcp`), so
+  a port can be TCP-free and UDP-reserved; measured 2026-08-11, ~1,860 of the 16,384-port dynamic
+  range was UDP-excluded in bands of 60-500 consecutive ports, disjoint from the TCP exclusions.
+  `bind(0)` hands out ports sequentially from a machine-global cursor (+1/call, measured: 20 binds
+  spanned 19 ports), so the retry loop probed 20 ADJACENT numbers -- one band wider than that span
+  fails all attempts, and each failure advances the cursor by only 1 (~100 retries to escape a
+  100-port band). Fixed by sampling candidates at random from 49152-65535, probing both protocols
+  with both sockets held at once. Guard: `scripts/test/test_allocate_free_port.py` asserts the
+  candidates are not sequential (revert-checked RED against the old `bind(0)` source: `span 11
+  across 12 calls`).
 
 ## Appending new findings
 
