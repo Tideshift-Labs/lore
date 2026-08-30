@@ -656,12 +656,48 @@ async fn acquire_result_boundary_is_rejected_before_lock_mutation() {
     let sub_millisecond = AcquireOrRenewInput {
         lease_duration: Some(Duration::from_nanos(999_999)),
         resources: vec![resource(rand::random(), None)],
-        ..last_valid
+        ..last_valid.clone()
     };
     assert!(matches!(
         acquire_or_renew_binding(&sub_millisecond),
         Err(DomainError::InvalidInput(message)) if message.contains("1ms")
     ));
+
+    let whole_millisecond = AcquireOrRenewInput {
+        lease_duration: Some(Duration::from_millis(1)),
+        resources: vec![resource(rand::random(), None)],
+        ..last_valid.clone()
+    };
+    acquire_or_renew_binding(&whole_millisecond)
+        .expect("whole-millisecond lease has an exact binding");
+    let fractional_millisecond = AcquireOrRenewInput {
+        lease_duration: Some(Duration::from_millis(1) + Duration::from_nanos(1)),
+        resources: vec![resource(rand::random(), None)],
+        ..last_valid
+    };
+    assert!(matches!(
+        acquire_or_renew_binding(&fractional_millisecond),
+        Err(DomainError::InvalidInput(message)) if message.contains("whole milliseconds")
+    ));
+    let fractional_result = coordinator
+        .acquire_or_renew(&operation, &fractional_millisecond)
+        .await;
+    assert!(matches!(
+        fractional_result,
+        Err(DomainError::InvalidInput(message)) if message.contains("whole milliseconds")
+    ));
+    let after_fractional: i64 = direct
+        .query_one(
+            "SELECT count(*) FROM lore_locks WHERE repository = $1 AND branch = $2",
+            &[&repository_id.as_slice(), &branch_id.as_slice()],
+        )
+        .await
+        .expect("recount after fractional lease rejection")
+        .get(0);
+    assert_eq!(
+        after_fractional, before,
+        "fractional-millisecond lease must be rejected before lock mutation"
+    );
 }
 
 #[tokio::test]
