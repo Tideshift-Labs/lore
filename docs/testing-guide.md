@@ -188,7 +188,8 @@ will update an older check constraint or state schema.
   `pwsh -File lore-object-dispatch/tests/run-local-authority-live.ps1` (add `-KeepOnFailure` to
   leave the labelled container up for debugging). All nine tests stay `#[ignore]`; the harness
   opts them in explicitly with `--ignored --exact <name>`, it does not un-ignore them, so the
-  crate's baseline `cargo test -p lore-object-dispatch` ignored count (13) is unchanged by this.
+  crate's baseline `cargo test -p lore-object-dispatch` ignored count is unchanged by this run
+  (don't hardcode a count here — it drifts; list it fresh with `-- --list --ignored`).
   CD-1's out-of-band installer/attester itself (`lore-object-dispatch/src/cell_schema_install.rs`
   plus `src/bin/cell-schema-install.rs`, a one-shot operator CLI, not a service) has its own
   offline-only suite, `tests/cell_schema_install.rs` — no Postgres, no `#[ignore]`. It re-reads
@@ -205,6 +206,12 @@ will update an older check constraint or state schema.
   (`cell_schema_error_is_a_standard_redacted_error_type`) is a type-level stub pending the real
   `CellSchemaError` variant list, which the module's pinned contract deliberately left open —
   fill in the per-variant `format!("{e}")`/`{e:?}` redaction assertions once the enum lands.
+  WP-114 CD-5's provider client (`provider_client.rs`): `AuthorizedProviderAttempt` is
+  crate-private-constructed, and a transport reporting `provider_requests_issued != 1` poisons the
+  ledger (this, not a declared retry policy, enforces disabled SDK auto-retry). Double pattern: one
+  generic closure-scripted double per trait, `new` returning `(Self, Rc<Cell<u32>>)` — the double
+  moves into the client, so the counter handle must outlive it. Gate:
+  `cargo test -p lore-object-dispatch --test provider_client -j 4` (53 tests, no `#[ignore]`).
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

@@ -1,0 +1,1387 @@
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
+// SPDX-License-Identifier: MIT
+
+//! The governed provider client: cell boundary binding, the put execution plan, and the
+//! charge-before-send kernel (WP-114 CD-5, CR-033 D4).
+//!
+//! This module is the crate's only place a provider attempt may be authorized. It holds no
+//! provider SDK, no credential, no endpoint route, no database connection, no lock, and performs
+//! no filesystem or network I/O. What it owns is the algebra CR-033 D4 requires around a send:
+//!
+//! - **One boundary.** Every attempt names a [`ProviderTarget`], and the cell's configured
+//!   [`CellProviderBoundary`] must match its bucket, region, and endpoint host exactly. There is no
+//!   fallback route and no second bucket, so no attempt and no object byte can be addressed outside
+//!   the cell's region on any drain, repair, read, fallback, or operator path.
+//! - **Charge before send.** [`GovernedProviderClient::execute`] charges the CD-4 authority first
+//!   and only then constructs an [`AuthorizedProviderAttempt`]. That permit is the sole input to
+//!   [`ProviderTransport::issue`] and cannot be constructed outside this crate, so a transport can
+//!   never be handed an attempt that was not charged.
+//! - **One authorized attempt per grant.** A transport reports how many provider requests it
+//!   issued. Anything other than one is a fail-closed error, which is how "the SDK's automatic
+//!   retry is disabled" is enforced rather than merely declared: a retrying transport reports more
+//!   requests than it was granted and poisons the ledger instead of escaping authority.
+//! - **No refund.** [`ProviderAttemptLedger`] has no refund path at all. A committed grant that
+//!   never reached the provider stays charged, which is the valid, nonrefundable
+//!   grant-without-attempt window; conservative charging explicitly does not claim exact-once.
+//!
+//! Nothing here is durable outcome authority. A provider report, including a listing or a
+//! read-after-write observation, only ever produces a [`ProviderAttemptOutcome`], which converts
+//! into no terminal result, no receipt, and no lifecycle transition. The cell database's committed
+//! result row remains the only outcome authority.
+//!
+//! # What CD-5 deliberately does not wire
+//!
+//! The charge authority is CD-4's shared cell-local limiter and the transport is CD-6's S3 client.
+//! Neither exists. This module ships [`UnwiredChargeAuthority`] and [`UnwiredProviderTransport`],
+//! which fail closed on every call and can never report a success. They are guards, not stubs: a
+//! client assembled from them charges nothing and sends nothing, so compiling or testing this
+//! module authorizes no provider traffic. The budget pin a request carries is passed through
+//! opaquely and only checked for shape and for exact echo by the grant; CD-5 does not resolve it,
+//! because resolving it is CD-4's obligation against WP-121's unpublished per-cell envelope.
+
+use std::fmt;
+
+use thiserror::Error;
+
+use crate::compaction::ObjectStoreProviderAttemptAudit;
+use crate::contract::canonical_uuid_v7_timestamp;
+use crate::contract::validate_canonical_id;
+use crate::no_dispatch::CanonicalNoDispatchProof;
+use crate::spool::LedgerSpoolView;
+use crate::spool::SpoolLayout;
+use crate::spool::SpoolObjectKey;
+use crate::spool::SpoolObjectKind;
+
+/// Smallest part size S3-compatible multipart uploads accept for any part but the last.
+pub const PROVIDER_MIN_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024;
+/// Largest part size S3-compatible multipart uploads accept.
+pub const PROVIDER_MAX_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Largest object a single-shot PUT may carry.
+pub const PROVIDER_MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Largest number of parts one multipart upload may carry.
+pub const PROVIDER_MAX_MULTIPART_PARTS: u32 = 10_000;
+
+/// The closed set of physical provider attempt classes this cell may issue.
+///
+/// These are *physical* attempts, one charged operation each, not the logical operations of
+/// `object_store_request_v1`. One logical PUT expands into a create, its parts, and a complete,
+/// and CR-033 D4 charges each of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderAttemptClass {
+    /// Bucket readiness probe (`HeadBucket`).
+    Readiness,
+    HeadObject,
+    GetObject,
+    PutObject,
+    CreateMultipartUpload,
+    UploadPart,
+    CompleteMultipartUpload,
+    AbortMultipartUpload,
+    ListObjectsV2,
+    ListObjectVersions,
+    DeleteObject,
+}
+
+impl ProviderAttemptClass {
+    pub const ALL: [Self; 11] = [
+        Self::Readiness,
+        Self::HeadObject,
+        Self::GetObject,
+        Self::PutObject,
+        Self::CreateMultipartUpload,
+        Self::UploadPart,
+        Self::CompleteMultipartUpload,
+        Self::AbortMultipartUpload,
+        Self::ListObjectsV2,
+        Self::ListObjectVersions,
+        Self::DeleteObject,
+    ];
+
+    pub const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Readiness => "Readiness",
+            Self::HeadObject => "HeadObject",
+            Self::GetObject => "GetObject",
+            Self::PutObject => "PutObject",
+            Self::CreateMultipartUpload => "CreateMultipartUpload",
+            Self::UploadPart => "UploadPart",
+            Self::CompleteMultipartUpload => "CompleteMultipartUpload",
+            Self::AbortMultipartUpload => "AbortMultipartUpload",
+            Self::ListObjectsV2 => "ListObjectsV2",
+            Self::ListObjectVersions => "ListObjectVersions",
+            Self::DeleteObject => "DeleteObject",
+        }
+    }
+
+    /// Whether the class is a provider listing, which needs the capability gate and the stricter
+    /// subordinate cap of CR-033 D4.
+    pub const fn is_listing(self) -> bool {
+        matches!(self, Self::ListObjectsV2 | Self::ListObjectVersions)
+    }
+
+    /// Whether the class transfers an object body and therefore requires a durable spooled body.
+    pub const fn carries_object_body(self) -> bool {
+        matches!(self, Self::PutObject | Self::UploadPart)
+    }
+}
+
+/// The closed set of traffic classes that share the one cell budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderTrafficClass {
+    Drain,
+    DirectFallback,
+    Read,
+    Repair,
+    Operator,
+}
+
+impl ProviderTrafficClass {
+    pub const ALL: [Self; 5] = [
+        Self::Drain,
+        Self::DirectFallback,
+        Self::Read,
+        Self::Repair,
+        Self::Operator,
+    ];
+
+    pub const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Drain => "Drain",
+            Self::DirectFallback => "DirectFallback",
+            Self::Read => "Read",
+            Self::Repair => "Repair",
+            Self::Operator => "Operator",
+        }
+    }
+
+    pub const fn cap_class(self) -> ProviderCapClass {
+        match self {
+            Self::Drain => ProviderCapClass::TrafficDrain,
+            Self::DirectFallback => ProviderCapClass::TrafficDirectFallback,
+            Self::Read => ProviderCapClass::TrafficRead,
+            Self::Repair => ProviderCapClass::TrafficRepair,
+            Self::Operator => ProviderCapClass::TrafficOperator,
+        }
+    }
+}
+
+/// The closed set of caps one charge consumes.
+///
+/// [`ProviderCapClass::SharedPhysicalBudget`] is the cell's one physical budget over its provider
+/// boundary. Every other variant is a *subordinate* cap inside it. A class label never creates
+/// another copy of a physical ceiling, so every charge consumes the shared budget as well as each
+/// applicable subordinate cap, atomically, in CD-4's one transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderCapClass {
+    SharedPhysicalBudget,
+    TrafficDrain,
+    TrafficDirectFallback,
+    TrafficRead,
+    TrafficRepair,
+    TrafficOperator,
+    List,
+}
+
+impl ProviderCapClass {
+    pub const fn metric_label(self) -> &'static str {
+        match self {
+            Self::SharedPhysicalBudget => "SharedPhysicalBudget",
+            Self::TrafficDrain => "TrafficDrain",
+            Self::TrafficDirectFallback => "TrafficDirectFallback",
+            Self::TrafficRead => "TrafficRead",
+            Self::TrafficRepair => "TrafficRepair",
+            Self::TrafficOperator => "TrafficOperator",
+            Self::List => "List",
+        }
+    }
+}
+
+/// The SDK's automatic retry setting, which has exactly one legal value.
+///
+/// The type exists so a provider client cannot be constructed without stating the setting, and so
+/// the setting cannot be stated as anything but disabled. The setting itself is not the
+/// enforcement: [`ProviderAttemptReport::provider_requests_issued`] is, because it is observable
+/// from this side of the seam and a declaration is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderRetryPolicy(());
+
+impl ProviderRetryPolicy {
+    pub const fn disabled() -> Self {
+        Self(())
+    }
+
+    pub const fn max_attempts(self) -> u32 {
+        1
+    }
+}
+
+/// Provider capabilities the cell's operator has granted.
+///
+/// Absent a capability the corresponding attempt class fails closed. There is no default-on
+/// capability: [`ProviderCapabilities::none`] is the only starting point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    listing: bool,
+}
+
+impl ProviderCapabilities {
+    pub const fn none() -> Self {
+        Self { listing: false }
+    }
+
+    pub const fn with_listing(self) -> Self {
+        Self { listing: true }
+    }
+
+    pub const fn listing(self) -> bool {
+        self.listing
+    }
+}
+
+/// The provider address an attempt is aimed at.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderTarget {
+    pub bucket: String,
+    pub region: String,
+    pub endpoint_host: String,
+}
+
+impl fmt::Debug for ProviderTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderTarget")
+            .field("bucket", &"[REDACTED]")
+            .field("region", &"[REDACTED]")
+            .field("endpoint_host", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// The cell's one configured provider boundary.
+///
+/// The type names no credential and holds no secret. A cell's credentials are scoped to this one
+/// bucket by the operator; this value is the in-process check that nothing addresses anything else.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CellProviderBoundary {
+    provider_boundary_id: String,
+    target: ProviderTarget,
+}
+
+impl CellProviderBoundary {
+    pub fn new(
+        provider_boundary_id: &str,
+        bucket: &str,
+        region: &str,
+        endpoint_host: &str,
+    ) -> Result<Self, ProviderClientError> {
+        validate_canonical_id(provider_boundary_id)
+            .map_err(|_| ProviderClientError::InvalidProviderBoundaryId)?;
+        validate_bucket_name(bucket)?;
+        validate_region(region)?;
+        validate_endpoint_host(endpoint_host)?;
+        Ok(Self {
+            provider_boundary_id: provider_boundary_id.to_string(),
+            target: ProviderTarget {
+                bucket: bucket.to_string(),
+                region: region.to_string(),
+                endpoint_host: endpoint_host.to_string(),
+            },
+        })
+    }
+
+    pub fn provider_boundary_id(&self) -> &str {
+        &self.provider_boundary_id
+    }
+
+    pub fn target(&self) -> &ProviderTarget {
+        &self.target
+    }
+
+    /// Rejects any target that is not exactly this cell's bucket, region, and endpoint host.
+    pub fn validate_target(&self, target: &ProviderTarget) -> Result<(), ProviderClientError> {
+        if target.bucket != self.target.bucket {
+            return Err(ProviderClientError::BucketOutsideCellBoundary);
+        }
+        if target.region != self.target.region {
+            return Err(ProviderClientError::RegionOutsideCell);
+        }
+        if target.endpoint_host != self.target.endpoint_host {
+            return Err(ProviderClientError::EndpointOutsideCellRegion);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for CellProviderBoundary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CellProviderBoundary")
+            .field("provider_boundary_id", &"[REDACTED]")
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+fn validate_bucket_name(value: &str) -> Result<(), ProviderClientError> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 3
+        || bytes.len() > 63
+        || !bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+        })
+        || value.contains("..")
+        || value.contains(".-")
+        || value.contains("-.")
+    {
+        return Err(ProviderClientError::InvalidBucketName);
+    }
+    let first = bytes.first().copied().unwrap_or(b'.');
+    let last = bytes.last().copied().unwrap_or(b'.');
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit())
+        || !(last.is_ascii_lowercase() || last.is_ascii_digit())
+    {
+        return Err(ProviderClientError::InvalidBucketName);
+    }
+    Ok(())
+}
+
+fn validate_region(value: &str) -> Result<(), ProviderClientError> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 63
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        || bytes.first() == Some(&b'-')
+        || bytes.last() == Some(&b'-')
+    {
+        return Err(ProviderClientError::InvalidRegion);
+    }
+    Ok(())
+}
+
+fn validate_endpoint_host(value: &str) -> Result<(), ProviderClientError> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > 253 {
+        return Err(ProviderClientError::InvalidEndpointHost);
+    }
+    let labels: Vec<&str> = value.split('.').collect();
+    if labels.len() < 2 {
+        return Err(ProviderClientError::InvalidEndpointHost);
+    }
+    for label in labels {
+        let label = label.as_bytes();
+        if label.is_empty()
+            || label.len() > 63
+            || label.first() == Some(&b'-')
+            || label.last() == Some(&b'-')
+            || !label
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        {
+            return Err(ProviderClientError::InvalidEndpointHost);
+        }
+    }
+    Ok(())
+}
+
+/// Bounds the cell applies when planning a PUT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderPutLimits {
+    /// Largest body a single-shot PUT may carry before the plan becomes multipart.
+    pub multipart_threshold_bytes: u64,
+    /// Size of every part but the last.
+    pub part_size_bytes: u64,
+    /// Largest number of parts this cell will plan, never above the provider's own ceiling.
+    pub max_parts: u32,
+}
+
+impl ProviderPutLimits {
+    fn validate(&self) -> Result<(), ProviderClientError> {
+        if self.part_size_bytes < PROVIDER_MIN_PART_SIZE_BYTES
+            || self.part_size_bytes > PROVIDER_MAX_PART_SIZE_BYTES
+        {
+            return Err(ProviderClientError::InvalidPutLimits);
+        }
+        if self.max_parts == 0 || self.max_parts > PROVIDER_MAX_MULTIPART_PARTS {
+            return Err(ProviderClientError::InvalidPutLimits);
+        }
+        if self.multipart_threshold_bytes < self.part_size_bytes
+            || self.multipart_threshold_bytes > PROVIDER_MAX_SINGLE_PUT_BYTES
+        {
+            return Err(ProviderClientError::InvalidPutLimits);
+        }
+        Ok(())
+    }
+}
+
+/// The attempt sequence one logical PUT expands into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutObjectPlan {
+    SingleShot {
+        body_size: u64,
+    },
+    Multipart {
+        body_size: u64,
+        part_size_bytes: u64,
+        part_count: u32,
+        final_part_size_bytes: u64,
+    },
+}
+
+impl PutObjectPlan {
+    /// Number of provider attempts the plan charges when every attempt succeeds.
+    ///
+    /// An abort is contingent on failure and is charged when it is issued, so it is not counted
+    /// here.
+    pub const fn planned_attempt_count(self) -> u64 {
+        match self {
+            Self::SingleShot { .. } => 1,
+            Self::Multipart { part_count, .. } => part_count as u64 + 2,
+        }
+    }
+
+    /// The attempt class at `index` in the planned sequence.
+    pub const fn attempt_class_at(self, index: u64) -> Option<ProviderAttemptClass> {
+        match self {
+            Self::SingleShot { .. } => {
+                if index == 0 {
+                    Some(ProviderAttemptClass::PutObject)
+                } else {
+                    None
+                }
+            }
+            Self::Multipart { part_count, .. } => {
+                let parts = part_count as u64;
+                if index == 0 {
+                    Some(ProviderAttemptClass::CreateMultipartUpload)
+                } else if index <= parts {
+                    Some(ProviderAttemptClass::UploadPart)
+                } else if index == parts + 1 {
+                    Some(ProviderAttemptClass::CompleteMultipartUpload)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Byte range of the 1-based `part_number`, or `None` outside the plan.
+    pub const fn part_range(self, part_number: u32) -> Option<(u64, u64)> {
+        match self {
+            Self::SingleShot { .. } => None,
+            Self::Multipart {
+                part_size_bytes,
+                part_count,
+                final_part_size_bytes,
+                ..
+            } => {
+                if part_number == 0 || part_number > part_count {
+                    return None;
+                }
+                let offset = (part_number as u64 - 1) * part_size_bytes;
+                let length = if part_number == part_count {
+                    final_part_size_bytes
+                } else {
+                    part_size_bytes
+                };
+                Some((offset, length))
+            }
+        }
+    }
+}
+
+/// Plans the attempt sequence for one PUT of `body_size` bytes.
+pub fn plan_put_object(
+    body_size: u64,
+    limits: &ProviderPutLimits,
+) -> Result<PutObjectPlan, ProviderClientError> {
+    limits.validate()?;
+    if body_size <= limits.multipart_threshold_bytes {
+        return Ok(PutObjectPlan::SingleShot { body_size });
+    }
+    let part_count = body_size.div_ceil(limits.part_size_bytes);
+    let part_count =
+        u32::try_from(part_count).map_err(|_| ProviderClientError::MultipartPartCountExceeded)?;
+    if part_count > limits.max_parts {
+        return Err(ProviderClientError::MultipartPartCountExceeded);
+    }
+    let whole_parts = u64::from(part_count - 1)
+        .checked_mul(limits.part_size_bytes)
+        .ok_or(ProviderClientError::MultipartPartCountExceeded)?;
+    let final_part_size_bytes = body_size
+        .checked_sub(whole_parts)
+        .ok_or(ProviderClientError::MultipartPartCountExceeded)?;
+    Ok(PutObjectPlan::Multipart {
+        body_size,
+        part_size_bytes: limits.part_size_bytes,
+        part_count,
+        final_part_size_bytes,
+    })
+}
+
+/// A PUT body proven durable in the cell's spool and bound to the request that owns it.
+///
+/// The only constructor is [`bind_durable_put_body`], and it accepts only a ledger row already in
+/// [`LedgerSpoolView::Ready`]. A PUT attempt cannot be assembled without one, so the governed
+/// client cannot send a body that is not durably spooled, and cannot send one request's body under
+/// another request's identity.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DurableProviderPutBody {
+    provider_boundary_id: String,
+    logical_request_id: String,
+    spool_attempt_id: String,
+    opaque_handle: String,
+    size: u64,
+    blake3: [u8; 32],
+}
+
+impl DurableProviderPutBody {
+    pub fn provider_boundary_id(&self) -> &str {
+        &self.provider_boundary_id
+    }
+
+    pub fn logical_request_id(&self) -> &str {
+        &self.logical_request_id
+    }
+
+    pub fn spool_attempt_id(&self) -> &str {
+        &self.spool_attempt_id
+    }
+
+    pub fn opaque_handle(&self) -> &str {
+        &self.opaque_handle
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn blake3(&self) -> &[u8; 32] {
+        &self.blake3
+    }
+}
+
+impl fmt::Debug for DurableProviderPutBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DurableProviderPutBody")
+            .field("provider_boundary_id", &"[REDACTED]")
+            .field("logical_request_id", &"[REDACTED]")
+            .field("spool_attempt_id", &"[REDACTED]")
+            .field("opaque_handle", &"[REDACTED]")
+            .field("size", &self.size)
+            .field("blake3", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Binds a spool ledger row to the PUT body an attempt may send.
+///
+/// This derives the layout's path handle and requires the ledger's stored handle to equal it, so a
+/// ready row recorded against a different request or boundary cannot be adopted. It performs no
+/// filesystem access: readiness is the database's assertion, and physical revalidation belongs to
+/// the spool verifier that minted the observation behind that assertion.
+pub fn bind_durable_put_body(
+    layout: &SpoolLayout,
+    key: &SpoolObjectKey,
+    ledger: &LedgerSpoolView,
+) -> Result<DurableProviderPutBody, ProviderClientError> {
+    if key.kind != SpoolObjectKind::Put {
+        return Err(ProviderClientError::InvalidSpoolKind);
+    }
+    let paths = layout
+        .derive_paths(key)
+        .map_err(|_| ProviderClientError::InvalidSpoolKey)?;
+    let LedgerSpoolView::Ready {
+        opaque_handle,
+        size,
+        blake3,
+    } = ledger
+    else {
+        return Err(ProviderClientError::PutBodyNotDurable);
+    };
+    if opaque_handle != paths.opaque_handle() {
+        return Err(ProviderClientError::PutBodyHandleMismatch);
+    }
+    Ok(DurableProviderPutBody {
+        provider_boundary_id: key.provider_boundary_id.clone(),
+        logical_request_id: key.logical_request_id.clone(),
+        spool_attempt_id: key.attempt_id.clone(),
+        opaque_handle: opaque_handle.clone(),
+        size: *size,
+        blake3: *blake3,
+    })
+}
+
+/// The byte range of one multipart part.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderPutPart {
+    pub part_number: u32,
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// WP-121's frozen per-cell budget-configuration revision and its monotonic generation.
+///
+/// CD-5 treats the pin as opaque. It checks the shape, passes it to the charge authority, and
+/// requires the grant to echo it exactly. Resolving the pin against the cell's current envelope is
+/// CD-4's obligation, and the envelope is unpublished.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BudgetPin {
+    pub revision: String,
+    pub fence: u64,
+}
+
+impl fmt::Debug for BudgetPin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BudgetPin")
+            .field("revision", &"[REDACTED]")
+            .field("fence", &self.fence)
+            .finish()
+    }
+}
+
+/// One physical provider attempt a caller asks the governed client to execute.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderAttemptRequest {
+    pub traffic_class: ProviderTrafficClass,
+    pub attempt_class: ProviderAttemptClass,
+    pub target: ProviderTarget,
+    pub logical_request_id: String,
+    pub attempt_id: String,
+    pub attempt_ordinal: u32,
+    pub budget_pin: BudgetPin,
+    pub put_body: Option<DurableProviderPutBody>,
+    pub put_part: Option<ProviderPutPart>,
+}
+
+impl fmt::Debug for ProviderAttemptRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderAttemptRequest")
+            .field("traffic_class", &self.traffic_class)
+            .field("attempt_class", &self.attempt_class)
+            .field("target", &self.target)
+            .field("logical_request_id", &"[REDACTED]")
+            .field("attempt_id", &"[REDACTED]")
+            .field("attempt_ordinal", &self.attempt_ordinal)
+            .field("budget_pin", &self.budget_pin)
+            .field("put_body", &self.put_body)
+            .field("put_part", &self.put_part)
+            .finish()
+    }
+}
+
+/// What the governed client asks CD-4's limiter to charge.
+///
+/// Constructed only by [`GovernedProviderClient::execute`], after the boundary, capability, and
+/// body checks pass, so a charge request always describes an attempt this cell may make.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderChargeRequest {
+    provider_boundary_id: String,
+    traffic_class: ProviderTrafficClass,
+    attempt_class: ProviderAttemptClass,
+    attempt_units: u64,
+    budget_pin: BudgetPin,
+    logical_request_id: String,
+    attempt_id: String,
+    attempt_ordinal: u32,
+}
+
+impl ProviderChargeRequest {
+    pub fn provider_boundary_id(&self) -> &str {
+        &self.provider_boundary_id
+    }
+
+    pub fn traffic_class(&self) -> ProviderTrafficClass {
+        self.traffic_class
+    }
+
+    pub fn attempt_class(&self) -> ProviderAttemptClass {
+        self.attempt_class
+    }
+
+    /// Units this attempt consumes from every cap it touches. One physical attempt is one unit;
+    /// a class label never scales it.
+    pub fn attempt_units(&self) -> u64 {
+        self.attempt_units
+    }
+
+    pub fn budget_pin(&self) -> &BudgetPin {
+        &self.budget_pin
+    }
+
+    pub fn logical_request_id(&self) -> &str {
+        &self.logical_request_id
+    }
+
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    pub fn attempt_ordinal(&self) -> u32 {
+        self.attempt_ordinal
+    }
+
+    /// Every cap this charge must consume atomically: the cell's one shared physical budget, the
+    /// traffic class cap, and the stricter listing cap when the attempt is a listing.
+    pub fn cap_classes(&self) -> Vec<ProviderCapClass> {
+        let mut caps = vec![
+            ProviderCapClass::SharedPhysicalBudget,
+            self.traffic_class.cap_class(),
+        ];
+        if self.attempt_class.is_listing() {
+            caps.push(ProviderCapClass::List);
+        }
+        caps
+    }
+}
+
+impl fmt::Debug for ProviderChargeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderChargeRequest")
+            .field("provider_boundary_id", &"[REDACTED]")
+            .field("traffic_class", &self.traffic_class)
+            .field("attempt_class", &self.attempt_class)
+            .field("attempt_units", &self.attempt_units)
+            .field("budget_pin", &self.budget_pin)
+            .field("logical_request_id", &"[REDACTED]")
+            .field("attempt_id", &"[REDACTED]")
+            .field("attempt_ordinal", &self.attempt_ordinal)
+            .finish()
+    }
+}
+
+/// A committed charge against the cell budget.
+///
+/// A grant bounds one attempt. It does not prove the attempt happened, and it is never refunded.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderChargeGrant {
+    pub grant_id: String,
+    pub traffic_class: ProviderTrafficClass,
+    pub attempt_class: ProviderAttemptClass,
+    pub charged_units: u64,
+    pub budget_pin: BudgetPin,
+    pub logical_request_id: String,
+    pub attempt_id: String,
+    pub attempt_ordinal: u32,
+    /// The cell database's clock at commit. Process time is not admission authority.
+    pub granted_at_database_unix_ms: i64,
+}
+
+impl fmt::Debug for ProviderChargeGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderChargeGrant")
+            .field("grant_id", &"[REDACTED]")
+            .field("traffic_class", &self.traffic_class)
+            .field("attempt_class", &self.attempt_class)
+            .field("charged_units", &self.charged_units)
+            .field("budget_pin", &self.budget_pin)
+            .field("logical_request_id", &"[REDACTED]")
+            .field("attempt_id", &"[REDACTED]")
+            .field("attempt_ordinal", &self.attempt_ordinal)
+            .field(
+                "granted_at_database_unix_ms",
+                &self.granted_at_database_unix_ms,
+            )
+            .finish()
+    }
+}
+
+/// Why CD-4's limiter refused or could not complete a charge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum ProviderChargeError {
+    #[error("cell dispatch charge authority is not wired")]
+    Unwired,
+    #[error("cell dispatch charge rejected the pinned budget revision or generation")]
+    BudgetPinRejected,
+    #[error("cell dispatch shared physical budget is exhausted")]
+    BudgetExhausted,
+    #[error("cell dispatch subordinate class cap is exhausted")]
+    ClassCapExhausted,
+    #[error("cell dispatch budget configuration could not be resolved")]
+    ConfigurationUnresolved,
+    #[error("cell dispatch charge authority is unavailable")]
+    AuthorityUnavailable,
+    /// The charge transaction's commit is unresolved. Conservative charging treats it as
+    /// committed and nonrefundable, and no attempt may be issued under it.
+    #[error("cell dispatch charge commit is ambiguous")]
+    AmbiguousCommit,
+}
+
+/// CD-4's shared cell-local limiter, seen from the provider client.
+///
+/// The implementation is CD-4's and does not exist. Every method must consume the cell's one shared
+/// physical budget and each subordinate cap in [`ProviderChargeRequest::cap_classes`] atomically in
+/// one transaction, and must fail closed when the budget configuration cannot be resolved rather
+/// than falling back to an unbounded rate.
+pub trait ProviderChargeAuthority {
+    fn charge(
+        &self,
+        request: &ProviderChargeRequest,
+    ) -> Result<ProviderChargeGrant, ProviderChargeError>;
+}
+
+/// The shipped charge authority: it charges nothing and grants nothing.
+///
+/// This is the fail-closed guard that keeps CD-5 source-dark. It is not a stub that fakes a
+/// success, and it has no configuration that could turn it into one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnwiredChargeAuthority;
+
+impl ProviderChargeAuthority for UnwiredChargeAuthority {
+    fn charge(
+        &self,
+        _request: &ProviderChargeRequest,
+    ) -> Result<ProviderChargeGrant, ProviderChargeError> {
+        Err(ProviderChargeError::Unwired)
+    }
+}
+
+/// A charged attempt a transport may issue, and the only thing a transport is ever handed.
+///
+/// The constructor is crate-private, so no code outside this crate can build one. That is the
+/// no-bypass property CR-033 D1 leaves reviewable by construction now that caller identity is
+/// database-role identity rather than an mTLS binding.
+pub struct AuthorizedProviderAttempt<'a> {
+    request: &'a ProviderAttemptRequest,
+    grant: &'a ProviderChargeGrant,
+    retry_policy: ProviderRetryPolicy,
+}
+
+impl<'a> AuthorizedProviderAttempt<'a> {
+    fn new(
+        request: &'a ProviderAttemptRequest,
+        grant: &'a ProviderChargeGrant,
+        retry_policy: ProviderRetryPolicy,
+    ) -> Self {
+        Self {
+            request,
+            grant,
+            retry_policy,
+        }
+    }
+
+    pub fn traffic_class(&self) -> ProviderTrafficClass {
+        self.request.traffic_class
+    }
+
+    pub fn attempt_class(&self) -> ProviderAttemptClass {
+        self.request.attempt_class
+    }
+
+    pub fn target(&self) -> &ProviderTarget {
+        &self.request.target
+    }
+
+    pub fn logical_request_id(&self) -> &str {
+        &self.request.logical_request_id
+    }
+
+    pub fn attempt_id(&self) -> &str {
+        &self.request.attempt_id
+    }
+
+    pub fn attempt_ordinal(&self) -> u32 {
+        self.request.attempt_ordinal
+    }
+
+    pub fn put_body(&self) -> Option<&DurableProviderPutBody> {
+        self.request.put_body.as_ref()
+    }
+
+    pub fn put_part(&self) -> Option<ProviderPutPart> {
+        self.request.put_part
+    }
+
+    pub fn grant(&self) -> &ProviderChargeGrant {
+        self.grant
+    }
+
+    /// The automatic-retry setting the transport's client must have been built with.
+    pub fn retry_policy(&self) -> ProviderRetryPolicy {
+        self.retry_policy
+    }
+}
+
+impl fmt::Debug for AuthorizedProviderAttempt<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizedProviderAttempt")
+            .field("request", &self.request)
+            .field("grant", &self.grant)
+            .finish()
+    }
+}
+
+/// What the provider did with one issued attempt.
+///
+/// This is not a durable outcome. It records whether the provider's response was definite, never
+/// what the object's lifecycle state now is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderAttemptOutcome {
+    /// The provider returned a definite response, success or definite failure.
+    Decisive,
+    /// No definite response was observed. The charge stands and the effect is unknown.
+    Ambiguous,
+}
+
+/// A transport's report on one authorized attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderAttemptReport {
+    pub outcome: ProviderAttemptOutcome,
+    /// How many requests the transport actually put on the wire for this one authorized attempt.
+    ///
+    /// Exactly one is authorized. A transport whose SDK retried internally reports more than one
+    /// and is rejected, because the extra requests were never charged.
+    pub provider_requests_issued: u32,
+}
+
+/// A transport's assertion that it issued nothing.
+///
+/// Returning this is a claim that no request reached the provider. A transport that cannot prove
+/// that must report [`ProviderAttemptOutcome::Ambiguous`] instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum ProviderTransportRefusal {
+    #[error("cell provider transport is not wired")]
+    Unwired,
+}
+
+/// CD-6's one governed S3 client for the cell's bucket, seen from the charge kernel.
+///
+/// An implementation must build its SDK client with automatic retry disabled, must issue exactly
+/// one request per call, and must never address anything but the attempt's [`ProviderTarget`].
+pub trait ProviderTransport {
+    fn issue(
+        &self,
+        attempt: &AuthorizedProviderAttempt<'_>,
+    ) -> Result<ProviderAttemptReport, ProviderTransportRefusal>;
+}
+
+/// The shipped transport: it issues nothing.
+///
+/// CD-5 owns no provider SDK, endpoint, or credential, so the only transport that exists refuses
+/// every attempt. A refusal is not a send, so a grant charged before it stays in the valid,
+/// nonrefundable grant-without-attempt window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnwiredProviderTransport;
+
+impl ProviderTransport for UnwiredProviderTransport {
+    fn issue(
+        &self,
+        _attempt: &AuthorizedProviderAttempt<'_>,
+    ) -> Result<ProviderAttemptReport, ProviderTransportRefusal> {
+        Err(ProviderTransportRefusal::Unwired)
+    }
+}
+
+/// The attempt accounting one logical request accumulates, and the source of its retained
+/// provider-attempt audit.
+///
+/// There is no refund method. `provider_authority_refunded` is therefore always false, which is
+/// also the only value [`crate::compaction::validate_and_encode_object_store_provider_attempt_audit`]
+/// accepts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProviderAttemptLedger {
+    attempt_count: u64,
+    committed_grant_count: u64,
+    no_dispatch_count: u64,
+    decisive_terminal_count: u64,
+    ambiguous_count: u64,
+    poisoned: Option<ProviderClientError>,
+}
+
+impl ProviderAttemptLedger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn attempt_count(&self) -> u64 {
+        self.attempt_count
+    }
+
+    pub fn committed_grant_count(&self) -> u64 {
+        self.committed_grant_count
+    }
+
+    pub fn no_dispatch_count(&self) -> u64 {
+        self.no_dispatch_count
+    }
+
+    pub fn decisive_terminal_count(&self) -> u64 {
+        self.decisive_terminal_count
+    }
+
+    pub fn ambiguous_count(&self) -> u64 {
+        self.ambiguous_count
+    }
+
+    /// The error that closed this ledger, if any. A poisoned ledger yields no audit.
+    pub fn poisoned(&self) -> Option<ProviderClientError> {
+        self.poisoned
+    }
+
+    /// Records that the request resolved without any provider dispatch.
+    ///
+    /// A validated proof is required, and the retained audit algebra admits at most one no-dispatch
+    /// record and none once a decisive terminal has been counted.
+    pub fn record_no_dispatch(
+        &mut self,
+        _proof: &CanonicalNoDispatchProof,
+    ) -> Result<(), ProviderClientError> {
+        if let Some(error) = self.poisoned {
+            return Err(error);
+        }
+        if self.no_dispatch_count != 0 || self.decisive_terminal_count != 0 {
+            return Err(ProviderClientError::NoDispatchNotPermitted);
+        }
+        self.no_dispatch_count = 1;
+        Ok(())
+    }
+
+    /// The retained provider-attempt audit for this request.
+    pub fn audit(&self) -> Result<ObjectStoreProviderAttemptAudit, ProviderClientError> {
+        if let Some(error) = self.poisoned {
+            return Err(error);
+        }
+        Ok(ObjectStoreProviderAttemptAudit {
+            attempt_count: self.attempt_count,
+            committed_grant_count: self.committed_grant_count,
+            no_dispatch_count: self.no_dispatch_count,
+            decisive_terminal_count: self.decisive_terminal_count,
+            ambiguous_count: self.ambiguous_count,
+            provider_authority_refunded: false,
+            audit_blake3: None,
+        })
+    }
+
+    fn poison(&mut self, error: ProviderClientError) -> ProviderClientError {
+        if self.poisoned.is_none() {
+            self.poisoned = Some(error);
+        }
+        error
+    }
+
+    fn record_committed_grant(&mut self) -> Result<(), ProviderClientError> {
+        self.committed_grant_count = self
+            .committed_grant_count
+            .checked_add(1)
+            .ok_or(ProviderClientError::LedgerOverflow)?;
+        Ok(())
+    }
+
+    fn record_issued_attempt(&mut self) -> Result<(), ProviderClientError> {
+        self.attempt_count = self
+            .attempt_count
+            .checked_add(1)
+            .ok_or(ProviderClientError::LedgerOverflow)?;
+        Ok(())
+    }
+}
+
+/// The cell's one governed provider client.
+pub struct GovernedProviderClient<C, T> {
+    boundary: CellProviderBoundary,
+    capabilities: ProviderCapabilities,
+    retry_policy: ProviderRetryPolicy,
+    charge_authority: C,
+    transport: T,
+}
+
+impl<C, T> GovernedProviderClient<C, T>
+where
+    C: ProviderChargeAuthority,
+    T: ProviderTransport,
+{
+    pub fn new(
+        boundary: CellProviderBoundary,
+        capabilities: ProviderCapabilities,
+        retry_policy: ProviderRetryPolicy,
+        charge_authority: C,
+        transport: T,
+    ) -> Self {
+        Self {
+            boundary,
+            capabilities,
+            retry_policy,
+            charge_authority,
+            transport,
+        }
+    }
+
+    pub fn boundary(&self) -> &CellProviderBoundary {
+        &self.boundary
+    }
+
+    pub fn capabilities(&self) -> ProviderCapabilities {
+        self.capabilities
+    }
+
+    pub fn retry_policy(&self) -> ProviderRetryPolicy {
+        self.retry_policy
+    }
+
+    /// Charges one attempt and, only if the grant binds it exactly, issues it.
+    ///
+    /// Every failure path is fail-closed: a rejected request never charges, a charge that commits
+    /// is never refunded, and a grant that does not bind the attempt closes the ledger instead of
+    /// sending under it.
+    pub fn execute(
+        &self,
+        ledger: &mut ProviderAttemptLedger,
+        request: &ProviderAttemptRequest,
+    ) -> Result<ProviderAttemptOutcome, ProviderClientError> {
+        if let Some(error) = ledger.poisoned() {
+            return Err(error);
+        }
+        let charge_request = self.authorize(request)?;
+
+        let grant = match self.charge_authority.charge(&charge_request) {
+            Ok(grant) => grant,
+            Err(ProviderChargeError::AmbiguousCommit) => {
+                // The commit is unresolved, so conservative charging counts the grant and forbids
+                // the send. This is the valid, nonrefundable grant-without-attempt window.
+                ledger.record_committed_grant()?;
+                return Err(ProviderClientError::ChargeAmbiguous);
+            }
+            Err(error) => return Err(ProviderClientError::ChargeRefused(error)),
+        };
+
+        if let Err(error) = validate_grant(&charge_request, &grant) {
+            // A returned grant may have committed even though it does not describe this attempt,
+            // so it is counted and never refunded, and the ledger closes rather than sending.
+            ledger.record_committed_grant()?;
+            return Err(ledger.poison(error));
+        }
+        ledger.record_committed_grant()?;
+
+        let attempt = AuthorizedProviderAttempt::new(request, &grant, self.retry_policy);
+        let report = match self.transport.issue(&attempt) {
+            Ok(report) => report,
+            Err(refusal) => return Err(ProviderClientError::TransportRefused(refusal)),
+        };
+
+        match report.provider_requests_issued {
+            0 => Err(ledger.poison(ProviderClientError::TransportReportInconsistent)),
+            1 => {
+                ledger.record_issued_attempt()?;
+                match report.outcome {
+                    ProviderAttemptOutcome::Decisive => {
+                        ledger.decisive_terminal_count = ledger
+                            .decisive_terminal_count
+                            .checked_add(1)
+                            .ok_or(ProviderClientError::LedgerOverflow)?;
+                    }
+                    ProviderAttemptOutcome::Ambiguous => {
+                        ledger.ambiguous_count = ledger
+                            .ambiguous_count
+                            .checked_add(1)
+                            .ok_or(ProviderClientError::LedgerOverflow)?;
+                    }
+                }
+                Ok(report.outcome)
+            }
+            _ => {
+                // Only one request was authorized and charged. The rest escaped authority, so the
+                // ledger closes and this request produces no audit.
+                ledger.record_issued_attempt()?;
+                Err(ledger.poison(ProviderClientError::TransportIssuedUnauthorizedRequests))
+            }
+        }
+    }
+
+    /// Validates a request against the cell boundary, the capability gate, and the body rules, and
+    /// returns the charge it implies. Charges nothing and sends nothing.
+    pub fn authorize(
+        &self,
+        request: &ProviderAttemptRequest,
+    ) -> Result<ProviderChargeRequest, ProviderClientError> {
+        self.boundary.validate_target(&request.target)?;
+        if request.attempt_class.is_listing() && !self.capabilities.listing {
+            return Err(ProviderClientError::ListCapabilityNotGranted);
+        }
+        canonical_uuid_v7_timestamp(&request.logical_request_id)
+            .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
+        canonical_uuid_v7_timestamp(&request.attempt_id)
+            .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
+        if request.attempt_ordinal == 0 {
+            return Err(ProviderClientError::InvalidAttemptOrdinal);
+        }
+        validate_budget_pin(&request.budget_pin)?;
+        self.validate_body(request)?;
+        Ok(ProviderChargeRequest {
+            provider_boundary_id: self.boundary.provider_boundary_id.clone(),
+            traffic_class: request.traffic_class,
+            attempt_class: request.attempt_class,
+            attempt_units: 1,
+            budget_pin: request.budget_pin.clone(),
+            logical_request_id: request.logical_request_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            attempt_ordinal: request.attempt_ordinal,
+        })
+    }
+
+    fn validate_body(&self, request: &ProviderAttemptRequest) -> Result<(), ProviderClientError> {
+        let carries_body = request.attempt_class.carries_object_body();
+        let body = match (&request.put_body, carries_body) {
+            (Some(body), true) => body,
+            (None, false) => {
+                if request.put_part.is_some() {
+                    return Err(ProviderClientError::PutPartNotPermitted);
+                }
+                return Ok(());
+            }
+            (None, true) => return Err(ProviderClientError::PutBodyRequired),
+            (Some(_), false) => return Err(ProviderClientError::PutBodyNotPermitted),
+        };
+        if body.provider_boundary_id != self.boundary.provider_boundary_id {
+            return Err(ProviderClientError::PutBodyBoundaryMismatch);
+        }
+        if body.logical_request_id != request.logical_request_id {
+            return Err(ProviderClientError::PutBodyRequestMismatch);
+        }
+        match request.attempt_class {
+            ProviderAttemptClass::PutObject => {
+                if request.put_part.is_some() {
+                    return Err(ProviderClientError::PutPartNotPermitted);
+                }
+                if body.size > PROVIDER_MAX_SINGLE_PUT_BYTES {
+                    return Err(ProviderClientError::SinglePutBodyTooLarge);
+                }
+            }
+            ProviderAttemptClass::UploadPart => {
+                let part = request
+                    .put_part
+                    .ok_or(ProviderClientError::PutPartRequired)?;
+                if part.part_number == 0 || part.part_number > PROVIDER_MAX_MULTIPART_PARTS {
+                    return Err(ProviderClientError::InvalidPutPart);
+                }
+                if part.length == 0 || part.length > PROVIDER_MAX_PART_SIZE_BYTES {
+                    return Err(ProviderClientError::InvalidPutPart);
+                }
+                let end = part
+                    .offset
+                    .checked_add(part.length)
+                    .ok_or(ProviderClientError::InvalidPutPart)?;
+                if end > body.size {
+                    return Err(ProviderClientError::InvalidPutPart);
+                }
+            }
+            _ => return Err(ProviderClientError::PutBodyNotPermitted),
+        }
+        Ok(())
+    }
+}
+
+impl<C, T> fmt::Debug for GovernedProviderClient<C, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GovernedProviderClient")
+            .field("boundary", &self.boundary)
+            .field("capabilities", &self.capabilities)
+            .field("retry_policy", &self.retry_policy)
+            .finish()
+    }
+}
+
+fn validate_budget_pin(pin: &BudgetPin) -> Result<(), ProviderClientError> {
+    validate_canonical_id(&pin.revision).map_err(|_| ProviderClientError::InvalidBudgetPin)?;
+    if pin.fence == 0 {
+        return Err(ProviderClientError::InvalidBudgetPin);
+    }
+    Ok(())
+}
+
+fn validate_grant(
+    request: &ProviderChargeRequest,
+    grant: &ProviderChargeGrant,
+) -> Result<(), ProviderClientError> {
+    canonical_uuid_v7_timestamp(&grant.grant_id)
+        .map_err(|_| ProviderClientError::GrantDoesNotBindAttempt)?;
+    if grant.traffic_class != request.traffic_class
+        || grant.attempt_class != request.attempt_class
+        || grant.charged_units != request.attempt_units
+        || grant.budget_pin != request.budget_pin
+        || grant.logical_request_id != request.logical_request_id
+        || grant.attempt_id != request.attempt_id
+        || grant.attempt_ordinal != request.attempt_ordinal
+        || grant.granted_at_database_unix_ms < 0
+    {
+        return Err(ProviderClientError::GrantDoesNotBindAttempt);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum ProviderClientError {
+    #[error("cell provider boundary ID is invalid")]
+    InvalidProviderBoundaryId,
+    #[error("cell provider bucket name is invalid")]
+    InvalidBucketName,
+    #[error("cell provider region is invalid")]
+    InvalidRegion,
+    #[error("cell provider endpoint host is invalid")]
+    InvalidEndpointHost,
+    #[error("provider attempt names a bucket outside the cell boundary")]
+    BucketOutsideCellBoundary,
+    #[error("provider attempt names a region outside the cell")]
+    RegionOutsideCell,
+    #[error("provider attempt names an endpoint outside the cell region")]
+    EndpointOutsideCellRegion,
+    #[error("provider listing capability is not granted for this cell")]
+    ListCapabilityNotGranted,
+    #[error("provider attempt request identity is not canonical UUIDv7")]
+    InvalidRequestIdentity,
+    #[error("provider attempt ordinal must be positive")]
+    InvalidAttemptOrdinal,
+    #[error("provider attempt budget pin is invalid")]
+    InvalidBudgetPin,
+    #[error("provider put limits are outside the supported range")]
+    InvalidPutLimits,
+    #[error("provider multipart plan exceeds the permitted part count")]
+    MultipartPartCountExceeded,
+    #[error("object-dispatch spool key names the wrong object kind")]
+    InvalidSpoolKind,
+    #[error("object-dispatch spool key is invalid")]
+    InvalidSpoolKey,
+    #[error("provider put body is not durably spooled")]
+    PutBodyNotDurable,
+    #[error("provider put body handle does not match its spool key")]
+    PutBodyHandleMismatch,
+    #[error("provider put body belongs to another provider boundary")]
+    PutBodyBoundaryMismatch,
+    #[error("provider put body belongs to another logical request")]
+    PutBodyRequestMismatch,
+    #[error("provider attempt class requires a durable put body")]
+    PutBodyRequired,
+    #[error("provider attempt class does not carry a put body")]
+    PutBodyNotPermitted,
+    #[error("provider single-shot put body exceeds the provider maximum")]
+    SinglePutBodyTooLarge,
+    #[error("provider upload-part attempt requires a part range")]
+    PutPartRequired,
+    #[error("provider attempt class does not carry a part range")]
+    PutPartNotPermitted,
+    #[error("provider upload-part range is invalid for its body")]
+    InvalidPutPart,
+    #[error("cell dispatch charge was refused: {0}")]
+    ChargeRefused(ProviderChargeError),
+    #[error("cell dispatch charge committed ambiguously and no attempt may be issued under it")]
+    ChargeAmbiguous,
+    #[error("cell dispatch grant does not bind this attempt")]
+    GrantDoesNotBindAttempt,
+    #[error("cell provider transport issued nothing: {0}")]
+    TransportRefused(ProviderTransportRefusal),
+    #[error("cell provider transport reported a successful call that issued no request")]
+    TransportReportInconsistent,
+    #[error("cell provider transport issued more requests than were charged")]
+    TransportIssuedUnauthorizedRequests,
+    #[error("provider attempt ledger already recorded a no-dispatch or decisive terminal")]
+    NoDispatchNotPermitted,
+    #[error("provider attempt ledger counter overflowed")]
+    LedgerOverflow,
+}
