@@ -656,7 +656,22 @@ fn provisioning_artifact_is_embedded_only_and_source_dark() {
         !sources.is_empty(),
         "production source inventory must not be empty"
     );
+    // WP-114 CD-1 gave the crate one deliberate, non-runtime caller of these entrypoints: the
+    // out-of-band installer/attester and its one-shot operator binary. The invariant this guard
+    // exists for is unchanged -- no runtime module may install or read provisioning state -- so the
+    // exemption is by exact file, never by pattern, and `tests/cell_schema_install.rs` separately
+    // proves those two files are the only ones that mention the installer at all.
+    // Exact paths, not file names: a future `src/spool/cell_schema_install.rs` must not inherit the
+    // exemption by sharing a name.
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let installer_paths = [
+        src_root.join("cell_schema_install.rs"),
+        src_root.join("bin").join("cell-schema-install.rs"),
+    ];
     for source_path in sources {
+        if installer_paths.contains(&source_path) {
+            continue;
+        }
         let source = std::fs::read_to_string(&source_path).expect("read production Rust source");
         for sql_identifier in [
             "object_store_dispatch_authority_install_v1",

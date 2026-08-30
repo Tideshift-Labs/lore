@@ -303,7 +303,21 @@ fn every_production_rust_source_remains_dark_to_provisioning_sql_entrypoints() {
         "production source inventory must not be empty"
     );
 
+    // WP-114 CD-1's out-of-band installer/attester and its one-shot operator binary are the crate's
+    // one deliberate, non-runtime caller of these entrypoints. Exempted by exact file name, never by
+    // pattern; `tests/cell_schema_install.rs` proves they are the only two files that reference the
+    // installer at all, so the "runtime installs nothing" invariant is unchanged.
+    // Exact paths, not file names: a future `src/spool/cell_schema_install.rs` must not inherit the
+    // exemption by sharing a name.
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let installer_paths = [
+        src_root.join("cell_schema_install.rs"),
+        src_root.join("bin").join("cell-schema-install.rs"),
+    ];
     for source_path in sources {
+        if installer_paths.contains(&source_path) {
+            continue;
+        }
         let source = std::fs::read_to_string(&source_path).expect("read production Rust source");
         for sql_identifier in [
             "object_store_retention_install_v1",

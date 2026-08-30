@@ -332,6 +332,21 @@ fn every_production_rust_source_remains_dark_to_readback_sql_entrypoints() {
             {
                 continue;
             }
+            if source_path
+                == Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src")
+                    .join("cell_schema_install.rs")
+            {
+                // WP-114 CD-1's attester names the deferred 0004 procedures only to assert they are
+                // ABSENT from a cell. Hold it to the stronger rule instead of exempting it: the bare
+                // name may appear in its inventory, but a schema-qualified reference -- the only
+                // form that can execute one -- may not.
+                assert!(
+                    !source.contains(&format!("object_store_retention.{sql_identifier}")),
+                    "the cell schema installer must never reference {sql_identifier} in callable form"
+                );
+                continue;
+            }
             assert!(
                 !source.contains(sql_identifier),
                 "retention readback SQL identifier {sql_identifier} escaped the dedicated client into {}",

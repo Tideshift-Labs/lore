@@ -286,13 +286,22 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
         [array]$Tests
     )
 
-    # The four retention-client live tests are the crate's only other ignored tier. Named here so
-    # a brand-new ignored test outside both known families is caught, not silently accepted.
+    # The retention-client and cell-schema-install live tiers are the crate's other ignored tiers,
+    # each with its own runner. Named here so a brand-new ignored test outside every known family is
+    # caught, not silently accepted.
     $knownOtherIgnoredTests = @(
+        # retention-client live tier -- run-retention-client-live.ps1
         'exact_maintenance_mtls_read_is_bounded_and_reconnects_after_response_stall',
         'transfer_retries_one_serialization_abort_then_applies_once',
         'transfer_retries_one_deadlock_abort_then_applies_once',
-        'prune_lost_commit_response_adopts_exact_immutable_receipt_without_duplicate_mutation'
+        'prune_lost_commit_response_adopts_exact_immutable_receipt_without_duplicate_mutation',
+        # WP-114 CD-1 cell-schema installer/attester -- run-cell-schema-install-live.ps1
+        'live_postgres_cell_schema_installs_clean_and_attests',
+        'live_postgres_cell_schema_install_is_idempotent',
+        'live_postgres_cell_schema_refuses_a_partial_install',
+        'live_postgres_cell_schema_refuses_a_drifted_catalog',
+        'live_postgres_cell_schema_revokes_service_privileges_after_replacement',
+        'live_postgres_cell_schema_measure_catalog_manifest'
     )
 
     Write-Host 'Cross-checking the ignored-test catalog against this harness''s known live tests...'
@@ -324,15 +333,15 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
     if ($unexpectedOther.Count -gt 0) {
         $descriptions = ($unexpectedOther | ForEach-Object { "$($_.Name) ($($_.Target))" }) -join '; '
         $message = "found unexpected ignored test(s) outside the local_authority_* family and the known " +
-        "retention-client live tier: $descriptions"
+        "retention-client and cell-schema-install live tiers: $descriptions"
         throw $message
     }
     if ($otherCatalog.Count -ne $knownOtherIgnoredTests.Count) {
         $missing = @($knownOtherIgnoredTests | Where-Object { $name = $_; -not @($otherCatalog | Where-Object { $_.Name -eq $name }) })
-        Write-Warning "retention-client live tier's ignored-test count changed: expected $($knownOtherIgnoredTests.Count), found $($otherCatalog.Count) (missing: $($missing -join ', '))"
+        Write-Warning "the other live tiers' ignored-test count changed: expected $($knownOtherIgnoredTests.Count), found $($otherCatalog.Count) (missing: $($missing -join ', '))"
     }
 
-    $catalogMessage = "Ignored-test catalog: $($catalog.Count) total ($($localAuthorityCatalog.Count) local_authority_* known, $($otherCatalog.Count) retention-client known). " +
+    $catalogMessage = "Ignored-test catalog: $($catalog.Count) total ($($localAuthorityCatalog.Count) local_authority_* known, $($otherCatalog.Count) in the other known live tiers). " +
     "spool_verifier's Linux-only live test is #[cfg(target_os = 'linux')]-gated and does not compile " +
     'into this Windows binary at all, so it cannot appear in this catalog; it is NOT RUN by static ' +
     'knowledge of the source, not because this harness observed and skipped it.'

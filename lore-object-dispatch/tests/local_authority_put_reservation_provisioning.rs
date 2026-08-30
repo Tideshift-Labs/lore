@@ -461,7 +461,21 @@ fn artifact_is_embedded_and_source_dark_without_runtime_calls() {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
         &mut sources,
     );
+    // WP-114 CD-1's out-of-band installer/attester and its one-shot operator binary are the crate's
+    // one deliberate, non-runtime caller of these entrypoints. Exempted by exact file name, never by
+    // pattern; `tests/cell_schema_install.rs` proves they are the only two files that reference the
+    // installer at all, so the "no runtime source calls this" invariant is unchanged.
+    // Exact paths, not file names: a future `src/spool/cell_schema_install.rs` must not inherit the
+    // exemption by sharing a name.
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let installer_paths = [
+        src_root.join("cell_schema_install.rs"),
+        src_root.join("bin").join("cell-schema-install.rs"),
+    ];
     for path in sources {
+        if installer_paths.contains(&path) {
+            continue;
+        }
         let source = std::fs::read_to_string(&path).expect("read production Rust source");
         for entrypoint in [
             "object_store_dispatch_put_reservation_install_v1",

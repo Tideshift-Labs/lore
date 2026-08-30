@@ -181,6 +181,88 @@ These functions perform no database, spool, clock, provider, or network access; 
 authority client and drain workers call them, and call the retained PostgreSQL procedures for the
 durable admission, ReservePut, and spool-ready transitions themselves.
 
+## Out-of-band cell schema install (WP-114 CD-1)
+
+`cell_schema_install.rs` and the one-shot `cell-schema-install` binary are the production install
+path. The binary is an operator command, not a service: one connection, one action, one verdict,
+exit. It has no listener, socket, RPC surface, or run loop, and nothing in runtime references it.
+
+Preconditions the installer checks and refuses without:
+
+- the connection's `session_user` is `object_dispatch_retention_migrator`;
+- all four `object_dispatch_retention_*` roles exist;
+- the migrator is a member of `object_dispatch_retention_owner` **with `INHERIT FALSE`**; and
+- `object_dispatch_retention_owner` holds `CREATE` on the target database.
+
+The non-inheriting membership is not a style preference. Every frozen migration opens with
+`SET LOCAL ROLE object_dispatch_retention_owner`, so membership is required; but 0008's and 0011's
+own catalog asserts reject any service role holding a table privilege on an authority table, and
+`has_table_privilege` counts privileges reached through an inheriting membership. A plain
+`GRANT object_dispatch_retention_owner TO object_dispatch_retention_migrator` makes the very first
+install call fail with `DISPATCH_AUTHORITY_CATALOG_MISMATCH` while nothing has actually drifted.
+
+```sql
+GRANT object_dispatch_retention_owner TO object_dispatch_retention_migrator
+  WITH INHERIT FALSE, SET TRUE;
+GRANT CREATE ON DATABASE <cell> TO object_dispatch_retention_owner;
+```
+
+```sh
+$env:LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL = "postgresql://.../<cell>"
+cell-schema-install install    # apply the CR-033 D5 set in order, then attest
+cell-schema-install attest     # attest only; writes no schema
+cell-schema-install measure    # print the live catalog manifest digests
+```
+
+The URL is read only from the environment, so it never reaches a process argument list, and it is
+never echoed, including on failure. Exit codes: `0` success, `1` refused or drifted, `2` misuse.
+
+What `install` does, and what it refuses:
+
+- a database with no `object_store_retention` schema runs the full plan: the thirteen frozen
+  artifacts in order, with the retention, authority and put-reservation install procedures called at
+  their exact points in the chain (0011 retires 0008's install entrypoint, so the authority layer
+  must be installed before 0011 is applied);
+- a database that already carries the schema is **never re-migrated**. It is attested first, and the
+  run is refused unless every layer already attests. Forward migrations are one-shot, so resuming a
+  half-installed chain blind is how a recoverable cell becomes an unrecoverable one;
+- after any function replacement it issues the explicit service-role revokes itself. This is a no-op
+  against a correct cell, because the frozen migrations already issue them, and it is what brings a
+  cell whose ACLs were widened out of band back before attestation.
+
+**If a fresh install fails part way through, drop and recreate the cell database.** The plan is not
+one transaction and cannot be made one: each frozen artifact carries its own `BEGIN`/`COMMIT`, so an
+outer transaction would be ended by the first artifact rather than wrapping it. Artifacts that
+already committed stay committed. Every later run then refuses that database, which is the intended
+behaviour — forward migrations are one-shot, so there is no safe "continue from step k". CD-1
+installs into a fresh cell database, so drop-and-retry is the recovery; a database that already
+holds data is an operator decision, not an installer one.
+
+`attest` verifies, in order: each layer's identity tuple as one all-absent-or-all-valid fact; the
+live catalog manifest against a pinned per-section and whole-manifest BLAKE3 (relations, columns,
+constraints, indexes, types, function definitions with `prosecdef`/`proconfig`, function ACLs, and
+relation and column ACLs); that no service role retains `EXECUTE` on a replaced function; the
+expected inert state; and that the retired readback entrypoints are in fact unreachable.
+
+Two consequences worth knowing before reading a failure:
+
+- **0003's readback now has a live caller.** It had none anywhere before this, which was the first
+  half of WP-114 CD-1's caveat N2.
+- **Both dispatch-layer readbacks are retired at full chain depth, for different reasons.** 0011
+  revokes `object_store_dispatch_authority_read_state_v1` outright (`42501`). And 0011's
+  `assert_dispatch_put_reservation_catalog_v1` manifests every function in the schema with no name
+  filter, so once 0012 through 0017 add functions,
+  `object_store_dispatch_put_reservation_read_state_v1` fails closed with `55000` on a fully
+  installed cell. That is sharper than N2's "0012-0017 have no `read_state` procedure": the existing
+  readback does not merely fail to cover them, it stops working. The Rust attester carries those
+  layers instead. Whether a successor readback migration should exist is a CD-3 question; CD-1 does
+  not add one, because a new procedure is a new migration.
+
+The pinned manifest is a **PostgreSQL 16** pin: it carries `pg_get_functiondef` and
+`pg_get_indexdef` output, whose exact rendering is a server-version property. A different major
+version is expected to fail closed and needs a re-measured pin, not a relaxed check. Re-measure with
+`tests/run-cell-schema-install-live.ps1 -Measure`.
+
 ## Verification
 
 ```sh
@@ -191,6 +273,10 @@ cargo test -p lore-object-dispatch
 # Local-authority live tier: supported path (stands up disposable PostgreSQL 16,
 # installs the CD-1 set, runs all nine by exact name, reports PASS/FAIL/NOT RUN)
 tests/run-local-authority-live.ps1
+
+# Cell-schema installer/attester live tier (WP-114 CD-1): five gates over the real
+# migrator-role install path, on its own disposable PostgreSQL 16
+tests/run-cell-schema-install-live.ps1
 ```
 
 The library suite validates cell-authority configuration, canonical request fingerprinting, UUIDv7
@@ -227,6 +313,15 @@ LORE_TEST_LOCAL_PUT_SPOOL_READY_MUTATION_PG_URL=postgresql://... cargo test -p l
 
 An `--ignored` run with the environment unset exits early — that is **NOT RUN**, never passing
 evidence. Prefer the runner; the manual fallback exists for isolating one fixture.
+
+`run-cell-schema-install-live.ps1` (WP-114 CD-1) owns a second, separate disposable container. It
+does not share CD-2's, because its tests connect **as** `object_dispatch_retention_migrator`, a real
+LOGIN role with a non-inheriting owner membership, rather than as a superuser using
+`SET SESSION AUTHORIZATION`. That is the production install path, and only a real login exercises
+it. Its five gates are a clean install on an empty database, an idempotent re-run that neither
+re-migrates nor moves the catalog, refusal on a truncated chain with the schema left exactly as
+found, refusal on seven distinct catalog drift classes each caught in its own manifest section, and
+the revoke-after-replacement path restoring the exact pinned ACL state. Verified 5/5 PASS.
 
 Limitations that stand regardless of path: `object_store_retention_read_state_v1` (0003's
 readback) has no live caller among the nine. Migrations 0012-0017 have no `read_state` procedure

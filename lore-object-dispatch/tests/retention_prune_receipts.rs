@@ -273,10 +273,25 @@ fn prune_v2_entrypoints_remain_confined_to_the_maintenance_client() {
             continue;
         }
         let source = std::fs::read_to_string(&source_path).expect("read production Rust source");
+        let is_cell_installer = source_path
+            == Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("cell_schema_install.rs");
         for identifier in [
             "object_store_retention_read_prune_v2",
             "object_store_retention_apply_prune_v2",
         ] {
+            if is_cell_installer {
+                // WP-114 CD-1's attester names the deferred 0006 procedures only to assert they are
+                // ABSENT from a cell. Hold it to the stronger rule rather than exempting it: the
+                // bare name may appear in its inventory, but a schema-qualified reference -- the
+                // only form that can execute one -- may not.
+                assert!(
+                    !source.contains(&format!("object_store_retention.{identifier}")),
+                    "the cell schema installer must never reference {identifier} in callable form"
+                );
+                continue;
+            }
             assert!(
                 !source.contains(identifier),
                 "prune v2 entrypoint {identifier} escaped into {}",

@@ -6,6 +6,7 @@
 //! This crate is not wired into loreserver composition. Its source cannot authorize provider
 //! traffic or first-seen admission until the WP-121 deployment and calibration gates are current.
 
+pub mod cell_schema_install;
 pub mod compact_prune;
 pub mod compaction;
 pub mod config;

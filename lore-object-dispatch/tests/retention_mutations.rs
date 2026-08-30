@@ -600,6 +600,21 @@ fn mutation_artifact_is_embedded_only_and_all_production_rust_remains_dark() {
             {
                 continue;
             }
+            if source_path
+                == Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src")
+                    .join("cell_schema_install.rs")
+            {
+                // WP-114 CD-1's attester names the deferred 0004-0006 procedures to assert they are
+                // ABSENT from a cell, which is the opposite of calling one. Hold it to the stronger
+                // rule instead of exempting it: the bare name may appear in its inventory, but a
+                // schema-qualified reference -- the only form that can execute one -- may not.
+                assert!(
+                    !source.contains(&format!("object_store_retention.{sql_identifier}")),
+                    "the cell schema installer must never reference {sql_identifier} in callable form"
+                );
+                continue;
+            }
             assert!(
                 !source.contains(sql_identifier),
                 "retention mutation SQL identifier {sql_identifier} escaped the dedicated client into {}",
