@@ -192,8 +192,24 @@ the S3 transport — are traits with exactly one shipped implementation each,
 `UnwiredChargeAuthority` and `UnwiredProviderTransport`, and both **fail closed on every call**.
 Compiling or testing this module authorizes no provider traffic; it is not activation evidence.
 `compaction.rs` exposes `pub(crate) provider_attempt_audit_is_valid` so the ledger calls the one
-frozen audit predicate instead of restating it. See `WP-114`'s CD-5 section and CR-033 D4 for the
-governing spec and disposition; this file states only the module's boundary.
+frozen audit predicate instead of restating it.
+
+`ProviderAttemptLedger::new(provider_boundary_id, logical_request_id)` opens a ledger bound to one
+boundary and one request; there is no `Default`. `execute` refuses an attempt naming a different
+boundary or request with `LedgerRequestMismatch`, checked before the poison and no-dispatch guards
+and before anything is charged or sent, without closing the ledger. `audit_for(logical_request_id)`
+replaced `audit()` for the same reason, but it is a check, not a binding: `audit_for` refuses to
+hand an audit to a caller naming the wrong request, yet `ObjectStoreProviderAttemptAudit` is a
+public struct of public counters that `ObjectStoreCompactReceiptInput` accepts beside a
+`logical_request_id` it never compares it against, so a correct audit can still attach to the wrong
+receipt. Closing that is WP-114 CD-8's obligation. `GovernedProviderClient::authorize` is now
+crate-private; `validate_attempt` (returning `()`) is its public replacement, and
+`ProviderChargeRequest` has no public constructor and is deliberately not `Clone`, so a charge
+authority cannot retain a chargeable value past the call — charging outside a ledger is unreachable
+rather than merely discouraged. `record_no_dispatch` still cannot bind its proof:
+`NoDispatchProofFields` carries no request identity, a WP-114 CD-6 obligation. See `WP-114`'s CD-5
+section and CR-033 D4 for the governing spec and disposition; this file states only the module's
+boundary.
 
 ## Out-of-band cell schema install (WP-114 CD-1)
 
