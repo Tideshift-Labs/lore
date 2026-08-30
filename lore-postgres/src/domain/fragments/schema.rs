@@ -33,8 +33,16 @@ pub const BACKFILL_CUTOVER: i16 = 3;
 
 /// `lore_fragment_associations.state`: the association is live and readable.
 pub const ASSOCIATION_LIVE: i16 = 0;
-/// `lore_fragment_associations.state`: tombstoned. Never revived; a later bind
-/// of the same triple takes a greater association epoch.
+/// `lore_fragment_associations.state`: tombstoned.
+///
+/// The **epoch** is never revived: a later bind of the same triple takes a
+/// greater association epoch, so no reader can be handed a stale one. The
+/// **row** is reused in place — `create_association` upserts
+/// `ON CONFLICT (hash, repository_id, context) DO UPDATE`, flipping the state
+/// back to live under the new epoch rather than inserting a second row. An
+/// earlier version of this comment said "never revived" without that
+/// distinction, which described the row rule as something the code does not do
+/// (INV-EF P2-10).
 pub const ASSOCIATION_TOMBSTONED: i16 = 1;
 
 /// `lore_fragment_epochs.authority`: a finalized durable staged file plus its
@@ -274,13 +282,67 @@ CREATE TABLE IF NOT EXISTS lore_fragment_schema_state (
 INSERT INTO lore_fragment_schema_state (
     id, schema_version, backfill_version, backfill_state, database_identity, updated_at
 )
-SELECT 1,
-       1,
-       0,
-       0,
-       control.system_identifier::text || ':' || database.oid::text || ':' || current_database(),
-       clock_timestamp()
+-- The schema_version literal below is aliased so `seed_schema_version_matches_the_constant`
+-- can pin it against FRAGMENT_SCHEMA_VERSION. `bootstrap()` binds the constant, this
+-- seed cannot, and parity compares catalog shape rather than row contents -- so without
+-- that test a version bump would diverge silently between the two paths (INV-EF P2-9).
+SELECT 1                                                                       AS id,
+       1                                                                       AS schema_version,
+       0                                                                       AS backfill_version,
+       0                                                                       AS backfill_state,
+       control.system_identifier::text || ':' || database.oid::text || ':' || current_database()
+                                                                               AS database_identity,
+       clock_timestamp()                                                       AS updated_at
   FROM pg_control_system() AS control
   JOIN pg_database AS database ON database.datname = current_database()
 ON CONFLICT (id) DO NOTHING;
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two paths write `lore_fragment_schema_state.schema_version` and only one
+    /// of them can reference the constant: `bootstrap()` binds
+    /// [`FRAGMENT_SCHEMA_VERSION`], while the seed inside [`FRAGMENT_SCHEMA`] is
+    /// raw SQL with a literal. The migration/runtime parity test compares
+    /// catalog *shape*, not row contents, so nothing else would notice a bump
+    /// applied to one and not the other (INV-EF P2-9).
+    #[test]
+    fn seed_schema_version_matches_the_constant() {
+        let marker = "AS schema_version";
+        let line = FRAGMENT_SCHEMA
+            .lines()
+            .find(|line| line.contains(marker))
+            .expect("the seed must alias its schema_version literal so this test can find it");
+        let literal: i64 = line
+            .split_whitespace()
+            .next()
+            .and_then(|token| token.parse().ok())
+            .expect("the aliased schema_version column must lead with a bare integer literal");
+        assert_eq!(
+            literal, FRAGMENT_SCHEMA_VERSION,
+            "the FRAGMENT_SCHEMA seed writes schema_version {literal} but bootstrap() binds \
+             FRAGMENT_SCHEMA_VERSION = {FRAGMENT_SCHEMA_VERSION}; bump both or neither"
+        );
+    }
+
+    #[test]
+    fn the_probe_array_holds_every_fragment_table_and_no_sequence() {
+        // The fence sequence is deliberately outside the array: `to_regclass`
+        // would find it, but presence of a sequence says nothing about whether
+        // the tables installed. Miscounting this is what INV-EF P2-13 caught in
+        // the skill's prose.
+        assert_eq!(FRAGMENT_SCHEMA_RELATIONS.len(), 7);
+        assert!(
+            !FRAGMENT_SCHEMA_RELATIONS.contains(&"lore_fragment_fence_seq"),
+            "the fence sequence must stay out of the relation-presence probe"
+        );
+        for relation in FRAGMENT_SCHEMA_RELATIONS {
+            assert!(
+                FRAGMENT_SCHEMA.contains(relation),
+                "{relation} is probed for but never created by FRAGMENT_SCHEMA"
+            );
+        }
+    }
+}

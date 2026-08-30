@@ -627,6 +627,20 @@ impl PostgresFragmentCoordinator {
     /// SQLSTATE 23514 an operator has to decode.
     pub async fn enable_lifecycle(&self) -> Result<(), DomainError> {
         let readiness = self.readiness().await?;
+        // Checked BEFORE the general readiness verdict, because
+        // `ready_for_lifecycle()` already folds the same upper bound in — so
+        // behind it this arm was unreachable and its specific diagnostic could
+        // never be emitted (INV-EF P2-1, INV-EE's dead-fallback class). An
+        // operator whose cell is ahead of the binary needs to be told to roll
+        // the binary forward, not handed a field dump.
+        if readiness.provisioned && readiness.schema_version > schema::FRAGMENT_SCHEMA_VERSION {
+            return Err(DomainError::NotReady(format!(
+                "cell fragment schema_version {} is newer than this binary's {}; \
+                 roll the binary forward before enabling lifecycle routing",
+                readiness.schema_version,
+                schema::FRAGMENT_SCHEMA_VERSION
+            )));
+        }
         if !readiness.ready_for_lifecycle() {
             return Err(DomainError::NotReady(format!(
                 "provisioned={} schema_version={} backfill_state={} cutover={} \
@@ -641,14 +655,6 @@ impl PostgresFragmentCoordinator {
                 readiness.same_database,
                 readiness.sequence_headroom,
                 readiness.unresolved_rows
-            )));
-        }
-        if readiness.schema_version > schema::FRAGMENT_SCHEMA_VERSION {
-            return Err(DomainError::NotReady(format!(
-                "cell fragment schema_version {} is newer than this binary's {}; \
-                 roll the binary forward before enabling lifecycle routing",
-                readiness.schema_version,
-                schema::FRAGMENT_SCHEMA_VERSION
             )));
         }
         let client = self.checkout().await?;
@@ -1069,10 +1075,14 @@ impl PostgresFragmentCoordinator {
         )
         .await
         .map_err(|error| DomainError::from_pg("mark missing update", error))?;
+        // Confirmed unconditionally, before the readability branch: the growth
+        // check is about whether this transaction locked what it is about to
+        // affect, which is a question every path has to answer (INV-EF P1-1).
+        let confirmed = confirm_lifecycle_fanout(&tx, &witness.hash, &fanout).await?;
         if was_readable {
             // Readable to unreadable is a lifecycle transition, so every
             // live-associated repository's scalar moves atomically with it.
-            apply_lifecycle_generation(&tx, &witness.hash, &fanout).await?;
+            apply_lifecycle_generation(&tx, &confirmed).await?;
         }
         classify_commit(tx.commit().await, "mark missing commit")?;
         Ok(CommitVerdict::Published)
@@ -1231,24 +1241,42 @@ impl PostgresFragmentCoordinator {
         )
         .await
         .map_err(|error| DomainError::from_pg("obliterate state update", error))?;
+        // Confirmed BEFORE the readability branch and used for everything below.
+        //
+        // This is INV-EF P1-1. The bump used to run over the plan-time list while
+        // the tombstone ran by predicate over the current set, and the only
+        // growth check sat inside `apply_lifecycle_generation` — which obliterate
+        // calls only when the head was readable. On a non-readable head
+        // (`Missing`, `Preparing*`, `Deleting*` are all accepted here; only
+        // `Tombstoned` is refused above) an association created between the plan
+        // read and the head lock was retired by a transaction that had never
+        // locked its repository row and moved no scalar attributable to the
+        // removal.
+        let confirmed = confirm_lifecycle_fanout(&tx, hash, &fanout).await?;
         if was_readable {
-            apply_lifecycle_generation(&tx, hash, &fanout).await?;
+            apply_lifecycle_generation(&tx, &confirmed).await?;
         }
         // Retiring associations moves the association scalar too, for every
         // repository that loses one. Obliterate previously moved only the
         // lifecycle scalar, so a push whose preflight predated an obliterate of
         // content it referenced could see an unchanged association generation
         // and take the fast path. The rows are already locked by the fanout.
-        bump_association_generation_many(&tx, &fanout).await?;
+        bump_association_generation_many(&tx, &confirmed).await?;
         sequence.enter(LockClass::Associations)?;
+        // Scoped to the confirmed repository set rather than every live
+        // association on the hash, so the rows this statement retires are
+        // exactly the rows whose scalars moved above. A bare
+        // `WHERE hash = $1 AND state = LIVE` predicate would silently widen to
+        // anything that appeared in the planning window.
         tx.execute(
             "UPDATE lore_fragment_associations \
                 SET state = $2, updated_at = clock_timestamp() \
-              WHERE hash = $1 AND state = $3",
+              WHERE hash = $1 AND state = $3 AND repository_id = ANY($4)",
             &[
                 &hash,
                 &schema::ASSOCIATION_TOMBSTONED,
                 &schema::ASSOCIATION_LIVE,
+                &confirmed,
             ],
         )
         .await
@@ -1658,6 +1686,9 @@ impl PostgresFragmentCoordinator {
             return Ok(CommitVerdict::Fenced);
         }
         let was_readable = head.state.is_readable();
+        // Confirmed once, before either arm branches, so both arms move scalars
+        // over a set this transaction has proved it holds.
+        let confirmed = confirm_lifecycle_fanout(&tx, &intent.hash, &fanout).await?;
 
         let manifest = match observation {
             IoObservation::Unusable(diagnostic) => {
@@ -1678,7 +1709,7 @@ impl PostgresFragmentCoordinator {
                 .await
                 .map_err(|error| DomainError::from_pg("publication missing update", error))?;
                 if was_readable {
-                    apply_lifecycle_generation(&tx, &intent.hash, &fanout).await?;
+                    apply_lifecycle_generation(&tx, &confirmed).await?;
                 }
                 classify_commit(tx.commit().await, "publication missing commit")?;
                 return Ok(CommitVerdict::Published);
@@ -1772,7 +1803,7 @@ impl PostgresFragmentCoordinator {
 
         if !was_readable {
             // Unreadable to readable is a lifecycle transition too.
-            apply_lifecycle_generation(&tx, &intent.hash, &fanout).await?;
+            apply_lifecycle_generation(&tx, &confirmed).await?;
         }
         classify_commit(tx.commit().await, "publication commit")?;
         Ok(CommitVerdict::Published)
@@ -1812,6 +1843,16 @@ impl FragmentHeadLock {
 }
 
 /// Lock one lifecycle head (position 4, `LockClass::Fragments`).
+///
+/// **`None` means nothing was locked, not "locked an absent row".** `FOR UPDATE`
+/// over zero rows takes no lock, so a caller that treats `None` as a benign
+/// "no head yet" and carries on is running unserialised against every other
+/// transaction doing the same. Every caller here except `create_association`
+/// returns immediately on `None`; `create_association` deliberately proceeds,
+/// which is sound only because a hash with no head row has no lifecycle
+/// transition to race — nothing can be mid-flight against a head that does not
+/// exist. Any future caller that proceeds on `None` must re-derive that
+/// argument rather than inherit it.
 async fn lock_fragment_head(
     tx: &Transaction<'_>,
     sequence: &mut LockSequence,
@@ -1887,6 +1928,20 @@ async fn current_epoch_key(
 
 /// Move one repository's association scalar. The row is already locked by the
 /// caller's `lock_repository`, so this takes no new lock class.
+/// **PRECONDITION: the caller already holds this repository row `FOR UPDATE`.**
+///
+/// This takes no `LockSequence::enter`, and that is deliberate rather than an
+/// oversight of the kind INV-EF P2-4 flags. Registering here would be *wrong*,
+/// not merely redundant: `create_association` reaches this after entering
+/// `LockClass::Associations` (position 5), so an `enter(Repository)` at position
+/// 1 would be a downward move and `LockSequence` would reject the whole
+/// transaction. The row is already held from that method's opening call to
+/// `lock_repository`, so this statement acquires nothing new.
+///
+/// The cost is that the guard cannot see this write. A future caller that reaches
+/// it without holding the row gets no error — it gets an unserialised increment.
+/// Verify the precondition at any new call site; do not infer it from the fact
+/// that the existing ones are fine.
 async fn bump_association_generation(
     tx: &Transaction<'_>,
     repository_id: &[u8],
@@ -1978,25 +2033,36 @@ async fn lock_lifecycle_fanout(
     Ok(())
 }
 
-/// Move the lifecycle scalar for every repository in the planned fanout,
-/// atomically, after confirming the set did not grow.
+/// Re-read the live fanout under the head lock and confirm it is still covered
+/// by the rows this transaction locked.
 ///
-/// The set is re-read under the head lock. It cannot grow from here —
+/// **Every caller must run this, whether or not it goes on to move a scalar.**
+/// It used to live inside [`apply_lifecycle_generation`], which
+/// `begin_obliterate` calls only under `if was_readable` — so on a non-readable
+/// head the growth check was skipped while the association tombstone still ran
+/// by predicate over the *current* set. An association created between the plan
+/// read and the head lock was then retired by a transaction that had never
+/// locked its repository row and never moved its scalar (INV-EF P1-1).
+///
+/// The set cannot grow once the head row is **actually** held:
 /// `create_association` takes the repository row, then the head, then the
-/// association row, so while this transaction holds the head no new association
-/// can be inserted for this hash. It *can* have grown between
-/// [`plan_lifecycle_fanout`] and the head lock, and a repository that appeared
-/// in that window is one this transaction never locked. Committing anyway would
-/// be exactly the partial fanout CR-031 forbids, so it returns retryable
-/// [`DomainError::Contention`] and the next attempt plans the larger set.
+/// association row, so a concurrent inserter blocks on the head before it can
+/// insert. That guarantee is exactly as strong as the head lock and no stronger,
+/// which is why every caller of this helper has already returned on a `None`
+/// head — `FOR UPDATE` over an absent row locks nothing (see
+/// [`lock_fragment_head`]). It *can* have grown between the plan and the head
+/// lock, and a repository that appeared in that window is one this transaction
+/// never locked; committing anyway would be the partial fanout CR-031 forbids,
+/// so this returns retryable [`DomainError::Contention`].
 ///
-/// The update itself is one statement over the already-locked set inside the
-/// caller's transaction, so a partial fanout is not representable.
-async fn apply_lifecycle_generation(
+/// Returns the confirmed set, which callers use for **both** the generation
+/// bump and the association tombstone, so those two can no longer disagree
+/// about which repositories the operation affects.
+async fn confirm_lifecycle_fanout(
     tx: &Transaction<'_>,
     hash: &[u8],
     locked: &[Vec<u8>],
-) -> Result<(), DomainError> {
+) -> Result<Vec<Vec<u8>>, DomainError> {
     let current = match plan_lifecycle_fanout(tx, hash).await {
         Ok(current) => current,
         // The re-plan crossing the admission bound is a race, not a caller
@@ -2012,9 +2078,6 @@ async fn apply_lifecycle_generation(
         }
         Err(other) => return Err(other),
     };
-    if current.is_empty() {
-        return Ok(());
-    }
     let held: BTreeSet<&Vec<u8>> = locked.iter().collect();
     if current.iter().any(|id| !held.contains(id)) {
         return Err(DomainError::Contention(format!(
@@ -2023,6 +2086,20 @@ async fn apply_lifecycle_generation(
             locked.len(),
             current.len()
         )));
+    }
+    Ok(current)
+}
+
+/// Move the lifecycle scalar for every repository in the confirmed fanout.
+///
+/// One statement over rows [`confirm_lifecycle_fanout`] has already proved this
+/// transaction holds, so a partial fanout is not representable.
+async fn apply_lifecycle_generation(
+    tx: &Transaction<'_>,
+    locked: &[Vec<u8>],
+) -> Result<(), DomainError> {
+    if locked.is_empty() {
+        return Ok(());
     }
     // Bound by `locked`, which this has just proved is a superset of `current`.
     // Writing the already-locked set makes "one statement over rows this
@@ -2043,6 +2120,16 @@ async fn apply_lifecycle_generation(
 /// Used where one operation retires many associations, so every affected
 /// repository's push witness moves with the removal rather than only the
 /// caller's own.
+/// **PRECONDITION: the caller already holds every one of these repository rows
+/// `FOR UPDATE`**, which for its one caller means passing the set returned by
+/// [`confirm_lifecycle_fanout`] and nothing else.
+///
+/// Takes no `LockSequence::enter` for the same reason as
+/// [`bump_association_generation`]: `begin_obliterate` reaches it after
+/// `lock_lifecycle_fanout` has already entered `LockClass::Repository`, and a
+/// second entry is harmless only because same-class repeats are allowed —
+/// but it would still be registering a lock this function does not take. The
+/// guard therefore does not cover this write; the precondition does.
 async fn bump_association_generation_many(
     tx: &Transaction<'_>,
     repositories: &[Vec<u8>],

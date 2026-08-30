@@ -1168,12 +1168,17 @@ CREATE TABLE IF NOT EXISTS lore_fragment_schema_state (
 INSERT INTO lore_fragment_schema_state (
     id, schema_version, backfill_version, backfill_state, database_identity, updated_at
 )
-SELECT 1,
-       1,
-       0,
-       0,
-       control.system_identifier::text || ':' || database.oid::text || ':' || current_database(),
-       clock_timestamp()
+-- The schema_version literal below is aliased so `seed_schema_version_matches_the_constant`
+-- can pin it against FRAGMENT_SCHEMA_VERSION. `bootstrap()` binds the constant, this
+-- seed cannot, and parity compares catalog shape rather than row contents -- so without
+-- that test a version bump would diverge silently between the two paths (INV-EF P2-9).
+SELECT 1                                                                       AS id,
+       1                                                                       AS schema_version,
+       0                                                                       AS backfill_version,
+       0                                                                       AS backfill_state,
+       control.system_identifier::text || ':' || database.oid::text || ':' || current_database()
+                                                                               AS database_identity,
+       clock_timestamp()                                                       AS updated_at
   FROM pg_control_system() AS control
   JOIN pg_database AS database ON database.datname = current_database()
 ON CONFLICT (id) DO NOTHING;
