@@ -1445,4 +1445,192 @@ mod tests {
             "a cell without the SCHEMA-117 migration must stay on the legacy lock route"
         );
     }
+
+    // --- 9. WP-116 guarded-stop contract gap: real construction paths ------
+
+    // PERMANENT cross-namespace isolation guarantee (WP-116 guarded stop),
+    // corrected 2026-08-30 after a reviewer round. This test deliberately
+    // consumes under the WRONG scope key (a direct handler's
+    // `GovernedScope::TargetRepository`/`RepositoryCreate` key) against a row
+    // `domain_operation_prepare` created under the CORRECT mediated key. That
+    // must ALWAYS fail closed -- cross-namespace consumption is a permanent
+    // invariant of the receipt state machine, not an artifact of today's gap,
+    // and this test's assertions (`ADMISSION_REJECTED_V1`, no domain
+    // mutation, the source row still `PREPARED`) must stay green forever. Do
+    // NOT replace them with a positive `Applied` proof when the WP-116
+    // carriage gap closes: add a positive proof ALONGSIDE these assertions
+    // instead, exercising a call site that correctly threads the mediated key
+    // end-to-end once carriage exists.
+    //
+    // What today's gap actually is: a governed handler has no way to obtain
+    // the `org_uuid`/principal identity a correct mediated key would need.
+    // One of the two carriage sites is pinned at compile time
+    // (`grpc::domain_operation_metadata::tests::
+    // domain_operation_metadata_carries_no_org_or_principal_identity`, over
+    // this module's own request-metadata carriage struct); the other,
+    // `AuthorizationToken` (`auth/jwt.rs:60`), is deliberately not pinned by
+    // an exhaustive destructure there and must be checked by hand when
+    // closing MISSING-1 -- see that test's own comment for why. This test is
+    // the live, decisive companion to
+    // `grpc::domain_operation_metadata::tests::
+    // direct_and_mediated_scope_key_families_never_collide`, driven through
+    // the REAL production construction path against a live Postgres domain
+    // store rather than by comparing key bytes in isolation: a
+    // `domain_operation_prepare` call built exactly the way the private
+    // `DomainOperationPrepare` RPC builds it, followed by a coordinator
+    // mutation call built exactly the way a governed handler builds it.
+    #[tokio::test]
+    #[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
+    async fn a_mediated_prepare_key_cannot_be_consumed_by_a_repository_scoped_governed_mutation() {
+        use lore_postgres::domain::DomainOutcome;
+        use lore_postgres::domain::coordinator::ADMISSION_REJECTED_V1;
+        use lore_postgres::domain::coordinator::GovernedOperation;
+        use lore_postgres::domain::coordinator::RepositoryCreateInput;
+        use lore_postgres::domain::receipts::OperationBinding;
+        use lore_postgres::domain::receipts::PrepareResult;
+        use lore_postgres::domain::receipts::ReceiptKey;
+        use lore_postgres::domain::receipts::ReceiptLookup;
+
+        use crate::grpc::domain_operation_metadata::ScopeKeyError;
+        use crate::grpc::domain_operation_metadata::scope_key_mediated_namespace;
+        use crate::grpc::domain_operation_metadata::scope_key_repository_create;
+        use crate::grpc::domain_operation_metadata::scope_key_target_repository;
+
+        // Required explicitly, matching this module's other live case: a
+        // silent `return` here would let an unconfigured run report a pass it
+        // never earned. A skipped live case is NOT RUN, never a pass.
+        std::env::var("LORE_TEST_PG_URL")
+            .expect("LORE_TEST_PG_URL must be set; a skipped live case is NOT RUN, never a pass");
+        let context = super::test_support::configured_enforcing_context()
+            .await
+            .expect("real domain-context construction path must yield an enforcing context");
+        let store = context.store().clone();
+
+        type ScopeBuilder = fn(&[u8]) -> Result<Vec<u8>, ScopeKeyError>;
+        let handler_builders: [(&str, ScopeBuilder); 2] = [
+            (
+                "GovernedScope::TargetRepository",
+                scope_key_target_repository,
+            ),
+            (
+                "GovernedScope::RepositoryCreate",
+                scope_key_repository_create,
+            ),
+        ];
+
+        for (label, build_handler_scope) in handler_builders {
+            let repository_id = *Uuid::new_v4().as_bytes();
+            let org_uuid = *Uuid::new_v4().as_bytes();
+            let principal_namespace = format!("principal-v1\0{}", Uuid::new_v4());
+            let verified_issuer = format!(
+                "https://issuer.example/wp116-gap/{:016x}",
+                rand::random::<u64>()
+            );
+            let authenticated_subject = "svc:wp116-gap-test".to_string();
+            let operation_id = Uuid::now_v7();
+
+            let mediated_scope =
+                scope_key_mediated_namespace(&org_uuid, principal_namespace.as_bytes())
+                    .expect("valid mediated namespace components");
+            let mediated_key = ReceiptKey {
+                verified_issuer: verified_issuer.clone(),
+                authenticated_subject: authenticated_subject.clone(),
+                tenant_scope_key: mediated_scope,
+                operation_id,
+            };
+            let binding = OperationBinding {
+                method: "lore.RepositoryService/RepositoryCreate".to_string(),
+                scope: mediated_key.tenant_scope_key.clone(),
+                fingerprint_version: 1,
+                fingerprint: rand::random::<[u8; 32]>().to_vec(),
+                canonical_intent_digest: rand::random::<[u8; 32]>().to_vec(),
+            };
+
+            // Prepare exactly the way DomainOperationPrepare does: the
+            // mediated key.
+            let prepared = store
+                .domain_operation_prepare(&mediated_key, &binding, None)
+                .await
+                .expect("prepare through the real production construction path must succeed");
+            let PrepareResult::Prepared { token, .. } = prepared else {
+                panic!("{label}: expected Prepared, got {prepared:?}");
+            };
+
+            // Now build the operation the way a governed handler would: same
+            // prepare token and identity fields, but a repository-scoped key.
+            let handler_scope = build_handler_scope(&repository_id).expect("valid repository id");
+            let handler_key = ReceiptKey {
+                verified_issuer,
+                authenticated_subject,
+                tenant_scope_key: handler_scope,
+                operation_id,
+            };
+            let governed = GovernedOperation {
+                key: handler_key,
+                binding: binding.clone(),
+                prepare_token: token,
+            };
+            let input = RepositoryCreateInput {
+                repository_id: repository_id.to_vec(),
+                name: format!("wp116-gap-{operation_id}"),
+                metadata_hash: rand::random::<[u8; 32]>().to_vec(),
+                default_branch_id: Uuid::new_v4().as_bytes().to_vec(),
+                default_branch_name: "main".to_string(),
+                default_branch_metadata_hash: rand::random::<[u8; 32]>().to_vec(),
+                default_branch_latest_hash: vec![0u8; 32],
+                creation_fingerprint: binding.fingerprint.clone(),
+                creation_fingerprint_version: binding.fingerprint_version,
+                projection: Vec::new(),
+                event: None,
+            };
+
+            let result = store.repository_create(&governed, &input).await.expect(
+                "a wrong-scope consume must fail closed with a decisive result, not a \
+                     transport/database error",
+            );
+
+            assert_eq!(
+                result.repository_generation, None,
+                "{label}: no domain mutation may happen on a scope-key mismatch"
+            );
+            assert_eq!(
+                result.branch_generation, None,
+                "{label}: no domain mutation may happen on a scope-key mismatch"
+            );
+            match result.outcome {
+                DomainOutcome::NotApplied { reason, .. } => {
+                    assert_eq!(
+                        reason, ADMISSION_REJECTED_V1,
+                        "{label}: must be refused as an admission rejection, not a downstream \
+                         precondition failure"
+                    );
+                }
+                other => {
+                    panic!("{label}: expected NotApplied(ADMISSION_REJECTED_V1), got {other:?}")
+                }
+            }
+
+            // No repository row was ever written.
+            let snapshot = store
+                .repository_snapshot(&repository_id)
+                .await
+                .expect("repository snapshot lookup");
+            assert!(
+                snapshot.is_none(),
+                "{label}: repository_create must not have written a domain row"
+            );
+
+            // The originally prepared row, under its own mediated key, is
+            // left completely untouched by the failed consume attempt.
+            let lookup = store
+                .domain_operation_receipt_get(&mediated_key, &binding)
+                .await
+                .expect("receipt lookup under the mediated key");
+            assert!(
+                matches!(lookup, ReceiptLookup::Prepared { .. }),
+                "{label}: the mediated-key row must remain PREPARED, untouched by the failed \
+                 consume attempt under a different scope key"
+            );
+        }
+    }
 }

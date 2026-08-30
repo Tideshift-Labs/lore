@@ -3,7 +3,7 @@
 
 <#
 .SYNOPSIS
-Runs the six WP-116 real-construction enforcement regressions on disposable PostgreSQL 16 databases.
+Runs the seven WP-116 real-construction enforcement regressions on disposable PostgreSQL 16 databases.
 
 .DESCRIPTION
 The Rust cases remain `#[ignore]`. This runner verifies the fixed fully-qualified inventory, runs
@@ -35,7 +35,8 @@ $expectedTests = @(
     'grpc::revision::v1::branch_push::test::enforcing_cell_rejects_before_v1_branch_push_body',
     'grpc::handlers::branch_metadata_set::test::enforcing_cell_rejects_before_legacy_metadata_cas_body',
     'grpc::revision::v1::branch_metadata_set::test::enforcing_cell_rejects_before_v1_metadata_cas_body',
-    'grpc::handlers::obliterate::tests::enforcing_cell_rejects_before_obliterate_body'
+    'grpc::handlers::obliterate::tests::enforcing_cell_rejects_before_obliterate_body',
+    'domain::tests::a_mediated_prepare_key_cannot_be_consumed_by_a_repository_scoped_governed_mutation'
 )
 
 $results = @(
@@ -91,8 +92,8 @@ function Get-EnforcementTestCatalog {
 function Assert-ExpectedCatalog {
     $catalog = @(Get-EnforcementTestCatalog)
     $missing = @($expectedTests | Where-Object { $_ -notin $catalog })
-    if ($expectedTests.Count -ne 6 -or $missing.Count -ne 0) {
-        throw "expected six WP-116 enforcement tests; missing=[$($missing -join ', ')]"
+    if ($expectedTests.Count -ne 7 -or $missing.Count -ne 0) {
+        throw "expected seven WP-116 enforcement tests; missing=[$($missing -join ', ')]"
     }
 }
 

@@ -461,6 +461,28 @@ will update an older check constraint or state schema.
   grpc::tests::domain_error_mapping_tests domain::tests grpc::handlers::repository_metadata_set
   grpc::repository::v1::repository_metadata_set grpc::handlers::repository_query
   grpc::handlers::branch_list grpc::repository::v1::repository_get`.
+  **A scope-key/receipt-key disagreement can be a carriage gap, not a derivation gap — verify which
+  before framing a pin.** WP-116: `scope_key_mediated` and `scope_key_mediated_namespace`
+  (`domain_operation_metadata.rs`) are byte-identical for the same (org, principal) pair, and
+  `GovernedScope::Mediated` (`domain.rs`) already calls the former — an agreeing derivation exists. The
+  real blocker is that no governed handler can obtain `org_uuid`/principal identity at all — there are
+  TWO carriage sites, and only one is compile-time pinned (a no-`..`-rest-pattern exhaustive destructure
+  over the three-header struct, so an added field forces revisiting the pin). The second site,
+  `AuthorizationToken` (`auth/jwt.rs`), is deliberately left unpinned by that technique since it mirrors
+  an upstream JWT contract and would churn on every refresh — check it by hand when closing MISSING-1.
+  Cross-family scope-key inequality
+  (`repository-*-v1\0` vs `mediated-v1\0`) and cross-namespace consume failing closed
+  (`ADMISSION_REJECTED_V1`, no mutation, source row stays `PREPARED`) are PERMANENT invariants, true
+  whether or not the carriage gap ever closes — they must stay green forever; add a positive proof
+  alongside once carriage lands, never replace them. Tests: `domain_operation_metadata.rs`'s
+  `direct_and_mediated_scope_key_families_never_collide` /
+  `mediated_scope_key_derivation_already_agrees_with_the_prepare_side` /
+  `domain_operation_metadata_carries_no_org_or_principal_identity`; `domain.rs`'s
+  `a_mediated_prepare_key_cannot_be_consumed_by_a_repository_scoped_governed_mutation` (tracked in
+  `run-domain-enforcement-live.ps1`).
+  **A generic gate's own unit tests don't prove one call site's legacy path is reachable.** Check each
+  fenced handler individually for a `handler(domain_context: None, ...)` call asserting the pre-gate
+  outcome before assuming coverage exists.
 
 ## Durable test patterns and gotchas
 

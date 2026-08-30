@@ -1214,4 +1214,124 @@ mod tests {
 
         assert!(contains_subslice(&key, URC_PREFIX));
     }
+
+    // --- 10. WP-116 guarded-stop contract gap (CR-029 rail unwireability) --
+    //
+    // CORRECTED STORY (2026-08-30, after a reviewer round): an earlier version
+    // of this section framed the inequality test below as itself pinning the
+    // WP-116 gap, and its comment said the gap would be "closed" if that test
+    // ever started failing. That was imprecise and is now fixed. What's true:
+    //
+    // - `scope_key_mediated(org, user_id)` and
+    //   `scope_key_mediated_namespace(org, "principal-v1\0" + user_id)` are
+    //   BYTE-IDENTICAL, and `GovernedScope::Mediated` (`lore-server/src/domain.rs`)
+    //   already exists and calls the former. An agreeing derivation already
+    //   exists on the handler side -- derivation disagreement is NOT the
+    //   blocker. See `mediated_scope_key_derivation_already_agrees_with_the_prepare_side`
+    //   below (general encoding-boundary coverage for the same equality lives
+    //   in `canonical_mediated_namespace_is_encoded_once_and_noncanonical_forms_fail`
+    //   above; this copy exists to carry the WP-116 narrative explicitly).
+    // - The real blocker is CARRIAGE, and it has TWO sites, only one of which
+    //   this file pins. The three request-metadata headers this module reads
+    //   carry neither `org_uuid` nor the initiating principal namespace --
+    //   `domain_operation_metadata_carries_no_org_or_principal_identity`
+    //   below is a compile-time pin over exactly that site, breaking the
+    //   build the day this module's carriage struct grows an org/principal
+    //   field. The SECOND carriage site, `AuthorizationToken`
+    //   (`lore-server/src/auth/jwt.rs:60`), is NOT pinned here on purpose: it
+    //   mirrors an upstream JWT contract and an exhaustive destructure over
+    //   it would churn on every upstream refresh. Closing MISSING-1 (or any
+    //   change that adds an org claim to `AuthorizationToken`) must be
+    //   checked against that struct by hand -- this file's pin alone does not
+    //   prove full carriage coverage.
+    //
+    // The inequality test immediately below is real and stays, but it is a
+    // PERMANENT invariant, not a gap indicator: two different scope-key
+    // families (`repository-create-v1\0` / `repository-v1\0` vs
+    // `mediated-v1\0`) must never collide, forever, independent of whether the
+    // carriage gap is ever closed -- that is ordinary tenant-isolation hygiene
+    // across scope kinds, and it stays green even after the gap closes.
+    #[test]
+    fn direct_and_mediated_scope_key_families_never_collide() {
+        // The identical 16 bytes stand in for "the same logical operation's
+        // target identity" on both sides: a mediated key uses them as the org
+        // UUID, and a direct handler key uses them as the repository UUID.
+        // Reusing the exact same bytes gives the inequality assertion its
+        // strongest form -- any difference in the encoded keys comes only
+        // from the method tag and framing, not from different input identity
+        // bytes happening to differ.
+        let shared_identity = *Uuid::new_v4().as_bytes();
+        let principal_namespace = format!("principal-v1\0{}", Uuid::new_v4());
+
+        let mediated_key =
+            scope_key_mediated_namespace(&shared_identity, principal_namespace.as_bytes())
+                .expect("valid mediated namespace components");
+        let handler_target_key =
+            scope_key_target_repository(&shared_identity).expect("valid repository id");
+        let handler_create_key =
+            scope_key_repository_create(&shared_identity).expect("valid repository id");
+
+        assert_ne!(
+            mediated_key, handler_target_key,
+            "a mediated scope key must never collide with a GovernedScope::TargetRepository \
+             key for the same logical operation -- this is a permanent cross-family \
+             tenant-isolation invariant, not evidence of the WP-116 carriage gap"
+        );
+        assert_ne!(
+            mediated_key, handler_create_key,
+            "a mediated scope key must never collide with a GovernedScope::RepositoryCreate \
+             key for the same logical operation"
+        );
+    }
+
+    // WP-116 pin 2a: an agreeing derivation already exists on the handler
+    // side. `GovernedScope::Mediated` (`domain.rs`) calls `scope_key_mediated`
+    // directly; `DomainOperationPrepare`'s `receipt_key`
+    // (`grpc/domain/v1/service.rs`) calls `scope_key_mediated_namespace`. This
+    // proves the two produce byte-identical output for the same
+    // (org, principal) pair, so unifying derivation is not what closing the
+    // WP-116 gap requires.
+    #[test]
+    fn mediated_scope_key_derivation_already_agrees_with_the_prepare_side() {
+        let org_uuid = *Uuid::new_v4().as_bytes();
+        let principal_id = Uuid::new_v4().to_string();
+        let canonical_namespace = format!("principal-v1\0{principal_id}");
+
+        let via_handler_builder = scope_key_mediated(&org_uuid, principal_id.as_bytes())
+            .expect("GovernedScope::Mediated's own builder");
+        let via_prepare_builder =
+            scope_key_mediated_namespace(&org_uuid, canonical_namespace.as_bytes())
+                .expect("DomainOperationPrepare's own builder");
+
+        assert_eq!(
+            via_handler_builder, via_prepare_builder,
+            "scope_key_mediated and scope_key_mediated_namespace must keep agreeing for the \
+             same (org, principal) pair -- if this ever fails, a real derivation gap has \
+             appeared and the WP-116 story above needs to be revisited"
+        );
+    }
+
+    // WP-116 pin 2b: a COMPILE-TIME pin on ONE of the two carriage sites, not
+    // a runtime assertion and not full carriage coverage. `DomainOperationMetadata`
+    // is exhaustively destructured with no `..` rest pattern, so the day this
+    // struct gains an `org_uuid`/principal field, this destructure fails to
+    // compile with "pattern does not mention field ..." -- forcing whoever
+    // lands that change to revisit this test and the WP-116 guarded-stop
+    // story it documents, rather than the gap silently closing unnoticed.
+    // This does NOT cover the second carriage site, `AuthorizationToken`
+    // (`lore-server/src/auth/jwt.rs:60`) -- deliberately not pinned by an
+    // exhaustive destructure here, since it mirrors an upstream JWT contract
+    // and would churn on every upstream refresh; check it by hand.
+    #[test]
+    fn domain_operation_metadata_carries_no_org_or_principal_identity() {
+        let (metadata, ..) = valid_metadata();
+        let parsed = require(&metadata).expect("well-formed metadata must parse");
+
+        let DomainOperationMetadata {
+            operation_id: _,
+            fingerprint_version: _,
+            fingerprint: _,
+            prepare_token: _,
+        } = parsed;
+    }
 }

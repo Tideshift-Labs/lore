@@ -1559,7 +1559,7 @@ mod tests {
     #[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
     async fn enforcing_cell_rejects_before_legacy_branch_push_body() {
         let Some(domain) = crate::domain::test_support::configured_enforcing_context().await else {
-            return;
+            panic!("LORE_TEST_PG_URL must be set; a skipped live case is NOT RUN, never a pass");
         };
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, _) = test_store_create().await.expect("test stores");
