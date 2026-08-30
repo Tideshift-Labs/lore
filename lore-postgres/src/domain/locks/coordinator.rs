@@ -404,9 +404,10 @@ impl PostgresLockCoordinator {
         if let Some(actor) = &input.acting_owner {
             validate_owner(actor)?;
         }
-        // `readiness()` is five round trips, two of them unindexed `lore_locks`
-        // scans. Only the finite-lease question needs it, and finite leases stay
-        // off until WP-120, so a tokenless acquire must not pay for it.
+        // `readiness()` is a pool checkout plus seven round trips, two of them
+        // unindexed `lore_locks` scans. Only the finite-lease question needs it,
+        // and finite leases stay off until WP-120, so a tokenless acquire must
+        // not pay for it.
         if input.lease_duration.is_some() && !self.readiness().await?.lease_enabled {
             return Err(DomainError::NotReady(
                 "finite lock leases are disabled until token-capable clients are active".to_owned(),
@@ -880,6 +881,11 @@ impl PostgresLockCoordinator {
         resources: &[(&[u8], &[u8])],
     ) -> Result<Vec<FencedLock>, DomainError> {
         validate_id("repository_id", repository_id)?;
+        if resources.len() > MAX_BATCH_RESOURCES {
+            return Err(DomainError::InvalidInput(format!(
+                "lock status batch must contain at most {MAX_BATCH_RESOURCES} entries"
+            )));
+        }
         for (branch_id, resource_hash) in resources {
             validate_id("branch_id", branch_id)?;
             validate_hash(resource_hash)?;
@@ -1289,13 +1295,16 @@ impl PostgresLockCoordinator {
 
     /// Current database-backed readiness evidence.
     ///
-    /// This runs on the mandatory startup path, before the legacy lock-store
-    /// plugin has connected, so it must tolerate two absences that are normal
-    /// rather than exceptional: a database the SCHEMA-117 migration has not
-    /// reached at all (CR-030 N-7 keeps that DDL migration-owned), and a
-    /// `lore_locks` table the legacy plugin has not created yet. Both answer
-    /// "not provisioned, use the legacy route" — reading them as errors aborted
-    /// startup on every unmigrated cell (INV-EE P0-1).
+    /// This runs on the mandatory startup path, so exactly one absence is
+    /// normal rather than exceptional: a database the SCHEMA-117 migration has
+    /// not reached at all (CR-030 N-7 keeps that DDL migration-owned). That one
+    /// answers "not provisioned, use the legacy route" — reading it as an error
+    /// aborted startup on every unmigrated cell (INV-EE P0-1).
+    ///
+    /// Every other gap is damage and is refused. In particular `lore_locks` is
+    /// part of SCHEMA-117, not something the legacy plugin contributes later,
+    /// so a provisioned schema missing it is an error and not a boot-order
+    /// window.
     pub async fn readiness(&self) -> Result<LockFencingReadiness, DomainError> {
         let client = self.checkout().await?;
         match fenced_schema_presence(&client).await? {
@@ -1308,8 +1317,9 @@ impl PostgresLockCoordinator {
             // armed cell to the subject-only legacy comparison.
             FencedSchemaPresence::Partial { present } => {
                 return Err(DomainError::NotReady(format!(
-                    "SCHEMA-117 is partially present ({present} of {} relations); a migration \
-                     never produces this state, so it is refused rather than routed around",
+                    "SCHEMA-117 is partially installed: {present} of {} probed relations exist. \
+                     A migration never produces this state, so it is refused rather than routed \
+                     around",
                     FENCED_SCHEMA_RELATIONS.len()
                 )));
             }
@@ -1331,20 +1341,26 @@ impl PostgresLockCoordinator {
                     .to_owned(),
             ));
         };
-        // The legacy lock store creates `lore_locks` after this call in the
-        // boot order, so its absence contributes no fences and no legacy rows.
-        let legacy_locks_present = relation_present(&client, "lore_locks").await?;
+        // SCHEMA-117 creates `lore_locks` itself (`LOCK_SCHEMA`, mirrored in
+        // `migrations/0001_init.sql`), so a provisioned schema always has it and
+        // its absence is damage rather than the pre-plugin boot window. Reading
+        // around it is the dangerous option, not the safe one: with no lock
+        // table, `unfenced_rows` would count zero and headroom would be proved
+        // from the namespaces alone, so an armed cell would pass readiness and
+        // then take SQLSTATE 42P01 on its first lock read.
+        if !relation_present(&client, "lore_locks").await? {
+            return Err(DomainError::NotReady(
+                "SCHEMA-117 is installed but `lore_locks` is absent; the lock table is part of \
+                 that schema, so this installation is damaged"
+                    .to_owned(),
+            ));
+        }
         let max_fence: i64 = client
             .query_one(
-                if legacy_locks_present {
-                    "SELECT GREATEST( \
-                        COALESCE((SELECT max(fence) FROM lore_locks), 0), \
-                        COALESCE((SELECT max(last_applied_fence) \
-                                    FROM lore_domain_lock_namespaces), 0))"
-                } else {
-                    "SELECT COALESCE((SELECT max(last_applied_fence) \
-                                        FROM lore_domain_lock_namespaces), 0)"
-                },
+                "SELECT GREATEST( \
+                    COALESCE((SELECT max(fence) FROM lore_locks), 0), \
+                    COALESCE((SELECT max(last_applied_fence) \
+                                FROM lore_domain_lock_namespaces), 0))",
                 &[],
             )
             .await
@@ -1358,23 +1374,19 @@ impl PostgresLockCoordinator {
             .await
             .map_err(|error| DomainError::from_pg("lock quarantine readiness", error))?
             .get(0);
-        let unfenced_rows: i64 = if legacy_locks_present {
-            client
-                .query_one(
-                    "SELECT count(*)::bigint FROM lore_locks \
-                      WHERE repository_lock_generation IS NULL \
-                         OR branch_lock_generation IS NULL \
-                         OR owner_issuer IS NULL OR owner_subject IS NULL \
-                         OR ownership_token IS NULL OR fence IS NULL \
-                         OR acquired_at IS NULL OR renewed_at IS NULL",
-                    &[],
-                )
-                .await
-                .map_err(|error| DomainError::from_pg("unfenced lock readiness", error))?
-                .get(0)
-        } else {
-            0
-        };
+        let unfenced_rows: i64 = client
+            .query_one(
+                "SELECT count(*)::bigint FROM lore_locks \
+                  WHERE repository_lock_generation IS NULL \
+                     OR branch_lock_generation IS NULL \
+                     OR owner_issuer IS NULL OR owner_subject IS NULL \
+                     OR ownership_token IS NULL OR fence IS NULL \
+                     OR acquired_at IS NULL OR renewed_at IS NULL",
+                &[],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("unfenced lock readiness", error))?
+            .get(0);
         let evidence: Option<i64> = row.get("sequence_headroom_fence");
         let sequence = client
             .query_one(
@@ -1412,8 +1424,13 @@ impl PostgresLockCoordinator {
     }
 }
 
-/// The migration-owned SCHEMA-117 relations `readiness` reads, excluding the
-/// legacy `lore_locks` table the lock-store plugin creates later in boot.
+/// The SCHEMA-117 relations that decide whether the migration ran here.
+///
+/// `lore_locks` is excluded on purpose, but not because something else creates
+/// it: `LOCK_SCHEMA` does, ahead of these four. It is excluded because it also
+/// pre-dates SCHEMA-117 on an upgraded cell, so its presence alone proves
+/// nothing about the migration. Its *absence* alongside these four is damage,
+/// and `readiness` refuses on it separately.
 const FENCED_SCHEMA_RELATIONS: [&str; 4] = [
     "lore_domain_lock_schema_state",
     "lore_domain_lock_namespaces",
@@ -1433,10 +1450,17 @@ async fn relation_present(
 }
 
 /// How much of the migration-owned SCHEMA-117 schema this database holds.
+///
+/// A relation-level probe, not a schema check. `Complete` means every probed
+/// relation exists; it says nothing about the columns, functions, triggers, and
+/// indexes `LOCK_SCHEMA` also installs. Those fail closed on their own — a
+/// missing fenced column is SQLSTATE 42703 out of the readiness query itself —
+/// so this probe's only job is to separate "the migration never ran here" from
+/// "it ran and something is missing".
 enum FencedSchemaPresence {
     /// The migration has not reached this database. A routing answer.
     Absent,
-    /// Some relations exist and some do not — never a migration's output.
+    /// Some probed relations exist and some do not — never a migration's output.
     Partial {
         present: i64,
     },

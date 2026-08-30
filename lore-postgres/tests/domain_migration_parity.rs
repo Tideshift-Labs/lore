@@ -29,8 +29,10 @@ use lore_postgres::store::lock_store::PostgresLockStore;
 /// itself fails to build, not just this test.
 const MIGRATIONS_0001: &str = include_str!("../migrations/0001_init.sql");
 
-/// The relations only `migrations/0001_init.sql` (or the isolated test fixture)
-/// creates. `lore_locks` is excluded: the legacy plugin creates that one.
+/// The relations that prove `migrations/0001_init.sql` (or the isolated test
+/// fixture) ran here. `lore_locks` is excluded because it also pre-dates
+/// SCHEMA-117 on an upgraded cell, so its presence proves nothing either way —
+/// not because anything other than SCHEMA-117 creates it.
 const SCHEMA_117_RELATIONS: [&str; 4] = [
     "lore_domain_lock_schema_state",
     "lore_domain_lock_namespaces",

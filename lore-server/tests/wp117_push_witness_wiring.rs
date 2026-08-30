@@ -145,14 +145,36 @@ fn a_zero_revision_is_rejected_before_any_witness_capture() {
 /// deliberate: UFCS (`PostgresLockCoordinator::enable_fencing_for_component_fixture(..)`),
 /// a function-pointer binding, and a call split across lines all reach the
 /// bypass without ever writing `.name(`.
+///
+/// Files that are themselves test code — declared `#[cfg(test)] mod <name>;` by
+/// a parent module, like `branch_push/governed_tests.rs` — are excluded, since
+/// a bypass call there is exactly what the bypass is for.
 #[test]
 fn only_tests_bypass_the_public_mutation_contract_gate() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("lore-server must sit inside the workspace root");
+    let roots =
+        ["lore-server", "lore-postgres"].map(|crate_name| workspace.join(crate_name).join("src"));
+
+    let mut test_only = Vec::new();
+    for root in &roots {
+        collect_test_only_module_files(root, &mut test_only);
+    }
+    // Without this, a detector that silently stopped resolving module paths
+    // would excuse every file rather than none, and the gate would pass by
+    // scanning nothing.
+    assert!(
+        test_only
+            .iter()
+            .any(|path| path.ends_with("branch_push/governed_tests.rs")),
+        "the test-only module detector resolved no path for a known whole-file test module, so \
+         its exclusions cannot be trusted; found: {test_only:?}"
+    );
+
     let mut offenders = Vec::new();
-    for crate_name in ["lore-server", "lore-postgres"] {
-        collect_fixture_arming_references(&workspace.join(crate_name).join("src"), &mut offenders);
+    for root in &roots {
+        collect_fixture_arming_references(root, &test_only, &mut offenders);
     }
     assert!(
         offenders.is_empty(),
@@ -160,6 +182,65 @@ fn only_tests_bypass_the_public_mutation_contract_gate() {
          it at: {}",
         offenders.join(", ")
     );
+}
+
+/// Files declared `#[cfg(test)] mod <name>;` by some module in `directory`.
+///
+/// Resolved from that declaration rather than a hardcoded path list, and
+/// deliberately not by counting braces around an *inline* `#[cfg(test)] mod` —
+/// brace counting drifts on format strings, and a drifting scanner silently
+/// stops covering production code, which is the one failure this gate cannot
+/// have. An inline test module that needs the bypass therefore still trips the
+/// gate; move the call into a whole-file test module rather than loosening the
+/// identifier match.
+fn collect_test_only_module_files(directory: &Path, found: &mut Vec<std::path::PathBuf>) {
+    let entries = std::fs::read_dir(directory).expect("source directory must be readable");
+    for entry in entries {
+        let path = entry.expect("directory entry must be readable").path();
+        if path.is_dir() {
+            collect_test_only_module_files(&path, found);
+            continue;
+        }
+        if path.extension().is_none_or(|extension| extension != "rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("source file must be readable");
+        let mut cfg_test_pending = false;
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed == "#[cfg(test)]" {
+                cfg_test_pending = true;
+                continue;
+            }
+            if cfg_test_pending
+                && let Some(name) = trimmed
+                    .strip_prefix("mod ")
+                    .and_then(|rest| rest.strip_suffix(';'))
+            {
+                // Exactly ONE candidate, never a fallback. In the 2018 module
+                // system `mod bar;` inside `foo.rs` resolves to `foo/bar.rs`
+                // and nothing else; only a `mod.rs` or crate root resolves to
+                // the sibling `<dir>/bar.rs`. Trying both would silently excuse
+                // a production `<dir>/bar.rs` whenever a `foo/bar.rs` test
+                // module shares its name — and over-excluding is the one
+                // direction this gate cannot fail in.
+                let stem = path.file_stem().unwrap_or_default();
+                let parent = path.parent().unwrap_or(Path::new(""));
+                let candidate = if stem == "mod" || stem == "lib" || stem == "main" {
+                    parent.join(format!("{name}.rs"))
+                } else {
+                    parent.join(stem).join(format!("{name}.rs"))
+                };
+                if candidate.is_file() {
+                    found.push(candidate);
+                }
+            }
+            cfg_test_pending = false;
+        }
+    }
 }
 
 /// The detector must actually detect. Without this, a matcher that silently
@@ -198,15 +279,22 @@ fn fixture_arming_reference_count(source: &str) -> usize {
         .count()
 }
 
-fn collect_fixture_arming_references(directory: &Path, offenders: &mut Vec<String>) {
+fn collect_fixture_arming_references(
+    directory: &Path,
+    test_only: &[std::path::PathBuf],
+    offenders: &mut Vec<String>,
+) {
     let entries = std::fs::read_dir(directory).expect("source directory must be readable");
     for entry in entries {
         let path = entry.expect("directory entry must be readable").path();
         if path.is_dir() {
-            collect_fixture_arming_references(&path, offenders);
+            collect_fixture_arming_references(&path, test_only, offenders);
             continue;
         }
         if path.extension().is_none_or(|extension| extension != "rs") {
+            continue;
+        }
+        if test_only.contains(&path) {
             continue;
         }
         let source = std::fs::read_to_string(&path).expect("source file must be readable");

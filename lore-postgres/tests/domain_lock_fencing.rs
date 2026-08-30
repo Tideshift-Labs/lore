@@ -1230,6 +1230,100 @@ async fn missing_and_repeated_release_are_not_found_and_empty_list_is_ok() {
     assert_eq!(empty_result.rejection, None);
 }
 
+/// The batched fenced Status path, at the batch size it exists for.
+///
+/// `status_many` replaced a per-resource loop that took one pool checkout per
+/// entry off the shared CR-029 domain pool (INV-EE P1-8). One query for the
+/// whole batch only pays off at N > 1, and only that size exercises the
+/// `unnest` join's ordering and duplicate semantics — the two things its
+/// contract actually promises.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn batched_status_orders_by_stored_key_and_repeats_a_duplicate_request() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.lock_coordinator();
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let lock_owner = owner("https://issuer.example", "status-batch");
+
+    // Sorted so the expected order is a property of the stored key rather than
+    // of whichever random hash happened to come out larger.
+    let mut hashes: [[u8; 32]; 2] = [rand::random(), rand::random()];
+    hashes.sort();
+    let [lower, higher] = hashes;
+    let absent: [u8; 32] = rand::random();
+    // Acquired HIGH first, so insertion order is the reverse of key order and
+    // the expected result below cannot be satisfied by insertion order alone.
+    for hash in [higher, lower] {
+        acquire_one(&store, &lock_owner, &repository_id, &branch_id, hash, None).await;
+    }
+
+    // Requested high-first, with `lower` twice and one resource that was never
+    // locked: the result must be key-ordered, must repeat the duplicate, and
+    // must simply omit the absent one.
+    let requested: Vec<(&[u8], &[u8])> = vec![
+        (&branch_id, &higher),
+        (&branch_id, &lower),
+        (&branch_id, &absent),
+        (&branch_id, &lower),
+    ];
+    let found = coordinator
+        .status_many(&repository_id, &requested)
+        .await
+        .expect("batched status");
+    assert_eq!(
+        found
+            .iter()
+            .map(|lock| lock.resource_hash.as_slice())
+            .collect::<Vec<_>>(),
+        vec![lower.as_slice(), lower.as_slice(), higher.as_slice()],
+        "the batch must be ordered by stored key, and a duplicate request must repeat"
+    );
+    assert!(found.iter().all(|lock| lock.owner == lock_owner));
+
+    // A resource on a branch of a different repository must not leak in.
+    let (other_repository, other_branch) = create_repository(&store).await;
+    let other_hash: [u8; 32] = rand::random();
+    acquire_one(
+        &store,
+        &lock_owner,
+        &other_repository,
+        &other_branch,
+        other_hash,
+        None,
+    )
+    .await;
+    let cross: Vec<(&[u8], &[u8])> = vec![(&other_branch, &other_hash)];
+    assert!(
+        coordinator
+            .status_many(&repository_id, &cross)
+            .await
+            .expect("cross-repository batched status")
+            .is_empty(),
+        "a batch is scoped to its repository, not to the branch alone"
+    );
+
+    // `status` is now a thin wrapper over the batch path.
+    assert_eq!(
+        coordinator
+            .status(&repository_id, &branch_id, &higher)
+            .await
+            .expect("single status")
+            .expect("the lock is current")
+            .resource_hash,
+        higher.to_vec()
+    );
+    assert!(
+        coordinator
+            .status(&repository_id, &branch_id, &absent)
+            .await
+            .expect("single status for an absent resource")
+            .is_none()
+    );
+}
+
 /// Absent SCHEMA-117 is a routing answer; half-present SCHEMA-117 is damage.
 ///
 /// A cell the migration never reached must boot on the legacy route (INV-EE
@@ -1292,6 +1386,30 @@ async fn an_absent_schema_routes_legacy_but_a_partial_one_is_refused() {
             Err(DomainError::NotReady(_))
         ),
         "a missing singleton schema-state row must be refused, not reported as unprovisioned"
+    );
+
+    // `lore_locks` is part of SCHEMA-117, not something the legacy plugin adds
+    // later, so a provisioned schema without it is damage too. Reading around
+    // it would count zero unfenced rows and prove headroom from the namespaces
+    // alone, arming a cell whose first lock read takes 42P01 (INV-EE R2-P2-1).
+    bare.lock_coordinator()
+        .bootstrap()
+        .await
+        .expect("reinstall SCHEMA-117 and its schema-state row");
+    bare.lock_coordinator()
+        .readiness()
+        .await
+        .expect("a fully installed schema must answer");
+    direct
+        .execute("DROP TABLE lore_locks CASCADE", &[])
+        .await
+        .expect("drop the lock table");
+    assert!(
+        matches!(
+            bare.lock_coordinator().readiness().await,
+            Err(DomainError::NotReady(_))
+        ),
+        "a provisioned schema missing lore_locks must be refused, never reported as ready"
     );
 }
 

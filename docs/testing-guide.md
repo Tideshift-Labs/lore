@@ -357,12 +357,18 @@ will update an older check constraint or state schema.
   materialization provisions the org row at revision/count 0 and atomically charges both. A
   capacity-revision rejection case must reread the seeded revision before submitting a mismatch.
 - **CR-030 lock fencing [SERVER, WP-117]**: `tests/run-lock-fencing-live.ps1` is the only evidence,
-  and its pinned inventory is the definition of what ran: 16 `domain_lock_fencing.rs` cases,
-  migration/runtime parity, both `domain_obliterate_fence.rs` cases (its push leg needs SCHEMA-117),
-  and eight `lore-server` library cases — the never-migrated boot regression, both CR-019 bypasses,
-  and the fenced owner-pair push set. Each gets a fresh database. A case outside that inventory is
-  NOT RUN however green a plain `cargo test` looks; that is exactly how INV-EE P1-3's broken
-  regression stayed unexecuted. Batch tests need distinct earlier-sorted keys plus a shared later
+  and its `$inventory` is the definition of what ran — read it there rather than from a count
+  written down here, which is how INV-EE P2-4 caught this entry restating a stale number inside its
+  own fix. It spans four targets: `domain_lock_fencing.rs`, migration/runtime parity,
+  `domain_obliterate_fence.rs` (whose push leg needs SCHEMA-117), and `lore-server` library cases
+  covering the never-migrated boot regression, both CR-019 bypasses, and the fenced owner-pair push
+  set. Each gets a fresh database, and `Assert-ExpectedCatalog` fails the run when the compiled
+  catalog and the inventory disagree — fully for the three `lore-postgres` targets, and for the
+  shared `lore-server` library only under the module prefixes this runner owns, so a case added
+  under a module it shares with another package (`grpc::handlers::branch_push::tests::`) is still
+  policed only if pinned by name. A case outside the inventory is NOT RUN however green a plain
+  `cargo test` looks; that is exactly how INV-EE P1-3's
+  broken regression stayed unexecuted. Batch tests need distinct earlier-sorted keys plus a shared later
   key (three rows expose a committed loser). Receipt-first tests block the repo row and expect
   SQLSTATE 55P03 from a receipt `FOR UPDATE NOWAIT`; lease tests hold the namespace lock past the
   lease, then require a full lease. Offline, `lore-server/tests/wp117_push_witness_wiring.rs` pins
