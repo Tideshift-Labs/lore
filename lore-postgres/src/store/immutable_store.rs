@@ -1412,4 +1412,37 @@ mod tests {
 
         assert!(error.is_internal(), "expected Internal, got {error:?}");
     }
+
+    /// CR-031/WP-118: the fragment lifecycle schema lives under
+    /// `domain/fragments/schema.rs`, migration-owned and mirrored into
+    /// `migrations/0001_init.sql`. It must never be added to this legacy
+    /// auto-bootstrap `SCHEMA` const, because that would make a legacy-only
+    /// cell (one that never runs the CR-031 migration, e.g. an old binary or a
+    /// deployment that intentionally stays on the pre-WP-118 lifecycle path)
+    /// silently start creating fragment-coordinator relations it has no
+    /// coordinator to read them with. A name collision here is a real defect,
+    /// not a naming coincidence -- every one of these tables/sequences is a
+    /// CR-031 contract name, not a word that could appear in this legacy
+    /// schema by accident.
+    #[test]
+    fn legacy_bootstrap_schema_does_not_contain_the_fragment_lifecycle_relations() {
+        const FRAGMENT_LIFECYCLE_RELATIONS: [&str; 7] = [
+            "lore_fragment_lifecycle",
+            "lore_fragment_epochs",
+            "lore_fragment_associations",
+            "lore_fragment_lifecycle_metering",
+            "lore_fragment_staged_leases",
+            "lore_fragment_schema_state",
+            "lore_fragment_fence_seq",
+        ];
+        for relation in FRAGMENT_LIFECYCLE_RELATIONS {
+            assert!(
+                !SCHEMA.contains(relation),
+                "the legacy immutable-store SCHEMA const must not create the \
+                 CR-031 fragment lifecycle relation {relation}; that DDL \
+                 belongs only to domain/fragments/schema.rs and \
+                 migrations/0001_init.sql"
+            );
+        }
+    }
 }

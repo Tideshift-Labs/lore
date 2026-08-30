@@ -339,9 +339,7 @@ will update an older check constraint or state schema.
   issuer even when the caller intends "same tenant," landing the second prepare in an empty quota
   namespace instead of the exhausted one (confirmed: both quota tests passed for the wrong reason —
   a fresh empty quota — until fixed with a `same_namespace_key(base, operation_id)` helper that copies
-  the identity fields and varies only `operation_id`). This file caught and confirmed two now-fixed
-  regressions: past-TTL PREPARED reads, differently-bound future markers, and concurrent duplicate
-  future prepares (the quota increment must be gated on marker rows-affected).
+  the identity fields and varies only `operation_id`).
   `domain_obliterate_fence.rs`
   covers `begin_obliterate`'s generation fence both ways (live advances by one; tombstoned refuses
   with `TOMBSTONED_V1`, generation unchanged) plus push-versus-obliterate agreement: `branch_push_commit`
@@ -475,6 +473,9 @@ will update an older check constraint or state schema.
   serialization and fragment walks.
 - Shared mock state must use `Arc`-backed counters/maps so the test and code-under-test observe the
   same clone.
+- A migration-owned schema block needs a legacy-non-inheritance pin: assert the sibling store's
+  older auto-bootstrap `SCHEMA` const never names the new relations, so an edit can't silently fold
+  new DDL into the legacy path. See `lore-postgres/store/immutable_store.rs` (CR-031/WP-118).
 
 ### Postgres parameter typing and retry classification
 
