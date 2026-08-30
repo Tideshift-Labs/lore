@@ -36,6 +36,8 @@ use lore_postgres::domain::DomainSchemaState;
 use lore_postgres::domain::bypass::DomainEnforcement;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
+use lore_postgres::domain::locks::LockFencingReadiness;
+use lore_postgres::domain::locks::PostgresLockCoordinator;
 use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::ReceiptKey;
 use tonic::Status;
@@ -119,12 +121,32 @@ impl GovernedScope<'_> {
 pub struct DomainContext {
     store: Arc<dyn DomainTransactionStore>,
     enforcement: bool,
+    lock_coordinator: Option<Arc<PostgresLockCoordinator>>,
 }
 
 impl DomainContext {
     /// Wrap an already-connected coordinator with its enforcement state.
     pub fn new(store: Arc<dyn DomainTransactionStore>, enforcement: bool) -> Self {
-        Self { store, enforcement }
+        Self {
+            store,
+            enforcement,
+            lock_coordinator: None,
+        }
+    }
+
+    /// Wrap a coordinator and the active fenced-lock authority. The latter is
+    /// present only after SCHEMA-117 cutover and all fail-closed readiness
+    /// checks have succeeded.
+    pub fn new_with_lock_coordinator(
+        store: Arc<dyn DomainTransactionStore>,
+        enforcement: bool,
+        lock_coordinator: Arc<PostgresLockCoordinator>,
+    ) -> Self {
+        Self {
+            store,
+            enforcement,
+            lock_coordinator: Some(lock_coordinator),
+        }
     }
 
     /// The coordinator itself.
@@ -136,6 +158,11 @@ impl DomainContext {
     /// residue classification, and cutover have all completed.
     pub fn enforcement_enabled(&self) -> bool {
         self.enforcement
+    }
+
+    /// Active fenced-lock coordinator, absent until SCHEMA-117 cutover.
+    pub fn lock_coordinator(&self) -> Option<&Arc<PostgresLockCoordinator>> {
+        self.lock_coordinator.as_ref()
     }
 
     /// Turn request metadata plus a target identity into a governed operation.
@@ -388,15 +415,93 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
         .await
         .map_err(|e| anyhow!("Failed to read the domain schema state: {e}"))?;
     let enforcement = resolve_enforcement(&state)?;
+    let lock_coordinator = store.lock_coordinator();
+    let lock_readiness = lock_coordinator
+        .readiness()
+        .await
+        .map_err(|e| anyhow!("Failed to read SCHEMA-117 lock-fencing readiness: {e}"))?;
+    let lock_fencing = resolve_lock_fencing(&lock_readiness, settings)?;
     let mutable_enforcement = DomainEnforcement::disabled();
     if enforcement {
         mutable_enforcement.enable();
     }
 
+    let context = if lock_fencing {
+        DomainContext::new_with_lock_coordinator(
+            Arc::new(store),
+            enforcement,
+            Arc::new(lock_coordinator),
+        )
+    } else {
+        DomainContext::new(Arc::new(store), enforcement)
+    };
     Ok(ConfiguredDomainContext {
-        context: Some(Arc::new(DomainContext::new(Arc::new(store), enforcement))),
+        context: Some(Arc::new(context)),
         mutable_enforcement: Some(mutable_enforcement),
     })
+}
+
+fn resolve_lock_fencing(readiness: &LockFencingReadiness, settings: &Settings) -> Result<bool> {
+    if !readiness.fencing_enabled {
+        info!(
+            schema_version = readiness.schema_version,
+            backfill_state = readiness.backfill_state,
+            "Fenced lock routing is off; the public lock service remains on its legacy store"
+        );
+        return Ok(false);
+    }
+
+    let auth = settings.server.auth.as_ref().ok_or_else(|| {
+        anyhow!("Lock fencing is enabled but JWT authentication is not configured")
+    })?;
+    if auth.jwk.is_none() {
+        return Err(anyhow!(
+            "Lock fencing is enabled but no JWK verifier is configured"
+        ));
+    }
+    if auth.jwt_issuer.as_deref().is_none_or(str::is_empty) {
+        return Err(anyhow!(
+            "Lock fencing is enabled but no non-empty JWT issuer policy is configured"
+        ));
+    }
+    if !auth.enforce_write_permission {
+        return Err(anyhow!(
+            "Lock fencing is enabled but enforce_write_permission is false"
+        ));
+    }
+    if settings
+        .lock_store
+        .as_ref()
+        .is_none_or(|lock_store| lock_store.mode != POSTGRES_MODE)
+    {
+        return Err(anyhow!(
+            "Lock fencing is enabled but the configured lock store is not Postgres"
+        ));
+    }
+    if readiness.schema_version != lore_postgres::domain::locks::schema::LOCK_SCHEMA_VERSION
+        || readiness.backfill_state != lore_postgres::domain::locks::schema::BACKFILL_COMPLETE
+        || !readiness.same_database
+        || !readiness.sequence_headroom
+        || readiness.quarantined_rows != 0
+    {
+        return Err(anyhow!(
+            "Lock fencing is enabled without complete SCHEMA-117 evidence \
+             (schema_version={}, backfill_state={}, same_database={}, sequence_headroom={}, \
+              quarantined_rows={})",
+            readiness.schema_version,
+            readiness.backfill_state,
+            readiness.same_database,
+            readiness.sequence_headroom,
+            readiness.quarantined_rows
+        ));
+    }
+    if readiness.lease_enabled {
+        return Err(anyhow!(
+            "Finite lock leases are enabled before token-capable public clients are available"
+        ));
+    }
+    info!("Fenced lock coordinator is active");
+    Ok(true)
 }
 
 /// Decide whether this cell may enforce, refusing readiness rather than
@@ -508,6 +613,15 @@ pub(crate) mod test_support {
         let store = PostgresDomainStore::connect(&url, 2, &TlsConfig::default())
             .await
             .expect("bootstrap disposable domain schema");
+        let lock_coordinator = store.lock_coordinator();
+        lock_coordinator
+            .bootstrap()
+            .await
+            .expect("install SCHEMA-117 in the disposable fixture");
+        lock_coordinator
+            .backfill(&Default::default())
+            .await
+            .expect("complete the empty disposable lock backfill");
         let _mutable_store = PostgresMutableStore::connect(&url, 2, &TlsConfig::default())
             .await
             .expect("bootstrap disposable mutable projection schema");
@@ -685,6 +799,8 @@ mod tests {
 
     use lore_postgres::domain::schema::BACKFILL_CUTOVER;
     use lore_postgres::domain::schema::BACKFILL_NOT_STARTED;
+    use crate::auth::jwk::JWKServiceSettings;
+    use crate::settings::AuthSettings;
     use tonic::Code;
     use tonic::metadata::BinaryMetadataValue;
     use uuid::Uuid;
@@ -1044,5 +1160,105 @@ mod tests {
         let enforcement = resolve_enforcement(&state).expect("a ready cell must enforce");
 
         assert!(enforcement);
+    }
+
+    fn lock_ready() -> LockFencingReadiness {
+        LockFencingReadiness {
+            schema_version: lore_postgres::domain::locks::schema::LOCK_SCHEMA_VERSION,
+            backfill_state: lore_postgres::domain::locks::schema::BACKFILL_COMPLETE,
+            fencing_enabled: true,
+            lease_enabled: false,
+            same_database: true,
+            sequence_headroom: true,
+            quarantined_rows: 0,
+        }
+    }
+
+    fn fenced_settings() -> Settings {
+        let mut settings: Settings = toml::from_str(include_str!("../config/default.toml"))
+            .expect("built-in settings fixture must deserialize");
+        settings
+            .lock_store
+            .as_mut()
+            .expect("default lock store")
+            .mode = POSTGRES_MODE.to_owned();
+        settings.server.auth = Some(AuthSettings {
+            jwk: Some(JWKServiceSettings {
+                endpoint: "https://issuer.example/.well-known/jwks.json".to_owned(),
+            }),
+            jwt_audience: None,
+            jwt_issuer: Some("https://issuer.example".to_owned()),
+            enforce_write_permission: true,
+        });
+        settings
+    }
+
+    #[test]
+    fn lock_fencing_off_keeps_the_legacy_route_without_auth_requirements() {
+        let mut readiness = lock_ready();
+        readiness.fencing_enabled = false;
+        let settings: Settings = toml::from_str(include_str!("../config/default.toml"))
+            .expect("built-in settings fixture must deserialize");
+        assert!(!resolve_lock_fencing(&readiness, &settings).expect("disabled route"));
+    }
+
+    #[test]
+    fn lock_fencing_requires_auth_issuer_write_permission_and_postgres_routing() {
+        let readiness = lock_ready();
+
+        let mut no_auth = fenced_settings();
+        no_auth.server.auth = None;
+        assert!(resolve_lock_fencing(&readiness, &no_auth).is_err());
+
+        let mut no_jwk = fenced_settings();
+        no_jwk.server.auth.as_mut().expect("auth").jwk = None;
+        assert!(resolve_lock_fencing(&readiness, &no_jwk).is_err());
+
+        let mut no_issuer = fenced_settings();
+        no_issuer.server.auth.as_mut().expect("auth").jwt_issuer = None;
+        assert!(resolve_lock_fencing(&readiness, &no_issuer).is_err());
+
+        let mut no_write_enforcement = fenced_settings();
+        no_write_enforcement
+            .server
+            .auth
+            .as_mut()
+            .expect("auth")
+            .enforce_write_permission = false;
+        assert!(resolve_lock_fencing(&readiness, &no_write_enforcement).is_err());
+
+        let mut wrong_store = fenced_settings();
+        wrong_store.lock_store.as_mut().expect("lock store").mode = "local".to_owned();
+        assert!(resolve_lock_fencing(&readiness, &wrong_store).is_err());
+    }
+
+    #[test]
+    fn lock_fencing_requires_every_database_backfill_and_cutover_witness() {
+        let settings = fenced_settings();
+        assert!(resolve_lock_fencing(&lock_ready(), &settings).expect("complete evidence"));
+
+        let mut cases = Vec::new();
+        let mut schema = lock_ready();
+        schema.schema_version += 1;
+        cases.push(schema);
+        let mut backfill = lock_ready();
+        backfill.backfill_state = lore_postgres::domain::locks::schema::BACKFILL_RUNNING;
+        cases.push(backfill);
+        let mut database = lock_ready();
+        database.same_database = false;
+        cases.push(database);
+        let mut sequence = lock_ready();
+        sequence.sequence_headroom = false;
+        cases.push(sequence);
+        let mut quarantine = lock_ready();
+        quarantine.quarantined_rows = 1;
+        cases.push(quarantine);
+        let mut lease = lock_ready();
+        lease.lease_enabled = true;
+        cases.push(lease);
+
+        for readiness in cases {
+            assert!(resolve_lock_fencing(&readiness, &settings).is_err());
+        }
     }
 }

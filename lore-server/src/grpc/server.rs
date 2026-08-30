@@ -693,13 +693,21 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         let lock_svc = match self.0.lock_store {
             Some(lock_store) => {
                 info!("Enabling LockService");
-                Some(LoreLockService::new(
-                    lock_store.clone(),
-                    self.0.notification_sender.clone(),
-                    self.0.hook_dispatcher.clone(),
-                    rpc_timeout,
-                    enforce_write_permission,
-                ))
+                let fenced_coordinator = self
+                    .0
+                    .domain_context
+                    .as_ref()
+                    .and_then(|domain| domain.lock_coordinator().cloned());
+                Some(
+                    LoreLockService::new(
+                        lock_store.clone(),
+                        self.0.notification_sender.clone(),
+                        self.0.hook_dispatcher.clone(),
+                        rpc_timeout,
+                        enforce_write_permission,
+                    )
+                    .with_fenced_coordinator(fenced_coordinator),
+                )
             }
             None => None,
         };

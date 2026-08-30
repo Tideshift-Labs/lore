@@ -6,6 +6,9 @@ use std::time::Duration;
 use lore_base::error::InvalidArguments;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::LockResource;
+use lore_postgres::domain::locks::FencedLock;
+use lore_postgres::domain::locks::PostgresLockCoordinator;
+use lore_postgres::domain::locks::VerifiedLockOwner;
 use lore_proto::LockService;
 use lore_proto::lock::AdminLockRequest;
 use lore_proto::lock::AdminLockResponse;
@@ -31,6 +34,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::extract_correlation_id;
+use super::get_authorization;
 use super::get_repository;
 use super::get_user_id;
 use super::is_owner_or_admin;
@@ -100,6 +104,7 @@ pub struct LoreLockService {
     hook_dispatcher: Arc<HookDispatcher>,
     rpc_timeout: Duration,
     enforce_write_permission: bool,
+    fenced_coordinator: Option<Arc<PostgresLockCoordinator>>,
 
     instrument_provider: LoreLockServiceInstrumentProvider,
     locking_histogram: Histogram<u64>,
@@ -122,6 +127,7 @@ impl LoreLockService {
             hook_dispatcher,
             rpc_timeout,
             enforce_write_permission,
+            fenced_coordinator: None,
             locking_histogram: instrument_provider.length_histogram(
                 "locking.request.resources.length",
                 vec![1., 5., 10., 25., 50., 75., 100., 200.],
@@ -136,6 +142,44 @@ impl LoreLockService {
             instrument_provider,
         }
     }
+
+    /// Route read operations through the active fenced authority. Public
+    /// token-bearing mutations remain dark until WP-120 adds their wire shape.
+    pub fn with_fenced_coordinator(
+        mut self,
+        coordinator: Option<Arc<PostgresLockCoordinator>>,
+    ) -> Self {
+        self.fenced_coordinator = coordinator;
+        self
+    }
+}
+
+fn fenced_lock_to_wire(lock: FencedLock) -> Result<lore_proto::lock::Lock, Status> {
+    let elapsed = lock
+        .acquired_at
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_err(|_| Status::internal("Stored lock timestamp predates the Unix epoch"))?;
+    let seconds = i64::try_from(elapsed.as_secs())
+        .map_err(|_| Status::internal("Stored lock timestamp exceeds the wire range"))?;
+    Ok(lore_proto::lock::Lock {
+        resource: Some(lore_proto::lock::Resource {
+            branch: lock.branch_id.into(),
+            hash: lock.resource_hash.into(),
+            description: lock.description,
+        }),
+        owner: lock.owner.authenticated_subject,
+        locked_at: Some(prost_types::Timestamp {
+            seconds,
+            nanos: i32::try_from(elapsed.subsec_nanos())
+                .map_err(|_| Status::internal("Stored lock nanoseconds exceed the wire range"))?,
+        }),
+    })
+}
+
+fn fenced_public_mutation_unavailable() -> Status {
+    Status::failed_precondition(
+        "Fenced lock mutations require the token-bearing public contract from WP-120",
+    )
 }
 
 impl InstrumentProvider for LoreLockServiceInstrumentProvider {
@@ -244,6 +288,10 @@ impl LoreLockService {
             return Ok(Response::new(LockResponse { locks: vec![] }));
         }
 
+        if self.fenced_coordinator.is_some() {
+            return Err(fenced_public_mutation_unavailable());
+        }
+
         let resources = lock_request.resources;
 
         let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
@@ -269,6 +317,30 @@ impl LoreLockService {
         let query =
             lock_query_from_request(repository, query_request).map_err(handle_lock_error)?;
 
+        if let Some(coordinator) = &self.fenced_coordinator {
+            let authorization = get_authorization(request.extensions())?;
+            let owner = query_request
+                .owner
+                .as_ref()
+                .map(|subject| VerifiedLockOwner {
+                    verified_issuer: authorization.issuer.clone(),
+                    authenticated_subject: subject.clone(),
+                });
+            let locks = coordinator
+                .query_filtered(
+                    repository.as_ref(),
+                    query_request.branch.as_deref(),
+                    owner.as_ref(),
+                    query_request.description.as_deref(),
+                )
+                .await
+                .map_err(|error| super::map_domain_error_to_status(&error))?
+                .into_iter()
+                .map(fenced_lock_to_wire)
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(Response::new(QueryResponse { result: locks }));
+        }
+
         let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
 
         LORE_CONTEXT
@@ -293,6 +365,11 @@ impl LoreLockService {
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
+        let fenced_authorization = if self.fenced_coordinator.is_some() {
+            Some(get_authorization(request.extensions())?)
+        } else {
+            None
+        };
         let status_request = request.into_inner();
 
         if status_request.resources.len() > STATUS_MAX_RESOURCE_LEN {
@@ -308,6 +385,26 @@ impl LoreLockService {
 
         if status_request.resources.is_empty() {
             return Ok(Response::new(StatusResponse { locks: vec![] }));
+        }
+
+        if let Some(coordinator) = &self.fenced_coordinator {
+            let _authorization = fenced_authorization
+                .ok_or_else(|| Status::unauthenticated("Missing authorization"))?;
+            let mut locks = Vec::new();
+            for resource in &status_request.resources {
+                if let Some(lock) = coordinator
+                    .status(
+                        repository.as_ref(),
+                        resource.branch.as_ref(),
+                        resource.hash.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| super::map_domain_error_to_status(&error))?
+                {
+                    locks.push(fenced_lock_to_wire(lock)?);
+                }
+            }
+            return Ok(Response::new(StatusResponse { locks }));
         }
 
         info!(
@@ -357,6 +454,10 @@ impl LoreLockService {
 
         if unlock_request.resources.is_empty() {
             return Ok(Response::new(UnlockResponse { resources: vec![] }));
+        }
+
+        if self.fenced_coordinator.is_some() {
+            return Err(fenced_public_mutation_unavailable());
         }
 
         let resources: Vec<LockResource> =
@@ -432,6 +533,10 @@ impl LoreLockService {
                 if !can_admin_lock(&extensions, repository) {
                     warn!("Attempt to apply admin locks, but user does not have the correct permissions");
                     return Err(Status::permission_denied("Permission denied"));
+                }
+
+                if self.fenced_coordinator.is_some() {
+                    return Err(fenced_public_mutation_unavailable());
                 }
 
                 self.lock_as_user(repository, resources, &owner, &correlation_id)
