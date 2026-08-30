@@ -533,6 +533,48 @@ will update an older check constraint or state schema.
   `lore-postgres/tests/run-domain-maintenance-live.ps1`. The TLS retention proxy additionally pins
   the fixture CA and maintenance CN. Serialize direct runs with a database advisory-lock lease.
 
+### A fanout helper reusing the caller's `LockSequence` must lock earlier classes before the caller's own lock, not after
+
+Symptom: every real-data case of a multi-repository generation bump (CR-031's
+`fragment_lifecycle_generation` fanout) returns `DomainError::Internal` ("lock
+order violation"); every offline/unit case stayed green because each used a
+fragment with zero associations, where the fanout loop is a no-op. Cause: the
+helper entered `LockClass::Repository` from inside a transaction whose caller
+had already entered a later class (`Fragments`) for its own head lock —
+`LockSequence::enter` rejects the downward move. What to do: plan the fanout
+(an unlocked, bounded SELECT) before taking any lock in a class later than the
+fanout's own; lock the fanout's rows first; take the caller's own later-class
+lock; then re-verify the fanout did not grow under that lock, returning
+retryable `Contention` if it did. Write at least one live case with a
+non-empty fanout — this bug class is invisible to any case whose association
+set is empty. `lore-postgres/tests/domain_fragment_lifecycle.rs`'s
+`a_readable_to_unreadable_transition_bumps_every_live_associated_repository_atomically`
+is that case.
+
+### A catalog-parity test's "only in X" / "only in Y" printed blocks can be byte-identical — the diff format itself is then lying about what differs
+
+`domain_migration_parity.rs`'s `migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs`
+fails at the plain baseline (`b5a0877`, no CR-031 present, reproduced in a
+clean detached worktree) over five SCHEMA-117 lock-trigger functions
+(`lore_domain_repository_lock_generation_*`,
+`lore_domain_branch_lock_generation_*`,
+`lore_domain_branch_lock_namespace_after_insert`) that print as identical text
+on both sides of the diff — confirmed by MD5 over both printed blocks. **Do
+not conclude a text/whitespace mismatch (e.g. CRLF from a missing `eol=lf`
+`.gitattributes` rule) from a diff shaped like this without hashing both
+sides**; a first pass here mistook line-ending conversion of
+`migrations/0001_init.sql` (real on this Windows checkout, confirmed with
+`file`) for the cause, but MD5-identical blocks rule out a per-line text
+difference — the mismatch is in something the `.filter(|l| !other.contains(l))`
+set-difference can surface without the printed lines themselves differing
+(duplicate/count divergence, not content). Root cause not yet found as of
+this note; pre-existing, unrelated to CR-031/SCHEMA-118 (independently
+verified: applying `FRAGMENT_SCHEMA` and its migration block to separate
+databases and comparing every `lore_fragment_*` relation plus
+`lore_domain_repositories`'s two added columns showed zero differences). Owned
+by WP-116/WP-117, not fixed here. If you hit this test failing, do not chase
+it as a WP-118 regression.
+
 ### Poisoning a persisted `State`/`Tree` field for a fault-injection test
 
 `State::set_delta_block(hash, count)` is `pub` and the cheapest lever to make a *persisted*
