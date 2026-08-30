@@ -189,6 +189,22 @@ will update an older check constraint or state schema.
   leave the labelled container up for debugging). All nine tests stay `#[ignore]`; the harness
   opts them in explicitly with `--ignored --exact <name>`, it does not un-ignore them, so the
   crate's baseline `cargo test -p lore-object-dispatch` ignored count (13) is unchanged by this.
+  CD-1's out-of-band installer/attester itself (`lore-object-dispatch/src/cell_schema_install.rs`
+  plus `src/bin/cell-schema-install.rs`, a one-shot operator CLI, not a service) has its own
+  offline-only suite, `tests/cell_schema_install.rs` — no Postgres, no `#[ignore]`. It re-reads
+  `migrations/*.sql` from disk independently of the module's own `include_str!` copies (so a
+  frozen-bytes claim is checked against ground truth, not against itself), and pins: the exact
+  13-migration install set against the on-disk directory (a future migration must be classified
+  installed-or-deferred or the test fails); the interleaved 16-step install plan; each schema
+  layer's install/read_state function names, revisions, and digest against the migration that
+  creates them; the 3-entry `CREATE OR REPLACE FUNCTION` replacement inventory across 0012-0017
+  (scanned by text, not hand-enumerated, so an unpinned replace/one dropped from the pinned list
+  both fail); and a `local_authority_put_reservation_provisioning.rs`-style "runtime source never
+  calls the install entrypoints" guard extended to the new bin target. Gate:
+  `cargo test -p lore-object-dispatch --test cell_schema_install`. One test
+  (`cell_schema_error_is_a_standard_redacted_error_type`) is a type-level stub pending the real
+  `CellSchemaError` variant list, which the module's pinned contract deliberately left open —
+  fill in the per-variant `format!("{e}")`/`{e:?}` redaction assertions once the enum lands.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.
@@ -549,66 +565,35 @@ retryable `Contention` if it did. Write at least one live case with a
 non-empty fanout — this bug class is invisible to any case whose association
 set is empty. `lore-postgres/tests/domain_fragment_lifecycle.rs`'s
 `a_readable_to_unreadable_transition_bumps_every_live_associated_repository_atomically`
-is that case.
+is that case. The same file proves a *pre-lock* refusal structurally too: call
+`sequence.enter(LockClass::Repository)` right after a call that should refuse
+before ever entering the later `Fragments` class — success proves Fragments
+was never entered, since `enter` rejects exactly that downward re-entry
+(`revalidate_push_witness_refuses_over_the_revalidation_limit_before_locking_any_fragment_row`).
+For a method borrowing the caller's `Transaction<'_>` instead of owning one
+(`revalidate_push_witness`), build an independent connection with
+`lore_postgres::pool::build_pool(url, pool_max, &TlsConfig::default())` --
+`deadpool-postgres` is a normal (non-dev) dependency, so `deadpool_postgres`
+is `use`-able from `tests/*.rs` the same way `tokio_postgres` already is here.
 
 ### Never hash two blocks of program output to rule out a whitespace difference — the pipeline you hashed through may have removed it
 
-**RESOLVED 2026-08-30 (Lore `6dfcd32`). The cause was exactly the line-ending
-mismatch an earlier revision of this section argued against.** The reasoning
-error is worth more than the bug.
-
-`domain_migration_parity.rs`'s `migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs`
-failed over five SCHEMA-117 lock-trigger functions
-(`lore_domain_repository_lock_generation_*`,
-`lore_domain_branch_lock_generation_*`,
-`lore_domain_branch_lock_namespace_after_insert`) that printed as identical
-text on both sides of its diff.
-
-**Second correction, same section: it was not pre-existing, and a worktree
-reproduction cannot show that it was.** `core.autocrlf=true` means a *checkout*
-produces CRLF for a path with no `eol=lf` rule — but the last writer of
-`0001_init.sql` had been an agent Write/Edit (LF), and Git normalises on
-comparison, so `git status` stayed clean and the gate stayed green. INV-EE's
-`run-lock-fencing-live.ps1` 29/29 at `b5a0877` was sound. WP-118's
-migration-mirror step then armed it, by appending with Python's
-`read_text`/`write_text` pair, which rewrites the whole file through
-`os.linesep` (verified: 0 CRs before, 4 after, on a three-line LF fixture).
-Running the case at `b5a0877` in a fresh `git worktree` then "reproduced" the
-failure — but `git worktree add` is a checkout, so it manufactured the very
-condition under test. **A reproduction at an older SHA proves nothing if
-reaching that SHA required a checkout and the checkout introduces the
-condition.** Never rewrite a whole file to append to it; open with `newline=""`
-or use an editor tool.
-
-The real cause: `.gitattributes` pinned `lore-object-dispatch/migrations/*.sql`
-to `eol=lf` but nothing for `lore-postgres/migrations/`, so `0001_init.sql`
-checked out CRLF while the Rust DDL string literals stayed LF. A migration's
-bytes reach PostgreSQL verbatim and PL/pgSQL bodies are stored as text, so
-every trigger installed from the file carried carriage returns the same DDL
-declared as a Rust const did not. **Only function and trigger bodies expose
-this** — tables, columns, constraints, and indexes are parsed and normalised by
-the server — which is why exactly the five trigger functions differed and every
-other object matched, and why a migration declaring no functions can be CRLF
-for years and look fine.
-
-**The trap.** An earlier pass took MD5 over both printed blocks, found them
-identical, and concluded a per-line text difference was ruled out — so it
-explicitly steered the next reader away from CRLF. But the hash was taken
-*downstream* of a pipeline (cargo's captured output, a redirect, `sed` line
-extraction under MSYS) that had already normalised the carriage returns away.
-Hashing proved the blocks were equal **after normalisation**, which says nothing
-about the values the test actually compared. A whitespace difference is the one
-class of difference that output-and-hash cannot see, so it is the one class you
-must never rule out that way.
-
-**What to do instead.** Ask the authority directly, in the value's own storage,
-with a query that cannot normalise: here,
-`SELECT proname, position(chr(13) in prosrc) FROM pg_proc WHERE ...` returned
-`1` for all five functions in one line. `file <path>` on the inputs is the
-cheap prior check, and a `text eol=lf` rule for every `migrations/*.sql` path is
-the fix. Generalised: when two things that should be byte-identical are reported
-different but print the same, compare them where they live, never where they
-were rendered.
+Symptom: `domain_migration_parity.rs`'s catalog-parity test failed over five SCHEMA-117
+lock-trigger functions that printed as textually identical on both sides of the diff. Cause:
+`.gitattributes` pinned `eol=lf` for `lore-object-dispatch/migrations/*.sql` but not
+`lore-postgres/migrations/`, so `0001_init.sql` checked out CRLF while the matching Rust DDL
+string literal stayed LF. Only function/trigger bodies expose this — tables, columns,
+constraints, and indexes are parsed and normalised by the server — so a migration declaring no
+functions can be CRLF for years and look fine. The trap: an earlier pass MD5'd both printed
+blocks, found them equal, and wrongly ruled out a text difference; the hash was taken
+*downstream* of a pipeline (captured output, a redirect, `sed` under MSYS) that had already
+normalised the CRs away. Whitespace is the one difference class output-and-hash cannot see. What
+to do: query the value's own storage directly, with a query that cannot normalise (here,
+`SELECT proname, position(chr(13) in prosrc) FROM pg_proc WHERE ...` returned `1` for all five
+functions), or `file <path>` on the inputs; add a `text eol=lf` rule for every `migrations/*.sql`
+path. Compare things where they live, never where they were rendered. A `git worktree add`
+reproduction is itself a checkout and can manufacture the very CRLF condition under test — it is
+not independent confirmation that a failure pre-existed.
 
 ### Poisoning a persisted `State`/`Tree` field for a fault-injection test
 
@@ -745,53 +730,45 @@ current-thread/one-worker runs and event or stage-end counts do not prove topolo
 ### PowerShell live-test runner scripts (Windows)
 
 - Symptom: `cargo test ... -- --ignored --exact <name>` reports `0 tests` / `N filtered out` even
-  though the name is correct and the binary target builds. Cause: building the trailing argument
-  list as a bare comma-separated list after a backtick line continuation (`` & cmd -- ` ``\n
-  `'--ignored', '--exact', $name`) makes PowerShell construct one array *value* that gets
-  stringified into a single argv token, not several separate arguments -- the native process sees
-  one blob it doesn't recognize as `--ignored`, silently filters everything out, and still exits
-  0. What to do: build the full argument list as its own named array (`$cargoArgs = @('test',
-  '-p', ..., '--', '--ignored', '--exact', $name)`) and invoke via splatting (`& cargo
-  @cargoArgs`) -- confirmed broken with the bare comma form and fixed by splatting, both against
-  the same `cargo test` invocation. Never trust a runner script's "N NOT RUN" report as evidence
-  the tests don't exist without first confirming an intentionally-broken filter reproduces the
-  same "0 tests" shape -- that confirms the parser path is actually reachable and not silently
-  vacuous itself.
+  though the name is correct and the target builds. Cause: a bare comma-separated argument list
+  after a backtick line continuation (`` & cmd -- ` ``\n`'--ignored', '--exact', $name`) becomes one
+  stringified array *value*, not separate argv tokens -- the native process sees one unrecognized
+  blob, silently filters everything out, and still exits 0. Fix: build the list as its own named
+  array (`$cargoArgs = @('test', '-p', ..., '--', '--ignored', '--exact', $name)`) and invoke via
+  splatting (`& cargo @cargoArgs`). Never trust a runner's "N NOT RUN" as evidence the tests don't
+  exist without first confirming an intentionally-broken filter reproduces the same "0 tests" shape
+  -- that proves the parser path is reachable, not vacuous.
 - `Format-Table -AutoSize | Out-String | Write-Host` truncates columns to the host's reported
   console width, which a non-interactive/redirected `pwsh -File` invocation can report as
   narrower than an interactive terminal -- a results table can silently drop its rightmost
   columns (status/pass/fail counts) with no error. Pin a width: `Out-String -Width 200`.
-- A trailing `+` at end-of-line only continues an *expression* (`$x = "a" +`\n`"b"`). A cmdlet
-  invoked in command syntax (`Write-Host "a" +`\n`"b"`, `throw "a" +`\n`"b"`) parses `+` and the
-  following string as two more positional arguments, not concatenation -- the literal `+`
-  character and a line break land in the output. Confirmed: a multi-line `Write-Host`/`throw`
-  message built this way printed a bare ` +` mid-sentence with the message split across lines.
-  Fix by assigning the concatenation to a variable first (`$message = "a" +`\n`"b"`, which *is*
-  expression context) and passing that variable to the cmdlet, not by trying to keep `+` at
-  end-of-line inside the command call itself.
+- A trailing `+` at end-of-line only continues an *expression* (`$x = "a" +`\n`"b"`). A cmdlet in
+  command syntax (`Write-Host "a" +`\n`"b"`, `throw "a" +`\n`"b"`) parses `+` and the following
+  string as two more positional arguments, not concatenation -- confirmed: the literal `+` and a
+  line break land mid-message in the output. Fix: assign the concatenation to a variable first
+  (`$message = "a" +`\n`"b"`, which *is* expression context) and pass that variable to the cmdlet.
 - Cross-check a runner's hardcoded live-test name/target map against ground truth before trusting
   it: `cargo test -p <crate> -- --ignored --list` needs no infrastructure and enumerates every
-  `<name>: test` line under each `Running tests\<target>.rs` header. Diff both directions --
-  every hardcoded entry must appear in the list (catches a rename), and every list entry in the
-  live family must appear in the hardcoded map (catches an unnoticed new live test) -- and treat
-  either direction failing as a hard error, not a warning. A `#[cfg(target_os = "linux")]`-gated
-  test does not appear in this list at all on a non-Linux rig; it is unenumerable, not merely
-  filtered, so a runner cannot detect or report it from this catalog and must instead name it as
-  NOT RUN from static source knowledge in its own documentation/output.
+  `<name>: test` line under each `Running tests\<target>.rs` header. Diff both directions -- every
+  hardcoded entry must appear in the list (catches a rename), and every list entry must appear in
+  the hardcoded map (catches an unnoticed new live test) -- treat either direction failing as a
+  hard error, not a warning. A `#[cfg(target_os = "linux")]`-gated test is unenumerable (not merely
+  filtered) on a non-Linux rig, so a runner must name it NOT RUN from static source knowledge, not
+  from this catalog.
 - Piping a long-running provisioning script through `head` (or any early-closing consumer, e.g.
-  `... | tee log | head -5`) can `SIGPIPE` it mid-run without actually killing the underlying
-  process tree -- the foreground shell call returns once the truncating consumer exits, but a
-  detached child (here, the `pwsh.exe` driving Docker) can keep running unobserved, still holding
-  a labelled container open. Redirect to a file and read the file after the process exits instead
-  of piping through a line-limiting consumer.
+  `... | tee log | head -5`) can `SIGPIPE` it mid-run without killing the underlying process tree --
+  the foreground shell call returns once the truncating consumer exits, but a detached child (here,
+  the `pwsh.exe` driving Docker) can keep running unobserved, still holding a labelled container
+  open. Redirect to a file and read it after the process exits instead of piping through a
+  line-limiting consumer.
 - A container label that merely restates the container's own name (e.g. a `run-id` label derived
-  from the same GUID embedded in the name) proves only self-consistency, not ownership -- it is
-  true for *any* correctly running instance of the script, not just the one you happen to be
-  looking at. A label-filtered `docker ps` listing tells you a labelled container exists, never
-  that it is yours or that whatever created it has exited. Before removing a container you did not
-  just create in the current process, get an independent ownership signal (e.g. an owning-pid
-  label written at creation time) and confirm that pid is actually dead -- do not infer ownership
-  from "I just ran something and there's a matching container now."
+  from the same GUID embedded in the name) proves only self-consistency, not ownership -- true for
+  *any* correctly running instance of the script, not just the one you happen to be looking at. A
+  label-filtered `docker ps` listing never tells you the container is yours or that its creator has
+  exited. Before removing a container you did not just create in the current process, get an
+  independent ownership signal (e.g. an owning-pid label written at creation time) and confirm that
+  pid is dead -- do not infer ownership from "I just ran something and there's a matching container
+  now."
 
 ### Known tier limitations
 

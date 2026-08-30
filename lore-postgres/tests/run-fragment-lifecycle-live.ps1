@@ -69,7 +69,19 @@ $inventory = @(
             'a_repair_on_a_missing_fragment_with_a_live_association_bumps_its_repository_fanout',
             'an_obliterate_on_a_readable_fragment_with_a_live_association_bumps_its_repository_fanout',
             'readiness_reports_zero_unresolved_rows_for_a_preparing_head_and_a_missing_head',
-            'a_promotion_round_trip_allocates_a_new_epoch_and_publishes_under_remote_authority'
+            'a_promotion_round_trip_allocates_a_new_epoch_and_publishes_under_remote_authority',
+            # INV-EF P1-2/P1-3: the six previously-untested public entry points.
+            'revalidate_push_witness_reports_unchanged_when_neither_scalar_moved',
+            'revalidate_push_witness_is_satisfied_by_the_fallback_when_the_lifecycle_scalar_moved_and_required_fragments_are_still_readable',
+            'revalidate_push_witness_aborts_when_a_required_fragment_is_no_longer_readable',
+            'revalidate_push_witness_aborts_when_a_required_fragments_epoch_advanced',
+            'revalidate_push_witness_refuses_over_the_revalidation_limit_before_locking_any_fragment_row',
+            'acquire_staged_leases_and_release_round_trip_a_batch_with_a_monotonic_reader_fence',
+            'commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tombstones_the_head',
+            'commit_obliterate_fences_a_stale_intent_and_mutates_nothing',
+            'enable_lifecycle_refuses_on_a_not_ready_cell_and_succeeds_once_ready',
+            'abandon_promotion_leaves_the_head_staged_and_readable_and_moves_no_repository_lifecycle_generation',
+            'a_successful_repair_quarantines_the_predecessor_epoch_and_marks_the_successor_current_eligible'
         )
     },
     [pscustomobject]@{

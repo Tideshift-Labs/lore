@@ -31,13 +31,22 @@ use lore_postgres::domain::fragments::FragmentManifest;
 use lore_postgres::domain::fragments::FragmentResolution;
 use lore_postgres::domain::fragments::FragmentVerdict;
 use lore_postgres::domain::fragments::IoObservation;
+use lore_postgres::domain::fragments::MAX_PUSH_FRAGMENT_REVALIDATIONS;
 use lore_postgres::domain::fragments::MissingDiagnostic;
 use lore_postgres::domain::fragments::PostgresFragmentCoordinator;
+use lore_postgres::domain::fragments::PushWitnessVerdict;
+use lore_postgres::domain::fragments::REQUIRED_FRAGMENT_CHANGED;
+use lore_postgres::domain::fragments::REQUIRED_FRAGMENT_REVALIDATION_LIMIT;
+use lore_postgres::domain::fragments::RequiredFragment;
+use lore_postgres::domain::fragments::schema;
 use lore_postgres::domain::fragments::states::FragmentLifecycleState;
+use lore_postgres::domain::lock_order::LockClass;
+use lore_postgres::domain::lock_order::LockSequence;
 use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptKey;
 use lore_postgres::pool::TlsConfig;
+use lore_postgres::pool::build_pool;
 use tokio::time::timeout;
 use tokio_postgres::Client;
 use uuid::NoContext;
@@ -1480,5 +1489,1115 @@ async fn an_absent_fragment_schema_routes_legacy_but_a_partial_one_is_refused() 
         ),
         "a provisioned schema missing its repository generation columns must be refused, \
          never reported as ready"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// INV-EF P1-2 / P1-3: six previously-untested public entry points, all
+// closable inside Phases 2-3.
+// ---------------------------------------------------------------------------
+
+/// Open a caller-owned transaction on a fresh connection pool. This coordinator
+/// deliberately does not expose its own pool, and `revalidate_push_witness` is
+/// the one method that borrows the caller's `Transaction` rather than owning
+/// one -- a real push transaction supplies it, so a test does too.
+async fn own_transaction_client(url: &str) -> deadpool_postgres::Client {
+    let pool = build_pool(url, 4, &TlsConfig::default()).expect("build push-witness pool");
+    pool.get().await.expect("checkout push-witness connection")
+}
+
+/// P1-2 item 1a: `revalidate_push_witness`'s `Unchanged` verdict, reached when
+/// neither per-repository scalar moved between preflight capture and the final
+/// push transaction. The fast path reads no fragment row at all, so an empty
+/// `required` slice is enough to prove it.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn revalidate_push_witness_reports_unchanged_when_neither_scalar_moved() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository_id = create_repository(&store).await;
+
+    let captured = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness")
+        .expect("repository must exist");
+
+    let mut tx_client = own_transaction_client(&url).await;
+    let tx = tx_client
+        .transaction()
+        .await
+        .expect("open push-witness transaction");
+    let mut sequence = LockSequence::new();
+
+    let verdict = coordinator
+        .revalidate_push_witness(&tx, &mut sequence, &repository_id, captured, &[])
+        .await
+        .expect("revalidate must not error");
+    assert_eq!(verdict, PushWitnessVerdict::Unchanged);
+}
+
+/// P1-2 item 1b: `FallbackSatisfied`. The lifecycle scalar moves via a
+/// bystander fragment's readable-to-unreadable transition; the two required
+/// fragments are untouched and still readable at their captured epoch, so the
+/// bounded fallback revalidates and satisfies the push.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn revalidate_push_witness_is_satisfied_by_the_fallback_when_the_lifecycle_scalar_moved_and_required_fragments_are_still_readable()
+ {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+
+    // Two required fragments, published and associated BEFORE capture, so
+    // their association does not itself move the content-association scalar
+    // after the witness is taken.
+    let mut required = Vec::new();
+    for seed in 0u8..2 {
+        let hash = random_hash();
+        let key = format!("push-fallback/required-{seed}");
+        let BeginOutcome::Admitted(intent) = coordinator
+            .begin_direct_write(&hash, &key)
+            .await
+            .expect("begin required fragment")
+        else {
+            panic!("a fresh hash must admit a direct write");
+        };
+        assert_eq!(
+            coordinator
+                .commit_remote(
+                    &intent,
+                    IoObservation::Valid(manifest(&key, 0xD0 + seed, EpochAuthority::Remote))
+                )
+                .await
+                .expect("commit required fragment"),
+            CommitVerdict::Published
+        );
+        assert_eq!(
+            coordinator
+                .create_association(&hash, &repository_id, &context)
+                .await
+                .expect("associate required fragment"),
+            CommitVerdict::Published
+        );
+        required.push(RequiredFragment {
+            hash,
+            epoch: intent.epoch,
+        });
+    }
+
+    // A bystander fragment, also associated before capture, whose later
+    // transition is the only thing that moves the lifecycle scalar.
+    let bystander_hash = random_hash();
+    let BeginOutcome::Admitted(bystander_intent) = coordinator
+        .begin_direct_write(&bystander_hash, "push-fallback/bystander")
+        .await
+        .expect("begin bystander")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &bystander_intent,
+                IoObservation::Valid(manifest(
+                    "push-fallback/bystander",
+                    0xD9,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit bystander"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&bystander_hash, &repository_id, &context)
+            .await
+            .expect("associate bystander"),
+        CommitVerdict::Published
+    );
+
+    let captured = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness")
+        .expect("repository must exist");
+
+    let resolved_bystander = coordinator
+        .resolve(
+            &repository_id,
+            &context,
+            std::slice::from_ref(&bystander_hash),
+        )
+        .await
+        .expect("resolve bystander");
+    let (bystander_witness, ..) = expect_readable(&resolved_bystander[0]);
+    let bystander_witness = bystander_witness.clone();
+    assert_eq!(
+        coordinator
+            .mark_missing(&bystander_witness, MissingDiagnostic::Absent)
+            .await
+            .expect("mark bystander missing"),
+        CommitVerdict::Published
+    );
+
+    let mut tx_client = own_transaction_client(&url).await;
+    let tx = tx_client
+        .transaction()
+        .await
+        .expect("open push-witness transaction");
+    let mut sequence = LockSequence::new();
+
+    let verdict = coordinator
+        .revalidate_push_witness(&tx, &mut sequence, &repository_id, captured, &required)
+        .await
+        .expect("revalidate must not error");
+    assert_eq!(
+        verdict,
+        PushWitnessVerdict::FallbackSatisfied { revalidated: 2 }
+    );
+}
+
+/// P1-2 item 1c (first `Aborted` shape): a required fragment that has become
+/// unreadable (here, `Missing`) since preflight.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn revalidate_push_witness_aborts_when_a_required_fragment_is_no_longer_readable() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, "push-abort/removed")
+        .await
+        .expect("begin")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest("push-abort/removed", 0xD1, EpochAuthority::Remote))
+            )
+            .await
+            .expect("commit"),
+        CommitVerdict::Published
+    );
+    let required_epoch = intent.epoch;
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate"),
+        CommitVerdict::Published
+    );
+
+    let captured = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness")
+        .expect("repository must exist");
+
+    let resolved = coordinator
+        .resolve(&repository_id, &context, std::slice::from_ref(&hash))
+        .await
+        .expect("resolve before removal");
+    let (witness, ..) = expect_readable(&resolved[0]);
+    let witness = witness.clone();
+    assert_eq!(
+        coordinator
+            .mark_missing(&witness, MissingDiagnostic::Absent)
+            .await
+            .expect("mark missing"),
+        CommitVerdict::Published
+    );
+
+    let required = vec![RequiredFragment {
+        hash,
+        epoch: required_epoch,
+    }];
+    let mut tx_client = own_transaction_client(&url).await;
+    let tx = tx_client
+        .transaction()
+        .await
+        .expect("open push-witness transaction");
+    let mut sequence = LockSequence::new();
+
+    let verdict = coordinator
+        .revalidate_push_witness(&tx, &mut sequence, &repository_id, captured, &required)
+        .await
+        .expect("revalidate must not error");
+    assert_eq!(
+        verdict,
+        PushWitnessVerdict::Aborted {
+            reason: REQUIRED_FRAGMENT_CHANGED
+        }
+    );
+}
+
+/// P1-2 item 1c (second `Aborted` shape): a required fragment whose epoch
+/// advanced (a repair successor) since preflight, even though it is still
+/// readable.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn revalidate_push_witness_aborts_when_a_required_fragments_epoch_advanced() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, "push-abort/repaired")
+        .await
+        .expect("begin")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(
+                    "push-abort/repaired",
+                    0xD2,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit"),
+        CommitVerdict::Published
+    );
+    let original_epoch = intent.epoch;
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate"),
+        CommitVerdict::Published
+    );
+
+    let captured = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness")
+        .expect("repository must exist");
+
+    let resolved = coordinator
+        .resolve(&repository_id, &context, std::slice::from_ref(&hash))
+        .await
+        .expect("resolve before repair");
+    let (witness, ..) = expect_readable(&resolved[0]);
+    let witness = witness.clone();
+    assert_eq!(
+        coordinator
+            .mark_missing(&witness, MissingDiagnostic::Absent)
+            .await
+            .expect("mark missing"),
+        CommitVerdict::Published
+    );
+    let BeginOutcome::Admitted(repair_intent) =
+        coordinator.claim_repair(&hash).await.expect("claim repair")
+    else {
+        panic!("a Missing head must admit a repair claim");
+    };
+    assert_eq!(
+        coordinator
+            .commit_repair(
+                &repair_intent,
+                IoObservation::Valid(manifest(
+                    "push-abort/repaired-successor",
+                    0xD3,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit repair"),
+        CommitVerdict::Published
+    );
+
+    // `required` still names the ORIGINAL (now stale) epoch.
+    let required = vec![RequiredFragment {
+        hash,
+        epoch: original_epoch,
+    }];
+    let mut tx_client = own_transaction_client(&url).await;
+    let tx = tx_client
+        .transaction()
+        .await
+        .expect("open push-witness transaction");
+    let mut sequence = LockSequence::new();
+
+    let verdict = coordinator
+        .revalidate_push_witness(&tx, &mut sequence, &repository_id, captured, &required)
+        .await
+        .expect("revalidate must not error");
+    assert_eq!(
+        verdict,
+        PushWitnessVerdict::Aborted {
+            reason: REQUIRED_FRAGMENT_CHANGED
+        }
+    );
+}
+
+/// P1-2 item 1d: the 4,097-synthetic-fragment refusal. `MAX_PUSH_FRAGMENT_REVALIDATIONS`
+/// is a count check on the caller's slice, reachable with fabricated hashes
+/// that were never inserted -- this is the case INV-EF's own record wrongly
+/// attributed to needing real upload traffic. Proven both behaviorally
+/// (`Aborted`) and structurally: the refusal happens before `LockClass::Fragments`
+/// is ever entered, and the push witness is unchanged afterward.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn revalidate_push_witness_refuses_over_the_revalidation_limit_before_locking_any_fragment_row()
+ {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, "push-abort/limit")
+        .await
+        .expect("begin")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest("push-abort/limit", 0xD4, EpochAuthority::Remote))
+            )
+            .await
+            .expect("commit"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate"),
+        CommitVerdict::Published
+    );
+
+    let captured = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness")
+        .expect("repository must exist");
+
+    // Move the lifecycle scalar so the call reaches the count check rather
+    // than short-circuiting on `Unchanged`.
+    let resolved = coordinator
+        .resolve(&repository_id, &context, std::slice::from_ref(&hash))
+        .await
+        .expect("resolve before mark missing");
+    let (witness, ..) = expect_readable(&resolved[0]);
+    let witness = witness.clone();
+    assert_eq!(
+        coordinator
+            .mark_missing(&witness, MissingDiagnostic::Absent)
+            .await
+            .expect("mark missing"),
+        CommitVerdict::Published
+    );
+    let witness_before_call = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness before the oversized call")
+        .expect("repository must exist");
+
+    // 4,097 synthetic RequiredFragment values: fabricated hashes, never
+    // inserted anywhere, one over the frozen limit.
+    let required: Vec<RequiredFragment> = (0..=MAX_PUSH_FRAGMENT_REVALIDATIONS)
+        .map(|_| RequiredFragment {
+            hash: random_hash(),
+            epoch: 1,
+        })
+        .collect();
+    assert_eq!(required.len(), MAX_PUSH_FRAGMENT_REVALIDATIONS + 1);
+
+    let mut tx_client = own_transaction_client(&url).await;
+    let tx = tx_client
+        .transaction()
+        .await
+        .expect("open push-witness transaction");
+    let mut sequence = LockSequence::new();
+
+    let verdict = coordinator
+        .revalidate_push_witness(&tx, &mut sequence, &repository_id, captured, &required)
+        .await
+        .expect("revalidate must not error");
+    assert_eq!(
+        verdict,
+        PushWitnessVerdict::Aborted {
+            reason: REQUIRED_FRAGMENT_REVALIDATION_LIMIT
+        }
+    );
+
+    // Structural proof: the count check runs BEFORE any fragment row is
+    // locked. `LockClass::Fragments` (position 4) is later than
+    // `LockClass::Repository` (position 1); if the refusal had already
+    // entered Fragments, re-entering Repository here would be rejected as a
+    // lock-order inversion.
+    sequence.enter(LockClass::Repository).expect(
+        "the revalidation-limit refusal must return before locking any fragment row; if \
+         LockClass::Fragments had been entered, this would be a lock-order violation",
+    );
+    drop(tx); // never committed, so nothing this transaction touched persists
+
+    // And behaviorally: a refused push provably mutated nothing.
+    let witness_after_call = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness after the oversized call")
+        .expect("repository must exist");
+    assert_eq!(witness_after_call, witness_before_call);
+}
+
+/// P1-2 item 2: `acquire_staged_leases`/`release_staged_lease` round trip over
+/// a **batch** of several staged fragments -- one lease row covering many
+/// members is the whole design point, not one lease per fragment.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn acquire_staged_leases_and_release_round_trip_a_batch_with_a_monotonic_reader_fence() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+
+    let mut members = Vec::new();
+    for seed in 0u8..3 {
+        let hash = random_hash();
+        let BeginOutcome::Admitted(intent) =
+            coordinator.begin_stage(&hash).await.expect("begin stage")
+        else {
+            panic!("a fresh hash must admit a stage begin");
+        };
+        let staged_manifest = manifest(
+            &format!("staged-lease/member-{seed}"),
+            0xE0 + seed,
+            EpochAuthority::Staged,
+        );
+        assert_eq!(
+            coordinator
+                .commit_staged(&intent, IoObservation::Valid(staged_manifest))
+                .await
+                .expect("commit staged member"),
+            CommitVerdict::Published
+        );
+        members.push((hash, intent.epoch));
+    }
+
+    let lease_id_a = rand::random::<[u8; 16]>().to_vec();
+    let deadline = SystemTime::now() + Duration::from_secs(60);
+    let lease_a = coordinator
+        .acquire_staged_leases(&lease_id_a, &members, deadline)
+        .await
+        .expect("acquire lease a");
+    assert_eq!(lease_a.lease_id, lease_id_a);
+    assert_eq!(lease_a.members, members);
+
+    let member_count: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_staged_lease_members WHERE lease_id = $1",
+            &[&lease_id_a],
+        )
+        .await
+        .expect("count lease members")
+        .get(0);
+    assert_eq!(
+        member_count,
+        members.len() as i64,
+        "every batched member must land"
+    );
+
+    let lease_row = direct
+        .query_one(
+            "SELECT reader_fence, terminal FROM lore_fragment_staged_leases WHERE lease_id = $1",
+            &[&lease_id_a],
+        )
+        .await
+        .expect("read lease row");
+    let stored_fence: i64 = lease_row.get(0);
+    let terminal: bool = lease_row.get(1);
+    assert_eq!(stored_fence, lease_a.reader_fence);
+    assert!(!terminal, "a fresh lease must not start terminal");
+
+    // Monotonic reader fence: a second lease, over one member, gets a
+    // strictly greater fence.
+    let lease_id_b = rand::random::<[u8; 16]>().to_vec();
+    let lease_b = coordinator
+        .acquire_staged_leases(&lease_id_b, &members[..1], deadline)
+        .await
+        .expect("acquire lease b");
+    assert!(
+        lease_b.reader_fence > lease_a.reader_fence,
+        "reader fences must be monotonic: a={} b={}",
+        lease_a.reader_fence,
+        lease_b.reader_fence
+    );
+
+    coordinator
+        .release_staged_lease(&lease_id_a)
+        .await
+        .expect("release lease a");
+    let released_terminal: bool = direct
+        .query_one(
+            "SELECT terminal FROM lore_fragment_staged_leases WHERE lease_id = $1",
+            &[&lease_id_a],
+        )
+        .await
+        .expect("read released lease terminal flag")
+        .get(0);
+    assert!(released_terminal, "release must flip terminal");
+
+    // Releasing lease A must not affect lease B.
+    let lease_b_terminal: bool = direct
+        .query_one(
+            "SELECT terminal FROM lore_fragment_staged_leases WHERE lease_id = $1",
+            &[&lease_id_b],
+        )
+        .await
+        .expect("read lease b terminal flag")
+        .get(0);
+    assert!(!lease_b_terminal);
+}
+
+/// P1-2 item 3: `commit_obliterate` purges the epoch's disposition, deletes
+/// the metering row, and moves the head to `Tombstoned`.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tombstones_the_head() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, "obliterate-commit/key")
+        .await
+        .expect("begin")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(
+                    "obliterate-commit/key",
+                    0xF0,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit"),
+        CommitVerdict::Published
+    );
+    let published_epoch = intent.epoch;
+
+    let metering_before: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_lifecycle_metering WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("count metering before")
+        .get(0);
+    assert_eq!(
+        metering_before, 1,
+        "a published fragment has a metering row"
+    );
+
+    let BeginOutcome::Admitted(obliterate_intent) = coordinator
+        .begin_obliterate(&hash)
+        .await
+        .expect("begin obliterate")
+    else {
+        panic!("a readable head must admit begin_obliterate");
+    };
+    assert_eq!(
+        coordinator
+            .commit_obliterate(&obliterate_intent)
+            .await
+            .expect("commit obliterate"),
+        CommitVerdict::Published
+    );
+
+    let head_row = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read head after obliterate");
+    let state: i16 = head_row.get(0);
+    assert_eq!(state, FragmentLifecycleState::Tombstoned.bits());
+
+    let disposition: i16 = direct
+        .query_one(
+            "SELECT disposition FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
+            &[&hash, &published_epoch],
+        )
+        .await
+        .expect("read published epoch disposition")
+        .get(0);
+    assert_eq!(disposition, schema::DISPOSITION_PURGED);
+
+    let metering_after: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_lifecycle_metering WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("count metering after")
+        .get(0);
+    assert_eq!(metering_after, 0, "the metering row must be deleted");
+}
+
+/// P1-2 item 3 (fencing half): a stale obliterate intent -- one whose fence
+/// was overtaken by a second `begin_obliterate` on the same head before its
+/// own commit ran -- fences `commit_obliterate` and leaves the winner's
+/// mutation exactly as it was.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn commit_obliterate_fences_a_stale_intent_and_mutates_nothing() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, "obliterate-stale/key")
+        .await
+        .expect("begin")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(
+                    "obliterate-stale/key",
+                    0xF1,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit"),
+        CommitVerdict::Published
+    );
+
+    let BeginOutcome::Admitted(stale_intent) = coordinator
+        .begin_obliterate(&hash)
+        .await
+        .expect("begin obliterate (stale)")
+    else {
+        panic!("a readable head must admit begin_obliterate");
+    };
+    // A second begin_obliterate on the same head -- still DeletingPayload, not
+    // yet Tombstoned -- moves the fence again without publishing anything.
+    let BeginOutcome::Admitted(winning_intent) = coordinator
+        .begin_obliterate(&hash)
+        .await
+        .expect("begin obliterate (winner)")
+    else {
+        panic!(
+            "a DeletingPayload head is not yet Tombstoned and must still admit begin_obliterate"
+        );
+    };
+    assert_ne!(stale_intent.fence, winning_intent.fence);
+
+    assert_eq!(
+        coordinator
+            .commit_obliterate(&winning_intent)
+            .await
+            .expect("commit obliterate (winner)"),
+        CommitVerdict::Published
+    );
+
+    let state_after_win: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read head after winner")
+        .get(0);
+    assert_eq!(state_after_win, FragmentLifecycleState::Tombstoned.bits());
+    let disposition_after_win: i16 = direct
+        .query_one(
+            "SELECT disposition FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
+            &[&hash, &winning_intent.epoch],
+        )
+        .await
+        .expect("read epoch disposition after winner")
+        .get(0);
+
+    let stale_result = coordinator
+        .commit_obliterate(&stale_intent)
+        .await
+        .expect("stale commit obliterate must not error");
+    assert_eq!(
+        stale_result,
+        CommitVerdict::Fenced,
+        "a fence moved between the stale begin and its commit"
+    );
+
+    let state_after_stale: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read head after stale attempt")
+        .get(0);
+    assert_eq!(
+        state_after_stale, state_after_win,
+        "a fenced obliterate commit must leave the head exactly as the winner published it"
+    );
+    let disposition_after_stale: i16 = direct
+        .query_one(
+            "SELECT disposition FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
+            &[&hash, &winning_intent.epoch],
+        )
+        .await
+        .expect("read epoch disposition after stale attempt")
+        .get(0);
+    assert_eq!(
+        disposition_after_stale, disposition_after_win,
+        "a fenced obliterate commit must not mutate the epoch disposition"
+    );
+}
+
+/// P1-2 item 4: `enable_lifecycle` refuses with the typed `DomainError::NotReady`
+/// on a cell that has not completed backfill and cutover, and succeeds once
+/// the schema-state row genuinely satisfies cutover, residue classification,
+/// and sequence headroom.
+///
+/// SCHEMA-118's Phase 2/3 surface has no coordinator method that advances
+/// `backfill_state`/`cutover_at`/`residue_classified` -- that orchestrator is
+/// a later phase, unlike SCHEMA-117's sibling in `domain/locks/coordinator.rs`.
+/// The positive precondition is staged with the same direct-SQL technique this
+/// file's own `an_absent_fragment_schema_routes_legacy_but_a_partial_one_is_refused`
+/// already uses to stage schema-damage preconditions -- exercising the real
+/// row `enable_lifecycle` reads and writes, not a hand-built
+/// `FragmentLifecycleReadiness` fixture (that shape is already pinned by
+/// `readiness_fails_closed_on_each_missing_precondition` in this crate's own
+/// `mod tests`).
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn enable_lifecycle_refuses_on_a_not_ready_cell_and_succeeds_once_ready() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+
+    // A freshly bootstrapped cell (a real write: `bootstrap()`'s INSERT) has
+    // not backfilled or cut over.
+    let refusal = coordinator.enable_lifecycle().await;
+    assert!(
+        matches!(refusal, Err(DomainError::NotReady(_))),
+        "expected the typed NotReady error, got {refusal:?}"
+    );
+
+    direct
+        .execute(
+            "UPDATE lore_fragment_schema_state \
+                SET backfill_state = $1, cutover_at = clock_timestamp(), \
+                    residue_classified = true, sequence_headroom_fence = 1 \
+              WHERE id = 1",
+            &[&schema::BACKFILL_CUTOVER],
+        )
+        .await
+        .expect("stage the cutover precondition");
+
+    coordinator
+        .enable_lifecycle()
+        .await
+        .expect("enable_lifecycle must succeed once every precondition holds");
+
+    let enabled: bool = direct
+        .query_one(
+            "SELECT lifecycle_enabled FROM lore_fragment_schema_state WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("read lifecycle_enabled")
+        .get(0);
+    assert!(enabled);
+}
+
+/// P1-2 item 5: a promotion whose I/O comes back `Unusable` must leave the
+/// head `Staged` and still readable, must not commit `Missing`, and must not
+/// move any repository's `fragment_lifecycle_generation` -- the actual bug
+/// this path was added to fix (a transient provider error demoting a good
+/// staged fragment).
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn abandon_promotion_leaves_the_head_staged_and_readable_and_moves_no_repository_lifecycle_generation()
+ {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(stage_intent) =
+        coordinator.begin_stage(&hash).await.expect("begin stage")
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    let staged_manifest = manifest("abandon-promotion/staged", 0xA5, EpochAuthority::Staged);
+    assert_eq!(
+        coordinator
+            .commit_staged(&stage_intent, IoObservation::Valid(staged_manifest.clone()))
+            .await
+            .expect("commit staged"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate staged fragment"),
+        CommitVerdict::Published
+    );
+
+    let witness_before = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness before promotion")
+        .expect("repository must exist");
+
+    let BeginOutcome::Admitted(promotion_intent) = coordinator
+        .begin_promotion(&hash)
+        .await
+        .expect("begin promotion")
+    else {
+        panic!("a Staged head must admit begin_promotion");
+    };
+    let verdict = coordinator
+        .commit_promotion(
+            &promotion_intent,
+            IoObservation::Unusable(MissingDiagnostic::Truncated),
+        )
+        .await
+        .expect("commit promotion must not error");
+    assert_eq!(verdict, CommitVerdict::Abandoned);
+    assert!(verdict.left_representation_intact());
+
+    let head_row = direct
+        .query_one(
+            "SELECT current_epoch, state, manifest_id FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read head after abandon");
+    let current_epoch: i64 = head_row.get(0);
+    let state: i16 = head_row.get(1);
+    let manifest_id: Option<Vec<u8>> = head_row.get(2);
+    assert_eq!(
+        state,
+        FragmentLifecycleState::Staged.bits(),
+        "an abandoned promotion must leave the head Staged, not Missing"
+    );
+    assert_eq!(
+        current_epoch, stage_intent.epoch,
+        "the head must still name the staged epoch, not the abandoned promotion epoch"
+    );
+    assert_eq!(
+        manifest_id,
+        Some(staged_manifest.manifest_id.clone()),
+        "the staged manifest must survive an abandoned promotion untouched"
+    );
+
+    let resolved = coordinator
+        .resolve(&repository_id, &context, std::slice::from_ref(&hash))
+        .await
+        .expect("resolve after abandoned promotion");
+    let (_, resolved_manifest, _) = expect_readable(&resolved[0]);
+    assert_eq!(
+        resolved_manifest, &staged_manifest,
+        "the fragment must remain readable under its original staged representation"
+    );
+
+    let witness_after = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness after promotion abandon")
+        .expect("repository must exist");
+    assert_eq!(
+        witness_after, witness_before,
+        "an abandoned promotion must move neither push-witness scalar for the associated \
+         repository"
+    );
+}
+
+/// P1-2 item 6 / P1-3: nothing else reads `lore_fragment_epochs.disposition`.
+/// A successful repair publishing a greater epoch must quarantine the
+/// predecessor epoch and leave the successor `DISPOSITION_CURRENT_ELIGIBLE`.
+/// WP-118's acceptance line claimed this was tested; it was not, and this is
+/// the test that makes the corrected line true.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn a_successful_repair_quarantines_the_predecessor_epoch_and_marks_the_successor_current_eligible()
+ {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, "quarantine/predecessor")
+        .await
+        .expect("begin predecessor")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(
+                    "quarantine/predecessor",
+                    0xB0,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit predecessor"),
+        CommitVerdict::Published
+    );
+    let predecessor_epoch = intent.epoch;
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate"),
+        CommitVerdict::Published
+    );
+
+    let predecessor_disposition_before: i16 = direct
+        .query_one(
+            "SELECT disposition FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
+            &[&hash, &predecessor_epoch],
+        )
+        .await
+        .expect("read predecessor disposition before repair")
+        .get(0);
+    assert_eq!(
+        predecessor_disposition_before,
+        schema::DISPOSITION_CURRENT_ELIGIBLE,
+        "a freshly published epoch is current-eligible until superseded"
+    );
+
+    let resolved = coordinator
+        .resolve(&repository_id, &context, std::slice::from_ref(&hash))
+        .await
+        .expect("resolve before repair");
+    let (witness, ..) = expect_readable(&resolved[0]);
+    let witness = witness.clone();
+    assert_eq!(
+        coordinator
+            .mark_missing(&witness, MissingDiagnostic::Absent)
+            .await
+            .expect("mark missing"),
+        CommitVerdict::Published
+    );
+
+    let BeginOutcome::Admitted(repair_intent) =
+        coordinator.claim_repair(&hash).await.expect("claim repair")
+    else {
+        panic!("a Missing head must admit a repair claim");
+    };
+    let successor_epoch = repair_intent.epoch;
+    assert!(
+        successor_epoch > predecessor_epoch,
+        "epochs are allocated from a monotonic sequence"
+    );
+    assert_eq!(
+        coordinator
+            .commit_repair(
+                &repair_intent,
+                IoObservation::Valid(manifest(
+                    "quarantine/successor",
+                    0xB1,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit repair"),
+        CommitVerdict::Published
+    );
+
+    let predecessor_disposition_after: i16 = direct
+        .query_one(
+            "SELECT disposition FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
+            &[&hash, &predecessor_epoch],
+        )
+        .await
+        .expect("read predecessor disposition after repair")
+        .get(0);
+    assert_eq!(
+        predecessor_disposition_after,
+        schema::DISPOSITION_QUARANTINED,
+        "the predecessor epoch must be quarantined once a greater epoch publishes"
+    );
+
+    let successor_disposition: i16 = direct
+        .query_one(
+            "SELECT disposition FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
+            &[&hash, &successor_epoch],
+        )
+        .await
+        .expect("read successor disposition")
+        .get(0);
+    assert_eq!(
+        successor_disposition,
+        schema::DISPOSITION_CURRENT_ELIGIBLE,
+        "the successor epoch must be current-eligible"
     );
 }
