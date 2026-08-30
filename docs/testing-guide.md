@@ -223,8 +223,11 @@ will update an older check constraint or state schema.
   `validate_endpoint_host` accepts a single-label host (`minio`, `localhost`).
   Double pattern: one generic closure-scripted double per trait, `new` returning
   `(Self, Rc<Cell<u32>>)` — the double moves into the client, so the counter handle must outlive
-  it; to capture a value the double *receives* rather than just count calls, close over an
-  `Rc<RefCell<Option<T>>>` in the same closure instead of a bespoke struct. INV-EJ P1 (round 4):
+  it; to capture what the double *receives* rather than just count calls, close over an
+  `Rc<RefCell<Option<T>>>` in the same closure — and when the received type is deliberately not
+  `Clone` (as `ProviderChargeRequest` is, so no implementation can retain a chargeable value past
+  the call), copy the fields you assert on into a plain struct of your own rather than reaching for
+  the value itself. INV-EJ P1 (round 4):
   `ProviderAttemptLedger::new` now takes `(provider_boundary_id, logical_request_id) ->
   Result<Self, _>` (no `Default`), and `execute` refuses a request naming a different
   boundary/logical-request than the ledger is bound to with `LedgerRequestMismatch`, checked before

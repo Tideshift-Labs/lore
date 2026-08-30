@@ -1059,9 +1059,10 @@ impl ProviderTransport for UnwiredProviderTransport {
 /// accepts.
 ///
 /// `Clone` exists for callers that want to explore a hypothetical continuation, such as a test
-/// matrix branching one prefix into several suffixes. A clone is a separate accumulator that no
-/// longer tracks the original: never finalize a request from a clone, only from the ledger the
-/// request's own attempts were recorded on.
+/// matrix branching one prefix into several suffixes. A clone carries the same binding, so it
+/// cannot be used to attribute one request's counters to another; what it can do is diverge from
+/// the original and then be finalized as if it had not. Never finalize a request from a clone, only
+/// from the ledger that request's own attempts were recorded on.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderAttemptLedger {
     provider_boundary_id: String,
@@ -1162,21 +1163,29 @@ impl ProviderAttemptLedger {
 
     /// The retained provider-attempt audit, for the logical request the caller is attaching it to.
     ///
-    /// The caller must name that request, and it must be the one this ledger is bound to. Binding
-    /// `execute`'s input was only half the problem INV-EJ found: the audit itself carries bare
-    /// counters, so a caller could still take a correctly accumulated audit and attach it to
-    /// another request's compact receipt, and the frozen encoder would accept it. Requiring the
-    /// identity here means an audit cannot be obtained at all without naming the request it
-    /// describes.
+    /// The caller must name that request and it must be this ledger's, so a caller reaching for
+    /// the wrong ledger is told so at the point of the mistake. **This is not a binding, and the
+    /// difference matters.** [`ObjectStoreProviderAttemptAudit`] is a public struct of public
+    /// counters, and `ObjectStoreCompactReceiptInput` takes it beside a `logical_request_id` it
+    /// never checks it against, so an audit obtained here for request A still attaches to request
+    /// B's receipt, and one can be written as a struct literal without calling this at all.
+    /// Binding `execute`'s input closed the half that could be closed from inside this module:
+    /// one ledger can no longer accumulate two requests' attempts. Closing the other half means a
+    /// bound audit type the receipt input requires, which is a contract change to the retained
+    /// compact-receipt family and is recorded as an obligation in WP-114 rather than improvised
+    /// here.
+    ///
+    /// Identity is checked before poison, matching [`GovernedProviderClient::execute`]: whether
+    /// this is the caller's ledger at all precedes any question about the state it is in.
     pub fn audit_for(
         &self,
         logical_request_id: &str,
     ) -> Result<ObjectStoreProviderAttemptAudit, ProviderClientError> {
-        if let Some(error) = self.poisoned {
-            return Err(error);
-        }
         if logical_request_id != self.logical_request_id {
             return Err(ProviderClientError::LedgerRequestMismatch);
+        }
+        if let Some(error) = self.poisoned {
+            return Err(error);
         }
         let audit = ObjectStoreProviderAttemptAudit {
             attempt_count: self.attempt_count,
@@ -1317,19 +1326,21 @@ where
         ledger: &mut ProviderAttemptLedger,
         request: &ProviderAttemptRequest,
     ) -> Result<ProviderAttemptOutcome, ProviderClientError> {
-        if let Some(error) = ledger.poisoned() {
-            return Err(error);
-        }
-        // Identity first: "is this even my ledger" precedes any question about its state, so a
-        // mismatched request on a no-dispatch ledger reports the mismatch rather than a sequencing
-        // fault it does not have. The audit this ledger produces is attached to a compact receipt
-        // that carries its own request identity, and the frozen encoder validates the counters
-        // without knowing whose they are, so the binding has to be checked here or nowhere.
-        // Refused before anything is charged or sent, and so without closing the ledger.
+        // Identity first, ahead of the poison flag and the no-dispatch guard alike, and the same
+        // order `ProviderAttemptLedger::audit_for` uses: "is this even my ledger" precedes every
+        // question about the state that ledger is in, so a caller holding the wrong one is told
+        // that rather than handed a fault belonging to a request it is not working on. The audit
+        // this ledger produces is attached to a compact receipt carrying its own request identity,
+        // and the frozen encoder validates the counters without knowing whose they are, so the
+        // binding has to be checked here or nowhere. Refused before anything is charged or sent,
+        // and so without closing the ledger.
         if ledger.provider_boundary_id() != self.boundary.provider_boundary_id
             || ledger.logical_request_id() != request.logical_request_id
         {
             return Err(ProviderClientError::LedgerRequestMismatch);
+        }
+        if let Some(error) = ledger.poisoned() {
+            return Err(error);
         }
         // A recorded no-dispatch proof asserts the request resolved without reaching the provider,
         // so dispatching afterwards would contradict a durable claim. The refusal happens before

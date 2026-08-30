@@ -1868,8 +1868,11 @@ fn execute_hands_the_transport_the_exact_authorized_permit() {
 // encoder would accept that shape because it validates counters without knowing whose they are.
 // `ProviderAttemptLedger::new` now takes and validates the boundary/request identity, and `execute`
 // refuses any attempt naming a different logical request or boundary than the ledger is bound to,
-// checked after the poison/no-dispatch guards and before `authorize`, the charge, and the
-// transport -- so, like `DispatchAfterNoDispatch`, the refusal never poisons the ledger.
+// checked before the poison and no-dispatch guards and before `authorize`, the charge, and the
+// transport -- whether this is even the caller's ledger precedes every other question, including
+// what state that ledger is in. Like `DispatchAfterNoDispatch`, the refusal never poisons the
+// ledger. See `execute_on_a_poisoned_ledger_reports_mismatch_for_a_different_request_but_still_the_poison_for_its_own`
+// below for the case this order actually distinguishes from poison-first.
 
 #[test]
 fn ledger_new_validates_boundary_and_request_identity_and_exposes_them() {
@@ -2135,6 +2138,106 @@ fn execute_reports_the_ledger_mismatch_before_dispatch_after_no_dispatch_on_a_no
     assert_eq!(transport_calls.get(), 0, "transport must not be called");
 }
 
+/// The case that distinguishes `execute`'s current identity-then-poison order from the poison-first
+/// order it used to have: on a poisoned ledger, an attempt naming a *different* logical request must
+/// report `LedgerRequestMismatch`, not leak this ledger's poison to a caller asking about a request
+/// it never handled, while an attempt naming the ledger's own bound request must still surface the
+/// poison. Mirrors `audit_for_returns_the_poison_for_the_bound_request_id_on_a_poisoned_ledger` /
+/// `audit_for_returns_a_ledger_request_mismatch_for_a_different_id_on_a_poisoned_ledger` (Section 9),
+/// which already pinned this shape for `audit_for`; `execute` had no equivalent pair, which is
+/// exactly how the two functions' orders were able to disagree unnoticed. Neither call reaches the
+/// charge authority or the transport, and the ledger's poison/counters are unchanged by either --
+/// a rejected call never mutates.
+#[test]
+fn execute_on_a_poisoned_ledger_reports_mismatch_for_a_different_request_but_still_the_poison_for_its_own()
+ {
+    let (charge_authority, charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 0,
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let mut ledger = new_ledger();
+
+    // Poison the ledger.
+    let poisoning = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    assert_eq!(
+        poisoning,
+        Err(ProviderClientError::TransportReportInconsistent)
+    );
+    assert_eq!(
+        ledger.poisoned(),
+        Some(ProviderClientError::TransportReportInconsistent)
+    );
+    let attempt_count_after_poisoning = ledger.attempt_count();
+    let committed_grant_count_after_poisoning = ledger.committed_grant_count();
+    assert_eq!(charge_calls.get(), 1);
+    assert_eq!(transport_calls.get(), 1);
+
+    // A different logical request: the identity check runs first, so the caller is told this
+    // isn't its ledger rather than handed a poison belonging to someone else's request.
+    let mut different_request = base_request(ProviderAttemptClass::Readiness);
+    different_request.logical_request_id = other_logical_request_id();
+    different_request.attempt_id = other_attempt_id();
+
+    let mismatch_outcome = client.execute(&mut ledger, &different_request);
+    assert_eq!(
+        mismatch_outcome,
+        Err(ProviderClientError::LedgerRequestMismatch)
+    );
+    assert_eq!(
+        ledger.poisoned(),
+        Some(ProviderClientError::TransportReportInconsistent),
+        "poison must be unchanged by the rejected mismatched-identity call"
+    );
+    assert_eq!(ledger.attempt_count(), attempt_count_after_poisoning);
+    assert_eq!(
+        ledger.committed_grant_count(),
+        committed_grant_count_after_poisoning
+    );
+    assert_eq!(
+        charge_calls.get(),
+        1,
+        "a mismatched-identity attempt must not reach the charge authority"
+    );
+    assert_eq!(
+        transport_calls.get(),
+        1,
+        "a mismatched-identity attempt must not reach the transport"
+    );
+
+    // The ledger's own bound request: identity matches, so the poison still surfaces, unchanged.
+    let own_request_outcome =
+        client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    assert_eq!(
+        own_request_outcome,
+        Err(ProviderClientError::TransportReportInconsistent)
+    );
+    assert_eq!(
+        ledger.poisoned(),
+        Some(ProviderClientError::TransportReportInconsistent),
+        "poison must be unchanged by the rejected own-request replay"
+    );
+    assert_eq!(ledger.attempt_count(), attempt_count_after_poisoning);
+    assert_eq!(
+        ledger.committed_grant_count(),
+        committed_grant_count_after_poisoning
+    );
+    assert_eq!(
+        charge_calls.get(),
+        1,
+        "an own-request replay on a poisoned ledger must not reach the charge authority again"
+    );
+    assert_eq!(
+        transport_calls.get(),
+        1,
+        "an own-request replay on a poisoned ledger must not reach the transport again"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // 8. ProviderRetryPolicy
 // ---------------------------------------------------------------------------------------------
@@ -2296,7 +2399,42 @@ fn execute_refuses_after_a_recorded_no_dispatch_without_poisoning_the_ledger() {
 }
 
 #[test]
-fn record_no_dispatch_and_audit_for_return_the_poison_on_a_poisoned_ledger() {
+fn record_no_dispatch_returns_the_poison_on_a_poisoned_ledger() {
+    let (charge_authority, _charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 0,
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let mut ledger = new_ledger();
+    let _ = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    assert_eq!(
+        ledger.poisoned(),
+        Some(ProviderClientError::TransportReportInconsistent)
+    );
+
+    // `record_no_dispatch` takes no request id, so there is no identity to check against poison
+    // here -- it always reports the poison. This is unaffected by `audit_for`'s
+    // identity-before-poison ordering below; the two guards have nothing in common to reorder.
+    assert_eq!(
+        ledger.record_no_dispatch(&no_dispatch_proof()),
+        Err(ProviderClientError::TransportReportInconsistent)
+    );
+}
+
+// `ProviderAttemptLedger::audit_for` checks the request identity before the poison (see its own
+// doc comment on the ordering rationale: whether this is the caller's ledger at all precedes any
+// question about the state that ledger is in). Do not "fix" this back to poison-first: on a
+// poisoned ledger, only the ledger's own bound request id may surface the poison; a different
+// (but validly formed) id names a request this ledger never handled at all, so it must surface
+// `LedgerRequestMismatch` instead -- never leaking this ledger's poison to a caller asking about
+// someone else's request. Keep both cases below if this ordering is ever touched again.
+
+#[test]
+fn audit_for_returns_the_poison_for_the_bound_request_id_on_a_poisoned_ledger() {
     let (charge_authority, _charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
     let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
@@ -2314,18 +2452,32 @@ fn record_no_dispatch_and_audit_for_return_the_poison_on_a_poisoned_ledger() {
     );
 
     assert_eq!(
-        ledger.record_no_dispatch(&no_dispatch_proof()),
-        Err(ProviderClientError::TransportReportInconsistent)
-    );
-    // The poison wins over the identity check both ways: a matching id and a mismatching id both
-    // report the poison, never `LedgerRequestMismatch`.
-    assert_eq!(
         ledger.audit_for(&logical_request_id()),
         Err(ProviderClientError::TransportReportInconsistent)
     );
+}
+
+#[test]
+fn audit_for_returns_a_ledger_request_mismatch_for_a_different_id_on_a_poisoned_ledger() {
+    let (charge_authority, _charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 0,
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let mut ledger = new_ledger();
+    let _ = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    assert_eq!(
+        ledger.poisoned(),
+        Some(ProviderClientError::TransportReportInconsistent)
+    );
+
     assert_eq!(
         ledger.audit_for(&other_logical_request_id()),
-        Err(ProviderClientError::TransportReportInconsistent)
+        Err(ProviderClientError::LedgerRequestMismatch)
     );
 }
 
