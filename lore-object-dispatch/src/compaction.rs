@@ -423,6 +423,19 @@ fn complete(
     Ok((bytes, digest))
 }
 
+/// The frozen algebra a provider-attempt audit must satisfy to be encodable.
+///
+/// This is the single definition. `provider_client`'s ledger calls it rather than restating it, so
+/// the producer and this encoder cannot come to disagree about what a valid audit is.
+pub(crate) fn provider_attempt_audit_is_valid(value: &ObjectStoreProviderAttemptAudit) -> bool {
+    !(value.provider_authority_refunded
+        || value.no_dispatch_count > 1
+        || value.attempt_count > value.committed_grant_count
+        || value.decisive_terminal_count > value.attempt_count
+        || value.ambiguous_count > value.attempt_count
+        || (value.no_dispatch_count == 1 && value.decisive_terminal_count != 0))
+}
+
 fn audit_fields(value: &ObjectStoreProviderAttemptAudit) -> Result<[u64; 5], CompactReceiptError> {
     let values = [
         value.attempt_count,
@@ -431,13 +444,7 @@ fn audit_fields(value: &ObjectStoreProviderAttemptAudit) -> Result<[u64; 5], Com
         value.decisive_terminal_count,
         value.ambiguous_count,
     ];
-    if value.provider_authority_refunded
-        || value.no_dispatch_count > 1
-        || value.attempt_count > value.committed_grant_count
-        || value.decisive_terminal_count > value.attempt_count
-        || value.ambiguous_count > value.attempt_count
-        || (value.no_dispatch_count == 1 && value.decisive_terminal_count != 0)
-    {
+    if !provider_attempt_audit_is_valid(value) {
         return Err(CompactReceiptError::InvalidProviderAttemptAudit);
     }
     Ok(values)

@@ -212,8 +212,12 @@ will update an older check constraint or state schema.
   off, because an SDK retry happens below the one call and reports one honestly. Disabling it is
   CD-6's construction obligation, and `ProviderRetryPolicy` is only the declaration. `record_no_dispatch`
   refuses after any issued attempt regardless of outcome (decisive or ambiguous) — a hand-listed
-  audit-mirroring test missed the ambiguous case; generate such state matrices by driving the real
-  API, not by hand. `validate_endpoint_host` accepts a single-label host (`minio`, `localhost`).
+  audit-mirroring test missed the ambiguous case, and its successor matrix then missed it again by
+  applying the no-dispatch only *before* the outcome sequence; generate such state matrices by
+  driving the real API, and give a sequencing rule an axis on both sides of the sequence.
+  `ProviderAttemptLedger::audit` calls `compaction`'s own `provider_attempt_audit_is_valid` rather
+  than restating the algebra, so a producer/encoder drift is not possible to write.
+  `validate_endpoint_host` accepts a single-label host (`minio`, `localhost`).
   Double pattern: one generic closure-scripted double per trait, `new` returning
   `(Self, Rc<Cell<u32>>)` — the double moves into the client, so the counter handle must outlive
   it. Gate: `cargo test -p lore-object-dispatch --test provider_client -j 4` (60 tests, no

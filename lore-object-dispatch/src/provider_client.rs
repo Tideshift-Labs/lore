@@ -59,6 +59,7 @@ use std::fmt;
 use thiserror::Error;
 
 use crate::compaction::ObjectStoreProviderAttemptAudit;
+use crate::compaction::provider_attempt_audit_is_valid;
 use crate::contract::canonical_uuid_v7_timestamp;
 use crate::contract::validate_canonical_id;
 use crate::no_dispatch::CanonicalNoDispatchProof;
@@ -366,11 +367,14 @@ fn validate_bucket_name(value: &str) -> Result<(), ProviderClientError> {
 }
 
 fn is_ipv4_shaped(value: &str) -> bool {
-    let labels: Vec<&str> = value.split('.').collect();
-    labels.len() == 4
-        && labels
-            .iter()
-            .all(|label| !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit()))
+    let mut labels = 0usize;
+    for label in value.split('.') {
+        labels += 1;
+        if labels > 4 || label.is_empty() || !label.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+    }
+    labels == 4
 }
 
 fn validate_region(value: &str) -> Result<(), ProviderClientError> {
@@ -394,8 +398,9 @@ fn validate_endpoint_host(value: &str) -> Result<(), ProviderClientError> {
         return Err(ProviderClientError::InvalidEndpointHost);
     }
     // A single-label host is accepted. A dotted name is not the boundary control here: the exact
-    // bucket, region, and host match is, and requiring a dot would make the local container and
-    // loopback hosts a later tier needs unexpressible without loosening this validator then.
+    // bucket, region, and host match is, so accepting one label loosens nothing. Requiring a dot
+    // would make a container hostname such as `minio`, which a later local tier needs, expressible
+    // only by loosening this validator at that point instead.
     let labels: Vec<&str> = value.split('.').collect();
     for label in labels {
         let label = label.as_bytes();
@@ -498,8 +503,10 @@ impl PutObjectPlan {
     ///
     /// The variants' fields are public so callers can match on a plan, which means a hand-built
     /// plan need not be one [`plan_put_object`] would mint. The arithmetic here is therefore
-    /// checked and answers `None` for a plan whose own numbers do not fit, rather than trusting
-    /// them.
+    /// checked and answers `None` where a plan's own numbers do not fit in a `u64`. That is all it
+    /// checks: a hand-built plan whose parts do not tile its own `body_size` still yields ranges,
+    /// and the ranges a request actually sends are revalidated against the durable body by
+    /// [`GovernedProviderClient::authorize`], which is where a bad range is caught.
     pub const fn part_range(self, part_number: u32) -> Option<(u64, u64)> {
         match self {
             Self::SingleShot { .. } => None,
@@ -521,10 +528,10 @@ impl PutObjectPlan {
                 } else {
                     part_size_bytes
                 };
-                match offset.checked_add(length) {
-                    Some(_) => Some((offset, length)),
-                    None => None,
+                if offset.checked_add(length).is_none() {
+                    return None;
                 }
+                Some((offset, length))
             }
         }
     }
@@ -1076,12 +1083,10 @@ impl ProviderAttemptLedger {
             return Err(error);
         }
         // A no-dispatch proof asserts that nothing reached the provider, so an issued attempt
-        // forbids it even when that attempt's outcome was ambiguous. A committed grant does not:
-        // a charge that never reached the wire is exactly the case a no-dispatch proof records.
-        if self.no_dispatch_count != 0
-            || self.decisive_terminal_count != 0
-            || self.attempt_count != 0
-        {
+        // forbids it. A committed grant does not: a charge that never reached the wire is exactly
+        // the case a no-dispatch proof records. A decisive terminal implies an issued attempt, so
+        // it needs no separate clause here.
+        if self.no_dispatch_count != 0 || self.attempt_count != 0 {
             return Err(ProviderClientError::NoDispatchNotPermitted);
         }
         self.no_dispatch_count = 1;
@@ -1093,20 +1098,7 @@ impl ProviderAttemptLedger {
         if let Some(error) = self.poisoned {
             return Err(error);
         }
-        // The frozen encoder in `compaction::audit_fields` is the authority on this algebra. It is
-        // restated here so no reachable ledger state can hand it a record it would reject: a
-        // transition this crate later gets wrong fails here, at the ledger, instead of at a
-        // compact receipt far downstream. `provider_authority_refunded` is absent because there is
-        // no refund path, and false is the only value the encoder accepts.
-        if self.no_dispatch_count > 1
-            || self.attempt_count > self.committed_grant_count
-            || self.decisive_terminal_count > self.attempt_count
-            || self.ambiguous_count > self.attempt_count
-            || (self.no_dispatch_count == 1 && self.decisive_terminal_count != 0)
-        {
-            return Err(ProviderClientError::LedgerAlgebraViolation);
-        }
-        Ok(ObjectStoreProviderAttemptAudit {
+        let audit = ObjectStoreProviderAttemptAudit {
             attempt_count: self.attempt_count,
             committed_grant_count: self.committed_grant_count,
             no_dispatch_count: self.no_dispatch_count,
@@ -1114,7 +1106,15 @@ impl ProviderAttemptLedger {
             ambiguous_count: self.ambiguous_count,
             provider_authority_refunded: false,
             audit_blake3: None,
-        })
+        };
+        // The frozen encoder's own predicate, called rather than restated, so this producer and
+        // `compaction`'s encoder cannot drift into disagreeing about what a valid audit is. Every
+        // state reachable today satisfies it; the call is what makes a later wrong transition fail
+        // here, at the ledger, instead of at a compact receipt far downstream.
+        if !provider_attempt_audit_is_valid(&audit) {
+            return Err(ProviderClientError::LedgerAlgebraViolation);
+        }
+        Ok(audit)
     }
 
     fn poison(&mut self, error: ProviderClientError) -> ProviderClientError {
@@ -1222,11 +1222,14 @@ where
         if let Some(error) = ledger.poisoned() {
             return Err(error);
         }
-        // A recorded no-dispatch proof asserts the request resolved without reaching the provider.
-        // Dispatching afterwards would contradict a durable claim, and the resulting counters are a
-        // record the frozen audit encoder rejects, so the ledger closes instead.
+        // A recorded no-dispatch proof asserts the request resolved without reaching the provider,
+        // so dispatching afterwards would contradict a durable claim. The refusal happens before
+        // anything is charged or sent, which makes it the same class of caller-sequencing fault
+        // `record_no_dispatch` refuses, and it is refused the same way: the ledger stays open and
+        // keeps its truthful no-dispatch audit rather than being closed over a call that had no
+        // effect.
         if ledger.no_dispatch_count() != 0 {
-            return Err(ledger.poison(ProviderClientError::DispatchAfterNoDispatch));
+            return Err(ProviderClientError::DispatchAfterNoDispatch);
         }
         let charge_request = self.authorize(request)?;
 

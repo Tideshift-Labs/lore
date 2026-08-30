@@ -7,6 +7,7 @@
 //! (`ProviderChargeAuthority`, `ProviderTransport`); no provider SDK, no database, no filesystem.
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -1861,11 +1862,13 @@ fn record_no_dispatch_is_still_allowed_after_a_committed_grant_that_never_reache
         .expect("audit must be accepted by the frozen encoder");
 }
 
-/// A recorded no-dispatch asserts the request resolved without reaching the provider. Dispatching
-/// afterwards would contradict that durable claim, so `execute` must refuse before charging or
-/// sending, and poison the ledger rather than leave it open to a later successful dispatch.
+/// A recorded no-dispatch asserts the request resolved without reaching the provider. The refusal
+/// happens before anything is charged or sent, so it is the mirror image of the sequencing fault
+/// `record_no_dispatch` itself refuses (an issued attempt after a no-dispatch): `execute` refuses
+/// the call, but the ledger stays open and unpoisoned, keeping the truthful
+/// `{no_dispatch: 1, attempt: 0}` audit finalizable rather than destroying it.
 #[test]
-fn execute_refuses_after_a_recorded_no_dispatch_and_poisons_the_ledger() {
+fn execute_refuses_after_a_recorded_no_dispatch_without_poisoning_the_ledger() {
     let mut ledger = ProviderAttemptLedger::new();
     ledger
         .record_no_dispatch(&no_dispatch_proof())
@@ -1886,7 +1889,9 @@ fn execute_refuses_after_a_recorded_no_dispatch_and_poisons_the_ledger() {
     assert_eq!(outcome, Err(ProviderClientError::DispatchAfterNoDispatch));
     assert_eq!(
         ledger.poisoned(),
-        Some(ProviderClientError::DispatchAfterNoDispatch)
+        None,
+        "the refusal happens before any charge or send, so it must not destroy a truthful \
+         no-dispatch audit"
     );
     assert_eq!(ledger.no_dispatch_count(), 1);
     assert_eq!(ledger.attempt_count(), 0);
@@ -1903,6 +1908,14 @@ fn execute_refuses_after_a_recorded_no_dispatch_and_poisons_the_ledger() {
         0,
         "transport must not be called after a recorded no-dispatch"
     );
+
+    let audit = ledger
+        .audit()
+        .expect("the refused-but-unpoisoned ledger must still produce an audit");
+    assert_eq!(audit.no_dispatch_count, 1);
+    assert_eq!(audit.attempt_count, 0);
+    validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
+        .expect("the truthful no-dispatch audit must still be accepted by the frozen encoder");
 }
 
 #[test]
@@ -2038,95 +2051,417 @@ fn outcome_sequences() -> Vec<Vec<ProviderAttemptOutcome>> {
     sequences
 }
 
+/// A compact fingerprint of a ledger's publicly observable state: its five counters plus a label
+/// for its poison (empty when unpoisoned). Two ledgers reached through different call sequences
+/// but landing on the same fingerprint are the same audited state as far as any caller, including
+/// the frozen encoder, can ever observe.
+fn ledger_state_fingerprint(ledger: &ProviderAttemptLedger) -> (u64, u64, u64, u64, u64, String) {
+    (
+        ledger.attempt_count(),
+        ledger.committed_grant_count(),
+        ledger.no_dispatch_count(),
+        ledger.decisive_terminal_count(),
+        ledger.ambiguous_count(),
+        ledger
+            .poisoned()
+            .map(|error| format!("{error:?}"))
+            .unwrap_or_default(),
+    )
+}
+
+/// Asserts the mirroring property `LedgerAlgebraViolation` exists to guard: a poisoned ledger's
+/// `audit()` returns exactly that poison, and a non-poisoned ledger's `audit()` is `Ok` and
+/// accepted by the frozen encoder.
+fn assert_mirrors_audit_algebra(ledger: &ProviderAttemptLedger, label: &str) {
+    match ledger.poisoned() {
+        Some(poison) => {
+            assert_eq!(ledger.audit(), Err(poison), "case: {label}");
+        }
+        None => {
+            let audit = ledger.audit().unwrap_or_else(|error| {
+                panic!("case {label}: non-poisoned ledger must audit: {error}")
+            });
+            // ProviderAttemptLedger has no refund method at all, so this must always be false.
+            assert!(!audit.provider_authority_refunded, "case: {label}");
+            validate_and_encode_object_store_provider_attempt_audit(
+                &audit,
+                &compact_receipt_limits(),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case {label}: audit must be accepted by the frozen encoder: {error:?}: \
+                         {audit:?}"
+                )
+            });
+        }
+    }
+}
+
+/// The exact set of ledger-state fingerprints ([`ledger_state_fingerprint`]) the matrix below
+/// reaches through the public API. Most of the matrix's raw combinations collapse into a handful
+/// of poisoned states, and the loop bounds alone say nothing about how many distinct audited
+/// states that actually produces, so the matrix does not assert a restated case count. Pinning
+/// this set instead means a change that silently shrinks the reachable state space -- collapsing
+/// two states the algebra should keep distinct -- fails visibly here rather than passing a vacuous
+/// count check.
+///
+/// `DispatchAfterNoDispatch` never appears here: `execute` refuses before touching either seam
+/// once a no-dispatch is recorded, so every sequence-loop or terminal-action `execute` call after
+/// `preceding_no_dispatch` leaves the ledger's fingerprint exactly as it was; the state this test
+/// actually reaches for that path is `(0, 0, 1, 0, 0, "")`, not a poisoned variant.
+///
+/// Generated, not hand-derived: produced by sorting and printing `reachable_states` from a
+/// temporary run of the test below. Regenerate the same way after any deliberate change to
+/// `provider_client.rs`'s `execute`/`record_no_dispatch`, `TERMINAL_ACTIONS`, or
+/// `outcome_sequences` that should move this set.
+fn expected_reachable_states() -> HashSet<(u64, u64, u64, u64, u64, String)> {
+    [
+        (0, 0, 0, 0, 0, String::new()),
+        (0, 0, 1, 0, 0, String::new()),
+        (0, 1, 0, 0, 0, String::new()),
+        (0, 1, 0, 0, 0, "GrantDoesNotBindAttempt".to_string()),
+        (0, 1, 0, 0, 0, "TransportReportInconsistent".to_string()),
+        (0, 1, 1, 0, 0, String::new()),
+        (0, 2, 0, 0, 0, String::new()),
+        (0, 2, 0, 0, 0, "GrantDoesNotBindAttempt".to_string()),
+        (0, 2, 0, 0, 0, "TransportReportInconsistent".to_string()),
+        (
+            1,
+            1,
+            0,
+            0,
+            0,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (1, 1, 0, 0, 1, String::new()),
+        (1, 1, 0, 1, 0, String::new()),
+        (
+            1,
+            2,
+            0,
+            0,
+            0,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (1, 2, 0, 0, 1, String::new()),
+        (1, 2, 0, 0, 1, "GrantDoesNotBindAttempt".to_string()),
+        (1, 2, 0, 0, 1, "TransportReportInconsistent".to_string()),
+        (1, 2, 0, 1, 0, String::new()),
+        (1, 2, 0, 1, 0, "GrantDoesNotBindAttempt".to_string()),
+        (1, 2, 0, 1, 0, "TransportReportInconsistent".to_string()),
+        (1, 3, 0, 0, 1, String::new()),
+        (1, 3, 0, 0, 1, "GrantDoesNotBindAttempt".to_string()),
+        (1, 3, 0, 0, 1, "TransportReportInconsistent".to_string()),
+        (1, 3, 0, 1, 0, String::new()),
+        (1, 3, 0, 1, 0, "GrantDoesNotBindAttempt".to_string()),
+        (1, 3, 0, 1, 0, "TransportReportInconsistent".to_string()),
+        (
+            2,
+            2,
+            0,
+            0,
+            1,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (2, 2, 0, 0, 2, String::new()),
+        (
+            2,
+            2,
+            0,
+            1,
+            0,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (2, 2, 0, 1, 1, String::new()),
+        (2, 2, 0, 2, 0, String::new()),
+        (
+            2,
+            3,
+            0,
+            0,
+            1,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (2, 3, 0, 0, 2, String::new()),
+        (2, 3, 0, 0, 2, "GrantDoesNotBindAttempt".to_string()),
+        (2, 3, 0, 0, 2, "TransportReportInconsistent".to_string()),
+        (
+            2,
+            3,
+            0,
+            1,
+            0,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (2, 3, 0, 1, 1, String::new()),
+        (2, 3, 0, 1, 1, "GrantDoesNotBindAttempt".to_string()),
+        (2, 3, 0, 1, 1, "TransportReportInconsistent".to_string()),
+        (2, 3, 0, 2, 0, String::new()),
+        (2, 3, 0, 2, 0, "GrantDoesNotBindAttempt".to_string()),
+        (2, 3, 0, 2, 0, "TransportReportInconsistent".to_string()),
+        (2, 4, 0, 0, 2, String::new()),
+        (2, 4, 0, 0, 2, "GrantDoesNotBindAttempt".to_string()),
+        (2, 4, 0, 0, 2, "TransportReportInconsistent".to_string()),
+        (2, 4, 0, 1, 1, String::new()),
+        (2, 4, 0, 1, 1, "GrantDoesNotBindAttempt".to_string()),
+        (2, 4, 0, 1, 1, "TransportReportInconsistent".to_string()),
+        (2, 4, 0, 2, 0, String::new()),
+        (2, 4, 0, 2, 0, "GrantDoesNotBindAttempt".to_string()),
+        (2, 4, 0, 2, 0, "TransportReportInconsistent".to_string()),
+        (
+            3,
+            3,
+            0,
+            0,
+            2,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (3, 3, 0, 0, 3, String::new()),
+        (
+            3,
+            3,
+            0,
+            1,
+            1,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (3, 3, 0, 1, 2, String::new()),
+        (
+            3,
+            3,
+            0,
+            2,
+            0,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (3, 3, 0, 2, 1, String::new()),
+        (3, 3, 0, 3, 0, String::new()),
+        (
+            3,
+            4,
+            0,
+            0,
+            2,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (3, 4, 0, 0, 3, String::new()),
+        (3, 4, 0, 0, 3, "GrantDoesNotBindAttempt".to_string()),
+        (3, 4, 0, 0, 3, "TransportReportInconsistent".to_string()),
+        (
+            3,
+            4,
+            0,
+            1,
+            1,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (3, 4, 0, 1, 2, String::new()),
+        (3, 4, 0, 1, 2, "GrantDoesNotBindAttempt".to_string()),
+        (3, 4, 0, 1, 2, "TransportReportInconsistent".to_string()),
+        (
+            3,
+            4,
+            0,
+            2,
+            0,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (3, 4, 0, 2, 1, String::new()),
+        (3, 4, 0, 2, 1, "GrantDoesNotBindAttempt".to_string()),
+        (3, 4, 0, 2, 1, "TransportReportInconsistent".to_string()),
+        (3, 4, 0, 3, 0, String::new()),
+        (3, 4, 0, 3, 0, "GrantDoesNotBindAttempt".to_string()),
+        (3, 4, 0, 3, 0, "TransportReportInconsistent".to_string()),
+        (3, 5, 0, 0, 3, String::new()),
+        (3, 5, 0, 0, 3, "GrantDoesNotBindAttempt".to_string()),
+        (3, 5, 0, 0, 3, "TransportReportInconsistent".to_string()),
+        (3, 5, 0, 1, 2, String::new()),
+        (3, 5, 0, 1, 2, "GrantDoesNotBindAttempt".to_string()),
+        (3, 5, 0, 1, 2, "TransportReportInconsistent".to_string()),
+        (3, 5, 0, 2, 1, String::new()),
+        (3, 5, 0, 2, 1, "GrantDoesNotBindAttempt".to_string()),
+        (3, 5, 0, 2, 1, "TransportReportInconsistent".to_string()),
+        (3, 5, 0, 3, 0, String::new()),
+        (3, 5, 0, 3, 0, "GrantDoesNotBindAttempt".to_string()),
+        (3, 5, 0, 3, 0, "TransportReportInconsistent".to_string()),
+        (
+            4,
+            4,
+            0,
+            0,
+            3,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (
+            4,
+            4,
+            0,
+            1,
+            2,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (
+            4,
+            4,
+            0,
+            2,
+            1,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (
+            4,
+            4,
+            0,
+            3,
+            0,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (
+            4,
+            5,
+            0,
+            0,
+            3,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (
+            4,
+            5,
+            0,
+            1,
+            2,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (
+            4,
+            5,
+            0,
+            2,
+            1,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+        (
+            4,
+            5,
+            0,
+            3,
+            0,
+            "TransportIssuedUnauthorizedRequests".to_string(),
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
 /// Rebuilds `every_non_poisoned_ledger_audit_is_accepted_by_the_frozen_compact_encoder` (removed):
 /// that test asserted the mirroring property over a hand-listed set of 6 states and missed the one
 /// that failed (no-dispatch recorded after an ambiguous, not just a decisive, attempt). This
 /// version generates every ledger state from a systematic matrix driven entirely through the real
 /// public API -- every 0-3-attempt outcome sequence, every terminal error path, with and without a
-/// preceding no-dispatch, with and without a preceding grant-without-attempt -- and asserts the
-/// mirroring property on each: a non-poisoned ledger's `audit()` is `Ok` and the frozen encoder
-/// accepts it, or the ledger is poisoned and `audit()` returns that same poison.
+/// preceding no-dispatch, with and without a preceding grant-without-attempt, and a **trailing**
+/// no-dispatch attempted immediately after the outcome sequence (closing the gap a prior version of
+/// this comment claimed was covered but was not: `record_no_dispatch` was previously only ever
+/// called *before* the sequence in this matrix) -- and asserts the mirroring property on every
+/// resulting state: a non-poisoned ledger's `audit()` is `Ok` and the frozen encoder accepts it, or
+/// the ledger is poisoned and `audit()` returns that same poison.
+///
+/// Most of the matrix's raw combinations collapse into the poison branch, and the loop bounds alone
+/// say nothing about how many distinct audited states that actually reaches, so this test does not
+/// assert a restated case count. It fingerprints every reachable state instead ([`
+/// ledger_state_fingerprint`]) and pins the exact resulting set against [`expected_reachable_states`].
 #[test]
 fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_audit_algebra() {
-    let mut case_count = 0usize;
+    let mut reachable_states = HashSet::new();
 
     for preceding_grant in [false, true] {
         for preceding_no_dispatch in [false, true] {
             for sequence in outcome_sequences() {
-                for terminal in TERMINAL_ACTIONS {
-                    let mut ledger = ProviderAttemptLedger::new();
-                    let label = format!(
-                        "preceding_grant={preceding_grant} preceding_no_dispatch=\
-                         {preceding_no_dispatch} sequence={sequence:?} terminal={terminal}"
+                let mut base_ledger = ProviderAttemptLedger::new();
+                let base_label = format!(
+                    "preceding_grant={preceding_grant} preceding_no_dispatch=\
+                     {preceding_no_dispatch} sequence={sequence:?}"
+                );
+
+                if preceding_grant {
+                    let (charge_authority, _calls) =
+                        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+                    let client = client_with(
+                        ProviderCapabilities::none(),
+                        charge_authority,
+                        UnwiredProviderTransport,
                     );
+                    let _ = client.execute(
+                        &mut base_ledger,
+                        &base_request(ProviderAttemptClass::Readiness),
+                    );
+                }
 
-                    if preceding_grant {
-                        let (charge_authority, _calls) =
-                            ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
-                        let client = client_with(
-                            ProviderCapabilities::none(),
-                            charge_authority,
-                            UnwiredProviderTransport,
-                        );
-                        let _ = client
-                            .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
-                    }
+                if preceding_no_dispatch {
+                    let _ = base_ledger.record_no_dispatch(&no_dispatch_proof());
+                }
 
-                    if preceding_no_dispatch {
-                        let _ = ledger.record_no_dispatch(&no_dispatch_proof());
-                    }
+                for outcome in &sequence {
+                    let outcome = *outcome;
+                    let (charge_authority, _calls) =
+                        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+                    let (transport, _calls2) = ScriptedTransport::new(move |_attempt| {
+                        Ok(ProviderAttemptReport {
+                            outcome,
+                            provider_requests_issued: 1,
+                        })
+                    });
+                    let client =
+                        client_with(ProviderCapabilities::none(), charge_authority, transport);
+                    let _ = client.execute(
+                        &mut base_ledger,
+                        &base_request(ProviderAttemptClass::Readiness),
+                    );
+                }
 
-                    for outcome in &sequence {
-                        let outcome = *outcome;
-                        let (charge_authority, _calls) =
-                            ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
-                        let (transport, _calls2) = ScriptedTransport::new(move |_attempt| {
-                            Ok(ProviderAttemptReport {
-                                outcome,
-                                provider_requests_issued: 1,
-                            })
-                        });
-                        let client =
-                            client_with(ProviderCapabilities::none(), charge_authority, transport);
-                        let _ = client
-                            .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
-                    }
+                // Trailing axis: attempt a no-dispatch immediately after the sequence, on a clone
+                // so it does not disturb the terminal-action states built below. Ok exactly when
+                // no attempt was ever issued and no no-dispatch was already recorded; otherwise
+                // NoDispatchNotPermitted, or the ledger's existing poison if it was already
+                // poisoned.
+                {
+                    let mut trailing_ledger = base_ledger.clone();
+                    let expected = match trailing_ledger.poisoned() {
+                        Some(poison) => Err(poison),
+                        None if trailing_ledger.attempt_count() != 0
+                            || trailing_ledger.no_dispatch_count() != 0 =>
+                        {
+                            Err(ProviderClientError::NoDispatchNotPermitted)
+                        }
+                        None => Ok(()),
+                    };
+                    let label = format!("{base_label} trailing_no_dispatch");
+                    assert_eq!(
+                        trailing_ledger.record_no_dispatch(&no_dispatch_proof()),
+                        expected,
+                        "case: {label}"
+                    );
+                    assert_mirrors_audit_algebra(&trailing_ledger, &label);
+                    reachable_states.insert(ledger_state_fingerprint(&trailing_ledger));
+                }
+
+                for terminal in TERMINAL_ACTIONS {
+                    let mut ledger = base_ledger.clone();
+                    let label = format!("{base_label} terminal={terminal}");
 
                     apply_terminal_action(terminal, &mut ledger);
 
-                    match ledger.poisoned() {
-                        Some(poison) => {
-                            assert_eq!(ledger.audit(), Err(poison), "case: {label}");
-                        }
-                        None => {
-                            let audit = ledger.audit().unwrap_or_else(|error| {
-                                panic!("case {label}: non-poisoned ledger must audit: {error}")
-                            });
-                            // ProviderAttemptLedger has no refund method at all, so this must
-                            // always be false.
-                            assert!(!audit.provider_authority_refunded, "case: {label}");
-                            validate_and_encode_object_store_provider_attempt_audit(
-                                &audit,
-                                &compact_receipt_limits(),
-                            )
-                            .unwrap_or_else(|error| {
-                                panic!(
-                                    "case {label}: audit must be accepted by the frozen encoder: \
-                                     {error:?}: {audit:?}"
-                                )
-                            });
-                        }
-                    }
-                    case_count += 1;
+                    assert_mirrors_audit_algebra(&ledger, &label);
+                    reachable_states.insert(ledger_state_fingerprint(&ledger));
                 }
             }
         }
     }
 
     assert_eq!(
-        case_count,
-        2 * 2 * outcome_sequences().len() * TERMINAL_ACTIONS.len(),
-        "matrix must enumerate every combination"
+        reachable_states,
+        expected_reachable_states(),
+        "the matrix's reachable-state set changed -- update expected_reachable_states() \
+         deliberately if this is an intended change to the algebra's reachable states"
     );
 }
 
