@@ -620,6 +620,57 @@ fn inert_state_inventory_is_exact() {
 // 8. Manifest SQL hygiene.
 // ---------------------------------------------------------------------------------------------
 
+/// Every ACL aggregate must order by values that are stable across clusters.
+///
+/// A role OID is assigned in creation order, so `ORDER BY entry.grantee` produces a different row
+/// order on a cluster whose roles were created in a different sequence. That does not make the
+/// pinned digest wrong, it makes it flaky, which is worse: the failure appears only on the cell you
+/// did not test on. The disposable-container live tier cannot catch this, because its role creation
+/// order is fixed, so the check has to be a source-level one.
+///
+/// This test exists because a review found five aggregates still ordering by OID after a commit
+/// that claimed to have fixed exactly that.
+#[test]
+fn every_acl_aggregate_orders_by_rendered_name_never_by_oid() {
+    let sql = CELL_CATALOG_MANIFEST_SQL;
+
+    // `aclexplode` yields (grantor, grantee, privilege_type, is_grantable). Every aggregate over it
+    // must render and sort by grantor and grantee, and must break ties on is_grantable, or two
+    // items differing only in those collide on every sort key and come back unordered.
+    let acl_aggregates = sql.matches("pg_catalog.aclexplode(").count();
+    assert!(
+        acl_aggregates >= 6,
+        "expected at least six aclexplode aggregates, found {acl_aggregates}"
+    );
+    assert_eq!(
+        sql.matches("pg_catalog.pg_get_userbyid(entry.grantor)")
+            .count(),
+        acl_aggregates * 2,
+        "each aclexplode aggregate must render the grantor AND sort by it"
+    );
+
+    // No ORDER BY key may be a raw OID column.
+    for raw_oid_key in [
+        "ORDER BY entry.grantee",
+        "ORDER BY role_oid",
+        "ORDER BY default_acl.defaclrole,",
+        "entry.grantee, entry.privilege_type)",
+    ] {
+        assert!(
+            !sql.contains(raw_oid_key),
+            "manifest SQL sorts by a raw OID: {raw_oid_key}"
+        );
+    }
+
+    // Every ACL aggregate ends its sort on is_grantable, the last discriminating column.
+    assert_eq!(
+        sql.matches("entry.privilege_type, entry.is_grantable)")
+            .count(),
+        acl_aggregates,
+        "each ACL aggregate must break its final tie on is_grantable"
+    );
+}
+
 #[test]
 fn catalog_manifest_sql_is_a_single_hygienic_read_only_statement() {
     assert_eq!(CELL_CATALOG_MANIFEST_SECTIONS.len(), 12);

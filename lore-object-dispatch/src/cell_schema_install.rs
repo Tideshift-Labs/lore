@@ -465,7 +465,7 @@ pub const CELL_CATALOG_MANIFEST_SECTIONS: [&str; 12] = [
     "rules_and_policies",
 ];
 
-/// One read-only statement producing the nine manifest sections, in
+/// One read-only statement producing the twelve manifest sections, in
 /// [`CELL_CATALOG_MANIFEST_SECTIONS`] order.
 ///
 /// Every aggregate is explicitly ordered so the manifest is deterministic. Every ACL is read
@@ -478,10 +478,14 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
       space.nspname,
       pg_catalog.pg_get_userbyid(space.nspowner),
       (SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
+         pg_catalog.pg_get_userbyid(entry.grantor),
          CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
               ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
          entry.privilege_type, entry.is_grantable
-       ) ORDER BY entry.grantee, entry.privilege_type)
+       ) ORDER BY pg_catalog.pg_get_userbyid(entry.grantor),
+                  CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
+                       ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
+                  entry.privilege_type, entry.is_grantable)
          FROM pg_catalog.aclexplode(
            COALESCE(space.nspacl, pg_catalog.acldefault('n', space.nspowner))
          ) AS entry)
@@ -554,10 +558,14 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
       type_state.typisdefined, type_state.typdelim, type_state.typnotnull,
       type_state.typdefault, pg_catalog.pg_get_userbyid(type_state.typowner),
       (SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
+         pg_catalog.pg_get_userbyid(entry.grantor),
          CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
               ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
          entry.privilege_type, entry.is_grantable
-       ) ORDER BY entry.grantee, entry.privilege_type)
+       ) ORDER BY pg_catalog.pg_get_userbyid(entry.grantor),
+                  CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
+                       ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
+                  entry.privilege_type, entry.is_grantable)
          FROM pg_catalog.aclexplode(
            COALESCE(type_state.typacl, pg_catalog.acldefault('T', type_state.typowner))
          ) AS entry)
@@ -585,12 +593,16 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
     SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
       procedure.proname,
       pg_catalog.pg_get_function_identity_arguments(procedure.oid),
+      pg_catalog.pg_get_userbyid(entry.grantor),
       CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
            ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
       entry.privilege_type, entry.is_grantable
     ) ORDER BY procedure.proname,
                pg_catalog.pg_get_function_identity_arguments(procedure.oid),
-               entry.grantee, entry.privilege_type)::text
+               pg_catalog.pg_get_userbyid(entry.grantor),
+               CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
+                    ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
+               entry.privilege_type, entry.is_grantable)::text
       FROM pg_catalog.pg_proc AS procedure
       JOIN pg_catalog.pg_namespace AS space ON space.oid = procedure.pronamespace
       CROSS JOIN LATERAL pg_catalog.aclexplode(
@@ -601,10 +613,15 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
   COALESCE((
     SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
       relation.relname,
+      pg_catalog.pg_get_userbyid(entry.grantor),
       CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
            ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
       entry.privilege_type, entry.is_grantable
-    ) ORDER BY relation.relname, entry.grantee, entry.privilege_type)::text
+    ) ORDER BY relation.relname,
+               pg_catalog.pg_get_userbyid(entry.grantor),
+               CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
+                    ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
+               entry.privilege_type, entry.is_grantable)::text
       FROM pg_catalog.pg_class AS relation
       JOIN pg_catalog.pg_namespace AS space ON space.oid = relation.relnamespace
       CROSS JOIN LATERAL pg_catalog.aclexplode(
@@ -614,11 +631,15 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
   ), '[]') || '|' || COALESCE((
     SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
       relation.relname, attribute.attname,
+      pg_catalog.pg_get_userbyid(entry.grantor),
       CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
            ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
       entry.privilege_type, entry.is_grantable
     ) ORDER BY relation.relname, attribute.attname,
-               entry.grantee, entry.privilege_type)::text
+               pg_catalog.pg_get_userbyid(entry.grantor),
+               CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
+                    ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
+               entry.privilege_type, entry.is_grantable)::text
       FROM pg_catalog.pg_class AS relation
       JOIN pg_catalog.pg_namespace AS space ON space.oid = relation.relnamespace
       JOIN pg_catalog.pg_attribute AS attribute ON attribute.attrelid = relation.oid
@@ -633,15 +654,17 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
       pg_catalog.pg_get_userbyid(default_acl.defaclrole),
       COALESCE(space.nspname, ''),
       default_acl.defaclobjtype,
+      pg_catalog.pg_get_userbyid(entry.grantor),
       CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
            ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
       entry.privilege_type, entry.is_grantable
     ) ORDER BY pg_catalog.pg_get_userbyid(default_acl.defaclrole),
                COALESCE(space.nspname, ''),
                default_acl.defaclobjtype,
+               pg_catalog.pg_get_userbyid(entry.grantor),
                CASE WHEN entry.grantee = 0 THEN 'PUBLIC'
                     ELSE pg_catalog.pg_get_userbyid(entry.grantee) END,
-               entry.privilege_type)::text
+               entry.privilege_type, entry.is_grantable)::text
       FROM pg_catalog.pg_default_acl AS default_acl
       -- LEFT JOIN, and schema-less entries are in scope. defaclnamespace is 0 for a
       -- default-privilege statement written without an IN SCHEMA clause, and no namespace has oid
@@ -697,18 +720,18 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
 /// Sections are in [`CELL_CATALOG_MANIFEST_SECTIONS`] order. Measured, not derived: see
 /// `tests/run-cell-schema-install-live.ps1`.
 pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
-    hex32("ad659e388e49dc7666f006ca9f7b598f59f133ff8e9c4d61a90f6d01cbd265a7"),
-    hex32("bacb6cf9f7b75490162883a1d628341aebb9d77bbbf48e2cee84e5f21ef6c8cf"),
-    hex32("e926ee2b4c879aa706209b29c9a2e9e0a5e664cdce60c5b7f0b6757d0915b709"),
-    hex32("6466061c5fa0fcf6ec39045c04ba05df71e4f6dcbd2d00d4a3e1e3bd3cde7a57"),
-    hex32("241b7d6b4a675b7ab5bb4b62d0a6d4eb15748fc057ab8f4f979f2cfb7922d434"),
-    hex32("8667b08b5a9da461c0b0a72cf0eb4a4940d780002ee2b2552d4e77d2d56e6a2f"),
-    hex32("e0089845a21d0fa195350ecbe39d1410c05823eec9081f3e8b1c025f17f7377b"),
-    hex32("c7829d074938d6ceec64c83640576b1f163fe731e9b4e3eec2939f6b35183e54"),
-    hex32("8a807de8704f40f36bf4102d9576523afab0359da8bf32b607c8955c1b39fadb"),
-    hex32("d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab"),
-    hex32("d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab"),
-    hex32("d51a543740627c0260abd1ea027bf7afd18eb9dff372c5857f2b8683f4ca4b7b"),
+    hex32("f468de7d148f5335b52a10c4298d609be546801754da1d991ff0ac7e7c0da0ca"),
+    hex32("14ce9d1c488912465cda1992122423aa87a51f94cb1e19ffaadbe4ca54cd36e8"),
+    hex32("0b870b9505e2aef59be9fbcf12b252f9e742ee4d09c644f45132d5fce44a2acb"),
+    hex32("282efc06669651d11437ebe91526b5387d5fe81830bc92a4479351341207191d"),
+    hex32("1eb1403b86f4983fad0312b455443a9cb9a70b97534366209e82170bfb80c6ae"),
+    hex32("f3b4ad7863d91864e60c763f922266fca10ebc1a900766f3bc568f4552e6911b"),
+    hex32("4c224663955226f3b8e30e8594348fe85d01a23443efd8e4a14bd2cf4d552377"),
+    hex32("9d83905855f4f18687e893f9c023e438c483d48b0c43831768e0d16fcc5e048d"),
+    hex32("e8614209f171b3478f4f30da3fc814d845a00d065f6569a77dd6ba67635a7539"),
+    hex32("971ec53fc27466c873c783701757e1434c20b383d23f081d918a2d6e4c797971"),
+    hex32("b5f633ebe7a54a9d43e75d043387b67cc659395fa8f0880a5c0d869a2b90fe81"),
+    hex32("444e1ca598f3a2dbe3601fdb803e2479f21b3b22fe4713d50f9a0e47fd7b73b2"),
 ];
 
 /// Pinned BLAKE3-256 of the complete manifest of a fully installed cell, PostgreSQL 16.
@@ -717,7 +740,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
 /// whose exact rendering is a server-version property. A different major version is expected to
 /// fail closed here and needs a re-measured pin, not a relaxed check.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_V1: [u8; 32] =
-    hex32("560d0e9412459e94e500e2af79e66219983412293fe3cc7f4c81a1a3c9f0f2b2");
+    hex32("16cecbef4a323b5fed204ff2a069f3d6f5f993247cde26775bdeeb27e9d5ec7d");
 
 /// Const hex decoder for the pinned digests above.
 const fn hex32(text: &str) -> [u8; 32] {
@@ -1262,6 +1285,14 @@ async fn assert_no_open_transaction(client: &Client) -> Result<(), CellSchemaErr
             let Some(database_error) = error.as_db_error() else {
                 return Err(CellSchemaError::Postgres);
             };
+            // 25P02 is a caller's transaction that is open AND already aborted. That is still "a
+            // transaction is open", and naming it beats the reason-less database error this
+            // module's own precondition discipline exists to avoid.
+            if database_error.code().code() == "25P02" {
+                return Err(CellSchemaError::Precondition(
+                    "install must not run inside an aborted transaction",
+                ));
+            }
             if database_error.code().code() == "25P01" {
                 Ok(())
             } else {
@@ -1298,8 +1329,13 @@ async fn assert_install_preconditions(client: &Client) -> Result<(), CellSchemaE
     // every check above and then fails at the first artifact's `SET LOCAL ROLE` as an opaque
     // database error with no carried reason, which is exactly the misleading-failure mode this
     // module's own `INHERIT FALSE` precondition exists to prevent.
+    // The two statements are issued separately so their failures cannot be confused. A failing
+    // `SET ROLE` is the finding; a failing `RESET ROLE` is a broken connection, and reporting it as
+    // a missing grant would be the misleading-diagnosis mode this whole precondition block exists
+    // to prevent. `RESET ROLE` is also not optional: leaving the session as the owner would change
+    // what every later statement runs as.
     if client
-        .batch_execute(&format!("SET ROLE {CELL_OWNER_ROLE}; RESET ROLE;"))
+        .batch_execute(&format!("SET ROLE {CELL_OWNER_ROLE};"))
         .await
         .is_err()
     {
@@ -1307,6 +1343,10 @@ async fn assert_install_preconditions(client: &Client) -> Result<(), CellSchemaE
             "owner membership must be WITH SET TRUE",
         ));
     }
+    client
+        .batch_execute("RESET ROLE;")
+        .await
+        .map_err(CellSchemaError::postgres)?;
     Ok(())
 }
 
@@ -1469,7 +1509,14 @@ async fn read_catalog_manifest(
         let text: String = row
             .try_get(index)
             .map_err(|_| CellSchemaError::InvalidResponse("catalog manifest section"))?;
-        sections[index] = *blake3::hash(text.as_bytes()).as_bytes();
+        // Domain-separated by section name. Without it two empty sections digest identically, and
+        // a transposed pin between them would be undetectable; the whole-manifest digest frames the
+        // name already, so only the per-section values needed this.
+        let mut section = blake3::Hasher::new();
+        section.update(name.as_bytes());
+        section.update(b"\n");
+        section.update(text.as_bytes());
+        sections[index] = *section.finalize().as_bytes();
         whole.update(name.as_bytes());
         whole.update(b"\n");
         whole.update(text.as_bytes());

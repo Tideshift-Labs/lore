@@ -208,6 +208,16 @@ GRANT object_dispatch_retention_owner TO object_dispatch_retention_migrator
 GRANT CREATE ON DATABASE <cell> TO object_dispatch_retention_owner;
 ```
 
+One further precondition, undocumented until a review pointed it out: **the cell database must hold
+no `pg_default_acl` rows at install time.** The `default_acls` manifest section is database-scoped
+on purpose, because a default privilege written without an `IN SCHEMA` clause has
+`defaclnamespace = 0` and still reaches functions created in `object_store_retention`. The pinned
+digest is therefore the digest of an empty `pg_default_acl`, which is what a freshly created
+database has and what a disposable test container has, but not necessarily what a database
+someone has already configured has. A cell that carries unrelated default privileges will fail
+attestation. That is fail-closed, not a hole, but it is a real deployment precondition rather than
+a property of the schema.
+
 ```sh
 $env:LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL = "postgresql://.../<cell>"
 cell-schema-install install    # apply the CR-033 D5 set in order, then attest

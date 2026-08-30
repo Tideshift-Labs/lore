@@ -474,6 +474,78 @@ async fn live_postgres_cell_schema_refuses_a_drifted_catalog() {
         .await
         .expect("attestation holds once every drift is rolled back");
 
+    // Both default-ACL cases above assert the same section name, so a regression that narrowed the
+    // section back to schema-less entries only would still pass both. Pin the distinction itself:
+    // the two forms must produce DIFFERENT manifest text, because one carries the schema name and
+    // the other carries the empty string.
+    let mut default_acl_texts = Vec::new();
+    for statement in [
+        "ALTER DEFAULT PRIVILEGES FOR ROLE object_dispatch_retention_owner
+         IN SCHEMA object_store_retention
+         GRANT EXECUTE ON FUNCTIONS TO object_dispatch_retention_runtime;",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE object_dispatch_retention_owner
+         GRANT EXECUTE ON FUNCTIONS TO object_dispatch_retention_runtime;",
+    ] {
+        cell.client
+            .batch_execute(&format!(
+                "BEGIN; SET LOCAL ROLE {CELL_OWNER_ROLE}; {statement}"
+            ))
+            .await
+            .expect("apply a default-privilege widening");
+        let text: String = cell
+            .client
+            .query_one(
+                lore_object_dispatch::cell_schema_install::CELL_CATALOG_MANIFEST_SQL,
+                &[],
+            )
+            .await
+            .expect("read the manifest")
+            .get(9);
+        assert_ne!(text, "[]", "the widening must be visible in default_acls");
+        default_acl_texts.push(text);
+        cell.client
+            .batch_execute("ROLLBACK;")
+            .await
+            .expect("roll back the widening");
+    }
+    assert!(
+        default_acl_texts[0].contains("object_store_retention"),
+        "the IN SCHEMA form must record its schema"
+    );
+    assert_ne!(
+        default_acl_texts[0], default_acl_texts[1],
+        "the schema-scoped and schema-less forms must be distinguishable in the manifest"
+    );
+
+    // `RetiredEntrypointUnexpectedFailure` is defence in depth and is NOT reachable through
+    // `attest_cell_schema` on a cell whose catalog still matches: every way to make a retired
+    // entrypoint fail differently also moves the manifest, and the catalog comparison runs first.
+    // Dropping the put-reservation readback proves exactly that ordering, which is the useful
+    // assertion available here. The variant covers the residual case where the pinned digest is
+    // stale but the entrypoint's behaviour changed; the offline redaction sweep constructs it, and
+    // no live case can, so this records the limitation rather than faking coverage for it.
+    cell.client
+        .batch_execute(&format!(
+            "BEGIN; SET LOCAL ROLE {CELL_OWNER_ROLE};
+             DROP FUNCTION object_store_retention.\
+             object_store_dispatch_put_reservation_read_state_v1(text);"
+        ))
+        .await
+        .expect("drop the retired readback");
+    assert_eq!(
+        attest_cell_schema(&cell.client).await,
+        Err(CellSchemaError::CatalogDrift("functions")),
+        "a dropped function is caught by the catalog comparison, before any retirement probe"
+    );
+    cell.client
+        .batch_execute("ROLLBACK;")
+        .await
+        .expect("restore the dropped readback");
+
+    attest_cell_schema(&cell.client)
+        .await
+        .expect("attestation holds after every probe is rolled back");
+
     // Attestation is documented as callable from inside a caller's open transaction. That is not
     // free: it probes two retired entrypoints with statements that are expected to fail, and a
     // failed statement aborts an open transaction. Prove the caller's transaction survives and can
