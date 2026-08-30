@@ -97,7 +97,14 @@ tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 
 [features]
 default = []
-oodle = ["lore-revision/oodle"]
+# `lore-postgres/oodle` is forwarded too, and must stay forwarded. It gates
+# nothing but a DIAGNOSTIC: CR-031's lifecycle coordinator has to tell a damaged
+# payload from an intact one this build has no codec for. Enabling the codec in
+# `lore-revision` without telling `lore-postgres` gives a server that can decode
+# a legacy Oodle2 object while reporting it unrepairable, which is the exact
+# misdiagnosis the distinction exists to prevent. Pinned by
+# `plugins::postgres::tests::the_oodle_feature_chain_reaches_lore_postgres`.
+oodle = ["lore-revision/oodle", "lore-postgres/oodle"]
 integration_tests = []
 test_random = []
 seeding = ["lore-revision/seeding"]

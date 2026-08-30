@@ -422,6 +422,39 @@ mod tests {
     use crate::plugins::MutableStorePluginContext;
     use crate::settings::Settings;
 
+    /// The `oodle` Cargo feature must reach `lore-postgres`, not only
+    /// `lore-revision`.
+    ///
+    /// `lore-postgres`'s copy gates no codec of its own. It gates a
+    /// **diagnostic**: CR-031's coordinator distinguishes a damaged payload
+    /// (repairable in band) from an intact one this build has no codec for
+    /// (needs a differently-built binary). A server whose codec is enabled but
+    /// whose coordinator does not know it would report a perfectly decodable
+    /// legacy Oodle2 object as unrepairable, sending an operator hunting for
+    /// damage that is not there.
+    ///
+    /// Cargo cannot express "these two features move together", so this is the
+    /// guard. It compiles in both configurations and fails only when the two
+    /// disagree, which is exactly the drift a hand-edited feature list produces.
+    #[test]
+    fn the_oodle_feature_chain_reaches_lore_postgres() {
+        use lore_base::types::FragmentFlags;
+        use lore_postgres::domain::fragments::DecodeSupport;
+        use lore_postgres::domain::fragments::decodable_encoding;
+
+        let verdict = decodable_encoding(FragmentFlags::PayloadCompressedOodle2.bits());
+        let expected = if cfg!(feature = "oodle") {
+            DecodeSupport::Supported
+        } else {
+            DecodeSupport::RecognizedUnsupported
+        };
+        assert_eq!(
+            verdict, expected,
+            "lore-server's `oodle` feature must forward to lore-postgres/oodle; \
+             without it the coordinator misreports a decodable Oodle2 object as unrepairable"
+        );
+    }
+
     async fn direct_client(url: &str) -> tokio_postgres::Client {
         let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
             .await
