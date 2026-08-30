@@ -498,6 +498,16 @@ async fn same_subject_under_different_issuers_is_foreign_for_every_owner_operati
         .await
         .expect("query owner B");
     assert_eq!((visible_a.len(), visible_b.len()), (1, 0));
+    let push_foreign = coordinator
+        .query(&repository_id, Some(&branch_id), None)
+        .await
+        .expect("query push authority")
+        .into_iter()
+        .any(|lock| lock.owner != owner_b);
+    assert!(
+        push_foreign,
+        "same subject under a different issuer must remain foreign at push preflight"
+    );
     assert_eq!(
         coordinator
             .status(&repository_id, &branch_id, &hash)
