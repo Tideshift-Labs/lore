@@ -28,9 +28,10 @@
 //! reads are forbidden, because the fork has been burned by body-versus-metadata
 //! divergence before (CR-010).
 //!
-//! `domain/locks/` is **not** in this package — it belongs to the lock-fencing
-//! package (CR-030). WP-116 owns only the transaction-local call site into it
-//! from the final-push coordinator. `domain/outbox/` is the CR-032 base only,
+//! `domain/locks/` is the separately owned lock-fencing package (CR-030),
+//! nested here only so it can reuse this coordinator's pool, receipt rail, and
+//! lock order. WP-116 owns only the transaction-local call site into it from
+//! the final-push coordinator. `domain/outbox/` is the CR-032 base only,
 //! and transfers to the relay package at `SCHEMA-119`.
 //!
 //! # What is here as of Phase 2
@@ -44,6 +45,7 @@ pub mod bypass;
 pub mod coordinator;
 pub mod errors;
 pub mod lock_order;
+pub mod locks;
 pub mod maintenance;
 pub mod outbox;
 pub mod postgres_coordinator;
