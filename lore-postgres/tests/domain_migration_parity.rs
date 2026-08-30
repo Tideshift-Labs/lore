@@ -4,9 +4,9 @@
 //!
 //! Applies `lore-postgres/migrations/0001_init.sql` wholesale to one throwaway
 //! database, boots `PostgresDomainStore::connect` (the real
-//! schema+mediated+outbox `ensure_schema` path plus SCHEMA-117's isolated
-//! migration fixture) against a second, and
-//! compares their `lore_domain_*`/`lore_outbox_*` catalog shape — tables,
+//! schema+mediated+outbox `ensure_schema` path plus SCHEMA-117's and
+//! SCHEMA-118's isolated migration fixtures) against a second, and
+//! compares their `lore_domain_*`/`lore_outbox_*`/`lore_fragment_*` catalog shape — tables,
 //! columns (name/type/nullability/default), constraints (via
 //! `pg_get_constraintdef`, which normalises to Postgres's parsed
 //! representation rather than raw DDL text, so this only fails on a real
@@ -20,6 +20,7 @@
 //! identities on one database.
 
 use lore_postgres::domain::PostgresDomainStore;
+use lore_postgres::domain::fragments::schema as fragment_schema;
 use lore_postgres::pool::TlsConfig;
 use lore_postgres::store::lock_store::PostgresLockStore;
 
@@ -39,6 +40,14 @@ const SCHEMA_117_RELATIONS: [&str; 4] = [
     "lore_domain_lock_backfill_quarantine",
     "lore_domain_lock_fence_seq",
 ];
+
+/// SCHEMA-118's own relation-presence probe (CR-031/WP-118), reused here
+/// rather than duplicated. `lore_fragment_fence_seq` is a sequence, not a
+/// table, and is deliberately not part of this constant; the catalog snapshot
+/// below covers it separately via `pg_sequences`.
+fn schema_118_relations() -> Vec<&'static str> {
+    fragment_schema::FRAGMENT_SCHEMA_RELATIONS.to_vec()
+}
 
 fn pg_url() -> String {
     std::env::var("LORE_TEST_PG_URL")
@@ -167,16 +176,27 @@ async fn table_snapshot(client: &tokio_postgres::Client, table: &str) -> Vec<Str
 }
 
 /// The full catalog snapshot: every domain/outbox table plus the legacy lock
-/// table extended by SCHEMA-117, and all domain sequences/functions/triggers.
+/// table extended by SCHEMA-117, the SCHEMA-118 fragment lifecycle tables, and
+/// all domain sequences/functions/triggers.
+///
+/// SCHEMA-118's tables are matched by their exact `FRAGMENT_SCHEMA_RELATIONS`
+/// names, not a `lore_fragment_%` LIKE pattern. The legacy CR-007 immutable
+/// store's own self-bootstrap tables (`lore_fragments`, `lore_fragment_state`,
+/// `lore_fragment_metering`) also match that prefix and are mirrored into
+/// `migrations/0001_init.sql`, but this test's runtime side never constructs a
+/// `PostgresImmutableStore` to create them — a LIKE pattern would make the
+/// migration snapshot see three tables the runtime snapshot never gets a
+/// chance to create, failing on a mismatch this test has no way to close and
+/// that has nothing to do with SCHEMA-118 parity.
 async fn domain_catalog_snapshot(client: &tokio_postgres::Client) -> Vec<String> {
     let tables = client
         .query(
             "SELECT table_name FROM information_schema.tables \
              WHERE table_schema = 'public' \
                AND (table_name LIKE 'lore_domain_%' OR table_name LIKE 'lore_outbox_%' \
-                    OR table_name = 'lore_locks') \
+                    OR table_name = ANY($1) OR table_name = 'lore_locks') \
              ORDER BY table_name",
-            &[],
+            &[&schema_118_relations()],
         )
         .await
         .expect("list domain/outbox tables");
@@ -195,7 +215,8 @@ async fn domain_catalog_snapshot(client: &tokio_postgres::Client) -> Vec<String>
         .query(
             "SELECT sequencename, start_value, min_value, max_value, increment_by, cycle \
                FROM pg_sequences WHERE schemaname = 'public' \
-                AND sequencename LIKE 'lore_domain_%' ORDER BY sequencename",
+                AND (sequencename LIKE 'lore_domain_%' OR sequencename = 'lore_fragment_fence_seq') \
+              ORDER BY sequencename",
             &[],
         )
         .await
@@ -254,14 +275,16 @@ async fn domain_catalog_snapshot(client: &tokio_postgres::Client) -> Vec<String>
 ///
 /// The runtime side boots exactly as `lore-server/src/server.rs` does — the
 /// domain store first, the legacy lock-store plugin second — and the test
-/// first asserts what that boot does *not* create: every SCHEMA-117 relation is
-/// still absent, because CR-030 N-7 keeps that DDL migration-owned. Skipping
-/// straight to `bootstrap()` proved parity against a fixture production never
-/// executes and hid the fact that a booted cell has no fenced schema at all
-/// (INV-EE P0-1).
+/// first asserts what that boot does *not* create: every SCHEMA-117 AND
+/// SCHEMA-118 relation is still absent, because CR-030 N-7 and CR-031 both
+/// keep their DDL migration-owned. Skipping straight to `bootstrap()` proved
+/// parity against a fixture production never executes and hid the fact that a
+/// booted cell has no fenced schema at all (INV-EE P0-1); CR-031 repeats that
+/// exact lesson for fragment lifecycle routing.
 ///
-/// Only then does it install `LOCK_SCHEMA` through the isolated fixture and
-/// compare the full catalogs, which is the "two declarations, one shape" claim.
+/// Only then does it install `LOCK_SCHEMA` and `FRAGMENT_SCHEMA` through their
+/// isolated fixtures and compare the full catalogs, which is the "two
+/// declarations, one shape" claim for both CR-030 and CR-031.
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
 async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs() {
@@ -300,6 +323,26 @@ async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_cat
     assert!(!readiness.provisioned);
     assert!(!readiness.fencing_enabled);
 
+    // Same shape, one Lore change request over: SCHEMA-118's fragment
+    // lifecycle DDL is migration-owned too (CR-031), kept out of both the
+    // legacy immutable store's self-bootstrap and this same
+    // `PostgresDomainStore::connect` path, so a cell the migration has not
+    // reached must answer "not provisioned" here as well.
+    for relation in schema_118_relations() {
+        assert!(
+            !relation_exists(&runtime_client, relation).await,
+            "the boot-time ensure_schema path must not create the migration-owned \
+             SCHEMA-118 relation {relation}"
+        );
+    }
+    let fragment_readiness = runtime_store
+        .fragment_coordinator()
+        .readiness()
+        .await
+        .expect("fragment readiness on a cell the migration has not reached must not error");
+    assert!(!fragment_readiness.provisioned);
+    assert!(!fragment_readiness.lifecycle_enabled);
+
     let _runtime_lock_store = PostgresLockStore::connect(&runtime_url, 2, &TlsConfig::default())
         .await
         .expect("boot the legacy lock store, as the plugin does after the domain store");
@@ -308,6 +351,11 @@ async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_cat
         .bootstrap()
         .await
         .expect("install SCHEMA-117 through the isolated runtime fixture");
+    runtime_store
+        .fragment_coordinator()
+        .bootstrap()
+        .await
+        .expect("install SCHEMA-118 through the isolated runtime fixture");
 
     let migration_snapshot = domain_catalog_snapshot(&migration_client).await;
     let runtime_snapshot = domain_catalog_snapshot(&runtime_client).await;
