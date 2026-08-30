@@ -4,7 +4,8 @@
 //!
 //! Applies `lore-postgres/migrations/0001_init.sql` wholesale to one throwaway
 //! database, boots `PostgresDomainStore::connect` (the real
-//! schema+mediated+outbox `ensure_schema` path) against a second, and
+//! schema+mediated+outbox `ensure_schema` path plus SCHEMA-117's isolated
+//! migration fixture) against a second, and
 //! compares their `lore_domain_*`/`lore_outbox_*` catalog shape — tables,
 //! columns (name/type/nullability/default), constraints (via
 //! `pg_get_constraintdef`, which normalises to Postgres's parsed
@@ -192,9 +193,14 @@ async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_cat
         .await
         .expect("apply migrations/0001_init.sql wholesale to the migration-side database");
 
-    let _runtime_store = PostgresDomainStore::connect(&runtime_url, 2, &TlsConfig::default())
+    let runtime_store = PostgresDomainStore::connect(&runtime_url, 2, &TlsConfig::default())
         .await
         .expect("boot PostgresDomainStore against the runtime-side database");
+    runtime_store
+        .lock_coordinator()
+        .bootstrap()
+        .await
+        .expect("install SCHEMA-117 through the isolated runtime fixture");
     let runtime_client = pg_client(&runtime_url).await;
 
     let migration_snapshot = domain_catalog_snapshot(&migration_client).await;

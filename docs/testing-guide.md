@@ -340,16 +340,9 @@ will update an older check constraint or state schema.
   namespace instead of the exhausted one (confirmed: both quota tests passed for the wrong reason —
   a fresh empty quota — until fixed with a `same_namespace_key(base, operation_id)` helper that copies
   the identity fields and varies only `operation_id`). This file caught and confirmed two now-fixed
-  defects, each with its own regression test: `receipt_get`'s `PREPARED` branch used to skip the
-  `hard_expires_at` check `prepare`/`consume` both apply (contradicting `expire_prepared`'s own "every
-  prepare, get, and consume touch" doc comment) — `receipt_get_of_a_past_ttl_prepared_row`; and
-  `load_future_marker` used to ignore the caller's binding entirely, so a differently-bound
-  `prepare`/`receipt_get` against an existing marker returned that marker's outcome regardless —
-  the two `..._under_a_different_binding_must_return_mismatch` tests. A concurrency test
-  (`tokio::join!` of two `prepare` calls against one identical beyond-horizon key, matching
-  `concurrency.rs`'s pattern) pins the fix for a third: `insert_future_marker`'s
-  `ON CONFLICT DO NOTHING` used to increment the quota unconditionally, over-counting a concurrent
-  duplicate permanently; it now gates the increment on rows-affected. `domain_obliterate_fence.rs`
+  regressions: past-TTL PREPARED reads, differently-bound future markers, and concurrent duplicate
+  future prepares (the quota increment must be gated on marker rows-affected).
+  `domain_obliterate_fence.rs`
   covers `begin_obliterate`'s generation fence both ways (live advances by one; tombstoned refuses
   with `TOMBSTONED_V1`, generation unchanged) plus push-versus-obliterate agreement: `branch_push_commit`
   refuses the pre-obliteration generation and accepts the post-obliteration one.
@@ -363,6 +356,13 @@ will update an older check constraint or state schema.
   Mediated-schema setup seeds the singleton global counter at revision 0/quota 1; first
   materialization provisions the org row at revision/count 0 and atomically charges both. A
   capacity-revision rejection case must reread the seeded revision before submitting a mismatch.
+- **CR-030 lock fencing [SERVER, WP-117]**: the runner pins 14 ignored cases in
+  `domain_lock_fencing.rs`, each in a fresh database. Batch tests need distinct earlier-sorted keys
+  plus a shared later key (three rows expose a committed loser). Receipt-first tests block the repo
+  row and expect SQLSTATE 55P03 from a receipt `FOR UPDATE NOWAIT`; lease tests hold the namespace
+  lock past the lease, then require a full lease. Only `tests/run-lock-fencing-live.ps1` is evidence.
+  The offline `lore-server/tests/wp117_push_witness_wiring.rs` pins unconditional capture before
+  both v0/v1 CR-019 guards and its no-foreign-lock early return.
 - **CR-029 WP-116 Phase 4, gRPC metadata carriage, status mapping, and the admission gate
   [SERVER]**: offline, no Postgres. `domain_operation_metadata.rs`'s `extract`/`require` (R-BLOCK-2's
   one-reader header contract) and `scope_key_*` (R-BLOCK-5) are pinned in an inline `tests` module:
