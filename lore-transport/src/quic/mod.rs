@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 pub mod client;
 pub mod command_header;
@@ -83,6 +84,11 @@ pub enum QuicClientError {
     NotFound,
     #[error("Oversized fragment rejected by server")]
     Oversized,
+    /// The session id offered was not issued on the connection the command was about to be
+    /// written to. Raised at the write boundary, before any byte is framed, so the command was
+    /// not dispatched and the caller's session layer can resolve a replacement and try again.
+    #[error("Session id does not belong to the current connection")]
+    SessionRebindRequired,
 }
 
 #[derive(Debug)]

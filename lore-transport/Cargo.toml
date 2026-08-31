@@ -39,3 +39,9 @@ zerocopy = { workspace = true }
 
 [features]
 trace_log = ["lore-base/trace_log"]
+# Exposes seams a test in another crate needs and production must not have. Today: forging a
+# session-id-to-connection-generation binding, which is exactly what the QUIC write boundary
+# exists to make impossible (INV-EO P0-1). The WP-108 regression suite forges one deliberately,
+# to prove the SERVER's half of that fix holds against a client that did emit a stale id. Off by
+# default, and no production build turns it on.
+test_seams = []

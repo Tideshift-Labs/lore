@@ -54,6 +54,7 @@ use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
 use crate::quic::client::CongestionAlgorithm;
 use crate::replay::MutableOutcome;
+use crate::replay::OutcomeUnknown;
 use crate::replay::ReplayClass;
 use crate::replay::storage_replay_class;
 use crate::traits::Storage;
@@ -310,11 +311,21 @@ impl StorageClient {
         };
 
         if payload.len() != size_of::<Hash>() {
-            return Err(ProtocolError::internal(format!(
-                "mutable_cas: Invalid server response, expected {} bytes got {}",
+            // Reported as unknown, not as an error, and the difference is a retry. The swap was
+            // dispatched and the server answered it, so it may well have been applied; only its
+            // result is unreadable. A plain `Err` here says "this call produced no result",
+            // which `StorageSession::attempt` is entitled to treat as repeatable — and repeating
+            // a compare-and-swap that already moved the key is the defect the whole replay
+            // contract exists to prevent. `Unknown` carries the one instruction that is true
+            // either way: do not repeat it, read the key back.
+            lore_debug!(
+                "mutable_cas: invalid server response, expected {} bytes got {}",
                 size_of::<Hash>(),
                 payload.len()
-            )));
+            );
+            return Ok(MutableOutcome::Unknown(OutcomeUnknown {
+                command: storage_service::command_name(&Command::MutableCas),
+            }));
         }
 
         Ok(MutableOutcome::Applied(Hash::from(&payload[..])))
@@ -366,10 +377,16 @@ impl StorageClient {
 
         // Response should be 2 bytes: corrupted + healed
         if payload.len() != 2 {
-            return Err(ProtocolError::internal(format!(
-                "verify: Invalid server payload for address {address}, got {} bytes",
+            // Unknown rather than an error, for the reason given at the same point in
+            // `send_mutable_cas`: the server answered, so a healing verify may already have
+            // written, and only the result is unreadable. An error here would be repeatable.
+            lore_debug!(
+                "verify: invalid server payload for address {address}, got {} bytes",
                 payload.len()
-            )));
+            );
+            return Ok(MutableOutcome::Unknown(OutcomeUnknown {
+                command: storage_service::command_name(&Command::Verify),
+            }));
         }
 
         Ok(MutableOutcome::Applied(VerifyResult {
@@ -475,6 +492,13 @@ impl Storage for StorageClient {
         partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError> {
+        // Sampled before the request goes out, never after. If the connection is replaced while
+        // this call is in flight, the id the server returns belongs to a connection that is
+        // already gone, and recording the older generation is what makes the send path refuse it
+        // and the session layer rebind. Sampling after the answer would record the generation the
+        // id was never issued on, which is the defect this whole path exists to prevent.
+        let generation = self.quic.connection_generation();
+
         // Fetch auth token via token exchange (cached if already exchanged).
         // The credentials are read here, not at construction: the server checks
         // storage authorization at each session start, so a session opened later
@@ -522,13 +546,20 @@ impl Storage for StorageClient {
         }
 
         let session_id = u32::from_le_bytes(response[..4].try_into().unwrap());
+        self.quic.register_session(session_id, generation);
         Ok(session_id)
     }
 
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {
         if !self.quic.has_streams().await {
+            self.quic.forget_session(session_id);
             return Ok(());
         }
+        // Stopping a session puts its id on the wire like any other command, so it goes through
+        // the same write-boundary check and is refused if the connection that issued the id has
+        // been replaced. The result is discarded, as it always was: a stop that does not reach
+        // the server costs nothing, because the server reaps every session of a connection when
+        // that connection closes.
         let _ = send_normal(
             self.quic.clone(),
             Command::Authorize as QuicOpCode,
@@ -537,6 +568,7 @@ impl Storage for StorageClient {
             &mut [Bytes::default(), Bytes::from_static(&[1u8])],
         )
         .await;
+        self.quic.forget_session(session_id);
         Ok(())
     }
 
@@ -871,10 +903,20 @@ impl Storage for StorageClient {
             .await
     }
 
-    /// The QUIC connection's generation counter. Each reconnect gives the server a fresh
-    /// session namespace, so this is what an issued session id is only valid within.
+    /// The QUIC connection's reconnect counter. Zero once reconnection has given up, which the
+    /// session layer reads as "no replacement is coming" rather than as a new generation.
     fn connection_epoch(&self) -> u32 {
         self.quic.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Which underlying connection is installed. Moves at the swap, before `connection_epoch`
+    /// does, which is why the session layer binds to this one.
+    fn connection_generation(&self) -> u32 {
+        self.quic.connection_generation()
+    }
+
+    fn forget_session(&self, session_id: u32) {
+        self.quic.forget_session(session_id);
     }
 
     async fn close(&self) {

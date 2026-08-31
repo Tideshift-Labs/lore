@@ -50,7 +50,7 @@ struct SessionBinding {
     storage: Arc<dyn Storage>,
     /// The server-assigned session id and the connection generation it was assigned on.
     ///
-    /// A storage session belongs to one connection. Holding the id without the epoch it came
+    /// A storage session belongs to one connection. Holding the id without the generation it came
     /// from is what lets an id from a replaced connection reach a server that never issued it,
     /// so the two are stored together and read together.
     session: Mutex<BoundSession>,
@@ -67,44 +67,41 @@ struct SessionBinding {
 
 /// A session id and the connection generation it is valid on.
 ///
-/// `epoch` is `None` for a session that is known to be gone, which is not the same as one
-/// bound to some particular generation: there is no epoch value that could stand for it, since
-/// every value the transport reports is a generation a session could legitimately hold.
+/// `generation` is `None` for a session that is known to be gone, which is not the same as one
+/// bound to some particular generation: there is no generation value that could stand for it,
+/// since every value the transport reports is one a session could legitimately hold.
 #[derive(Clone, Copy)]
 struct BoundSession {
     id: u32,
-    epoch: Option<u32>,
+    generation: Option<u32>,
 }
 
 impl SessionBinding {
     /// The session id to send on the connection as it is now, starting a replacement session
     /// first if the connection has been replaced since this one was issued.
     ///
-    /// The epoch is sampled before `session_start` rather than after, so a connection replaced
-    /// again mid-call records the older generation and the next caller rebinds. That costs an
-    /// extra round trip in a rare race, which is the way round this has to fail.
+    /// The generation is sampled before `session_start` rather than after, so a connection
+    /// replaced again mid-call records the older generation and the next caller rebinds. That
+    /// costs an extra round trip in a rare race, which is the way round this has to fail.
     ///
-    /// What this guarantees is that no id is *handed out* for a generation it did not come
-    /// from. It does not guarantee the id is still current when the bytes reach the socket.
-    /// `send_with_reconnect` re-reads the epoch after its permit wait, which is the longest
-    /// block in the path, and refuses rather than sending. Three awaits still follow that
-    /// check inside `send_command_tracked` — growing a stream, taking the connection read
-    /// lock, and taking the writer — and the read lock is the one a reconnect holds in write
-    /// mode while it swaps the connection, so a whole reconnect can land between the check and
-    /// the write. A stale id sent in that window is rejected by the server, and
-    /// [`StorageSession::attempt`] rebinds and retries: the window is closed after the fact,
-    /// not before. Closing it beforehand needs this binding's epoch threaded down to the
-    /// write, which the send path's future-size bound does not currently have room for.
+    /// What this guarantees is that no id is *handed out* for a generation it did not come from.
+    /// It does not guarantee the id is still current when the bytes reach the socket, because
+    /// awaits follow: growing a stream, taking the connection read lock, taking the writer. That
+    /// remainder is not left to the server to catch. The QUIC send path repeats the check at the
+    /// write boundary, inside the read lock a reconnect must take in write mode to replace the
+    /// connection, and refuses to frame an id whose generation has moved
+    /// (`QuicConnection::session_is_current`). So the window is closed before the write, not
+    /// after it, and [`StorageSession::attempt`] turns the refusal into a rebind and one retry.
     async fn session_id(&self) -> Result<u32, ProtocolError> {
-        let current = self.storage.connection_epoch();
+        let current = self.storage.connection_generation();
         if let Some(id) = self.bound_to(current) {
             return Ok(id);
         }
 
         let _flight = self.rebind.lock().await;
         // Re-read under the guard: whoever held it before us may already have rebound, and the
-        // epoch may have moved again while we waited.
-        let current = self.storage.connection_epoch();
+        // generation may have moved again while we waited.
+        let current = self.storage.connection_generation();
         if let Some(id) = self.bound_to(current) {
             return Ok(id);
         }
@@ -118,24 +115,39 @@ impl SessionBinding {
             .await?;
         *self.session.lock() = BoundSession {
             id,
-            epoch: Some(current),
+            generation: Some(current),
         };
         Ok(id)
     }
 
-    /// The session id if it belongs to `epoch`, otherwise nothing.
-    fn bound_to(&self, epoch: u32) -> Option<u32> {
+    /// The session id if it belongs to `generation`, otherwise nothing.
+    fn bound_to(&self, generation: u32) -> Option<u32> {
         let bound = *self.session.lock();
-        (bound.epoch == Some(epoch)).then_some(bound.id)
+        (bound.generation == Some(generation)).then_some(bound.id)
     }
 
-    /// Force the next use to start a replacement session, whatever the epoch reads as.
+    /// The id and the generation it is bound to, whatever either reads as. For the cleanup paths,
+    /// which have to decide whether a stop is still worth sending.
+    fn bound(&self) -> BoundSession {
+        *self.session.lock()
+    }
+
+    /// Force the next use to start a replacement session, whatever the generation reads as.
     ///
     /// Used when the connection was replaced under a command: the id we hold belongs to the
-    /// generation that is gone, and the epoch comparison alone is not enough to say so at
+    /// generation that is gone, and the generation comparison alone is not enough to say so at
     /// every moment we might look.
+    ///
+    /// The transport is told to forget the id too. Nothing else will: this session will never
+    /// send a `session_stop` for an id it has given up on, so without this the transport's
+    /// id-to-generation record would keep it until the connection is replaced or closed.
     fn unbind(&self) {
-        self.session.lock().epoch = None;
+        let abandoned = {
+            let mut bound = self.session.lock();
+            bound.generation = None;
+            bound.id
+        };
+        self.storage.forget_session(abandoned);
     }
 }
 
@@ -170,13 +182,13 @@ enum SessionInner {
 impl StorageSession {
     /// Construct an already-resolved session. Used by the connection internals
     /// after a successful `session_start` RPC.
-    /// `epoch` is the connection generation `session_id` was issued on, sampled before the
+    /// `generation` is the connection generation `session_id` was issued on, sampled before the
     /// `session_start` that produced it.
     pub(crate) fn resolved(
         storage: Arc<dyn Storage>,
         connection: Arc<Connection>,
         session_id: u32,
-        epoch: u32,
+        generation: u32,
         partition: Partition,
         correlation_id: Arc<str>,
     ) -> Self {
@@ -186,7 +198,7 @@ impl StorageSession {
                     storage,
                     session: Mutex::new(BoundSession {
                         id: session_id,
-                        epoch: Some(epoch),
+                        generation: Some(generation),
                     }),
                     rebind: TokioMutex::new(()),
                     partition,
@@ -300,20 +312,31 @@ impl StorageSession {
             attempts_left -= 1;
             // Resolves the session, and starts a replacement first if the connection has moved
             // on since this one was issued.
-            let (storage, session_id) = self.ensure().await?;
-            let epoch = storage.connection_epoch();
+            let binding = self.binding().await?;
+            let session_id = binding.session_id().await?;
+            let storage = binding.storage.clone();
 
             let error = match operation(storage.clone(), session_id).await {
                 Ok(value) => return Ok(value),
                 Err(error) => error,
             };
 
-            // Retry only when the connection was actually replaced under the command. Zero is
-            // the transport's "reconnection gave up" sentinel rather than a new generation, so
-            // it is not a replacement to rebind onto — reading it as one spends the last
-            // attempt on a connection that is never coming back.
-            let epoch_now = storage.connection_epoch();
-            if attempts_left == 0 || epoch_now == epoch || epoch_now == GAVE_UP_EPOCH {
+            // Retry only when *this session's own binding* stopped being valid, which is the one
+            // condition a rebind can repair.
+            //
+            // Not "the connection generation moved", which is what this used to ask and which is
+            // a different question with a worse answer. A command whose session was already
+            // rebound before it ran, and which then failed because the server refused it, would
+            // read a moved generation and be dispatched a second time — and a server error means
+            // an answer arrived, not that nothing was applied. Asking about the binding instead
+            // makes the retry conditional on the failure being one a replacement session could
+            // have avoided: a session resolved on the current generation is still current after
+            // an ordinary failure, so that failure is returned rather than repeated.
+            //
+            // A zero epoch is consulted for its own separate meaning: reconnection has given up,
+            // so there is nothing to rebind onto and spending the last attempt is waste.
+            let rebindable = binding.bound_to(storage.connection_generation()).is_none();
+            if attempts_left == 0 || !rebindable || storage.connection_epoch() == GAVE_UP_EPOCH {
                 return Err(error);
             }
 
@@ -370,18 +393,6 @@ impl StorageSession {
                 }
             }
         }
-    }
-
-    /// Get the resolved `(storage, session_id)` pair, driving the pending resolver on first
-    /// call. All operation methods go through here.
-    ///
-    /// The id is bound to the connection generation it was issued on, so this is also where a
-    /// replaced connection gets its replacement session. Two steps because the projection out
-    /// of the resolver cannot await and starting a session can.
-    async fn ensure(&self) -> Result<(Arc<dyn Storage>, u32), ProtocolError> {
-        let binding = self.binding().await?;
-        let session_id = binding.session_id().await?;
-        Ok((binding.storage.clone(), session_id))
     }
 
     /// The resolved session binding, driving the pending resolver on first call.
@@ -661,19 +672,19 @@ impl Drop for StorageSession {
         // refcount reaches zero.
         if let SessionInner::Resolved(r) = &self.inner {
             let storage = r.binding.storage.clone();
-            let bound = *r.binding.session.lock();
+            let bound = r.binding.bound();
             // Stopping a session is still putting its id on the wire, so it obeys the same rule
             // as every other command: only on the connection that issued it. A session from a
             // replaced connection needs no stop — the server drops the whole session map with
             // the connection — and sending one would be the exact defect this fix removes.
             //
             // The check has to be inside the task, not here. `Drop` only decides to try; the
-            // connection can be replaced before the task runs, `session_stop` carries no epoch
-            // guard of its own, and its result is discarded, so a stale id sent from here would
-            // go out unnoticed by anything.
-            if let Some(epoch) = bound.epoch {
+            // connection can be replaced before the task runs, `session_stop` carries no
+            // generation guard of its own, and its result is discarded, so a stale id sent from
+            // here would go out unnoticed by anything.
+            if let Some(generation) = bound.generation {
                 lore_base::lore_spawn_net!(async move {
-                    if storage.connection_epoch() == epoch {
+                    if storage.connection_generation() == generation {
                         let _ = storage.session_stop(bound.id).await;
                     }
                 });
@@ -722,13 +733,41 @@ impl SessionPool {
 struct PoolEntry {
     /// Weak ref to the live pool. If upgradeable, every session it owns is in use.
     pool: Weak<SessionPool>,
-    /// Server-assigned session IDs aligned with `storages`, for sending
-    /// `session_stop` if this entry is replaced.
-    session_ids: Vec<u32>,
-    /// Weak refs to the storages each session was started on, aligned with
-    /// `session_ids`. If a `Weak` no longer upgrades, the connection is gone
-    /// and the server already cleaned up -- no stop needed.
-    storages: Vec<Weak<dyn Storage>>,
+    /// The server-side sessions this entry owns, for stopping if it is replaced.
+    cleanup: Vec<CleanupTarget>,
+}
+
+/// A server-side session a cleanup path may still have to stop.
+///
+/// The generation is carried alongside the id, not dropped as it once was. A cleanup vector is
+/// built at one moment and drained at another, and a bare id from the connection in between can
+/// name a live session on its replacement — stopping which removes somebody else's working
+/// session (INV-EO P0-2).
+#[derive(Clone)]
+struct CleanupTarget {
+    /// Server-assigned session id.
+    id: u32,
+    /// The connection generation `id` was issued on.
+    generation: u32,
+    /// The storage the session was started on. If the `Weak` no longer upgrades, the connection
+    /// is gone and the server has already reaped the session — no stop needed.
+    storage: Weak<dyn Storage>,
+}
+
+/// Stop each session that is still live on the connection that issued it, and skip the rest.
+///
+/// The generation is compared here, immediately before the send, rather than when the vector was
+/// built: the whole hazard is the connection being replaced in between.
+async fn stop_sessions(targets: Vec<CleanupTarget>) {
+    for target in targets {
+        let Some(storage) = target.storage.upgrade() else {
+            continue;
+        };
+        if storage.connection_generation() != target.generation {
+            continue;
+        }
+        let _ = storage.session_stop(target.id).await;
+    }
 }
 
 /// Result of the synchronous `DashMap` entry check in
@@ -739,8 +778,7 @@ enum PoolOutcome {
     /// We replaced an expired entry -- we own the new pool, must stop the old sessions.
     Replaced {
         pool: Arc<SessionPool>,
-        old_session_ids: Vec<u32>,
-        old_storages: Vec<Weak<dyn Storage>>,
+        old_cleanup: Vec<CleanupTarget>,
     },
     /// Another task won the race -- use the winner, stop our server-side sessions.
     RaceLost { winner: Arc<SessionPool> },
@@ -847,9 +885,9 @@ impl StorageConnector {
                 // Sampled before the call, so a connection replaced while `session_start` is in
                 // flight leaves the session bound to the older generation and the first use
                 // rebinds. The other order would record a generation the id was never valid on.
-                let epoch = storage.connection_epoch();
+                let generation = storage.connection_generation();
                 let session_id = storage.session_start(partition, &correlation_id).await?;
-                started.lock().push((storage, session_id, epoch));
+                started.lock().push((storage, session_id, generation));
                 Ok::<_, ProtocolError>(())
             });
         }
@@ -874,21 +912,26 @@ impl StorageConnector {
         let correlation: Arc<str> = Arc::from(correlation_id);
         let sessions: Vec<Arc<StorageSession>> = started
             .iter()
-            .map(|(storage, session_id, epoch)| {
+            .map(|(storage, session_id, generation)| {
                 Arc::new(StorageSession::resolved(
                     storage.clone(),
                     connection.clone(),
                     *session_id,
-                    *epoch,
+                    *generation,
                     partition,
                     correlation.clone(),
                 ))
             })
             .collect();
         let pool = Arc::new(SessionPool::new(sessions));
-        let session_ids: Vec<u32> = started.iter().map(|(_, id, _)| *id).collect();
-        let storages: Vec<Weak<dyn Storage>> =
-            started.iter().map(|(s, _, _)| Arc::downgrade(s)).collect();
+        let cleanup: Vec<CleanupTarget> = started
+            .iter()
+            .map(|(storage, id, generation)| CleanupTarget {
+                id: *id,
+                generation: *generation,
+                storage: Arc::downgrade(storage),
+            })
+            .collect();
 
         // Try to insert under the entry lock (synchronous only -- no .await).
         let outcome = {
@@ -902,25 +945,21 @@ impl StorageConnector {
                         PoolOutcome::RaceLost { winner: alive }
                     } else {
                         // Expired entry -- take old info for cleanup, replace with ours.
-                        let old_session_ids = std::mem::take(&mut e.get_mut().session_ids);
-                        let old_storages = std::mem::take(&mut e.get_mut().storages);
+                        let old_cleanup = std::mem::take(&mut e.get_mut().cleanup);
                         e.insert(PoolEntry {
                             pool: Arc::downgrade(&pool),
-                            session_ids: session_ids.clone(),
-                            storages: storages.clone(),
+                            cleanup: cleanup.clone(),
                         });
                         PoolOutcome::Replaced {
                             pool: pool.clone(),
-                            old_session_ids,
-                            old_storages,
+                            old_cleanup,
                         }
                     }
                 }
                 dashmap::mapref::entry::Entry::Vacant(v) => {
                     v.insert(PoolEntry {
                         pool: Arc::downgrade(&pool),
-                        session_ids: session_ids.clone(),
-                        storages: storages.clone(),
+                        cleanup: cleanup.clone(),
                     });
                     PoolOutcome::Inserted { pool: pool.clone() }
                 }
@@ -929,26 +968,14 @@ impl StorageConnector {
 
         match outcome {
             PoolOutcome::Inserted { pool } => Ok(pool),
-            PoolOutcome::Replaced {
-                pool,
-                old_session_ids,
-                old_storages,
-            } => {
+            PoolOutcome::Replaced { pool, old_cleanup } => {
                 // Stop expired sessions outside the lock.
-                for (id, storage) in old_session_ids.into_iter().zip(old_storages) {
-                    if let Some(storage) = storage.upgrade() {
-                        let _ = storage.session_stop(id).await;
-                    }
-                }
+                stop_sessions(old_cleanup).await;
                 Ok(pool)
             }
             PoolOutcome::RaceLost { winner } => {
                 // Stop every server-side session we just started -- the winner owns this key.
-                for (id, storage) in session_ids.into_iter().zip(storages) {
-                    if let Some(storage) = storage.upgrade() {
-                        let _ = storage.session_stop(id).await;
-                    }
-                }
+                stop_sessions(cleanup).await;
                 Ok(winner)
             }
         }

@@ -1393,6 +1393,13 @@ impl Storage for GRPCStorage {
     fn connection_epoch(&self) -> u32 {
         GRPC_STATIC_SESSION_EPOCH
     }
+
+    /// Constant, for the same reason [`Storage::connection_epoch`] is: this client's sessions do
+    /// not belong to a connection generation, so there is no generation for one to stop
+    /// belonging to.
+    fn connection_generation(&self) -> u32 {
+        GRPC_STATIC_SESSION_EPOCH
+    }
 }
 
 /// The epoch every gRPC storage connection reports. See [`Storage::connection_epoch`].

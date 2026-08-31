@@ -254,6 +254,27 @@ pub trait Storage: Send + Sync {
     /// inheriting a default that describes a different transport's lifecycle.
     fn connection_epoch(&self) -> u32;
 
+    /// The connection generation a session id issued now would belong to.
+    ///
+    /// Distinct from [`Storage::connection_epoch`], which counts completed reconnects and is
+    /// therefore published only once a replacement connection is usable. This moves the instant
+    /// the underlying connection is replaced, which is the instant every session id issued on the
+    /// previous one stops being sendable. The session layer binds to this value, and the QUIC
+    /// send path refuses an id whose generation no longer matches.
+    ///
+    /// No default, for the same reason [`Storage::connection_epoch`] has none: a transport whose
+    /// sessions outlive its connections has to say so by returning a constant.
+    fn connection_generation(&self) -> u32;
+
+    /// Drop any client-side record of `session_id`, without telling the server.
+    ///
+    /// For a session abandoned rather than stopped — [`crate::session::StorageSession::invalidate`]
+    /// gives up an id it will never send a `session_stop` for, and nothing else would ever clear
+    /// it. The default does nothing, which is correct for a transport that keeps no such record.
+    fn forget_session(&self, session_id: u32) {
+        let _ = session_id;
+    }
+
     /// [`Storage::put`], reporting a dispatched request whose response was lost as
     /// [`MutableOutcome::Unknown`] instead of an error.
     ///

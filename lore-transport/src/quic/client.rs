@@ -341,6 +341,27 @@ pub struct QuicConnection {
     last_send: AtomicU64,
     last_recv: Arc<AtomicU64>,
     pub epoch: AtomicU32,
+    /// Which underlying connection the streams inside `connection` belong to.
+    ///
+    /// Distinct from `epoch`, and not interchangeable with it. `epoch` counts *completed*
+    /// reconnects: it is bumped after the replacement connection has been installed, its first
+    /// stream opened, and its authorization run, so that a command waiting on a reconnect learns
+    /// there is something usable to retry on. Between the swap and that bump, the streams are
+    /// already the replacement's while `epoch` still reads the old value — which is exactly the
+    /// state in which a session id from the old connection would be framed onto the new one.
+    ///
+    /// This counter is bumped inside the same write-lock section that swaps the connection, so a
+    /// reader holding the read lock sees either the old connection with the old value or the new
+    /// connection with the new one, and never a mixture. That is what makes it usable as the
+    /// binding token at the write boundary.
+    generation: AtomicU32,
+    /// The generation each live server-side session id was issued on.
+    ///
+    /// The send path has the id but not the generation it came from, and threading one down
+    /// through every `Storage` method would put it in the read path's future, which is size
+    /// bounded. Recording it here instead keeps the answer reachable from the one place that can
+    /// act on it — inside the read lock, immediately before the writer is taken.
+    sessions: dashmap::DashMap<u32, u32>,
     max_reconnects: Option<u32>,
     reconnect_guard: Semaphore,
     counter: AtomicU32,
@@ -367,6 +388,8 @@ impl QuicConnection {
             last_send: AtomicU64::new(0),
             last_recv: Arc::new(AtomicU64::new(0)),
             epoch: AtomicU32::new(1),
+            generation: AtomicU32::new(1),
+            sessions: dashmap::DashMap::new(),
             max_reconnects: None,
             reconnect_guard: Semaphore::new(1),
             counter: AtomicU32::new(0),
@@ -376,6 +399,64 @@ impl QuicConnection {
             max_chunk_size,
             v4,
         }
+    }
+
+    /// The connection generation a session id issued right now would belong to.
+    ///
+    /// Sample this *before* asking the server for a session, never after: a connection replaced
+    /// while `session_start` is in flight leaves the id recorded against the older generation,
+    /// which costs a rebind. Sampling afterwards would record a generation the id was never valid
+    /// on, which costs correctness.
+    pub fn connection_generation(&self) -> u32 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Record that the server issued `session_id` on `generation`.
+    ///
+    /// Crate-visible, and it has to stay that way. The registry is what the write boundary
+    /// consults, so anything able to write it can mark an arbitrary id current on an arbitrary
+    /// connection and put P0-1 straight back. The invariant it depends on — the generation was
+    /// sampled *before* the `session_start` whose id this is — is held by the single caller in
+    /// `quic/storage_service/client.rs`, and keeping the writer inside this crate is what makes
+    /// that an invariant rather than a convention.
+    ///
+    /// The WP-108 regression suite does need to forge one from another crate, to prove the
+    /// server's half of the fix holds against a client that did emit a stale id. It reaches
+    /// [`QuicConnection::register_session_for_test`], behind the `test_seams` feature, rather
+    /// than through this.
+    pub(crate) fn register_session(&self, session_id: u32, generation: u32) {
+        if session_id != 0 {
+            self.sessions.insert(session_id, generation);
+        }
+    }
+
+    /// Forge a session-id-to-generation binding. Tests only, and gated so it cannot be reached
+    /// from a production build.
+    ///
+    /// A test in another crate uses this to put a session id on the wire that this connection
+    /// never earned — the one thing [`QuicConnection::session_is_current`] exists to prevent —
+    /// so that the server's independent defence can be exercised on its own. If you are reaching
+    /// for this outside a test, the answer is no: call `session_start`.
+    #[cfg(feature = "test_seams")]
+    pub fn register_session_for_test(&self, session_id: u32, generation: u32) {
+        self.register_session(session_id, generation);
+    }
+
+    /// Forget a session that has been stopped, or whose stop was attempted.
+    pub(crate) fn forget_session(&self, session_id: u32) {
+        self.sessions.remove(&session_id);
+    }
+
+    /// Whether `session_id` was issued on the connection as it is now.
+    ///
+    /// Answers `false` for an id this connection never issued as well as for one issued on a
+    /// generation that has been replaced, because the two are the same thing to a send: neither
+    /// may go on the wire. Call it while holding the connection read lock, so the answer cannot
+    /// be invalidated by a swap before the writer is taken.
+    fn session_is_current(&self, session_id: u32) -> bool {
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|generation| *generation == self.connection_generation())
     }
 
     pub async fn create_initial_stream(&self) -> Result<(), QuicClientError> {
@@ -587,14 +668,14 @@ where
                 service_client.map_send_error(request_type, SendWithReconnectError::PermitAcquire)
             );
         };
-        // Waiting for a permit can take arbitrarily long under load, which makes it the one
-        // place a connection is likely to be replaced between the caller resolving its session
-        // and this sending. Re-read before framing anything, so a session id issued on the
-        // generation that is now gone is not written to its replacement.
-        if session_id != 0 && service_client.quic().epoch.load(Ordering::Relaxed) != epoch {
-            return Err(service_client
-                .map_send_error(request_type, SendWithReconnectError::SessionRebindRequired));
-        }
+        // No session check here any more, deliberately. One used to sit at this point, comparing
+        // the epoch after the permit wait, and it was unsound in both directions: it could not
+        // see a connection replaced during the awaits that follow it, and the epoch it compared
+        // is published after the swap rather than at it. The check now lives at the write
+        // boundary inside `send_command_tracked`, under the connection read lock and in the same
+        // section that takes the writer, where nothing can invalidate it before the bytes are
+        // framed. Removing it here also keeps its captured epoch out of this future, which is
+        // size bounded by `test_futures_size`.
         match send_command_tracked::<HIGH_PRIORITY>(
             service_client.quic().clone(),
             request_type.into(),
@@ -693,6 +774,14 @@ where
         // establishes a replacement connection, runs a replacement `session_start`, or sends an
         // epoch-N+1 byte on behalf of a command that must not be repeated.
         QuicClientError::Terminated | QuicClientError::StreamOpen => Verdict::Reconnect,
+        // The write boundary refused the id. Reconnecting is the one thing that must not happen:
+        // the connection is fine, it is the id that is stale, and retrying here would spend the
+        // budget re-offering the same stale id. The session layer resolves a replacement session
+        // and re-enters with a valid one.
+        QuicClientError::SessionRebindRequired => Verdict::Failed(
+            service_client
+                .map_send_error(request_type, SendWithReconnectError::SessionRebindRequired),
+        ),
         // The server did answer, but the answer may be a consequence of something else
         // replacing the connection under us.
         _ => {
@@ -1341,14 +1430,28 @@ where
                 let connection_id = quic_connection.stable_id();
 
                 {
-                    let mut connection = connection.connection.write().await;
-                    for reader in connection.reader.drain(..) {
+                    let mut connection_lock = connection.connection.write().await;
+                    for reader in connection_lock.reader.drain(..) {
                         let _ = reader.task.await;
                     }
 
-                    connection.reader = vec![];
-                    connection.writer = vec![];
-                    connection.connection = quic_connection;
+                    connection_lock.reader = vec![];
+                    connection_lock.writer = vec![];
+                    connection_lock.connection = quic_connection;
+                    // Under the same write guard as the swap, so no send can observe the
+                    // replacement streams while still reading the generation the sessions on the
+                    // old connection were issued on. `epoch` cannot serve here: it is bumped
+                    // below, after the first stream and the authorization, and a send landing in
+                    // between would pass an epoch check and then write onto the new connection.
+                    //
+                    // The ids are dropped rather than left to age out. Every one of them belongs
+                    // to the connection that is gone, and dropping them bounds the map to the
+                    // sessions actually live on the connection in hand. A `register_session`
+                    // still in flight records the generation it sampled before its
+                    // `session_start`, so an insert landing after this clear is refused by the
+                    // generation comparison rather than resurrected by it.
+                    connection.generation.fetch_add(1, Ordering::Relaxed);
+                    connection.sessions.clear();
                 }
 
                 let restart_flow = connection
@@ -1658,6 +1761,32 @@ async fn send_command_tracked<const HIGH_PRIORITY: bool>(
         if connection_lock.reader.is_empty() {
             lore_debug!("No quic stream available when sending command");
             return Err(SendFailure::not_dispatched(QuicClientError::StreamOpen));
+        }
+
+        // The write boundary. Everything above is a caller's intent; from here the id is framed
+        // and handed to a stream, so this is the last moment at which "is this id valid on the
+        // connection I am about to write to" is still answerable — and the first at which the
+        // answer cannot go stale, because a reconnect has to take this lock in write mode to
+        // replace the connection, and cannot until the writer below has been taken.
+        //
+        // Refusing is the whole point. A session id the server issued on a connection that has
+        // since been replaced is not merely unknown to the replacement: the replacement is free
+        // to have issued the same number to a live session of its own, in which case the command
+        // would be applied under that session's repository, user and permissions (INV-EO P0-1).
+        // Nothing downstream can detect that, because the server answers it normally, so it is
+        // refused here or not at all.
+        //
+        // The guard is released at the end of this block, before the write below, and the check
+        // still holds afterwards for a reason worth stating because a refactor can destroy it:
+        // the writer taken here is an `Arc` over one of *this* generation's `SendStream`s. A
+        // reconnect replaces the vector, but this clone keeps pointing at a stream of the
+        // connection that was closed, so a write after a swap fails rather than landing on the
+        // replacement. Resolving the writer again after the guard drops — or reaching for
+        // `connection.connection` below — would reopen P0-1.
+        if session_id != 0 && !connection.session_is_current(session_id) {
+            return Err(SendFailure::not_dispatched(
+                QuicClientError::SessionRebindRequired,
+            ));
         }
 
         // Select stream based on priority, computed inside lock to avoid living across await points
@@ -1983,5 +2112,295 @@ mod tests {
         );
 
         task.abort();
+    }
+
+    /// A live loopback QUIC connection, self-signed and unverified (mirrors `connect()`'s own
+    /// `validate_server_certificate: false` path). `session_is_current` and its two writers
+    /// never touch the socket -- only `generation`/`sessions` -- but `QuicConnection` has no
+    /// constructor that does not require a real `quinn::Connection`, so this builds the
+    /// cheapest one that satisfies the type. Held connections/endpoints are leaked into the
+    /// returned `JoinHandle` rather than gracefully closed; the process exits at the end of the
+    /// test binary regardless, and this keeps the fixture to what the pin actually needs.
+    async fn loopback_quic_connection() -> (quinn::Connection, tokio::task::JoinHandle<()>) {
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::PrivateKeyDer;
+        use rustls::pki_types::pem::PemObject;
+
+        const ALPN: &str = "lore-transport-client-test-loopback";
+
+        let cert = crate::tls::generate_self_signed(vec!["localhost".to_string()])
+            .expect("self-signed cert");
+        let cert_der = CertificateDer::from_pem_slice(cert.cert_pem.as_bytes())
+            .expect("parse self-signed cert")
+            .into_owned();
+        let key_der =
+            PrivateKeyDer::from_pem_slice(cert.key_pem.as_bytes()).expect("parse self-signed key");
+
+        let mut server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("server crypto config");
+        server_crypto.alpn_protocols = vec![ALPN.as_bytes().to_vec()];
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+                .expect("quic server crypto"),
+        ));
+
+        let server_endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
+                .expect("bind server endpoint");
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        // Accept exactly one connection and hold both it and the endpoint alive for as long as
+        // the caller keeps the returned task around.
+        let accept_task = lore_base::lore_spawn!(async move {
+            let incoming = server_endpoint.accept().await.expect("incoming connection");
+            let _connection = incoming.await.expect("server-side handshake");
+            std::future::pending::<()>().await
+        });
+
+        let client_crypto = client_crypto_config(
+            ALPN,
+            CertificateSettings {
+                custom_ca: None,
+                client: None,
+            },
+            false,
+        )
+        .expect("client crypto config");
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(client_crypto).expect("quic client crypto"),
+        ));
+        let mut client_endpoint =
+            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("bind client endpoint");
+        client_endpoint.set_default_client_config(client_config);
+        let quinn_connection = client_endpoint
+            .connect(server_addr, "localhost")
+            .expect("start connect")
+            .await
+            .expect("client-side handshake");
+
+        (quinn_connection, accept_task)
+    }
+
+    /// The INV-EO P0-1 client-side pin, isolated from the (non-deterministic) reconnect race
+    /// itself: `session_is_current` must answer purely from `generation`/`sessions`, so this
+    /// drives it directly rather than trying to force a real reconnect mid-command.
+    ///
+    /// This is the client half of the two-layer fix; the server half (no two `SessionMap`s ever
+    /// issue the same id) is pinned independently by
+    /// `lore-server/src/protocol/storage/session.rs`'s `two_maps_never_issue_the_same_session_id`,
+    /// and the end-to-end wire behavior (both layers composed, through a real loopback server)
+    /// by `lore-integration-tests/tests/quic_session_rebind_test.rs`'s R1/R2.
+    #[tokio::test]
+    async fn a_session_id_stops_being_current_once_its_generation_is_replaced() {
+        let (quinn_connection, accept_task) = loopback_quic_connection().await;
+        let quic = QuicConnection::with_v4(quinn_connection, 65536, true);
+
+        assert!(
+            !quic.session_is_current(7),
+            "an id this connection never issued must never be current"
+        );
+
+        let generation_before = quic.connection_generation();
+        quic.register_session(7, generation_before);
+        assert!(
+            quic.session_is_current(7),
+            "an id just registered on the connection's current generation must be current"
+        );
+
+        // Simulate the generation bump `establish_quic_connection`'s reconnect performs inside
+        // the connection write-lock section, at the swap -- the one property `session_is_current`
+        // exists to check. `sessions` is deliberately left un-cleared here (a real reconnect also
+        // clears it, see `client.rs`'s connection-swap block) so this test isolates the
+        // generation *comparison* itself from that separate cleanup step.
+        quic.generation.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(
+            quic.connection_generation(),
+            generation_before,
+            "the simulated reconnect must have moved the generation"
+        );
+        assert!(
+            !quic.session_is_current(7),
+            "an id registered on a generation that has since been replaced must stop being \
+             current, even though its entry is still physically present in the sessions map"
+        );
+
+        // A session registered AFTER the bump, on the new generation, is current.
+        let generation_after = quic.connection_generation();
+        quic.register_session(9, generation_after);
+        assert!(
+            quic.session_is_current(9),
+            "an id registered on the connection's current generation is current"
+        );
+        assert!(
+            !quic.session_is_current(7),
+            "the old id must remain stale even after a newer id is registered"
+        );
+
+        // `forget_session` removes an entry outright, not just marking it stale.
+        quic.forget_session(9);
+        assert!(
+            !quic.session_is_current(9),
+            "a forgotten session id must stop being current"
+        );
+
+        // register_session(0, ..) is a no-op: 0 is the wire's "no session" sentinel and must
+        // never occupy an entry, matching `send_command_tracked`'s own `session_id != 0` guard.
+        quic.register_session(0, generation_after);
+        assert!(
+            !quic.session_is_current(0),
+            "id 0 must never become current -- it names no session on the wire"
+        );
+
+        accept_task.abort();
+    }
+
+    #[derive(Debug)]
+    struct MockError(String);
+
+    impl std::fmt::Display for MockError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::error::Error for MockError {}
+
+    /// Never called by `classify` (it touches only `replay_class`/`map_send_error`), but every
+    /// `ServiceClient` needs one to construct.
+    struct NoopAuthAdapter;
+
+    #[async_trait]
+    impl AuthAdapter for NoopAuthAdapter {
+        type ErrorType = MockError;
+
+        async fn initial_authorize(
+            &self,
+            _connection: Arc<QuicConnection>,
+        ) -> Result<(), MockError> {
+            Ok(())
+        }
+
+        async fn reconnect_authorize(
+            &self,
+            _connection: Arc<QuicConnection>,
+        ) -> Result<(), QuicClientError> {
+            Ok(())
+        }
+
+        fn client_certs(&self) -> CertificateSettings {
+            CertificateSettings {
+                custom_ca: None,
+                client: None,
+            }
+        }
+    }
+
+    /// Minimal `ServiceClient` for exercising `classify` directly. `quic` is real (`classify`
+    /// never calls `.quic()`, but the trait requires a valid `&Arc<QuicConnection>` to exist to
+    /// return one) -- see `loopback_quic_connection`. `map_send_error` records the
+    /// `SendWithReconnectError` variant it was given as text, via `{:?}`, so the test can assert
+    /// exactly which arm fired without needing a richer mock error type.
+    struct MockServiceClient {
+        quic: Arc<QuicConnection>,
+        auth_adapter: Arc<dyn AuthAdapter<ErrorType = MockError>>,
+    }
+
+    impl ServiceClient for MockServiceClient {
+        const ALPN: &'static str = "mock/0";
+        const DEFAULT_PORT: u16 = 0;
+        type RequestType = QuicOpCode;
+        type ErrorType = MockError;
+
+        async fn acquire_command_permit(&self) -> Option<SemaphorePermit<'_>> {
+            None
+        }
+
+        fn quic(&self) -> &Arc<QuicConnection> {
+            &self.quic
+        }
+
+        fn endpoint_config(&self) -> EndpointConfig {
+            EndpointConfig {
+                remote_url: "lore://127.0.0.1:0".to_string(),
+                default_port: 0,
+                sni_override: None,
+            }
+        }
+
+        fn alpn(&self) -> &str {
+            Self::ALPN
+        }
+
+        fn map_send_error(
+            &self,
+            _failed_request: Self::RequestType,
+            error: SendWithReconnectError,
+        ) -> Self::ErrorType {
+            MockError(format!("{error:?}"))
+        }
+
+        fn auth_adapter(&self) -> &Arc<dyn AuthAdapter<ErrorType = Self::ErrorType>> {
+            &self.auth_adapter
+        }
+
+        fn transport_config(&self) -> TransportConfig {
+            TransportConfig {
+                max_bytes_bandwidth_per_second: (1024 * 1024 * 1024) / 8,
+                expected_rtt_ms: DEFAULT_EXPECTED_RTT_MS,
+                congestion_algorithm: CongestionAlgorithm::Bbr,
+                initial_cwnd: None,
+            }
+        }
+
+        fn replay_class(&self, _request: Self::RequestType) -> ReplayClass {
+            // Irrelevant here: `classify`'s `SessionRebindRequired` arm is checked after the
+            // ambiguity check, but `SessionRebindRequired` is only ever raised for a command
+            // that was NOT dispatched (`send_command_tracked`'s write-boundary refusal, before
+            // any byte is framed), so `outcome_is_unknown` is false regardless of this value.
+            ReplayClass::ReadRetryable
+        }
+
+        fn request_name(&self, _request: Self::RequestType) -> &'static str {
+            "mock"
+        }
+    }
+
+    /// INV-EO P0-1's write-boundary refusal (`QuicClientError::SessionRebindRequired`) must
+    /// become `Verdict::Failed`, never `Verdict::Reconnect`. Reconnecting would spend the
+    /// caller's retry budget re-offering the exact same stale id to the exact same connection
+    /// generation that just refused it -- see `classify`'s own doc comment on this arm.
+    #[tokio::test]
+    async fn classify_maps_session_rebind_required_to_failed_not_reconnect() {
+        let (quinn_connection, accept_task) = loopback_quic_connection().await;
+        let mock = MockServiceClient {
+            quic: Arc::new(QuicConnection::with_v4(quinn_connection, 65536, true)),
+            auth_adapter: Arc::new(NoopAuthAdapter),
+        };
+
+        let failure = SendFailure::not_dispatched(QuicClientError::SessionRebindRequired);
+        const PUT_OPCODE: QuicOpCode = 2; // storage_service::Command::Put's wire value
+        let verdict = classify(&mock, PUT_OPCODE, 1, &failure);
+
+        match verdict {
+            Verdict::Failed(MockError(message)) => {
+                assert!(
+                    message.contains("SessionRebindRequired"),
+                    "expected the SessionRebindRequired arm to have produced the error, got \
+                     {message:?}"
+                );
+            }
+            Verdict::Reconnect => panic!(
+                "a refused stale session id must not be retried by reconnecting -- the id is \
+                 stale, not the connection"
+            ),
+            Verdict::Unknown => panic!(
+                "SessionRebindRequired is raised before any byte is dispatched, so it can never \
+                 be the ambiguous case"
+            ),
+        }
+
+        accept_task.abort();
     }
 }

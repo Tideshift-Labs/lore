@@ -49,7 +49,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 lore-server = { workspace = true }
-lore-transport = { workspace = true }
+lore-transport = { workspace = true, features = ["test_seams"] }
 rcgen = { workspace = true }
 
 [features]
