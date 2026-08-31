@@ -33,7 +33,9 @@ mod quic_session_rebind_tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use bytes::BufMut;
     use bytes::Bytes;
+    use bytes::BytesMut;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Hash;
     use lore_base::types::KeyType;
@@ -65,10 +67,20 @@ mod quic_session_rebind_tests {
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use lore_transport::quic::QuicOpCode;
+    use lore_transport::quic::client::CertificateSettings;
+    use lore_transport::quic::client::CongestionAlgorithm;
+    use lore_transport::quic::client::DEFAULT_EXPECTED_RTT_MS;
+    use lore_transport::quic::client::EndpointConfig;
+    use lore_transport::quic::client::QuicConnection;
+    use lore_transport::quic::client::TransportConfig;
+    use lore_transport::quic::client::connect as raw_quic_connect;
+    use lore_transport::quic::client::send_normal;
     use lore_transport::quic::command_header::CommandHeader;
     use lore_transport::quic::storage_service::Command;
+    use lore_transport::quic::storage_service::MAX_CHUNK_SIZE;
     use rand::random;
     use tracing::Span;
+    use zerocopy::IntoBytes;
 
     use crate::common::net_common::bind_matched_pair;
     use crate::setup_execution;
@@ -1497,4 +1509,393 @@ mod quic_session_rebind_tests {
     // `send_normal_with_reconnect`/`send_normal_with_reconnect_outcome` with its own dedicated
     // `Command` variant, never a shared or inferred one. No test function: there is nothing left
     // to assert once the call-site sweep confirms this structurally -- B12 already covers it.
+
+    // ── Phase C: INV-EO P0-1/P0-2 -- server-side session-id aliasing across connections ──
+    //
+    // INV-EO (2026-08-31 independent review) found the rebinding core was NOT sound: the
+    // deliberately-open client race window (documented at `session.rs:87-97`, not
+    // deterministically reproducible in a test -- see this file's top comment) could hand a
+    // STALE numeric session id to a REPLACEMENT connection. That id used to be accepted
+    // whenever it happened to exist in the replacement connection's own `SessionMap`, because
+    // each accepted QUIC connection's `SessionMap` counter independently restarted at 1, so two
+    // live sessions on two DIFFERENT connections routinely got the exact same numeric id.
+    //
+    // Fixed (2026-08-31) in two independent layers -- see the `lore-transport-client` skill for
+    // the full contract:
+    //   - SERVER: session ids now come from one process-wide `NEXT_SESSION_ID` sequence,
+    //     randomised at start rather than fixed at 1 (`lore-server/src/protocol/storage/
+    //     session.rs`), so no two `SessionMap`s ever issue the same id and one loreserver
+    //     process's ids are not predictable from another's. Allocation claims the id through
+    //     `DashMap`'s vacant-entry API rather than blind-inserting, so a post-wrap collision with
+    //     a still-live entry is redrawn rather than silently overwriting it.
+    //   - CLIENT: `QuicConnection` records the connection generation each session id was issued
+    //     on (`register_session`) and `send_command_tracked` refuses to frame an id whose
+    //     generation has moved, at the write boundary, inside the same lock section a reconnect
+    //     must take to swap the connection (`QuicConnection::session_is_current`).
+    //
+    // R1/R2 below reproduce the fully deterministic SERVER-side half specifically: no reconnect,
+    // no timing race, two ordinary connections and a hand-framed command, with the client's own
+    // write-boundary gate deliberately forced open (see R1's doc comment) so a failure here is
+    // proof of the server's own defense, not just the client's. `register_session` itself is
+    // `pub(crate)` to `lore-transport` -- marking an arbitrary id current on an arbitrary
+    // connection from ANY linking crate would reopen INV-EO P0-1 by another door. This file
+    // instead calls `QuicConnection::register_session_for_test`, a `pub` forwarder gated behind
+    // `lore-transport`'s `test_seams` cargo feature (enabled for this crate in
+    // `lore-integration-tests/Cargo.toml`) -- forging that state deliberately, from this one
+    // named door, is how the server half of the fix gets exercised on its own, independent of
+    // the client layer it must not depend on. The client gate's own correctness is pinned
+    // separately and deterministically in `lore-transport/src/quic/client.rs`'s
+    // `quic::client::tests::a_session_id_stops_being_current_once_its_generation_is_replaced`.
+    //
+    // No test here may assume a session id is small, starts at a fixed value, or is contiguous
+    // with another -- `NEXT_SESSION_ID` starts at a random `u32` and is shared with whatever
+    // else in this test binary happens to be running concurrently.
+
+    /// A bare QUIC connection to the recording server, with no `StorageSession`/`StorageClient`
+    /// wrapping. Gives R1/R2 direct control of the wire framing via [`send_normal`] -- exactly
+    /// what is needed to send a session id issued to a DIFFERENT connection, which is what the
+    /// documented client race (INV-EO P0-1/P0-2) would emit. Mirrors `StorageClient::connect`'s
+    /// own low-level setup (`quic/storage_service/client.rs:129-203`), minus the auth-adapter
+    /// and credential plumbing this auth-OFF harness never exercises -- `CertificateSettings`
+    /// below is byte-for-byte what `StorageClientAuth::client_certs()`
+    /// (`quic/storage_service/auth.rs`) returns, and `lore://` (not `lores://`) means the
+    /// server certificate is never validated, exactly as for every other connection in this
+    /// file.
+    async fn raw_quic_connection(port: u16) -> Arc<QuicConnection> {
+        let quinn_connection = raw_quic_connect(
+            &EndpointConfig {
+                remote_url: format!("lore://127.0.0.1:{port}"),
+                default_port: port,
+                sni_override: None,
+            },
+            CertificateSettings {
+                custom_ca: None,
+                client: None,
+            },
+            TEST_PROTOCOL_V4,
+            TransportConfig {
+                max_bytes_bandwidth_per_second: (1024 * 1024 * 1024) / 8,
+                expected_rtt_ms: DEFAULT_EXPECTED_RTT_MS,
+                congestion_algorithm: CongestionAlgorithm::Bbr,
+                initial_cwnd: None,
+            },
+        )
+        .await
+        .expect("raw QUIC connect to the recording server");
+
+        let quic = Arc::new(QuicConnection::with_v4(
+            quinn_connection,
+            MAX_CHUNK_SIZE,
+            true,
+        ));
+        quic.create_initial_stream()
+            .await
+            .expect("raw QUIC initial stream");
+        quic.stream_count
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        quic
+    }
+
+    /// Send a real `Command::Authorize` (session_start) on `quic`, framed exactly as
+    /// `StorageClient::session_start` does (`quic/storage_service/client.rs:473-526`): the byte
+    /// layout is action(1=0), partition(16), corr_len(1), corr(N), token_len(2, u16 LE),
+    /// token(M). The token is empty because this harness's `auth_url` is always empty (auth is
+    /// off), matching production's own
+    /// `if !self.auth_url.is_empty() { .. } else { String::new() }` branch. Also mirrors
+    /// production's post-fix bookkeeping (`StorageClient::session_start`'s
+    /// `self.quic.register_session(session_id, generation)`, `pub(crate)` to `lore-transport` --
+    /// reached here through the `test_seams`-gated `register_session_for_test` forwarder
+    /// instead): without it, `quic`'s own `sessions` map would stay empty forever and the
+    /// client-side write-boundary check (`QuicConnection::session_is_current`, `quic/client.rs`)
+    /// would refuse even this connection's own legitimately-issued id on every later send.
+    /// Returns the server-assigned session id.
+    async fn raw_session_start(
+        quic: &Arc<QuicConnection>,
+        partition: RepositoryId,
+        correlation_id: &str,
+    ) -> u32 {
+        let corr_bytes = correlation_id.as_bytes();
+        let mut payload = BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2);
+        payload.put_u8(0); // action = start
+        payload.extend_from_slice(partition.as_bytes());
+        payload.put_u8(corr_bytes.len() as u8);
+        payload.extend_from_slice(corr_bytes);
+        payload.extend_from_slice(&0u16.to_le_bytes()); // empty token, auth is off
+        let payload = payload.freeze();
+
+        // Sampled before the request, exactly as `StorageClient::session_start` does, and for
+        // the same reason: a connection replaced mid-call must record the OLDER generation.
+        let generation = quic.connection_generation();
+
+        let response = send_normal(
+            quic.clone(),
+            Command::Authorize as QuicOpCode,
+            0,
+            true,
+            &mut [Bytes::default(), payload],
+        )
+        .await
+        .expect("raw session_start should succeed against an auth-off server");
+
+        assert_eq!(
+            response.len(),
+            4,
+            "session_start response must be a 4-byte little-endian session id, got {} bytes",
+            response.len()
+        );
+        let session_id = u32::from_le_bytes(response[..4].try_into().unwrap());
+        quic.register_session_for_test(session_id, generation);
+        session_id
+    }
+
+    /// R1: connection 1's session id, framed onto connection 2's wire, must not apply a `Put` to
+    /// connection 2's repository -- INV-EO P0-1's deterministic SERVER-side half, isolated from
+    /// the client-side write-boundary check (`QuicConnection::session_is_current`) so this test
+    /// proves what it always proved: the server-side fix (`NEXT_SESSION_ID`, one process-wide
+    /// sequence -- `lore-server/src/protocol/storage/session.rs`) independently refuses a
+    /// foreign id, not only the client's own bookkeeping.
+    ///
+    /// The client-side check is real and would ALSO refuse this send outright (`conn2` never
+    /// registered `id_a`), which is why this test forces
+    /// `conn2.register_session_for_test(id_a, ..)` immediately before sending: that one line
+    /// (the `test_seams`-gated forwarder to the `pub(crate)` `register_session`) simulates the
+    /// exact state a real client's
+    /// bookkeeping would be in right after the documented, non-deterministic race window this
+    /// file's top comment describes (the client believes `id_a` is valid to send here) --
+    /// isolating the question this test exists to answer: if the client's own gate is somehow
+    /// wrong, does the server independently refuse it? `session_is_current`'s own correctness is
+    /// a separate, client-only property, pinned deterministically by
+    /// `quic::client::tests::a_session_id_stops_being_current_once_its_generation_is_replaced`
+    /// in `lore-transport/src/quic/client.rs`, not by this file.
+    #[tokio::test]
+    async fn r1_a_stale_session_id_is_accepted_on_another_connection_and_writes_the_wrong_repository()
+    -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (tcp, udp) = bind_matched_pair();
+                let addr: SocketAddr = tcp.local_addr().unwrap();
+                let port = addr.port();
+                let _grpc_shutdown = start_grpc_backend(tcp, addr).await;
+
+                let (immutable, mutable) = fresh_stores().await;
+                let log: Log = Arc::new(StdMutex::new(Vec::new()));
+                let _server =
+                    start_recording_quic_server(udp, immutable.clone(), mutable, log.clone());
+
+                let partition_a = random::<RepositoryId>();
+                let partition_b = random::<RepositoryId>();
+                assert_ne!(
+                    partition_a, partition_b,
+                    "the two connections must be authorized for genuinely different repositories \
+                     for a wrong-repository write to be observable"
+                );
+
+                let conn1 = raw_quic_connection(port).await;
+                let id_a = raw_session_start(&conn1, partition_a, "r1-conn1").await;
+
+                let conn2 = raw_quic_connection(port).await;
+                let id_b = raw_session_start(&conn2, partition_b, "r1-conn2").await;
+
+                // Post-fix: session ids come from one process-wide sequence
+                // (`NEXT_SESSION_ID`), so two live sessions on two DIFFERENT connections can
+                // never collide any more -- the opposite of the pre-fix precondition this test
+                // used to assert. If this ever fires, the server-side allocator has regressed
+                // back toward per-connection numbering. Do not additionally assert anything
+                // about the MAGNITUDE of either id -- see this file's Phase C header comment
+                // (`NEXT_SESSION_ID` starts at a random `u32`).
+                assert_ne!(
+                    id_a, id_b,
+                    "two connections' session ids must never collide once session ids come from \
+                     one process-wide sequence (NEXT_SESSION_ID)"
+                );
+
+                // Simulate a client whose bookkeeping already (incorrectly) believes id_a is
+                // valid to send here -- see the doc comment above. Real production code never
+                // does this; `StorageClient::session_start` is the only caller of
+                // `register_session`, and it only ever registers the id the SERVER just handed
+                // back to THIS call.
+                conn2.register_session_for_test(id_a, conn2.connection_generation());
+
+                let (fragment, address, payload) = random_fragment();
+                let put_result = send_normal(
+                    conn2.clone(),
+                    Command::Put as QuicOpCode,
+                    id_a,
+                    true,
+                    &mut [
+                        Bytes::default(),
+                        Bytes::from_owner(address),
+                        Bytes::from_owner(fragment),
+                        payload.clone(),
+                    ],
+                )
+                .await;
+
+                // With the client-side gate forced open, the bytes actually left the process
+                // this time -- confirm the server genuinely saw them, so a failure below is
+                // proof of a SERVER-side refusal, not just an unsent command.
+                let log_snapshot = log.lock().unwrap().clone();
+                assert_eq!(
+                    log_snapshot.last(),
+                    Some(&Observed {
+                        opcode: Command::Put as u8,
+                        session_id: id_a,
+                    }),
+                    "the server must have received the forged Put carrying connection 1's \
+                     session id on connection 2's wire; observed: {log_snapshot:?}"
+                );
+
+                // Pre-fix reproduction (recorded verbatim 2026-08-31, before NEXT_SESSION_ID
+                // landed): put_result = Ok(b"") -- the forged Put SUCCEEDED; found_in_a =
+                // Err(AddressNotFound(..)); found_in_b = Ok(StoreGetData { fragment: Fragment {
+                // flags: 262144, size_payload: 32, size_content: 32 }, match_made: MatchFull,
+                // partition: <partition_b>, payload: Some(<the 32-byte payload>) }) -- the
+                // fragment landed in partition B, connection 2's OWN repository, even though the
+                // id sent was the one issued to connection 1.
+                // Post-fix (recorded verbatim 2026-08-31, one representative run against the
+                // final tree -- NEXT_SESSION_ID's random start means the exact numbers vary run
+                // to run, but id_a != id_b always holds): id_a=1058134712, id_b=1058134714,
+                // put_result=Err(ServerError(3)), found_in_a=Err(AddressNotFound(..)),
+                // found_in_b=Err(AddressNotFound(..)) -- the forged Put reached the server
+                // (confirmed by the log assertion above) and was refused; the fragment landed
+                // nowhere.
+                let found_in_a = immutable.clone().get(partition_a, address).await;
+                let found_in_b = immutable.clone().get(partition_b, address).await;
+
+                assert!(
+                    put_result.is_err(),
+                    "the server's own SessionMap for connection 2 was never given id_a (it \
+                     belongs to connection 1's SessionMap under the process-wide sequence), so \
+                     the forged Put must be refused server-side even with the client's own gate \
+                     forced open; got {put_result:?}"
+                );
+
+                assert!(
+                    found_in_a.is_err(),
+                    "partition A must never see a write it was never party to; got {found_in_a:?}"
+                );
+
+                assert!(
+                    found_in_b.is_err(),
+                    "the forged Put must not have applied anywhere, including connection 2's \
+                     own partition B; got {found_in_b:?}"
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// R2: a session_stop framed with connection 1's session id, sent on connection 2's wire,
+    /// must not remove connection 2's own live session -- INV-EO P0-2's deterministic SERVER-side
+    /// half, isolated from the client-side gate the same way R1 does (see its doc comment for
+    /// why forcing `register_session_for_test` here is deliberate, not a bypass of what this
+    /// test means to prove).
+    #[tokio::test]
+    async fn r2_a_stale_session_stop_removes_an_unrelated_live_session() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (tcp, udp) = bind_matched_pair();
+                let addr: SocketAddr = tcp.local_addr().unwrap();
+                let port = addr.port();
+                let _grpc_shutdown = start_grpc_backend(tcp, addr).await;
+
+                let (immutable, mutable) = fresh_stores().await;
+                let log: Log = Arc::new(StdMutex::new(Vec::new()));
+                let _server = start_recording_quic_server(udp, immutable, mutable, log.clone());
+
+                let partition_a = random::<RepositoryId>();
+                let partition_b = random::<RepositoryId>();
+
+                let conn1 = raw_quic_connection(port).await;
+                let id_a = raw_session_start(&conn1, partition_a, "r2-conn1").await;
+
+                let conn2 = raw_quic_connection(port).await;
+                let id_b = raw_session_start(&conn2, partition_b, "r2-conn2").await;
+
+                // Post-fix: see R1's comment on the same assertion.
+                assert_ne!(
+                    id_a, id_b,
+                    "two connections' session ids must never collide once session ids come from \
+                     one process-wide sequence (NEXT_SESSION_ID)"
+                );
+
+                // Simulate a client whose bookkeeping already (incorrectly) believes id_a is
+                // valid to send here -- see R1's doc comment for why this is deliberate.
+                conn2.register_session_for_test(id_a, conn2.connection_generation());
+
+                // Forge a session_stop carrying connection 1's id on connection 2's wire -- the
+                // exact framing `StorageClient::session_stop` uses: action byte 1, no partition,
+                // header session id set to the id being stopped
+                // (`quic/storage_service/client.rs:528-540`).
+                let stop_result = send_normal(
+                    conn2.clone(),
+                    Command::Authorize as QuicOpCode,
+                    id_a,
+                    true,
+                    &mut [Bytes::default(), Bytes::from_static(&[1u8])],
+                )
+                .await;
+
+                let log_snapshot = log.lock().unwrap().clone();
+                assert_eq!(
+                    log_snapshot.last(),
+                    Some(&Observed {
+                        opcode: Command::Authorize as u8,
+                        session_id: id_a,
+                    }),
+                    "the server must have received the forged stop on connection 2's wire; \
+                     observed: {log_snapshot:?}"
+                );
+
+                // Pre-fix reproduction (recorded verbatim 2026-08-31, before NEXT_SESSION_ID
+                // landed): stop_result = Ok(b"") -- the forged stop SUCCEEDED against connection
+                // 2's own entry (`SessionMap::stop` matched on the bare id alone);
+                // post_stop_put = Err(ServerError(3)) -- a subsequent Put on connection 2 using
+                // its own session id id_b then failed as an unknown session, because the entry
+                // the forged stop removed WAS connection 2's own live session.
+                //
+                // Post-fix: id_a was never issued to connection 2's own SessionMap (it belongs
+                // to connection 1's, under the process-wide sequence), so the server's `stop`
+                // must find nothing there to remove.
+                // Post-fix (recorded verbatim 2026-08-31, one representative run against the
+                // final tree): id_a=1058134713, id_b=1058134715,
+                // stop_result=Err(ServerError(3)).
+                assert!(
+                    stop_result.is_err(),
+                    "the server's own SessionMap for connection 2 never held id_a, so the \
+                     forged stop must be refused server-side, not silently accepted; got \
+                     {stop_result:?}"
+                );
+
+                let (fragment, address, payload) = random_fragment();
+                let post_stop_put = send_normal(
+                    conn2.clone(),
+                    Command::Put as QuicOpCode,
+                    id_b,
+                    true,
+                    &mut [
+                        Bytes::default(),
+                        Bytes::from_owner(address),
+                        Bytes::from_owner(fragment),
+                        payload.clone(),
+                    ],
+                )
+                .await;
+                // Recorded verbatim 2026-08-31: post_stop_put=Ok(b"") -- connection 2's own
+                // session survived the forged stop.
+
+                assert!(
+                    post_stop_put.is_ok(),
+                    "a stale session_stop forged from another connection must not remove \
+                     connection 2's own live session -- a Put on connection 2's still-live \
+                     session should succeed; got {post_stop_put:?}"
+                );
+
+                Ok(())
+            })
+            .await
+    }
 }
