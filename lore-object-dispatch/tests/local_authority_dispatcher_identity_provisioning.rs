@@ -18,9 +18,9 @@ use lore_object_dispatch::local_authority_dispatcher_identity_provisioning::vali
 use tokio_postgres::error::SqlState;
 use tokio_util::task::AbortOnDropHandle;
 
-const EXPECTED_MIGRATION_BYTES: usize = 22_692;
+const EXPECTED_MIGRATION_BYTES: usize = 25_375;
 const EXPECTED_MIGRATION_BLAKE3: &str =
-    "6413bda96da9263c0d0b631b7c696fd717ff67ff198a2c3304de7d202decfc70";
+    "fd0aa946118010222eed883ab9bc68fa09fd3a3fbb0eb2d1e21e1904bd9c213e";
 const RETENTION_SCHEMA_BLAKE3: &str =
     "f86d1a574cab9346ef39843fed6ffb849cafe5967881a45d0c6d89028780f6dd";
 const AUTHORITY_SCHEMA_BLAKE3: &str =

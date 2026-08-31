@@ -138,23 +138,36 @@ BEGIN
 END
 $$;
 
--- The growth-tolerant object assertion: three questions about one table's constraints.
+-- The growth-tolerant object assertion: four questions about one table, two over `pg_index` and
+-- two over `pg_constraint`.
 --
 -- The first requires D8's per-participant ACTIVE-uniqueness index to be present in exactly its
--- intended shape.
+-- intended shape, INCLUDE columns included in "exactly": D8's index carries none, and an index that
+-- grew one is not the index this migration created.
 --
--- The second is the load-bearing one, and it is stated as a property rather than as a list of
--- forbidden index names: **every unique index on this table must carry `dispatcher_id` among its
+-- The second is the load-bearing prohibition, and it is stated as a property rather than as a list
+-- of forbidden index names: **every unique index on this table must carry `dispatcher_id` among its
 -- key columns.** Uniqueness on this table that does not constrain the participant is uniqueness
 -- across participants, which is the single-active-dispatcher model D8 rejected. The property form
 -- is what caught 0007's PRIMARY KEY (provider_boundary_id, lease_generation) during 0018's first
 -- live run, which D8's own finding had not named -- an enumeration of the one index D8 did name
 -- would have passed that database.
 --
--- A third check covers the one spelling the second cannot see, because an exclusion constraint
--- enforces uniqueness without being `indisunique`.
+-- The third covers the one spelling the second cannot see, because an exclusion constraint enforces
+-- uniqueness without being `indisunique`.
 --
--- All three are asked by shape, not by name, because a rename is not the drift that matters. Every
+-- The fourth is a *positive* requirement rather than a prohibition, and it exists because the second
+-- is satisfied vacuously by a table with no unique index at all. 0018 drops 0007's primary key and
+-- hands the table's identity to 0007's retained
+-- UNIQUE (provider_boundary_id, dispatcher_id, lease_generation), naming that index as the replica
+-- identity. `relreplident` then reads `'i'`, and the attester's manifest pins that letter -- but the
+-- letter does not name which index, and PostgreSQL treats `'i'` with the index gone as `NOTHING`.
+-- So dropping that one constraint would take the table's identity, the attempts foreign key's
+-- target, and its replica identity together, while every digest and every prohibition above stayed
+-- satisfied. The fourth check requires it: present, unique, valid, non-partial, no INCLUDE columns,
+-- exactly those three key columns in that order, and carrying the replica identity.
+--
+-- All four are asked by shape, not by name, because a rename is not the drift that matters. Every
 -- one of these failures is silent without this assert: writes keep succeeding until the second
 -- participant registers.
 --
@@ -189,6 +202,7 @@ BEGIN
        AND idx.indisready
        AND idx.indpred IS NOT NULL
        AND pg_catalog.pg_get_expr(idx.indpred, idx.indrelid) = '(state = 1)'
+       AND idx.indnatts = idx.indnkeyatts
        AND ARRAY(
              SELECT attribute.attname::text
                FROM pg_catalog.unnest(idx.indkey) WITH ORDINALITY AS key(attnum, ordinal)
@@ -236,6 +250,36 @@ BEGIN
       FROM pg_catalog.pg_constraint AS constraint_state
      WHERE constraint_state.conrelid = dispatchers_oid
        AND constraint_state.contype = 'x'
+  ) THEN
+    RAISE EXCEPTION 'DISPATCH_DISPATCHER_IDENTITY_CATALOG_MISMATCH' USING ERRCODE = '55000';
+  END IF;
+
+  -- The table's identity must exist, and must be the replica identity. Every check above is a
+  -- prohibition, and a table with no unique index at all satisfies all of them; `relreplident` would
+  -- still read `'i'` in the attester's manifest while resolving to nothing. This is the positive
+  -- half, and it is what makes dropping 0007's retained three-column UNIQUE fail closed instead of
+  -- silently removing the attempts foreign key's target along with the replica identity.
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_constraint AS constraint_state
+      JOIN pg_catalog.pg_index AS idx ON idx.indexrelid = constraint_state.conindid
+     WHERE constraint_state.conrelid = dispatchers_oid
+       AND constraint_state.contype = 'u'
+       AND idx.indisunique
+       AND idx.indisvalid
+       AND idx.indisready
+       AND idx.indisreplident
+       AND idx.indpred IS NULL
+       AND idx.indnatts = idx.indnkeyatts
+       AND ARRAY(
+             SELECT attribute.attname::text
+               FROM pg_catalog.unnest(idx.indkey) WITH ORDINALITY AS key(attnum, ordinal)
+               JOIN pg_catalog.pg_attribute AS attribute
+                 ON attribute.attrelid = idx.indrelid
+                AND attribute.attnum = key.attnum
+              WHERE key.ordinal <= idx.indnkeyatts
+              ORDER BY key.ordinal
+           ) = ARRAY['provider_boundary_id', 'dispatcher_id', 'lease_generation']
   ) THEN
     RAISE EXCEPTION 'DISPATCH_DISPATCHER_IDENTITY_CATALOG_MISMATCH' USING ERRCODE = '55000';
   END IF;

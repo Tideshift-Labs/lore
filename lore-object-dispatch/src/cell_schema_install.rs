@@ -196,7 +196,7 @@ pub const CELL_INSTALL_SET: [CellMigration; 15] = [
     cell_migration!(
         19,
         "0019_object_store_dispatch_dispatcher_identity_provisioning.sql",
-        "6413bda96da9263c0d0b631b7c696fd717ff67ff198a2c3304de7d202decfc70"
+        "fd0aa946118010222eed883ab9bc68fa09fd3a3fbb0eb2d1e21e1904bd9c213e"
     ),
 ];
 
@@ -778,13 +778,18 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
 /// empty on a correctly installed cell, so a change in any of those four would have meant the
 /// migration did something it does not claim to do.
 ///
-/// Re-measured once more in CD-3's review fix round, which moved exactly two sections and thereby
-/// confirmed both fixes: `functions`, because 0019's object assert gained the key-column bound and
-/// the exclusion-constraint check, and `relations`, because 0018 now names a replica identity
-/// explicitly. That second one is the interesting half. Dropping a primary key leaves
-/// `relreplident` at `'d'` -- "the primary key" -- which after the drop resolves to nothing, and a
-/// value that does not change is a value this manifest cannot flag. Setting it to `'i'` against the
-/// retained three-column unique index is what put the choice inside the pin.
+/// Re-measured in CD-3's review fix rounds. `functions` moves with 0019's object assert and
+/// `relations` with 0018's replica-identity choice; `indexes` and `constraints` stay still, because
+/// no index or constraint is added.
+///
+/// One limit of this pin is worth stating where the pin lives, because a second review pass found
+/// it: `relations` carries `relreplident`, which is one letter and does not name *which* index the
+/// `'i'` refers to, and the `indexes` section does not carry `indisreplident`. So the manifest
+/// records that a replica identity was chosen and cannot record that the index it named still
+/// exists. Dropping 0007's retained three-column UNIQUE would leave `relreplident` reading `'i'`
+/// while resolving to nothing, and every digest here would still match. That gap is closed in the
+/// database instead, by 0019's fourth object assertion, which requires that constraint to be
+/// present and to carry the replica identity.
 pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
     hex32("f468de7d148f5335b52a10c4298d609be546801754da1d991ff0ac7e7c0da0ca"),
     hex32("5e01c7cd66a23346d17b156fc891ddacb3eab076ab6825859a3372ed2173cca1"),
@@ -792,7 +797,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
     hex32("95078ccb57b724114f162a6c4a410195601a16a48042b3a2f5d0a0b8df4dd2ae"),
     hex32("fe4e7104687d714c8ac084dca11fcd9d0131f03608649e295309004758a62923"),
     hex32("925f3c6fced9ba0b390b1bdb20293aa84c35f5ded074832e9dcbc2c2adbf4a78"),
-    hex32("cdd3992342d81120bdfd6b1577aa412437657e9cba8196e2d7235d06fbf12a71"),
+    hex32("b7e565c9ddfcbdd99eca7e41680ea19334222cccd5e0baf7d013c34089f31c33"),
     hex32("946c88196f476aa6817695043f4fea8b754e38e97b3c21272d9a087d869d12ce"),
     hex32("cb220f3aef0f0bfb93996548ff1951f59374ce24b980d75f0beb6189a559a38a"),
     hex32("971ec53fc27466c873c783701757e1434c20b383d23f081d918a2d6e4c797971"),
@@ -806,7 +811,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
 /// whose exact rendering is a server-version property. A different major version is expected to
 /// fail closed here and needs a re-measured pin, not a relaxed check.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_V1: [u8; 32] =
-    hex32("82423ef3c787dd1b81905b6258c04fdab82c8db0953034bc4d57b65036d17bf1");
+    hex32("26a00924eeae83a07c04844ea28f58ea62af250555ebd9baecef1f67fa3212ef");
 
 /// Const hex decoder for the pinned digests above.
 const fn hex32(text: &str) -> [u8; 32] {
