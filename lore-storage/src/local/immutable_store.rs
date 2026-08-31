@@ -5950,3 +5950,81 @@ mod tests {
         }
     }
 }
+
+/// Verification needs the store's files, so a store with no path cannot do it.
+///
+/// This is the whole of `verify_fragment`'s path handling, and it had no coverage until a
+/// WP-108 QUIC harness built its stores in memory, verified a fragment it had just written
+/// successfully, and got back a generic server failure. The error is real and correct; what
+/// was missing was anything saying so, which cost that campaign a false defect report against
+/// the transport. The heal flag is deliberately asserted on both settings: the failure is
+/// about the store having nowhere to read from, not about healing.
+#[cfg(test)]
+mod verify_fragment_path_requirement {
+    use super::*;
+    use crate::immutable_store::ImmutableStore as _;
+
+    async fn store_with(path: Option<PathBuf>) -> (Arc<LocalImmutableStore>, Partition, Address) {
+        let store = LocalImmutableStore::new(path, ImmutableStoreSettings::default())
+            .await
+            .expect("create store");
+        let partition = Partition::from(rand::random::<[u8; 16]>());
+        let payload = b"verify needs a path".to_vec();
+        let address = Address {
+            hash: crate::hash::hash_slice(&payload),
+            context: Context::from(rand::random::<[u8; 16]>()),
+        };
+        store
+            .clone()
+            .put(
+                partition,
+                address,
+                Fragment {
+                    flags: 0,
+                    size_payload: payload.len() as u32,
+                    size_content: payload.len() as u64,
+                },
+                Some(Bytes::copy_from_slice(&payload)),
+                false,
+            )
+            .await
+            .expect("put the fragment to verify");
+        (store, partition, address)
+    }
+
+    /// A path-less store refuses to verify, whether or not healing was asked for, and says why.
+    #[tokio::test]
+    async fn a_store_with_no_path_cannot_verify() {
+        for heal in [false, true] {
+            let (store, partition, address) = store_with(None).await;
+            let error = store
+                .verify_fragment(address, partition, StoreMatch::MatchFull, heal)
+                .await
+                .expect_err("a store with no path has no fragment file to verify");
+            assert!(
+                error.to_string().contains("no path to store"),
+                "heal={heal}: the refusal must name its cause, got {error:?}"
+            );
+        }
+    }
+
+    /// The same fragment on a path-backed store verifies clean, which is what makes the case
+    /// above a property of the store's construction rather than of the fragment or the flag.
+    #[tokio::test]
+    async fn a_path_backed_store_verifies_an_intact_fragment() {
+        let dir = crate::test_util::TempDir::new("verify_path_");
+        let (store, partition, address) = store_with(Some(dir.path().to_path_buf())).await;
+
+        let result = store
+            .verify_fragment(address, partition, StoreMatch::MatchFull, true)
+            .await
+            .expect("a path-backed store can verify");
+
+        assert!(
+            result.verification_result.is_ok(),
+            "an intact fragment must verify clean, got {:?}",
+            result.verification_result
+        );
+        assert!(!result.healed, "nothing was corrupt, so nothing was healed");
+    }
+}

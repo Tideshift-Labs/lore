@@ -1264,17 +1264,27 @@ mod quic_session_rebind_tests {
     /// (`Observed { opcode: 6 (Verify), session_id: 1 }`, right after the seed `Put`'s `opcode:
     /// 2`), so this is a real dispatched-and-answered error, not a hang or a severing-mechanism
     /// defect -- the severing wrapper's `result.is_ok()` gate correctly never fires because the
-    /// real result genuinely is not `Ok`. Two candidate causes, neither confirmed: (a) the
-    /// `Any::downcast::<LocalImmutableStore>()` in `handle_verify` failing against this harness's
-    /// store construction (unlikely -- this test builds stores identically to
-    /// `TestHandlerFactory`'s, which sibling suites already exercise), or (b)
-    /// `LocalImmutableStore::verify_fragment` itself returning an unexpected `StoreError` for a
-    /// heal=true request against a fragment that needs no healing. Flagged to the implementation
-    /// per its request to report suspicions rather than silently drop cases; not something a test
-    /// specialist should root-cause deeper by reading `verify_fragment`'s internals or adding
-    /// server-side tracing capture, since that risks guessing at behavior instead of asking the
-    /// owner. `Put`, `MutableStore`, and `Copy` below all correctly resolve `Ok(Unknown)` when
-    /// severed, so this is specific to `Verify`, not the mechanism.
+    /// real result genuinely is not `Ok`.
+    ///
+    /// ROOT CAUSE, since confirmed by execution: this harness builds its stores in memory
+    /// (`fresh_stores` passes `None::<&str>`), and `LocalImmutableStore::verify_fragment`
+    /// refuses a path-less store in its first statement -- `Err(Internal("Cannot verify
+    /// fragment: no path to store"))`, at `lore-storage/src/local/immutable_store.rs:4198`.
+    /// `handle_verify`'s catch-all maps that to `StoreFailure`, which is the code 3 seen here.
+    /// It is identical for `heal=false`, so the heal flag was incidental, and the
+    /// `Any::downcast::<LocalImmutableStore>()` candidate is disproven: `immutable_store::create`
+    /// returns `LocalImmutableStore::new`'s `Arc<Self>` upcast, so the downcast succeeds and
+    /// `verify_fragment` is genuinely reached. Verification reads the fragment's file, so a store
+    /// with nowhere to read from cannot do it. That is correct server behaviour, not a transport
+    /// or WP-108 defect. Pinned now by `verify_fragment_path_requirement` in `lore-storage`,
+    /// which had no coverage before this.
+    ///
+    /// So `Verify` is uncoverable HERE rather than broken: closing it means giving this harness
+    /// path-backed stores, a change to `fresh_stores` and its twelve call sites, not to the
+    /// transport. Until then this sweep is honestly three of four.
+    ///
+    /// `Put`, `MutableStore`, and `Copy` below all correctly resolve `Ok(Unknown)` when severed,
+    /// so the severing mechanism itself is sound.
     #[tokio::test]
     async fn b11_every_mutable_no_replay_opcode_yields_unknown_when_severed() -> TestResult {
         let execution = setup_execution("test".to_string());
