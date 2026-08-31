@@ -35,6 +35,9 @@ use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::client::TransportConfig;
 use lore_transport::quic::client::connect;
 use lore_transport::quic::client::send_normal_with_reconnect;
+use lore_transport::quic::client::send_normal_with_reconnect_outcome;
+use lore_transport::replay::MutableOutcome;
+use lore_transport::replay::OutcomeUnknown;
 use lore_transport::replay::ReplayClass;
 use opentelemetry::KeyValue;
 use thiserror::Error;
@@ -75,6 +78,16 @@ pub enum ReplicationStoreClientError {
     ServiceError(ReplicationServiceErrorCode),
     #[error("Response received successfully, but error encountered: '{0}'")]
     ResponseError(&'static str),
+    /// The request was dispatched and its response was lost, and its replay class forbids
+    /// sending it again. Whether the peer applied it is unknown.
+    ///
+    /// A distinct variant, not folded into [`ReplicationStoreClientError::ConnectionFailed`],
+    /// because the two say opposite things about the peer's state: `ConnectionFailed` is a
+    /// request that did not happen, and this is one that may have. A caller that reconciles
+    /// against authoritative state has to be able to tell them apart, and one that does not is
+    /// unchanged — this is still an `Err`, and still means the call did not return a result.
+    #[error("{0}")]
+    OutcomeUnknown(OutcomeUnknown),
 }
 
 impl From<ReplicationServiceErrorCode> for ReplicationStoreClientError {
@@ -254,8 +267,25 @@ impl ReplicationStoreClient {
         command: Command,
     ) -> Result<(), ReplicationStoreClientError> {
         let quic_chunks = request.to_quic_chunks();
-        send_normal_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
+        Self::applied(
+            send_normal_with_reconnect_outcome(self, command, 0, || quic_chunks.clone()).await?,
+        )?;
         Ok(())
+    }
+
+    /// Read a mutable send's outcome, reporting an ambiguous one as
+    /// [`ReplicationStoreClientError::OutcomeUnknown`] rather than as a connection failure.
+    ///
+    /// Every `MutableNoReplay` send goes through here. The alternative — calling the untyped
+    /// send and letting `map_send_error` collapse the unknown — is what erased the distinction
+    /// at this boundary in the first place (INV-EO P1-1).
+    fn applied<T>(outcome: MutableOutcome<T>) -> Result<T, ReplicationStoreClientError> {
+        match outcome {
+            MutableOutcome::Applied(value) => Ok(value),
+            MutableOutcome::Unknown(unknown) => {
+                Err(ReplicationStoreClientError::OutcomeUnknown(unknown))
+            }
+        }
     }
 
     async fn send_get(
@@ -314,11 +344,12 @@ impl StoreClient for ReplicationStoreClient {
         request: Obliterate,
     ) -> Result<ObliterateResponse, ReplicationStoreClientError> {
         let quic_chunks = request.to_quic_chunks();
-        let response_chunks =
-            send_normal_with_reconnect(self, Command::ImmutableObliterate, 0, || {
+        let response_chunks = Self::applied(
+            send_normal_with_reconnect_outcome(self, Command::ImmutableObliterate, 0, || {
                 quic_chunks.clone()
             })
-            .await?;
+            .await?,
+        )?;
         Ok(ObliterateResponse::parse(response_chunks)?)
     }
 
@@ -363,7 +394,12 @@ impl StoreClient for ReplicationStoreClient {
 
     async fn copy(&self, request: ImmutableCopy) -> Result<(), ReplicationStoreClientError> {
         let quic_chunks = request.to_quic_chunks();
-        send_normal_with_reconnect(self, Command::ImmutableCopy, 0, || quic_chunks.clone()).await?;
+        Self::applied(
+            send_normal_with_reconnect_outcome(self, Command::ImmutableCopy, 0, || {
+                quic_chunks.clone()
+            })
+            .await?,
+        )?;
         Ok(())
     }
 }
@@ -412,14 +448,19 @@ impl ServiceClient for ReplicationStoreClient {
                 ReplicationStoreClientError::ConnectionFailed
             }
             // This client sends no session id, so it has nothing to rebind; the transport
-            // reaches the variant only for a session-bearing command. An unknown outcome is
-            // reported as a connection failure here rather than as a typed result: the
-            // replication caller's reconciliation is WP-118/WP-120's, and inventing a
-            // caller-visible distinction it does not act on would be a capability this
-            // deployment cannot serve.
-            SendWithReconnectError::SessionRebindRequired
-            | SendWithReconnectError::OutcomeUnknown(_) => {
+            // reaches that variant only for a session-bearing command.
+            SendWithReconnectError::SessionRebindRequired => {
                 ReplicationStoreClientError::ConnectionFailed
+            }
+            // Not reachable as the code stands, and mapped honestly rather than conveniently in
+            // case it becomes so. The transport only produces this for a `MutableNoReplay`
+            // command (a read is never classified ambiguous), and every `MutableNoReplay`
+            // operation on this client asks for the typed outcome instead — they go through
+            // `send_normal_with_reconnect_outcome` and `Self::applied`, which never reach here.
+            // A future mutable operation that forgets to therefore gets the truthful error, not
+            // one that says the request did not happen.
+            SendWithReconnectError::OutcomeUnknown(unknown) => {
+                ReplicationStoreClientError::OutcomeUnknown(unknown)
             }
             SendWithReconnectError::ClientError(quic_error) => match quic_error {
                 QuicClientError::SlowDown => {
@@ -535,8 +576,11 @@ pub fn make_put_message(
     Ok(request)
 }
 
-/// Maps a `ReplicationStoreClientError` to a `StoreError`, handling all error variants
-/// except `ConnectionFailed` which requires caller-specific handling
+/// Maps a `ReplicationStoreClientError` to a `StoreError`, handling every variant.
+///
+/// `ConnectionFailed` and `OutcomeUnknown` additionally require caller-specific handling — both
+/// mean the connection is gone, so both drive a client regeneration — but the callers now do that
+/// *and* pass the error here rather than producing their own, so the two get distinct messages.
 pub fn map_client_error_to_store_error(
     error: ReplicationStoreClientError,
     meta: &ServiceRequestMeta,
@@ -574,6 +618,18 @@ pub fn map_client_error_to_store_error(
             // If we get here, treat it as an internal error.
             StoreError::internal("connection failed")
         }
+        // Deliberately NOT mapped to the same error as `ConnectionFailed`. That one says the
+        // request did not happen; this one says it may have, and the peer's state has to be
+        // re-read rather than assumed. `StoreError` carries no ambiguous-outcome shape today, so
+        // the distinction survives as far as this boundary and no further — the caller-side
+        // reconciliation that would consume it is WP-118/WP-120's, and is named as an unadopted
+        // residual in WP-108's handoff rather than half-built here. The message is explicit so
+        // an operator reading a log is not told the write did not land.
+        ReplicationStoreClientError::OutcomeUnknown(unknown) => StoreError::internal_with_context(
+            unknown,
+            "replication request was dispatched and its response lost; whether the peer applied \
+             it is unknown",
+        ),
     }
 }
 
@@ -601,6 +657,9 @@ pub fn observe_client_interaction<ResponseType>()
                 // as a bad thing - some observers might want to know while others might not
                 ReplicationStoreClientError::ServiceError(_) => "graceful_service_error",
                 ReplicationStoreClientError::ResponseError(_) => "response_error",
+                // Its own label, because an operator counting write failures needs the
+                // ambiguous ones separated from the ones that provably did not happen.
+                ReplicationStoreClientError::OutcomeUnknown(_) => "outcome_unknown",
             },
         };
         labels.push(KeyValue::new("handled_status", handled_value));

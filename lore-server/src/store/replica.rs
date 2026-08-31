@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::time::Duration;
@@ -455,7 +456,17 @@ where
 {
     match result {
         Ok(output) => Ok(output),
-        Err(ReplicationStoreClientError::ConnectionFailed) => {
+        // Both say the connection carrying the request is gone, so both have to drive the
+        // reconnect below: the replica heals only because the request that saw the loss starts
+        // it, and an ambiguous write is no less a lost connection than a failed one. They part
+        // company in what the caller is told, which `map_client_error_to_store_error` decides —
+        // `ConnectionFailed` did not happen, an unknown outcome may have (INV-EO P1-1). Neither
+        // redispatches the request here, which is what keeps a `MutableNoReplay` operation from
+        // being applied twice.
+        Err(
+            error @ (ReplicationStoreClientError::ConnectionFailed
+            | ReplicationStoreClientError::OutcomeUnknown(_)),
+        ) => {
             let weak = Arc::downgrade(&replica);
             lore_spawn!({
                 async move {
@@ -484,7 +495,7 @@ where
                 }
                 .in_current_span()
             });
-            Err(StoreError::internal("connection failed"))
+            Err(map_client_error_to_store_error(error, &meta))
         }
         Err(error) => Err(map_client_error_to_store_error(error, &meta)),
     }

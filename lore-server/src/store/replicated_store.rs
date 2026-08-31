@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -563,7 +564,14 @@ where
 {
     match result {
         Ok(output) => Ok(output),
-        Err(ReplicationStoreClientError::ConnectionFailed) => {
+        // Both say the connection carrying the request is gone, so both regenerate the client.
+        // What the caller is told differs, and `map_client_error_to_store_error` is where that
+        // is decided: `ConnectionFailed` is a request that did not happen, an unknown outcome is
+        // one that may have (INV-EO P1-1). Neither redispatches the request.
+        Err(
+            error @ (ReplicationStoreClientError::ConnectionFailed
+            | ReplicationStoreClientError::OutcomeUnknown(_)),
+        ) => {
             lore_spawn!({
                 async move {
                     let regen_result = store
@@ -581,7 +589,7 @@ where
                 }
                 .in_current_span()
             });
-            Err(StoreError::internal("connection failed"))
+            Err(map_client_error_to_store_error(error, &meta))
         }
         Err(error) => Err(map_client_error_to_store_error(error, &meta)),
     }
