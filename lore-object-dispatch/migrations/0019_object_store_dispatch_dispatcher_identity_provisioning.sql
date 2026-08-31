@@ -28,8 +28,8 @@
 --
 -- What an in-database readback *can* do, and what this one does, is assert the specific objects it
 -- names. `assert_dispatch_dispatcher_identity_objects_v1` below is growth-tolerant by construction:
--- it names one table and asks two questions about the indexes on it. Migration 0020 may add fifty
--- functions without disturbing it.
+-- it names one table and asks three questions about the constraints on it. Migration 0020 may add
+-- fifty functions without disturbing it.
 --
 -- The second half of N2's answer is who may call it. Every readback in the chain so far is gated on
 -- `assert_retention_reader_v1`, which admits only the migrator and maintenance roles, so the
@@ -138,22 +138,25 @@ BEGIN
 END
 $$;
 
--- The growth-tolerant object assertion: two questions about one table's indexes.
+-- The growth-tolerant object assertion: three questions about one table's constraints.
 --
 -- The first requires D8's per-participant ACTIVE-uniqueness index to be present in exactly its
 -- intended shape.
 --
 -- The second is the load-bearing one, and it is stated as a property rather than as a list of
--- forbidden index names: **every unique index on this table must include `dispatcher_id` in its
--- key.** Uniqueness on this table that does not mention the participant is uniqueness across
--- participants, which is the single-active-dispatcher model D8 rejected in whatever spelling it
--- arrives. The property form is what caught 0007's PRIMARY KEY (provider_boundary_id,
--- lease_generation) during 0018's first live run, which D8's own finding had not named -- an
--- enumeration of the one index D8 did name would have passed that database.
+-- forbidden index names: **every unique index on this table must carry `dispatcher_id` among its
+-- key columns.** Uniqueness on this table that does not constrain the participant is uniqueness
+-- across participants, which is the single-active-dispatcher model D8 rejected. The property form
+-- is what caught 0007's PRIMARY KEY (provider_boundary_id, lease_generation) during 0018's first
+-- live run, which D8's own finding had not named -- an enumeration of the one index D8 did name
+-- would have passed that database.
 --
--- Both are asked by shape, not by name, because a rename is not the drift that matters. Either
--- failure is silent without this assert: every write still succeeds until the second participant
--- registers.
+-- A third check covers the one spelling the second cannot see, because an exclusion constraint
+-- enforces uniqueness without being `indisunique`.
+--
+-- All three are asked by shape, not by name, because a rename is not the drift that matters. Every
+-- one of these failures is silent without this assert: writes keep succeeding until the second
+-- participant registers.
 --
 -- One rendering is pinned rather than derived: `pg_get_expr` over the partial-index predicate,
 -- measured on PostgreSQL 16. That is the same version dependence the out-of-band attester's
@@ -192,12 +195,20 @@ BEGIN
                JOIN pg_catalog.pg_attribute AS attribute
                  ON attribute.attrelid = idx.indrelid
                 AND attribute.attnum = key.attnum
+              WHERE key.ordinal <= idx.indnkeyatts
               ORDER BY key.ordinal
            ) = ARRAY['provider_boundary_id', 'dispatcher_id']
   ) THEN
     RAISE EXCEPTION 'DISPATCH_DISPATCHER_IDENTITY_CATALOG_MISMATCH' USING ERRCODE = '55000';
   END IF;
 
+  -- `indkey` spans key **and** INCLUDE columns; `indnkeyatts` is where the key ends. Without the
+  -- ordinal bound below,
+  --   CREATE UNIQUE INDEX ... (provider_boundary_id, lease_generation) INCLUDE (dispatcher_id)
+  -- satisfies "mentions dispatcher_id" while enforcing exactly the cross-participant uniqueness the
+  -- dropped primary key enforced. An INCLUDE column is payload, not part of the uniqueness, so it
+  -- must not count. Found by review, not by the first live run: the planted-drift case used the
+  -- plain two-column form, which this check caught either way.
   IF EXISTS (
     SELECT 1
       FROM pg_catalog.pg_index AS idx
@@ -209,11 +220,31 @@ BEGIN
                JOIN pg_catalog.pg_attribute AS attribute
                  ON attribute.attrelid = idx.indrelid
                 AND attribute.attnum = key.attnum
+              WHERE key.ordinal <= idx.indnkeyatts
               ORDER BY key.ordinal
            )))
   ) THEN
     RAISE EXCEPTION 'DISPATCH_DISPATCHER_IDENTITY_CATALOG_MISMATCH' USING ERRCODE = '55000';
   END IF;
+
+  -- An exclusion constraint enforces uniqueness without being `indisunique`, so the check above
+  -- cannot see one. Migration 0007 declares none on this table and none is expected, so the rule
+  -- here is the stricter and simpler one: no exclusion constraint at all. A future layer that wants
+  -- one must amend this assert deliberately rather than slip past it.
+  IF EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_constraint AS constraint_state
+     WHERE constraint_state.conrelid = dispatchers_oid
+       AND constraint_state.contype = 'x'
+  ) THEN
+    RAISE EXCEPTION 'DISPATCH_DISPATCHER_IDENTITY_CATALOG_MISMATCH' USING ERRCODE = '55000';
+  END IF;
+EXCEPTION WHEN no_data_found OR too_many_rows THEN
+  -- The `INTO STRICT` above is the only source of these, and it means the dispatchers table is
+  -- absent or duplicated. That is catalog drift, and reporting it as such matters: without this
+  -- handler it escapes to the projection's own handler and is reported as UNAVAILABLE, which names
+  -- an uninstalled layer rather than a broken one.
+  RAISE EXCEPTION 'DISPATCH_DISPATCHER_IDENTITY_CATALOG_MISMATCH' USING ERRCODE = '55000';
 END
 $$;
 
@@ -254,7 +285,7 @@ BEGIN
      OR schema_state.dispatcher_identity_schema_revision IS DISTINCT FROM
         'object-store-dispatch-dispatcher-identity-schema-v1'
      OR schema_state.dispatcher_identity_migration_blake3 IS DISTINCT FROM
-        pg_catalog.decode('390a1275927fc9273746a8180aab42ab7c446be6283a82f1263026fbee0f755b', 'hex')
+        pg_catalog.decode('a7d54d94d0fa5035872eb9b3426cbbe6471bcf9ae34ed41877542f050e1aaad9', 'hex')
      OR schema_state.dispatcher_identity_install_revision IS NULL
      OR schema_state.dispatcher_identity_install_revision = 0
      OR schema_state.dispatcher_identity_installed_at_unix_ms IS NULL THEN
@@ -305,7 +336,7 @@ BEGIN
   IF expected_schema_revision IS DISTINCT FROM
        'object-store-dispatch-dispatcher-identity-schema-v1'
      OR expected_migration_blake3 IS DISTINCT FROM
-        pg_catalog.decode('390a1275927fc9273746a8180aab42ab7c446be6283a82f1263026fbee0f755b', 'hex')
+        pg_catalog.decode('a7d54d94d0fa5035872eb9b3426cbbe6471bcf9ae34ed41877542f050e1aaad9', 'hex')
      OR expected_install_revision IS NULL OR expected_install_revision = 0 THEN
     RAISE EXCEPTION 'DISPATCH_DISPATCHER_IDENTITY_INSTALL_CONTRACT_MISMATCH'
       USING ERRCODE = '22023';

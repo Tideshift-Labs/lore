@@ -14,9 +14,9 @@ use lore_object_dispatch::local_authority_dispatcher_identity_schema::validate_e
 use tokio_postgres::error::SqlState;
 use tokio_util::task::AbortOnDropHandle;
 
-const EXPECTED_MIGRATION_BYTES: usize = 3_772;
+const EXPECTED_MIGRATION_BYTES: usize = 4_477;
 const EXPECTED_MIGRATION_BLAKE3: &str =
-    "390a1275927fc9273746a8180aab42ab7c446be6283a82f1263026fbee0f755b";
+    "a7d54d94d0fa5035872eb9b3426cbbe6471bcf9ae34ed41877542f050e1aaad9";
 
 fn migration() -> &'static str {
     std::str::from_utf8(LOCAL_AUTHORITY_DISPATCHER_IDENTITY_SCHEMA_MIGRATION_V1)

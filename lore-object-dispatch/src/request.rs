@@ -345,10 +345,20 @@ pub fn fingerprint_object_store_request(
     // state, which cannot be re-driven under a fresh logical request id.
     //
     // Verified against the frozen SQL rather than assumed: 0013's ReservePut replay-conflict
-    // comparison (`0013_object_store_dispatch_reserve_put_mutation.sql:263-278`) compares
+    // comparison (`0013_object_store_dispatch_reserve_put_mutation.sql:265-278`) compares
     // `put_reservation_fingerprint` and thirteen identity fields, and does **not** compare
     // `allocation_revision` or `allocation_fence`. So the stored row already tolerates a rotated
     // pin, and this exclusion is what keeps the fingerprint it does compare stable across one.
+    //
+    // One field of the same name is still written into this preimage, and deliberately: the
+    // StartupAdmission consumer context's `allocation_revision` (see `validate_and_encode_consumer`
+    // below). It is not this pin. It is a HeadBucket readiness probe's record of the configuration
+    // its own process started under, D3's amendment does not name it, and nothing here reconciles
+    // the two -- `validate_expected_authority` never compares the consumer's copy against
+    // `ExpectedRequestAuthority::allocation_revision`. A caller that populated it from the *live*
+    // pin instead of its startup snapshot would reintroduce exactly the wedge this exclusion
+    // removes, for that one consumer arm. The startup snapshot is the correct source and there is
+    // no guard enforcing it, so this is written down rather than assumed.
     writer.text(&request.cell_admission_id)?;
     writer.u64(request.cell_admission_fence)?;
     writer.u64(request.deadline_unix_ms as u64)?;

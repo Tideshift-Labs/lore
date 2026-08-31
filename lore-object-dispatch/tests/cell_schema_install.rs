@@ -311,7 +311,7 @@ fn layer_contract_matches_the_frozen_sql() {
             // cannot invalidate it the way 0012 invalidates 0011's whole-schema manifest.
             read_state_retired_after: None,
             installed_after_migration: 19,
-            migration_blake3_hex: "390a1275927fc9273746a8180aab42ab7c446be6283a82f1263026fbee0f755b",
+            migration_blake3_hex: "a7d54d94d0fa5035872eb9b3426cbbe6471bcf9ae34ed41877542f050e1aaad9",
         },
     ];
 

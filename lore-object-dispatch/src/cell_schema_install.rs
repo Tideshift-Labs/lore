@@ -191,12 +191,12 @@ pub const CELL_INSTALL_SET: [CellMigration; 15] = [
     cell_migration!(
         18,
         "0018_object_store_dispatch_dispatcher_identity_schema.sql",
-        "390a1275927fc9273746a8180aab42ab7c446be6283a82f1263026fbee0f755b"
+        "a7d54d94d0fa5035872eb9b3426cbbe6471bcf9ae34ed41877542f050e1aaad9"
     ),
     cell_migration!(
         19,
         "0019_object_store_dispatch_dispatcher_identity_provisioning.sql",
-        "c7d78710d1252b22a0a7a9fe722e91f9fd79e0676987d961d0ccb77b0417e78f"
+        "6413bda96da9263c0d0b631b7c696fd717ff67ff198a2c3304de7d202decfc70"
     ),
 ];
 
@@ -375,7 +375,7 @@ pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 4] = [
         id: CellSchemaLayerId::DispatcherIdentity,
         api_revision: "object-store-dispatch-dispatcher-identity-provisioning-v1",
         schema_revision: "object-store-dispatch-dispatcher-identity-schema-v1",
-        migration_blake3_hex: "390a1275927fc9273746a8180aab42ab7c446be6283a82f1263026fbee0f755b",
+        migration_blake3_hex: "a7d54d94d0fa5035872eb9b3426cbbe6471bcf9ae34ed41877542f050e1aaad9",
         contract_migration: 18,
         install_function: "object_store_dispatch_dispatcher_identity_install_v1",
         read_state_function: "object_store_dispatch_dispatcher_identity_read_state_v1",
@@ -777,14 +777,22 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
 /// `schema` is the namespace entry, and `default_acls`, `triggers` and `rules_and_policies` are all
 /// empty on a correctly installed cell, so a change in any of those four would have meant the
 /// migration did something it does not claim to do.
+///
+/// Re-measured once more in CD-3's review fix round, which moved exactly two sections and thereby
+/// confirmed both fixes: `functions`, because 0019's object assert gained the key-column bound and
+/// the exclusion-constraint check, and `relations`, because 0018 now names a replica identity
+/// explicitly. That second one is the interesting half. Dropping a primary key leaves
+/// `relreplident` at `'d'` -- "the primary key" -- which after the drop resolves to nothing, and a
+/// value that does not change is a value this manifest cannot flag. Setting it to `'i'` against the
+/// retained three-column unique index is what put the choice inside the pin.
 pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
     hex32("f468de7d148f5335b52a10c4298d609be546801754da1d991ff0ac7e7c0da0ca"),
-    hex32("30bf677d50aa7e735200d84570a76a2e4e16368fb33b8c4dc112098378eaa2d3"),
+    hex32("5e01c7cd66a23346d17b156fc891ddacb3eab076ab6825859a3372ed2173cca1"),
     hex32("14879db8f573eb8670a391b7e786acfa4331c43f03bc2807497e95f00aa565a9"),
     hex32("95078ccb57b724114f162a6c4a410195601a16a48042b3a2f5d0a0b8df4dd2ae"),
     hex32("fe4e7104687d714c8ac084dca11fcd9d0131f03608649e295309004758a62923"),
     hex32("925f3c6fced9ba0b390b1bdb20293aa84c35f5ded074832e9dcbc2c2adbf4a78"),
-    hex32("21194f097f406846092a3c50053e49dd5fa6a38def0e1b7cb6e38f5cc8d061a7"),
+    hex32("cdd3992342d81120bdfd6b1577aa412437657e9cba8196e2d7235d06fbf12a71"),
     hex32("946c88196f476aa6817695043f4fea8b754e38e97b3c21272d9a087d869d12ce"),
     hex32("cb220f3aef0f0bfb93996548ff1951f59374ce24b980d75f0beb6189a559a38a"),
     hex32("971ec53fc27466c873c783701757e1434c20b383d23f081d918a2d6e4c797971"),
@@ -798,7 +806,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
 /// whose exact rendering is a server-version property. A different major version is expected to
 /// fail closed here and needs a re-measured pin, not a relaxed check.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_V1: [u8; 32] =
-    hex32("0f5d060971a3961a2263a0a1d35a7634766789b98038e866385c9f48ddcdc34b");
+    hex32("82423ef3c787dd1b81905b6258c04fdab82c8db0953034bc4d57b65036d17bf1");
 
 /// Const hex decoder for the pinned digests above.
 const fn hex32(text: &str) -> [u8; 32] {

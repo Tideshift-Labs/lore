@@ -43,6 +43,13 @@
 -- promoted in place because a unique constraint already owns its index. The invariant a reader
 -- should hold on to is stated as an assertion in 0019 rather than as a redundant index here: no
 -- uniqueness on this table may be enforced across participants.
+--
+-- Dropping a primary key does take one thing with it that the constraint itself is not: replica
+-- identity. `relreplident` stays `'d'`, which means "the primary key", so with no primary key
+-- logical decoding of an UPDATE or DELETE on this table would fail -- and the failure would be
+-- invisible to drift detection, because `relreplident` never changes value. The retained
+-- three-column UNIQUE is eligible to serve (all three columns NOT NULL, not partial, not
+-- deferrable), so it is named explicitly below rather than left implied.
 
 BEGIN;
 SET LOCAL ROLE object_dispatch_retention_owner;
@@ -51,6 +58,9 @@ DROP INDEX object_store_retention.object_dispatch_dispatchers_one_active_generat
 
 ALTER TABLE object_store_retention.object_dispatch_dispatchers
   DROP CONSTRAINT object_dispatch_dispatchers_pkey;
+
+ALTER TABLE object_store_retention.object_dispatch_dispatchers
+  REPLICA IDENTITY USING INDEX object_dispatch_dispatchers_provider_boundary_id_dispatcher_key;
 
 CREATE UNIQUE INDEX object_dispatch_dispatchers_one_active_participant_idx
   ON object_store_retention.object_dispatch_dispatchers (provider_boundary_id, dispatcher_id)

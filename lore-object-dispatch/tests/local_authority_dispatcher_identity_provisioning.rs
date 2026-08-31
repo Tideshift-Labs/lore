@@ -18,9 +18,9 @@ use lore_object_dispatch::local_authority_dispatcher_identity_provisioning::vali
 use tokio_postgres::error::SqlState;
 use tokio_util::task::AbortOnDropHandle;
 
-const EXPECTED_MIGRATION_BYTES: usize = 20_706;
+const EXPECTED_MIGRATION_BYTES: usize = 22_692;
 const EXPECTED_MIGRATION_BLAKE3: &str =
-    "c7d78710d1252b22a0a7a9fe722e91f9fd79e0676987d961d0ccb77b0417e78f";
+    "6413bda96da9263c0d0b631b7c696fd717ff67ff198a2c3304de7d202decfc70";
 const RETENTION_SCHEMA_BLAKE3: &str =
     "f86d1a574cab9346ef39843fed6ffb849cafe5967881a45d0c6d89028780f6dd";
 const AUTHORITY_SCHEMA_BLAKE3: &str =
@@ -28,7 +28,7 @@ const AUTHORITY_SCHEMA_BLAKE3: &str =
 const PUT_RESERVATION_SCHEMA_BLAKE3: &str =
     "56b6b891f6fa44875494a9d644b1a8ad66f1f87be5f886efeb324da05cb2ae67";
 const DISPATCHER_IDENTITY_SCHEMA_BLAKE3: &str =
-    "390a1275927fc9273746a8180aab42ab7c446be6283a82f1263026fbee0f755b";
+    "a7d54d94d0fa5035872eb9b3426cbbe6471bcf9ae34ed41877542f050e1aaad9";
 const DISPATCHER_IDENTITY_API_REVISION: &str =
     "object-store-dispatch-dispatcher-identity-provisioning-v1";
 const DISPATCHER_IDENTITY_SCHEMA_REVISION: &str =
