@@ -2408,7 +2408,7 @@ mod is_file_modified_chunking_compat {
     use lore_revision::node::Node;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::state::is_file_modified;
+    use lore_revision::state::file_modification;
     use lore_revision::util::path::RelativePath;
     use rand::Rng;
     use zerocopy::IntoBytes;
@@ -2661,7 +2661,7 @@ mod is_file_modified_chunking_compat {
                 ..Default::default()
             };
 
-            let is_modified = is_file_modified(
+            let is_modified = file_modification(
                 repository.clone(),
                 &node,
                 mtime,
@@ -2670,7 +2670,8 @@ mod is_file_modified_chunking_compat {
                 true,
             )
             .await
-            .expect("is_file_modified failed");
+            .expect("file_modification failed")
+            .is_modified();
 
             assert!(is_modified, "a file with one byte changed is modified");
         })
@@ -2702,9 +2703,10 @@ mod is_file_modified_chunking_compat {
 
             let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
             let modified =
-                is_file_modified(repository.clone(), &node, mtime, size, &relative_path, true)
+                file_modification(repository.clone(), &node, mtime, size, &relative_path, true)
                     .await
-                    .expect("is_file_modified failed");
+                    .expect("file_modification failed")
+            .is_modified();
 
             assert!(
                 !modified,
@@ -2738,9 +2740,10 @@ mod is_file_modified_chunking_compat {
 
             let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
             let modified =
-                is_file_modified(repository.clone(), &node, mtime, size, &relative_path, true)
+                file_modification(repository.clone(), &node, mtime, size, &relative_path, true)
                     .await
-                    .expect("is_file_modified failed");
+                    .expect("file_modification failed")
+            .is_modified();
 
             assert!(
                 !modified,

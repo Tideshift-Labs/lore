@@ -491,7 +491,7 @@ mod tests {
     use super::*;
 
     // A concrete `#[error_set]` error for the wrapper closures. Its `NotFound`
-    // variant wraps `lore_base::error::NotFound`, which carries error code 13, so
+    // variant wraps `lore_base::error::NotFound`, which carries error code 79, so
     // the failure path has a known non-internal code to assert against.
     #[error_set]
     enum SampleError {
@@ -554,7 +554,7 @@ mod tests {
             .collect();
         assert_eq!(completes.len(), 1, "exactly one Complete event");
 
-        // The status holds the error code (13 for `NotFound`) and the detail is
+        // The status holds the error code (79 for `NotFound`) and the detail is
         // populated with that code and the error's message.
         let data = &completes[0];
         let expected_code = SampleError::from(NotFound).ffi_code();

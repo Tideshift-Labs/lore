@@ -10,7 +10,6 @@ use std::sync::Arc;
 use lore_base::error::InvalidArguments;
 use lore_error_set::prelude::*;
 
-use crate::error::LoreResultExt;
 use crate::errors::InvalidPath;
 use crate::repository::RepositoryContext;
 
@@ -49,18 +48,17 @@ pub fn make_absolute_from(
 ) -> Result<PathBuf, PathError> {
     let path = path.as_ref();
     let cleanpath = clean(path.to_owned());
-    let pathbuf = PathBuf::from_str(cleanpath.as_str()).emit_map_err(InvalidPath {
-        path: path.to_string(),
-    })?;
+    // `PathBuf: FromStr` has `Err = Infallible`, so the old error arm here was
+    // unreachable. Construct it directly rather than mapping an error that
+    // cannot occur.
+    let pathbuf = PathBuf::from(cleanpath.as_str());
     if pathbuf.is_absolute() {
         return Ok(pathbuf);
     }
     match base {
         Some(base) => Ok(base.join(pathbuf)),
         None => Ok(std::env::current_dir()
-            .emit_map_err(PathError::internal(
-                "failed to get current working directory",
-            ))?
+            .internal("getting the current working directory")?
             .join(pathbuf)),
     }
 }
@@ -231,6 +229,12 @@ fn reduce_parent_segments(path: &mut String) {
     }
 
     *path = reduced;
+}
+
+/// Checks if the path contains any ".." segments. For example "..", "subdir/.." matches.
+/// A legitimate file name starting with dots does not match, e.g. "..hidden.txt"
+fn contains_directory_step_up(path: &str) -> bool {
+    path.contains("..") && path.split('/').any(|component| component == "..")
 }
 
 /// `path` in the form the repository names paths in: forward separators, none of
@@ -1017,14 +1021,14 @@ impl RelativePathBuf {
     }
 
     /// Construct from an initial path string.
-    /// Validates that the path is not absolute and cleans it.
+    /// Validates that the path is not absolute, holds no step up, and cleans it.
     ///
     /// Only a path carrying a separator it does not keep is rewritten. Trimming
     /// and the canonical separator are what nearly every path already holds, and
     /// establishing that costs no string of its own.
     pub fn new_from_initial_path(name: impl AsRef<str>) -> Result<RelativePathBuf, PathError> {
         let name = name.as_ref();
-        if name.starts_with("..") || (name.len() >= 2 && name.as_bytes()[1] == b':') {
+        if name.len() >= 2 && name.as_bytes()[1] == b':' {
             return Err(InvalidPath {
                 path: name.to_string(),
             }
@@ -1039,6 +1043,12 @@ impl RelativePathBuf {
             Cow::Borrowed(name)
         };
         let name = name.trim_start_matches("./");
+        if contains_directory_step_up(name) {
+            return Err(InvalidPath {
+                path: name.to_string(),
+            }
+            .into());
+        }
         let mut initial_path = RelativePathBuf::with_capacity(name.len());
         if name != "." && !name.is_empty() {
             initial_path.push(name);

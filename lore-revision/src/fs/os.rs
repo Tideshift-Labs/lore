@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
-use lore_error_set::WrapInternal;
+use lore_error_set::prelude::*;
 
 use super::filesystem_provider::FileDifferenceFromNode;
 use super::filesystem_provider::FileInfo;
@@ -34,6 +34,7 @@ use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::repository::RepositoryContext;
 use crate::state::FilesystemDiffStats;
+use crate::state::NodeComparison;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
@@ -86,7 +87,7 @@ impl InstanceOperation for OsOperation {
         root_node_to: NodeID,
         filter_mode: FilterMode,
     ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), FsError> {
-        Ok(crate::state::diff_filesystem_subtree(
+        crate::state::diff_filesystem_subtree(
             repository_from,
             state_from,
             repository_current,
@@ -98,7 +99,7 @@ impl InstanceOperation for OsOperation {
             std::sync::Arc::new(Vec::new()),
         )
         .await
-        .internal("Failed to diff filesystem")?)
+        .forward_any::<FsError>("Failed to diff filesystem")
     }
 
     async fn file_info(&self, path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
@@ -135,7 +136,7 @@ impl InstanceOperation for OsOperation {
                     .from
                     .get_node()
                     .await
-                    .internal("Failed to find node")?,
+                    .forward_any::<FsError>("Failed to find node")?,
             )
         } else {
             None
@@ -154,7 +155,7 @@ impl InstanceOperation for OsOperation {
                 info.size
             );
             if from_node.is_file() {
-                let modified = crate::state::is_file_modified(
+                let modified = crate::state::file_modification(
                     repository,
                     from_node,
                     info.mtime,
@@ -163,7 +164,8 @@ impl InstanceOperation for OsOperation {
                     force_full_check,
                 )
                 .await
-                .internal("Failed to check file modification")?;
+                .forward_any::<FsError>("Failed to check file modification")?
+                .is_modified();
                 Some(FileDifferenceFromNode { modified })
             } else {
                 None
@@ -207,25 +209,16 @@ impl InstanceOperation for OsOperation {
         .unwrap_or_default())
     }
 
-    async fn file_modified_from_node(
+    async fn compare_file_to_node(
         &self,
         repository: Arc<RepositoryContext>,
         node: &Node,
         path: &RelativePath,
-        file_mtime: u64,
         file_size: u64,
-        force_full_check: bool,
-    ) -> Result<bool, FsError> {
-        Ok(crate::state::is_file_modified(
-            repository,
-            node,
-            file_mtime,
-            file_size,
-            path,
-            force_full_check,
-        )
-        .await
-        .internal("Failed to check file modification")?)
+    ) -> Result<NodeComparison, FsError> {
+        crate::state::file_matches_node(repository, node, file_size, path)
+            .await
+            .forward_any::<FsError>("Failed to compare file to node")
     }
 
     async fn make_executable(
@@ -309,7 +302,7 @@ impl InstanceOperation for OsOperation {
             options,
         )
         .await
-        .internal("Failed to read file")?;
+        .forward_any::<FsError>("Failed to read file")?;
         Ok((fragment, metadata.map(FileInfo::from_metadata)))
     }
 

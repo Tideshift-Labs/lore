@@ -1613,7 +1613,7 @@ pub async fn commit_exact_selection(
     .map_err(|err| ExactSelectionError::internal("building revision metadata", err))?;
 
     let admission = ExactSelectionAdmission::new(selected, expected_metadata);
-    let signature = commit::commit_staged_revision(
+    let committed = commit::commit_staged_revision(
         repository.clone(),
         token.share(),
         state_current.clone(),
@@ -1626,8 +1626,8 @@ pub async fn commit_exact_selection(
         Some(admission.clone()),
     )
     .await;
-    let signature = match signature {
-        Ok(signature) => signature,
+    let (signature, modified_times) = match committed {
+        Ok(committed) => committed,
         Err(err) => {
             if let Some(Err(exact)) = admission.take() {
                 return Err(exact);
@@ -1657,6 +1657,14 @@ pub async fn commit_exact_selection(
     )
     .await
     .map_err(map_exact_finalize_error)?;
+
+    // This path composes commit's pieces directly instead of going through
+    // `commit()`, so the modified-time cache that `commit()` writes has to be
+    // written here too; otherwise the next stage re-hashes every file this
+    // commit already read. Stored after finalize, as `commit()` orders it, so a
+    // revision that failed to finalize records nothing.
+    modified_times.store(repository.clone()).await;
+
     crate::event::metadata::send(&metadata);
     Ok(result)
 }

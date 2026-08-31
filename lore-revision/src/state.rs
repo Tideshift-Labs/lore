@@ -12,6 +12,7 @@ use std::mem::size_of;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -27,11 +28,14 @@ use serde::Serialize;
 pub use sink::ChangeSink;
 pub use sink::OwnedChangeSink;
 use tokio::join;
+use tokio::sync::Semaphore;
+use tokio::task::JoinError;
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use zerocopy::FromZeros;
 use zerocopy::Immutable;
 
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::bitflagsops;
 use crate::branch;
 use crate::change;
@@ -603,7 +607,7 @@ impl State {
     ) -> Result<(Arc<Self>, BranchId), StateError> {
         let (current_revision, branch) = crate::instance::load_current_anchor(&repository)
             .await
-            .internal("Failed to deserialize anchor")?;
+            .forward::<StateError>("Failed to deserialize anchor")?;
         Ok((
             State::deserialize(repository.clone(), current_revision).await?,
             branch,
@@ -619,7 +623,7 @@ impl State {
     ) -> Result<(Arc<Self>, Option<Arc<Self>>, BranchId), StateError> {
         let (current_revision, branch) = crate::instance::load_current_anchor(&repository)
             .await
-            .internal("Failed to deserialize anchor")?;
+            .forward::<StateError>("Failed to deserialize anchor")?;
         let state_current = State::deserialize(repository.clone(), current_revision).await?;
 
         let state_staged = match crate::instance::load_staged_revision(&repository)
@@ -800,7 +804,7 @@ impl State {
                                         .with_max_size_chunk(),
                                 )
                                 .await
-                                .internal("Failed to serialize node block")?
+                                .forward::<StateError>("Failed to serialize node block")?
                             } else {
                                 Address::default()
                             };
@@ -821,7 +825,7 @@ impl State {
                                 .with_max_size_chunk(),
                         )
                         .await
-                        .internal("Failed to serialize node block")?;
+                        .forward::<StateError>("Failed to serialize node block")?;
                     Ok((address, block_index))
                 });
             }
@@ -866,7 +870,7 @@ impl State {
                     .with_max_size_chunk(),
             )
             .await
-            .internal("Failed to serialize node block list")?;
+            .forward::<StateError>("Failed to serialize node block list")?;
 
             // Update the tree node block list address
             {
@@ -913,7 +917,7 @@ impl State {
                                 .with_max_size_chunk(),
                         )
                         .await
-                        .internal("Failed to serialize file metadata block")?;
+                        .forward::<StateError>("Failed to serialize file metadata block")?;
                     Ok((address, block_index))
                 });
             }
@@ -958,7 +962,7 @@ impl State {
                     .with_max_size_chunk(),
             )
             .await
-            .internal("Failed to serialize file metadata block list")?;
+            .forward::<StateError>("Failed to serialize file metadata block list")?;
 
             // Update the tree file metadata node block list address
             {
@@ -995,7 +999,7 @@ impl State {
                             .with_max_size_chunk(),
                     )
                     .await
-                    .internal("Failed to serialize link list")?;
+                    .forward::<StateError>("Failed to serialize link list")?;
 
                     address.hash
                 };
@@ -1020,7 +1024,7 @@ impl State {
                         .with_max_size_chunk(),
                 )
                 .await
-                .internal("Failed to serialize tree")?;
+                .forward::<StateError>("Failed to serialize tree")?;
             {
                 lore_trace!("Serialized tree to {}", address.hash);
                 lore_trace!("  node block {}", tree.hash_node);
@@ -1052,7 +1056,7 @@ impl State {
                     .with_max_size_chunk(),
             )
             .await
-            .internal("Failed to serialize state")?
+            .forward::<StateError>("Failed to serialize state")?
         };
 
         {
@@ -1185,7 +1189,6 @@ impl State {
         let metadata = self.metadata_hash();
         let metadata = metadata::Metadata::deserialize(repository, metadata)
             .await
-            .internal("Failed to deserialize metadata")
             .unwrap_or_default();
         metadata.get_branch().unwrap_or_default()
     }
@@ -1219,14 +1222,14 @@ impl State {
         let options = immutable::read_options_from_repository(&repository)
             .with_cache()
             .with_priority();
-        Ok(immutable::read(
+        immutable::read(
             repository,
             Address::zero_context_hash(tree.hash_delta),
             None, /* Full range */
             options,
         )
         .await
-        .internal("Failed to deserialize delta block")?)
+        .forward::<StateError>("Failed to deserialize delta block")
     }
 
     pub async fn node_delta(
@@ -1767,7 +1770,7 @@ impl State {
                 true,
             )
             .await
-            .internal("Failed to deserialize file metadata block")?;
+            .forward::<StateError>("Failed to deserialize file metadata block")?;
             NodeFileMetadataBlock::new(block_data)
         });
 
@@ -2699,8 +2702,7 @@ impl State {
         let renamed = node.name_hash != name_hash
             || block
                 .node_name_clone(node_index)
-                .internal("Node name")
-                .map_err(StateError::from)?
+                .forward::<StateError>("Node name")?
                 != dst_name;
         let source_parent_id = node.parent;
         if !renamed && source_parent_id == destination_parent_id {
@@ -3057,8 +3059,7 @@ impl State {
             .await?;
         block
             .node_name_clone(Node::index(node))
-            .internal("Node name")
-            .map_err(StateError::from)
+            .forward::<StateError>("Node name")
     }
 
     pub async fn node_name_ref(
@@ -3071,8 +3072,7 @@ impl State {
             .await?;
         block
             .node_name_ref(Node::index(node))
-            .internal("Node name")
-            .map_err(StateError::from)
+            .forward::<StateError>("Node name")
     }
 
     pub async fn node_mark(
@@ -3151,13 +3151,13 @@ impl State {
         let children = self
             .node_children(repository.clone(), parent_node)
             .await
-            .internal("Node not found")?;
+            .forward::<StateError>("Node not found")?;
 
         for &child in &children {
             if self
                 .node(repository.clone(), child)
                 .await
-                .internal("Node not found")?
+                .forward::<StateError>("Node not found")?
                 .is_staged()
             {
                 lore_trace!("Child node {child} is staged");
@@ -3247,13 +3247,13 @@ impl State {
         let children = self
             .node_children(repository.clone(), parent_node)
             .await
-            .internal("Node not found")?;
+            .forward::<StateError>("Node not found")?;
 
         for &child in &children {
             if self
                 .node(repository.clone(), child)
                 .await
-                .internal("Node not found")?
+                .forward::<StateError>("Node not found")?
                 .is_dirty()
             {
                 lore_trace!("Child node {child} is dirty");
@@ -3345,7 +3345,7 @@ impl State {
             let children = self
                 .node_children(repository.clone(), node_id)
                 .await
-                .internal("Failed to get children for dirty path collection")?;
+                .forward::<StateError>("Failed to get children for dirty path collection")?;
 
             if node_id == root_node && children.is_empty() && !path.is_empty() {
                 let node = self.node(repository.clone(), node_id).await?;
@@ -3624,7 +3624,7 @@ impl State {
             let name = self
                 .node_name_ref(repository.clone(), *node)
                 .await
-                .internal("Node name")?;
+                .forward::<StateError>("Node name")?;
             path.push(name);
         }
 
@@ -3672,7 +3672,7 @@ impl State {
             let linked_repository = Arc::new(repository.to_link_context(linked_repository).await);
             let link_state = State::deserialize(linked_repository.clone(), signature)
                 .await
-                .internal("Link error")?;
+                .forward::<StateError>("Link error")?;
 
             let result = Box::pin(link_state.collect_children_unsorted(
                 linked_repository.clone(),
@@ -3744,7 +3744,7 @@ impl State {
             let linked_repository = Arc::new(repository.to_link_context(linked_repository).await);
             let link_state = State::deserialize(linked_repository.clone(), signature)
                 .await
-                .internal("Link error")?;
+                .forward::<StateError>("Link error")?;
 
             let result = Box::pin(link_state.collect_named_children_unsorted(
                 linked_repository.clone(),
@@ -3919,7 +3919,7 @@ impl State {
     ) -> Result<RevisionMetadata, StateError> {
         let metadata = Metadata::deserialize(repository, self.metadata_hash())
             .await
-            .internal("Failed to deserialize metadata")?;
+            .forward::<StateError>("Failed to deserialize metadata")?;
 
         Ok(RevisionMetadata::from_metadata(metadata))
     }
@@ -3968,7 +3968,7 @@ impl State {
                 .with_max_size_chunk(),
         )
         .await
-        .internal("Failed to serialize link merge state")?;
+        .forward::<StateError>("Failed to serialize link merge state")?;
 
         self.set_link_merge_hash(address.hash);
         Ok(address.hash)
@@ -3991,7 +3991,7 @@ impl State {
             options,
         )
         .await
-        .internal("Failed to read link merge state")?;
+        .forward::<StateError>("Failed to read link merge state")?;
 
         let raw = data.as_ref();
         let header_size = std::mem::size_of::<LinkMergeState>();
@@ -4039,7 +4039,7 @@ impl State {
                 .with_priority(),
         )
         .await
-        .internal("Failed to read state data")?
+        .forward::<StateError>("Failed to read state data")?
         .to_aligned::<LinkReference>();
 
         Ok(data.as_type_slice::<LinkReference>().to_vec())
@@ -4114,7 +4114,7 @@ impl State {
                         .with_priority(),
                 )
                 .await
-                .internal("Failed to read state data")?
+                .forward::<StateError>("Failed to read state data")?
                 .to_aligned::<LinkReference>();
                 data.as_type_slice::<LinkReference>().to_vec()
             } else {
@@ -4243,7 +4243,7 @@ impl State {
             Arc::new(if !tree.hash_nametable_deprecated.is_zero() {
                 NameTable::deserialize(repository, tree.hash_nametable_deprecated)
                     .await
-                    .internal("Failed to deserialize name table")?
+                    .forward::<StateError>("Failed to deserialize name table")?
             } else {
                 NameTable::default()
             })
@@ -4819,7 +4819,9 @@ async fn gather_tree_paths_node(
     let node = block.node(node_index);
     node.walk_step(node_id, expected_parent, cycle)?;
 
-    let node_name = block.node_name_ref(node_index).internal("Node name")?;
+    let node_name = block
+        .node_name_ref(node_index)
+        .forward::<StateError>("Node name")?;
     let node_path = if parent_path.is_empty() {
         RelativePath::new_from_initial_path(node_name).unwrap_or_default()
     } else {
@@ -5843,6 +5845,10 @@ pub struct FilesystemDiffStats {
     pub file_delete: AtomicU64,
     pub file_retain: AtomicU64,
     pub file_replace: AtomicU64,
+    /// Files the answer required reading, including any that could not be read.
+    pub file_hash: AtomicU64,
+    /// Files a recorded modified time answered for, sparing them a hash check.
+    pub file_mtime_match: AtomicU64,
 }
 
 impl FilesystemDiffStats {
@@ -5857,6 +5863,25 @@ impl FilesystemDiffStats {
             stats.file_replace.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        self.file_hash
+            .fetch_add(stats.file_hash.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.file_mtime_match.fetch_add(
+            stats.file_mtime_match.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Record what settled a file's comparison. A size mismatch counts as neither.
+    pub fn classify(&self, modification: &FileModification) {
+        match modification.answered_by() {
+            ComparisonAnswer::Mtime => {
+                self.file_mtime_match.fetch_add(1, Ordering::Relaxed);
+            }
+            ComparisonAnswer::Hash => {
+                self.file_hash.fetch_add(1, Ordering::Relaxed);
+            }
+            ComparisonAnswer::Size => {}
+        }
     }
 }
 
@@ -6279,6 +6304,7 @@ async fn compare_single_file_against_state(
     current_node: Option<&Node>,
     file_metadata: &std::fs::Metadata,
     file_path: &RelativePath,
+    stats: &FilesystemDiffStats,
 ) -> Result<SingleFileCompareResult, StateError> {
     let Some(from_node) = from_node else {
         // No state node - this is a new file
@@ -6310,17 +6336,18 @@ async fn compare_single_file_against_state(
             current_node.is_none_or(|n| n.address.hash != from_node.address.hash);
 
         let (file_mtime, file_size) = util::fs::file_mtime_and_size(file_metadata);
-        let modified = is_file_modified(
+        let modification = file_modified_against_node(
             repository,
             from_node,
             file_mtime,
             file_size,
             file_path,
-            force_hash_check,
+            !force_hash_check,
         )
         .await?;
+        stats.classify(&modification);
 
-        if modified {
+        if modification.is_modified() {
             return Ok(SingleFileCompareResult::Modified);
         }
     }
@@ -7114,6 +7141,7 @@ async fn diff_filesystem_directory_walk(
                 current_node_ref,
                 &item.metadata,
                 &item_path,
+                stats,
             )
             .await?;
 
@@ -7160,11 +7188,8 @@ async fn diff_filesystem_directory_walk(
                 (link_from.clone(), state_from.clone(), subnode_from)
             };
             let subpath = item_path.clone();
-            let layer_mounts_recurse = ctx.layer_mounts.clone();
-            let filter_mode = ctx.filter_mode;
-            let scan_dirty = ctx.scan_dirty;
-            lore_spawn!(tasks, async move {
-                diff_filesystem_subtree_recurse(DiffFilesystemContext {
+            diff_filesystem_subtree_dispatch(
+                DiffFilesystemContext {
                     from: FilesystemTraversal {
                         repository: link_from,
                         state: state_from,
@@ -7178,15 +7203,18 @@ async fn diff_filesystem_directory_walk(
                         root_node: subnode_current,
                     },
                     filesystem_path: subpath,
-                    filter_mode,
-                    scan_dirty,
-                    layer_mounts: layer_mounts_recurse,
+                    filter_mode: ctx.filter_mode,
+                    scan_dirty: ctx.scan_dirty,
+                    layer_mounts: ctx.layer_mounts.clone(),
                     // Crossing into the linked state; parent's link mounts
                     // are paths in the parent tree and do not apply here.
                     link_mounts: Arc::new(vec![]),
-                })
-                .await
-            });
+                },
+                tasks,
+                changes,
+                stats,
+            )
+            .await?;
         } else if was_directory && is_directory {
             if ctx.scan_dirty && !current_node_id.is_valid_node_id() {
                 // Re-emit a staged dirty-add directory (in staged, absent from
@@ -7241,7 +7269,6 @@ async fn diff_filesystem_directory_walk(
             } else {
                 (repository_current, state_current.clone(), current_node_id)
             };
-            let layer_mounts_recurse = ctx.layer_mounts.clone();
             // Stay in the parent's link mounts when recursing into a normal
             // sub-directory; reset when crossing into a linked state because
             // those mount paths are in the parent tree, not the linked tree.
@@ -7250,10 +7277,8 @@ async fn diff_filesystem_directory_walk(
             } else {
                 ctx.link_mounts.clone()
             };
-            let filter_mode = ctx.filter_mode;
-            let scan_dirty = ctx.scan_dirty;
-            lore_spawn!(tasks, async move {
-                diff_filesystem_subtree_recurse(DiffFilesystemContext {
+            diff_filesystem_subtree_dispatch(
+                DiffFilesystemContext {
                     from: FilesystemTraversal {
                         repository: repository_from,
                         state: state_from,
@@ -7267,13 +7292,16 @@ async fn diff_filesystem_directory_walk(
                         root_node: subnode_current,
                     },
                     filesystem_path: subpath,
-                    filter_mode,
-                    scan_dirty,
-                    layer_mounts: layer_mounts_recurse,
+                    filter_mode: ctx.filter_mode,
+                    scan_dirty: ctx.scan_dirty,
+                    layer_mounts: ctx.layer_mounts.clone(),
                     link_mounts: link_mounts_recurse,
-                })
-                .await
-            });
+                },
+                tasks,
+                changes,
+                stats,
+            )
+            .await?;
         } else {
             // Type change: file <-> directory
             let file_ctx = FileDiffContext {
@@ -7472,9 +7500,8 @@ async fn diff_filesystem_directory_walk(
                 let layer_state = mount.state.clone();
                 let subpath = child_file_path.clone();
                 let layer_source_node = mount.source_node;
-                lore_spawn!(
-                    tasks,
-                    diff_filesystem_subtree_recurse(DiffFilesystemContext {
+                diff_filesystem_subtree_dispatch(
+                    DiffFilesystemContext {
                         from: FilesystemTraversal {
                             repository: layer_repository.clone(),
                             state: layer_state.clone(),
@@ -7495,8 +7522,12 @@ async fn diff_filesystem_directory_walk(
                         // Crossing into the layer state; parent's link mounts
                         // are paths in the parent tree and do not apply here.
                         link_mounts: Arc::new(vec![]),
-                    },)
-                );
+                    },
+                    tasks,
+                    changes,
+                    stats,
+                )
+                .await?;
                 continue 'new_file_iter;
             }
             lore_trace!("Filesystem has new directory in path {child_file_path}, recursing");
@@ -7556,9 +7587,8 @@ async fn diff_filesystem_directory_walk(
             let repository_current = ctx.current.repository.clone();
             let state_current = ctx.current.state.clone();
             let subpath = child_file_path.clone();
-            lore_spawn!(
-                tasks,
-                diff_filesystem_subtree_recurse(DiffFilesystemContext {
+            diff_filesystem_subtree_dispatch(
+                DiffFilesystemContext {
                     from: FilesystemTraversal {
                         repository: repository_from,
                         state: state_from,
@@ -7577,8 +7607,12 @@ async fn diff_filesystem_directory_walk(
                     layer_mounts: ctx.layer_mounts.clone(),
                     // Same parent state; deeper paths may still match a link.
                     link_mounts: ctx.link_mounts.clone(),
-                })
-            );
+                },
+                tasks,
+                changes,
+                stats,
+            )
+            .await?;
 
             // The single Dirty+Add directory node emitted above is the scan's
             // report for this new directory; skip the transient change below.
@@ -7611,16 +7645,77 @@ async fn diff_filesystem_directory_walk(
         .await?;
     }
 
-    while let Some(task_result) = tasks.join_next().await {
-        let (mut task_changes, task_stats) = task_result
-            .internal("Task failure")
-            .map_err(StateError::from)
-            .flatten()?;
-        changes.append(&mut task_changes);
-        stats.append(task_stats);
+    while let Some(joined) = tasks.join_next().await {
+        diff_filesystem_subtree_merge_task(joined, changes, stats)?;
     }
 
     Ok(())
+}
+
+/// Budget for subtree tasks live at once. Process-wide because every directory in the walk
+/// owns its own [`JoinSet`].
+static DIFF_FILESYSTEM_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn diff_filesystem_task_semaphore() -> &'static Arc<Semaphore> {
+    DIFF_FILESYSTEM_TASK_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TREE_TASKS)))
+}
+
+/// Diffs one subtree, spawned while the budget allows and inline once it does not, then folds
+/// back whatever has finished.
+///
+/// Inline rather than a blocking acquire: a parent holds its permit until its children finish,
+/// so waiting on one would wait on a descendant that cannot start.
+async fn diff_filesystem_subtree_dispatch(
+    subtree: DiffFilesystemContext,
+    tasks: &mut JoinSet<Result<(Vec<NodeChange>, FilesystemDiffStats), StateError>>,
+    changes: &mut Vec<NodeChange>,
+    stats: &mut FilesystemDiffStats,
+) -> Result<(), StateError> {
+    if let Ok(permit) = diff_filesystem_task_semaphore().clone().try_acquire_owned() {
+        lore_spawn!(tasks, async move {
+            let _permit = permit;
+            diff_filesystem_subtree_recurse(subtree).await
+        });
+    } else {
+        diff_filesystem_subtree_merge(
+            diff_filesystem_subtree_recurse(subtree).await?,
+            changes,
+            stats,
+        );
+    }
+    while let Some(joined) = tasks.try_join_next() {
+        diff_filesystem_subtree_merge_task(joined, changes, stats)?;
+    }
+    Ok(())
+}
+
+/// Folds a joined subtree task into the parent directory's changes and stats.
+fn diff_filesystem_subtree_merge_task(
+    joined: Result<Result<(Vec<NodeChange>, FilesystemDiffStats), StateError>, JoinError>,
+    changes: &mut Vec<NodeChange>,
+    stats: &mut FilesystemDiffStats,
+) -> Result<(), StateError> {
+    diff_filesystem_subtree_merge(
+        joined
+            .internal("Task failure")
+            .map_err(StateError::from)
+            .flatten()?,
+        changes,
+        stats,
+    );
+    Ok(())
+}
+
+/// Folds a finished subtree's changes and stats into the parent directory's.
+fn diff_filesystem_subtree_merge(
+    subtree: (Vec<NodeChange>, FilesystemDiffStats),
+    changes: &mut Vec<NodeChange>,
+    stats: &mut FilesystemDiffStats,
+) {
+    let (mut subtree_changes, subtree_stats) = subtree;
+    changes.append(&mut subtree_changes);
+    stats.append(subtree_stats);
 }
 
 /// Handle diff for a single file path.
@@ -7690,6 +7785,7 @@ async fn diff_filesystem_single_file(
         current_node.as_ref(),
         &file_item.metadata,
         &ctx.filesystem_path,
+        &stats,
     )
     .await?;
 
@@ -7830,31 +7926,139 @@ pub async fn count_staged_files(
 }
 
 // TODO(UCS-13059): Extend with file mode check
-/// Whether the file on disk differs from the content `node` addresses.
+/// Outcome of comparing a file on disk to the content a node addresses.
+pub enum NodeComparison {
+    /// The file holds the node's content.
+    Matches,
+    /// The file differs from the node, or the stored object could not be described or walked
+    /// well enough to tell. Nothing was established in the latter case, and treating it as a
+    /// match would let a real local change be overwritten.
+    Differs,
+    /// The file could not be read, which a scan running alongside a branch switch sees
+    /// whenever one is deleted under it.
+    Unreadable,
+}
+
+/// Whether the file on disk holds the content `node` addresses.
 ///
-/// Size and modification time answer first where they can. Beyond that the file is measured
-/// against the stored object's own fragmentation, which is the only comparison that holds:
-/// a commit may reuse a previous fragmentation, so the stored hash is a function of the
-/// content and of how it came to be chunked, and re-hashing the content from scratch does
-/// not reproduce it.
+/// The file is measured against the stored object's own fragmentation, which is the only
+/// comparison that holds: a commit may reuse a previous fragmentation, so the stored hash is
+/// a function of the content and of how it came to be chunked, and re-hashing the content
+/// from scratch does not reproduce it.
 ///
 /// Fetches fragment metadata but never content payloads, so the cost is bounded by the file
-/// however large the stored object is. When the stored object cannot be described or walked
-/// the file is reported modified: nothing was established, and treating it as unmodified
-/// would let a real local change be overwritten.
-pub async fn is_file_modified(
+/// however large the stored object is. Reads no recorded modification time and records none:
+/// a recorded time speaks for the current revision's node, and this answers about any node.
+pub async fn file_matches_node(
+    repository: Arc<RepositoryContext>,
+    node: &Node,
+    file_size: u64,
+    file_path: &RelativePath,
+) -> Result<NodeComparison, StateError> {
+    if file_size != node.size {
+        lore_trace!("File {file_path} size differs from node, differs");
+        return Ok(NodeComparison::Differs);
+    }
+
+    let absolute_path = file_path.to_absolute_path(repository.require_path()?);
+    let matches = immutable::file_matches(
+        repository,
+        &absolute_path,
+        node.address,
+        Some(node.size as usize),
+    )
+    .await;
+
+    match matches {
+        Ok(lore_storage::FileMatch::Match) => {
+            lore_trace!("File {file_path} matches stored content");
+            Ok(NodeComparison::Matches)
+        }
+        Ok(lore_storage::FileMatch::Differs) => {
+            lore_trace!("File {file_path} differs from stored content");
+            Ok(NodeComparison::Differs)
+        }
+        Ok(lore_storage::FileMatch::Indeterminate) => {
+            lore_trace!("File {file_path} could not be compared, treated as differing");
+            Ok(NodeComparison::Differs)
+        }
+        Err(_) => {
+            lore_trace!("File {file_path} could not be read");
+            Ok(NodeComparison::Unreadable)
+        }
+    }
+}
+
+/// How a file compared to the node it was measured against, and what answered it.
+pub enum FileModification {
+    /// The recorded modified time vouched for the file, which was never read.
+    UnmodifiedByMtime,
+    /// A hash check established that the file holds the node's content.
+    UnmodifiedByHash,
+    /// The file could not be read, which a scan running alongside a branch switch sees
+    /// whenever one is deleted under it. Reported unmodified so a routine deletion does not
+    /// look like a local change, and never recorded: nothing was established.
+    Unreadable,
+    /// The size differs from the node's, which settles it without a hash check.
+    ModifiedBySize,
+    /// A hash check established that the file differs from the node.
+    ModifiedByHash,
+}
+
+/// What settled a file comparison, which is what the size and hash counters report.
+pub enum ComparisonAnswer {
+    /// The size differed from the node's, settling it without reading either the recorded
+    /// time or the file.
+    Size,
+    /// A recorded modified time vouched for the file, which was never read.
+    Mtime,
+    /// The file had to be read to answer, whether or not the read succeeded.
+    Hash,
+}
+
+impl FileModification {
+    /// Whether the file differs from the node.
+    pub fn is_modified(&self) -> bool {
+        matches!(
+            self,
+            FileModification::ModifiedBySize | FileModification::ModifiedByHash
+        )
+    }
+
+    /// What settled the comparison.
+    pub fn answered_by(&self) -> ComparisonAnswer {
+        match self {
+            FileModification::ModifiedBySize => ComparisonAnswer::Size,
+            FileModification::UnmodifiedByMtime => ComparisonAnswer::Mtime,
+            FileModification::UnmodifiedByHash
+            | FileModification::ModifiedByHash
+            | FileModification::Unreadable => ComparisonAnswer::Hash,
+        }
+    }
+}
+
+/// How the file on disk compares to the content `node` addresses.
+///
+/// Size and the recorded modification time answer first where they can, and comparing the
+/// content answers the rest. A recorded time speaks for the node the current revision holds
+/// and no other, so a caller asking about a different node sets `force_check_hash`, or else
+/// knows that no time can have been recorded for the path.
+///
+/// Records nothing. Whether an observed match is worth recording depends on which node was
+/// asked about, which only the caller knows.
+pub async fn file_modification(
     repository: Arc<RepositoryContext>,
     node: &Node,
     file_mtime: u64,
     file_size: u64,
     file_path: &RelativePath,
     force_check_hash: bool,
-) -> Result<bool, StateError> {
+) -> Result<FileModification, StateError> {
     // Assume files are identical if size and timestamp match
     let node_size = node.size;
     if file_size != node_size {
         lore_trace!("File {file_path} size changed, modified");
-        return Ok(true);
+        return Ok(FileModification::ModifiedBySize);
     }
 
     let node_mtime = if !force_check_hash {
@@ -7864,43 +8068,237 @@ pub async fn is_file_modified(
     };
     if file_mtime == node_mtime {
         lore_trace!("File {file_path} unmodified, size {file_size} and mtime {file_mtime} match");
-        return Ok(false);
+        return Ok(FileModification::UnmodifiedByMtime);
     }
 
     lore_trace!(
         "Hash check file {file_path} - file size {file_size} node size {node_size}, file mtime {file_mtime}, node mtime {node_mtime}, force {force_check_hash}"
     );
-    let absolute_path = file_path.to_absolute_path(repository.require_path()?);
-    let matches = immutable::file_matches(
-        repository.clone(),
-        &absolute_path,
-        node.address,
-        Some(node.size as usize),
-    )
-    .await;
 
-    match matches {
-        Ok(lore_storage::FileMatch::Match) => {
-            lore_trace!("File {file_path} unmodified, matches stored content");
-            file_modified_time_store(repository.clone(), file_path, file_mtime).await;
-            Ok(false)
+    Ok(
+        match file_matches_node(repository, node, file_size, file_path).await? {
+            NodeComparison::Matches => FileModification::UnmodifiedByHash,
+            NodeComparison::Differs => FileModification::ModifiedByHash,
+            NodeComparison::Unreadable => FileModification::Unreadable,
+        },
+    )
+}
+
+/// How the file on disk compares to `node`, recording the modified time when a hash check is
+/// what established the match.
+///
+/// `node_is_current` states that `node` is the one the current revision holds at this path,
+/// and gates both halves: a recorded time speaks for that node alone, so it can neither
+/// answer for any other node nor be written from a match against one. Recording here is what
+/// spares the next scan the hash check this one just paid for.
+pub async fn file_modified_against_node(
+    repository: Arc<RepositoryContext>,
+    node: &Node,
+    file_mtime: u64,
+    file_size: u64,
+    file_path: &RelativePath,
+    node_is_current: bool,
+) -> Result<FileModification, StateError> {
+    let modification = file_modification(
+        repository.clone(),
+        node,
+        file_mtime,
+        file_size,
+        file_path,
+        !node_is_current,
+    )
+    .await?;
+
+    if node_is_current && matches!(modification, FileModification::UnmodifiedByHash) {
+        file_modified_time_store(repository, file_path, file_mtime).await;
+    }
+
+    Ok(modification)
+}
+
+/// Modified times collected by an operation, to be recorded once it has completed.
+///
+/// An entry states that a path held the current revision's content at that time. Recording
+/// as each file is handled would publish that before it is true and, worse, would vouch for
+/// a time the next write can still share, so entries are collected and written at the end by
+/// [`store`](Self::store). An operation that leaves the current revision elsewhere calls
+/// [`discard`](Self::discard).
+#[must_use]
+#[derive(Default)]
+pub struct RecordedModifiedTimes(Box<crossbeam::queue::SegQueue<(Hash, u64)>>);
+
+impl RecordedModifiedTimes {
+    /// Collects the entry recording that `path` held `repository`'s current content at
+    /// `mtime`.
+    pub fn record(&self, repository: &RepositoryContext, path: &RelativePath, mtime: u64) {
+        self.0
+            .push(file_modified_time_entry(repository, path, mtime));
+    }
+
+    /// Writes the collected times into `repository`'s mutable store, one task per store group.
+    ///
+    /// The store takes its write lock within the group a key's first byte selects, so
+    /// splitting the times by that byte lets every task run without ever contending with
+    /// another.
+    ///
+    /// Waits for the filesystem to stamp later than every time written, so that none of them
+    /// can be shared by a write that follows — bounded, so a filesystem that does not appear to
+    /// move on is left with times a following write can still share rather than being waited on
+    /// forever. See [`wait_until_settled`].
+    pub async fn store(&self, repository: Arc<RepositoryContext>) {
+        let mut times = Vec::with_capacity(self.0.len());
+        let mut mtime_max = 0;
+        while let Some((key, mtime)) = self.0.pop() {
+            mtime_max = mtime_max.max(mtime);
+            times.push((key, mtime));
         }
-        Ok(lore_storage::FileMatch::Differs) => {
-            lore_trace!("File {file_path} differs from stored content, modified");
-            Ok(true)
+        if times.is_empty() || execution_context().globals().dry_run() {
+            return;
         }
-        Ok(lore_storage::FileMatch::Indeterminate) => {
-            lore_trace!("File {file_path} could not be compared, treated as modified");
-            Ok(true)
+        let Some(store) = repository.try_mutable_store_arc() else {
+            return;
+        };
+
+        let mut groups = vec![Vec::new(); lore_storage::local::mutable_store::GROUP_COUNT];
+        for (key, mtime) in times {
+            groups[key.data()[0] as usize].push((key, mtime));
         }
-        // The file itself could not be read, which a scan running alongside a branch switch
-        // sees whenever one is deleted under it. Reporting it modified would make a routine
-        // race look like local changes, so it is left to the next scan that can read it.
-        Err(_) => {
-            lore_trace!("File {file_path} could not be read, consider unmodified");
-            Ok(false)
+
+        let mut tasks = JoinSet::new();
+        for items in groups {
+            if items.is_empty() {
+                continue;
+            }
+            lore_spawn!(tasks, {
+                let store = store.clone();
+                let partition = repository.id;
+                async move {
+                    file_modified_time_store_group(store, partition, items).await;
+                }
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+
+        wait_until_settled(&repository, mtime_max).await;
+    }
+
+    /// Collects an entry built by [`file_modified_time_entry`], for a caller that computed
+    /// the key where it had the path rather than where it records.
+    pub fn push(&self, entry: (Hash, u64)) {
+        self.0.push(entry);
+    }
+
+    /// Moves the times collected by `other` into this collector.
+    pub fn absorb(&self, other: Self) {
+        while let Some(entry) = other.0.pop() {
+            self.0.push(entry);
         }
     }
+
+    /// Removes the times collected so far, leaving the collector empty.
+    pub fn take(&self) -> Self {
+        let taken = Self::default();
+        while let Some(entry) = self.0.pop() {
+            taken.0.push(entry);
+        }
+        taken
+    }
+
+    /// Drops the times, for an operation that leaves the current revision elsewhere.
+    pub fn discard(&self) {
+        while self.0.pop().is_some() {}
+    }
+}
+
+/// Name of the file stamped to read the working copy's own clock.
+const MODIFIED_TIME_PROBE: &str = "mtime-probe";
+
+/// The whole time [`wait_until_settled`] may spend on the filesystem's clock.
+///
+/// A filesystem whose stamps do not advance — one keeping a clock coarser than the tick the
+/// wait assumes, one handing out a single time for the whole run, or one failing every probe —
+/// would otherwise hold the operation open indefinitely. Giving up leaves the recorded times
+/// unable to tell a following write apart, the same position a working copy that cannot be
+/// stamped at all is in.
+const MODIFIED_TIME_SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The path of the file stamped to read the working copy's clock, `None` when the working copy
+/// has no path to stamp.
+fn modified_time_probe_path(repository: &RepositoryContext) -> Option<std::path::PathBuf> {
+    Some(
+        repository
+            .require_path()
+            .ok()?
+            .join(repository.format.dot_dir())
+            .join(MODIFIED_TIME_PROBE),
+    )
+}
+
+/// Stamps the probe at `path` and reads back the time the filesystem gave it.
+///
+/// The metadata a write returns is taken while the file is still open, which on a filesystem
+/// that settles the stamp when the handle closes is not the time the file ends up carrying.
+/// The write closes the file before it completes, so reading the time back in a call of its
+/// own asks about the state a later scan will see.
+///
+/// `None` when either call fails: a probe that could not be written or read says nothing about
+/// the filesystem's clock, which is the same answer as a working copy that cannot be stamped.
+async fn stamp_probe(path: &std::path::Path) -> Option<u64> {
+    let driver = lore_io::IoDriver::global();
+    driver
+        .write_file_bytes(path, bytes::Bytes::from_static(&[0u8]), false)
+        .await
+        .ok()?;
+    let metadata = driver.metadata(path).await.ok()?;
+    Some(crate::util::fs::file_mtime(&metadata))
+}
+
+/// The time the working copy's filesystem is currently stamping writes with.
+///
+/// A file's modified time comes from a clock the filesystem advances on its own schedule and
+/// at its own resolution, which the process clock runs ahead of. Comparing a recorded time
+/// against [`std::time::SystemTime::now`] therefore always finds it older, however recently
+/// the file was written. Stamping a file and reading it back asks the filesystem instead, so
+/// the answer is on the scale the comparison needs.
+///
+/// `None` when the working copy cannot be stamped, which leaves a caller no way to tell a
+/// settled time from one a further write can still share.
+pub async fn filesystem_stamp_now(repository: &RepositoryContext) -> Option<u64> {
+    stamp_probe(&modified_time_probe_path(repository)?).await
+}
+
+/// Waits until the working copy's filesystem stamps later than `mtime_max`.
+///
+/// A file carrying the stamp the filesystem is still handing out can be written again without
+/// that stamp changing, so a time recorded for it cannot tell the two states apart. Holding
+/// the operation open until the filesystem has moved past every time it recorded leaves all
+/// of them able to, at the cost of at most the tick the filesystem is currently in — and never
+/// more than [`MODIFIED_TIME_SETTLE_LIMIT`], which is the ceiling on the whole wait rather than
+/// on the sleeps alone, so a probe that hangs cannot hold the operation either.
+///
+/// A probe that failed says nothing about the clock — least of all that it has moved on — so
+/// the wait asks again rather than reading the failure as settled, and the limit is what ends a
+/// wait that cannot get an answer.
+///
+/// The probe is removed on the way out however the wait ended, so a stamp file is not left
+/// behind in the dot directory.
+///
+/// Returns without waiting when the working copy cannot be stamped, which leaves no way to
+/// tell whether the times have settled.
+pub async fn wait_until_settled(repository: &RepositoryContext, mtime_max: u64) {
+    let Some(path) = modified_time_probe_path(repository) else {
+        return;
+    };
+    let _ = tokio::time::timeout(MODIFIED_TIME_SETTLE_LIMIT, async {
+        while stamp_probe(&path)
+            .await
+            .is_none_or(|stamp| mtime_max >= stamp)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    let _ = lore_io::IoDriver::global().remove_file(&path).await;
 }
 
 /// The key a file's modification time is stored under.
@@ -7915,6 +8313,19 @@ pub fn file_modified_time_key(salt: &[u8], instance: InstanceId, path: &Relative
         FILE_MTIME,
         instance.data(),
         path.as_lowercase_str().as_bytes(),
+    )
+}
+
+/// The entry recording that `path` held the current revision's content at `mtime`, for a
+/// caller collecting entries to write in one batch rather than one at a time.
+pub fn file_modified_time_entry(
+    repository: &RepositoryContext,
+    path: &RelativePath,
+    mtime: u64,
+) -> (Hash, u64) {
+    (
+        file_modified_time_key(repository.salt(), repository.instance_id, path),
+        mtime,
     )
 }
 
@@ -7937,12 +8348,19 @@ pub async fn file_modified_time(repository: Arc<RepositoryContext>, path: &Relat
     mtime
 }
 
+/// Records that `path` held the current revision's content at `mtime`.
+///
+/// A dry run records nothing: it leaves the current revision where it was, so no time it
+/// takes describes the revision the working copy is on.
 pub async fn file_modified_time_store(
     repository: Arc<RepositoryContext>,
     path: &RelativePath,
     mtime: u64,
 ) {
     lore_trace!("Store mtime {mtime} for {path}");
+    if execution_context().globals().dry_run() {
+        return;
+    }
     let Some(handle) = repository.try_write_mutable_store() else {
         return;
     };
@@ -7952,11 +8370,10 @@ pub async fn file_modified_time_store(
         .await;
 }
 
-/// Batch-write a collection of pre-computed `(mtime_key, mtime)` pairs into the
-/// mutable store. Used by the clone hot path so each `clone_file` task can drop
-/// its mtime into a shared buffer and a single fire-and-forget task issues the
-/// store calls instead of every task awaiting its own bucket lock inline.
-pub async fn file_modified_time_store_batch(
+/// Writes one store group's worth of pre-computed `(mtime_key, mtime)` pairs.
+///
+/// Every entry belongs to the same group, so the calls contend with no other group's task.
+async fn file_modified_time_store_group(
     store: Arc<dyn crate::store::MutableStore>,
     partition: RepositoryId,
     items: Vec<(Hash, u64)>,
@@ -8125,7 +8542,7 @@ async fn verify_node_name_case_impl(
                 None, // No link tracking in state verification
             )
             .await
-            .internal("Verify delete")?;
+            .forward::<StateError>("Verify delete")?;
 
             if delete_node.node == current_named_node.node {
                 break;
@@ -8260,7 +8677,7 @@ async fn collect_name_fragments(
                     let _block_data =
                         NodeBlockDataV0::read_box_from_immutable(repository.clone(), address, true)
                             .await
-                            .internal("Failed to deserialize node block")?;
+                            .forward::<StateError>("Failed to deserialize node block")?;
                     Ok(Hash::default())
                 }
             }
@@ -8822,7 +9239,7 @@ async fn collect_new_node_metadata_fragments(
     let metadata_block_from = if let Some(address) = block_address_from {
         NodeFileMetadataBlockData::read_box_from_immutable_compat(repository.clone(), address, true)
             .await
-            .internal("Failed to deserialize metadata")?
+            .forward::<StateError>("Failed to deserialize metadata")?
     } else {
         NodeFileMetadataBlockData::new_from_heap_zeroed()
     };
@@ -8833,7 +9250,7 @@ async fn collect_new_node_metadata_fragments(
         true,
     )
     .await
-    .internal("Failed to deserialize metadata")?;
+    .forward::<StateError>("Failed to deserialize metadata")?;
 
     let mut metadata_blobs = vec![];
     {
@@ -8860,7 +9277,7 @@ async fn collect_new_node_metadata_fragments(
     for metadata_blob in metadata_blobs.iter() {
         let metadata = Metadata::deserialize(repository.clone(), metadata_blob.hash)
             .await
-            .internal("Failed to deserialize metadata")?;
+            .forward::<StateError>("Failed to deserialize metadata")?;
 
         metadata.walk(
             |_key_slice: &[u8], value_slice: &[u8], value_type: MetadataType| {
@@ -9075,7 +9492,7 @@ pub async fn apply_tree_changes(
                 None,
             )
             .await
-            .internal("Node not found")?;
+            .forward::<StateError>("Node not found")?;
         }
     }
 
@@ -9108,7 +9525,7 @@ pub async fn apply_tree_changes(
                     None,
                 )
                 .await
-                .internal("Node not found")?;
+                .forward::<StateError>("Node not found")?;
             }
         }
 
@@ -9134,7 +9551,7 @@ pub async fn apply_tree_changes(
             crate::filter::FilterMode::Full,
         )
         .await
-        .internal("Node not found")?;
+        .forward::<StateError>("Node not found")?;
     }
 
     Ok(())
