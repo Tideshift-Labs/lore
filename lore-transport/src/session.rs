@@ -85,13 +85,16 @@ impl SessionBinding {
     /// extra round trip in a rare race, which is the way round this has to fail.
     ///
     /// What this guarantees is that no id is *handed out* for a generation it did not come
-    /// from. It cannot by itself guarantee the id is still current when the bytes reach the
-    /// socket, because the connection can be replaced in between. `send_with_reconnect`
-    /// re-reads the epoch after its permit wait — the one step in the path that can block for
-    /// long enough to matter — and refuses rather than sending. What is left is the few
-    /// instructions between that check and the writer being taken, which no await divides;
-    /// a replacement landing there is caught after the fact, by the send failing and
-    /// [`StorageSession::attempt`] rebinding, rather than before.
+    /// from. It does not guarantee the id is still current when the bytes reach the socket.
+    /// `send_with_reconnect` re-reads the epoch after its permit wait, which is the longest
+    /// block in the path, and refuses rather than sending. Three awaits still follow that
+    /// check inside `send_command_tracked` — growing a stream, taking the connection read
+    /// lock, and taking the writer — and the read lock is the one a reconnect holds in write
+    /// mode while it swaps the connection, so a whole reconnect can land between the check and
+    /// the write. A stale id sent in that window is rejected by the server, and
+    /// [`StorageSession::attempt`] rebinds and retries: the window is closed after the fact,
+    /// not before. Closing it beforehand needs this binding's epoch threaded down to the
+    /// write, which the send path's future-size bound does not currently have room for.
     async fn session_id(&self) -> Result<u32, ProtocolError> {
         let current = self.storage.connection_epoch();
         if let Some(id) = self.bound_to(current) {
@@ -325,8 +328,11 @@ impl StorageSession {
     fn collapse<T>(outcome: MutableOutcome<T>) -> Result<T, ProtocolError> {
         match outcome {
             MutableOutcome::Applied(value) => Ok(value),
-            // Says the connection carrying the command is gone, which is what a caller here
-            // already saw, and claims nothing about whether the write committed.
+            // The same error the transport produces for this case, arrived at without going
+            // back through `map_send_error`: it says the connection carrying the command is
+            // gone, which is what a caller here already saw, and claims nothing about whether
+            // the write committed. The unknown's command name is dropped because that mapping
+            // discards it too; a caller that wants it calls the `_outcome` method.
             MutableOutcome::Unknown(_) => Err(ProtocolError::from(Disconnected)),
         }
     }
@@ -658,11 +664,18 @@ impl Drop for StorageSession {
             let bound = *r.binding.session.lock();
             // Stopping a session is still putting its id on the wire, so it obeys the same rule
             // as every other command: only on the connection that issued it. A session from a
-            // replaced connection needs no stop — that connection discarded its whole session
-            // map when it went — and sending one would be the exact defect this fix removes.
-            if bound.epoch == Some(storage.connection_epoch()) {
+            // replaced connection needs no stop — the server drops the whole session map with
+            // the connection — and sending one would be the exact defect this fix removes.
+            //
+            // The check has to be inside the task, not here. `Drop` only decides to try; the
+            // connection can be replaced before the task runs, `session_stop` carries no epoch
+            // guard of its own, and its result is discarded, so a stale id sent from here would
+            // go out unnoticed by anything.
+            if let Some(epoch) = bound.epoch {
                 lore_base::lore_spawn_net!(async move {
-                    let _ = storage.session_stop(bound.id).await;
+                    if storage.connection_epoch() == epoch {
+                        let _ = storage.session_stop(bound.id).await;
+                    }
                 });
             }
         }

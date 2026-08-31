@@ -137,12 +137,12 @@ impl<T> MutableOutcome<T> {
 /// session layer starts a loop of its own, and nothing resets this count part-way, so a
 /// recovery cannot turn into a retry storm.
 ///
-/// It bounds the *operation*, not every message the recovery sends. Re-establishing a session
-/// is a command in its own right and carries its own single retry, so the honest worst case
-/// for one caller operation is two dispatches of the operation, at most one replacement
-/// `session_start` between them, and at most one reconnect per attempt. Counting the
-/// `session_start` as if it were a third attempt of the operation would be as misleading as
-/// pretending it costs nothing.
+/// It bounds the *operation*, not every message the recovery sends, and the difference is
+/// worth stating exactly rather than rounding down. Each of the two attempts resolves its
+/// session first, so each can run a `session_start`, and `session_start` is itself a command
+/// with this same budget. The honest worst case for one caller operation is therefore two
+/// dispatches of the operation plus two `session_start`s of two dispatches each: six messages,
+/// two reconnects, and no loop anywhere in it.
 pub const ATTEMPT_BUDGET: u32 = 2;
 
 /// The replay class of a QUIC storage command.

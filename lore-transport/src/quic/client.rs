@@ -1659,6 +1659,7 @@ async fn send_command_tracked<const HIGH_PRIORITY: bool>(
             lore_debug!("No quic stream available when sending command");
             return Err(SendFailure::not_dispatched(QuicClientError::StreamOpen));
         }
+
         // Select stream based on priority, computed inside lock to avoid living across await points
         let reader_count = connection_lock.reader.len() as u32;
         let stream_index = select_stream(
