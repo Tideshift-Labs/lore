@@ -1594,15 +1594,33 @@ fn startup_admission_head_bucket_budget_pin_rotation_is_exact_replay_but_its_own
 
     // Half 2: rotating the StartupAdmission consumer context's OWN allocation_revision is a
     // different field entirely (the process's startup-config snapshot, not the request's budget
-    // pin) and must change the fingerprint.
-    let context_rotated = startup_head_bucket("allocation-2");
+    // pin) and must change the fingerprint, the preimage, and the replay classification -- the
+    // same three-way proof Half 1 gives the request's own budget pin, just with the opposite
+    // outcome.
+    let mut context_rotated = startup_head_bucket("allocation-2");
     let context_rotated_validated = fingerprint(&context_rotated);
+    context_rotated.canonical_fingerprint = context_rotated_validated
+        .canonical_fingerprint()
+        .to_vec()
+        .into();
 
     assert_ne!(
         context_rotated_validated.canonical_fingerprint(),
         original_validated.canonical_fingerprint(),
         "rotating the StartupAdmission consumer context's own allocation_revision must change \
          the fingerprint"
+    );
+    assert_ne!(
+        context_rotated_validated.canonical_preimage(),
+        original_validated.canonical_preimage(),
+        "rotating the StartupAdmission consumer context's own allocation_revision must change \
+         the preimage"
+    );
+    assert_eq!(
+        classify_idempotency(&context_rotated, &context_rotated_validated, stored),
+        Ok(IdempotencyDecision::IdentityReuseConflict),
+        "rotating the StartupAdmission consumer context's own allocation_revision must classify \
+         as an identity reuse conflict against the original stored fingerprint"
     );
 }
 

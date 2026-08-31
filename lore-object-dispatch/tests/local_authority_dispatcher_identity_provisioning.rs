@@ -245,6 +245,34 @@ fn install_pins_lock_targets_and_replay_and_dirty_state_require_empty_dispatcher
 }
 
 #[test]
+fn objects_assertion_pins_the_replica_identity_bearing_unique_constraint() {
+    // Second review pass, gap 1: `assert_dispatch_dispatcher_identity_objects_v1`'s fourth check
+    // (0019:257-285) is the positive half -- a `contype = 'u'` constraint whose backing index is
+    // unique, valid, ready, the table's replica identity, non-partial, has no INCLUDE columns
+    // (`indnatts = indnkeyatts`), and whose key columns are exactly `provider_boundary_id`,
+    // `dispatcher_id`, `lease_generation` in that order. Pin the tokens that state each of those
+    // properties, distinct from the first check's similarly-shaped but different assertion (which
+    // has no `contype`/`indisreplident` condition and a two-column key array).
+    let sql = migration();
+    let objects = function_body(
+        sql,
+        "CREATE FUNCTION object_store_retention.assert_dispatch_dispatcher_identity_objects_v1(",
+    );
+    for required in [
+        "constraint_state.contype = 'u'",
+        "idx.indisreplident",
+        "idx.indpred IS NULL",
+        "idx.indnatts = idx.indnkeyatts",
+        "ARRAY['provider_boundary_id', 'dispatcher_id', 'lease_generation']",
+    ] {
+        assert!(
+            objects.contains(required),
+            "fourth check must assert: {required}"
+        );
+    }
+}
+
+#[test]
 fn install_requires_the_previously_installed_put_reservation_layer() {
     let sql = migration();
     let install = function_body(
@@ -449,8 +477,9 @@ fn read_call() -> String {
 /// Plants one catalog drift on `object_dispatch_dispatchers`, asserts the readback fails closed
 /// with `55000`/`OBJECT_NOT_IN_PREREQUISITE_STATE`, removes the drift, then re-asserts the
 /// readback returns `READ`. Every drift case in the live test below goes through this helper so
-/// the table is restored before the next case runs, and the fixture ends in a clean,
-/// fully-attesting state regardless of how many cases run or in what order.
+/// the table is restored before the next case runs. There is no unwind guard: a panic between the
+/// plant and the restore leaves the drift (and, for the `btree_gist` case, the extension) in
+/// place, so this only restores what it planted on the success path, not under every ordering.
 async fn assert_drift_fails_closed_then_restores(
     client: &tokio_postgres::Client,
     label: &str,
@@ -736,41 +765,30 @@ async fn live_postgres_dispatcher_identity_readback_authorizes_by_role_and_fails
 
     // Gap 2 (63e61d4 review finding 2): an exclusion constraint enforces uniqueness without being
     // `indisunique`, so both index-shaped checks above cannot see one; 0019's third check refuses
-    // any exclusion constraint on this table outright, regardless of which columns it names. Try
-    // the btree_gist-backed spelling that most naturally mirrors the dropped primary key first (it
-    // has been a "trusted" extension installable by a database owner without superuser since
-    // PostgreSQL 13); fall back to a native-GiST range-overlap exclusion needing no extension at
-    // all if btree_gist is unavailable in this disposable container. Either spelling exercises the
-    // same unconditional check, which does not inspect which columns the constraint names.
-    let btree_gist_available = client
+    // any exclusion constraint on this table outright, regardless of which columns it names. Use
+    // the btree_gist-backed spelling that most naturally mirrors the dropped primary key -- the
+    // `postgres:16` image this harness runs against bundles `btree_gist`, and the runner connects
+    // as a superuser, so there is no disposable-container shape where the extension is unavailable
+    // here; a native-GiST fallback would be permanently dead code, not a real branch under test.
+    client
         .batch_execute("CREATE EXTENSION IF NOT EXISTS btree_gist;")
         .await
-        .is_ok();
-    let (excl_label, excl_plant, excl_remove): (&str, &str, &str) = if btree_gist_available {
-        (
-            "btree_gist equality exclusion constraint on (provider_boundary_id, lease_generation)",
-            "ALTER TABLE object_store_retention.object_dispatch_dispatchers
-               ADD CONSTRAINT drift_excl EXCLUDE USING gist
-                 (provider_boundary_id WITH =, lease_generation WITH =);",
-            "ALTER TABLE object_store_retention.object_dispatch_dispatchers
-               DROP CONSTRAINT drift_excl;",
-        )
-    } else {
-        (
-            "native-GiST range-overlap exclusion constraint (btree_gist unavailable in this container)",
-            "ALTER TABLE object_store_retention.object_dispatch_dispatchers
-               ADD CONSTRAINT drift_excl EXCLUDE USING gist
-                 (numrange(lease_generation, lease_generation + 1) WITH &&);",
-            "ALTER TABLE object_store_retention.object_dispatch_dispatchers
-               DROP CONSTRAINT drift_excl;",
-        )
-    };
-    assert_drift_fails_closed_then_restores(&client, excl_label, excl_plant, excl_remove).await;
+        .expect("btree_gist must be available in the postgres:16 image this harness runs against");
+    assert_drift_fails_closed_then_restores(
+        &client,
+        "btree_gist equality exclusion constraint on (provider_boundary_id, lease_generation)",
+        "ALTER TABLE object_store_retention.object_dispatch_dispatchers
+           ADD CONSTRAINT drift_excl EXCLUDE USING gist
+             (provider_boundary_id WITH =, lease_generation WITH =);",
+        "ALTER TABLE object_store_retention.object_dispatch_dispatchers
+           DROP CONSTRAINT drift_excl;",
+    )
+    .await;
 
     // Item 7: dropping D8's own participant index likewise fails the readback closed. Restoring
-    // the exact index 0018 created leaves the fixture in a clean, fully-attesting state -- this is
-    // the fix for WP-114 CD-3 review round 63e61d4's Gap 3: the old version of this step dropped
-    // the index and never restored it, so anything appended after it failed for the wrong reason.
+    // the exact index 0018 created returns the readback to `READ` -- this is the fix for WP-114
+    // CD-3 review round 63e61d4's Gap 3: the old version of this step dropped the index and never
+    // restored it, so anything appended after it failed for the wrong reason.
     assert_drift_fails_closed_then_restores(
         &client,
         "D8's own one-active-participant unique index dropped entirely",
@@ -778,6 +796,68 @@ async fn live_postgres_dispatcher_identity_readback_authorizes_by_role_and_fails
         "CREATE UNIQUE INDEX object_dispatch_dispatchers_one_active_participant_idx
            ON object_store_retention.object_dispatch_dispatchers (provider_boundary_id, dispatcher_id)
            WHERE state = 1;",
+    )
+    .await;
+
+    // Item 8 (second review pass, gap 1): 0019's fourth check is the *positive* half -- the table
+    // must carry migration 0007's retained three-column UNIQUE, named by PostgreSQL as
+    // `object_dispatch_dispatchers_provider_boundary_id_dispatcher_key`, and that index must also
+    // be the table's replica identity. Verify the name and `contype` against the live catalog
+    // first, rather than trusting the name asserted in the task description.
+    let row = client
+        .query_one(
+            "SELECT conname::text, contype::text
+               FROM pg_catalog.pg_constraint
+              WHERE conrelid = 'object_store_retention.object_dispatch_dispatchers'::regclass
+                AND contype = 'u'",
+            &[],
+        )
+        .await
+        .expect("locate migration 0007's retained UNIQUE constraint in the live catalog");
+    let dispatcher_unique_constraint: (String, String) = (row.get(0), row.get(1));
+    assert_eq!(
+        dispatcher_unique_constraint,
+        (
+            "object_dispatch_dispatchers_provider_boundary_id_dispatcher_key".to_string(),
+            "u".to_string()
+        ),
+        "the live catalog's UNIQUE constraint name/type must match what this test then drives"
+    );
+
+    // Item 8a: dropping that UNIQUE constraint is exactly the case the migration's own comment
+    // (0019:159-168) says the fourth check exists to catch -- but `object_dispatch_attempts`'
+    // foreign key (0007) targets this same constraint's backing index, and PostgreSQL refuses to
+    // drop a constraint whose index a live foreign key still depends on. That refusal is itself a
+    // stronger guarantee than the SQL assertion: the drop is structurally impossible while the
+    // foreign key exists, not merely caught after the fact. Confirmed live (not asserted from
+    // documentation): PostgreSQL 16 raises `2BP01`/`dependent_objects_still_exist` naming
+    // `object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey` as the dependent object.
+    // Assert that refusal explicitly, and do not force it with CASCADE -- doing so would silently
+    // drop the attempts table's foreign key along with the constraint under test.
+    expect_sqlstate(
+        &client,
+        "ALTER TABLE object_store_retention.object_dispatch_dispatchers
+           DROP CONSTRAINT object_dispatch_dispatchers_provider_boundary_id_dispatcher_key;",
+        &SqlState::DEPENDENT_OBJECTS_STILL_EXIST,
+        "dropping 0007's retained UNIQUE constraint must be refused by the attempts foreign key",
+    )
+    .await;
+
+    // Item 8b: the half the fourth check exists for and the constraint-drop case above cannot
+    // reach -- the attester's manifest pins `relreplident = 'i'` (CD-1's twelve-section catalog
+    // manifest), but that letter names only that *some* index serves as replica identity, not
+    // which one, and a live PostgreSQL 16 run confirms it survives `REPLICA IDENTITY NOTHING`
+    // unchanged at the letter level even though logical decoding of an UPDATE/DELETE on this table
+    // would then fail. Leaving the UNIQUE constraint in place and only retargeting replica
+    // identity away from its index is invisible to the out-of-band attester and is exactly the gap
+    // 0019's fourth check closes.
+    assert_drift_fails_closed_then_restores(
+        &client,
+        "replica identity retargeted off 0007's retained UNIQUE constraint's index",
+        "ALTER TABLE object_store_retention.object_dispatch_dispatchers REPLICA IDENTITY NOTHING;",
+        "ALTER TABLE object_store_retention.object_dispatch_dispatchers
+           REPLICA IDENTITY USING INDEX
+           object_dispatch_dispatchers_provider_boundary_id_dispatcher_key;",
     )
     .await;
 }
