@@ -327,6 +327,9 @@ mod storage_copy_on_write_tests {
                 .with_immutable_store(served.clone(), served)
                 .with_mutable_store(mutable)
                 .with_lock_store(None)
+                // CR-029 inserted this step; `None` is the non-Postgres cell path these
+                // harnesses run, which is the same unsynchronised behaviour as before.
+                .with_domain_context(None)
                 .with_notification(notification_sender, None)
                 .with_hook_dispatcher(Arc::new(HookDispatcher::empty()))
                 .with_tls_config(None, None, None)
@@ -340,7 +343,7 @@ mod storage_copy_on_write_tests {
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(None)
+                .with_jwt_verifier(None, false)
                 .unwrap()
                 .serve_with_listener(listener, signal)
                 .await;

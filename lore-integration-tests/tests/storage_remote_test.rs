@@ -323,6 +323,9 @@ mod storage_remote_tests {
                 .with_immutable_store(backend_immutable.clone(), backend_immutable)
                 .with_mutable_store(backend_mutable)
                 .with_lock_store(None)
+                // CR-029 inserted this step; `None` is the non-Postgres cell path these
+                // harnesses run, which is the same unsynchronised behaviour as before.
+                .with_domain_context(None)
                 .with_notification(notification_sender, None)
                 .with_hook_dispatcher(hook_dispatcher)
                 .with_tls_config(None, None, None)
@@ -336,7 +339,7 @@ mod storage_remote_tests {
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(None)
+                .with_jwt_verifier(None, false)
                 .unwrap()
                 .serve_with_listener(listener, async {
                     shutdown_rx.await.ok();
@@ -1071,6 +1074,7 @@ mod storage_remote_tests {
         use lore_base::types::fragment_flags::FragmentFlags;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-revision-state".to_string());
@@ -1138,6 +1142,9 @@ mod storage_remote_tests {
                             id: 71,
                             partition,
                             address,
+                            // The whole content: from the start, and `0` reads to the end.
+                            offset: 0,
+                            length: 0,
                             streaming: 0,
                             local_cache: 0,
                         }]),
@@ -1162,11 +1169,13 @@ mod storage_remote_tests {
                         handle_id,
                     })
                     .expect("handle still registered");
-                let local_match = local
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                // `exist` is gone; asking about one address is the degenerate case of the
+                // batched `query` every store implements, and `query_one` is the free function
+                // that spells it so no store can answer the two differently.
+                let local_match = query_one(&local, partition, address)
                     .await
-                    .expect("local exist call");
+                    .expect("local query call")
+                    .match_made;
                 assert_eq!(
                     local_match,
                     StoreMatch::MatchFull,

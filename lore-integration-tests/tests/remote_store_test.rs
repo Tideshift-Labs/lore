@@ -98,6 +98,9 @@ mod remote_store_tests {
                 .with_immutable_store(served_immutable.clone(), served_immutable)
                 .with_mutable_store(served_mutable)
                 .with_lock_store(None)
+                // CR-029 inserted this step; `None` is the non-Postgres cell path these
+                // harnesses run, which is the same unsynchronised behaviour as before.
+                .with_domain_context(None)
                 .with_notification(notification_sender, None)
                 .with_hook_dispatcher(hook_dispatcher)
                 .with_tls_config(None, None, None)
