@@ -6,6 +6,7 @@ mod dynamodb_test;
 mod hashicorp;
 mod locks_test;
 mod presign_test;
+mod quic_session_rebind_test;
 mod remote_store_test;
 mod replicated_store_test;
 mod replication_service_test;
