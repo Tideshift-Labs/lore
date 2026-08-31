@@ -446,6 +446,53 @@ fn read_call() -> String {
     )
 }
 
+/// Plants one catalog drift on `object_dispatch_dispatchers`, asserts the readback fails closed
+/// with `55000`/`OBJECT_NOT_IN_PREREQUISITE_STATE`, removes the drift, then re-asserts the
+/// readback returns `READ`. Every drift case in the live test below goes through this helper so
+/// the table is restored before the next case runs, and the fixture ends in a clean,
+/// fully-attesting state regardless of how many cases run or in what order.
+async fn assert_drift_fails_closed_then_restores(
+    client: &tokio_postgres::Client,
+    label: &str,
+    plant_sql: &str,
+    remove_sql: &str,
+) {
+    client
+        .batch_execute(plant_sql)
+        .await
+        .unwrap_or_else(|error| panic!("{label}: plant drift: {error}"));
+    set_session_user(client, "object_dispatch_retention_maintenance").await;
+    let drift_error = match client.query_one(&read_call(), &[]).await {
+        Ok(_) => panic!("{label}: drifted readback was unexpectedly accepted"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        drift_error
+            .as_db_error()
+            .unwrap_or_else(|| panic!("{label}: expected typed catalog-mismatch error"))
+            .code(),
+        &SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE,
+        "{label}: must fail the readback closed"
+    );
+    reset_session_user(client).await;
+
+    client
+        .batch_execute(remove_sql)
+        .await
+        .unwrap_or_else(|error| panic!("{label}: remove drift: {error}"));
+    set_session_user(client, "object_dispatch_retention_maintenance").await;
+    let restored: String = client
+        .query_one(&read_call(), &[])
+        .await
+        .unwrap_or_else(|error| panic!("{label}: read after removing the drift: {error}"))
+        .get(0);
+    assert_eq!(
+        restored, "READ",
+        "{label}: must restore READ once the drift is removed"
+    );
+    reset_session_user(client).await;
+}
+
 #[tokio::test]
 #[ignore = "requires a fresh disposable PostgreSQL 16 database"]
 async fn live_postgres_dispatcher_identity_readback_authorizes_by_role_and_fails_closed_on_catalog_drift()
@@ -651,55 +698,86 @@ async fn live_postgres_dispatcher_identity_readback_authorizes_by_role_and_fails
     // Item 6: an additional unique index on the dispatchers table whose key omits dispatcher_id
     // makes the readback fail closed, and dropping it restores READ. Run only while the table holds
     // no rows, since a duplicate (provider_boundary_id, lease_generation) pair across participants
-    // would otherwise prevent the index from being created at all.
-    client
-        .batch_execute(
-            "CREATE UNIQUE INDEX drift_generation_only_idx
-             ON object_store_retention.object_dispatch_dispatchers
-             (provider_boundary_id, lease_generation);",
-        )
-        .await
-        .expect("create a participant-blind unique index on an empty table");
-    set_session_user(&client, "object_dispatch_retention_maintenance").await;
-    let drift_error = client.query_one(&read_call(), &[]).await.unwrap_err();
-    assert_eq!(
-        drift_error
-            .as_db_error()
-            .expect("typed catalog-mismatch error")
-            .code(),
-        &SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE,
-        "participant-blind unique index must fail the readback closed"
-    );
-    reset_session_user(&client).await;
-    client
-        .batch_execute("DROP INDEX object_store_retention.drift_generation_only_idx;")
-        .await
-        .expect("remove the participant-blind unique index");
-    set_session_user(&client, "object_dispatch_retention_maintenance").await;
-    let restored: String = client
-        .query_one(&read_call(), &[])
-        .await
-        .expect("read after removing the drift index")
-        .get(0);
-    assert_eq!(restored, "READ");
-    reset_session_user(&client).await;
+    // would otherwise prevent the index from being created at all. Every drift case from here on
+    // runs through `assert_drift_fails_closed_then_restores`, which restores the catalog before
+    // returning, so cases can be appended below without any one of them failing for the wrong
+    // reason (WP-114 CD-3 review round 63e61d4's Gap 3).
+    assert_drift_fails_closed_then_restores(
+        &client,
+        "unique index whose key omits dispatcher_id entirely",
+        "CREATE UNIQUE INDEX drift_generation_only_idx
+         ON object_store_retention.object_dispatch_dispatchers
+         (provider_boundary_id, lease_generation);",
+        "DROP INDEX object_store_retention.drift_generation_only_idx;",
+    )
+    .await;
 
-    // Item 7: dropping D8's own participant index likewise fails the readback closed.
-    client
-        .batch_execute(
-            "DROP INDEX object_store_retention.object_dispatch_dispatchers_one_active_participant_idx;",
-        )
+    // Gap 1 (63e61d4 review finding 1): `pg_index.indkey` spans key *and* INCLUDE columns, so a
+    // naive "does any unique index mention dispatcher_id" check is bypassable by an index that
+    // carries dispatcher_id only as an INCLUDE (payload) column while keying uniqueness on
+    // (provider_boundary_id, lease_generation) alone -- exactly the cross-participant uniqueness
+    // D8 rejected. An INCLUDE column is stored payload, not part of the key: two rows with equal
+    // key columns but different INCLUDE values still collide as duplicates. 0019's fix bounds the
+    // unnest of `indkey` by `indnkeyatts` (where the key ends) specifically to close this. Prove
+    // the INCLUDE form is rejected -- if it were NOT, this assertion would fail here rather than
+    // in the SQL, which is exactly the "implementation is wrong, report it" case the task calls
+    // out. Built on the empty table (no dispatcher rows), since two participants sharing
+    // (provider_boundary_id, lease_generation) would already violate this unique shape and the
+    // index could never be created in the first place.
+    assert_drift_fails_closed_then_restores(
+        &client,
+        "unique index carrying dispatcher_id only as an INCLUDE column, not a key column",
+        "CREATE UNIQUE INDEX drift_include_only_idx
+         ON object_store_retention.object_dispatch_dispatchers
+         (provider_boundary_id, lease_generation) INCLUDE (dispatcher_id);",
+        "DROP INDEX object_store_retention.drift_include_only_idx;",
+    )
+    .await;
+
+    // Gap 2 (63e61d4 review finding 2): an exclusion constraint enforces uniqueness without being
+    // `indisunique`, so both index-shaped checks above cannot see one; 0019's third check refuses
+    // any exclusion constraint on this table outright, regardless of which columns it names. Try
+    // the btree_gist-backed spelling that most naturally mirrors the dropped primary key first (it
+    // has been a "trusted" extension installable by a database owner without superuser since
+    // PostgreSQL 13); fall back to a native-GiST range-overlap exclusion needing no extension at
+    // all if btree_gist is unavailable in this disposable container. Either spelling exercises the
+    // same unconditional check, which does not inspect which columns the constraint names.
+    let btree_gist_available = client
+        .batch_execute("CREATE EXTENSION IF NOT EXISTS btree_gist;")
         .await
-        .expect("drop the participant index");
-    set_session_user(&client, "object_dispatch_retention_maintenance").await;
-    let missing_participant_index_error = client.query_one(&read_call(), &[]).await.unwrap_err();
-    assert_eq!(
-        missing_participant_index_error
-            .as_db_error()
-            .expect("typed catalog-mismatch error")
-            .code(),
-        &SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE,
-        "dropping the participant index must fail the readback closed"
-    );
-    reset_session_user(&client).await;
+        .is_ok();
+    let (excl_label, excl_plant, excl_remove): (&str, &str, &str) = if btree_gist_available {
+        (
+            "btree_gist equality exclusion constraint on (provider_boundary_id, lease_generation)",
+            "ALTER TABLE object_store_retention.object_dispatch_dispatchers
+               ADD CONSTRAINT drift_excl EXCLUDE USING gist
+                 (provider_boundary_id WITH =, lease_generation WITH =);",
+            "ALTER TABLE object_store_retention.object_dispatch_dispatchers
+               DROP CONSTRAINT drift_excl;",
+        )
+    } else {
+        (
+            "native-GiST range-overlap exclusion constraint (btree_gist unavailable in this container)",
+            "ALTER TABLE object_store_retention.object_dispatch_dispatchers
+               ADD CONSTRAINT drift_excl EXCLUDE USING gist
+                 (numrange(lease_generation, lease_generation + 1) WITH &&);",
+            "ALTER TABLE object_store_retention.object_dispatch_dispatchers
+               DROP CONSTRAINT drift_excl;",
+        )
+    };
+    assert_drift_fails_closed_then_restores(&client, excl_label, excl_plant, excl_remove).await;
+
+    // Item 7: dropping D8's own participant index likewise fails the readback closed. Restoring
+    // the exact index 0018 created leaves the fixture in a clean, fully-attesting state -- this is
+    // the fix for WP-114 CD-3 review round 63e61d4's Gap 3: the old version of this step dropped
+    // the index and never restored it, so anything appended after it failed for the wrong reason.
+    assert_drift_fails_closed_then_restores(
+        &client,
+        "D8's own one-active-participant unique index dropped entirely",
+        "DROP INDEX object_store_retention.object_dispatch_dispatchers_one_active_participant_idx;",
+        "CREATE UNIQUE INDEX object_dispatch_dispatchers_one_active_participant_idx
+           ON object_store_retention.object_dispatch_dispatchers (provider_boundary_id, dispatcher_id)
+           WHERE state = 1;",
+    )
+    .await;
 }

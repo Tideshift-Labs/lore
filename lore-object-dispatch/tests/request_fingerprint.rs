@@ -1532,6 +1532,81 @@ fn classify_idempotency_treats_a_budget_pin_rotation_as_exact_replay() {
 }
 
 #[test]
+fn startup_admission_head_bucket_budget_pin_rotation_is_exact_replay_but_its_own_allocation_revision_is_not()
+ {
+    // StartupAdmissionConsumerContextV1 writes its own `allocation_revision` into the preimage
+    // (see `independent_startup_consumer` above) -- deliberately, per CR-033 D3's amendment
+    // (`request.rs`): it is the record of the config the process started under, not the request's
+    // budget pin (`ObjectStoreRequestV1::allocation_revision`/`allocation_fence`, excluded from
+    // the preimage). Nothing reconciles the two fields, so this is the one consumer arm where a
+    // reader could reasonably expect the exclusion not to hold. Prove both halves in one test:
+    // rotating the *request's* budget pin still classifies as an exact replay here too, while
+    // rotating the *consumer context's own* allocation_revision changes the fingerprint.
+    fn startup_head_bucket(consumer_allocation_revision: &str) -> ObjectStoreRequestV1 {
+        let mut request = base_request(head_bucket());
+        request.consumer_context = Some(ResultConsumerContextV1 {
+            consumer: Some(result_consumer_context_v1::Consumer::StartupAdmission(
+                StartupAdmissionConsumerContextV1 {
+                    policy_revision: "policy-1".to_string(),
+                    allocation_revision: consumer_allocation_revision.to_string(),
+                    config_revision: "config-1".to_string(),
+                    startup_attempt_id: "startup-1".to_string(),
+                    readiness_generation: 1,
+                },
+            )),
+        });
+        request
+    }
+
+    let original = startup_head_bucket("allocation-1");
+    let original_validated = fingerprint(&original);
+    let stored = ExistingFingerprint::Full(*original_validated.canonical_fingerprint());
+
+    // Half 1: rotating the request's own budget pin leaves the fingerprint unchanged and
+    // classifies as an exact replay, the same as every other consumer arm.
+    let mut budget_rotated = startup_head_bucket("allocation-1");
+    budget_rotated.allocation_revision = "allocation-2".to_string();
+    budget_rotated.allocation_fence = 9;
+    let budget_rotated_validated = fingerprint(&budget_rotated);
+    budget_rotated.canonical_fingerprint = budget_rotated_validated
+        .canonical_fingerprint()
+        .to_vec()
+        .into();
+
+    assert_eq!(
+        budget_rotated_validated.canonical_fingerprint(),
+        original_validated.canonical_fingerprint(),
+        "rotating the request's budget pin must not change the fingerprint for a \
+         StartupAdmission HeadBucket request"
+    );
+    assert_eq!(
+        budget_rotated_validated.canonical_preimage(),
+        original_validated.canonical_preimage(),
+        "rotating the request's budget pin must not change the preimage for a \
+         StartupAdmission HeadBucket request"
+    );
+    assert_eq!(
+        classify_idempotency(&budget_rotated, &budget_rotated_validated, stored),
+        Ok(IdempotencyDecision::ExactReplay),
+        "rotating the request's budget pin must classify as an exact replay for a \
+         StartupAdmission HeadBucket request"
+    );
+
+    // Half 2: rotating the StartupAdmission consumer context's OWN allocation_revision is a
+    // different field entirely (the process's startup-config snapshot, not the request's budget
+    // pin) and must change the fingerprint.
+    let context_rotated = startup_head_bucket("allocation-2");
+    let context_rotated_validated = fingerprint(&context_rotated);
+
+    assert_ne!(
+        context_rotated_validated.canonical_fingerprint(),
+        original_validated.canonical_fingerprint(),
+        "rotating the StartupAdmission consumer context's own allocation_revision must change \
+         the fingerprint"
+    );
+}
+
+#[test]
 fn preimage_and_replay_still_bind_every_field_the_amendment_did_not_touch() {
     // The exclusion removed exactly two fields. Every other field the preimage still writes must
     // keep discriminating replay identity: a request differing only in that field must fingerprint
