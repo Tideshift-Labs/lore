@@ -9699,8 +9699,12 @@ mod tests {
     async fn wait_until_settled_never_reads_a_failed_probe_as_settled() {
         let repository = repository_with_unwritable_probe_path().await;
 
+        // `mtime_max = 0`, not `u64::MAX`: a probe that SUCCEEDS is already past 0 and
+        // would return promptly, so consuming the budget here can only be the `None`
+        // arm. Passing `u64::MAX` would keep the wait open on either arm, and the test
+        // would still pass if the fixture's probe path were accidentally writable.
         let started = std::time::Instant::now();
-        wait_until_settled(&repository, u64::MAX).await;
+        wait_until_settled(&repository, 0).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -9720,6 +9724,13 @@ mod tests {
     #[tokio::test]
     async fn wait_until_settled_keeps_waiting_while_the_probe_has_not_advanced_past_mtime_max() {
         let (_tempdir, repository) = repository_with_writable_probe_path().await;
+        // Without this the test silently degrades into a duplicate of the `None` case
+        // above whenever the fixture stops being stampable.
+        assert!(
+            filesystem_stamp_now(&repository).await.is_some(),
+            "this test needs a probe that SUCCEEDS; an unstampable fixture would exercise \
+             the None arm instead and assert nothing about this one"
+        );
 
         let started = std::time::Instant::now();
         wait_until_settled(&repository, u64::MAX).await;
@@ -9740,15 +9751,30 @@ mod tests {
     #[tokio::test]
     async fn wait_until_settled_returns_promptly_once_the_probe_is_past_mtime_max() {
         let (_tempdir, repository) = repository_with_writable_probe_path().await;
+        assert!(
+            filesystem_stamp_now(&repository).await.is_some(),
+            "this test needs a probe that SUCCEEDS; an unstampable fixture would consume \
+             the whole budget and the assertion below would be measuring the None arm"
+        );
 
-        let started = std::time::Instant::now();
-        wait_until_settled(&repository, 0).await;
-        let elapsed = started.elapsed();
+        // Best of several samples, not a single one. This is the only arm asserting an
+        // UPPER bound on wall time, so it is the only one a loaded machine can push over
+        // the line: the settled call is a single probe round trip, while the budget it is
+        // compared against is fixed. Observed flaking 1 run in 40 under four concurrent
+        // copies of this suite. A scheduler stall long enough to blow the budget is
+        // unlikely to hit every sample, so the minimum keeps the real claim (a settled
+        // probe returns without waiting out the budget) while dropping the noise.
+        let mut best = MODIFIED_TIME_SETTLE_LIMIT * 100;
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            wait_until_settled(&repository, 0).await;
+            best = best.min(started.elapsed());
+        }
 
         assert!(
-            elapsed < MODIFIED_TIME_SETTLE_LIMIT,
+            best < MODIFIED_TIME_SETTLE_LIMIT,
             "a probe already past mtime_max must settle promptly, not consume the full \
-             budget ({MODIFIED_TIME_SETTLE_LIMIT:?}); took {elapsed:?}"
+             budget ({MODIFIED_TIME_SETTLE_LIMIT:?}); best of 5 samples took {best:?}"
         );
     }
 
