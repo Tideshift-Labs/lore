@@ -32,8 +32,9 @@ drift guard over the surviving proto source in the same commit as any further pr
 ## Embedded migration
 
 The cell install set is migrations 0002 and 0003 (`retention_schema`/`retention_provisioning`, the
-verified install prerequisites for the chain below) plus 0007 through 0017 (`local_authority_*`).
-Migrations 0004 through 0006 (`retention_readback`/`retention_mutations`/`retention_prune_receipts`)
+verified install prerequisites for the chain below) plus 0007 through 0019 (`local_authority_*`),
+fifteen artifacts in total. Migrations 0004 through 0006
+(`retention_readback`/`retention_mutations`/`retention_prune_receipts`)
 are deferred and not installed, alongside the pure compact-receipt, full-to-compact, and
 compact-prune planners in `compaction.rs`, `full_to_compact.rs`, and `compact_prune.rs`: correct,
 tested, sized for the former global ledger's row volume, and uncalled until CR-033 D5's cell-scale
@@ -148,6 +149,39 @@ digest-provider failure, tamper, and overflow roll back the whole row and quota 
 asserts prior durability; this procedure does not write, inspect, fsync, or rename filesystem
 content, wire service/provider behavior, clean up, deploy, publish readiness, or name a handoff.
 
+`local_authority_dispatcher_identity_schema::LOCAL_AUTHORITY_DISPATCHER_IDENTITY_SCHEMA_MIGRATION_V1`
+embeds the exact 4,477-byte source-dark per-participant dispatcher-identity schema migration
+(migration 0018, CR-033 D8). Its BLAKE3-256 is
+`a7d54d94d0fa5035872eb9b3426cbbe6471bcf9ae34ed41877542f050e1aaad9`. It replaces 0007's two
+single-active-dispatcher constraints — the one-ACTIVE-per-boundary partial unique index and the
+`PRIMARY KEY (provider_boundary_id, lease_generation)`, which together admitted only one dispatcher
+row per boundary — with a unique partial index on `(provider_boundary_id, dispatcher_id) WHERE
+state = 1`, so each participant owns its own lease chain. The participant is `dispatcher_id`, not
+`service_instance_id`, because it must survive a process restart. The table's identity becomes
+0007's retained `UNIQUE (provider_boundary_id, dispatcher_id, lease_generation)`, which the attempts
+foreign key already targets and which 0018 also names as the table's replica identity — dropping
+the primary key would otherwise have silently taken replica identity with it, since `relreplident`
+names a mode, not an index. Runtime code neither installs nor calls this artifact.
+
+`local_authority_dispatcher_identity_provisioning::LOCAL_AUTHORITY_DISPATCHER_IDENTITY_PROVISIONING_MIGRATION_V1`
+embeds the exact 25,375-byte source-dark provisioning/readback migration for 0018's schema edge
+(migration 0019). Its BLAKE3-256 is
+`fd0aa946118010222eed883ab9bc68fa09fd3a3fbb0eb2d1e21e1904bd9c213e`. It carries the cell's fourth
+schema layer, `CellSchemaLayerId::DispatcherIdentity`, and
+`object_store_dispatch_dispatcher_identity_read_state_v1` — the only authority procedure the
+`object_dispatch_retention_runtime` role may call; every other readback in the chain is gated on
+`assert_retention_reader_v1` (migrator and maintenance only) and the Rust attester is migrator-only,
+so before this a replica had no readiness signal at all. Unlike the two dispatch-layer readbacks
+below, this one is **not** retired at full chain depth: it asserts only the objects it names — every
+unique index on the dispatchers table keys on `dispatcher_id` within its key columns (not INCLUDE),
+no exclusion constraint exists on the table, and the table's three-column unique index remains
+present, unique, valid, non-partial, and the replica identity — rather than manifesting the whole
+schema, so a later migration cannot invalidate it. It reports every installed layer's identity
+tuple; it does not manifest the catalog and does not count rows, and must not be read as proving the
+catalog has not drifted — catalog integrity stays with the out-of-band attester. Runtime code
+neither installs nor calls this artifact directly; the dispatch-runtime pool that will call it is
+CD-3's remaining obligation.
+
 ## Shared spool verifier
 
 `LinuxSpoolVerifier` is a source-dark, read-only observer for derived shared-spool paths. It retains
@@ -168,8 +202,14 @@ authority; callers must still revalidate candidate decisions under the authorita
 `request.rs`'s pure request-contract kernel validates and canonicalizes the complete seven-operation
 descriptor, reservations, consumer context, authenticated scope, metadata, range/list/body bounds,
 and optional durable PUT spool evidence. It derives the exact five-part durable request key and the
-frozen `object-dispatch-fingerprint-v1` BLAKE3 fingerprint. Canonical lowercase RFC 9562 UUIDv7
-identities are classified against an inclusive injected database-time window. One effect-free API
+frozen `object-dispatch-fingerprint-v1` BLAKE3 fingerprint, a 377-byte preimage whose golden digest
+`9e991435c9affbe204574ddb57eef288a3b0f512fe87b8e99b01e0912bb5bd28` is pinned identically in this
+crate and in lorehub's
+`packages/control-plane/test/capacity/object-store-request-fingerprint.test.ts` (CR-033 D3's
+2026-08-28 amendment). `allocation_revision` and `allocation_fence` are excluded from the preimage
+so an exact retry after a routine budget retune replays instead of conflicting forever as identity
+reuse; both remain a fail-closed first-seen admission check regardless. Canonical lowercase RFC 9562
+UUIDv7 identities are classified against an inclusive injected database-time window. One effect-free API
 atomically validates the caller-supplied fingerprint and classifies absent identity, exact full or
 compact replay, and identity reuse with a different fingerprint. Current authority, cell admission,
 deadline, reservation, and PUT spool checks are first-seen-only prerequisites. The former
@@ -259,10 +299,10 @@ never echoed, including on failure. Exit codes: `0` success, `1` refused or drif
 
 What `install` does, and what it refuses:
 
-- a database with no `object_store_retention` schema runs the full plan: the thirteen frozen
-  artifacts in order, with the retention, authority and put-reservation install procedures called at
-  their exact points in the chain (0011 retires 0008's install entrypoint, so the authority layer
-  must be installed before 0011 is applied);
+- a database with no `object_store_retention` schema runs the full plan: the fifteen frozen artifacts
+  in order, with the retention, authority, put-reservation and dispatcher-identity install
+  procedures called at their exact points in the chain (0011 retires 0008's install entrypoint, so
+  the authority layer must be installed before 0011 is applied; 0019 installs last, after 0018);
 - a database that already carries the schema is **never re-migrated**. It is attested first, and the
   run is refused unless every layer already attests. Forward migrations are one-shot, so resuming a
   half-installed chain blind is how a recoverable cell becomes an unrecoverable one;
@@ -284,7 +324,7 @@ constraints, indexes, types, function definitions with `prosecdef`/`proconfig`, 
 relation and column ACLs); that no service role retains `EXECUTE` on a replaced function; the
 expected inert state; and that the retired readback entrypoints are in fact unreachable.
 
-Two consequences worth knowing before reading a failure:
+Three consequences worth knowing before reading a failure:
 
 - **0003's readback now has a live caller.** It had none anywhere before this, which was the first
   half of WP-114 CD-1's caveat N2.
@@ -295,8 +335,15 @@ Two consequences worth knowing before reading a failure:
   `object_store_dispatch_put_reservation_read_state_v1` fails closed with `55000` on a fully
   installed cell. That is sharper than N2's "0012-0017 have no `read_state` procedure": the existing
   readback does not merely fail to cover them, it stops working. The Rust attester carries those
-  layers instead. Whether a successor readback migration should exist is a CD-3 question; CD-1 does
+  layers instead. Whether a successor readback migration should exist was a CD-3 question; CD-1 did
   not add one, because a new procedure is a new migration.
+- **The fourth layer's readback answers that question, and is not retired.** WP-114 CD-3 (migration
+  0019, Lore `5c6a583`) settled caveat N2: the out-of-band attester keeps the whole-schema manifest,
+  because only an unfiltered manifest can detect an added object, and 0019 adds the complement
+  instead — a growth-tolerant readback that asserts only the objects it names. Unlike the two
+  dispatch-layer readbacks above, it survives every later migration in this chain rather than being
+  invalidated by one, and it is the one authority procedure `object_dispatch_retention_runtime` may
+  call at all.
 
 The pinned manifest is a **PostgreSQL 16** pin: it carries `pg_get_functiondef` and
 `pg_get_indexdef` output, whose exact rendering is a server-version property. A different major
@@ -311,7 +358,7 @@ cargo clippy -p lore-object-dispatch --all-targets -- -D warnings --no-deps
 cargo test -p lore-object-dispatch
 
 # Local-authority live tier: supported path (stands up disposable PostgreSQL 16,
-# installs the CD-1 set, runs all nine by exact name, reports PASS/FAIL/NOT RUN)
+# installs the CD-1 set, runs all eleven by exact name, reports PASS/FAIL/NOT RUN)
 tests/run-local-authority-live.ps1
 
 # Cell-schema installer/attester live tier (WP-114 CD-1): five gates over the real
@@ -329,10 +376,11 @@ rather than only the embedded migration bytes agreeing with the client staticall
 
 `run-local-authority-live.ps1` (WP-114 CD-2, Lore `1bb4ff7`) is the checked-in provisioning
 harness for this tier, modeled on the retention client's runner
-(`tests/run-retention-client-live.ps1`). Two independent clean runs: 9/9 PASS, exit 0, container
-removed, dangling-volume count unchanged. It installs the CD-1 set into a dedicated
-`local_install_chain_proof` database to run the WP-114 CD-1 inert-state assertion; the
-`local_authority_put_spool_ready_mutation` live test separately self-installs the full chain via
+(`tests/run-retention-client-live.ps1`). It grew from nine tests and ten databases to eleven and
+twelve at WP-114 CD-3 (migrations 0018/0019's schema and provisioning live cases), and is currently
+11/11 PASS, exit 0, container removed, dangling-volume count unchanged. It installs the CD-1 set
+into a dedicated `local_install_chain_proof` database to run the WP-114 CD-1 inert-state assertion;
+the `local_authority_put_spool_ready_mutation` live test separately self-installs the full chain via
 compile-time `include_str!`. Full verification detail is in CR-033's "Verification: the retained
 half's live-test provisioning harness" section.
 
@@ -349,6 +397,8 @@ LORE_TEST_LOCAL_PUT_UPLOAD_PROGRESS_CODEC_PG_URL=postgresql://... cargo test -p 
 LORE_TEST_LOCAL_PUT_UPLOAD_PROGRESS_MUTATION_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_upload_progress_mutation -- --ignored --exact live_postgres_progress_mutation_is_atomic_and_replay_safe
 LORE_TEST_LOCAL_PUT_SPOOL_READY_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_spool_ready_codec -- --ignored --exact live_postgres_ready_codec_is_exact_fail_closed_and_replay_safe
 LORE_TEST_LOCAL_PUT_SPOOL_READY_MUTATION_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_put_spool_ready_mutation -- --ignored --exact live_postgres_spool_ready_is_atomic_replay_safe_and_source_dark
+LORE_TEST_LOCAL_DISPATCHER_IDENTITY_SCHEMA_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_dispatcher_identity_schema -- --ignored --exact live_postgres_dispatcher_identity_admits_concurrent_participants_and_retains_the_attempts_foreign_key
+LORE_TEST_LOCAL_DISPATCHER_IDENTITY_PROVISIONING_PG_URL=postgresql://... cargo test -p lore-object-dispatch --test local_authority_dispatcher_identity_provisioning -- --ignored --exact live_postgres_dispatcher_identity_readback_authorizes_by_role_and_fails_closed_on_catalog_drift
 ```
 
 An `--ignored` run with the environment unset exits early — that is **NOT RUN**, never passing
@@ -363,12 +413,15 @@ re-migrates nor moves the catalog, refusal on a truncated chain with the schema 
 found, refusal on seven distinct catalog drift classes each caught in its own manifest section, and
 the revoke-after-replacement path restoring the exact pinned ACL state. Verified 5/5 PASS.
 
-Limitations, updated at CD-1: `object_store_retention_read_state_v1` (0003's readback) still has
-no live caller among CD-2's nine `local_authority_*` tests, but `cell-schema-install attest` above
-is now a live caller. The first of WP-114 CD-1's two named readback gaps is closed. The second is
-not: migrations 0012-0017 still have no `read_state` procedure, and on a fully installed cell
+Limitations, updated through CD-3: `object_store_retention_read_state_v1` (0003's readback) still
+has no live caller among CD-2's eleven `local_authority_*` tests, but `cell-schema-install attest`
+above is now a live caller. The first of WP-114 CD-1's two named readback gaps is closed. The second
+is not: migrations 0012-0017 still have no `read_state` procedure, and on a fully installed cell
 0011's existing put-reservation readback fails closed (`55000`) rather than merely omitting them,
 alongside 0011's outright revoke of the 0008 readback (`42501`). The Rust attester carries those
-layers instead, behaviourally, not through catalog readback. Every cell-authority procedure the
-typed client calls (WP-114 CD-3) still needs a live case in CD-2's harness before it counts as
-evidence; the harness existing does not by itself supply that coverage.
+layers instead, behaviourally, not through catalog readback. Migration 0019's dispatcher-identity
+readback does not share that gap: it is a live caller for every layer named above it, itself
+included, and CD-2 carries live cases for both its schema and provisioning halves. What CD-3 still
+owes is the typed cell-authority client and dispatch-runtime pool that would call these procedures
+from a running loreserver; until that lands, every gate above proves the schema and its readback,
+not that anything calls it at runtime.
