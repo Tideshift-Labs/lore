@@ -3,7 +3,7 @@
 
 <#
 .SYNOPSIS
-Runs the seven WP-116 real-construction enforcement regressions on disposable PostgreSQL 16 databases.
+Runs the eight WP-116 real-construction enforcement regressions on disposable PostgreSQL 16 databases.
 
 .DESCRIPTION
 The Rust cases remain `#[ignore]`. This runner verifies the fixed fully-qualified inventory, runs
@@ -38,11 +38,13 @@ $expectedTests = @(
     'grpc::handlers::obliterate::tests::enforcing_cell_rejects_before_obliterate_body',
     'domain::tests::a_mediated_prepare_key_cannot_be_consumed_by_a_repository_scoped_governed_mutation'
 )
+$p12IntegrationTest = 'exact_mediated_obliterate_consumes_while_tuple_tamper_preserves_prepared'
 
 $results = @(
-    foreach ($name in $expectedTests) {
+    foreach ($name in @($expectedTests) + @($p12IntegrationTest)) {
         [pscustomobject]@{
             Test   = $name
+            Target = if ($name -eq $p12IntegrationTest) { 'p12_live' } else { 'lib' }
             Status = 'NOT RUN'
             Passed = 0
             Failed = 0
@@ -68,9 +70,15 @@ function Invoke-Checked {
 }
 
 function Get-EnforcementTestCatalog {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Target
+    )
     Push-Location $loreRoot
     try {
-        $output = & cargo test -p lore-server --lib -- --ignored --list 2>&1 | Out-String
+        $targetArgs = if ($Target -eq 'lib') { @('--lib') } else { @('--test', $Target) }
+        $catalogArgs = @('test', '-p', 'lore-server') + $targetArgs + @('--', '--ignored', '--list')
+        $output = & cargo @catalogArgs 2>&1 | Out-String
         $exitCode = $LASTEXITCODE
     }
     finally {
@@ -90,10 +98,11 @@ function Get-EnforcementTestCatalog {
 }
 
 function Assert-ExpectedCatalog {
-    $catalog = @(Get-EnforcementTestCatalog)
-    $missing = @($expectedTests | Where-Object { $_ -notin $catalog })
-    if ($expectedTests.Count -ne 7 -or $missing.Count -ne 0) {
-        throw "expected seven WP-116 enforcement tests; missing=[$($missing -join ', ')]"
+    $libCatalog = @(Get-EnforcementTestCatalog -Target 'lib')
+    $p12Catalog = @(Get-EnforcementTestCatalog -Target 'p12_live')
+    $missing = @($expectedTests | Where-Object { $_ -notin $libCatalog })
+    if ($expectedTests.Count -ne 7 -or $missing.Count -ne 0 -or $p12IntegrationTest -notin $p12Catalog) {
+        throw "expected seven library tests plus the P12 integration test; missing=[$($missing -join ', ')]; p12Present=$($p12IntegrationTest -in $p12Catalog)"
     }
 }
 
@@ -169,7 +178,9 @@ try {
             )
             Write-Host "Running $($result.Test)..."
             try {
-                $output = & cargo test -p lore-server --lib -- --ignored --exact $result.Test --test-threads=1 2>&1 | Out-String
+                $targetArgs = if ($result.Target -eq 'lib') { @('--lib') } else { @('--test', $result.Target) }
+                $cargoArgs = @('test', '-p', 'lore-server') + $targetArgs + @('--', '--ignored', '--exact', $result.Test, '--test-threads=1')
+                $output = & cargo @cargoArgs 2>&1 | Out-String
                 $exitCode = $LASTEXITCODE
             }
             finally {
@@ -208,7 +219,7 @@ try {
     }
 
     $passCount = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
-    if ($passCount -eq $expectedTests.Count) {
+    if ($passCount -eq $results.Count) {
         $runPassed = $true
     }
 }
@@ -237,7 +248,7 @@ $results | Format-Table -AutoSize | Out-String -Width 240 | Write-Host
 $passCount = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
 $failCount = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
 $notRunCount = @($results | Where-Object { $_.Status -eq 'NOT RUN' }).Count
-Write-Host "Summary: PASS=$passCount FAIL=$failCount NOT RUN=$notRunCount EXPECTED=$($expectedTests.Count)"
+Write-Host "Summary: PASS=$passCount FAIL=$failCount NOT RUN=$notRunCount EXPECTED=$($results.Count)"
 if ($null -ne $setupError) {
     Write-Warning "Setup failed: $setupError"
 }

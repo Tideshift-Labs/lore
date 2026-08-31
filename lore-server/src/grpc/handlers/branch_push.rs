@@ -55,6 +55,8 @@ use crate::domain::DomainContext;
 use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
 use crate::domain::reject_unwired_governed_operation;
+use crate::domain_intent::CanonicalIntent;
+use crate::domain_intent::canonical_intent_digest;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
@@ -421,17 +423,14 @@ pub(crate) async fn prepare_governed_push(
         .filter(|snapshot| snapshot.live)
         .ok_or_else(|| Status::not_found("Branch not found"))?;
 
-    let mut digest = blake3::Hasher::new();
-    digest.update(b"lore-branch-push-intent-v1\0");
-    for value in [
-        repository_id.as_ref(),
-        branch_id.as_ref(),
-        requested_revision.as_ref(),
-    ] {
-        digest.update(&(value.len() as u32).to_be_bytes());
-        digest.update(value);
-    }
-    digest.update(&[u8::from(force), u8::from(fast_forward_merge)]);
+    let digest = canonical_intent_digest(&CanonicalIntent::BranchPush {
+        repository_id: repository_id.as_ref(),
+        branch_id: branch_id.as_ref(),
+        requested_revision: requested_revision.as_ref(),
+        force,
+        fast_forward_merge,
+    })
+    .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
     let owner = VerifiedLockOwner {
         verified_issuer: admitted.key.verified_issuer.clone(),
@@ -439,8 +438,7 @@ pub(crate) async fn prepare_governed_push(
     };
     Ok(Some(GovernedPushCommit {
         domain: domain.clone(),
-        operation: admitted
-            .into_governed("branch_push_commit", digest.finalize().as_bytes().to_vec()),
+        operation: admitted.into_governed("branch_push_commit", digest),
         repository_generation: repository.generation,
         branch_generation: branch.generation,
         expected_latest_hash: branch.latest_hash,
@@ -1420,6 +1418,7 @@ mod tests {
                 fingerprint_version: 1,
                 fingerprint: vec![8; 32],
                 prepare_token: [9; 32],
+                mediated_scope: None,
             },
         };
         let governed = prepare_governed_push(

@@ -4,6 +4,7 @@ pub mod auth;
 pub mod authnz;
 pub mod cache;
 pub mod domain;
+pub mod domain_intent;
 pub mod drain;
 pub mod execution_state;
 pub mod grpc;

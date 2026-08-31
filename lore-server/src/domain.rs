@@ -55,6 +55,7 @@ use crate::store::configuration::resolve_plugin_config_with_fallback;
 
 /// The `mode` string that selects the Postgres backend.
 const POSTGRES_MODE: &str = "postgres";
+const CONTROL_PLANE_SERVICE_SUBJECT: &str = "lorehub-control-plane";
 
 /// Which tenant scope a governed operation belongs to.
 ///
@@ -209,7 +210,26 @@ impl DomainContext {
             ));
         };
 
-        let tenant_scope_key = scope.tenant_scope_key()?;
+        let is_control_plane = token.user_id == CONTROL_PLANE_SERVICE_SUBJECT
+            && token.is_service_account == Some(true);
+        let tenant_scope_key = match (is_control_plane, carried.mediated_scope.as_ref()) {
+            (true, Some(mediated)) => domain_operation_metadata::scope_key_mediated_namespace(
+                &mediated.org_uuid,
+                &mediated.initiating_principal_namespace,
+            )
+            .map_err(|error| Status::invalid_argument(error.to_string()))?,
+            (true, None) => {
+                return Err(Status::invalid_argument(
+                    "control-plane governed mutation is missing mediated-scope carriage",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(Status::invalid_argument(
+                    "mediated-scope carriage is reserved for the control-plane service principal",
+                ));
+            }
+            (false, None) => scope.tenant_scope_key()?,
+        };
 
         Ok(Some(AdmittedOperation {
             key: ReceiptKey {
@@ -319,6 +339,9 @@ pub fn reject_unwired_governed_operation(admitted: &AdmittedOperation, method: &
         "Governed domain repository operations are not yet available on this cell",
     )
 }
+
+#[cfg(test)]
+mod p12_tests;
 
 /// Build the domain coordinator for this cell, when one applies.
 ///

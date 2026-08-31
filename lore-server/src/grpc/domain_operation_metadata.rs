@@ -55,6 +55,8 @@ pub const OPERATION_ID_KEY: &str = "lore-domain-operation-id-bin";
 pub const FINGERPRINT_KEY: &str = "lore-domain-operation-fingerprint-bin";
 /// The single-use consume token returned by `domain_operation_prepare`.
 pub const PREPARE_TOKEN_KEY: &str = "lore-domain-prepare-token-bin";
+/// Frozen CR-029 mediated receipt-namespace tuple.
+pub const MEDIATED_SCOPE_KEY: &str = "lore-domain-mediated-scope-bin";
 
 /// A UUID is 16 bytes. Any other length is rejected, never padded or truncated.
 pub const OPERATION_ID_LEN: usize = 16;
@@ -66,6 +68,12 @@ pub const PREPARE_TOKEN_LEN: usize = 32;
 pub const FINGERPRINT_V1_LEN: usize = 32;
 /// The only fingerprint schema version this server accepts today.
 pub const FINGERPRINT_VERSION_V1: u8 = 1;
+/// Version 1 of the mediated-scope tuple.
+pub const MEDIATED_SCOPE_VERSION_V1: u8 = 1;
+/// Version + org UUID + canonical 49-byte principal namespace.
+pub const MEDIATED_SCOPE_V1_LEN: usize = 66;
+/// Exact canonical principal namespace width for carriage v1.
+pub const MEDIATED_PRINCIPAL_NAMESPACE_V1_LEN: usize = 49;
 
 /// Version byte leading every tenant scope key this server builds.
 pub const SCOPE_KEY_VERSION_V1: u8 = 1;
@@ -101,6 +109,16 @@ pub struct DomainOperationMetadata {
     pub fingerprint: Vec<u8>,
     /// The single-use prepare token.
     pub prepare_token: [u8; PREPARE_TOKEN_LEN],
+    /// Mediated receipt namespace, present only for the control-plane service
+    /// principal and interpreted by the shared admission function.
+    pub mediated_scope: Option<MediatedScope>,
+}
+
+/// Validated version-1 mediated receipt namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediatedScope {
+    pub org_uuid: [u8; 16],
+    pub initiating_principal_namespace: [u8; MEDIATED_PRINCIPAL_NAMESPACE_V1_LEN],
 }
 
 /// Typed pre-admission failure. Every variant is decisive and client-caused:
@@ -151,6 +169,14 @@ pub enum DomainOperationMetadataError {
         version: u8,
     },
 
+    /// The mediated-scope value names an unsupported schema.
+    #[error("unsupported domain-operation mediated-scope version {version}")]
+    UnsupportedMediatedScopeVersion { version: u8 },
+
+    /// The mediated-scope principal bytes are not the frozen canonical form.
+    #[error("domain-operation mediated-scope principal namespace is not canonical")]
+    InvalidMediatedPrincipalNamespace,
+
     /// The operation ID is 16 bytes but is not an RFC 9562 UUIDv7.
     #[error("domain-operation ID is not an RFC 9562 UUIDv7 (version {version})")]
     NotUuidV7 {
@@ -158,7 +184,7 @@ pub enum DomainOperationMetadataError {
         version: usize,
     },
 
-    /// Some but not all of the three headers were supplied. Partial carriage is
+    /// Some but not all of the original three headers were supplied. Partial carriage is
     /// never treated as absence, because absence has a legacy carve-out and
     /// partial carriage does not.
     #[error("partial domain-operation carriage: {present} present without {missing}")]
@@ -271,7 +297,8 @@ fn parse_fingerprint(bytes: &[u8]) -> Result<(i32, Vec<u8>), DomainOperationMeta
     Ok((i32::from(*version), payload.to_vec()))
 }
 
-/// Read and validate all three headers when any of them is present.
+/// Read and validate the original three headers and optional mediated scope
+/// when any carriage is present.
 ///
 /// `Ok(None)` means **none** of the three was supplied: the legacy,
 /// enforcement-off carve-out. Partial carriage is an error, never absence, so a
@@ -282,9 +309,16 @@ pub fn extract(
     let id = read_bin(metadata, OPERATION_ID_KEY)?;
     let fingerprint = read_bin(metadata, FINGERPRINT_KEY)?;
     let token = read_bin(metadata, PREPARE_TOKEN_KEY)?;
+    let mediated = read_bin(metadata, MEDIATED_SCOPE_KEY)?;
 
     match (id.is_some(), fingerprint.is_some(), token.is_some()) {
-        (false, false, false) => return Ok(None),
+        (false, false, false) if mediated.is_none() => return Ok(None),
+        (false, false, false) => {
+            return Err(DomainOperationMetadataError::PartialCarriage {
+                present: MEDIATED_SCOPE_KEY,
+                missing: OPERATION_ID_KEY,
+            });
+        }
         (true, false, _) => {
             return Err(DomainOperationMetadataError::PartialCarriage {
                 present: OPERATION_ID_KEY,
@@ -315,7 +349,8 @@ pub fn extract(
     Ok(Some(validated(metadata)?))
 }
 
-/// Read and validate all three headers, requiring every one of them.
+/// Read and validate the original three headers, requiring every one of them,
+/// plus the optional mediated-scope extension.
 ///
 /// This is the enforcement path: absence is a decisive pre-admission rejection,
 /// not a carve-out.
@@ -341,11 +376,41 @@ fn validated(
     let mut prepare_token = [0u8; PREPARE_TOKEN_LEN];
     prepare_token.copy_from_slice(&token_bytes);
 
+    let mediated_scope = read_bin(metadata, MEDIATED_SCOPE_KEY)?
+        .map(|value| parse_mediated_scope(&value))
+        .transpose()?;
+
     Ok(DomainOperationMetadata {
         operation_id,
         fingerprint_version,
         fingerprint,
         prepare_token,
+        mediated_scope,
+    })
+}
+
+fn parse_mediated_scope(bytes: &[u8]) -> Result<MediatedScope, DomainOperationMetadataError> {
+    if bytes.len() != MEDIATED_SCOPE_V1_LEN {
+        return Err(DomainOperationMetadataError::WrongLength {
+            header: MEDIATED_SCOPE_KEY,
+            expected: MEDIATED_SCOPE_V1_LEN,
+            actual: bytes.len(),
+        });
+    }
+    if bytes[0] != MEDIATED_SCOPE_VERSION_V1 {
+        return Err(
+            DomainOperationMetadataError::UnsupportedMediatedScopeVersion { version: bytes[0] },
+        );
+    }
+    let mut org_uuid = [0u8; 16];
+    org_uuid.copy_from_slice(&bytes[1..17]);
+    let mut initiating_principal_namespace = [0u8; MEDIATED_PRINCIPAL_NAMESPACE_V1_LEN];
+    initiating_principal_namespace.copy_from_slice(&bytes[17..]);
+    scope_key_mediated_namespace(&org_uuid, &initiating_principal_namespace)
+        .map_err(|_| DomainOperationMetadataError::InvalidMediatedPrincipalNamespace)?;
+    Ok(MediatedScope {
+        org_uuid,
+        initiating_principal_namespace,
     })
 }
 
@@ -1323,7 +1388,7 @@ mod tests {
     // exhaustive destructure here, since it mirrors an upstream JWT contract
     // and would churn on every upstream refresh; check it by hand.
     #[test]
-    fn domain_operation_metadata_carries_no_org_or_principal_identity() {
+    fn domain_operation_metadata_has_only_the_frozen_carriage_fields() {
         let (metadata, ..) = valid_metadata();
         let parsed = require(&metadata).expect("well-formed metadata must parse");
 
@@ -1332,6 +1397,10 @@ mod tests {
             fingerprint_version: _,
             fingerprint: _,
             prepare_token: _,
+            mediated_scope: _,
         } = parsed;
     }
 }
+
+#[cfg(test)]
+mod p12_tests;

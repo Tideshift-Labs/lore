@@ -272,7 +272,7 @@ pub fn map_domain_error_to_status(error: &lore_postgres::domain::DomainError) ->
 /// Every denial-shaped reason collapses to the same `NOT_FOUND` and the same
 /// fixed detail, so a caller cannot distinguish an unauthorized live
 /// repository, an unknown one, a tombstoned one, and a race it lost.
-fn map_domain_rejection_to_status(reason: &str) -> Status {
+pub(crate) fn map_domain_rejection_to_status(reason: &str) -> Status {
     use lore_postgres::domain::coordinator;
 
     match reason {

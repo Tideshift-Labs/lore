@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
+use lore_postgres::domain::errors::DomainOutcome;
 use lore_proto::ObliterateRequest;
 use lore_proto::ObliterateResponse;
 use lore_revision::notification::NotificationSender;
@@ -22,7 +23,8 @@ use crate::auth::jwt_interceptor::extract_bearer_token;
 use crate::domain::DomainContext;
 use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
-use crate::domain::reject_unwired_governed_operation;
+use crate::domain_intent::CanonicalIntent;
+use crate::domain_intent::canonical_intent_digest;
 use crate::grpc::can_obliterate;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -71,20 +73,39 @@ pub async fn handler(
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
 
-    if let Some(admitted) = admit_at_entry(
+    let admitted = admit_at_entry(
         domain_context,
         &request_metadata,
         request_authorization.as_ref(),
         GovernedScope::TargetRepository {
             repository_id: repository.data(),
         },
-    )? {
-        return Err(reject_unwired_governed_operation(
-            &admitted,
-            "lore.AdminService/Obliterate",
+    )?;
+    if let Some(raw_address) = req.address.as_ref()
+        && (raw_address.hash.len() != 32 || raw_address.context.len() != 16)
+    {
+        return Err(Status::invalid_argument(
+            "obliterate address must contain a 32-byte hash and 16-byte context",
         ));
     }
     let address = Address::from(req.address.unwrap_or_default());
+    let governed = match admitted {
+        Some(admitted) => {
+            let domain = domain_context
+                .ok_or_else(|| Status::failed_precondition("Domain coordinator is unavailable"))?;
+            let digest = canonical_intent_digest(&CanonicalIntent::Obliterate {
+                repository_id: repository.data(),
+                address_hash: address.hash.as_ref(),
+                address_context: address.context.as_ref(),
+            })
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            Some((
+                domain.clone(),
+                admitted.into_governed("begin_obliterate", digest),
+            ))
+        }
+        None => None,
+    };
 
     let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
 
@@ -112,6 +133,17 @@ pub async fn handler(
                 })?;
 
             info!("Handling obliterate request for address {address}");
+
+            if let Some((domain, operation)) = governed.as_ref() {
+                let result = domain
+                    .store()
+                    .begin_obliterate(operation, repository.data())
+                    .await
+                    .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?;
+                if let DomainOutcome::NotApplied { reason, .. } = result.outcome {
+                    return Err(crate::grpc::map_domain_rejection_to_status(&reason));
+                }
+            }
 
             let stats = Arc::new(StoreObliterateStats::default());
             immutable_store
@@ -322,6 +354,41 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn rejects_noncanonical_address_widths_before_store_work() {
+        let repository = random::<RepositoryId>();
+
+        for (hash, context) in [
+            (vec![0; 31], vec![0; 16]),
+            (vec![0; 33], vec![0; 16]),
+            (vec![0; 32], vec![0; 15]),
+            (vec![0; 32], vec![0; 17]),
+        ] {
+            let (immutable_store, mutable_store, _) = test_store_create().await.unwrap();
+            let notification = Arc::new(MockNotificationSender::new());
+            let hook_dispatcher = HookDispatcher::empty();
+            let mut request = make_request(repository, None);
+            request.get_mut().address = Some(lore_proto::Address {
+                hash: hash.into(),
+                context: context.into(),
+            });
+
+            let err = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                notification,
+                &hook_dispatcher,
+                &None.into(),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
     }
 
     #[tokio::test]
