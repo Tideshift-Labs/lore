@@ -6,7 +6,7 @@
 //!
 //! The ignored tier requires `LORE_TEST_LOCAL_DISPATCHER_IDENTITY_PROVISIONING_PG_URL`, an
 //! administrator URL for a fresh disposable database. It installs the complete cell install set
-//! (0002, 0003, 0007-0019) itself and intentionally leaves global test roles for the disposable
+//! (0002, 0003, 0007-0020) itself and intentionally leaves global test roles for the disposable
 //! server owner.
 
 use std::path::Path;
@@ -15,6 +15,9 @@ use std::path::PathBuf;
 use lore_object_dispatch::local_authority_dispatcher_identity_provisioning::LOCAL_AUTHORITY_DISPATCHER_IDENTITY_PROVISIONING_MIGRATION_BLAKE3_V1;
 use lore_object_dispatch::local_authority_dispatcher_identity_provisioning::LOCAL_AUTHORITY_DISPATCHER_IDENTITY_PROVISIONING_MIGRATION_V1;
 use lore_object_dispatch::local_authority_dispatcher_identity_provisioning::validate_embedded_local_authority_dispatcher_identity_provisioning_migration_v1;
+use lore_object_dispatch::local_authority_dispatcher_registration::LOCAL_AUTHORITY_DISPATCHER_REGISTRATION_MIGRATION_BLAKE3_V1;
+use lore_object_dispatch::local_authority_dispatcher_registration::LOCAL_AUTHORITY_DISPATCHER_REGISTRATION_MIGRATION_V1;
+use lore_object_dispatch::local_authority_dispatcher_registration::validate_embedded_local_authority_dispatcher_registration_migration_v1;
 use tokio_postgres::error::SqlState;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -33,10 +36,20 @@ const DISPATCHER_IDENTITY_API_REVISION: &str =
     "object-store-dispatch-dispatcher-identity-provisioning-v1";
 const DISPATCHER_IDENTITY_SCHEMA_REVISION: &str =
     "object-store-dispatch-dispatcher-identity-schema-v1";
+const DISPATCHER_REGISTRATION_API_REVISION: &str =
+    "object-store-dispatch-dispatcher-registration-v1";
+const EXPECTED_REGISTRATION_MIGRATION_BYTES: usize = 29_189;
+const EXPECTED_REGISTRATION_MIGRATION_BLAKE3: &str =
+    "aede4135d081a9adbec51cd41141faea81eb3b25860ab9d1968073a230aa78e9";
 
 fn migration() -> &'static str {
     std::str::from_utf8(LOCAL_AUTHORITY_DISPATCHER_IDENTITY_PROVISIONING_MIGRATION_V1)
         .expect("dispatcher-identity provisioning migration must remain UTF-8 SQL")
+}
+
+fn registration_migration() -> &'static str {
+    std::str::from_utf8(LOCAL_AUTHORITY_DISPATCHER_REGISTRATION_MIGRATION_V1)
+        .expect("dispatcher registration migration must remain UTF-8 SQL")
 }
 
 fn compact(sql: &str) -> String {
@@ -378,6 +391,8 @@ fn artifact_is_embedded_and_source_dark_without_runtime_calls() {
         for entrypoint in [
             "object_store_dispatch_dispatcher_identity_install_v1",
             "object_store_dispatch_dispatcher_identity_read_state_v1",
+            "object_store_dispatch_enroll_dispatcher_participant_v1",
+            "object_store_dispatch_register_dispatcher_v1",
         ] {
             assert!(
                 !source.contains(entrypoint),
@@ -385,6 +400,120 @@ fn artifact_is_embedded_and_source_dark_without_runtime_calls() {
                 path.display()
             );
         }
+    }
+}
+
+#[test]
+fn registration_artifact_digest_is_embedded_and_source_dark() {
+    let sql = registration_migration();
+    assert_eq!(
+        LOCAL_AUTHORITY_DISPATCHER_REGISTRATION_MIGRATION_V1.len(),
+        EXPECTED_REGISTRATION_MIGRATION_BYTES
+    );
+    assert_eq!(
+        blake3::hash(LOCAL_AUTHORITY_DISPATCHER_REGISTRATION_MIGRATION_V1)
+            .to_hex()
+            .as_str(),
+        EXPECTED_REGISTRATION_MIGRATION_BLAKE3
+    );
+    assert_eq!(
+        LOCAL_AUTHORITY_DISPATCHER_REGISTRATION_MIGRATION_BLAKE3_V1.as_slice(),
+        blake3::hash(LOCAL_AUTHORITY_DISPATCHER_REGISTRATION_MIGRATION_V1).as_bytes()
+    );
+    assert!(validate_embedded_local_authority_dispatcher_registration_migration_v1());
+    assert!(!sql.contains('\r'));
+
+    let module = include_str!("../src/local_authority_dispatcher_registration.rs");
+    let library = include_str!("../src/lib.rs");
+    assert!(module.contains(
+        "include_bytes!(\"../migrations/0020_object_store_dispatch_dispatcher_registration.sql\")"
+    ));
+    assert!(library.contains("pub mod local_authority_dispatcher_registration;"));
+    for forbidden in ["tokio_postgres", "batch_execute", ".execute(", ".await"] {
+        assert!(
+            !module.contains(forbidden),
+            "source-dark registration module contains {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn registration_surface_pins_enrollment_auth_codec_acl_and_generation_fence() {
+    let sql = registration_migration();
+    let compact_sql = compact(sql);
+    let registration = compact(function_body(
+        sql,
+        "CREATE FUNCTION object_store_retention.object_store_dispatch_register_dispatcher_v1(",
+    ));
+    let enrollment = compact(function_body(
+        sql,
+        "CREATE FUNCTION object_store_retention.object_store_dispatch_enroll_dispatcher_participant_v1(",
+    ));
+    for required in [
+        DISPATCHER_REGISTRATION_API_REVISION,
+        "assert_dispatch_maintenance_v1()",
+        "assert_serializable_write_v1()",
+        "participant_key_blake3",
+        "'REPLAY'",
+        "'CREATED'",
+    ] {
+        assert!(
+            enrollment.contains(required),
+            "participant enrollment missing invariant: {required}"
+        );
+    }
+    for required in [
+        DISPATCHER_REGISTRATION_API_REVISION,
+        "assert_dispatch_runtime_v1()",
+        "assert_serializable_write_v1()",
+        "object_dispatch_dispatcher_participants",
+        "local_blake3_v1(",
+        "FOR UPDATE",
+        "pg_catalog.max(dispatcher.lease_generation)",
+        "next_generation <=",
+        "INSERT INTO object_store_retention.object_dispatch_dispatchers",
+        "local_dispatcher_registration_record_v1(",
+        "'REPLAY'",
+        "'CREATED'",
+    ] {
+        assert!(
+            registration.contains(required),
+            "registration procedure missing invariant: {required}"
+        );
+    }
+    assert!(compact_sql.contains(
+        "object_store_retention.object_store_dispatch_enroll_dispatcher_participant_v1( text, text, text, bytea ), object_store_retention.object_store_dispatch_register_dispatcher_v1( text, bytea, object_store_retention.uint64, text, object_store_retention.uint64, object_store_retention.uint64, text, object_store_retention.uint64, text, bigint, bigint, bigint, bigint ) FROM PUBLIC, object_dispatch_retention_runtime, object_dispatch_retention_maintenance, object_dispatch_retention_migrator;"
+    ));
+    assert!(compact_sql.contains(
+        "GRANT EXECUTE ON FUNCTION object_store_retention.object_store_dispatch_enroll_dispatcher_participant_v1( text, text, text, bytea ) TO object_dispatch_retention_maintenance;"
+    ));
+    assert!(compact_sql.contains(
+        "GRANT EXECUTE ON FUNCTION object_store_retention.object_store_dispatch_register_dispatcher_v1( text, bytea, object_store_retention.uint64, text, object_store_retention.uint64, object_store_retention.uint64, text, object_store_retention.uint64, text, bigint, bigint, bigint, bigint ) TO object_dispatch_retention_runtime;"
+    ));
+    assert!(!registration.contains("canonical_record_bytes bytea"));
+    assert!(!registration.contains("record_blake3 bytea"));
+}
+
+#[test]
+fn registration_migration_pins_the_exact_attempts_foreign_key_carrier() {
+    let objects = compact(function_body(
+        registration_migration(),
+        "CREATE OR REPLACE FUNCTION object_store_retention.assert_dispatch_dispatcher_identity_objects_v1(",
+    ));
+    for required in [
+        "constraint_state.contype = 'f'",
+        "constraint_state.convalidated",
+        "NOT constraint_state.condeferrable",
+        "NOT constraint_state.condeferred",
+        "ARRAY[ 'provider_boundary_id', 'dispatcher_id', 'dispatcher_lease_generation' ]",
+        "ARRAY['provider_boundary_id', 'dispatcher_id', 'lease_generation']",
+        "object_dispatch_attempts",
+        "object_dispatch_dispatchers",
+    ] {
+        assert!(
+            objects.contains(required),
+            "attempts foreign-key assertion missing: {required}"
+        );
     }
 }
 
@@ -401,7 +530,12 @@ async fn expect_sqlstate(
     let database_error = error
         .as_db_error()
         .unwrap_or_else(|| panic!("{label}: expected typed PostgreSQL error, got {error}"));
-    assert_eq!(database_error.code(), expected, "{label}");
+    assert_eq!(
+        database_error.code(),
+        expected,
+        "{label}: {}",
+        database_error.message()
+    );
 }
 
 async fn set_session_user(client: &tokio_postgres::Client, role: &str) {
@@ -450,7 +584,12 @@ async fn expect_serializable_sqlstate(
     let database_error = error
         .as_db_error()
         .unwrap_or_else(|| panic!("{label}: expected typed PostgreSQL error, got {error}"));
-    assert_eq!(database_error.code(), expected, "{label}");
+    assert_eq!(
+        database_error.code(),
+        expected,
+        "{label}: {}",
+        database_error.message()
+    );
 }
 
 fn install_call(
@@ -474,6 +613,210 @@ fn read_call() -> String {
     )
 }
 
+#[derive(Clone, Copy)]
+struct Registration<'a> {
+    participant_key_byte: u8,
+    generation: u64,
+    service_instance_id: &'a str,
+}
+
+fn registration_call(input: Registration<'_>) -> String {
+    format!(
+        "SELECT (object_store_retention.object_store_dispatch_register_dispatcher_v1(
+           '{DISPATCHER_REGISTRATION_API_REVISION}',
+           pg_catalog.decode(pg_catalog.repeat('{participant_key_byte:02x}', 32), 'hex'),
+           {generation}, '{service_instance_id}', {generation}, 1, 'allocation-1', 1,
+           'credential-1', 1000, 1100, 2000, 1100
+         )).result_code",
+        participant_key_byte = input.participant_key_byte,
+        generation = input.generation,
+        service_instance_id = input.service_instance_id,
+    )
+}
+
+fn enrollment_call(
+    provider_boundary_id: &str,
+    dispatcher_id: &str,
+    participant_key_byte: u8,
+) -> String {
+    let digest = blake3::hash(&[participant_key_byte; 32]).to_hex();
+    format!(
+        "SELECT (object_store_retention.object_store_dispatch_enroll_dispatcher_participant_v1(
+           '{DISPATCHER_REGISTRATION_API_REVISION}', '{provider_boundary_id}', '{dispatcher_id}',
+           pg_catalog.decode('{digest}', 'hex')
+         )).result_code"
+    )
+}
+
+fn expected_registration_record(
+    dispatcher_id: &str,
+    provider_boundary_id: &str,
+    input: Registration<'_>,
+) -> (Vec<u8>, Vec<u8>) {
+    fn push_text(bytes: &mut Vec<u8>, value: &str) {
+        let value = value.as_bytes();
+        bytes.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(value);
+    }
+
+    let mut preimage = b"object-store-dispatch-dispatcher-registration-row-v1".to_vec();
+    preimage.push(0);
+    push_text(&mut preimage, "object-store-dispatch-authority-schema-v1");
+    push_text(&mut preimage, dispatcher_id);
+    preimage.extend_from_slice(&input.generation.to_be_bytes());
+    push_text(&mut preimage, provider_boundary_id);
+    push_text(&mut preimage, input.service_instance_id);
+    preimage.extend_from_slice(&input.generation.to_be_bytes());
+    preimage.extend_from_slice(&1_u64.to_be_bytes());
+    push_text(&mut preimage, "allocation-1");
+    preimage.extend_from_slice(&1_u64.to_be_bytes());
+    push_text(&mut preimage, "credential-1");
+    preimage.push(1);
+    for value in [1000_u64, 1100, 2000, 1100] {
+        preimage.extend_from_slice(&value.to_be_bytes());
+    }
+    let digest = blake3::hash(&preimage).as_bytes().to_vec();
+    let mut complete = preimage;
+    complete.extend_from_slice(&digest);
+    (complete, digest)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn blake3_provider_sql() -> String {
+    let mut vectors = Vec::new();
+    for key_byte in [0xaa, 0xbb, 0xc1, 0xc2, 0xee] {
+        let payload = vec![key_byte; 32];
+        vectors.push((payload.clone(), blake3::hash(&payload).as_bytes().to_vec()));
+    }
+    for (dispatcher_id, provider_boundary_id, input) in [
+        (
+            "dispatcher-a",
+            "boundary-a",
+            Registration {
+                participant_key_byte: 0xaa,
+                generation: 1,
+                service_instance_id: "instance-a-1",
+            },
+        ),
+        (
+            "dispatcher-a",
+            "boundary-a",
+            Registration {
+                participant_key_byte: 0xaa,
+                generation: 2,
+                service_instance_id: "instance-a-2",
+            },
+        ),
+        (
+            "dispatcher-b",
+            "boundary-a",
+            Registration {
+                participant_key_byte: 0xbb,
+                generation: 1,
+                service_instance_id: "instance-b-1",
+            },
+        ),
+        (
+            "dispatcher-race-first",
+            "boundary-race-first",
+            Registration {
+                participant_key_byte: 0xc1,
+                generation: 1,
+                service_instance_id: "instance-race-first-1",
+            },
+        ),
+        (
+            "dispatcher-race-next",
+            "boundary-race-next",
+            Registration {
+                participant_key_byte: 0xc2,
+                generation: 1,
+                service_instance_id: "instance-race-next-1",
+            },
+        ),
+        (
+            "dispatcher-race-next",
+            "boundary-race-next",
+            Registration {
+                participant_key_byte: 0xc2,
+                generation: 2,
+                service_instance_id: "instance-race-next-2",
+            },
+        ),
+    ] {
+        let (complete, digest) =
+            expected_registration_record(dispatcher_id, provider_boundary_id, input);
+        vectors.push((complete[..complete.len() - 32].to_vec(), digest));
+    }
+    let cases = vectors
+        .iter()
+        .map(|(payload, digest)| {
+            format!(
+                "WHEN '{}' THEN pg_catalog.decode('{}', 'hex')",
+                hex(payload),
+                hex(digest)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "CREATE FUNCTION public.blake3(payload bytea) RETURNS bytea
+         LANGUAGE sql IMMUTABLE STRICT
+         AS $$ SELECT CASE pg_catalog.encode(payload, 'hex')
+           {cases}
+           ELSE NULL::bytea
+         END $$;"
+    )
+}
+
+fn race_outcome(result: Result<tokio_postgres::Row, tokio_postgres::Error>) -> String {
+    match result {
+        Ok(row) => row.get(0),
+        Err(error)
+            if error.as_db_error().is_some_and(|database_error| {
+                database_error.code() == &SqlState::T_R_SERIALIZATION_FAILURE
+            }) =>
+        {
+            "40001".to_string()
+        }
+        Err(error) => panic!(
+            "registration race returned an unexpected error: {error}; database error: {:?}",
+            error.as_db_error()
+        ),
+    }
+}
+
+fn assert_registration_race_outcomes(left: String, right: String, label: &str) {
+    let outcomes = [left.as_str(), right.as_str()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == "CREATED")
+            .count(),
+        1,
+        "{label}: exactly one contender must create the generation; outcomes={outcomes:?}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| matches!(*outcome, "CREATED" | "REPLAY" | "40001")),
+        "{label}: loser may only replay or lose PostgreSQL serialization; outcomes={outcomes:?}"
+    );
+}
+
+async fn expect_registration_sqlstate(
+    client: &tokio_postgres::Client,
+    role: &str,
+    input: Registration<'_>,
+    expected: &SqlState,
+    label: &str,
+) {
+    expect_serializable_sqlstate(client, role, &registration_call(input), expected, label).await;
+}
+
 /// Plants one catalog drift on `object_dispatch_dispatchers`, asserts the readback fails closed
 /// with `55000`/`OBJECT_NOT_IN_PREREQUISITE_STATE`, removes the drift, then re-asserts the
 /// readback returns `READ`. Every drift case in the live test below goes through this helper so
@@ -490,7 +833,7 @@ async fn assert_drift_fails_closed_then_restores(
         .batch_execute(plant_sql)
         .await
         .unwrap_or_else(|error| panic!("{label}: plant drift: {error}"));
-    set_session_user(client, "object_dispatch_retention_maintenance").await;
+    set_session_user(client, "object_dispatch_retention_runtime").await;
     let drift_error = match client.query_one(&read_call(), &[]).await {
         Ok(_) => panic!("{label}: drifted readback was unexpectedly accepted"),
         Err(error) => error,
@@ -509,7 +852,7 @@ async fn assert_drift_fails_closed_then_restores(
         .batch_execute(remove_sql)
         .await
         .unwrap_or_else(|error| panic!("{label}: remove drift: {error}"));
-    set_session_user(client, "object_dispatch_retention_maintenance").await;
+    set_session_user(client, "object_dispatch_retention_runtime").await;
     let restored: String = client
         .query_one(&read_call(), &[])
         .await
@@ -637,12 +980,17 @@ async fn live_postgres_dispatcher_identity_readback_authorizes_by_role_and_fails
         include_str!(
             "../migrations/0019_object_store_dispatch_dispatcher_identity_provisioning.sql"
         ),
+        include_str!("../migrations/0020_object_store_dispatch_dispatcher_registration.sql"),
     ] {
         client
             .batch_execute(migration)
             .await
             .expect("apply mutation-chain and dispatcher-identity migration");
     }
+    client
+        .batch_execute(&blake3_provider_sql())
+        .await
+        .expect("install exact-vector BLAKE3 provider for dispatcher registration");
 
     // Item 5a: a wrong API revision is rejected before the serializable-write requirement is even
     // reached, so no explicit SERIALIZABLE transaction is needed to observe it.
@@ -699,30 +1047,440 @@ async fn live_postgres_dispatcher_identity_readback_authorizes_by_role_and_fails
         );
     }
 
-    // Item 4: the readback is reachable by all three known roles and refused for everyone else.
+    // 0020 narrows the growth-tolerant readback to the runtime authority. Maintenance and the
+    // owner remain unable to use it even though both can reach stronger out-of-band tooling.
+    set_session_user(&client, "object_dispatch_retention_runtime").await;
+    let read: String = client
+        .query_one(&read_call(), &[])
+        .await
+        .expect("runtime read")
+        .get(0);
+    assert_eq!(read, "READ");
+    reset_session_user(&client).await;
     for role in [
-        "object_dispatch_retention_runtime",
         "object_dispatch_retention_maintenance",
+        "object_dispatch_retention_owner",
     ] {
         set_session_user(&client, role).await;
-        let read: String = client
-            .query_one(&read_call(), &[])
-            .await
-            .unwrap_or_else(|error| panic!("{role} read: {error}"))
-            .get(0);
-        assert_eq!(read, "READ", "{role}");
+        let error = client.query_one(&read_call(), &[]).await.unwrap_err();
+        assert_eq!(
+            error
+                .as_db_error()
+                .expect("typed authorization error")
+                .code(),
+            &SqlState::INSUFFICIENT_PRIVILEGE,
+            "{role} must not read dispatcher identity state"
+        );
         reset_session_user(&client).await;
     }
-    set_session_user(&client, "object_dispatch_retention_owner").await;
-    let owner_error = client.query_one(&read_call(), &[]).await.unwrap_err();
-    assert_eq!(
-        owner_error
-            .as_db_error()
-            .expect("typed authorization error")
-            .code(),
-        &SqlState::INSUFFICIENT_PRIVILEGE
-    );
+
+    // Participant enrollment is maintenance-only and SERIALIZABLE-only. Runtime cannot mint its
+    // own restart-stable identity, and maintenance cannot bypass the transaction gate.
+    expect_serializable_sqlstate(
+        &client,
+        "object_dispatch_retention_runtime",
+        &enrollment_call("boundary-denied", "dispatcher-denied", 0xdd),
+        &SqlState::INSUFFICIENT_PRIVILEGE,
+        "non-maintenance participant enrollment",
+    )
+    .await;
+    set_session_user(&client, "object_dispatch_retention_maintenance").await;
+    expect_sqlstate(
+        &client,
+        &enrollment_call(
+            "boundary-nonserializable",
+            "dispatcher-nonserializable",
+            0xde,
+        ),
+        &SqlState::INVALID_TRANSACTION_STATE,
+        "non-serializable participant enrollment",
+    )
+    .await;
     reset_session_user(&client).await;
+
+    for expected in ["CREATED", "REPLAY"] {
+        let result: String = serializable_call(
+            &client,
+            "object_dispatch_retention_maintenance",
+            &enrollment_call("boundary-a", "dispatcher-a", 0xaa),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("participant A enrollment {expected}: {error}"))
+        .get(0);
+        assert_eq!(result, expected);
+    }
+    expect_serializable_sqlstate(
+        &client,
+        "object_dispatch_retention_maintenance",
+        &enrollment_call("boundary-a", "dispatcher-a", 0xab),
+        &SqlState::UNIQUE_VIOLATION,
+        "same participant identity with a changed key commitment",
+    )
+    .await;
+    for (boundary, dispatcher, key_byte) in [
+        ("boundary-a", "dispatcher-b", 0xbb),
+        ("boundary-race-first", "dispatcher-race-first", 0xc1),
+        ("boundary-race-next", "dispatcher-race-next", 0xc2),
+    ] {
+        let result: String = serializable_call(
+            &client,
+            "object_dispatch_retention_maintenance",
+            &enrollment_call(boundary, dispatcher, key_byte),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("enroll {dispatcher}: {error}"))
+        .get(0);
+        assert_eq!(result, "CREATED", "enroll {dispatcher}");
+    }
+
+    // Registration is runtime-only and SERIALIZABLE-only, and an unknown raw key is rejected
+    // rather than creating a participant row as the superseded design did.
+    expect_registration_sqlstate(
+        &client,
+        "object_dispatch_retention_maintenance",
+        Registration {
+            participant_key_byte: 0xaa,
+            generation: 1,
+            service_instance_id: "instance-denied",
+        },
+        &SqlState::INSUFFICIENT_PRIVILEGE,
+        "non-runtime registration",
+    )
+    .await;
+    set_session_user(&client, "object_dispatch_retention_runtime").await;
+    expect_sqlstate(
+        &client,
+        &registration_call(Registration {
+            participant_key_byte: 0xaa,
+            generation: 1,
+            service_instance_id: "instance-nonserializable",
+        }),
+        &SqlState::INVALID_TRANSACTION_STATE,
+        "non-serializable registration",
+    )
+    .await;
+    reset_session_user(&client).await;
+    expect_registration_sqlstate(
+        &client,
+        "object_dispatch_retention_runtime",
+        Registration {
+            participant_key_byte: 0xee,
+            generation: 1,
+            service_instance_id: "instance-unknown",
+        },
+        &SqlState::INSUFFICIENT_PRIVILEGE,
+        "unknown participant key",
+    )
+    .await;
+    let unknown_participant_count: i64 = client
+        .query_one(
+            "SELECT count(*)::bigint FROM object_store_retention.object_dispatch_dispatcher_participants",
+            &[],
+        )
+        .await
+        .expect("count pre-enrolled participants after unknown-key rejection")
+        .get(0);
+    assert_eq!(unknown_participant_count, 4);
+
+    let participant_a_generation_1 = Registration {
+        participant_key_byte: 0xaa,
+        generation: 1,
+        service_instance_id: "instance-a-1",
+    };
+    for expected in ["CREATED", "REPLAY"] {
+        let result: String = serializable_call(
+            &client,
+            "object_dispatch_retention_runtime",
+            &registration_call(participant_a_generation_1),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "participant A generation 1 {expected}: {error}; database error: {:?}",
+                error.as_db_error()
+            )
+        })
+        .get(0);
+        assert_eq!(result, expected);
+    }
+    let participant_a_count: i64 = client
+        .query_one(
+            "SELECT count(*)::bigint
+               FROM object_store_retention.object_dispatch_dispatchers
+              WHERE provider_boundary_id = 'boundary-a' AND dispatcher_id = 'dispatcher-a'",
+            &[],
+        )
+        .await
+        .expect("count participant A rows after exact replay")
+        .get(0);
+    assert_eq!(participant_a_count, 1, "exact replay must not insert a row");
+    let stored_record = client
+        .query_one(
+            "SELECT canonical_record_bytes, record_blake3
+               FROM object_store_retention.object_dispatch_dispatchers
+              WHERE provider_boundary_id = 'boundary-a'
+                AND dispatcher_id = 'dispatcher-a'
+                AND lease_generation = 1",
+            &[],
+        )
+        .await
+        .expect("read PostgreSQL-built canonical participant A generation 1 record");
+    let (expected_bytes, expected_digest) =
+        expected_registration_record("dispatcher-a", "boundary-a", participant_a_generation_1);
+    assert_eq!(stored_record.get::<_, Vec<u8>>(0), expected_bytes);
+    assert_eq!(stored_record.get::<_, Vec<u8>>(1), expected_digest);
+
+    expect_registration_sqlstate(
+        &client,
+        "object_dispatch_retention_runtime",
+        Registration {
+            service_instance_id: "instance-a-changed",
+            ..participant_a_generation_1
+        },
+        &SqlState::UNIQUE_VIOLATION,
+        "same generation with a changed payload",
+    )
+    .await;
+
+    client
+        .execute(
+            "UPDATE object_store_retention.object_dispatch_dispatchers
+                SET state = 2,
+                    revocation_id = 'revoke-a-1',
+                    revocation_requested_at_unix_ms = 1200,
+                    revoked_at_unix_ms = NULL,
+                    revocation_evidence_blake3 = NULL,
+                    state_changed_at_unix_ms = 1200
+              WHERE provider_boundary_id = 'boundary-a'
+                AND dispatcher_id = 'dispatcher-a'
+                AND lease_generation = 1",
+            &[],
+        )
+        .await
+        .expect("retire participant A generation 1");
+    let participant_a_generation_2 = Registration {
+        participant_key_byte: 0xaa,
+        generation: 2,
+        service_instance_id: "instance-a-2",
+    };
+    let created: String = serializable_call(
+        &client,
+        "object_dispatch_retention_runtime",
+        &registration_call(participant_a_generation_2),
+    )
+    .await
+    .expect("create participant A generation 2")
+    .get(0);
+    assert_eq!(created, "CREATED");
+    client
+        .execute(
+            "UPDATE object_store_retention.object_dispatch_dispatchers
+                SET state = 2,
+                    revocation_id = 'revoke-a-2',
+                    revocation_requested_at_unix_ms = 1300,
+                    revoked_at_unix_ms = NULL,
+                    revocation_evidence_blake3 = NULL,
+                    state_changed_at_unix_ms = 1300
+              WHERE provider_boundary_id = 'boundary-a'
+                AND dispatcher_id = 'dispatcher-a'
+                AND lease_generation = 2",
+            &[],
+        )
+        .await
+        .expect("retire participant A generation 2");
+
+    for (label, input) in [
+        (
+            "backward generation after retiring generation 2",
+            participant_a_generation_1,
+        ),
+        (
+            "rewound restart at generation 2",
+            participant_a_generation_2,
+        ),
+    ] {
+        expect_registration_sqlstate(
+            &client,
+            "object_dispatch_retention_runtime",
+            input,
+            &SqlState::INVALID_PARAMETER_VALUE,
+            label,
+        )
+        .await;
+    }
+
+    let independent: String = serializable_call(
+        &client,
+        "object_dispatch_retention_runtime",
+        &registration_call(Registration {
+            participant_key_byte: 0xbb,
+            generation: 1,
+            service_instance_id: "instance-b-1",
+        }),
+    )
+    .await
+    .expect("independent participant starts at generation 1")
+    .get(0);
+    assert_eq!(independent, "CREATED");
+
+    // Two independent sessions prove the participant-row lock closes both empty-chain and
+    // next-generation races. PostgreSQL may serialize the loser after the winner commits (REPLAY)
+    // or abort its stale SERIALIZABLE snapshot (40001), but exactly one call creates each row.
+    let (race_left, race_left_connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("connect left dispatcher registration racer");
+    let _race_left_task = AbortOnDropHandle::new(lore_base::lore_spawn!(
+        "dispatcher-registration-race-left",
+        async move {
+            let _ = race_left_connection.await;
+        }
+    ));
+    let (race_right, race_right_connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("connect right dispatcher registration racer");
+    let _race_right_task = AbortOnDropHandle::new(lore_base::lore_spawn!(
+        "dispatcher-registration-race-right",
+        async move {
+            let _ = race_right_connection.await;
+        }
+    ));
+
+    let first_race = Registration {
+        participant_key_byte: 0xc1,
+        generation: 1,
+        service_instance_id: "instance-race-first-1",
+    };
+    let first_race_sql = registration_call(first_race);
+    let (left, right) = tokio::join!(
+        serializable_call(
+            &race_left,
+            "object_dispatch_retention_runtime",
+            &first_race_sql
+        ),
+        serializable_call(
+            &race_right,
+            "object_dispatch_retention_runtime",
+            &first_race_sql
+        )
+    );
+    assert_registration_race_outcomes(
+        race_outcome(left),
+        race_outcome(right),
+        "concurrent first registration",
+    );
+    let first_race_row = client
+        .query_one(
+            "SELECT count(*) OVER ()::bigint, service_instance_id, dispatcher_fence::text,
+                    state, canonical_record_bytes, record_blake3
+               FROM object_store_retention.object_dispatch_dispatchers
+              WHERE provider_boundary_id = 'boundary-race-first'
+                AND dispatcher_id = 'dispatcher-race-first'
+                AND lease_generation = 1",
+            &[],
+        )
+        .await
+        .expect("read final concurrent first-registration chain");
+    assert_eq!(first_race_row.get::<_, i64>(0), 1);
+    assert_eq!(first_race_row.get::<_, String>(1), "instance-race-first-1");
+    assert_eq!(first_race_row.get::<_, String>(2), "1");
+    assert_eq!(first_race_row.get::<_, i16>(3), 1);
+    let (first_race_bytes, first_race_digest) =
+        expected_registration_record("dispatcher-race-first", "boundary-race-first", first_race);
+    assert_eq!(first_race_row.get::<_, Vec<u8>>(4), first_race_bytes);
+    assert_eq!(first_race_row.get::<_, Vec<u8>>(5), first_race_digest);
+
+    let next_race_generation_1 = Registration {
+        participant_key_byte: 0xc2,
+        generation: 1,
+        service_instance_id: "instance-race-next-1",
+    };
+    assert_eq!(
+        serializable_call(
+            &client,
+            "object_dispatch_retention_runtime",
+            &registration_call(next_race_generation_1),
+        )
+        .await
+        .expect("seed next-generation race chain")
+        .get::<_, String>(0),
+        "CREATED"
+    );
+    client
+        .execute(
+            "UPDATE object_store_retention.object_dispatch_dispatchers
+                SET state = 2,
+                    revocation_id = 'revoke-race-next-1',
+                    revocation_requested_at_unix_ms = 1200,
+                    revoked_at_unix_ms = NULL,
+                    revocation_evidence_blake3 = NULL,
+                    state_changed_at_unix_ms = 1200
+              WHERE provider_boundary_id = 'boundary-race-next'
+                AND dispatcher_id = 'dispatcher-race-next'
+                AND lease_generation = 1",
+            &[],
+        )
+        .await
+        .expect("retire seed generation before next-generation race");
+    let next_race = Registration {
+        participant_key_byte: 0xc2,
+        generation: 2,
+        service_instance_id: "instance-race-next-2",
+    };
+    let next_race_sql = registration_call(next_race);
+    let (left, right) = tokio::join!(
+        serializable_call(
+            &race_left,
+            "object_dispatch_retention_runtime",
+            &next_race_sql
+        ),
+        serializable_call(
+            &race_right,
+            "object_dispatch_retention_runtime",
+            &next_race_sql
+        )
+    );
+    assert_registration_race_outcomes(
+        race_outcome(left),
+        race_outcome(right),
+        "concurrent next generation",
+    );
+    let next_race_rows = client
+        .query(
+            "SELECT lease_generation::text, service_instance_id, dispatcher_fence::text, state,
+                    canonical_record_bytes, record_blake3
+               FROM object_store_retention.object_dispatch_dispatchers
+              WHERE provider_boundary_id = 'boundary-race-next'
+                AND dispatcher_id = 'dispatcher-race-next'
+              ORDER BY lease_generation",
+            &[],
+        )
+        .await
+        .expect("read final concurrent next-generation chain");
+    assert_eq!(next_race_rows.len(), 2);
+    assert_eq!(next_race_rows[0].get::<_, String>(0), "1");
+    assert_eq!(next_race_rows[0].get::<_, i16>(3), 2);
+    assert_eq!(next_race_rows[1].get::<_, String>(0), "2");
+    assert_eq!(
+        next_race_rows[1].get::<_, String>(1),
+        "instance-race-next-2"
+    );
+    assert_eq!(next_race_rows[1].get::<_, String>(2), "2");
+    assert_eq!(next_race_rows[1].get::<_, i16>(3), 1);
+    let (next_race_bytes, next_race_digest) =
+        expected_registration_record("dispatcher-race-next", "boundary-race-next", next_race);
+    assert_eq!(next_race_rows[1].get::<_, Vec<u8>>(4), next_race_bytes);
+    assert_eq!(next_race_rows[1].get::<_, Vec<u8>>(5), next_race_digest);
+
+    // The catalog-drift probes below deliberately create uniqueness shapes that 0019 must reject.
+    // They can only be planted on an empty dispatcher table once two independent participants
+    // have both used generation 1, so clear the completed registration fixture first.
+    client
+        .batch_execute(
+            "DELETE FROM object_store_retention.object_dispatch_dispatchers;
+             DELETE FROM object_store_retention.object_dispatch_dispatcher_participants;",
+        )
+        .await
+        .expect("clear completed dispatcher-registration fixture before catalog drift probes");
 
     // Item 6: an additional unique index on the dispatchers table whose key omits dispatcher_id
     // makes the readback fail closed, and dropping it restores READ. Run only while the table holds
@@ -860,4 +1618,166 @@ async fn live_postgres_dispatcher_identity_readback_authorizes_by_role_and_fails
            object_dispatch_dispatchers_provider_boundary_id_dispatcher_key;",
     )
     .await;
+
+    // INV-EM P1-2: the positive unique carrier is not enough. Dropping the attempts foreign key
+    // must make the unchanged 0019 public readback fail closed after 0020 replaces its object
+    // assertion, and restoring the exact source/target carrier must restore READ.
+    assert_drift_fails_closed_then_restores(
+        &client,
+        "attempts-to-dispatcher-generation foreign key dropped",
+        "ALTER TABLE object_store_retention.object_dispatch_attempts
+           DROP CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey;",
+        "ALTER TABLE object_store_retention.object_dispatch_attempts
+           ADD CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey
+           FOREIGN KEY (provider_boundary_id, dispatcher_id, dispatcher_lease_generation)
+           REFERENCES object_store_retention.object_dispatch_dispatchers
+             (provider_boundary_id, dispatcher_id, lease_generation)
+           NOT DEFERRABLE;",
+    )
+    .await;
+
+    assert_drift_fails_closed_then_restores(
+        &client,
+        "attempts foreign key replaced by a deferrable carrier",
+        "ALTER TABLE object_store_retention.object_dispatch_attempts
+           DROP CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey;
+         ALTER TABLE object_store_retention.object_dispatch_attempts
+           ADD CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey
+           FOREIGN KEY (provider_boundary_id, dispatcher_id, dispatcher_lease_generation)
+           REFERENCES object_store_retention.object_dispatch_dispatchers
+             (provider_boundary_id, dispatcher_id, lease_generation)
+           DEFERRABLE INITIALLY IMMEDIATE;",
+        "ALTER TABLE object_store_retention.object_dispatch_attempts
+           DROP CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey;
+         ALTER TABLE object_store_retention.object_dispatch_attempts
+           ADD CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey
+           FOREIGN KEY (provider_boundary_id, dispatcher_id, dispatcher_lease_generation)
+           REFERENCES object_store_retention.object_dispatch_dispatchers
+             (provider_boundary_id, dispatcher_id, lease_generation)
+           NOT DEFERRABLE;",
+    )
+    .await;
+
+    assert_drift_fails_closed_then_restores(
+        &client,
+        "attempts foreign key replaced by an unvalidated carrier",
+        "ALTER TABLE object_store_retention.object_dispatch_attempts
+           DROP CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey;
+         ALTER TABLE object_store_retention.object_dispatch_attempts
+           ADD CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey
+           FOREIGN KEY (provider_boundary_id, dispatcher_id, dispatcher_lease_generation)
+           REFERENCES object_store_retention.object_dispatch_dispatchers
+             (provider_boundary_id, dispatcher_id, lease_generation)
+           NOT DEFERRABLE NOT VALID;",
+        "ALTER TABLE object_store_retention.object_dispatch_attempts
+           DROP CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey;
+         ALTER TABLE object_store_retention.object_dispatch_attempts
+           ADD CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey
+           FOREIGN KEY (provider_boundary_id, dispatcher_id, dispatcher_lease_generation)
+           REFERENCES object_store_retention.object_dispatch_dispatchers
+             (provider_boundary_id, dispatcher_id, lease_generation)
+           NOT DEFERRABLE;",
+    )
+    .await;
+
+    assert_drift_fails_closed_then_restores(
+        &client,
+        "exact target columns carried from the wrong source relation",
+        "ALTER TABLE object_store_retention.object_dispatch_attempts
+           DROP CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey;
+         CREATE TABLE object_store_retention.drift_dispatch_attempt_source (
+           provider_boundary_id text NOT NULL,
+           dispatcher_id text NOT NULL,
+           dispatcher_lease_generation object_store_retention.uint64 NOT NULL
+         );
+         ALTER TABLE object_store_retention.drift_dispatch_attempt_source
+           ADD CONSTRAINT drift_wrong_source_fkey
+           FOREIGN KEY (provider_boundary_id, dispatcher_id, dispatcher_lease_generation)
+           REFERENCES object_store_retention.object_dispatch_dispatchers
+             (provider_boundary_id, dispatcher_id, lease_generation)
+           NOT DEFERRABLE;",
+        "DROP TABLE object_store_retention.drift_dispatch_attempt_source;
+         ALTER TABLE object_store_retention.object_dispatch_attempts
+           ADD CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey
+           FOREIGN KEY (provider_boundary_id, dispatcher_id, dispatcher_lease_generation)
+           REFERENCES object_store_retention.object_dispatch_dispatchers
+             (provider_boundary_id, dispatcher_id, lease_generation)
+           NOT DEFERRABLE;",
+    )
+    .await;
+
+    assert_drift_fails_closed_then_restores(
+        &client,
+        "exact source columns carried to the wrong target relation",
+        "ALTER TABLE object_store_retention.object_dispatch_attempts
+           DROP CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey;
+         CREATE TABLE object_store_retention.drift_dispatcher_target (
+           provider_boundary_id text NOT NULL,
+           dispatcher_id text NOT NULL,
+           lease_generation object_store_retention.uint64 NOT NULL,
+           UNIQUE (provider_boundary_id, dispatcher_id, lease_generation)
+         );
+         ALTER TABLE object_store_retention.object_dispatch_attempts
+           ADD CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey
+           FOREIGN KEY (provider_boundary_id, dispatcher_id, dispatcher_lease_generation)
+           REFERENCES object_store_retention.drift_dispatcher_target
+             (provider_boundary_id, dispatcher_id, lease_generation)
+           NOT DEFERRABLE;",
+        "ALTER TABLE object_store_retention.object_dispatch_attempts
+           DROP CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey;
+         DROP TABLE object_store_retention.drift_dispatcher_target;
+         ALTER TABLE object_store_retention.object_dispatch_attempts
+           ADD CONSTRAINT object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey
+           FOREIGN KEY (provider_boundary_id, dispatcher_id, dispatcher_lease_generation)
+           REFERENCES object_store_retention.object_dispatch_dispatchers
+             (provider_boundary_id, dispatcher_id, lease_generation)
+           NOT DEFERRABLE;",
+    )
+    .await;
+
+    let exact_fk = client
+        .query_one(
+            "SELECT constraint_state.conrelid::regclass::text,
+                    constraint_state.confrelid::regclass::text,
+                    constraint_state.convalidated,
+                    constraint_state.condeferrable,
+                    constraint_state.condeferred,
+                    (SELECT pg_catalog.string_agg(attribute.attname::text, ',' ORDER BY key.ordinal)
+                       FROM pg_catalog.unnest(constraint_state.conkey)
+                            WITH ORDINALITY AS key(attnum, ordinal)
+                       JOIN pg_catalog.pg_attribute AS attribute
+                         ON attribute.attrelid = constraint_state.conrelid
+                        AND attribute.attnum = key.attnum),
+                    (SELECT pg_catalog.string_agg(attribute.attname::text, ',' ORDER BY key.ordinal)
+                       FROM pg_catalog.unnest(constraint_state.confkey)
+                            WITH ORDINALITY AS key(attnum, ordinal)
+                       JOIN pg_catalog.pg_attribute AS attribute
+                         ON attribute.attrelid = constraint_state.confrelid
+                        AND attribute.attnum = key.attnum)
+               FROM pg_catalog.pg_constraint AS constraint_state
+              WHERE constraint_state.conname =
+                    'object_dispatch_attempts_provider_boundary_id_dispatcher_i_fkey'",
+            &[],
+        )
+        .await
+        .expect("read restored exact attempts foreign-key carrier");
+    assert_eq!(
+        exact_fk.get::<_, String>(0),
+        "object_store_retention.object_dispatch_attempts"
+    );
+    assert_eq!(
+        exact_fk.get::<_, String>(1),
+        "object_store_retention.object_dispatch_dispatchers"
+    );
+    assert!(exact_fk.get::<_, bool>(2));
+    assert!(!exact_fk.get::<_, bool>(3));
+    assert!(!exact_fk.get::<_, bool>(4));
+    assert_eq!(
+        exact_fk.get::<_, String>(5),
+        "provider_boundary_id,dispatcher_id,dispatcher_lease_generation"
+    );
+    assert_eq!(
+        exact_fk.get::<_, String>(6),
+        "provider_boundary_id,dispatcher_id,lease_generation"
+    );
 }

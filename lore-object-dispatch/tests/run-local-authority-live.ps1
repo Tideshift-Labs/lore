@@ -10,7 +10,7 @@ tests in lore-object-dispatch by exact name, reporting pass/fail/NOT RUN distinc
 WP-114 CD-2: the local-authority live tests are `#[ignore]` fixtures gated on per-test
 `LORE_TEST_LOCAL_*_PG_URL` environment variables with no provisioning script before this file
 existed. WP-114 CD-3 added the two `local_authority_dispatcher_identity_*` tests (schema and
-provisioning) for the per-participant dispatcher-identity edge (0018, 0019; CR-033 D8), bringing
+provisioning) for the per-participant dispatcher-identity edge (0018-0020; CR-033 D8), bringing
 the total from nine to eleven. This runner:
 
   1. Cross-checks its own eleven-entry name/target/env-var map against
@@ -43,7 +43,7 @@ the total from nine to eleven. This runner:
      guard, which is convergent and is state every test wants anyway. One container per test was
      not needed.
   5. Creates twelve databases: one per live test, plus `local_install_chain_proof`.
-  6. Installs the CD-1 cell install set (0002, 0003, then 0007 through 0019, in that exact
+  6. Installs the CD-1 cell install set (0002, 0003, then 0007 through 0020, in that exact
      order, resolved by numeric prefix) into `local_install_chain_proof` and asserts the CD-1
      "expected inert state": four of the five tables 0002 creates -- the ones inert while
      0004-0006 are uninstalled; the fifth, `object_dispatch_retention_schema_state`, is written by
@@ -68,15 +68,17 @@ the total from nine to eleven. This runner:
      WP-114 CD-3's 0019 adds the chain's one growth-tolerant readback
      (`object_store_dispatch_dispatcher_identity_read_state_v1`), which does have a live caller
      (`local_authority_dispatcher_identity_provisioning`'s own live test, which self-installs the
-     full 0002, 0003, 0007-0019 chain plus all four layer installs into its own dedicated
-     database) and is the only authority procedure the runtime role may call.
+     full 0002, 0003, 0007-0020 chain plus all four layer installs into its own dedicated
+     database). Migration 0020 narrows that readback to the runtime authority and adds
+     maintenance-only participant pre-enrollment plus runtime registration, canonical-record
+     projection, concurrent-generation races, and exact foreign-key drift to the same live case.
      Separately (also grep-verified): `local_authority_put_spool_ready_mutation.rs` self-installs
      0002, 0003 and 0007 through 0017 -- the chain its own subject needs, which since CD-3 is a
      proper prefix of the install set rather than the whole of it, and
      `local_authority_dispatcher_identity_schema`'s own live test self-installs only 0002, 0007,
      and 0018 -- the minimal chain needed to exercise D8's per-participant ACTIVE-uniqueness index
      and the retained attempts foreign key without the 0019 readback. Only this step's
-     (`local_install_chain_proof`) database receives 0018 and 0019 and the inert-state assertion.
+     (`local_install_chain_proof`) database receives 0018-0020 and the inert-state assertion.
   7. Pre-installs migrations 0002 and 0009 (only) into the `local_codec` database, matching
      `local_authority_canonical_codec.rs`'s own stated requirement -- it is the one live test
      that does not self-provision its schema. The other ten tests self-provision their roles
@@ -192,7 +194,7 @@ $databaseNames = @($tests | ForEach-Object { $_.Database }) + @($installChainPro
 
 # CR-033 D5's cell install set, shared with the classification check below so the two cannot
 # drift apart.
-$cd1InstallSetNumbers = @(2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)
+$cd1InstallSetNumbers = @(2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)
 $cd1KnownDeferredNumbers = @(4, 5, 6)
 
 $environmentNames = @($tests | ForEach-Object { $_.EnvVar })
@@ -539,7 +541,7 @@ $$;
         )
     }
 
-    Write-Host "Installing the CD-1 cell install set (0002, 0003, 0007-0019) into $installChainProofDatabase..."
+    Write-Host "Installing the CD-1 cell install set (0002, 0003, 0007-0020) into $installChainProofDatabase..."
     foreach ($number in $cd1InstallSetNumbers) {
         Install-MigrationToDatabase -DatabaseName $installChainProofDatabase -Path (Resolve-MigrationPath -Number $number)
     }
@@ -574,7 +576,7 @@ WHERE n.nspname = 'object_store_retention'
     if ($deferredProcedureCount -ne '0') {
         throw "expected zero installed 0004-0006 procedures, found $deferredProcedureCount"
     }
-    Write-Host "Install-chain proof: 0002, 0003, 0007-0019 installed cleanly; 4 of the 5 tables" `
+    Write-Host "Install-chain proof: 0002, 0003, 0007-0020 installed cleanly; 4 of the 5 tables" `
         "0002 creates are present-but-inert; 0 deferred 0004-0006 procedures are installed."
 
     Write-Host "Pre-installing 0002 and 0009 into $($tests[0].Database) for the canonical-codec live test..."

@@ -13,6 +13,10 @@ opaque validated artifact, then rechecks descriptor, preimage, digest, and field
 returning first-seen, replay, or identity-reuse conflict. The cross-language golden is 401 bytes:
 `a06dcf15928a3df8bd6db6b38980492e235460fb667f4be84cbd078b7e20e903`.
 
+Superseded 2026-08-31 by CR-033 D3's cell-local budget-pin amendment: the current replay preimage is
+377 bytes and its cross-language BLAKE3-256 is
+`9e991435c9affbe204574ddb57eef288a3b0f512fe87b8e99b01e0912bb5bd28`.
+
 The gate passed 61 library, 15 continuity, 25 request, 14 `service_mtls`, and 17 `service_shell`
 tests; five live tests were ignored. Four exact proto tests, warnings-denied all-target Clippy,
 nightly fmt, and diff checks passed.

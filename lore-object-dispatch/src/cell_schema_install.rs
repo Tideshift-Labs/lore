@@ -4,9 +4,10 @@
 //! Out-of-band cell authority schema installer and attester (WP-114 CD-1).
 //!
 //! This module is the production install path for CR-033 D5's cell install set: migrations 0002,
-//! 0003, then 0007 through 0019. Retention migrations 0004 through 0006 are deferred and are never
-//! installed; migration 0001 does not exist. 0018 and 0019 are WP-114 CD-3's addition (CR-033 D8's
-//! per-participant dispatcher identity, and its provisioning/readback).
+//! 0003, then 0007 through 0020. Retention migrations 0004 through 0006 are deferred and are never
+//! installed; migration 0001 does not exist. 0018 through 0020 are WP-114 CD-3's addition (CR-033
+//! D8's per-participant dispatcher identity, provisioning/readback, and database-owned monotonic
+//! registration).
 //!
 //! Six properties this module owns, and nothing else in the crate does:
 //!
@@ -122,7 +123,7 @@ macro_rules! cell_migration {
 }
 
 /// CR-033 D5's cell install set, in install order.
-pub const CELL_INSTALL_SET: [CellMigration; 15] = [
+pub const CELL_INSTALL_SET: [CellMigration; 16] = [
     cell_migration!(
         2,
         "0002_object_store_retention_authority.sql",
@@ -197,6 +198,11 @@ pub const CELL_INSTALL_SET: [CellMigration; 15] = [
         19,
         "0019_object_store_dispatch_dispatcher_identity_provisioning.sql",
         "fd0aa946118010222eed883ab9bc68fa09fd3a3fbb0eb2d1e21e1904bd9c213e"
+    ),
+    cell_migration!(
+        20,
+        "0020_object_store_dispatch_dispatcher_registration.sql",
+        "aede4135d081a9adbec51cd41141faea81eb3b25860ab9d1968073a230aa78e9"
     ),
 ];
 
@@ -379,12 +385,12 @@ pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 4] = [
         contract_migration: 18,
         install_function: "object_store_dispatch_dispatcher_identity_install_v1",
         read_state_function: "object_store_dispatch_dispatcher_identity_read_state_v1",
-        // Not retired, and by design rather than by luck: 0019's readback asserts only the objects
-        // it names, so a later migration adding functions or tables cannot invalidate it. That is
-        // the whole difference between it and the two dispatch-layer readbacks above, which manifest
-        // the entire schema from inside the schema and therefore retire on their own successors.
-        read_state_retired_after: None,
-        read_state_retired_sqlstate: None,
+        // 0020 keeps the readback valid and runtime-reachable, but narrows it from the migrator and
+        // maintenance roles because neither consumes this readiness signal. The out-of-band
+        // attester connects as migrator, so from this module's perspective 42501 is the exact
+        // expected retirement mode. Runtime calls remain the readback's intended live use.
+        read_state_retired_after: Some(20),
+        read_state_retired_sqlstate: Some("42501"),
         install_retired_after: None,
         identity_columns: [
             "dispatcher_identity_schema_revision",
@@ -429,7 +435,7 @@ const RESERVED_PUT_PROJECTION_ARGUMENTS: &str =
     "object_store_retention.object_dispatch_spool_objects, text";
 
 /// Every `CREATE OR REPLACE FUNCTION` in the install set whose target already existed.
-pub const CELL_REPLACED_FUNCTIONS: [ReplacedFunction; 3] = [
+pub const CELL_REPLACED_FUNCTIONS: [ReplacedFunction; 5] = [
     ReplacedFunction {
         name: "local_put_reservation_record_v1",
         argument_types: PUT_RESERVATION_RECORD_V1_ARGUMENTS,
@@ -450,6 +456,18 @@ pub const CELL_REPLACED_FUNCTIONS: [ReplacedFunction; 3] = [
         argument_types: RESERVED_PUT_PROJECTION_ARGUMENTS,
         introduced_by: 13,
         replaced_by: 16,
+    },
+    ReplacedFunction {
+        name: "assert_dispatch_dispatcher_identity_reader_v1",
+        argument_types: "",
+        introduced_by: 19,
+        replaced_by: 20,
+    },
+    ReplacedFunction {
+        name: "assert_dispatch_dispatcher_identity_objects_v1",
+        argument_types: "",
+        introduced_by: 19,
+        replaced_by: 20,
     },
 ];
 
@@ -483,7 +501,7 @@ pub enum CellInstallStep {
     InstallLayer(usize),
 }
 
-/// The exact ordered install plan: thirteen DDL steps with the three layer installs interleaved.
+/// The exact ordered install plan: sixteen DDL steps with the four layer installs interleaved.
 ///
 /// Ordering is load-bearing. 0011 retires 0008's install entrypoint, so the authority layer must be
 /// installed while migration 0011 has not yet been applied.
@@ -782,6 +800,12 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
 /// `relations` with 0018's replica-identity choice; `indexes` and `constraints` stay still, because
 /// no index or constraint is added.
 ///
+/// Re-measured for INV-EM migration 0020, then independently measured again before the live gate.
+/// Eight sections moved: the participant registry changes relations, columns, constraints and
+/// indexes; its composite result changes types; the mutation and replaced assertions change
+/// functions and function ACLs; and the new relation changes relation ACLs. `schema`,
+/// `default_acls`, `triggers`, and `rules_and_policies` stayed unchanged, as the migration requires.
+///
 /// One limit of this pin is worth stating where the pin lives, because a second review pass found
 /// it: `relations` carries `relreplident`, which is one letter and does not name *which* index the
 /// `'i'` refers to, and the `indexes` section does not carry `indisreplident`. So the manifest
@@ -792,14 +816,14 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
 /// present and to carry the replica identity.
 pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
     hex32("f468de7d148f5335b52a10c4298d609be546801754da1d991ff0ac7e7c0da0ca"),
-    hex32("5e01c7cd66a23346d17b156fc891ddacb3eab076ab6825859a3372ed2173cca1"),
-    hex32("14879db8f573eb8670a391b7e786acfa4331c43f03bc2807497e95f00aa565a9"),
-    hex32("95078ccb57b724114f162a6c4a410195601a16a48042b3a2f5d0a0b8df4dd2ae"),
-    hex32("fe4e7104687d714c8ac084dca11fcd9d0131f03608649e295309004758a62923"),
-    hex32("925f3c6fced9ba0b390b1bdb20293aa84c35f5ded074832e9dcbc2c2adbf4a78"),
-    hex32("b7e565c9ddfcbdd99eca7e41680ea19334222cccd5e0baf7d013c34089f31c33"),
-    hex32("946c88196f476aa6817695043f4fea8b754e38e97b3c21272d9a087d869d12ce"),
-    hex32("cb220f3aef0f0bfb93996548ff1951f59374ce24b980d75f0beb6189a559a38a"),
+    hex32("ed934ecff7e094a35c8534ff5afd5a30a2291e6aa35e6dbd740cf7c03acd7642"),
+    hex32("5df5588a5e2c4f031d54d69e95f42c93b61f869c734efef35eb58f25746fa2f2"),
+    hex32("80ba27988cfdc0204166271a69ea3e929162329d43c89e68eda98a6e074a1a68"),
+    hex32("df90214e35d34ff2d34d2e3b53156b1866091364f9ffa8f1e237eebe6f1e80b2"),
+    hex32("2896f4ec9606fdef75a75010200db1f7a20ca5fce4202edb6eba621239085f5b"),
+    hex32("211a78b03b5d9d64ed5c5f983dc9ac976a78a41db844b749646810ef3d16cc35"),
+    hex32("cc505eaae899f99f5ce19186e80bd2a3a60abf739185c51cc95b42cbbaa028f4"),
+    hex32("0a74ddc8c28330de85f5228734329a2283c1426cc46d4917a760ef5576e484df"),
     hex32("971ec53fc27466c873c783701757e1434c20b383d23f081d918a2d6e4c797971"),
     hex32("b5f633ebe7a54a9d43e75d043387b67cc659395fa8f0880a5c0d869a2b90fe81"),
     hex32("444e1ca598f3a2dbe3601fdb803e2479f21b3b22fe4713d50f9a0e47fd7b73b2"),
@@ -811,7 +835,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
 /// whose exact rendering is a server-version property. A different major version is expected to
 /// fail closed here and needs a re-measured pin, not a relaxed check.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_V1: [u8; 32] =
-    hex32("26a00924eeae83a07c04844ea28f58ea62af250555ebd9baecef1f67fa3212ef");
+    hex32("d28c4672e8b85fa021718a0c8c90ac5fdd5e0452f88542b3c0a97ca6d01b3264");
 
 /// Const hex decoder for the pinned digests above.
 const fn hex32(text: &str) -> [u8; 32] {

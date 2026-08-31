@@ -165,12 +165,13 @@ will update an older check constraint or state schema.
   the drain matrix rejects any head evolution unless its revision delta exactly equals the open-lease
   decrement and its commit time is not older than the reservation. This remains pure `[SERVER]`
   source with no loreserver composition, provider traffic, credentials, or deployment authority.
-  The nine `local_authority_*` live tests (the retained cell-authority half; CR-033 D5's install
-  set is 0002, 0003, then 0007-0017) have a checked-in provisioning harness:
+  The eleven `local_authority_*` live tests (the retained cell-authority half; CR-033 D5's install
+  set was 15 artifacts through 0019 and is 16 through the INV-EM fix migration 0020) have a
+  checked-in provisioning harness:
   `lore-object-dispatch/tests/run-local-authority-live.ps1`. Unlike the retention-client live
   tier, these tests call `tokio_postgres::connect` with `NoTls` -- no certificates, no
   `pg_hba.conf`, no `ssl=on`; the container runs with `POSTGRES_HOST_AUTH_METHOD=trust` and plain
-  `postgresql://postgres@...` URLs. Eight of the nine self-provision: each idempotently creates
+  `postgresql://postgres@...` URLs. Ten of the eleven self-provision: each idempotently creates
   the four `object_dispatch_retention_*` roles itself and installs its own required migration
   subset from its own `include_str!`'d copy of the migration file, so the harness only needs to
   hand each an empty fresh database. The one exception is `local_authority_canonical_codec.rs`'s
@@ -179,14 +180,14 @@ will update an older check constraint or state schema.
   migrations 0002 and 0009 installed") -- the harness must pre-install precisely that pair, not
   the full chain, matching what the test's calls actually touch (0009's codec functions need only
   0002's schema/roles, not 0007/0008's dispatch tables). The harness also runs the full CD-1
-  install set (0002, 0003, 0007-0017) once into its own dedicated database as first executed
+  install set (0002, 0003, 0007-0020) once into its own dedicated database as first executed
   proof the post-deletion chain installs cleanly, and cheaply asserts CD-1's documented inert
   state: four of the five tables 0002 creates (the ones inert while 0004-0006 are uninstalled;
   the fifth, `object_dispatch_retention_schema_state`, is written by 0003's install procedure)
   exist, and none of 0004-0006's mutation/readback procedures (which nothing installed can call)
   are present. Run:
   `pwsh -File lore-object-dispatch/tests/run-local-authority-live.ps1` (add `-KeepOnFailure` to
-  leave the labelled container up for debugging). All nine tests stay `#[ignore]`; the harness
+  leave the labelled container up for debugging). All eleven tests stay `#[ignore]`; the harness
   opts them in explicitly with `--ignored --exact <name>`, it does not un-ignore them, so the
   crate's baseline `cargo test -p lore-object-dispatch` ignored count is unchanged by this run
   (don't hardcode a count here — it drifts; list it fresh with `-- --list --ignored`).
@@ -195,10 +196,10 @@ will update an older check constraint or state schema.
   offline-only suite, `tests/cell_schema_install.rs` — no Postgres, no `#[ignore]`. It re-reads
   `migrations/*.sql` from disk independently of the module's own `include_str!` copies (so a
   frozen-bytes claim is checked against ground truth, not against itself), and pins: the exact
-  13-migration install set against the on-disk directory (a future migration must be classified
-  installed-or-deferred or the test fails); the interleaved 16-step install plan; each schema
+  16-artifact install set against the on-disk directory (a future migration must be classified
+  installed-or-deferred or the test fails); the interleaved 20-step install plan; each schema
   layer's install/read_state function names, revisions, and digest against the migration that
-  creates them; the 3-entry `CREATE OR REPLACE FUNCTION` replacement inventory across 0012-0017
+  creates them; the 5-entry `CREATE OR REPLACE FUNCTION` replacement inventory across 0012-0020
   (scanned by text, not hand-enumerated, so an unpinned replace/one dropped from the pinned list
   both fail); and a `local_authority_put_reservation_provisioning.rs`-style "runtime source never
   calls the install entrypoints" guard extended to the new bin target. Gate:

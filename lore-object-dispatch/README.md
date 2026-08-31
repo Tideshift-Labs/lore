@@ -32,8 +32,8 @@ drift guard over the surviving proto source in the same commit as any further pr
 ## Embedded migration
 
 The cell install set is migrations 0002 and 0003 (`retention_schema`/`retention_provisioning`, the
-verified install prerequisites for the chain below) plus 0007 through 0019 (`local_authority_*`),
-fifteen artifacts in total. Migrations 0004 through 0006
+verified install prerequisites for the chain below) plus 0007 through 0020 (`local_authority_*`),
+sixteen artifacts in total. Migrations 0004 through 0006
 (`retention_readback`/`retention_mutations`/`retention_prune_receipts`)
 are deferred and not installed, alongside the pure compact-receipt, full-to-compact, and
 compact-prune planners in `compaction.rs`, `full_to_compact.rs`, and `compact_prune.rs`: correct,
@@ -168,7 +168,7 @@ embeds the exact 25,375-byte source-dark provisioning/readback migration for 001
 (migration 0019). Its BLAKE3-256 is
 `fd0aa946118010222eed883ab9bc68fa09fd3a3fbb0eb2d1e21e1904bd9c213e`. It carries the cell's fourth
 schema layer, `CellSchemaLayerId::DispatcherIdentity`, and
-`object_store_dispatch_dispatcher_identity_read_state_v1` — the only authority procedure the
+`object_store_dispatch_dispatcher_identity_read_state_v1` — the first authority readback the
 `object_dispatch_retention_runtime` role may call; every other readback in the chain is gated on
 `assert_retention_reader_v1` (migrator and maintenance only) and the Rust attester is migrator-only,
 so before this a replica had no readiness signal at all. Unlike the two dispatch-layer readbacks
@@ -181,6 +181,23 @@ tuple; it does not manifest the catalog and does not count rows, and must not be
 catalog has not drifted — catalog integrity stays with the out-of-band attester. Runtime code
 neither installs nor calls this artifact directly; the dispatch-runtime pool that will call it is
 CD-3's remaining obligation.
+
+`local_authority_dispatcher_registration::LOCAL_AUTHORITY_DISPATCHER_REGISTRATION_MIGRATION_V1`
+embeds the exact 29,189-byte source-dark INV-EM fix migration (migration 0020). Its BLAKE3-256 is
+`aede4135d081a9adbec51cd41141faea81eb3b25860ab9d1968073a230aa78e9`. It adds the durable
+`object_dispatch_dispatcher_participants` registry keyed by provider boundary and restart-stable
+`dispatcher_id`, plus a maintenance-only enrollment procedure and
+`object_store_dispatch_register_dispatcher_v1`. Enrollment commits a random participant key by
+BLAKE3. The runtime-only procedure requires proof of that key and a serializable read-write
+transaction, locks the enrolled participant row and retained generation chain, returns an exact
+active-row replay, and otherwise requires
+`next_generation > max(lease_generation)` before inserting a new ACTIVE row. A per-boot
+`service_instance_id` or caller-chosen `dispatcher_id` cannot start a new chain. PostgreSQL builds
+the canonical dispatcher record from the inserted fields and verifies the same projection on every
+result. The same migration preserves 0019's public readback signature while narrowing it to its
+only consumer, runtime, and extending its object assertion to pin the exact validated,
+nondeferrable attempts foreign key. The future typed CD-3 client must use both procedures and keep
+the enrolled participant key across restarts; no typed client or runtime pool is wired yet.
 
 ## Shared spool verifier
 
@@ -299,10 +316,10 @@ never echoed, including on failure. Exit codes: `0` success, `1` refused or drif
 
 What `install` does, and what it refuses:
 
-- a database with no `object_store_retention` schema runs the full plan: the fifteen frozen artifacts
+- a database with no `object_store_retention` schema runs the full plan: the sixteen frozen artifacts
   in order, with the retention, authority, put-reservation and dispatcher-identity install
   procedures called at their exact points in the chain (0011 retires 0008's install entrypoint, so
-  the authority layer must be installed before 0011 is applied; 0019 installs last, after 0018);
+  the authority layer must be installed before 0011 is applied; 0020 installs last, after 0019);
 - a database that already carries the schema is **never re-migrated**. It is attested first, and the
   run is refused unless every layer already attests. Forward migrations are one-shot, so resuming a
   half-installed chain blind is how a recoverable cell becomes an unrecoverable one;
@@ -342,8 +359,9 @@ Three consequences worth knowing before reading a failure:
   because only an unfiltered manifest can detect an added object, and 0019 adds the complement
   instead — a growth-tolerant readback that asserts only the objects it names. Unlike the two
   dispatch-layer readbacks above, it survives every later migration in this chain rather than being
-  invalidated by one, and it is the one authority procedure `object_dispatch_retention_runtime` may
-  call at all.
+  invalidated by one. Migration 0020 keeps its name and result shape, adds the exact attempts-FK
+  assertion through the internal helper, and narrows the public readback to runtime because no
+  maintenance consumer exists.
 
 The pinned manifest is a **PostgreSQL 16** pin: it carries `pg_get_functiondef` and
 `pg_get_indexdef` output, whose exact rendering is a server-version property. A different major

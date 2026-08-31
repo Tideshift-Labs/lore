@@ -40,8 +40,8 @@ use lore_object_dispatch::cell_schema_install::validate_cell_install_set_digests
 // guard, and a source-dark check).
 // ---------------------------------------------------------------------------------------------
 
-const CELL_INSTALLED_MIGRATION_NUMBERS: [u16; 15] =
-    [2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+const CELL_INSTALLED_MIGRATION_NUMBERS: [u16; 16] =
+    [2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
 
 fn migrations_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations")
@@ -201,7 +201,7 @@ fn embedded_bytes_are_the_frozen_bytes() {
 #[test]
 fn plan_interleaves_layer_installs_immediately_after_their_ddl_step() {
     let plan = cell_install_plan();
-    assert_eq!(plan.len(), 19);
+    assert_eq!(plan.len(), 20);
 
     let ddl_indices: Vec<usize> = plan
         .iter()
@@ -307,9 +307,9 @@ fn layer_contract_matches_the_frozen_sql() {
             schema_revision: "object-store-dispatch-dispatcher-identity-schema-v1",
             install_function: "object_store_dispatch_dispatcher_identity_install_v1",
             read_state_function: "object_store_dispatch_dispatcher_identity_read_state_v1",
-            // Not retired: 0019's readback asserts only the objects it names, so a later migration
-            // cannot invalidate it the way 0012 invalidates 0011's whole-schema manifest.
-            read_state_retired_after: None,
+            // 0020 keeps the readback body but narrows EXECUTE to the runtime role. The out-of-band
+            // migrator therefore attests this layer from the identity tuple and live catalog.
+            read_state_retired_after: Some(20),
             installed_after_migration: 19,
             migration_blake3_hex: "a7d54d94d0fa5035872eb9b3426cbbe6471bcf9ae34ed41877542f050e1aaad9",
         },
@@ -435,6 +435,14 @@ fn retirement_claims_are_grounded_in_the_sql() {
         "0012 must add at least one new function to the schema 0011's readback would then see"
     );
 
+    let migration_0020 = CELL_INSTALL_SET
+        .iter()
+        .find(|migration| migration.number == 20)
+        .expect("migration 0020 in CELL_INSTALL_SET");
+    assert!(migration_0020.sql.contains(
+        "REVOKE ALL ON FUNCTION\n  object_store_retention.object_store_dispatch_dispatcher_identity_read_state_v1(text)\nFROM object_dispatch_retention_migrator, object_dispatch_retention_maintenance;"
+    ));
+
     // NOTE: the live consequence -- that 0011's readback therefore cannot attest a
     // fully-installed chain once 0012+ has landed -- is proved by the main session's live tier,
     // not by this offline test.
@@ -446,11 +454,11 @@ fn retirement_claims_are_grounded_in_the_sql() {
 
 #[test]
 fn replacement_inventory_is_complete() {
-    assert_eq!(CELL_REPLACED_FUNCTIONS.len(), 3);
+    assert_eq!(CELL_REPLACED_FUNCTIONS.len(), 5);
 
     let scan_migrations: Vec<_> = CELL_INSTALL_SET
         .iter()
-        .filter(|migration| (12..=17).contains(&migration.number))
+        .filter(|migration| (12..=20).contains(&migration.number))
         .collect();
 
     let needle = "CREATE OR REPLACE FUNCTION object_store_retention.";
@@ -461,7 +469,7 @@ fn replacement_inventory_is_complete() {
     assert_eq!(
         total_occurrences,
         CELL_REPLACED_FUNCTIONS.len(),
-        "every CREATE OR REPLACE FUNCTION in 0012-0017 must have exactly one CELL_REPLACED_FUNCTIONS entry"
+        "every CREATE OR REPLACE FUNCTION in 0012-0020 must have exactly one CELL_REPLACED_FUNCTIONS entry"
     );
 
     for replaced in &CELL_REPLACED_FUNCTIONS {
@@ -522,35 +530,41 @@ fn replacement_inventory_is_complete() {
             "project_dispatch_reserved_put_v1" => {
                 "object_store_retention.object_dispatch_spool_objects, text"
             }
+            "assert_dispatch_dispatcher_identity_reader_v1"
+            | "assert_dispatch_dispatcher_identity_objects_v1" => "",
             other => panic!("unexpected CELL_REPLACED_FUNCTIONS name in test fixture: {other}"),
         };
         assert_eq!(replaced.argument_types, expected_identity_arguments);
 
-        let revoke_signature = format!(
-            "REVOKE ALL ON FUNCTION object_store_retention.{}(",
-            replaced.name
-        );
-        let revoke_start = replacing_migration
+        let revoke_needle = format!("object_store_retention.{}(", replaced.name);
+        let revoke_statement = replacing_migration
             .sql
-            .find(&revoke_signature)
+            .split(';')
+            .find(|statement| {
+                statement.contains("REVOKE ALL ON FUNCTION") && statement.contains(&revoke_needle)
+            })
             .unwrap_or_else(|| {
                 panic!(
                     "migration {} missing REVOKE ALL for replaced function {}",
                     replaced.replaced_by, replaced.name
                 )
             });
-        let revoke_end = replacing_migration.sql[revoke_start..]
-            .find(';')
-            .map(|offset| revoke_start + offset)
-            .expect("REVOKE statement must terminate with a semicolon");
-        let revoke_statement = &replacing_migration.sql[revoke_start..=revoke_end];
-        for role in CELL_SERVICE_ROLES {
+        if replaced.replaced_by == 20 {
             assert!(
-                revoke_statement.contains(role),
-                "REVOKE ALL ON FUNCTION {} in migration {} does not name role {role}",
+                revoke_statement.contains("FROM PUBLIC"),
+                "REVOKE ALL ON FUNCTION {} in migration {} must remove inherited PUBLIC execute",
                 replaced.name,
                 replaced.replaced_by
             );
+        } else {
+            for role in CELL_SERVICE_ROLES {
+                assert!(
+                    revoke_statement.contains(role),
+                    "REVOKE ALL ON FUNCTION {} in migration {} does not name role {role}",
+                    replaced.name,
+                    replaced.replaced_by
+                );
+            }
         }
     }
 

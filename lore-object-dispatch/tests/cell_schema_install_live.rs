@@ -146,7 +146,8 @@ async fn live_postgres_cell_schema_installs_clean_and_attests() {
     // the first half of WP-114 CD-1's caveat N2.
     assert_eq!(report.attestation.retention_read_state_result, "READ");
 
-    // Both dispatch-layer readbacks are retired at full chain depth, for two different reasons:
+    // All three dispatch-layer readbacks are retired to the out-of-band migrator at full chain
+    // depth, for two different reasons:
     // 0011 revokes the authority entrypoint (42501), and 0011's whole-schema catalog manifest no
     // longer matches once 0012-0017 add functions (55000). This is the executed proof of that
     // consequence; the offline suite can only observe the SQL that causes it. The exact code per
@@ -154,15 +155,19 @@ async fn live_postgres_cell_schema_installs_clean_and_attests() {
     // accepting either code for either layer would leave that distinction unproven.
     assert_eq!(
         report.attestation.retired_readbacks,
-        vec![("authority", "42501"), ("put_reservation", "55000")]
+        vec![
+            ("authority", "42501"),
+            ("put_reservation", "55000"),
+            ("dispatcher_identity", "42501")
+        ]
     );
-    assert_eq!(report.attestation.replaced_functions_revoked, 2);
+    assert_eq!(report.attestation.replaced_functions_revoked, 4);
     assert_eq!(report.attestation.inert_tables_present, 4);
 
-    // The install set is 15 artifacts; nothing outside it may have been applied. WP-114 CD-3 added
-    // 0018 and 0019 (CR-033 D8's per-participant dispatcher identity, and its provisioning and
-    // growth-tolerant readback).
-    assert_eq!(CELL_INSTALL_SET.len(), 15);
+    // The install set is 16 artifacts; nothing outside it may have been applied. WP-114 CD-3 added
+    // 0018 through 0020 (CR-033 D8's per-participant identity, provisioning/readback, and the
+    // runtime-only monotonic registration fence).
+    assert_eq!(CELL_INSTALL_SET.len(), 16);
 
     // An installed cell holds ZERO `pg_default_acl` rows, cluster-wide. Measured, not assumed, and
     // it is not what reading 0002 suggests: 0002:12-17 issues three `ALTER DEFAULT PRIVILEGES ...
@@ -590,7 +595,7 @@ async fn live_postgres_cell_schema_revokes_service_privileges_after_replacement(
     let installed = install_cell_schema(&cell.client)
         .await
         .expect("clean install");
-    assert_eq!(installed.attestation.replaced_functions_revoked, 2);
+    assert_eq!(installed.attestation.replaced_functions_revoked, 4);
 
     // `CREATE OR REPLACE FUNCTION` is not an ACL reset, so a privilege granted to a replaced
     // function's earlier definition would survive silently. Grant one for real and prove the
@@ -613,7 +618,7 @@ async fn live_postgres_cell_schema_revokes_service_privileges_after_replacement(
     let revoked = revoke_replaced_function_privileges(&cell.client)
         .await
         .expect("explicit post-replacement revoke");
-    assert_eq!(revoked, 2, "two distinct replaced signatures");
+    assert_eq!(revoked, 4, "four distinct replaced signatures");
 
     let restored = attest_cell_schema(&cell.client)
         .await
@@ -622,7 +627,7 @@ async fn live_postgres_cell_schema_revokes_service_privileges_after_replacement(
         restored.catalog_blake3, installed.attestation.catalog_blake3,
         "the revoke must restore the exact pinned ACL state, not merely a passing one"
     );
-    assert_eq!(restored.replaced_functions_revoked, 2);
+    assert_eq!(restored.replaced_functions_revoked, 4);
 }
 
 /// Not a gate: installs a fresh chain and prints the live manifest digests so the pinned constants
