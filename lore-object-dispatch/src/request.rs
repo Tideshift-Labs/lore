@@ -335,8 +335,20 @@ pub fn fingerprint_object_store_request(
     writer.text(&request.authenticated_tenant_id)?;
     writer.text(&request.logical_request_id)?;
     writer.text(&request.attempt_id)?;
-    writer.text(&request.allocation_revision)?;
-    writer.u64(request.allocation_fence)?;
+    // The budget pin is deliberately absent from this preimage (CR-033 D3, amendment of
+    // 2026-08-28). `allocation_revision` and `allocation_fence` are re-bound to WP-121's per-cell
+    // frozen budget-configuration revision and its monotonic generation, so a routine rate retune
+    // rotates them. They remain a fail-closed *first-seen* check in
+    // `validate_expected_authority`, but writing them here would have made an exact retry across a
+    // retune fingerprint differently from the stored request and fail forever as an identity-reuse
+    // conflict — including a PUT whose body is already durably spooled in the pre-Submit unbound
+    // state, which cannot be re-driven under a fresh logical request id.
+    //
+    // Verified against the frozen SQL rather than assumed: 0013's ReservePut replay-conflict
+    // comparison (`0013_object_store_dispatch_reserve_put_mutation.sql:263-278`) compares
+    // `put_reservation_fingerprint` and thirteen identity fields, and does **not** compare
+    // `allocation_revision` or `allocation_fence`. So the stored row already tolerates a rotated
+    // pin, and this exclusion is what keeps the fingerprint it does compare stable across one.
     writer.text(&request.cell_admission_id)?;
     writer.u64(request.cell_admission_fence)?;
     writer.u64(request.deadline_unix_ms as u64)?;

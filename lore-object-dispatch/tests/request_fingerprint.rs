@@ -41,23 +41,28 @@ use lore_proto::lore::object_dispatch::v1::result_consumer_context_v1;
 const LOGICAL_ID: &str = "018f3e12-a456-7abc-8def-0123456789ab";
 const ATTEMPT_ID: &str = "018f3e12-a457-7abc-8def-0123456789ab";
 const SCOPE: &str = "urn:lore:object-dispatch:Ym91bmRhcnk:Y2VsbA:dGVuYW50:job:cHJpbmNpcGFs";
+// Repinned by WP-114 CD-3 for CR-033 D3's 2026-08-28 amendment: `allocation_revision` and
+// `allocation_fence` are no longer written into the replay preimage. The superseded pair was
+// digest a06dcf15…e903 over a 401-byte preimage; the 24 bytes that left are exactly
+// `text("allocation-1") || u64BE(7)` at offset 155, and nothing else moved. The paired TypeScript
+// vector in `lorehub/packages/control-plane/test/capacity/object-store-request-fingerprint.test.ts`
+// assembles the same bytes independently from primitives and pins the same digest.
 const GOLDEN_DIGEST: [u8; 32] = [
-    0xa0, 0x6d, 0xcf, 0x15, 0x92, 0x8a, 0x3d, 0xf8, 0xbd, 0x6d, 0xb6, 0xb3, 0x89, 0x80, 0x49, 0x2e,
-    0x23, 0x54, 0x60, 0xfb, 0x66, 0x7f, 0x4b, 0xe8, 0x4c, 0xbd, 0x07, 0x8b, 0x7e, 0x20, 0xe9, 0x03,
+    0x9e, 0x99, 0x14, 0x35, 0xc9, 0xaf, 0xfb, 0xe2, 0x04, 0x57, 0x4d, 0xdb, 0x57, 0xee, 0xf2, 0x88,
+    0xa3, 0xb0, 0xf5, 0x12, 0xfe, 0x87, 0xb8, 0xe9, 0x9b, 0x01, 0xe0, 0x91, 0x2b, 0xb5, 0xbd, 0x28,
 ];
 const GOLDEN_PREIMAGE_HEX: &str = concat!(
-    "6f626a6563742d64697370617463682d66696e6765727072696e742d763100",
-    "0000000a70726f746f636f6c2d3100000008626f756e646172790000000463656c6c",
-    "0000000674656e616e740000002430313866336531322d613435362d376162632d38646566",
-    "2d3031323334353637383961620000002430313866336531322d613435372d376162632d38",
-    "6465662d3031323334353637383961620000000c616c6c6f636174696f6e2d3100000000",
-    "000000070000000b61646d697373696f6e2d31000000000000000800000191a203220000",
-    "0000010000000d7265736572766174696f6e2d610000000a706879736963616c2d610000",
-    "0007636c6173732d61000000000000000200000003010000004575726e3a6c6f72653a6f",
-    "626a6563742d64697370617463683a596d3931626d5268636e6b3a5932567362413a6447",
-    "5675595735303a6a6f623a63484a70626d4e70634746730000000b6f7065726174696f6e",
-    "2d310000000000000009000000000000000a00000008706f6c6963792d31000000140000",
-    "00086275636b65742d31",
+    "6f626a6563742d64697370617463682d66696e6765727072696e742d7631000000000a70",
+    "726f746f636f6c2d3100000008626f756e646172790000000463656c6c0000000674656e",
+    "616e740000002430313866336531322d613435362d376162632d386465662d3031323334",
+    "353637383961620000002430313866336531322d613435372d376162632d386465662d30",
+    "31323334353637383961620000000b61646d697373696f6e2d3100000000000000080000",
+    "0191a2032200000000010000000d7265736572766174696f6e2d610000000a7068797369",
+    "63616c2d6100000007636c6173732d61000000000000000200000003010000004575726e",
+    "3a6c6f72653a6f626a6563742d64697370617463683a596d3931626d5268636e6b3a5932",
+    "567362413a64475675595735303a6a6f623a63484a70626d4e70634746730000000b6f70",
+    "65726174696f6e2d310000000000000009000000000000000a00000008706f6c6963792d",
+    "3100000014000000086275636b65742d31",
 );
 
 fn decode_hex(value: &str) -> Vec<u8> {
@@ -111,11 +116,13 @@ fn independent_common_preimage(consumer: &[u8], operation: &[u8]) -> Vec<u8> {
         "tenant",
         LOGICAL_ID,
         ATTEMPT_ID,
-        "allocation-1",
     ] {
         independent_text(&mut output, value);
     }
-    independent_u64(&mut output, 7);
+    // No `allocation_revision` / `allocation_fence` here: CR-033 D3's amendment excludes the budget
+    // pin from the replay preimage. `independent_startup_consumer` below still carries an
+    // `allocation-1`, and that one is a different field — the StartupAdmission consumer context's
+    // own record of the configuration its process started under, not the request's budget pin.
     independent_text(&mut output, "admission-1");
     independent_u64(&mut output, 8);
     independent_u64(&mut output, 1_725_000_000_000);
@@ -362,7 +369,7 @@ fn fingerprint_pins_independent_literal_preimage_and_digest() {
     let result = fingerprint(&base_request(head_bucket()));
 
     assert_eq!(result.canonical_preimage(), decode_hex(GOLDEN_PREIMAGE_HEX));
-    assert_eq!(result.canonical_preimage().len(), 401);
+    assert_eq!(result.canonical_preimage().len(), 377);
     assert_eq!(result.canonical_fingerprint(), &GOLDEN_DIGEST);
     assert_eq!(result.canonical_reservation_ids(), ["reservation-a"]);
 }
@@ -484,49 +491,49 @@ fn fingerprint_pins_independent_vectors_for_remaining_operations_and_contexts() 
             "list_objects_v2_raw_non_nfc_present_empty",
             list_request,
             independent_common_preimage(&durable, &list_operation),
-            "afa7b601f09bbc34f8a3f31d01e5cd5f147ea2be76866eef42010e70d22920f6",
+            "7b1adb07d1d7ed0a0ccfe7fec987f299c1c6a00390ae81b426f507b61bd24f57",
         ),
         (
             "head_object",
             head_request,
             independent_common_preimage(&durable, &head_operation),
-            "3995803166a622d14ea254aff8cd4ff43dec8597163362730f671db4d61d441f",
+            "52ee9d6988d4a582061f823a794e69c091cb357d94cb2bbb317396415870a073",
         ),
         (
             "get_object",
             get_request,
             independent_common_preimage(&durable, &get_operation),
-            "87ef40933c4d3a8b0b355619d1022205dfe13b4900980b684f47fe8cde385fdd",
+            "958e11a15160c4359c82f7982c3492bb6c519e58d2d6fcaba82d6cd964659b0d",
         ),
         (
             "put_object",
             put_request,
             independent_common_preimage(&durable, &put_operation),
-            "19dde98acbe25afbfd9ea34636922e247e95c46d636ddca6ed15231d84e6cafb",
+            "ceb9bf1abc310a18eb29fd3a22491b0f1a69145074edd4f38b822f6cc7cf058a",
         ),
         (
             "list_object_versions_present_empty",
             versions_request,
             independent_common_preimage(&durable, &versions_operation),
-            "b508feed629b277060f01882049df2975d9806bd8ebeaf5894c8a34cc83f1caa",
+            "fa56b6f3de41f216502b48602b37c5556796ef375879a56a987196196f05636a",
         ),
         (
             "delete_object_present_empty",
             delete_request,
             independent_common_preimage(&durable, &delete_operation),
-            "e4dbabf5e689d3deffa978b334de5d9f408bcf05d7c768e49061a2e0f1faea1c",
+            "5406d774d8684535af79cc7306332c800f53e67757a2e6c8ae1fa97b5b801171",
         ),
         (
             "fragment_context",
             fragment_request,
             independent_common_preimage(&independent_fragment_consumer(), &put_operation),
-            "f99caca21309ac88780375b037de7b4d1519047f9c2079cf6bf339ac8280d341",
+            "7c9e34b4aa91f9e040b3fc5d5ce9e6d0fdcac449accb695173f745c813526f91",
         ),
         (
             "startup_context",
             startup_request,
             independent_common_preimage(&independent_startup_consumer(), &head_bucket_operation),
-            "fe345dccf1f8093545d614b42d63dd419380d64a74811fec54779df69215c11e",
+            "41290768942f839c0df2841c70f7fd854513d41bb360061b38e8f63bd9e10b1f",
         ),
     ];
 
@@ -1479,6 +1486,245 @@ fn validate_authority_revision_bounds_are_independent_of_the_caller_limit() {
             Ok(FirstSeenIdentityDecision::Admit { .. })
         ),
         "precomposed NFC revision must be accepted"
+    );
+}
+
+#[test]
+fn classify_idempotency_treats_a_budget_pin_rotation_as_exact_replay() {
+    // CR-033 D3's 2026-08-28 amendment: `allocation_revision`/`allocation_fence` are excluded from
+    // the replay preimage precisely so a routine budget retune (which rotates both) does not turn
+    // an exact retry into a forever-failing identity-reuse conflict. Rotate the revision alone, the
+    // fence alone, and both together, and require every rotation to fingerprint identically to the
+    // original and to classify as `ExactReplay` against the original's stored fingerprint.
+    let original = base_request(head_bucket());
+    let original_validated = fingerprint(&original);
+    let stored = ExistingFingerprint::Full(*original_validated.canonical_fingerprint());
+
+    let rotations: [(&str, &str, u64); 3] = [
+        ("revision alone", "allocation-2", 7),
+        ("fence alone", "allocation-1", 9),
+        ("both", "allocation-2", 9),
+    ];
+
+    for (label, revision, fence) in rotations {
+        let mut rotated = base_request(head_bucket());
+        rotated.allocation_revision = revision.to_string();
+        rotated.allocation_fence = fence;
+        let rotated_validated = fingerprint(&rotated);
+        rotated.canonical_fingerprint = rotated_validated.canonical_fingerprint().to_vec().into();
+
+        assert_eq!(
+            rotated_validated.canonical_fingerprint(),
+            original_validated.canonical_fingerprint(),
+            "{label}: rotated budget pin must not change the fingerprint"
+        );
+        assert_eq!(
+            rotated_validated.canonical_preimage(),
+            original_validated.canonical_preimage(),
+            "{label}: rotated budget pin must not change the preimage"
+        );
+        assert_eq!(
+            classify_idempotency(&rotated, &rotated_validated, stored),
+            Ok(IdempotencyDecision::ExactReplay),
+            "{label}: a rotated budget pin must classify as an exact replay of the original request"
+        );
+    }
+}
+
+#[test]
+fn preimage_and_replay_still_bind_every_field_the_amendment_did_not_touch() {
+    // The exclusion removed exactly two fields. Every other field the preimage still writes must
+    // keep discriminating replay identity: a request differing only in that field must fingerprint
+    // differently and classify as `IdentityReuseConflict` against the original stored fingerprint.
+    let original = base_request(head_bucket());
+    let original_validated = fingerprint(&original);
+    let stored = ExistingFingerprint::Full(*original_validated.canonical_fingerprint());
+
+    type Mutation = fn(&mut ObjectStoreRequestV1);
+    let mutations: [(&str, Mutation); 5] = [
+        ("policy_revision", |request| {
+            request.policy_revision = "policy-2".to_string();
+        }),
+        ("cell_admission_id", |request| {
+            request.cell_admission_id = "admission-2".to_string();
+        }),
+        ("cell_admission_fence", |request| {
+            request.cell_admission_fence = 9;
+        }),
+        ("deadline_unix_ms", |request| {
+            request.deadline_unix_ms += 1;
+        }),
+        ("reservation.units", |request| {
+            request.reservations[0].units = 3;
+        }),
+    ];
+
+    for (label, mutate) in mutations {
+        let mut mutated = base_request(head_bucket());
+        mutate(&mut mutated);
+        let mutated_validated = fingerprint(&mutated);
+        mutated.canonical_fingerprint = mutated_validated.canonical_fingerprint().to_vec().into();
+
+        assert_ne!(
+            mutated_validated.canonical_fingerprint(),
+            original_validated.canonical_fingerprint(),
+            "{label} must still change the fingerprint"
+        );
+        assert_eq!(
+            classify_idempotency(&mutated, &mutated_validated, stored),
+            Ok(IdempotencyDecision::IdentityReuseConflict),
+            "{label} must classify as an identity reuse conflict against the original stored fingerprint"
+        );
+    }
+}
+
+#[test]
+fn first_seen_prerequisites_reject_a_stale_allocation_revision_pin_despite_an_unchanged_fingerprint()
+ {
+    // The preimage exclusion does not widen first-seen admission: `validate_expected_authority`
+    // still exact-matches `allocation_revision` against the cell's current pin. Prove the field is
+    // absent from replay identity (fingerprint unchanged) but not absent from admission (still
+    // fails closed) in the same test.
+    let canonical = fingerprint(&base_request(head_bucket()));
+
+    let mut request = base_request(head_bucket());
+    request.allocation_revision = "allocation-stale".to_string();
+    let computed = fingerprint(&request);
+    request.canonical_fingerprint = computed.canonical_fingerprint().to_vec().into();
+    let validated = fingerprint(&request);
+
+    assert_eq!(
+        validated.canonical_fingerprint(),
+        canonical.canonical_fingerprint(),
+        "a stale allocation_revision must not change the fingerprint"
+    );
+
+    let authority = expected_authority();
+    let admission = expected_admission();
+    let requirements = requirements();
+    let prerequisites = FirstSeenPrerequisites {
+        expected_authority: &authority,
+        expected_cell_admission: Some(&admission),
+        reservation_requirements: &requirements,
+        put_spool: None,
+        database_now_unix_ms: 1_724_999_999_000,
+        max_request_deadline_horizon_ms: 2_000,
+        cell_allocation_hard_expiry_unix_ms: 1_725_000_001_000,
+        dispatch_authority_hard_expiry_unix_ms: 1_725_000_001_000,
+    };
+
+    assert_eq!(
+        validate_first_seen_prerequisites(&request, &validated, &prerequisites, &limits()),
+        Err(RequestContractError::AuthorityMismatch)
+    );
+}
+
+#[test]
+fn first_seen_prerequisites_reject_a_stale_allocation_fence_pin_despite_an_unchanged_fingerprint() {
+    // Companion to the revision-only case above: `allocation_fence` alone must also still be
+    // exact-matched by first-seen admission even though it no longer participates in the fingerprint.
+    let canonical = fingerprint(&base_request(head_bucket()));
+
+    let mut request = base_request(head_bucket());
+    request.allocation_fence = 99;
+    let computed = fingerprint(&request);
+    request.canonical_fingerprint = computed.canonical_fingerprint().to_vec().into();
+    let validated = fingerprint(&request);
+
+    assert_eq!(
+        validated.canonical_fingerprint(),
+        canonical.canonical_fingerprint(),
+        "a stale allocation_fence must not change the fingerprint"
+    );
+
+    let authority = expected_authority();
+    let admission = expected_admission();
+    let requirements = requirements();
+    let prerequisites = FirstSeenPrerequisites {
+        expected_authority: &authority,
+        expected_cell_admission: Some(&admission),
+        reservation_requirements: &requirements,
+        put_spool: None,
+        database_now_unix_ms: 1_724_999_999_000,
+        max_request_deadline_horizon_ms: 2_000,
+        cell_allocation_hard_expiry_unix_ms: 1_725_000_001_000,
+        dispatch_authority_hard_expiry_unix_ms: 1_725_000_001_000,
+    };
+
+    assert_eq!(
+        validate_first_seen_prerequisites(&request, &validated, &prerequisites, &limits()),
+        Err(RequestContractError::AuthorityMismatch)
+    );
+}
+
+#[test]
+fn fingerprint_object_store_request_still_enforces_allocation_fence_and_revision_shape() {
+    // The exclusion only removes the two fields from the canonical preimage; shape validation on
+    // both fields in `fingerprint_object_store_request` itself is unchanged.
+    let mut zero_fence = base_request(head_bucket());
+    zero_fence.allocation_fence = 0;
+    assert_eq!(
+        fingerprint_object_store_request(&zero_fence, &identity(), &limits()),
+        Err(RequestContractError::AuthorityMismatch),
+        "allocation_fence == 0 must still be rejected"
+    );
+
+    let mut empty_revision = base_request(head_bucket());
+    empty_revision.allocation_revision = String::new();
+    assert_eq!(
+        fingerprint_object_store_request(&empty_revision, &identity(), &limits()),
+        Err(RequestContractError::InvalidCanonicalText),
+        "empty allocation_revision must still be rejected"
+    );
+
+    let mut overlong_revision = base_request(head_bucket());
+    overlong_revision.allocation_revision = "a".repeat(129);
+    assert_eq!(
+        fingerprint_object_store_request(&overlong_revision, &identity(), &limits()),
+        Err(RequestContractError::InvalidCanonicalText),
+        "an allocation_revision over max_identity_bytes (128) must still be rejected"
+    );
+
+    let mut noncanonical_revision = base_request(head_bucket());
+    noncanonical_revision.allocation_revision = "e\u{301}".to_string();
+    assert_eq!(
+        fingerprint_object_store_request(&noncanonical_revision, &identity(), &limits()),
+        Err(RequestContractError::InvalidCanonicalText),
+        "a non-NFC allocation_revision must still be rejected"
+    );
+
+    let mut control_char_revision = base_request(head_bucket());
+    control_char_revision.allocation_revision = "\0".to_string();
+    assert_eq!(
+        fingerprint_object_store_request(&control_char_revision, &identity(), &limits()),
+        Err(RequestContractError::InvalidCanonicalText),
+        "a NUL-containing allocation_revision must still be rejected"
+    );
+}
+
+#[test]
+fn golden_preimage_no_longer_contains_the_budget_pins_length_prefixed_bytes() {
+    // The regression fence for the removal itself: the golden preimage must never again contain
+    // `text("allocation-1") || u64BE(7)`, even though the request that produced it does carry
+    // `allocation_revision = "allocation-1"` and `allocation_fence = 7`.
+    let request = base_request(head_bucket());
+    assert_eq!(request.allocation_revision, "allocation-1");
+    assert_eq!(request.allocation_fence, 7);
+
+    let preimage = fingerprint(&request).canonical_preimage().to_vec();
+    assert_eq!(preimage, decode_hex(GOLDEN_PREIMAGE_HEX));
+
+    // u32BE(12) || "allocation-1" || u64BE(7)
+    let removed_write: [u8; 24] = [
+        0x00, 0x00, 0x00, 0x0c, 0x61, 0x6c, 0x6c, 0x6f, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2d,
+        0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+    ];
+
+    assert!(
+        !preimage
+            .windows(removed_write.len())
+            .any(|window| window == removed_write),
+        "the removed allocation-revision/allocation-fence write must never reappear in the golden preimage"
     );
 }
 
