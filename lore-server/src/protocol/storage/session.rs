@@ -124,8 +124,10 @@ impl SessionMap {
             if id == 0 {
                 continue;
             }
-            #[allow(clippy::disallowed_methods)]
-            // Synchronous entry check; nothing awaits while the shard lock is held.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "synchronous entry claim; nothing awaits while the shard lock is held"
+            )]
             let vacancy = self.entries.entry(id);
             if let dashmap::mapref::entry::Entry::Vacant(vacant) = vacancy {
                 let Some(entry) = entry.take() else {

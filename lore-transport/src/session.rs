@@ -92,10 +92,16 @@ impl SessionBinding {
     /// connection, and refuses to frame an id whose generation has moved
     /// (`QuicConnection::session_is_current`). So the window is closed before the write, not
     /// after it, and [`StorageSession::attempt`] turns the refusal into a rebind and one retry.
-    async fn session_id(&self) -> Result<u32, ProtocolError> {
+    ///
+    /// Returns the generation alongside the id, rather than leaving the caller to read it back
+    /// off the binding afterwards. The two have to be one observation: a sibling task calling
+    /// [`StorageSession::invalidate`] can clear the binding at any moment, and a caller that
+    /// re-read it would see "not bound to anything" and conclude the connection had been
+    /// replaced under its command when it had not.
+    async fn resolve(&self) -> Result<(u32, u32), ProtocolError> {
         let current = self.storage.connection_generation();
         if let Some(id) = self.bound_to(current) {
-            return Ok(id);
+            return Ok((id, current));
         }
 
         let _flight = self.rebind.lock().await;
@@ -103,7 +109,7 @@ impl SessionBinding {
         // generation may have moved again while we waited.
         let current = self.storage.connection_generation();
         if let Some(id) = self.bound_to(current) {
-            return Ok(id);
+            return Ok((id, current));
         }
 
         // A fresh `session_start` re-runs the token exchange and the server's authorization
@@ -117,7 +123,7 @@ impl SessionBinding {
             id,
             generation: Some(current),
         };
-        Ok(id)
+        Ok((id, current))
     }
 
     /// The session id if it belongs to `generation`, otherwise nothing.
@@ -138,16 +144,16 @@ impl SessionBinding {
     /// generation that is gone, and the generation comparison alone is not enough to say so at
     /// every moment we might look.
     ///
-    /// The transport is told to forget the id too. Nothing else will: this session will never
-    /// send a `session_stop` for an id it has given up on, so without this the transport's
-    /// id-to-generation record would keep it until the connection is replaced or closed.
+    /// This gives up the *binding*, not the server-side session, and deliberately does not tell
+    /// the transport to forget the id. It was made to, briefly, to stop an abandoned id sitting
+    /// in the transport's registry until the connection was replaced. That cure was worse than
+    /// the leak: `invalidate` is called on healthy connections, the pool still holds the same id
+    /// for cleanup, and a forgotten id fails the write-boundary check — so the eventual
+    /// `session_stop` was refused and the *server's* session leaked instead, one per invalidate
+    /// against a 10,000 limit. A stale client-side entry costs bytes; a stranded server session
+    /// costs a session slot.
     fn unbind(&self) {
-        let abandoned = {
-            let mut bound = self.session.lock();
-            bound.generation = None;
-            bound.id
-        };
-        self.storage.forget_session(abandoned);
+        self.session.lock().generation = None;
     }
 }
 
@@ -155,6 +161,11 @@ impl SessionBinding {
 ///
 /// Not a generation, so a session is never bound to it and a move *to* it is not a replacement
 /// worth rebinding onto.
+///
+/// This is why [`StorageSession::attempt`] reads both counters. The generation answers "was the
+/// connection replaced under this command", which is what decides whether a rebind could help;
+/// the epoch answers "is a replacement ever coming", and a zero says no, so the last attempt is
+/// not spent on a connection that will not return.
 const GAVE_UP_EPOCH: u32 = 0;
 
 /// Closure signature for a pending session's resolver. The resolver runs at most
@@ -290,9 +301,17 @@ impl StorageSession {
     /// Retrying here is safe only because of what the transport does *not* return on this
     /// path. A mutable command that was dispatched and then lost its response never comes back
     /// as an error — it comes back as [`MutableOutcome::Unknown`], which is an `Ok` and leaves
-    /// this loop untouched. So an error from a mutable operation means either the request never
-    /// reached the wire or the server answered it, and neither can be applied twice by asking
-    /// again on a replacement session.
+    /// this loop untouched. The same is true of a response that arrived but could not be read:
+    /// `mutable_cas` and `verify` report that as unknown rather than as an error, precisely
+    /// because it describes a write that landed.
+    ///
+    /// So an error reaching this loop means the request did not reach the wire, or the server
+    /// answered it and declined. Note what that does *not* say, because an earlier version of
+    /// this comment said it and was wrong: a server error does not prove nothing was applied.
+    /// It proves an answer arrived. Repeating such a command is safe only where the server's
+    /// refusal is also its whole effect, which is the case for the refusals that reach here —
+    /// and it is why the retry is gated below on the binding rather than on anything about the
+    /// error. Widening what may be retried means re-checking this paragraph first.
     ///
     /// That is why every mutable operation below runs its `_outcome` form through here and
     /// collapses the unknown to an error *afterwards*, rather than calling the plain form and
@@ -313,7 +332,7 @@ impl StorageSession {
             // Resolves the session, and starts a replacement first if the connection has moved
             // on since this one was issued.
             let binding = self.binding().await?;
-            let session_id = binding.session_id().await?;
+            let (session_id, sent_on) = binding.resolve().await?;
             let storage = binding.storage.clone();
 
             let error = match operation(storage.clone(), session_id).await {
@@ -321,22 +340,25 @@ impl StorageSession {
                 Err(error) => error,
             };
 
-            // Retry only when *this session's own binding* stopped being valid, which is the one
-            // condition a rebind can repair.
+            // Retry only when the connection the id was sent on has since been replaced, which
+            // is the one condition a replacement session could have avoided.
             //
-            // Not "the connection generation moved", which is what this used to ask and which is
-            // a different question with a worse answer. A command whose session was already
-            // rebound before it ran, and which then failed because the server refused it, would
-            // read a moved generation and be dispatched a second time — and a server error means
-            // an answer arrived, not that nothing was applied. Asking about the binding instead
-            // makes the retry conditional on the failure being one a replacement session could
-            // have avoided: a session resolved on the current generation is still current after
-            // an ordinary failure, so that failure is returned rather than repeated.
+            // `sent_on` comes back from `resolve` rather than being read off the binding here,
+            // and that is load-bearing rather than tidy. Reading the binding afterwards asks
+            // "is it bound to the current generation", which a sibling task's `invalidate` can
+            // answer no to without any connection having been replaced — turning an ordinary
+            // server refusal into a second dispatch of a command that must not be repeated.
+            // Comparing the generation the id actually went out on cannot be perturbed by
+            // anything but a real replacement.
+            //
+            // Not "the connection generation moved since some earlier moment", either: a command
+            // whose session was already rebound before it ran would read a moved generation and
+            // be dispatched again after an error the server itself returned.
             //
             // A zero epoch is consulted for its own separate meaning: reconnection has given up,
             // so there is nothing to rebind onto and spending the last attempt is waste.
-            let rebindable = binding.bound_to(storage.connection_generation()).is_none();
-            if attempts_left == 0 || !rebindable || storage.connection_epoch() == GAVE_UP_EPOCH {
+            let replaced = sent_on != storage.connection_generation();
+            if attempts_left == 0 || !replaced || storage.connection_epoch() == GAVE_UP_EPOCH {
                 return Err(error);
             }
 

@@ -915,10 +915,6 @@ impl Storage for StorageClient {
         self.quic.connection_generation()
     }
 
-    fn forget_session(&self, session_id: u32) {
-        self.quic.forget_session(session_id);
-    }
-
     async fn close(&self) {
         self.quic.close().await;
     }
