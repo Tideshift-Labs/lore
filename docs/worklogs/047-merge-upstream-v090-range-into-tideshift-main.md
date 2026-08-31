@@ -72,3 +72,21 @@ covered-elsewhere acknowledgement rather than a new execution entry. Not papered
 - INV-DS was **not** re-pinned; its own rule is that an artifact re-pins when its own entry gate is
   cleared, and this refresh clears none.
 - INV-EK carries a dated addendum recording actuals against its predictions.
+
+## Addendum - 2026-08-31: the lock-fencing tier is green
+
+`run-lock-fencing-live.ps1` is no longer NOT RUN. `b41f880` drops this runner's
+`domain::tests::` prefix claim, and the tier now reports
+**`Summary: PASS=29 FAIL=0 NOT RUN=0 EXPECTED=29`** against the merged HEAD.
+
+The Gates section above records the tier as NOT RUN, which was true when written and is
+left as written. The diagnosis there still holds: the guard was right, the inventory was
+stale, and the staleness predates the merge. What changed is the remedy. A prefix claim in
+that file asserts the runner owns every live case in the module, and WP-116's
+governed-mutation case made `domain::tests::` shared, so the claim had become false. The
+file already prescribes dropping the prefix and policing the owned case by exact name for
+exactly this situation, and already does it for `grpc::handlers::branch_push::tests::`.
+Adopting WP-116's case into this runner's `Cases` would instead have made the tier execute
+a case it does not own.
+
+All six live runners are therefore green at the merged HEAD.
