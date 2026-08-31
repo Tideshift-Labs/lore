@@ -3,15 +3,17 @@
 
 <#
 .SYNOPSIS
-Provisions a disposable PostgreSQL 16 and runs the nine `local_authority_*` cell-authority live
+Provisions a disposable PostgreSQL 16 and runs the eleven `local_authority_*` cell-authority live
 tests in lore-object-dispatch by exact name, reporting pass/fail/NOT RUN distinctly.
 
 .DESCRIPTION
-WP-114 CD-2: the nine local-authority live tests are `#[ignore]` fixtures gated on per-test
+WP-114 CD-2: the local-authority live tests are `#[ignore]` fixtures gated on per-test
 `LORE_TEST_LOCAL_*_PG_URL` environment variables with no provisioning script before this file
-existed. This runner:
+existed. WP-114 CD-3 added the two `local_authority_dispatcher_identity_*` tests (schema and
+provisioning) for the per-participant dispatcher-identity edge (0018, 0019; CR-033 D8), bringing
+the total from nine to eleven. This runner:
 
-  1. Cross-checks its own nine-entry name/target/env-var map against
+  1. Cross-checks its own eleven-entry name/target/env-var map against
      `cargo test -p lore-object-dispatch -- --ignored --list` (ground truth, not the README)
      before touching Docker. A known test missing from the catalog, or an unknown
      `local_authority_*` ignored test appearing in it, is a hard failure -- this is what keeps a
@@ -29,18 +31,18 @@ existed. This runner:
      observer can check whether the owning process is actually still alive before ever treating a
      labelled container as safe to remove.
   4. Creates the four cluster-wide `object_dispatch_retention_*` roles once, idempotently, and
-     shares that one container/cluster across all nine tests plus the install-chain-proof
-     database (ten databases total). This is safe specifically because a role census across all
-     nine test bodies (`grep`-verified) found zero `ALTER ROLE`, `DROP ROLE`, cross-role `GRANT
-     ... TO`, `CREATEDB`, `SUPERUSER`, or `BYPASSRLS` -- the one `ALTER ROLE` hit in the crate is
-     a string literal inside `local_authority_schema.rs`'s forbidden-keyword assertion list, not
-     an execution, and that file has no live test. Every `REVOKE`/`GRANT EXECUTE` is
+     shares that one container/cluster across all eleven tests plus the install-chain-proof
+     database (twelve databases total). This is safe specifically because a role census across
+     all eleven test bodies (`grep`-verified) found zero `ALTER ROLE`, `DROP ROLE`, cross-role
+     `GRANT ... TO`, `CREATEDB`, `SUPERUSER`, or `BYPASSRLS` -- the one `ALTER ROLE` hit in the
+     crate is a string literal inside `local_authority_schema.rs`'s forbidden-keyword assertion
+     list, not an execution, and that file has no live test. Every `REVOKE`/`GRANT EXECUTE` is
      object-scoped and schema-qualified (`ON ALL TABLES IN SCHEMA object_store_retention`, `ON
      FUNCTION`, `ON TYPE`, ...), and `SET SESSION AUTHORIZATION` is session-local. The only
      cluster-level effect any test has is the identical idempotent `CREATE ROLE ... NOLOGIN`
      guard, which is convergent and is state every test wants anyway. One container per test was
      not needed.
-  5. Creates ten databases: one per live test, plus `local_install_chain_proof`.
+  5. Creates twelve databases: one per live test, plus `local_install_chain_proof`.
   6. Installs the CD-1 cell install set (0002, 0003, then 0007 through 0019, in that exact
      order, resolved by numeric prefix) into `local_install_chain_proof` and asserts the CD-1
      "expected inert state": four of the five tables 0002 creates -- the ones inert while
@@ -60,22 +62,27 @@ existed. This runner:
      `object_store_dispatch_put_reservation_read_state_v1` for the 0010/0011 layer), and proves
      drift fails closed on both. Two things that layer does *not* cover, recorded here because
      nothing else covers them either: 0003's retention-layer readback
-     (`object_store_retention_read_state_v1`) has no live caller among the nine (grep-verified,
+     (`object_store_retention_read_state_v1`) has no live caller among the eleven (grep-verified,
      zero hits), and migrations 0012-0017 have no dedicated `read_state` procedure at all --
      they are codecs and mutations, attested behaviorally by their own live tests instead.
      WP-114 CD-3's 0019 adds the chain's one growth-tolerant readback
-     (`object_store_dispatch_dispatcher_identity_read_state_v1`), which does have a live caller and
-     is the only authority procedure the runtime role may call.
+     (`object_store_dispatch_dispatcher_identity_read_state_v1`), which does have a live caller
+     (`local_authority_dispatcher_identity_provisioning`'s own live test, which self-installs the
+     full 0002, 0003, 0007-0019 chain plus all four layer installs into its own dedicated
+     database) and is the only authority procedure the runtime role may call.
      Separately (also grep-verified): `local_authority_put_spool_ready_mutation.rs` self-installs
      0002, 0003 and 0007 through 0017 -- the chain its own subject needs, which since CD-3 is a
-     proper prefix of the install set rather than the whole of it. Only this step's database
-     receives 0018 and 0019 and the inert-state assertion.
+     proper prefix of the install set rather than the whole of it, and
+     `local_authority_dispatcher_identity_schema`'s own live test self-installs only 0002, 0007,
+     and 0018 -- the minimal chain needed to exercise D8's per-participant ACTIVE-uniqueness index
+     and the retained attempts foreign key without the 0019 readback. Only this step's
+     (`local_install_chain_proof`) database receives 0018 and 0019 and the inert-state assertion.
   7. Pre-installs migrations 0002 and 0009 (only) into the `local_codec` database, matching
      `local_authority_canonical_codec.rs`'s own stated requirement -- it is the one live test
-     that does not self-provision its schema. The other eight tests self-provision their roles
+     that does not self-provision its schema. The other ten tests self-provision their roles
      (idempotently) and self-install their own required migration subset from their own
      `include_str!`'d copies, so their databases are handed over empty.
-  8. Runs the nine tests by exact name, serially, via
+  8. Runs the eleven tests by exact name, serially, via
      `cargo test -p lore-object-dispatch --test <target> -- --ignored --exact <name>`.
   9. Parses each invocation's `running N tests` and `test result: ... P passed; F failed`
      lines. A test whose filter matched zero tests is reported NOT RUN, never as a pass.
@@ -165,6 +172,18 @@ $tests = @(
         Target   = 'local_authority_put_spool_ready_mutation'
         Name     = 'live_postgres_spool_ready_is_atomic_replay_safe_and_source_dark'
         Database = 'local_put_spool_ready_mutation'
+    },
+    @{
+        EnvVar   = 'LORE_TEST_LOCAL_DISPATCHER_IDENTITY_SCHEMA_PG_URL'
+        Target   = 'local_authority_dispatcher_identity_schema'
+        Name     = 'live_postgres_dispatcher_identity_admits_concurrent_participants_and_retains_the_attempts_foreign_key'
+        Database = 'local_dispatcher_identity_schema'
+    },
+    @{
+        EnvVar   = 'LORE_TEST_LOCAL_DISPATCHER_IDENTITY_PROVISIONING_PG_URL'
+        Target   = 'local_authority_dispatcher_identity_provisioning'
+        Name     = 'live_postgres_dispatcher_identity_readback_authorizes_by_role_and_fails_closed_on_catalog_drift'
+        Database = 'local_dispatcher_identity_provisioning'
     }
 )
 
@@ -628,22 +647,22 @@ WHERE n.nspname = 'object_store_retention'
 
     $results | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
 
-    # Assert what this is meant to prove: that all nine actually reported PASS, not merely that
-    # the (fixed-size) $tests map produced nine result rows -- a count check against $results
+    # Assert what this is meant to prove: that all eleven actually reported PASS, not merely that
+    # the (fixed-size) $tests map produced eleven result rows -- a count check against $results
     # would only ever catch $tests itself being resized, which is not an execution guarantee.
     # $ran -ne 1 above is what actually proves each test executed for real rather than matching
     # nothing under --exact.
     $passCount = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
     $failures = @($results | Where-Object { $_.Status -ne 'PASS' })
-    if ($passCount -ne 9) {
-        Write-Warning "$passCount of 9 local-authority live tests passed; $($failures.Count) did not:"
+    if ($passCount -ne 11) {
+        Write-Warning "$passCount of 11 local-authority live tests passed; $($failures.Count) did not:"
         foreach ($failure in $failures) {
             Write-Warning "  $($failure.Test): $($failure.Status)"
         }
     }
     else {
         $runPassed = $true
-        Write-Host "All 9 local-authority live tests passed."
+        Write-Host "All 11 local-authority live tests passed."
     }
 }
 finally {
