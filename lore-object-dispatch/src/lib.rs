@@ -14,6 +14,8 @@ mod contract;
 pub mod fetch_lease;
 pub mod full_to_compact;
 pub mod local_authority_canonical_codec;
+pub mod local_authority_dispatcher_identity_provisioning;
+pub mod local_authority_dispatcher_identity_schema;
 pub mod local_authority_provisioning;
 pub mod local_authority_put_reservation_provisioning;
 pub mod local_authority_put_reservation_record_codec;

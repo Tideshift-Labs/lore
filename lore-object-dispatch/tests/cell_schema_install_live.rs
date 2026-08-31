@@ -159,8 +159,10 @@ async fn live_postgres_cell_schema_installs_clean_and_attests() {
     assert_eq!(report.attestation.replaced_functions_revoked, 2);
     assert_eq!(report.attestation.inert_tables_present, 4);
 
-    // The install set is 13 artifacts; nothing outside it may have been applied.
-    assert_eq!(CELL_INSTALL_SET.len(), 13);
+    // The install set is 15 artifacts; nothing outside it may have been applied. WP-114 CD-3 added
+    // 0018 and 0019 (CR-033 D8's per-participant dispatcher identity, and its provisioning and
+    // growth-tolerant readback).
+    assert_eq!(CELL_INSTALL_SET.len(), 15);
 
     // An installed cell holds ZERO `pg_default_acl` rows, cluster-wide. Measured, not assumed, and
     // it is not what reading 0002 suggests: 0002:12-17 issues three `ALTER DEFAULT PRIVILEGES ...
@@ -262,8 +264,11 @@ async fn live_postgres_cell_schema_install_is_idempotent() {
         .expect("second install must replay, never re-migrate");
     assert_eq!(second.disposition, CellInstallDisposition::Replayed);
 
-    // Only the retention layer's install entrypoint survives to full chain depth; the other two are
-    // attested rather than re-executed, and say so.
+    // Two of the four layer install entrypoints survive to full chain depth, and for different
+    // reasons. Retention's is never retired. Dispatcher identity's survives because 0019 asserts
+    // only the objects it names instead of manifesting the whole schema, so nothing later can
+    // invalidate it. The two dispatch layers in between are attested rather than re-executed, and
+    // say so.
     assert_eq!(
         second.layer_outcomes,
         [
@@ -275,6 +280,10 @@ async fn live_postgres_cell_schema_install_is_idempotent() {
             (
                 CellSchemaLayerId::PutReservation,
                 LayerInstallOutcome::AttestedOnly
+            ),
+            (
+                CellSchemaLayerId::DispatcherIdentity,
+                LayerInstallOutcome::Replayed
             ),
         ]
     );

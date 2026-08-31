@@ -41,7 +41,7 @@ existed. This runner:
      guard, which is convergent and is state every test wants anyway. One container per test was
      not needed.
   5. Creates ten databases: one per live test, plus `local_install_chain_proof`.
-  6. Installs the CD-1 cell install set (0002, 0003, then 0007 through 0017, in that exact
+  6. Installs the CD-1 cell install set (0002, 0003, then 0007 through 0019, in that exact
      order, resolved by numeric prefix) into `local_install_chain_proof` and asserts the CD-1
      "expected inert state": four of the five tables 0002 creates -- the ones inert while
      0004-0006 are uninstalled; the fifth, `object_dispatch_retention_schema_state`, is written by
@@ -63,10 +63,13 @@ existed. This runner:
      (`object_store_retention_read_state_v1`) has no live caller among the nine (grep-verified,
      zero hits), and migrations 0012-0017 have no dedicated `read_state` procedure at all --
      they are codecs and mutations, attested behaviorally by their own live tests instead.
+     WP-114 CD-3's 0019 adds the chain's one growth-tolerant readback
+     (`object_store_dispatch_dispatcher_identity_read_state_v1`), which does have a live caller and
+     is the only authority procedure the runtime role may call.
      Separately (also grep-verified): `local_authority_put_spool_ready_mutation.rs` self-installs
-     the *complete* CD-1 chain itself (0002, 0003, 0007 through 0017), so the deepest live test and
-     this step are two independent full-chain installs -- only this step's database gets the
-     inert-state assertion, though.
+     0002, 0003 and 0007 through 0017 -- the chain its own subject needs, which since CD-3 is a
+     proper prefix of the install set rather than the whole of it. Only this step's database
+     receives 0018 and 0019 and the inert-state assertion.
   7. Pre-installs migrations 0002 and 0009 (only) into the `local_codec` database, matching
      `local_authority_canonical_codec.rs`'s own stated requirement -- it is the one live test
      that does not self-provision its schema. The other eight tests self-provision their roles
@@ -170,7 +173,7 @@ $databaseNames = @($tests | ForEach-Object { $_.Database }) + @($installChainPro
 
 # CR-033 D5's cell install set, shared with the classification check below so the two cannot
 # drift apart.
-$cd1InstallSetNumbers = @(2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
+$cd1InstallSetNumbers = @(2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)
 $cd1KnownDeferredNumbers = @(4, 5, 6)
 
 $environmentNames = @($tests | ForEach-Object { $_.EnvVar })
@@ -517,7 +520,7 @@ $$;
         )
     }
 
-    Write-Host "Installing the CD-1 cell install set (0002, 0003, 0007-0017) into $installChainProofDatabase..."
+    Write-Host "Installing the CD-1 cell install set (0002, 0003, 0007-0019) into $installChainProofDatabase..."
     foreach ($number in $cd1InstallSetNumbers) {
         Install-MigrationToDatabase -DatabaseName $installChainProofDatabase -Path (Resolve-MigrationPath -Number $number)
     }
@@ -552,7 +555,7 @@ WHERE n.nspname = 'object_store_retention'
     if ($deferredProcedureCount -ne '0') {
         throw "expected zero installed 0004-0006 procedures, found $deferredProcedureCount"
     }
-    Write-Host "Install-chain proof: 0002, 0003, 0007-0017 installed cleanly; 4 of the 5 tables" `
+    Write-Host "Install-chain proof: 0002, 0003, 0007-0019 installed cleanly; 4 of the 5 tables" `
         "0002 creates are present-but-inert; 0 deferred 0004-0006 procedures are installed."
 
     Write-Host "Pre-installing 0002 and 0009 into $($tests[0].Database) for the canonical-codec live test..."

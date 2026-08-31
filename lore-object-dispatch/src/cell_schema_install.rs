@@ -4,8 +4,9 @@
 //! Out-of-band cell authority schema installer and attester (WP-114 CD-1).
 //!
 //! This module is the production install path for CR-033 D5's cell install set: migrations 0002,
-//! 0003, then 0007 through 0017. Retention migrations 0004 through 0006 are deferred and are never
-//! installed; migration 0001 does not exist.
+//! 0003, then 0007 through 0019. Retention migrations 0004 through 0006 are deferred and are never
+//! installed; migration 0001 does not exist. 0018 and 0019 are WP-114 CD-3's addition (CR-033 D8's
+//! per-participant dispatcher identity, and its provisioning/readback).
 //!
 //! Six properties this module owns, and nothing else in the crate does:
 //!
@@ -48,14 +49,29 @@
 //! WP-114 CD-1's caveat N2 names two readback gaps. This module closes the first: it is the live
 //! caller of 0003's `object_store_retention_read_state_v1`, which previously had none.
 //!
-//! It does not add a `read_state` procedure for 0012 through 0017; new procedures are migrations,
-//! and migrations after 0017 belong to CD-3. Instead it attests those layers from the live catalog
-//! directly. That matters more than it first appears: 0011's
+//! The second is settled by CD-3, and the answer is that this module keeps it. 0011's
 //! `assert_dispatch_put_reservation_catalog_v1` manifests **every** function in the schema with no
-//! name filter, and 0012 through 0017 add functions. So on a fully installed cell the 0011 readback
+//! name filter, and 0012 through 0017 add functions, so on a fully installed cell the 0011 readback
 //! does not merely fail to cover the later layers, it fails closed with
 //! `DISPATCH_AUTHORITY_CATALOG_MISMATCH`. `attest_cell_schema` confirms exactly that, records it as
 //! an expected retirement rather than an error, and carries the later layers itself.
+//!
+//! CD-3 did not replace it with another in-database whole-schema manifest, because a manifest that
+//! lives inside the schema it measures necessarily covers the next migration's objects, so every
+//! successor invalidates it -- including the successor written to replace it. Narrowing such a
+//! manifest to a name-filtered inventory would make it survive, at the cost of the one property
+//! that makes it worth having: only an unfiltered manifest can detect an *added* object, such as a
+//! planted `SECURITY DEFINER` function. That check therefore belongs here, outside the schema,
+//! where re-pinning on growth is a deliberate, evidenced act rather than a migration's side effect.
+//!
+//! What CD-3 did add, in migration 0019, is the complement rather than a competitor: a
+//! growth-tolerant in-database readback that asserts only the objects it names, and that the
+//! dispatch **runtime** role may call. Nothing here is runtime-reachable -- every entry point in
+//! this module requires the migrator -- so a replica had no readiness signal at all before it.
+//! `object_store_dispatch_dispatcher_identity_read_state_v1` answers "is every layer installed at
+//! the artifact identity this cell expects, and is D8's participant constraint the one in force".
+//! It does not answer "has the catalog drifted"; that is this module's manifest, and the two must
+//! not be confused for each other.
 
 use std::fmt::Write as _;
 
@@ -106,7 +122,7 @@ macro_rules! cell_migration {
 }
 
 /// CR-033 D5's cell install set, in install order.
-pub const CELL_INSTALL_SET: [CellMigration; 13] = [
+pub const CELL_INSTALL_SET: [CellMigration; 15] = [
     cell_migration!(
         2,
         "0002_object_store_retention_authority.sql",
@@ -172,6 +188,16 @@ pub const CELL_INSTALL_SET: [CellMigration; 13] = [
         "0017_object_store_dispatch_put_spool_ready_mutation.sql",
         "1bf102fce2e86f48eed6295e1349795564c4aae48aa5ac5d5af5ab5233b0462c"
     ),
+    cell_migration!(
+        18,
+        "0018_object_store_dispatch_dispatcher_identity_schema.sql",
+        "390a1275927fc9273746a8180aab42ab7c446be6283a82f1263026fbee0f755b"
+    ),
+    cell_migration!(
+        19,
+        "0019_object_store_dispatch_dispatcher_identity_provisioning.sql",
+        "c7d78710d1252b22a0a7a9fe722e91f9fd79e0676987d961d0ccb77b0417e78f"
+    ),
 ];
 
 /// Retention migrations retained, compiled, and deliberately not installed (CR-033 D5).
@@ -216,7 +242,7 @@ pub fn cell_migration_for(number: u16) -> Option<CellMigration> {
     None
 }
 
-/// The three schema layers that carry an identity tuple in the singleton schema-state row.
+/// The schema layers that carry an identity tuple in the singleton schema-state row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellSchemaLayerId {
     /// Migrations 0002 and 0003.
@@ -225,6 +251,8 @@ pub enum CellSchemaLayerId {
     Authority,
     /// Migrations 0009, 0010 and 0011.
     PutReservation,
+    /// Migrations 0018 and 0019.
+    DispatcherIdentity,
 }
 
 impl CellSchemaLayerId {
@@ -235,6 +263,7 @@ impl CellSchemaLayerId {
             Self::Retention => "retention",
             Self::Authority => "authority",
             Self::PutReservation => "put_reservation",
+            Self::DispatcherIdentity => "dispatcher_identity",
         }
     }
 }
@@ -279,7 +308,7 @@ pub struct CellSchemaLayer {
 }
 
 /// The layer contracts, in install order.
-pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 3] = [
+pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 4] = [
     CellSchemaLayer {
         id: CellSchemaLayerId::Retention,
         api_revision: "object-store-retention-provisioning-v1",
@@ -341,6 +370,29 @@ pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 3] = [
             "put_reservation_installed_at_unix_ms",
         ],
         installed_after_migration: 11,
+    },
+    CellSchemaLayer {
+        id: CellSchemaLayerId::DispatcherIdentity,
+        api_revision: "object-store-dispatch-dispatcher-identity-provisioning-v1",
+        schema_revision: "object-store-dispatch-dispatcher-identity-schema-v1",
+        migration_blake3_hex: "390a1275927fc9273746a8180aab42ab7c446be6283a82f1263026fbee0f755b",
+        contract_migration: 18,
+        install_function: "object_store_dispatch_dispatcher_identity_install_v1",
+        read_state_function: "object_store_dispatch_dispatcher_identity_read_state_v1",
+        // Not retired, and by design rather than by luck: 0019's readback asserts only the objects
+        // it names, so a later migration adding functions or tables cannot invalidate it. That is
+        // the whole difference between it and the two dispatch-layer readbacks above, which manifest
+        // the entire schema from inside the schema and therefore retire on their own successors.
+        read_state_retired_after: None,
+        read_state_retired_sqlstate: None,
+        install_retired_after: None,
+        identity_columns: [
+            "dispatcher_identity_schema_revision",
+            "dispatcher_identity_migration_blake3",
+            "dispatcher_identity_install_revision",
+            "dispatcher_identity_installed_at_unix_ms",
+        ],
+        installed_after_migration: 19,
     },
 ];
 
@@ -719,16 +771,22 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
 ///
 /// Sections are in [`CELL_CATALOG_MANIFEST_SECTIONS`] order. Measured, not derived: see
 /// `tests/run-cell-schema-install-live.ps1`.
+///
+/// Re-measured by WP-114 CD-3 when migrations 0018 and 0019 joined the install set. Eight sections
+/// moved and four did not, which is itself a check on the change rather than a bookkeeping detail:
+/// `schema` is the namespace entry, and `default_acls`, `triggers` and `rules_and_policies` are all
+/// empty on a correctly installed cell, so a change in any of those four would have meant the
+/// migration did something it does not claim to do.
 pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
     hex32("f468de7d148f5335b52a10c4298d609be546801754da1d991ff0ac7e7c0da0ca"),
-    hex32("14ce9d1c488912465cda1992122423aa87a51f94cb1e19ffaadbe4ca54cd36e8"),
-    hex32("0b870b9505e2aef59be9fbcf12b252f9e742ee4d09c644f45132d5fce44a2acb"),
-    hex32("282efc06669651d11437ebe91526b5387d5fe81830bc92a4479351341207191d"),
-    hex32("1eb1403b86f4983fad0312b455443a9cb9a70b97534366209e82170bfb80c6ae"),
-    hex32("f3b4ad7863d91864e60c763f922266fca10ebc1a900766f3bc568f4552e6911b"),
-    hex32("4c224663955226f3b8e30e8594348fe85d01a23443efd8e4a14bd2cf4d552377"),
-    hex32("9d83905855f4f18687e893f9c023e438c483d48b0c43831768e0d16fcc5e048d"),
-    hex32("e8614209f171b3478f4f30da3fc814d845a00d065f6569a77dd6ba67635a7539"),
+    hex32("30bf677d50aa7e735200d84570a76a2e4e16368fb33b8c4dc112098378eaa2d3"),
+    hex32("14879db8f573eb8670a391b7e786acfa4331c43f03bc2807497e95f00aa565a9"),
+    hex32("95078ccb57b724114f162a6c4a410195601a16a48042b3a2f5d0a0b8df4dd2ae"),
+    hex32("fe4e7104687d714c8ac084dca11fcd9d0131f03608649e295309004758a62923"),
+    hex32("925f3c6fced9ba0b390b1bdb20293aa84c35f5ded074832e9dcbc2c2adbf4a78"),
+    hex32("21194f097f406846092a3c50053e49dd5fa6a38def0e1b7cb6e38f5cc8d061a7"),
+    hex32("946c88196f476aa6817695043f4fea8b754e38e97b3c21272d9a087d869d12ce"),
+    hex32("cb220f3aef0f0bfb93996548ff1951f59374ce24b980d75f0beb6189a559a38a"),
     hex32("971ec53fc27466c873c783701757e1434c20b383d23f081d918a2d6e4c797971"),
     hex32("b5f633ebe7a54a9d43e75d043387b67cc659395fa8f0880a5c0d869a2b90fe81"),
     hex32("444e1ca598f3a2dbe3601fdb803e2479f21b3b22fe4713d50f9a0e47fd7b73b2"),
@@ -740,7 +798,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
 /// whose exact rendering is a server-version property. A different major version is expected to
 /// fail closed here and needs a re-measured pin, not a relaxed check.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_V1: [u8; 32] =
-    hex32("16cecbef4a323b5fed204ff2a069f3d6f5f993247cde26775bdeeb27e9d5ec7d");
+    hex32("0f5d060971a3961a2263a0a1d35a7634766789b98038e866385c9f48ddcdc34b");
 
 /// Const hex decoder for the pinned digests above.
 const fn hex32(text: &str) -> [u8; 32] {
@@ -899,7 +957,7 @@ pub enum LayerInstallOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellAttestation {
     /// Each layer's identity tuple, in [`CELL_SCHEMA_LAYERS`] order.
-    pub layers: [(CellSchemaLayerId, LayerIdentity); 3],
+    pub layers: [(CellSchemaLayerId, LayerIdentity); 4],
     /// Per-section live catalog digests, in [`CELL_CATALOG_MANIFEST_SECTIONS`] order.
     pub catalog_sections: [[u8; 32]; 12],
     /// BLAKE3-256 over the whole manifest.
@@ -929,7 +987,7 @@ pub struct CellInstallReport {
     /// Whether this run created or replayed.
     pub disposition: CellInstallDisposition,
     /// Each layer's install-procedure outcome, in [`CELL_SCHEMA_LAYERS`] order.
-    pub layer_outcomes: [(CellSchemaLayerId, LayerInstallOutcome); 3],
+    pub layer_outcomes: [(CellSchemaLayerId, LayerInstallOutcome); 4],
     /// The attestation taken after the run.
     pub attestation: CellAttestation,
 }
@@ -976,7 +1034,11 @@ const SCHEMA_STATE_SQL: &str = "SELECT
     put_reservation_schema_revision,
     pg_catalog.encode(put_reservation_migration_blake3, 'hex'),
     put_reservation_install_revision::text,
-    put_reservation_installed_at_unix_ms
+    put_reservation_installed_at_unix_ms,
+    dispatcher_identity_schema_revision,
+    pg_catalog.encode(dispatcher_identity_migration_blake3, 'hex'),
+    dispatcher_identity_install_revision::text,
+    dispatcher_identity_installed_at_unix_ms
   FROM object_store_retention.object_dispatch_retention_schema_state
  WHERE singleton";
 
@@ -1094,7 +1156,7 @@ pub async fn apply_cell_install_plan(
 ) -> Result<
     (
         CellInstallDisposition,
-        [(CellSchemaLayerId, LayerInstallOutcome); 3],
+        [(CellSchemaLayerId, LayerInstallOutcome); 4],
     ),
     CellSchemaError,
 > {
@@ -1108,6 +1170,10 @@ pub async fn apply_cell_install_plan(
         (CellSchemaLayerId::Authority, LayerInstallOutcome::Created),
         (
             CellSchemaLayerId::PutReservation,
+            LayerInstallOutcome::Created,
+        ),
+        (
+            CellSchemaLayerId::DispatcherIdentity,
             LayerInstallOutcome::Created,
         ),
     ];
@@ -1399,7 +1465,7 @@ async fn call_layer_install(
 
 async fn read_layer_identities(
     client: &Client,
-) -> Result<[(CellSchemaLayerId, LayerIdentity); 3], CellSchemaError> {
+) -> Result<[(CellSchemaLayerId, LayerIdentity); 4], CellSchemaError> {
     // 0011 revokes every privilege on the schema-state table from all three service roles, so the
     // tuples are readable only as the schema owner. The migrator is a member of the owner role by
     // the install precondition above, which is what makes this legitimate rather than a widening.
@@ -1441,6 +1507,7 @@ async fn read_layer_identities(
         (CellSchemaLayerId::Retention, LayerIdentity::Absent),
         (CellSchemaLayerId::Authority, LayerIdentity::Absent),
         (CellSchemaLayerId::PutReservation, LayerIdentity::Absent),
+        (CellSchemaLayerId::DispatcherIdentity, LayerIdentity::Absent),
     ];
     for (index, layer) in CELL_SCHEMA_LAYERS.iter().enumerate() {
         identities[index] = (layer.id, read_layer_identity(row, index * 4, layer)?);

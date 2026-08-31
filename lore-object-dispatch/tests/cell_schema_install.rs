@@ -40,7 +40,8 @@ use lore_object_dispatch::cell_schema_install::validate_cell_install_set_digests
 // guard, and a source-dark check).
 // ---------------------------------------------------------------------------------------------
 
-const CELL_INSTALLED_MIGRATION_NUMBERS: [u16; 13] = [2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+const CELL_INSTALLED_MIGRATION_NUMBERS: [u16; 15] =
+    [2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
 
 fn migrations_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations")
@@ -200,7 +201,7 @@ fn embedded_bytes_are_the_frozen_bytes() {
 #[test]
 fn plan_interleaves_layer_installs_immediately_after_their_ddl_step() {
     let plan = cell_install_plan();
-    assert_eq!(plan.len(), 16);
+    assert_eq!(plan.len(), 19);
 
     let ddl_indices: Vec<usize> = plan
         .iter()
@@ -299,6 +300,18 @@ fn layer_contract_matches_the_frozen_sql() {
             read_state_retired_after: Some(12),
             installed_after_migration: 11,
             migration_blake3_hex: "56b6b891f6fa44875494a9d644b1a8ad66f1f87be5f886efeb324da05cb2ae67",
+        },
+        Expected {
+            id: CellSchemaLayerId::DispatcherIdentity,
+            api_revision: "object-store-dispatch-dispatcher-identity-provisioning-v1",
+            schema_revision: "object-store-dispatch-dispatcher-identity-schema-v1",
+            install_function: "object_store_dispatch_dispatcher_identity_install_v1",
+            read_state_function: "object_store_dispatch_dispatcher_identity_read_state_v1",
+            // Not retired: 0019's readback asserts only the objects it names, so a later migration
+            // cannot invalidate it the way 0012 invalidates 0011's whole-schema manifest.
+            read_state_retired_after: None,
+            installed_after_migration: 19,
+            migration_blake3_hex: "390a1275927fc9273746a8180aab42ab7c446be6283a82f1263026fbee0f755b",
         },
     ];
 
