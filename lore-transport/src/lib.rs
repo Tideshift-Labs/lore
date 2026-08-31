@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 pub mod auth;
 pub mod connection;

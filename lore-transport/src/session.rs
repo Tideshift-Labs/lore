@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::sync::Weak;
@@ -8,6 +9,7 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use lore_base::error::Disconnected;
 use lore_base::lore_drain_tasks;
 use lore_base::lore_spawn_net;
 use lore_base::types::*;
@@ -78,10 +80,18 @@ impl SessionBinding {
     /// The session id to send on the connection as it is now, starting a replacement session
     /// first if the connection has been replaced since this one was issued.
     ///
-    /// The epoch is sampled before `session_start` rather than after, so a connection that is
-    /// replaced again mid-call records the older generation and the next caller rebinds. That
-    /// costs an extra round trip in a rare race and never puts a stale id on the wire, which is
-    /// the way round this has to fail.
+    /// The epoch is sampled before `session_start` rather than after, so a connection replaced
+    /// again mid-call records the older generation and the next caller rebinds. That costs an
+    /// extra round trip in a rare race, which is the way round this has to fail.
+    ///
+    /// What this guarantees is that no id is *handed out* for a generation it did not come
+    /// from. It cannot by itself guarantee the id is still current when the bytes reach the
+    /// socket, because the connection can be replaced in between. `send_with_reconnect`
+    /// re-reads the epoch after its permit wait — the one step in the path that can block for
+    /// long enough to matter — and refuses rather than sending. What is left is the few
+    /// instructions between that check and the writer being taken, which no await divides;
+    /// a replacement landing there is caught after the fact, by the send failing and
+    /// [`StorageSession::attempt`] rebinding, rather than before.
     async fn session_id(&self) -> Result<u32, ProtocolError> {
         let current = self.storage.connection_epoch();
         if let Some(id) = self.bound_to(current) {
@@ -125,6 +135,12 @@ impl SessionBinding {
         self.session.lock().epoch = None;
     }
 }
+
+/// The epoch the QUIC client stores when it stops trying to reconnect.
+///
+/// Not a generation, so a session is never bound to it and a move *to* it is not a replacement
+/// worth rebinding onto.
+const GAVE_UP_EPOCH: u32 = 0;
 
 /// Closure signature for a pending session's resolver. The resolver runs at most
 /// once and returns an eager `Arc<StorageSession>` (typically obtained by calling
@@ -256,17 +272,19 @@ impl StorageSession {
     /// Run one storage operation, allowing a single rebound retry when the connection was
     /// replaced while the command was in flight.
     ///
-    /// Retrying here is safe because of what the transport does *not* return. A mutable
-    /// command that was dispatched and then lost its response never comes back as an error —
-    /// it comes back as [`MutableOutcome::Unknown`], which is an `Ok` and returns from this
-    /// loop untouched. So an error from a mutable operation means either the request never
+    /// Retrying here is safe only because of what the transport does *not* return on this
+    /// path. A mutable command that was dispatched and then lost its response never comes back
+    /// as an error — it comes back as [`MutableOutcome::Unknown`], which is an `Ok` and leaves
+    /// this loop untouched. So an error from a mutable operation means either the request never
     /// reached the wire or the server answered it, and neither can be applied twice by asking
-    /// again on a replacement session. If that transport invariant ever changes, this retry
-    /// becomes a double-write.
+    /// again on a replacement session.
     ///
-    /// The budget is the shared end-to-end one: at most [`ATTEMPT_BUDGET`] dispatches of the
-    /// operation, with the rebind's `session_start` inside the second, and no layer below
-    /// starting a loop of its own.
+    /// That is why every mutable operation below runs its `_outcome` form through here and
+    /// collapses the unknown to an error *afterwards*, rather than calling the plain form and
+    /// letting the transport collapse it first. Collapsing underneath this loop turns an
+    /// ambiguous write into an ordinary error and this retry into a second `Put`.
+    ///
+    /// At most [`ATTEMPT_BUDGET`] dispatches of the operation itself, one rebind between them.
     async fn attempt<T, Fut>(
         &self,
         operation: impl Fn(Arc<dyn Storage>, u32) -> Fut,
@@ -287,11 +305,29 @@ impl StorageSession {
                 Err(error) => error,
             };
 
-            if attempts_left == 0 || storage.connection_epoch() == epoch {
+            // Retry only when the connection was actually replaced under the command. Zero is
+            // the transport's "reconnection gave up" sentinel rather than a new generation, so
+            // it is not a replacement to rebind onto — reading it as one spends the last
+            // attempt on a connection that is never coming back.
+            let epoch_now = storage.connection_epoch();
+            if attempts_left == 0 || epoch_now == epoch || epoch_now == GAVE_UP_EPOCH {
                 return Err(error);
             }
 
             self.unbind().await;
+        }
+    }
+
+    /// Collapse an unknown outcome into the error an unadopted caller has always seen.
+    ///
+    /// Above [`attempt`](Self::attempt), never below it: the loop needs to see the unknown to
+    /// know not to retry.
+    fn collapse<T>(outcome: MutableOutcome<T>) -> Result<T, ProtocolError> {
+        match outcome {
+            MutableOutcome::Applied(value) => Ok(value),
+            // Says the connection carrying the command is gone, which is what a caller here
+            // already saw, and claims nothing about whether the write committed.
+            MutableOutcome::Unknown(_) => Err(ProtocolError::from(Disconnected)),
         }
     }
 
@@ -402,11 +438,7 @@ impl StorageSession {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
-        self.attempt(|storage, session_id| {
-            let payload = payload.clone();
-            async move { storage.put(session_id, address, fragment, payload).await }
-        })
-        .await
+        Self::collapse(self.put_outcome(address, fragment, payload).await?)
     }
 
     /// [`put`](Self::put), reporting a dispatched request whose response was lost as
@@ -442,10 +474,7 @@ impl StorageSession {
         address: &Address,
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError> {
-        self.attempt(|storage, session_id| async move {
-            storage.verify(session_id, address, heal).await
-        })
-        .await
+        Self::collapse(self.verify_outcome(address, heal).await?)
     }
 
     /// [`verify`](Self::verify) on the typed outcome path. See [`put_outcome`](Self::put_outcome).
@@ -466,12 +495,10 @@ impl StorageSession {
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError> {
-        self.attempt(|storage, session_id| async move {
-            storage
-                .copy(session_id, source_partition, source_address, target_context)
-                .await
-        })
-        .await
+        Self::collapse(
+            self.copy_outcome(source_partition, source_address, target_context)
+                .await?,
+        )
     }
 
     /// [`copy`](Self::copy) on the typed outcome path. See [`put_outcome`](Self::put_outcome).
@@ -531,15 +558,10 @@ impl StorageSession {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
-        self.attempt(|storage, session_id| {
-            let payload = payload.clone();
-            async move {
-                storage
-                    .put_resolved(session_id, key, address, fragment, payload)
-                    .await
-            }
-        })
-        .await
+        Self::collapse(
+            self.put_resolved_outcome(key, address, fragment, payload)
+                .await?,
+        )
     }
 
     /// [`put_resolved`](Self::put_resolved) on the typed outcome path. See
@@ -571,12 +593,7 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<(), ProtocolError> {
-        self.attempt(|storage, session_id| async move {
-            storage
-                .mutable_store(session_id, key, value, key_type)
-                .await
-        })
-        .await
+        Self::collapse(self.mutable_store_outcome(key, value, key_type).await?)
     }
 
     /// [`mutable_store`](Self::mutable_store) on the typed outcome path. See
@@ -602,12 +619,10 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
-        self.attempt(|storage, session_id| async move {
-            storage
-                .mutable_compare_and_swap(session_id, key, expected, value, key_type)
-                .await
-        })
-        .await
+        Self::collapse(
+            self.mutable_compare_and_swap_outcome(key, expected, value, key_type)
+                .await?,
+        )
     }
 
     /// [`mutable_compare_and_swap`](Self::mutable_compare_and_swap) on the typed outcome path.
@@ -641,9 +656,11 @@ impl Drop for StorageSession {
         if let SessionInner::Resolved(r) = &self.inner {
             let storage = r.binding.storage.clone();
             let bound = *r.binding.session.lock();
-            // An unbound session has no id the current connection would recognise, and the
-            // connection that issued the old one has already discarded it.
-            if bound.epoch.is_some() {
+            // Stopping a session is still putting its id on the wire, so it obeys the same rule
+            // as every other command: only on the connection that issued it. A session from a
+            // replaced connection needs no stop — that connection discarded its whole session
+            // map when it went — and sending one would be the exact defect this fix removes.
+            if bound.epoch == Some(storage.connection_epoch()) {
                 lore_base::lore_spawn_net!(async move {
                     let _ = storage.session_stop(bound.id).await;
                 });

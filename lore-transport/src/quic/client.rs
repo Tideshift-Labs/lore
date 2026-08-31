@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::future::Future;
 use std::net::IpAddr;
@@ -586,6 +587,14 @@ where
                 service_client.map_send_error(request_type, SendWithReconnectError::PermitAcquire)
             );
         };
+        // Waiting for a permit can take arbitrarily long under load, which makes it the one
+        // place a connection is likely to be replaced between the caller resolving its session
+        // and this sending. Re-read before framing anything, so a session id issued on the
+        // generation that is now gone is not written to its replacement.
+        if session_id != 0 && service_client.quic().epoch.load(Ordering::Relaxed) != epoch {
+            return Err(service_client
+                .map_send_error(request_type, SendWithReconnectError::SessionRebindRequired));
+        }
         match send_command_tracked::<HIGH_PRIORITY>(
             service_client.quic().clone(),
             request_type.into(),
@@ -654,6 +663,18 @@ fn classify<ServiceClientType>(
 where
     ServiceClientType: ServiceClient,
 {
+    // Ambiguity first, whatever the error kind and whatever the epoch has done. Every error
+    // below is either an answer the server sent or a failure before the wire, so reaching this
+    // means the request went out and its answer did not come back — and for a command that must
+    // not be repeated, that is the whole verdict. Checking it per-branch instead left
+    // `WriteChunks` and `Read` reporting an ambiguous write as a plain failure.
+    if outcome_is_unknown(
+        service_client.replay_class(request_type),
+        failure.dispatched,
+    ) {
+        return Verdict::Unknown;
+    }
+
     match failure.error {
         // Answers from the server that reconnecting cannot change. Bubble them up.
         QuicClientError::SlowDown
@@ -663,36 +684,15 @@ where
             request_type,
             SendWithReconnectError::ClientError(failure.error.clone()),
         )),
-        // A non-retryable connection error, so mark as disconnected immediately — but the
-        // connection dying is exactly when a dispatched write's answer goes missing, so its
-        // ambiguity is reported before its unrecoverability.
-        QuicClientError::CrytpoError => {
-            if outcome_is_unknown(
-                service_client.replay_class(request_type),
-                failure.dispatched,
-            ) {
-                Verdict::Unknown
-            } else {
-                Verdict::Failed(
-                    service_client
-                        .map_send_error(request_type, SendWithReconnectError::Disconnected),
-                )
-            }
-        }
-        // Errors that call for a reconnect — unless the command is one that must not be sent
-        // twice. Deciding that here, before anything reconnects, is what keeps a lost mutable
-        // response from costing a second dispatch: no replacement connection is established,
-        // no replacement `session_start` runs, and no epoch-N+1 byte of any kind is sent.
-        QuicClientError::Terminated | QuicClientError::StreamOpen => {
-            if outcome_is_unknown(
-                service_client.replay_class(request_type),
-                failure.dispatched,
-            ) {
-                Verdict::Unknown
-            } else {
-                Verdict::Reconnect
-            }
-        }
+        // A non-retryable connection error, so mark as disconnected immediately.
+        QuicClientError::CrytpoError => Verdict::Failed(
+            service_client.map_send_error(request_type, SendWithReconnectError::Disconnected),
+        ),
+        // Errors that call for a reconnect. The ambiguous case already returned above, so
+        // reaching a reconnect means no dispatched no-replay command is waiting on it: nothing
+        // establishes a replacement connection, runs a replacement `session_start`, or sends an
+        // epoch-N+1 byte on behalf of a command that must not be repeated.
+        QuicClientError::Terminated | QuicClientError::StreamOpen => Verdict::Reconnect,
         // The server did answer, but the answer may be a consequence of something else
         // replacing the connection under us.
         _ => {
@@ -712,21 +712,11 @@ where
             }
             // The connection was replaced while this command was in flight, by somebody else's
             // reconnect. Whatever id it carried belongs to the connection that is gone, so
-            // nothing is resent: either the outcome is unknown, or the session-aware layer
-            // resolves a replacement session first.
-            if outcome_is_unknown(
-                service_client.replay_class(request_type),
-                failure.dispatched,
-            ) {
-                Verdict::Unknown
-            } else {
-                Verdict::Failed(
-                    service_client.map_send_error(
-                        request_type,
-                        SendWithReconnectError::SessionRebindRequired,
-                    ),
-                )
-            }
+            // nothing is resent here; the session-aware layer resolves a replacement first.
+            Verdict::Failed(
+                service_client
+                    .map_send_error(request_type, SendWithReconnectError::SessionRebindRequired),
+            )
         }
     }
 }
@@ -1669,7 +1659,6 @@ async fn send_command_tracked<const HIGH_PRIORITY: bool>(
             lore_debug!("No quic stream available when sending command");
             return Err(SendFailure::not_dispatched(QuicClientError::StreamOpen));
         }
-
         // Select stream based on priority, computed inside lock to avoid living across await points
         let reader_count = connection_lock.reader.len() as u32;
         let stream_index = select_stream(

@@ -130,11 +130,19 @@ impl<T> MutableOutcome<T> {
     }
 }
 
-/// Total attempts one caller-visible operation may consume, end to end.
+/// Dispatches of one caller-visible operation, end to end.
 ///
-/// Transport reconnect, session rebind, authorization refresh, operation policy, and caller
-/// retry all spend from this one budget. No layer resets it and no layer nests a fresh one
-/// inside it, so the worst case is the original attempt plus a single rebound retry.
+/// The operation itself is attempted at most this many times: the original, plus one retry
+/// after the session has been rebound onto the replacement connection. Nothing below the
+/// session layer starts a loop of its own, and nothing resets this count part-way, so a
+/// recovery cannot turn into a retry storm.
+///
+/// It bounds the *operation*, not every message the recovery sends. Re-establishing a session
+/// is a command in its own right and carries its own single retry, so the honest worst case
+/// for one caller operation is two dispatches of the operation, at most one replacement
+/// `session_start` between them, and at most one reconnect per attempt. Counting the
+/// `session_start` as if it were a third attempt of the operation would be as misleading as
+/// pretending it costs nothing.
 pub const ATTEMPT_BUDGET: u32 = 2;
 
 /// The replay class of a QUIC storage command.
