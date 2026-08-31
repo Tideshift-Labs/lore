@@ -96,12 +96,19 @@ $inventory = @(
         Package       = 'lore-server'
         Target        = 'lib'
         Exact         = $false
-        # Both modules this runner draws from. `domain::tests::` holds the
-        # never-migrated boot regression; without its prefix a sibling live case
-        # added there would be silently NOT RUN.
+        # `grpc::handlers::branch_push::governed_tests::` is this runner's alone, so
+        # the prefix polices the whole module.
+        #
+        # `domain::tests::` no longer can. It became a shared module when WP-116 added
+        # `a_mediated_prepare_key_cannot_be_consumed_by_a_repository_scoped_governed_mutation`
+        # there, which `run-domain-enforcement-live.ps1` owns and runs as its seventh
+        # case. Claiming the prefix here would assert that this runner owns every live
+        # case in that module, which it does not, and the guard correctly refused to
+        # start rather than under-run. Per the shared-module rule above, the boot
+        # regression this runner DOES own stays policed by exact name in `Cases`, so
+        # nothing this tier covers became silently skippable.
         ExactPrefixes = @(
-            'grpc::handlers::branch_push::governed_tests::',
-            'domain::tests::'
+            'grpc::handlers::branch_push::governed_tests::'
         )
         Cases         = @(
             'domain::tests::a_never_migrated_postgres_cell_boots_on_the_legacy_lock_route',
