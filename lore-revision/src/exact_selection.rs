@@ -1673,6 +1673,8 @@ pub async fn commit_exact_selection(
 mod tests {
     use std::collections::BTreeSet;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     use async_trait::async_trait;
     use lore_base::error::NoRemote;
@@ -1688,6 +1690,7 @@ mod tests {
 
     use super::*;
     use crate::branch;
+    use crate::commit::CommitOptions;
     use crate::interface::ExecutionContext;
     use crate::interface::LoreGlobalArgs;
     use crate::lore::BranchId;
@@ -2453,5 +2456,364 @@ mod tests {
                 }],
             }
         );
+    }
+
+    // -- Store-after-finalize ordering (`commit_exact_selection` composes
+    //    `commit_staged_revision` + `finalize_exact_commit` + `modified_times.store()`
+    //    directly, rather than going through `commit()`) --------------------------
+
+    /// A real disk-backed `MutableStore` that fails every `store()` call to one
+    /// pre-known key once `armed`, and passes everything else straight through to
+    /// a real `LocalMutableStore`. Unlike `FaultInjectingMutableStore` above (which
+    /// matches by ordinal call number, suited to a narrow, fully-enumerated call
+    /// sequence), this matches by key identity so it can be wired into a full,
+    /// realistic `commit_exact_selection` run without needing to know or hardcode
+    /// how many unrelated store calls precede the one under test.
+    struct FailKeyMutableStore {
+        inner: Arc<LocalMutableStore>,
+        poison_key: Hash,
+        armed: Arc<AtomicBool>,
+        triggered: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl MutableStore for FailKeyMutableStore {
+        async fn load(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            key_type: KeyType,
+        ) -> Result<Hash, StoreError> {
+            self.inner.clone().load(partition, key, key_type).await
+        }
+
+        async fn store(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            value: Hash,
+            key_type: KeyType,
+        ) -> Result<(), StoreError> {
+            if self.armed.load(Ordering::SeqCst) && key == self.poison_key {
+                self.triggered.store(true, Ordering::SeqCst);
+                return Err(StoreError::internal(
+                    "injected finalize anchor-write failure",
+                ));
+            }
+            self.inner
+                .clone()
+                .store(partition, key, value, key_type)
+                .await
+        }
+
+        async fn compare_and_swap(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            expected: Hash,
+            value: Hash,
+            key_type: KeyType,
+        ) -> Result<Hash, StoreError> {
+            self.inner
+                .clone()
+                .compare_and_swap(partition, key, expected, value, key_type)
+                .await
+        }
+
+        async fn list(
+            self: Arc<Self>,
+            partition: Partition,
+            key_type: KeyType,
+        ) -> Result<KeyValueStream, StoreError> {
+            self.inner.clone().list(partition, key_type).await
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+    }
+
+    fn store_order_execution() -> Arc<ExecutionContext> {
+        Arc::new(ExecutionContext::new_client_with_user_id(
+            LoreGlobalArgs::default().set_offline(),
+            EventDispatcher::no_dispatch(),
+            "exact-selection-store-order-test".to_string(),
+        ))
+    }
+
+    /// A real, disk-backed repository with a legitimate baseline commit already
+    /// published, wired so the caller can arm a deterministic write failure on the
+    /// branch-latest anchor -- `finalize_exact_commit`'s first authoritative write
+    /// -- at a moment of the caller's choosing (after the baseline commit, so the
+    /// baseline itself is unaffected).
+    // Test fixture writes the working-tree file directly, outside repository
+    // token discipline -- there is no staged content yet for a token-gated
+    // helper to write.
+    #[allow(clippy::disallowed_methods)]
+    async fn build_exact_selection_store_order_fixture() -> (
+        tempfile::TempDir,
+        Arc<RepositoryContext>,
+        RepositoryWriteToken,
+        PathBuf,
+        BranchId,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+    ) {
+        let tempdir = tempfile::tempdir().expect("create real mutable-store fixture");
+        let store_path = tempdir.path().join("store");
+        let repository_path = tempdir.path().join("repository");
+        std::fs::create_dir_all(&repository_path).expect("create repository fixture path");
+
+        let immutable = lore_storage::LocalImmutableStore::new(
+            Some(store_path.clone()),
+            lore_storage::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create disk-backed immutable store");
+        let real_mutable = Arc::new(
+            LocalMutableStore::new(
+                Some(&store_path),
+                MutableStoreSettings::default(),
+                immutable.clone(),
+            )
+            .await
+            .expect("create disk-backed mutable store"),
+        );
+
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+        let instance_id = crate::instance::InstanceId::generate();
+        let branch = BranchId::from(uuid::Uuid::now_v7());
+
+        // The branch-latest anchor key is deterministic from (salt, repository id,
+        // branch id) alone, so it can be computed before the repository -- let alone
+        // any commit -- exists.
+        let (poison_key, _) = crate::branch::mutable_key(
+            RepositoryFormat::Lore.salt(),
+            branch::LATEST,
+            repository_id,
+            branch,
+        );
+        let armed = Arc::new(AtomicBool::new(false));
+        let triggered = Arc::new(AtomicBool::new(false));
+        let mutable: Arc<dyn MutableStore> = Arc::new(FailKeyMutableStore {
+            inner: real_mutable,
+            poison_key,
+            armed: armed.clone(),
+            triggered: triggered.clone(),
+        });
+
+        let token = RepositoryWriteToken::acquire(&repository_path).await;
+        let repository = Arc::new(
+            RepositoryContext::new(RepositoryContextCreationArgs {
+                path: Some(repository_path.clone()),
+                immutable_store: immutable,
+                mutable_store: mutable,
+                id: repository_id,
+                instance_id,
+                remote: Err(ProtocolError::from(NoRemote)),
+                filter: Arc::default(),
+                format: RepositoryFormat::Lore,
+                filesystem_provider: None,
+            })
+            .with_write_token(token.share()),
+        );
+
+        crate::instance::register_instance(
+            &repository,
+            instance_id,
+            &repository_path.display().to_string(),
+        )
+        .await
+        .expect("register instance");
+        branch::create(
+            repository.clone(),
+            &token,
+            branch,
+            "main",
+            branch::default_category(),
+            "exact-selection-store-order-test",
+            crate::util::time::timestamp(),
+            vec![],
+            false,
+            false,
+        )
+        .await
+        .expect("create default branch");
+        crate::instance::store_current_anchor_branch(&repository, branch)
+            .await
+            .expect("seed current-branch anchor");
+
+        // A real baseline commit, going through the ordinary `commit()` path (not
+        // exact-selection), so the branch's LATEST/LATEST_STATUS/LATEST_HISTORY and
+        // the current/staged anchors all carry legitimate values before the test
+        // arms the poisoned key -- exact-selection's early reads (`load_current_anchor`,
+        // `branch::load_latest`) require exactly this state to already exist.
+        std::fs::write(repository_path.join("baseline.txt"), b"baseline\n")
+            .expect("write baseline fixture file");
+        crate::file::stage::stage(
+            repository.clone(),
+            &token,
+            LoreArray::from_vec(vec![LoreString::from(&repository_path)]),
+            StageOptions {
+                case_change: StageCaseChange::Error,
+                scan: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("stage baseline fixture file");
+        commit::commit(
+            repository.clone(),
+            &token,
+            CommitOptions::new("baseline".to_string()),
+        )
+        .await
+        .expect("commit baseline revision");
+
+        (
+            tempdir,
+            repository,
+            token,
+            repository_path,
+            branch,
+            armed,
+            triggered,
+        )
+    }
+
+    fn exact_add(path: &str, bytes: &[u8]) -> SelectedFile {
+        SelectedFile {
+            path: path.to_string(),
+            expected_effective_action: ExpectedFileAction::Add,
+            source_hash: Some(hex::encode(Md5::digest(bytes))),
+            file_metadata: FileMetadataSelection::Unchanged,
+        }
+    }
+
+    /// Positive control for the ordering property below: a successful
+    /// exact-selection commit (finalize succeeds) must store the modified times it
+    /// recorded while fragmenting the new file, exactly as `commit()` does for the
+    /// ordinary commit path.
+    // Test fixture writes the working-tree file directly, outside repository
+    // token discipline -- there is no staged content yet for a token-gated
+    // helper to write.
+    #[allow(clippy::disallowed_methods)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn commit_exact_selection_stores_modified_times_after_a_successful_finalize() {
+        LORE_CONTEXT
+            .scope(store_order_execution(), async {
+                let (_tempdir, repository, token, repository_path, _branch, armed, triggered) =
+                    build_exact_selection_store_order_fixture().await;
+                // Not armed for this test, but confirm the fixture itself never
+                // trips the poison during the exercised call, or a false positive
+                // here would be indistinguishable from a passing test.
+                assert!(!armed.load(Ordering::SeqCst));
+
+                std::fs::write(repository_path.join("added.txt"), b"exact add\n")
+                    .expect("write exact-selection fixture file");
+
+                let path =
+                    RelativePath::new_from_initial_path("added.txt").expect("clean relative path");
+                assert_eq!(
+                    state::file_modified_time(repository.clone(), &path).await,
+                    0,
+                    "sanity: nothing recorded for a path before exact-selection has run"
+                );
+
+                commit_exact_selection(
+                    repository.clone(),
+                    &token,
+                    ExactSelectionOptions {
+                        message: "exact selection stores modified times".to_string(),
+                        files: vec![exact_add("added.txt", b"exact add\n")],
+                        revision_metadata: Vec::new(),
+                        stats: false,
+                    },
+                )
+                .await
+                .expect("exact-selection commit succeeds");
+
+                assert!(
+                    !triggered.load(Ordering::SeqCst),
+                    "positive control must not exercise the poisoned key"
+                );
+                let recorded = state::file_modified_time(repository.clone(), &path).await;
+                assert_ne!(
+                    recorded, 0,
+                    "a successful exact-selection commit must store the modified times \
+                     it recorded while fragmenting the added file"
+                );
+            })
+            .await;
+    }
+
+    /// A `finalize_exact_commit` failure must store nothing: the modified time
+    /// `commit_staged_revision` already recorded in memory for the fragmented file
+    /// must never reach the mutable store for a revision that never became current.
+    /// Recording a time for a revision that did not land is exactly the correctness
+    /// defect upstream's `RecordedModifiedTimes` design fixes -- a following `stage`
+    /// would then trust a cached witness describing content the working copy was
+    /// never advanced to.
+    // Test fixture writes the working-tree file directly, outside repository
+    // token discipline -- there is no staged content yet for a token-gated
+    // helper to write.
+    #[allow(clippy::disallowed_methods)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn commit_exact_selection_stores_nothing_when_finalize_fails() {
+        LORE_CONTEXT
+            .scope(store_order_execution(), async {
+                let (_tempdir, repository, token, repository_path, _branch, armed, triggered) =
+                    build_exact_selection_store_order_fixture().await;
+
+                std::fs::write(repository_path.join("added.txt"), b"exact add\n")
+                    .expect("write exact-selection fixture file");
+
+                let path =
+                    RelativePath::new_from_initial_path("added.txt").expect("clean relative path");
+                assert_eq!(
+                    state::file_modified_time(repository.clone(), &path).await,
+                    0,
+                    "sanity: nothing recorded for a path before exact-selection has run"
+                );
+
+                // Arm only now: the baseline commit inside the fixture already
+                // wrote this exact key once (legitimately) and must not be
+                // disturbed, only the write `finalize_exact_commit` makes below.
+                armed.store(true, Ordering::SeqCst);
+
+                let error = commit_exact_selection(
+                    repository.clone(),
+                    &token,
+                    ExactSelectionOptions {
+                        message: "exact selection finalize failure stores nothing".to_string(),
+                        files: vec![exact_add("added.txt", b"exact add\n")],
+                        revision_metadata: Vec::new(),
+                        stats: false,
+                    },
+                )
+                .await
+                .expect_err("poisoned branch-latest anchor write must reject the commit");
+
+                assert!(
+                    triggered.load(Ordering::SeqCst),
+                    "the injected fault must actually have fired for this to be a \
+                     meaningful negative control"
+                );
+                assert!(
+                    matches!(
+                        error.kind(),
+                        ExactSelectionErrorKind::PublicationFailure { .. }
+                    ),
+                    "unexpected exact-selection error shape: {error:?}"
+                );
+                assert_eq!(
+                    state::file_modified_time(repository.clone(), &path).await,
+                    0,
+                    "a finalize_exact_commit failure must store no modified time, even \
+                     though commit_staged_revision already recorded one in memory for \
+                     the fragmented file"
+                );
+            })
+            .await;
     }
 }

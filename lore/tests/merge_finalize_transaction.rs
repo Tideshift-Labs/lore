@@ -409,7 +409,11 @@ mod tests {
         let empty = Fixture::new("lore-merge-finalize-empty-").await;
         let (status, capture) = finalize_and_capture(&empty, "must reject empty").await;
         let expected = NothingStaged;
-        assert_eq!(expected.ffi_code(), 21);
+        // These three codes are the CLI's process exit status, so they are a
+        // contract and not an implementation detail. The numbers live in
+        // `lore-base/src/error.rs` as `#[ffi_code(..)]`; upstream regrouped them
+        // into blocks in b98b4d6, which is what a mismatch here usually means.
+        assert_eq!(expected.ffi_code(), 40);
         assert_terminal_contract(status, &capture, expected.ffi_code(), &expected.to_string());
         assert!(capture.lock().expect("capture lock").revision.is_none());
 
@@ -422,7 +426,7 @@ mod tests {
         let expected = InvalidArguments {
             reason: "merge finalize rejected: no fully-resolved branch merge is staged".into(),
         };
-        assert_eq!(expected.ffi_code(), 1);
+        assert_eq!(expected.ffi_code(), 3);
         assert_terminal_contract(status, &capture, expected.ffi_code(), &expected.to_string());
         assert!(capture.lock().expect("capture lock").revision.is_none());
         let after = fixture.status().await;
@@ -440,7 +444,7 @@ mod tests {
         let expected = Conflict {
             path: "shared.txt".to_string(),
         };
-        assert_eq!(expected.ffi_code(), 23);
+        assert_eq!(expected.ffi_code(), 43);
         assert_terminal_contract(status, &capture, expected.ffi_code(), &expected.to_string());
         assert!(capture.lock().expect("capture lock").revision.is_none());
         let after_unresolved = fixture.status().await;

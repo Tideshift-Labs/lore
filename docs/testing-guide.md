@@ -221,13 +221,12 @@ will update an older check constraint or state schema.
   invariant under swapping the decisive/ambiguous arms, so the two tests that pin that mapping
   directly are load-bearing rather than redundant with it.
   `validate_endpoint_host` accepts a single-label host (`minio`, `localhost`).
-  Double pattern: one generic closure-scripted double per trait, `new` returning
-  `(Self, Rc<Cell<u32>>)` — the double moves into the client, so the counter handle must outlive
-  it; to capture what the double *receives* rather than just count calls, close over an
-  `Rc<RefCell<Option<T>>>` in the same closure — and when the received type is deliberately not
-  `Clone` (as `ProviderChargeRequest` is, so no implementation can retain a chargeable value past
-  the call), copy the fields you assert on into a plain struct of your own rather than reaching for
-  the value itself. INV-EJ P1 (round 4):
+  Double pattern: one closure-scripted double per trait, `new` returning `(Self, Rc<Cell<u32>>)`
+  (the counter handle must outlive the double once moved into the client); close over an
+  `Rc<RefCell<Option<T>>>` in the same closure to capture what it *receives*, not just call counts.
+  When the received type is deliberately non-`Clone` (`ProviderChargeRequest`, so nothing can retain
+  a chargeable value past the call), copy the asserted fields into your own plain struct instead.
+  INV-EJ P1 (round 4):
   `ProviderAttemptLedger::new` now takes `(provider_boundary_id, logical_request_id) ->
   Result<Self, _>` (no `Default`), and `execute` refuses a request naming a different
   boundary/logical-request than the ledger is bound to with `LedgerRequestMismatch`, checked before
@@ -515,6 +514,11 @@ will update an older check constraint or state schema.
 ### Deterministic async tests
 
 - Use `#[tokio::test(start_paused = true)]` and `tokio::time::advance` for timer-driven behavior.
+  Unsound when the awaited work is real cross-thread I/O (`lore_io::IoDriver`), not a pure timer —
+  `tokio::time::timeout` reported the full budget elapsed regardless of actual outcome (revert-
+  checked: a comparison broken to resolve on the first check still took the full 10ms), because
+  paused-clock auto-advance races ahead of the real I/O completion. Use the real, unpaused clock
+  instead against the function's own small budget — `state.rs`'s `wait_until_settled_*` tests.
 - Use near-zero retry policies for behavioral tests; keep one explicit real-default test when the
   default delay itself is part of the contract.
 - Exact-selection lifecycle callbacks provide deterministic filesystem fault points without a
@@ -549,6 +553,13 @@ will update an older check constraint or state schema.
 - A migration-owned schema block needs a legacy-non-inheritance pin: assert the sibling store's
   older auto-bootstrap `SCHEMA` const never names the new relations, so an edit can't silently fold
   new DDL into the legacy path. See `lore-postgres/store/immutable_store.rs` (CR-031/WP-118).
+- A thin wrapper delegating to a shared inner impl needs a test calling the wrapper itself, not the
+  inner fn through another caller — a merge can drop/replace one delegated argument at just that
+  call site. Observe the caller-owned output's effect end-to-end, not just that the call returned
+  `Ok` (`commit.rs`'s `commit_files_and_rehash_wrapper_forwards_callers_modified_times`).
+- To pin a "store only after X succeeds" ordering property through a realistic pipeline with many
+  unrelated store calls first, fault-inject by key identity (computed ahead via its own public
+  derivation), not ordinal call number, which only works for a fully enumerated narrow sequence.
 
 ### Postgres parameter typing and retry classification
 
@@ -821,36 +832,24 @@ current-thread/one-worker runs and event or stage-end counts do not prove topolo
   exist without first confirming an intentionally-broken filter reproduces the same "0 tests" shape
   -- that proves the parser path is reachable, not vacuous.
 - `Format-Table -AutoSize | Out-String | Write-Host` truncates columns to the host's reported
-  console width, which a non-interactive/redirected `pwsh -File` invocation can report as
-  narrower than an interactive terminal -- a results table can silently drop its rightmost
-  columns (status/pass/fail counts) with no error. Pin a width: `Out-String -Width 200`.
+  console width, narrower for a redirected `pwsh -File` run than an interactive terminal -- a
+  results table can silently drop its rightmost columns. Pin a width: `Out-String -Width 200`.
 - A trailing `+` at end-of-line only continues an *expression* (`$x = "a" +`\n`"b"`). A cmdlet in
-  command syntax (`Write-Host "a" +`\n`"b"`, `throw "a" +`\n`"b"`) parses `+` and the following
-  string as two more positional arguments, not concatenation -- confirmed: the literal `+` and a
-  line break land mid-message in the output. Fix: assign the concatenation to a variable first
-  (`$message = "a" +`\n`"b"`, which *is* expression context) and pass that variable to the cmdlet.
+  command syntax parses `+` and the following string as two more positional arguments, not
+  concatenation. Fix: assign the concatenation to a variable first (expression context), then pass
+  that to the cmdlet.
 - Cross-check a runner's hardcoded live-test name/target map against ground truth before trusting
   it: `cargo test -p <crate> -- --ignored --list` needs no infrastructure and enumerates every
-  `<name>: test` line under each `Running tests\<target>.rs` header. Diff both directions -- every
-  hardcoded entry must appear in the list (catches a rename), and every list entry must appear in
-  the hardcoded map (catches an unnoticed new live test) -- treat either direction failing as a
-  hard error, not a warning. A `#[cfg(target_os = "linux")]`-gated test is unenumerable (not merely
-  filtered) on a non-Linux rig, so a runner must name it NOT RUN from static source knowledge, not
-  from this catalog.
-- Piping a long-running provisioning script through `head` (or any early-closing consumer, e.g.
-  `... | tee log | head -5`) can `SIGPIPE` it mid-run without killing the underlying process tree --
-  the foreground shell call returns once the truncating consumer exits, but a detached child (here,
-  the `pwsh.exe` driving Docker) can keep running unobserved, still holding a labelled container
-  open. Redirect to a file and read it after the process exits instead of piping through a
-  line-limiting consumer.
-- A container label that merely restates the container's own name (e.g. a `run-id` label derived
-  from the same GUID embedded in the name) proves only self-consistency, not ownership -- true for
-  *any* correctly running instance of the script, not just the one you happen to be looking at. A
-  label-filtered `docker ps` listing never tells you the container is yours or that its creator has
-  exited. Before removing a container you did not just create in the current process, get an
-  independent ownership signal (e.g. an owning-pid label written at creation time) and confirm that
-  pid is dead -- do not infer ownership from "I just ran something and there's a matching container
-  now."
+  `<name>: test` line per target. Diff both directions as a hard error, not a warning -- every
+  hardcoded entry must appear in the list (catches a rename) and vice versa (catches an unnoticed
+  new live test). A `#[cfg(target_os = "linux")]`-gated test is unenumerable on a non-Linux rig, so
+  a runner must name it NOT RUN from static source knowledge, not from this catalog.
+- Piping a long-running provisioning script through `head` can `SIGPIPE` it mid-run without killing
+  the underlying process tree -- a detached child (`pwsh.exe` driving Docker) can keep running
+  unobserved, still holding a labelled container open. Redirect to a file instead.
+- A container label restating only its own name/GUID proves self-consistency, not ownership -- true
+  for any correctly running instance. Before removing a container you did not just create, get an
+  independent ownership signal (e.g. an owning-pid label) and confirm that pid is dead.
 
 ### Known tier limitations
 

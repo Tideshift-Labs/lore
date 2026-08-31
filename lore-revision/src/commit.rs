@@ -4402,6 +4402,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
 
+    use lore_base::runtime::LORE_CONTEXT;
+
     use super::*;
     use crate::errors::NotALayer;
 
@@ -4537,5 +4539,152 @@ mod tests {
             [published.branch_latest, original.current, original.staged],
             "failed restoration must leave the partial publication observable"
         );
+    }
+
+    /// Standalone fixture for the public `commit_files_and_rehash` wrapper: a
+    /// real disk-backed repository with one staged file, built without going
+    /// through `commit_staged_revision` (the other, already-covered call
+    /// site), so this test can observe only what the wrapper itself does with
+    /// the `modified_times` collector its caller hands it.
+    fn wrapper_fixture_execution() -> Arc<crate::interface::ExecutionContext> {
+        Arc::new(crate::interface::ExecutionContext::new_client_with_user_id(
+            crate::interface::LoreGlobalArgs::default().set_offline(),
+            crate::relay::EventDispatcher::no_dispatch(),
+            "commit-files-and-rehash-wrapper-test".to_string(),
+        ))
+    }
+
+    /// Regression for the merge that produced a `commit_files_and_rehash`
+    /// wrapper which accepted the caller's `modified_times` parameter and then
+    /// never forwarded it to `commit_files_and_rehash_with_admission`,
+    /// recording every fragmented file's time into an internal collector the
+    /// caller could never observe or `store()`.
+    ///
+    /// This calls the `pub(crate)` wrapper directly (not `commit_staged_revision`,
+    /// which delegates to `commit_files_and_rehash_with_admission` itself and so
+    /// cannot see a bug confined to the wrapper's delegation call), passes in a
+    /// `RecordedModifiedTimes` the test owns, and proves the wrapper's work
+    /// reaches that exact instance: `store()`-ing it must persist a non-zero
+    /// mtime for the file the wrapper fragmented.
+    ///
+    /// Confirmed to catch the regression: reverting the wrapper's delegation
+    /// call to build a fresh `Arc::new(RecordedModifiedTimes::default())`
+    /// in place of forwarding `modified_times` turns this test red (the
+    /// caller's collector stays empty, so `store()` is a no-op and the
+    /// read-back stays 0); restoring the forwarding turns it green again.
+    // Test fixture writes the working-tree file directly, outside repository
+    // token discipline -- there is no staged content yet for a token-gated
+    // helper to write.
+    #[allow(clippy::disallowed_methods)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn commit_files_and_rehash_wrapper_forwards_callers_modified_times() {
+        LORE_CONTEXT
+            .scope(wrapper_fixture_execution(), async {
+                let tempdir = tempfile::tempdir().expect("create temp repository dir");
+                let root = tempdir.path().to_path_buf();
+                let branch_id = BranchId::from(uuid::Uuid::now_v7());
+                let write_token = RepositoryWriteToken::acquire(&root).await;
+                let repository = crate::repository::create_local(
+                    &root,
+                    &write_token,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                    branch_id,
+                    branch::DEFAULT_DEFAULT_NAME.to_string(),
+                    crate::repository::RepositoryConfig::default(),
+                    false,
+                )
+                .await
+                .expect("create local repository fixture");
+
+                std::fs::write(root.join("tracked.txt"), b"hello world")
+                    .expect("write fixture file");
+
+                crate::file::stage::stage(
+                    repository.clone(),
+                    &write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&root)]),
+                    crate::stage::StageOptions {
+                        case_change: crate::stage::StageCaseChange::Error,
+                        node_flags: NodeFlags::NoFlags,
+                        file_id: None,
+                        no_children: false,
+                        scan: true,
+                    },
+                )
+                .await
+                .expect("stage fixture file");
+
+                let staged_revision = crate::instance::load_staged_revision(&repository)
+                    .await
+                    .expect("load staged anchor")
+                    .expect("staged anchor present after staging a new file");
+                let state_staged = State::deserialize(repository.clone(), staged_revision)
+                    .await
+                    .expect("deserialize staged state");
+
+                let metadata = build_commit_metadata(
+                    repository.clone(),
+                    &state_staged,
+                    branch_id,
+                    "wrapper forwards modified times".to_string(),
+                    LoreArray::from_vec(Vec::new()),
+                    LoreArray::from_vec(Vec::new()),
+                    LoreArray::from_vec(Vec::new()),
+                )
+                .await
+                .expect("build commit metadata fixture");
+
+                prune_dirty_for_commit(state_staged.clone(), repository.clone())
+                    .await
+                    .expect("prune dirty state before rehash");
+
+                let tracker = Arc::new(lore_storage::write_tracker::WriteTracker::new());
+                let modified_times = Arc::new(RecordedModifiedTimes::default());
+
+                // Exercise the PUBLIC WRAPPER, not `commit_staged_revision` --
+                // this is the delegation site the merge dropped the parameter at.
+                commit_files_and_rehash(
+                    repository.clone(),
+                    write_token.share(),
+                    state_staged.clone(),
+                    repository.require_path().expect("repository root path"),
+                    metadata,
+                    None,
+                    Arc::new(HashMap::new()),
+                    branch_id,
+                    tracker.clone(),
+                    modified_times.clone(),
+                )
+                .await
+                .expect("wrapper rehash succeeds");
+                tracker
+                    .await_all()
+                    .await
+                    .expect("drain rehash tracker after wrapper call");
+
+                let path = RelativePath::new_from_initial_path("tracked.txt")
+                    .expect("clean relative path");
+                assert_eq!(
+                    state::file_modified_time(repository.clone(), &path).await,
+                    0,
+                    "recording happens in-memory only; nothing is durable before store()"
+                );
+
+                // This is the caller's own collector -- if the wrapper silently
+                // built and used a fresh one internally instead of forwarding it,
+                // this `store()` call has nothing to write and the read-back below
+                // stays 0.
+                modified_times.store(repository.clone()).await;
+
+                let recorded = state::file_modified_time(repository.clone(), &path).await;
+                assert_ne!(
+                    recorded, 0,
+                    "commit_files_and_rehash must forward the caller's \
+                     RecordedModifiedTimes into the inner commit so the fragmented \
+                     file's mtime reaches it, rather than being recorded into an \
+                     internal collector the caller can never store"
+                );
+            })
+            .await;
     }
 }

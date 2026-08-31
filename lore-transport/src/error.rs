@@ -64,7 +64,7 @@ mod tests {
     use super::*;
 
     // CR-017(c): a server-side auth rejection must classify as `NotAuthenticated`
-    // (FFI 12), not collapse into the catch-all `Internal` (FFI -1) — a client
+    // (FFI 16), not collapse into the catch-all `Internal` (FFI -1) — a client
     // needs to distinguish "not authenticated" from an opaque internal error to
     // drive recovery (WP-074 Phase 1).
     #[test]
@@ -72,7 +72,9 @@ mod tests {
         let status = tonic::Status::unauthenticated("authorization header required");
         let err = ProtocolError::from(status);
         assert!(matches!(err, ProtocolError::NotAuthenticated(_)));
-        assert_eq!(err.ffi_code(), 12);
+        // Codes are `#[ffi_code(..)]` in `lore-base/src/error.rs`; upstream
+        // b98b4d6 regrouped them into blocks, which is what a mismatch means.
+        assert_eq!(err.ffi_code(), 16);
     }
 
     // Regression pin: a neighboring arm untouched by CR-017(c) still classifies
@@ -82,7 +84,7 @@ mod tests {
         let status = tonic::Status::unavailable("server unreachable");
         let err = ProtocolError::from(status);
         assert!(matches!(err, ProtocolError::Disconnected(_)));
-        assert_eq!(err.ffi_code(), 6);
+        assert_eq!(err.ffi_code(), 28);
     }
 
     // An unmapped tonic code still falls through to `Internal`, not

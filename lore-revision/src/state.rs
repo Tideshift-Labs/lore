@@ -9560,6 +9560,7 @@ pub async fn apply_tree_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
 
     /// The key every stored modification time is filed under. It has to stay the
     /// digest over the path's own lowercase form, or a scan finds nothing it wrote
@@ -9637,6 +9638,117 @@ mod tests {
         assert_eq!(
             file_modified_time_key(salt, instance, &narrowed),
             mtime_key_reference(salt, instance, &narrowed)
+        );
+    }
+
+    // -- `wait_until_settled`'s truth table: `stamp_probe(&path).await.is_none_or(|stamp|
+    // mtime_max >= stamp)` continues the wait in exactly two cases (probe failed; probe
+    // succeeded but hasn't advanced past `mtime_max`), and stops in exactly one (probe
+    // succeeded and is past `mtime_max`). `stamp_probe` does real filesystem I/O with no
+    // injectable seam, so each arm is driven through the public function against a real
+    // filesystem. `#[tokio::test(start_paused = true)]` is this guide's documented pattern
+    // for timer-driven tests elsewhere, but is unsound here: revert-checking with a
+    // deliberately broken comparison that should exit on the very first check still
+    // reported the full budget elapsed under a paused clock (`tokio::time::timeout`
+    // wrapping real, cross-thread disk I/O lets the paused-clock auto-advance race ahead
+    // of the real work, so elapsed stops discriminating). These tests use the real,
+    // unpaused clock instead, against the real `MODIFIED_TIME_SETTLE_LIMIT` budget, which
+    // is small enough (10ms) to stay fast.
+
+    /// A repository whose working-tree path does not exist on disk, wrapped around the
+    /// crate's own `#[cfg(test)]` fixture helpers so the store plumbing needs no
+    /// bespoke setup. `wait_until_settled` never creates this directory, so every probe
+    /// write inside it fails and `stamp_probe` returns `None` on every attempt.
+    async fn repository_with_unwritable_probe_path() -> Arc<RepositoryContext> {
+        let (immutable, mutable, _execution) =
+            crate::fs::filesystem_provider::tests::test_store_create()
+                .await
+                .expect("create in-memory stores");
+        let missing_root = std::env::temp_dir().join(format!(
+            "lore-wait-until-settled-missing-{}",
+            uuid::Uuid::now_v7()
+        ));
+        Arc::new(RepositoryContext::new(
+            crate::repository::test_helpers::default_repository_creation_args(immutable, mutable)
+                .with_path(&missing_root),
+        ))
+    }
+
+    /// A repository backed by a real, writable temporary directory, with the format's
+    /// dot-directory already created so a probe write there succeeds.
+    async fn repository_with_writable_probe_path() -> (tempfile::TempDir, Arc<RepositoryContext>) {
+        let (immutable, mutable, _execution) =
+            crate::fs::filesystem_provider::tests::test_store_create()
+                .await
+                .expect("create in-memory stores");
+        let tempdir = tempfile::tempdir().expect("create temp working-tree dir");
+        let repository = Arc::new(RepositoryContext::new(
+            crate::repository::test_helpers::default_repository_creation_args(immutable, mutable)
+                .with_path(tempdir.path()),
+        ));
+        std::fs::create_dir_all(tempdir.path().join(repository.format.dot_dir()))
+            .expect("create dot-dir for the probe file");
+        (tempdir, repository)
+    }
+
+    /// The reviewer's specific ask: a probe that always fails must never be read as
+    /// settled. Per the function's own doc comment, a failed probe "says nothing about
+    /// the clock -- least of all that it has moved on" -- so the wait must keep asking
+    /// (and therefore run its whole budget) rather than returning early as if settled.
+    #[tokio::test]
+    async fn wait_until_settled_never_reads_a_failed_probe_as_settled() {
+        let repository = repository_with_unwritable_probe_path().await;
+
+        let started = std::time::Instant::now();
+        wait_until_settled(&repository, u64::MAX).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= MODIFIED_TIME_SETTLE_LIMIT,
+            "a probe that always fails (the None case) must never be read as settled -- \
+             the wait must run its full budget ({MODIFIED_TIME_SETTLE_LIMIT:?}) rather than \
+             exiting early; took {elapsed:?}"
+        );
+    }
+
+    /// The complementary "probe succeeded but hasn't advanced" arm: a real probe stamp
+    /// that has not yet moved past `mtime_max` must also keep the wait open, for a
+    /// different reason than the `None` case above but the same outcome. Distinguishing
+    /// this from the `None` case is what makes the failed-probe assertion meaningful --
+    /// without it, "always waits the full budget" could just as well describe a
+    /// function that ignores the probe result entirely.
+    #[tokio::test]
+    async fn wait_until_settled_keeps_waiting_while_the_probe_has_not_advanced_past_mtime_max() {
+        let (_tempdir, repository) = repository_with_writable_probe_path().await;
+
+        let started = std::time::Instant::now();
+        wait_until_settled(&repository, u64::MAX).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= MODIFIED_TIME_SETTLE_LIMIT,
+            "a probe that succeeds but never gets past mtime_max must not be read as \
+             settled either; took {elapsed:?}"
+        );
+    }
+
+    /// The settled arm: a real probe stamp already past `mtime_max` must let the wait
+    /// return promptly rather than consuming the whole budget -- the positive control
+    /// that gives the two "keeps waiting" assertions above their meaning (without it,
+    /// "always waits the full budget" could just as well describe a function that
+    /// ignores the probe result entirely and always waits).
+    #[tokio::test]
+    async fn wait_until_settled_returns_promptly_once_the_probe_is_past_mtime_max() {
+        let (_tempdir, repository) = repository_with_writable_probe_path().await;
+
+        let started = std::time::Instant::now();
+        wait_until_settled(&repository, 0).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < MODIFIED_TIME_SETTLE_LIMIT,
+            "a probe already past mtime_max must settle promptly, not consume the full \
+             budget ({MODIFIED_TIME_SETTLE_LIMIT:?}); took {elapsed:?}"
         );
     }
 
