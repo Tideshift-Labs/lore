@@ -27,6 +27,7 @@ use lore_base::lore_info;
 use lore_base::lore_trace;
 use lore_base::lore_warn;
 use lore_error_set::prelude::*;
+use parking_lot::Mutex as SyncMutex;
 use quinn::AckFrequencyConfig;
 use quinn::IdleTimeout;
 use quinn::VarInt;
@@ -54,6 +55,11 @@ use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
 use crate::error::ProtocolError;
+use crate::replay::ATTEMPT_BUDGET;
+use crate::replay::DispatchState;
+use crate::replay::MutableOutcome;
+use crate::replay::OutcomeUnknown;
+use crate::replay::ReplayClass;
 use crate::tls::load_certs;
 use crate::tls::load_private_key;
 
@@ -285,6 +291,17 @@ pub trait ServiceClient: Send + Sync {
     fn v4_protocol(&self) -> bool {
         false
     }
+
+    /// Whether repeating `request` is safe once it has been dispatched.
+    ///
+    /// There is deliberately no default. A client that adds an opcode has to decide whether
+    /// repeating it can publish, revive, or advance server state, and the compiler is what
+    /// asks the question.
+    fn replay_class(&self, request: Self::RequestType) -> ReplayClass;
+
+    /// The wire name of `request`, carried by the typed outcome a lost mutable response
+    /// reports so a consumer identifies the operation without parsing a message.
+    fn request_name(&self, request: Self::RequestType) -> &'static str;
 }
 
 struct QuicQuinnConnection {
@@ -437,6 +454,88 @@ pub enum SendWithReconnectError {
     Disconnected,
     #[error("Reconnect to server failed")]
     ReconnectFailed,
+    /// The connection was replaced while this command was in flight, and the command was not
+    /// dispatched (or is safe to repeat). Its session id belongs to the connection that is
+    /// gone, so the send is not retried here: the session-aware layer has to resolve a
+    /// replacement session first. See [`crate::session::StorageSession`].
+    #[error("Connection replaced; session must be rebound before this command is sent again")]
+    SessionRebindRequired,
+    /// The request was dispatched on the connection that was then replaced, and its response
+    /// was lost. The command's replay class forbids sending it again, so whether the server
+    /// applied it is unknown.
+    #[error("{0}")]
+    OutcomeUnknown(OutcomeUnknown),
+}
+
+/// Where an ambiguous mutable outcome is recorded, if anywhere.
+///
+/// A generic taken by value rather than an `Option<&mut _>` parameter, for the same reason
+/// `HIGH_PRIORITY` is a const generic: the send future is the storage read path's, is
+/// heap-allocated once per request through `async_trait`, and is held to a size bound by
+/// `test_futures_size`. [`IgnoreOutcome`] is zero-sized, so a read carries no bytes for a
+/// distinction only a mutable write asks about.
+pub trait OutcomeSink: Copy + Send {
+    fn record(self, unknown: &OutcomeUnknown);
+}
+
+/// Discards the outcome. Zero-sized, and what every read path passes.
+#[derive(Clone, Copy)]
+pub struct IgnoreOutcome;
+
+impl OutcomeSink for IgnoreOutcome {
+    fn record(self, _unknown: &OutcomeUnknown) {}
+}
+
+/// Records the outcome for a caller that asked for one.
+///
+/// A shared reference so the sink stays `Copy`, and a mutex rather than a `Cell` so the future
+/// holding it is still `Send`.
+#[derive(Clone, Copy)]
+pub struct RecordOutcome<'a>(pub &'a SyncMutex<Option<OutcomeUnknown>>);
+
+impl OutcomeSink for RecordOutcome<'_> {
+    fn record(self, unknown: &OutcomeUnknown) {
+        *self.0.lock() = Some(unknown.clone());
+    }
+}
+
+/// A failed [`send_command`], with what the transport knows about whether the request reached
+/// the server.
+///
+/// The dispatch state is what separates "the server cannot have seen this" from "the server
+/// may have applied this and the answer was lost", which is the only basis on which a mutable
+/// command may or may not be sent again.
+struct SendFailure {
+    error: QuicClientError,
+    dispatched: DispatchState,
+}
+
+impl SendFailure {
+    /// A failure that happened before any request byte could reach the wire.
+    fn not_dispatched(error: QuicClientError) -> Self {
+        Self {
+            error,
+            dispatched: DispatchState::NotDispatched,
+        }
+    }
+
+    /// A failure after the request was handed to the stream, with no answer from the server.
+    /// Written this way round on purpose: a partial write may already have reached the peer,
+    /// so an incomplete write counts as dispatched rather than being assumed harmless.
+    fn response_lost(error: QuicClientError) -> Self {
+        Self {
+            error,
+            dispatched: DispatchState::DispatchedResponseLost,
+        }
+    }
+
+    /// An error the server sent back. The command reached it and it declined.
+    fn answered(error: QuicClientError) -> Self {
+        Self {
+            error,
+            dispatched: DispatchState::DispatchedAndAnswered,
+        }
+    }
 }
 
 #[error_set]
@@ -460,24 +559,34 @@ pub enum ReconnectError {
 /// cost. Using a const generic resolves the priority value at compile time through
 /// monomorphization, adding zero bytes to the future. This is validated by the
 /// `test_futures_size` test which enforces a strict upper bound on the get future size.
-pub async fn send_with_reconnect<ServiceClientType, const LEN: usize, const HIGH_PRIORITY: bool>(
+///
+/// `unknown` is how the typed path learns that the error it is about to see is an ambiguous
+/// mutable write rather than a failure. See [`OutcomeSink`] for why it is a by-value generic
+/// rather than a richer return type or an out-parameter.
+pub async fn send_with_reconnect<
+    ServiceClientType,
+    Sink,
+    const LEN: usize,
+    const HIGH_PRIORITY: bool,
+>(
     service_client: &ServiceClientType,
     request_type: ServiceClientType::RequestType,
     session_id: u32,
     chunks: impl Fn() -> [Bytes; LEN],
+    unknown: Sink,
 ) -> Result<Bytes, ServiceClientType::ErrorType>
 where
     ServiceClientType: ServiceClient,
+    Sink: OutcomeSink,
 {
-    loop {
-        let Some(permit) = service_client.acquire_command_permit().await else {
+    let epoch = service_client.quic().epoch.load(Ordering::Relaxed);
+    let failure = {
+        let Some(_permit) = service_client.acquire_command_permit().await else {
             return Err(
                 service_client.map_send_error(request_type, SendWithReconnectError::PermitAcquire)
             );
         };
-
-        let epoch = service_client.quic().epoch.load(Ordering::Relaxed);
-        match send_command::<HIGH_PRIORITY>(
+        match send_command_tracked::<HIGH_PRIORITY>(
             service_client.quic().clone(),
             request_type.into(),
             session_id,
@@ -487,67 +596,255 @@ where
         .await
         {
             Ok(payload) => return Ok(payload),
-            // error handling for things that cannot be recovered by reconnecting
-            // and should be bubbled up to the caller immediately
-            Err(err)
-                if matches!(
-                    err,
-                    QuicClientError::SlowDown
-                        | QuicClientError::NotAuthorized
-                        | QuicClientError::NotFound
-                        | QuicClientError::ClientMessageTooBig
-                ) =>
-            {
-                return Err(service_client
-                    .map_send_error(request_type, SendWithReconnectError::ClientError(err)));
-            }
-            // error handling for things that should trigger a reconnect
-            Err(QuicClientError::Terminated | QuicClientError::StreamOpen) => {
-                // Fall through to reconnect
-                drop(permit);
-            }
-            // a non retryable connection error - so just mark as disconnected immediately
-            Err(QuicClientError::CrytpoError) => {
-                return Err(service_client
-                    .map_send_error(request_type, SendWithReconnectError::Disconnected));
-            }
-            // error handling for things that have indicated an error, but the error could
-            // be related to something else that triggered a reconnect. We should see if we are
-            // reconnecting, and if we are then retry the message again otherwise bubble it up
-            Err(err) => {
-                drop(permit);
+            Err(failure) => failure,
+        }
+        // The permit is released here, before anything reconnects.
+    };
 
-                let epoch_current = service_client.quic().epoch.load(Ordering::Relaxed);
-                if epoch_current == 0 {
-                    return Err(service_client
-                        .map_send_error(request_type, SendWithReconnectError::Disconnected));
-                }
-                if epoch >= epoch_current {
-                    // Not reconnected, return failure
-                    return Err(service_client
-                        .map_send_error(request_type, SendWithReconnectError::ClientError(err)));
-                }
+    // Resolved before the await below, not across it. A `Verdict` carries a mapped error, and
+    // holding one over a reconnect would put that error in this function's future for the
+    // length of the reconnect.
+    match classify(service_client, request_type, epoch, &failure) {
+        Verdict::Failed(error) => return Err(error),
+        Verdict::Unknown => return Err(report_unknown(service_client, request_type, unknown)),
+        Verdict::Reconnect => {}
+    }
 
-                // Reconnected, loop and retry
-                continue;
+    // Everything past this point reconnects, and none of it belongs in this function's future:
+    // that future is the read path's, is heap-allocated once per request through `async_trait`,
+    // and is held to a size bound by `test_futures_size`. Boxing the recovery keeps the
+    // recovery's own state off every successful read.
+    Box::pin(reconnect_and_retry::<
+        ServiceClientType,
+        Sink,
+        LEN,
+        HIGH_PRIORITY,
+    >(
+        service_client,
+        request_type,
+        session_id,
+        chunks,
+        unknown,
+        epoch,
+        failure.error,
+    ))
+    .await
+}
+
+/// What to do about a failed send.
+enum Verdict<ErrorType> {
+    /// Definitely failed. Nothing to recover.
+    Failed(ErrorType),
+    /// Dispatched, response lost, and not repeatable.
+    Unknown,
+    /// Worth another attempt once the connection has been replaced.
+    Reconnect,
+}
+
+/// Decide a failed send's fate.
+///
+/// Synchronous on purpose: it runs between the send and the reconnect, so anything it held
+/// would live in the caller's future across the reconnect await.
+fn classify<ServiceClientType>(
+    service_client: &ServiceClientType,
+    request_type: ServiceClientType::RequestType,
+    epoch: u32,
+    failure: &SendFailure,
+) -> Verdict<ServiceClientType::ErrorType>
+where
+    ServiceClientType: ServiceClient,
+{
+    match failure.error {
+        // Answers from the server that reconnecting cannot change. Bubble them up.
+        QuicClientError::SlowDown
+        | QuicClientError::NotAuthorized
+        | QuicClientError::NotFound
+        | QuicClientError::ClientMessageTooBig => Verdict::Failed(service_client.map_send_error(
+            request_type,
+            SendWithReconnectError::ClientError(failure.error.clone()),
+        )),
+        // A non-retryable connection error, so mark as disconnected immediately — but the
+        // connection dying is exactly when a dispatched write's answer goes missing, so its
+        // ambiguity is reported before its unrecoverability.
+        QuicClientError::CrytpoError => {
+            if outcome_is_unknown(
+                service_client.replay_class(request_type),
+                failure.dispatched,
+            ) {
+                Verdict::Unknown
+            } else {
+                Verdict::Failed(
+                    service_client
+                        .map_send_error(request_type, SendWithReconnectError::Disconnected),
+                )
             }
-        };
-
-        if Box::pin(reconnect(
-            service_client.endpoint_config(),
-            service_client.alpn(),
-            service_client.auth_adapter().clone(),
-            service_client.transport_config(),
-            service_client.quic().clone(),
-            epoch,
-        ))
-        .await
-        .is_err()
-        {
-            return Err(service_client
-                .map_send_error(request_type, SendWithReconnectError::ReconnectFailed));
+        }
+        // Errors that call for a reconnect — unless the command is one that must not be sent
+        // twice. Deciding that here, before anything reconnects, is what keeps a lost mutable
+        // response from costing a second dispatch: no replacement connection is established,
+        // no replacement `session_start` runs, and no epoch-N+1 byte of any kind is sent.
+        QuicClientError::Terminated | QuicClientError::StreamOpen => {
+            if outcome_is_unknown(
+                service_client.replay_class(request_type),
+                failure.dispatched,
+            ) {
+                Verdict::Unknown
+            } else {
+                Verdict::Reconnect
+            }
+        }
+        // The server did answer, but the answer may be a consequence of something else
+        // replacing the connection under us.
+        _ => {
+            let epoch_current = service_client.quic().epoch.load(Ordering::Relaxed);
+            if epoch_current == 0 {
+                return Verdict::Failed(
+                    service_client
+                        .map_send_error(request_type, SendWithReconnectError::Disconnected),
+                );
+            }
+            if epoch >= epoch_current {
+                // Nothing reconnected, so this is a real failure.
+                return Verdict::Failed(service_client.map_send_error(
+                    request_type,
+                    SendWithReconnectError::ClientError(failure.error.clone()),
+                ));
+            }
+            // The connection was replaced while this command was in flight, by somebody else's
+            // reconnect. Whatever id it carried belongs to the connection that is gone, so
+            // nothing is resent: either the outcome is unknown, or the session-aware layer
+            // resolves a replacement session first.
+            if outcome_is_unknown(
+                service_client.replay_class(request_type),
+                failure.dispatched,
+            ) {
+                Verdict::Unknown
+            } else {
+                Verdict::Failed(
+                    service_client.map_send_error(
+                        request_type,
+                        SendWithReconnectError::SessionRebindRequired,
+                    ),
+                )
+            }
         }
     }
+}
+
+/// The cold half of [`send_with_reconnect`]: replace the connection, then spend the one
+/// remaining attempt.
+///
+/// There is no loop. The end-to-end budget is two dispatches — the caller's first and the one
+/// below — and expressing that structurally is what makes "no layer resets or nests it" a
+/// property of the code rather than of a counter someone has to reason about.
+async fn reconnect_and_retry<ServiceClientType, Sink, const LEN: usize, const HIGH_PRIORITY: bool>(
+    service_client: &ServiceClientType,
+    request_type: ServiceClientType::RequestType,
+    session_id: u32,
+    chunks: impl Fn() -> [Bytes; LEN],
+    unknown: Sink,
+    epoch: u32,
+    first_error: QuicClientError,
+) -> Result<Bytes, ServiceClientType::ErrorType>
+where
+    ServiceClientType: ServiceClient,
+    Sink: OutcomeSink,
+{
+    if reconnect(
+        service_client.endpoint_config(),
+        service_client.alpn(),
+        service_client.auth_adapter().clone(),
+        service_client.transport_config(),
+        service_client.quic().clone(),
+        epoch,
+    )
+    .await
+    .is_err()
+    {
+        return Err(
+            service_client.map_send_error(request_type, SendWithReconnectError::ReconnectFailed)
+        );
+    }
+
+    // The connection is now a new epoch with its own server-side session namespace. A captured
+    // session id from the old one is meaningless to it and must never go on the wire, so the
+    // session-aware layer resolves a replacement before anything is sent.
+    if session_id != 0 {
+        return Err(service_client
+            .map_send_error(request_type, SendWithReconnectError::SessionRebindRequired));
+    }
+
+    let epoch = service_client.quic().epoch.load(Ordering::Relaxed);
+    let failure = {
+        let Some(_permit) = service_client.acquire_command_permit().await else {
+            return Err(
+                service_client.map_send_error(request_type, SendWithReconnectError::PermitAcquire)
+            );
+        };
+        match send_command_tracked::<HIGH_PRIORITY>(
+            service_client.quic().clone(),
+            request_type.into(),
+            session_id,
+            service_client.v4_protocol(),
+            &mut chunks(),
+        )
+        .await
+        {
+            Ok(payload) => return Ok(payload),
+            Err(failure) => failure,
+        }
+    };
+
+    match classify(service_client, request_type, epoch, &failure) {
+        Verdict::Failed(error) => Err(error),
+        Verdict::Unknown => Err(report_unknown(service_client, request_type, unknown)),
+        // The budget is spent. Reconnecting again here is the nested retry the contract
+        // forbids, so the first attempt's error is what the caller is told.
+        Verdict::Reconnect => Err(service_client.map_send_error(
+            request_type,
+            SendWithReconnectError::ClientError(first_error),
+        )),
+    }
+}
+
+/// The budget this module implements structurally rather than by counting. Both dispatches are
+/// written out above; a change to the constant has to be a change to the code.
+const _: () = assert!(
+    ATTEMPT_BUDGET == 2,
+    "send_with_reconnect performs exactly one retry after a reconnect"
+);
+
+/// Record an ambiguous mutable write for a caller that asked for one, and produce the error
+/// every caller gets.
+///
+/// The error is produced either way, so a caller that did not ask sees exactly what it saw
+/// before this distinction existed rather than a new failure mode it has no handling for.
+fn report_unknown<ServiceClientType, Sink>(
+    service_client: &ServiceClientType,
+    request_type: ServiceClientType::RequestType,
+    sink: Sink,
+) -> ServiceClientType::ErrorType
+where
+    ServiceClientType: ServiceClient,
+    Sink: OutcomeSink,
+{
+    let unknown = OutcomeUnknown {
+        command: service_client.request_name(request_type),
+    };
+    sink.record(&unknown);
+    service_client.map_send_error(
+        request_type,
+        SendWithReconnectError::OutcomeUnknown(unknown),
+    )
+}
+
+/// Whether a failed command's fate is unknown rather than failed.
+///
+/// Both conditions are needed. A command that never reached the wire did not happen whatever
+/// its class, and a read that reached the wire can simply be asked again.
+fn outcome_is_unknown(replay_class: ReplayClass, dispatched: DispatchState) -> bool {
+    replay_class == ReplayClass::MutableNoReplay
+        && dispatched == DispatchState::DispatchedResponseLost
 }
 
 fn strip_ipv6_brackets(host: &str) -> &str {
@@ -1261,11 +1558,12 @@ pub fn send_normal_with_reconnect<'a, ServiceClientType, const LEN: usize>(
 where
     ServiceClientType: ServiceClient,
 {
-    send_with_reconnect::<ServiceClientType, LEN, false>(
+    send_with_reconnect::<ServiceClientType, IgnoreOutcome, LEN, false>(
         service_client,
         request_type,
         session_id,
         chunks,
+        IgnoreOutcome,
     )
 }
 
@@ -1278,12 +1576,48 @@ pub fn send_high_priority_with_reconnect<'a, ServiceClientType, const LEN: usize
 where
     ServiceClientType: ServiceClient,
 {
-    send_with_reconnect::<ServiceClientType, LEN, true>(
+    send_with_reconnect::<ServiceClientType, IgnoreOutcome, LEN, true>(
         service_client,
         request_type,
         session_id,
         chunks,
+        IgnoreOutcome,
     )
+}
+
+/// [`send_normal_with_reconnect`], reporting a lost dispatched response as
+/// [`MutableOutcome::Unknown`] rather than as an error.
+///
+/// Only a caller that knows how to reconcile an ambiguous mutable write should use this. It
+/// costs a frame the plain variant does not, which is affordable because this is the mutable
+/// path rather than the read path the future-size bound protects.
+pub async fn send_normal_with_reconnect_outcome<ServiceClientType, const LEN: usize>(
+    service_client: &ServiceClientType,
+    request_type: ServiceClientType::RequestType,
+    session_id: u32,
+    chunks: impl Fn() -> [Bytes; LEN] + Send,
+) -> Result<MutableOutcome<Bytes>, ServiceClientType::ErrorType>
+where
+    ServiceClientType: ServiceClient,
+{
+    let unknown = SyncMutex::new(None);
+    match send_with_reconnect::<ServiceClientType, RecordOutcome<'_>, LEN, false>(
+        service_client,
+        request_type,
+        session_id,
+        chunks,
+        RecordOutcome(&unknown),
+    )
+    .await
+    {
+        Ok(payload) => Ok(MutableOutcome::Applied(payload)),
+        // The error is the same one an unadopted caller is given. Having asked for the
+        // distinction, this caller reads the outcome instead of the error.
+        Err(error) => match unknown.into_inner() {
+            Some(unknown) => Ok(MutableOutcome::Unknown(unknown)),
+            None => Err(error),
+        },
+    }
 }
 
 pub async fn send_command<const HIGH_PRIORITY: bool>(
@@ -1293,6 +1627,24 @@ pub async fn send_command<const HIGH_PRIORITY: bool>(
     v4: bool,
     chunks: &mut [Bytes],
 ) -> Result<Bytes, QuicClientError> {
+    send_command_tracked::<HIGH_PRIORITY>(connection, command, session_id, v4, chunks)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+/// [`send_command`], additionally reporting whether the request reached the wire.
+///
+/// Every early return below is a failure that happened before any byte of the request was
+/// written, so only the write and the response wait are dispatched. That split is what the
+/// replay contract branches on, so it is recorded here at the one place that can actually
+/// observe it rather than inferred from an error kind further up.
+async fn send_command_tracked<const HIGH_PRIORITY: bool>(
+    connection: Arc<QuicConnection>,
+    command: QuicOpCode,
+    session_id: u32,
+    v4: bool,
+    chunks: &mut [Bytes],
+) -> Result<Bytes, SendFailure> {
     {
         let stream_index = connection.counter.fetch_add(1, Ordering::Relaxed) % STREAM_COUNT;
         let stream_count = connection.stream_count.load(Ordering::Relaxed);
@@ -1300,7 +1652,9 @@ pub async fn send_command<const HIGH_PRIORITY: bool>(
         if stream_count != 0 && stream_index >= stream_count {
             // Box the rare path to avoid increasing send_command future size
             let connection = connection.clone();
-            Box::pin(async move { add_stream(connection).await }).await?;
+            Box::pin(async move { add_stream(connection).await })
+                .await
+                .map_err(SendFailure::not_dispatched)?;
         }
     }
 
@@ -1313,7 +1667,7 @@ pub async fn send_command<const HIGH_PRIORITY: bool>(
         let connection_lock = connection.connection.read().await;
         if connection_lock.reader.is_empty() {
             lore_debug!("No quic stream available when sending command");
-            return Err(QuicClientError::StreamOpen);
+            return Err(SendFailure::not_dispatched(QuicClientError::StreamOpen));
         }
 
         // Select stream based on priority, computed inside lock to avoid living across await points
@@ -1328,7 +1682,9 @@ pub async fn send_command<const HIGH_PRIORITY: bool>(
         let inflight = StreamInflightGuard::new(&connection.stream_inflight[stream_index]);
 
         let (tx, rx) = oneshot::channel();
-        let command_id = connection_lock.reader[stream_index].wait_for(tx)?;
+        let command_id = connection_lock.reader[stream_index]
+            .wait_for(tx)
+            .map_err(SendFailure::not_dispatched)?;
         let writer = connection_lock.writer[stream_index].clone();
         (command_id, writer, rx, inflight)
     };
@@ -1341,7 +1697,9 @@ pub async fn send_command<const HIGH_PRIORITY: bool>(
                 "Client '{command}' message too big - message size '{total_size}' exceeds {}",
                 connection.max_chunk_size
             );
-            return Err(QuicClientError::ClientMessageTooBig);
+            return Err(SendFailure::not_dispatched(
+                QuicClientError::ClientMessageTooBig,
+            ));
         }
         if v4 {
             let header =
@@ -1355,20 +1713,38 @@ pub async fn send_command<const HIGH_PRIORITY: bool>(
 
     {
         let mut stream = writer.lock_owned().await;
+        // A failed `write_all_chunks` may still have flushed earlier chunks to the peer, so
+        // this counts as dispatched. Treating a partial write as harmless is the assumption
+        // that would let a mutable command be sent twice.
         stream.write_all_chunks(chunks).await.map_err(|err| {
             if let quinn::WriteError::ConnectionLost(_) = err {
-                QuicClientError::Terminated
+                SendFailure::response_lost(QuicClientError::Terminated)
             } else {
                 lore_warn!("{}: {err}", QuicClientError::WriteChunks);
-                QuicClientError::WriteChunks
+                SendFailure::response_lost(QuicClientError::WriteChunks)
             }
         })?;
     }
 
-    rx.await.map_err(|err| {
-        lore_warn!("{}: {err}", QuicClientError::Read);
-        QuicClientError::Read
-    })?
+    // The request is fully written by here, so the server has seen the command either way.
+    // What is left is whether an answer came back, and the two ways it can fail to are not the
+    // same thing to the replay contract.
+    rx.await
+        .map_err(|err| {
+            lore_warn!("{}: {err}", QuicClientError::Read);
+            SendFailure::response_lost(QuicClientError::Read)
+        })?
+        .map_err(|error| match error {
+            // The reader task fails every still-pending command with exactly one of these two
+            // when its stream ends (`ResponseReader::new`'s task, which drains `pending` on
+            // exit). Reaching this arm therefore means the connection died with the answer
+            // still outstanding, not that the server said no.
+            QuicClientError::Terminated | QuicClientError::CrytpoError => {
+                SendFailure::response_lost(error)
+            }
+            // Everything else was decoded from a response header the server actually sent.
+            _ => SendFailure::answered(error),
+        })
 }
 
 #[cfg(test)]

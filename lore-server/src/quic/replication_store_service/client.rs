@@ -34,6 +34,7 @@ use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::client::TransportConfig;
 use lore_transport::quic::client::connect;
 use lore_transport::quic::client::send_normal_with_reconnect;
+use lore_transport::replay::ReplayClass;
 use opentelemetry::KeyValue;
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -409,6 +410,16 @@ impl ServiceClient for ReplicationStoreClient {
             SendWithReconnectError::Disconnected | SendWithReconnectError::ReconnectFailed => {
                 ReplicationStoreClientError::ConnectionFailed
             }
+            // This client sends no session id, so it has nothing to rebind; the transport
+            // reaches the variant only for a session-bearing command. An unknown outcome is
+            // reported as a connection failure here rather than as a typed result: the
+            // replication caller's reconciliation is WP-118/WP-120's, and inventing a
+            // caller-visible distinction it does not act on would be a capability this
+            // deployment cannot serve.
+            SendWithReconnectError::SessionRebindRequired
+            | SendWithReconnectError::OutcomeUnknown(_) => {
+                ReplicationStoreClientError::ConnectionFailed
+            }
             SendWithReconnectError::ClientError(quic_error) => match quic_error {
                 QuicClientError::SlowDown => {
                     ReplicationStoreClientError::ServerSideMessageThrottling
@@ -439,6 +450,45 @@ impl ServiceClient for ReplicationStoreClient {
 
     fn transport_config(&self) -> TransportConfig {
         self.transport_config.clone()
+    }
+
+    /// Exhaustive by construction: a new replication opcode does not compile until it is
+    /// classified here.
+    fn replay_class(&self, request: Self::RequestType) -> ReplayClass {
+        match request {
+            // Reads. The store answers the same way however many times it is asked.
+            Command::ImmutableGet
+            | Command::ImmutableLocalGet
+            | Command::ImmutableGetMetadata
+            | Command::ImmutableLocalGetMetadata
+            | Command::ImmutableQuery
+            | Command::ImmutableLocalQuery => ReplayClass::ReadRetryable,
+
+            // Replication `Put` publishes or revives a repository/context association just as
+            // the public one does, and obliterate and copy move lifecycle state outright. A
+            // second dispatch after a lost response can revive what an intervening obliterate
+            // retired, so the content address being immutable does not make any of these
+            // repeatable.
+            Command::ImmutablePut
+            | Command::ImmutableLocalPut
+            | Command::ImmutableObliterate
+            | Command::ImmutableCopy => ReplayClass::MutableNoReplay,
+        }
+    }
+
+    fn request_name(&self, request: Self::RequestType) -> &'static str {
+        match request {
+            Command::ImmutablePut => "immutable_put",
+            Command::ImmutableLocalPut => "immutable_local_put",
+            Command::ImmutableObliterate => "immutable_obliterate",
+            Command::ImmutableGet => "immutable_get",
+            Command::ImmutableLocalGet => "immutable_local_get",
+            Command::ImmutableGetMetadata => "immutable_get_metadata",
+            Command::ImmutableLocalGetMetadata => "immutable_local_get_metadata",
+            Command::ImmutableQuery => "immutable_query",
+            Command::ImmutableLocalQuery => "immutable_local_query",
+            Command::ImmutableCopy => "immutable_copy",
+        }
     }
 }
 

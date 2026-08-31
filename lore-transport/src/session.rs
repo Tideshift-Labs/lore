@@ -17,6 +17,8 @@ use tokio::task::JoinSet;
 
 use crate::connection::Connection;
 use crate::error::ProtocolError;
+use crate::replay::ATTEMPT_BUDGET;
+use crate::replay::MutableOutcome;
 use crate::traits::Storage;
 
 /// A live session on a `Storage` connection. Provides all storage operations
@@ -34,17 +36,94 @@ pub struct StorageSession {
 }
 
 struct ResolvedFields {
-    storage: Arc<dyn Storage>,
+    /// Everything needed to hold, and to replace, the server-side session.
+    binding: Arc<SessionBinding>,
     /// Keeps the connection alive while this session exists, and is what a source partition is
     /// authorized on — authorization is per connection, not per session.
     connection: Arc<Connection>,
-    session_id: u32,
+}
+
+/// A resolved server-side session, bound to the connection generation it belongs to.
+struct SessionBinding {
+    storage: Arc<dyn Storage>,
+    /// The server-assigned session id and the connection generation it was assigned on.
+    ///
+    /// A storage session belongs to one connection. Holding the id without the epoch it came
+    /// from is what lets an id from a replaced connection reach a server that never issued it,
+    /// so the two are stored together and read together.
+    session: Mutex<BoundSession>,
+    /// Serialises replacement `session_start` calls, so concurrent commands that all notice the
+    /// same epoch change cost one authorization round trip rather than one each.
+    rebind: TokioMutex<()>,
     /// The partition this session was started for, so a copy naming it as its source needs no
     /// authorization beyond the session itself.
     partition: Partition,
     /// The correlation id the session was started under, so authorizing a further partition on this
     /// connection is attributed to the same command.
     correlation_id: Arc<str>,
+}
+
+/// A session id and the connection generation it is valid on.
+///
+/// `epoch` is `None` for a session that is known to be gone, which is not the same as one
+/// bound to some particular generation: there is no epoch value that could stand for it, since
+/// every value the transport reports is a generation a session could legitimately hold.
+#[derive(Clone, Copy)]
+struct BoundSession {
+    id: u32,
+    epoch: Option<u32>,
+}
+
+impl SessionBinding {
+    /// The session id to send on the connection as it is now, starting a replacement session
+    /// first if the connection has been replaced since this one was issued.
+    ///
+    /// The epoch is sampled before `session_start` rather than after, so a connection that is
+    /// replaced again mid-call records the older generation and the next caller rebinds. That
+    /// costs an extra round trip in a rare race and never puts a stale id on the wire, which is
+    /// the way round this has to fail.
+    async fn session_id(&self) -> Result<u32, ProtocolError> {
+        let current = self.storage.connection_epoch();
+        if let Some(id) = self.bound_to(current) {
+            return Ok(id);
+        }
+
+        let _flight = self.rebind.lock().await;
+        // Re-read under the guard: whoever held it before us may already have rebound, and the
+        // epoch may have moved again while we waited.
+        let current = self.storage.connection_epoch();
+        if let Some(id) = self.bound_to(current) {
+            return Ok(id);
+        }
+
+        // A fresh `session_start` re-runs the token exchange and the server's authorization
+        // check for this partition. Nothing from the old session's permission snapshot carries
+        // over, which is the point: the replacement connection decides for itself.
+        let id = self
+            .storage
+            .session_start(self.partition, &self.correlation_id)
+            .await?;
+        *self.session.lock() = BoundSession {
+            id,
+            epoch: Some(current),
+        };
+        Ok(id)
+    }
+
+    /// The session id if it belongs to `epoch`, otherwise nothing.
+    fn bound_to(&self, epoch: u32) -> Option<u32> {
+        let bound = *self.session.lock();
+        (bound.epoch == Some(epoch)).then_some(bound.id)
+    }
+
+    /// Force the next use to start a replacement session, whatever the epoch reads as.
+    ///
+    /// Used when the connection was replaced under a command: the id we hold belongs to the
+    /// generation that is gone, and the epoch comparison alone is not enough to say so at
+    /// every moment we might look.
+    fn unbind(&self) {
+        self.session.lock().epoch = None;
+    }
 }
 
 /// Closure signature for a pending session's resolver. The resolver runs at most
@@ -72,20 +151,29 @@ enum SessionInner {
 impl StorageSession {
     /// Construct an already-resolved session. Used by the connection internals
     /// after a successful `session_start` RPC.
+    /// `epoch` is the connection generation `session_id` was issued on, sampled before the
+    /// `session_start` that produced it.
     pub(crate) fn resolved(
         storage: Arc<dyn Storage>,
         connection: Arc<Connection>,
         session_id: u32,
+        epoch: u32,
         partition: Partition,
         correlation_id: Arc<str>,
     ) -> Self {
         Self {
             inner: SessionInner::Resolved(ResolvedFields {
-                storage,
+                binding: Arc::new(SessionBinding {
+                    storage,
+                    session: Mutex::new(BoundSession {
+                        id: session_id,
+                        epoch: Some(epoch),
+                    }),
+                    rebind: TokioMutex::new(()),
+                    partition,
+                    correlation_id,
+                }),
                 connection,
-                session_id,
-                partition,
-                correlation_id,
             }),
         }
     }
@@ -135,6 +223,7 @@ impl StorageSession {
     pub async fn invalidate(&self) {
         match &self.inner {
             SessionInner::Resolved(r) => {
+                r.binding.unbind();
                 r.connection.invalidate_all_sessions();
             }
             SessionInner::Pending { resolved, .. } => {
@@ -145,10 +234,64 @@ impl StorageSession {
                 if let Some(Ok(inner)) = guard.as_ref()
                     && let SessionInner::Resolved(r) = &inner.inner
                 {
+                    r.binding.unbind();
                     r.connection.invalidate_all_sessions();
                 }
                 *guard = None;
             }
+        }
+    }
+
+    /// Mark the resolved session gone so the next operation starts a replacement.
+    ///
+    /// Narrower than [`invalidate`](Self::invalidate): the connection's pool cache is left
+    /// alone, because a replaced connection invalidates one session's id, not the caller's
+    /// pinned pools.
+    async fn unbind(&self) {
+        if let Ok(binding) = self.binding().await {
+            binding.unbind();
+        }
+    }
+
+    /// Run one storage operation, allowing a single rebound retry when the connection was
+    /// replaced while the command was in flight.
+    ///
+    /// Retrying here is safe because of what the transport does *not* return. A mutable
+    /// command that was dispatched and then lost its response never comes back as an error —
+    /// it comes back as [`MutableOutcome::Unknown`], which is an `Ok` and returns from this
+    /// loop untouched. So an error from a mutable operation means either the request never
+    /// reached the wire or the server answered it, and neither can be applied twice by asking
+    /// again on a replacement session. If that transport invariant ever changes, this retry
+    /// becomes a double-write.
+    ///
+    /// The budget is the shared end-to-end one: at most [`ATTEMPT_BUDGET`] dispatches of the
+    /// operation, with the rebind's `session_start` inside the second, and no layer below
+    /// starting a loop of its own.
+    async fn attempt<T, Fut>(
+        &self,
+        operation: impl Fn(Arc<dyn Storage>, u32) -> Fut,
+    ) -> Result<T, ProtocolError>
+    where
+        Fut: std::future::Future<Output = Result<T, ProtocolError>>,
+    {
+        let mut attempts_left = ATTEMPT_BUDGET;
+        loop {
+            attempts_left -= 1;
+            // Resolves the session, and starts a replacement first if the connection has moved
+            // on since this one was issued.
+            let (storage, session_id) = self.ensure().await?;
+            let epoch = storage.connection_epoch();
+
+            let error = match operation(storage.clone(), session_id).await {
+                Ok(value) => return Ok(value),
+                Err(error) => error,
+            };
+
+            if attempts_left == 0 || storage.connection_epoch() == epoch {
+                return Err(error);
+            }
+
+            self.unbind().await;
         }
     }
 
@@ -187,16 +330,26 @@ impl StorageSession {
         }
     }
 
-    /// Get the resolved `(storage, session_id)` pair, driving the pending
-    /// resolver on first call. All operation methods go through here.
+    /// Get the resolved `(storage, session_id)` pair, driving the pending resolver on first
+    /// call. All operation methods go through here.
+    ///
+    /// The id is bound to the connection generation it was issued on, so this is also where a
+    /// replaced connection gets its replacement session. Two steps because the projection out
+    /// of the resolver cannot await and starting a session can.
     async fn ensure(&self) -> Result<(Arc<dyn Storage>, u32), ProtocolError> {
-        self.with_resolved(|r| (r.storage.clone(), r.session_id))
-            .await
+        let binding = self.binding().await?;
+        let session_id = binding.session_id().await?;
+        Ok((binding.storage.clone(), session_id))
+    }
+
+    /// The resolved session binding, driving the pending resolver on first call.
+    async fn binding(&self) -> Result<Arc<SessionBinding>, ProtocolError> {
+        self.with_resolved(|r| r.binding.clone()).await
     }
 
     /// The partition this session is scoped to, driving the pending resolver on first call.
     pub async fn partition(&self) -> Result<Partition, ProtocolError> {
-        self.with_resolved(|r| r.partition).await
+        self.with_resolved(|r| r.binding.partition).await
     }
 
     /// Whether a [`StorageSession::copy`] on this session may name `partition` as its source.
@@ -208,7 +361,13 @@ impl StorageSession {
     /// refuse for a cached lookup.
     pub async fn can_copy_from(&self, partition: Partition) -> bool {
         let Ok((connection, own, correlation_id)) = self
-            .with_resolved(|r| (r.connection.clone(), r.partition, r.correlation_id.clone()))
+            .with_resolved(|r| {
+                (
+                    r.connection.clone(),
+                    r.binding.partition,
+                    r.binding.correlation_id.clone(),
+                )
+            })
             .await
         else {
             return false;
@@ -223,16 +382,18 @@ impl StorageSession {
     }
 
     pub async fn get(&self, address: &Address) -> Result<(Fragment, Bytes), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.get(session_id, address).await
+        self.attempt(|storage, session_id| async move { storage.get(session_id, address).await })
+            .await
     }
 
     pub async fn get_priority(
         &self,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.get_priority(session_id, address).await
+        self.attempt(|storage, session_id| async move {
+            storage.get_priority(session_id, address).await
+        })
+        .await
     }
 
     pub async fn put(
@@ -241,13 +402,39 @@ impl StorageSession {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.put(session_id, address, fragment, payload).await
+        self.attempt(|storage, session_id| {
+            let payload = payload.clone();
+            async move { storage.put(session_id, address, fragment, payload).await }
+        })
+        .await
+    }
+
+    /// [`put`](Self::put), reporting a dispatched request whose response was lost as
+    /// [`MutableOutcome::Unknown`] rather than as an error.
+    ///
+    /// `Put` publishes or revives the repository/context lifecycle association for its payload,
+    /// so an ambiguous one is never repeated. Refresh and reconcile authoritative state on an
+    /// unknown outcome; do not read it as proof the attempt did not commit.
+    pub async fn put_outcome(
+        &self,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        self.attempt(|storage, session_id| {
+            let payload = payload.clone();
+            async move {
+                storage
+                    .put_outcome(session_id, address, fragment, payload)
+                    .await
+            }
+        })
+        .await
     }
 
     pub async fn query(&self, address: &[Address]) -> Result<Bytes, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.query(session_id, address).await
+        self.attempt(|storage, session_id| async move { storage.query(session_id, address).await })
+            .await
     }
 
     pub async fn verify(
@@ -255,8 +442,22 @@ impl StorageSession {
         address: &Address,
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.verify(session_id, address, heal).await
+        self.attempt(|storage, session_id| async move {
+            storage.verify(session_id, address, heal).await
+        })
+        .await
+    }
+
+    /// [`verify`](Self::verify) on the typed outcome path. See [`put_outcome`](Self::put_outcome).
+    pub async fn verify_outcome(
+        &self,
+        address: &Address,
+        heal: bool,
+    ) -> Result<MutableOutcome<VerifyResult>, ProtocolError> {
+        self.attempt(|storage, session_id| async move {
+            storage.verify_outcome(session_id, address, heal).await
+        })
+        .await
     }
 
     pub async fn copy(
@@ -265,10 +466,27 @@ impl StorageSession {
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage
-            .copy(session_id, source_partition, source_address, target_context)
-            .await
+        self.attempt(|storage, session_id| async move {
+            storage
+                .copy(session_id, source_partition, source_address, target_context)
+                .await
+        })
+        .await
+    }
+
+    /// [`copy`](Self::copy) on the typed outcome path. See [`put_outcome`](Self::put_outcome).
+    pub async fn copy_outcome(
+        &self,
+        source_partition: Partition,
+        source_address: Address,
+        target_context: Context,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        self.attempt(|storage, session_id| async move {
+            storage
+                .copy_outcome(session_id, source_partition, source_address, target_context)
+                .await
+        })
+        .await
     }
 
     /// Fetch only fragment metadata (`flags`, `size_payload`, `size_content`) for `address`.
@@ -276,13 +494,17 @@ impl StorageSession {
     /// Use this when the caller needs metadata without paying the payload transfer cost — e.g.
     /// the storage API's `query` op for remote-hit metadata lookups.
     pub async fn get_metadata(&self, address: &Address) -> Result<Fragment, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.get_metadata(session_id, address).await
+        self.attempt(|storage, session_id| async move {
+            storage.get_metadata(session_id, address).await
+        })
+        .await
     }
 
     pub async fn mutable_load(&self, key: &Hash, key_type: KeyType) -> Result<Hash, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.mutable_load(session_id, key, key_type).await
+        self.attempt(|storage, session_id| async move {
+            storage.mutable_load(session_id, key, key_type).await
+        })
+        .await
     }
 
     /// `mutable_load` + `get` in one round trip, always reading the key as
@@ -294,8 +516,10 @@ impl StorageSession {
         context: &Context,
         flags: u32,
     ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.get_resolved(session_id, key, context, flags).await
+        self.attempt(|storage, session_id| async move {
+            storage.get_resolved(session_id, key, context, flags).await
+        })
+        .await
     }
 
     /// `put` + `mutable_store` in one round trip: store the fragment, then map `key` to
@@ -307,10 +531,38 @@ impl StorageSession {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage
-            .put_resolved(session_id, key, address, fragment, payload)
-            .await
+        self.attempt(|storage, session_id| {
+            let payload = payload.clone();
+            async move {
+                storage
+                    .put_resolved(session_id, key, address, fragment, payload)
+                    .await
+            }
+        })
+        .await
+    }
+
+    /// [`put_resolved`](Self::put_resolved) on the typed outcome path. See
+    /// [`put_outcome`](Self::put_outcome).
+    ///
+    /// This publishes a mutable key, so an ambiguous one is not an immutable put that happens
+    /// to carry a key: repeating it can overwrite a successor mapping.
+    pub async fn put_resolved_outcome(
+        &self,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        self.attempt(|storage, session_id| {
+            let payload = payload.clone();
+            async move {
+                storage
+                    .put_resolved_outcome(session_id, key, address, fragment, payload)
+                    .await
+            }
+        })
+        .await
     }
 
     pub async fn mutable_store(
@@ -319,10 +571,28 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage
-            .mutable_store(session_id, key, value, key_type)
-            .await
+        self.attempt(|storage, session_id| async move {
+            storage
+                .mutable_store(session_id, key, value, key_type)
+                .await
+        })
+        .await
+    }
+
+    /// [`mutable_store`](Self::mutable_store) on the typed outcome path. See
+    /// [`put_outcome`](Self::put_outcome).
+    pub async fn mutable_store_outcome(
+        &self,
+        key: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        self.attempt(|storage, session_id| async move {
+            storage
+                .mutable_store_outcome(session_id, key, value, key_type)
+                .await
+        })
+        .await
     }
 
     pub async fn mutable_compare_and_swap(
@@ -332,10 +602,32 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage
-            .mutable_compare_and_swap(session_id, key, expected, value, key_type)
-            .await
+        self.attempt(|storage, session_id| async move {
+            storage
+                .mutable_compare_and_swap(session_id, key, expected, value, key_type)
+                .await
+        })
+        .await
+    }
+
+    /// [`mutable_compare_and_swap`](Self::mutable_compare_and_swap) on the typed outcome path.
+    /// See [`put_outcome`](Self::put_outcome).
+    ///
+    /// An unknown outcome here is not a failed swap. Read the key back before deciding what
+    /// happened, and remember that another writer may have moved it since.
+    pub async fn mutable_compare_and_swap_outcome(
+        &self,
+        key: Hash,
+        expected: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> Result<MutableOutcome<Hash>, ProtocolError> {
+        self.attempt(|storage, session_id| async move {
+            storage
+                .mutable_compare_and_swap_outcome(session_id, key, expected, value, key_type)
+                .await
+        })
+        .await
     }
 }
 
@@ -347,11 +639,15 @@ impl Drop for StorageSession {
         // in the OnceCell has its own Drop that fires session_stop when its
         // refcount reaches zero.
         if let SessionInner::Resolved(r) = &self.inner {
-            let storage = r.storage.clone();
-            let session_id = r.session_id;
-            lore_base::lore_spawn_net!(async move {
-                let _ = storage.session_stop(session_id).await;
-            });
+            let storage = r.binding.storage.clone();
+            let bound = *r.binding.session.lock();
+            // An unbound session has no id the current connection would recognise, and the
+            // connection that issued the old one has already discarded it.
+            if bound.epoch.is_some() {
+                lore_base::lore_spawn_net!(async move {
+                    let _ = storage.session_stop(bound.id).await;
+                });
+            }
         }
     }
 }
@@ -518,8 +814,12 @@ impl StorageConnector {
             let correlation_id = correlation_id.to_string();
             let started = started.clone();
             lore_spawn_net!(tasks, async move {
+                // Sampled before the call, so a connection replaced while `session_start` is in
+                // flight leaves the session bound to the older generation and the first use
+                // rebinds. The other order would record a generation the id was never valid on.
+                let epoch = storage.connection_epoch();
                 let session_id = storage.session_start(partition, &correlation_id).await?;
-                started.lock().push((storage, session_id));
+                started.lock().push((storage, session_id, epoch));
                 Ok::<_, ProtocolError>(())
             });
         }
@@ -530,7 +830,7 @@ impl StorageConnector {
         let Ok(started) = Arc::try_unwrap(started) else {
             unreachable!("session_start tasks dropped their Arc<Mutex<_>> clones");
         };
-        let started: Vec<(Arc<dyn Storage>, u32)> = started.into_inner();
+        let started: Vec<(Arc<dyn Storage>, u32, u32)> = started.into_inner();
 
         // session_start succeeded on every connection in parallel above; the partition is now
         // in `authorized_repos` of every server-side `SessionMap` for the pool. Even on the
@@ -544,20 +844,21 @@ impl StorageConnector {
         let correlation: Arc<str> = Arc::from(correlation_id);
         let sessions: Vec<Arc<StorageSession>> = started
             .iter()
-            .map(|(storage, session_id)| {
+            .map(|(storage, session_id, epoch)| {
                 Arc::new(StorageSession::resolved(
                     storage.clone(),
                     connection.clone(),
                     *session_id,
+                    *epoch,
                     partition,
                     correlation.clone(),
                 ))
             })
             .collect();
         let pool = Arc::new(SessionPool::new(sessions));
-        let session_ids: Vec<u32> = started.iter().map(|(_, id)| *id).collect();
+        let session_ids: Vec<u32> = started.iter().map(|(_, id, _)| *id).collect();
         let storages: Vec<Weak<dyn Storage>> =
-            started.iter().map(|(s, _)| Arc::downgrade(s)).collect();
+            started.iter().map(|(s, _, _)| Arc::downgrade(s)).collect();
 
         // Try to insert under the entry lock (synchronous only -- no .await).
         let outcome = {

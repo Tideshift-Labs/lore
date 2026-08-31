@@ -1381,7 +1381,24 @@ impl Storage for GRPCStorage {
         })
         .await
     }
+
+    /// Constant, deliberately.
+    ///
+    /// A gRPC storage session is held in this client's own `sessions` map and re-registered on
+    /// reconnect, so a session id here does not expire with a connection generation the way a
+    /// QUIC one does. Reporting a moving epoch would make the session layer re-run
+    /// `session_start` on a transport that never needed it, which is the QUIC lifecycle
+    /// leaking into a path that does not share it.
+    fn connection_epoch(&self) -> u32 {
+        GRPC_STATIC_SESSION_EPOCH
+    }
 }
+
+/// The epoch every gRPC storage connection reports. See [`Storage::connection_epoch`].
+///
+/// Non-zero because zero is the QUIC client's "reconnection gave up" sentinel, and nothing
+/// should read that meaning into a transport that does not use it.
+const GRPC_STATIC_SESSION_EPOCH: u32 = 1;
 
 /// Revision protocol implementation over gRPC
 struct GRPCRevision {

@@ -5,6 +5,7 @@ pub mod connection;
 pub mod error;
 pub mod grpc;
 pub mod quic;
+pub mod replay;
 pub mod session;
 pub mod tls;
 pub mod traits;
@@ -13,6 +14,7 @@ pub mod util;
 
 pub use connection::*;
 pub use error::*;
+pub use replay::*;
 pub use session::*;
 pub use traits::*;
 pub use types::*;

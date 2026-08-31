@@ -10,6 +10,7 @@ use lore_base::types::*;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
+use crate::replay::MutableOutcome;
 use crate::types::*;
 
 /// Protocol interface
@@ -239,6 +240,104 @@ pub trait Storage: Send + Sync {
     ) -> Result<Hash, ProtocolError> {
         let _ = (session_id, key, expected, value, key_type);
         Err(ProtocolError::internal("unsupported: mutable_cas"))
+    }
+
+    /// The connection generation a session id issued now would belong to.
+    ///
+    /// A storage session is scoped to one connection, so an id is only meaningful while this
+    /// value is unchanged. The session layer records the epoch it resolved on and re-resolves
+    /// when it moves, which is what stops an id from crossing a replacement connection.
+    ///
+    /// There is deliberately no default body. A transport whose sessions do not expire with a
+    /// connection has to say so explicitly by returning a constant, rather than silently
+    /// inheriting a default that describes a different transport's lifecycle.
+    fn connection_epoch(&self) -> u32;
+
+    /// [`Storage::put`], reporting a dispatched request whose response was lost as
+    /// [`MutableOutcome::Unknown`] instead of an error.
+    ///
+    /// The default delegates to [`Storage::put`] and reports success as
+    /// [`MutableOutcome::Applied`], which is the correct answer for a transport that does not
+    /// scope sessions to a connection generation: it never produces the ambiguity this
+    /// distinguishes. The QUIC client overrides it.
+    async fn put_outcome(
+        &self,
+        session_id: u32,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        self.put(session_id, address, fragment, payload)
+            .await
+            .map(MutableOutcome::Applied)
+    }
+
+    /// [`Storage::put_resolved`] on the typed outcome path. See [`Storage::put_outcome`].
+    async fn put_resolved_outcome(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        self.put_resolved(session_id, key, address, fragment, payload)
+            .await
+            .map(MutableOutcome::Applied)
+    }
+
+    /// [`Storage::mutable_store`] on the typed outcome path. See [`Storage::put_outcome`].
+    async fn mutable_store_outcome(
+        &self,
+        session_id: u32,
+        key: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        self.mutable_store(session_id, key, value, key_type)
+            .await
+            .map(MutableOutcome::Applied)
+    }
+
+    /// [`Storage::mutable_compare_and_swap`] on the typed outcome path. See
+    /// [`Storage::put_outcome`].
+    async fn mutable_compare_and_swap_outcome(
+        &self,
+        session_id: u32,
+        key: Hash,
+        expected: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> Result<MutableOutcome<Hash>, ProtocolError> {
+        self.mutable_compare_and_swap(session_id, key, expected, value, key_type)
+            .await
+            .map(MutableOutcome::Applied)
+    }
+
+    /// [`Storage::copy`] on the typed outcome path. See [`Storage::put_outcome`].
+    async fn copy_outcome(
+        &self,
+        session_id: u32,
+        source_partition: Partition,
+        source_address: Address,
+        target_context: Context,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        self.copy(session_id, source_partition, source_address, target_context)
+            .await
+            .map(MutableOutcome::Applied)
+    }
+
+    /// [`Storage::verify`] on the typed outcome path. See [`Storage::put_outcome`]. Verify is
+    /// on this path because it carries the heal flag, and healing writes.
+    async fn verify_outcome(
+        &self,
+        session_id: u32,
+        address: &Address,
+        heal: bool,
+    ) -> Result<MutableOutcome<VerifyResult>, ProtocolError> {
+        self.verify(session_id, address, heal)
+            .await
+            .map(MutableOutcome::Applied)
     }
 
     /// Gracefully close the underlying transport, draining any in-flight streams

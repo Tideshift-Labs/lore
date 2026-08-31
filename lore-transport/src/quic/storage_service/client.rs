@@ -43,6 +43,7 @@ use super::super::client::connect;
 use super::super::client::send_high_priority_with_reconnect;
 use super::super::client::send_normal;
 use super::super::client::send_normal_with_reconnect;
+use super::super::client::send_normal_with_reconnect_outcome;
 use super::super::storage_service;
 use super::super::storage_service::Command;
 use super::super::storage_service::MAX_CHUNK_SIZE;
@@ -51,6 +52,9 @@ use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
 use crate::quic::client::CongestionAlgorithm;
+use crate::replay::MutableOutcome;
+use crate::replay::ReplayClass;
+use crate::replay::storage_replay_class;
 use crate::traits::Storage;
 
 const INFLIGHT_COMMAND_LIMIT: usize = 10000;
@@ -196,6 +200,182 @@ impl StorageClient {
 
         Ok(storage)
     }
+
+    /// Collapse a typed outcome for a caller that did not ask for one.
+    ///
+    /// An unknown outcome becomes whatever [`ServiceClient::map_send_error`] makes of it, which
+    /// is the same error such a caller saw before this distinction existed.
+    fn collapse<T>(
+        &self,
+        command: Command,
+        outcome: MutableOutcome<T>,
+    ) -> Result<T, ProtocolError> {
+        match outcome {
+            MutableOutcome::Applied(value) => Ok(value),
+            MutableOutcome::Unknown(unknown) => {
+                Err(self.map_send_error(command, SendWithReconnectError::OutcomeUnknown(unknown)))
+            }
+        }
+    }
+
+    // Each mutable operation has exactly one send site, below, and both the plain and the typed
+    // trait method go through it. Two sites would be two chances for the wire framing and the
+    // replay class to drift apart.
+
+    async fn send_put(
+        &self,
+        session_id: u32,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        send_normal_with_reconnect_outcome(self, Command::Put, session_id, || {
+            [
+                Bytes::default(),
+                Bytes::from_owner(address),
+                Bytes::from_owner(fragment),
+                payload.clone().unwrap_or_default(),
+            ]
+        })
+        .await
+        .map(|outcome| outcome.map(|_| ()))
+    }
+
+    /// Request framing: `put`'s, with the mutable key prepended — key (32) ++ `Address` (48) ++
+    /// `Fragment` (16) ++ payload, keeping the 96-byte header a multiple of four.
+    async fn send_put_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        send_normal_with_reconnect_outcome(self, Command::PutResolved, session_id, || {
+            [
+                Bytes::default(),
+                Bytes::from_owner(*key),
+                Bytes::from_owner(address),
+                Bytes::from_owner(fragment),
+                payload.clone().unwrap_or_default(),
+            ]
+        })
+        .await
+        .map(|outcome| outcome.map(|_| ()))
+    }
+
+    async fn send_mutable_store(
+        &self,
+        session_id: u32,
+        key: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        send_normal_with_reconnect_outcome(self, Command::MutableStore, session_id, || {
+            [
+                Bytes::default(),
+                Bytes::from_owner(key),
+                Bytes::from_owner(value),
+                Bytes::copy_from_slice(&[key_type as u8]),
+            ]
+        })
+        .await
+        .map(|outcome| outcome.map(|_| ()))
+    }
+
+    async fn send_mutable_cas(
+        &self,
+        session_id: u32,
+        key: Hash,
+        expected: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> Result<MutableOutcome<Hash>, ProtocolError> {
+        let outcome =
+            send_normal_with_reconnect_outcome(self, Command::MutableCas, session_id, || {
+                [
+                    Bytes::default(),
+                    Bytes::from_owner(key),
+                    Bytes::from_owner(expected),
+                    Bytes::from_owner(value),
+                    Bytes::copy_from_slice(&[key_type as u8]),
+                ]
+            })
+            .await?;
+
+        let payload = match outcome {
+            MutableOutcome::Applied(payload) => payload,
+            MutableOutcome::Unknown(unknown) => return Ok(MutableOutcome::Unknown(unknown)),
+        };
+
+        if payload.len() != size_of::<Hash>() {
+            return Err(ProtocolError::internal(format!(
+                "mutable_cas: Invalid server response, expected {} bytes got {}",
+                size_of::<Hash>(),
+                payload.len()
+            )));
+        }
+
+        Ok(MutableOutcome::Applied(Hash::from(&payload[..])))
+    }
+
+    /// Wire payload layout for Copy is: source_partition (16) + source_address (32+16) +
+    /// target_context (16) = 80 bytes. The target_context tail allows the destination's dedup
+    /// tag to differ from the source's without transferring the payload.
+    async fn send_copy(
+        &self,
+        session_id: u32,
+        source_partition: Partition,
+        source_address: Address,
+        target_context: Context,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        send_normal_with_reconnect_outcome(self, Command::Copy, session_id, || {
+            [
+                Bytes::default(),
+                Bytes::from_owner(source_partition),
+                Bytes::from_owner(source_address),
+                Bytes::from_owner(target_context),
+            ]
+        })
+        .await
+        .map(|outcome| outcome.map(|_| ()))
+    }
+
+    async fn send_verify(
+        &self,
+        session_id: u32,
+        address: &Address,
+        heal: bool,
+    ) -> Result<MutableOutcome<VerifyResult>, ProtocolError> {
+        let heal_byte = if heal { 1u8 } else { 0u8 };
+        let mut request_bytes = BytesMut::with_capacity(size_of::<Address>() + 1);
+        request_bytes.extend_from_slice(address.as_bytes());
+        request_bytes.put_u8(heal_byte);
+        let request_bytes = request_bytes.freeze();
+
+        let outcome = send_normal_with_reconnect_outcome(self, Command::Verify, session_id, || {
+            [Bytes::default(), request_bytes.clone()]
+        })
+        .await?;
+
+        let payload = match outcome {
+            MutableOutcome::Applied(payload) => payload,
+            MutableOutcome::Unknown(unknown) => return Ok(MutableOutcome::Unknown(unknown)),
+        };
+
+        // Response should be 2 bytes: corrupted + healed
+        if payload.len() != 2 {
+            return Err(ProtocolError::internal(format!(
+                "verify: Invalid server payload for address {address}, got {} bytes",
+                payload.len()
+            )));
+        }
+
+        Ok(MutableOutcome::Applied(VerifyResult {
+            corrupted: payload[0] != 0,
+            healed: HealResult::from(payload[1]),
+        }))
+    }
 }
 
 impl ServiceClient for StorageClient {
@@ -233,6 +413,13 @@ impl ServiceClient for StorageClient {
         match error {
             SendWithReconnectError::PermitAcquire => ProtocolError::internal("permit acquire"),
             SendWithReconnectError::Disconnected => ProtocolError::from(Disconnected),
+            // Both report that the connection carrying the command is gone, which is what
+            // `Disconnected` has always meant here. Neither claims the operation did not
+            // happen: a caller that needs to tell "never reached the server" from "may have
+            // been applied" opts into the typed path, and one that has not is unchanged by
+            // this library knowing the difference.
+            SendWithReconnectError::SessionRebindRequired
+            | SendWithReconnectError::OutcomeUnknown(_) => ProtocolError::from(Disconnected),
             SendWithReconnectError::ReconnectFailed => {
                 if let Some(connection) = self.connection.upgrade() {
                     connection.stale.store(true, Ordering::Relaxed);
@@ -269,6 +456,14 @@ impl ServiceClient for StorageClient {
 
     fn v4_protocol(&self) -> bool {
         true
+    }
+
+    fn replay_class(&self, request: Self::RequestType) -> ReplayClass {
+        storage_replay_class(request)
+    }
+
+    fn request_name(&self, request: Self::RequestType) -> &'static str {
+        storage_service::command_name(&request)
     }
 }
 
@@ -487,20 +682,22 @@ impl Storage for StorageClient {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
-        send_normal_with_reconnect(self, Command::Put, session_id, || {
-            [
-                Bytes::default(),
-                Bytes::from_owner(address),
-                Bytes::from_owner(fragment),
-                payload.clone().unwrap_or_default(),
-            ]
-        })
-        .await
-        .map(|_| ())
+        let outcome = self
+            .send_put(session_id, address, fragment, payload)
+            .await?;
+        self.collapse(Command::Put, outcome)
     }
 
-    /// Request framing: `put`'s, with the mutable key prepended — key (32) ++ `Address` (48) ++
-    /// `Fragment` (16) ++ payload, keeping the 96-byte header a multiple of four.
+    async fn put_outcome(
+        &self,
+        session_id: u32,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        self.send_put(session_id, address, fragment, payload).await
+    }
+
     async fn put_resolved(
         &self,
         session_id: u32,
@@ -509,17 +706,22 @@ impl Storage for StorageClient {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
-        send_normal_with_reconnect(self, Command::PutResolved, session_id, || {
-            [
-                Bytes::default(),
-                Bytes::from_owner(*key),
-                Bytes::from_owner(address),
-                Bytes::from_owner(fragment),
-                payload.clone().unwrap_or_default(),
-            ]
-        })
-        .await
-        .map(|_| ())
+        let outcome = self
+            .send_put_resolved(session_id, key, address, fragment, payload)
+            .await?;
+        self.collapse(Command::PutResolved, outcome)
+    }
+
+    async fn put_resolved_outcome(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        self.send_put_resolved(session_id, key, address, fragment, payload)
+            .await
     }
 
     async fn query(&self, session_id: u32, address: &[Address]) -> Result<Bytes, ProtocolError> {
@@ -555,29 +757,17 @@ impl Storage for StorageClient {
         address: &Address,
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError> {
-        let heal_byte = if heal { 1u8 } else { 0u8 };
-        let mut request_bytes = BytesMut::with_capacity(size_of::<Address>() + 1);
-        request_bytes.extend_from_slice(address.as_bytes());
-        request_bytes.put_u8(heal_byte);
-        let request_bytes = request_bytes.freeze();
+        let outcome = self.send_verify(session_id, address, heal).await?;
+        self.collapse(Command::Verify, outcome)
+    }
 
-        let payload = send_normal_with_reconnect(self, Command::Verify, session_id, || {
-            [Bytes::default(), request_bytes.clone()]
-        })
-        .await?;
-
-        // Response should be 2 bytes: corrupted + healed
-        if payload.len() != 2 {
-            return Err(ProtocolError::internal(format!(
-                "verify: Invalid server payload for address {address}, got {} bytes",
-                payload.len()
-            )));
-        }
-
-        Ok(VerifyResult {
-            corrupted: payload[0] != 0,
-            healed: HealResult::from(payload[1]),
-        })
+    async fn verify_outcome(
+        &self,
+        session_id: u32,
+        address: &Address,
+        heal: bool,
+    ) -> Result<MutableOutcome<VerifyResult>, ProtocolError> {
+        self.send_verify(session_id, address, heal).await
     }
 
     async fn copy(
@@ -587,19 +777,21 @@ impl Storage for StorageClient {
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError> {
-        // Wire payload layout for Copy is: source_partition (16) + source_address (32+16) +
-        // target_context (16) = 80 bytes. The target_context tail allows the destination's
-        // dedup tag to differ from the source's without transferring the payload.
-        send_normal_with_reconnect(self, Command::Copy, session_id, || {
-            [
-                Bytes::default(),
-                Bytes::from_owner(source_partition),
-                Bytes::from_owner(source_address),
-                Bytes::from_owner(target_context),
-            ]
-        })
-        .await
-        .map(|_| ())
+        let outcome = self
+            .send_copy(session_id, source_partition, source_address, target_context)
+            .await?;
+        self.collapse(Command::Copy, outcome)
+    }
+
+    async fn copy_outcome(
+        &self,
+        session_id: u32,
+        source_partition: Partition,
+        source_address: Address,
+        target_context: Context,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        self.send_copy(session_id, source_partition, source_address, target_context)
+            .await
     }
 
     async fn mutable_load(
@@ -635,16 +827,21 @@ impl Storage for StorageClient {
         value: Hash,
         key_type: KeyType,
     ) -> Result<(), ProtocolError> {
-        send_normal_with_reconnect(self, Command::MutableStore, session_id, || {
-            [
-                Bytes::default(),
-                Bytes::from_owner(key),
-                Bytes::from_owner(value),
-                Bytes::copy_from_slice(&[key_type as u8]),
-            ]
-        })
-        .await
-        .map(|_| ())
+        let outcome = self
+            .send_mutable_store(session_id, key, value, key_type)
+            .await?;
+        self.collapse(Command::MutableStore, outcome)
+    }
+
+    async fn mutable_store_outcome(
+        &self,
+        session_id: u32,
+        key: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> Result<MutableOutcome<()>, ProtocolError> {
+        self.send_mutable_store(session_id, key, value, key_type)
+            .await
     }
 
     async fn mutable_compare_and_swap(
@@ -655,26 +852,28 @@ impl Storage for StorageClient {
         value: Hash,
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
-        let payload = send_normal_with_reconnect(self, Command::MutableCas, session_id, || {
-            [
-                Bytes::default(),
-                Bytes::from_owner(key),
-                Bytes::from_owner(expected),
-                Bytes::from_owner(value),
-                Bytes::copy_from_slice(&[key_type as u8]),
-            ]
-        })
-        .await?;
+        let outcome = self
+            .send_mutable_cas(session_id, key, expected, value, key_type)
+            .await?;
+        self.collapse(Command::MutableCas, outcome)
+    }
 
-        if payload.len() != size_of::<Hash>() {
-            return Err(ProtocolError::internal(format!(
-                "mutable_cas: Invalid server response, expected {} bytes got {}",
-                size_of::<Hash>(),
-                payload.len()
-            )));
-        }
+    async fn mutable_compare_and_swap_outcome(
+        &self,
+        session_id: u32,
+        key: Hash,
+        expected: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> Result<MutableOutcome<Hash>, ProtocolError> {
+        self.send_mutable_cas(session_id, key, expected, value, key_type)
+            .await
+    }
 
-        Ok(Hash::from(&payload[..]))
+    /// The QUIC connection's generation counter. Each reconnect gives the server a fresh
+    /// session namespace, so this is what an issued session id is only valid within.
+    fn connection_epoch(&self) -> u32 {
+        self.quic.epoch.load(Ordering::Relaxed)
     }
 
     async fn close(&self) {
