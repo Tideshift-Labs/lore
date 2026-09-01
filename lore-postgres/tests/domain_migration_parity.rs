@@ -431,6 +431,19 @@ fn create_table_body<'a>(ddl: &'a str, table: &str) -> &'a str {
     &rest[..end]
 }
 
+/// Collapse every run of whitespace to one space.
+///
+/// Every pin in this file matches against this form, so all of them are
+/// alignment-tolerant in the same way. The `NOT NULL` loop below already had
+/// that property by construction while the `disposition` pin was an exact
+/// spacing literal; the two disagreed, and the tolerant direction is the right
+/// one because a pin that fails on a column-alignment change is noise, and noise
+/// is what gets a pin deleted rather than investigated. Content is still
+/// matched exactly — only the spacing between tokens is normalised.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Assert one premise against both DDL declarations at once.
 fn pin_premise(table: &str, needle: &str, why: &str) {
     for (label, ddl) in [
@@ -442,7 +455,7 @@ fn pin_premise(table: &str, needle: &str, why: &str) {
     ] {
         let body = create_table_body(ddl, table);
         assert!(
-            body.contains(needle),
+            collapse_whitespace(body).contains(&collapse_whitespace(needle)),
             "{label}: {table} must declare `{needle}`.\n{why}\nActual body:\n{body}"
         );
     }

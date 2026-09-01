@@ -91,6 +91,36 @@ pub const MAX_PUSH_FRAGMENT_REVALIDATIONS: usize = 4_096;
 /// real shared-hash distribution before wider rollout.
 pub const MAX_LIFECYCLE_GENERATION_FANOUT: usize = MAX_PUSH_FRAGMENT_REVALIDATIONS;
 
+/// How many members one staged reader lease may cover.
+///
+/// The third per-transaction row budget in `LockClass::Fragments`, and it exists
+/// for the same reason as the other two: `lock_lease_member_heads` takes a
+/// `FOR SHARE` row lock per member, and an unbounded lock acquisition inside one
+/// transaction is the shape that turns a large request into a latency and
+/// availability problem for everyone else on those rows.
+///
+/// **Set to [`MAX_PUSH_FRAGMENT_REVALIDATIONS`] deliberately**, following the
+/// precedent [`MAX_LIFECYCLE_GENERATION_FANOUT`] already set. This is not
+/// consistency for its own sake: the cost being bounded is a set-based row-lock
+/// acquisition over `lore_fragment_lifecycle`, which is the same table, the same
+/// lock class, and the same statement shape as the push fallback's. Giving the
+/// lease path a different budget would mean claiming its locks cost something
+/// different, which nothing measured supports.
+///
+/// **A caller over the bound splits into several leases, and that is sound**
+/// where the push equivalent is not. A push's required set must be revalidated
+/// atomically, so exceeding 4,096 is a genuine refusal of work. Leases are
+/// independent: two leases over disjoint halves of one hydration protect exactly
+/// what one lease over the whole would have. So this bound is a batching
+/// instruction rather than a ceiling on hydration size, which is why a bound
+/// this generous is safe even though a staged working set should rarely
+/// approach it.
+///
+/// Like its siblings, this is a bound and not a measurement. Phase 5 gives this
+/// method its first caller; real staged-batch distribution should replace the
+/// number before wider rollout.
+pub const MAX_STAGED_LEASE_MEMBERS: usize = MAX_PUSH_FRAGMENT_REVALIDATIONS;
+
 /// Postgres-only CR-031 coordinator, sharing CR-029's pool and database.
 ///
 /// Cloneable and cheap: two clones are two handles on one pool. Two *separately
@@ -2348,13 +2378,32 @@ struct DivergentEpoch<'a> {
 /// this function. Equivalence over content columns alone would not be enough.
 ///
 /// That dependency is no longer positional. This function takes both witnesses
-/// and `debug_assert_eq!`s the association scalar itself, so the precondition
-/// is an argument it checks rather than an ordering a reader has to notice, and
+/// and `debug_assert_eq!`s the association scalar itself, so the precondition is
+/// an argument it checks rather than an ordering a reader has to notice, and
 /// [`classify_push_witness`] makes the precedence a value rather than a branch
-/// order. A release build compiles the assertion out, which is why the
-/// classifier — not the assertion — is the actual enforcement; the assertion is
-/// what makes a reordering fail a `cargo test` run instead of only the live
-/// tier.
+/// order.
+///
+/// # Where each guarantee is actually pinned — measured, not assumed
+///
+/// An earlier version of this comment claimed the assertion "makes a reordering
+/// fail a `cargo test` run instead of only the live tier". **That is false and
+/// is retracted.** This function is unreachable without a database, so with the
+/// `AssociationMoved` arm stubbed to fall through, `cargo test -p lore-postgres`
+/// stays fully green and only the live tier fails — measured both with and
+/// without the assertion present. The three guards partition as:
+///
+/// * [`classify_push_witness`]'s unit tests are the **only** offline pin, and
+///   their scope is the classifier itself, not its use.
+/// * The live case is what **detects** a consumer that skips the abort arm. It
+///   does so with or without the assertion.
+/// * This assertion is a live-tier **tripwire**: it fires one frame earlier than
+///   the verdict assertion, naming the violated invariant instead of leaving a
+///   wrong verdict to be interpreted. Diagnosis, not detection.
+///
+/// **A release build is fully sufficient without it.** The `AssociationMoved`
+/// arm returns `Aborted` unconditionally and no assertion sits in that path, so
+/// release enforces the precedence exactly as debug does. Compiling the
+/// assertion out costs nothing.
 ///
 /// Quarantine cannot forge equivalence either: a publication quarantines only
 /// epochs below the one it publishes, so a readable head's current epoch is
@@ -2380,9 +2429,13 @@ async fn equivalent_epochs(
     // The precondition, checked here rather than left to a reader noticing the
     // caller's branch order. Taking both witnesses turns "the association check
     // happens earlier in the function" from an ordering into an argument this
-    // function verifies. `cargo test` builds debug, so a reordering that let an
-    // association-moved witness reach the allowance trips this in the default
-    // tier — no live database required.
+    // function verifies.
+    //
+    // This is a live-tier tripwire, NOT offline coverage: reaching this line
+    // needs a database, so a consumer that skips the abort arm is detected by
+    // the live case either way. What the assertion adds is the diagnosis —
+    // it fires one frame before the verdict assertion and names the invariant.
+    // See this function's doc for the measurement.
     debug_assert_eq!(
         captured.content_association_generation, current.content_association_generation,
         "equivalent_epochs must never see a witness whose association scalar moved: the fallback \
@@ -2450,6 +2503,19 @@ fn validate_lease_members(members: &[(Vec<u8>, i64)]) -> Result<(), DomainError>
         return Err(DomainError::InvalidInput(
             "a staged reader lease must cover at least one member".to_owned(),
         ));
+    }
+    // Bounded for the same reason its two `LockClass::Fragments` siblings are:
+    // every member costs a `FOR SHARE` row lock in `lock_lease_member_heads`,
+    // and an unbounded acquisition inside one transaction is the shape that
+    // makes one large request everyone else's latency problem. Refused here,
+    // before any database work, so an over-large batch takes no lock at all.
+    if members.len() > MAX_STAGED_LEASE_MEMBERS {
+        return Err(DomainError::InvalidInput(format!(
+            "a staged reader lease may cover at most {MAX_STAGED_LEASE_MEMBERS} members, got {}; \
+             split the hydration across several leases, which protect the same bytes because \
+             leases are independent",
+            members.len()
+        )));
     }
     let mut seen: BTreeSet<&[u8]> = BTreeSet::new();
     for (hash, _) in members {
@@ -2983,6 +3049,12 @@ mod tests {
         // CR-031 fixes this at 4,096 for WP-118. A silent change here would
         // move the point at which a push is refused.
         assert_eq!(MAX_PUSH_FRAGMENT_REVALIDATIONS, 4_096);
+        // The third per-transaction row budget in `LockClass::Fragments`. All
+        // three bound a row-lock acquisition over the same table in the same
+        // lock class, so a divergence between them is a claim that one of those
+        // acquisitions costs something different — which is a claim that needs
+        // a measurement, not a constant edit.
+        assert_eq!(MAX_STAGED_LEASE_MEMBERS, MAX_PUSH_FRAGMENT_REVALIDATIONS);
     }
 
     #[test]
@@ -3188,6 +3260,34 @@ mod tests {
                 Err(DomainError::InvalidInput(_))
             ),
             "one hash at two epochs must be refused, not silently deduplicated"
+        );
+    }
+
+    #[test]
+    fn a_lease_member_batch_is_bounded_before_any_lock_is_taken() {
+        // `lock_lease_member_heads` takes a FOR SHARE row lock per member, so
+        // an unbounded batch is an unbounded lock acquisition. Distinct hashes
+        // throughout, so this exercises the bound rather than tripping the
+        // duplicate guard.
+        let batch = |count: usize| -> Vec<(Vec<u8>, i64)> {
+            (0..count)
+                .map(|index| {
+                    let mut hash = vec![0u8; 32];
+                    hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                    (hash, 1)
+                })
+                .collect()
+        };
+        assert!(
+            validate_lease_members(&batch(MAX_STAGED_LEASE_MEMBERS)).is_ok(),
+            "exactly the bound must be admitted; an off-by-one here silently narrows hydration"
+        );
+        assert!(
+            matches!(
+                validate_lease_members(&batch(MAX_STAGED_LEASE_MEMBERS + 1)),
+                Err(DomainError::InvalidInput(_))
+            ),
+            "one over the bound must be refused before any database work"
         );
     }
 
