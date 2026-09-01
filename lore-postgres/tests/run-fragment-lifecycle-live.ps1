@@ -83,6 +83,9 @@ $inventory = @(
             # two-fragment batch, plus a required fragment whose captured epoch was never published.
             'revalidate_push_witness_all_or_nothing_over_a_mixed_divergent_batch',
             'revalidate_push_witness_aborts_when_the_captured_epoch_was_never_published',
+            # WP-118 fix-round hardening review: the association-precedence case, the only case
+            # in the file that moves BOTH push-witness scalars for the same required fragment.
+            'revalidate_push_witness_aborts_when_the_association_set_moved_even_though_a_required_fragment_is_equivalent',
             'acquire_staged_leases_and_release_round_trip_a_batch_with_a_monotonic_reader_fence',
             # INV-EF P2-5/P2-6: acquire_staged_leases's three new refusals plus duplicate-lease_id replay.
             'acquire_staged_leases_refuses_a_lease_id_that_is_not_the_schema_length',
@@ -92,6 +95,12 @@ $inventory = @(
             # validate_lease_members' duplicate-hash/empty-batch refusals.
             'acquire_staged_leases_refuses_a_purged_staged_member',
             'acquire_staged_leases_admits_a_quarantined_staged_member',
+            # WP-118 fix-round hardening review: lock_lease_member_heads's Tombstoned/deleting head
+            # check (one epoch deeper than the disposition guard alone) and its FOR SHARE
+            # serialisation against a concurrent commit_obliterate.
+            'acquire_staged_leases_refuses_a_member_whose_fragment_was_obliterated_after_promotion',
+            'acquire_staged_leases_refuses_a_member_whose_head_is_mid_deletion',
+            'acquire_staged_leases_waits_for_a_concurrently_locked_head',
             'acquire_staged_leases_refuses_a_duplicate_hash_batch_and_an_empty_batch',
             'commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tombstones_the_head',
             'commit_obliterate_fences_a_stale_intent_and_mutates_nothing',

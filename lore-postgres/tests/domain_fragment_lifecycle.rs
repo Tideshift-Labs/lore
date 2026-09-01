@@ -3708,6 +3708,18 @@ async fn begin_obliterate_on_a_non_readable_head_moves_the_association_scalar_fo
 /// on a `Staged` head) must be refused the same way a `Remote` or fabricated
 /// member is -- a lease over purged bytes would report protection that
 /// cannot exist.
+///
+/// **Post-WP-118-hardening-review note: this case no longer isolates a single
+/// guard.** Obliterating a `Staged` head directly (never promoted) purges
+/// exactly the epoch this lease asks for AND tombstones the head in the same
+/// transaction, so both `lock_lease_member_heads`'s Tombstoned-head check and
+/// the older epoch-disposition `DISPOSITION_PURGED` check refuse
+/// independently here -- removing either guard alone would leave this case
+/// green. `acquire_staged_leases_refuses_a_member_whose_fragment_was_obliterated_after_promotion`
+/// is the case that isolates the head check by leaving the disposition guard
+/// unable to fire (QUARANTINED, never PURGED). The two assertions added below
+/// pin the shape this case actually exercises, so a reader does not have to
+/// re-derive it.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn acquire_staged_leases_refuses_a_purged_staged_member() {
@@ -3716,6 +3728,7 @@ async fn acquire_staged_leases_refuses_a_purged_staged_member() {
     };
     let store = store(&url).await;
     let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
     let deadline = microsecond_deadline(Duration::from_secs(60));
 
     let hash = random_hash();
@@ -3755,6 +3768,39 @@ async fn acquire_staged_leases_refuses_a_purged_staged_member() {
         CommitVerdict::Published
     );
 
+    // Both guards this case exercises, confirmed by direct SQL before the
+    // lease attempt: the epoch-disposition guard fires because this epoch is
+    // PURGED (a never-promoted Staged head has its only epoch purged by
+    // obliterate), and the head-state guard fires because the head is
+    // Tombstoned. Neither assertion is new coverage on its own -- they exist
+    // so the doc comment above is checked rather than asserted.
+    let staged_disposition: i16 = direct
+        .query_one(
+            "SELECT disposition FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
+            &[&hash, &staged_epoch],
+        )
+        .await
+        .expect("read staged epoch disposition after obliterate")
+        .get(0);
+    assert_eq!(
+        staged_disposition,
+        schema::DISPOSITION_PURGED,
+        "a never-promoted Staged head's only epoch must be purged by obliterate"
+    );
+    let head_state: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read head after obliterate")
+        .get(0);
+    assert_eq!(
+        head_state,
+        FragmentLifecycleState::Tombstoned.bits(),
+        "the head must be Tombstoned once obliterate publishes"
+    );
+
     let lease_id = rand::random::<[u8; 16]>().to_vec();
     let result = coordinator
         .acquire_staged_leases(&lease_id, &[(hash, staged_epoch)], deadline)
@@ -3780,6 +3826,14 @@ async fn acquire_staged_leases_refuses_a_purged_staged_member() {
 /// into refusing every superseded staged epoch, not only purged ones -- a
 /// reader still mid-hydration against a quarantined staged epoch is exactly
 /// what the lease protects.
+///
+/// **Which guard this pins, post-hardening-review**: both of
+/// `lock_lease_member_heads`'s checks agree to admit here, and this case
+/// cannot tell them apart on its own -- the head is `Remote` (readable, so
+/// neither Tombstoned nor deleting) AND the epoch is QUARANTINED (never
+/// PURGED). It exists to prove the new head check does not over-correct into
+/// refusing a promoted fragment's superseded staged predecessor, the same way
+/// the older disposition-only guard already had to avoid doing.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn acquire_staged_leases_admits_a_quarantined_staged_member() {
@@ -3858,6 +3912,334 @@ async fn acquire_staged_leases_admits_a_quarantined_staged_member() {
         .await
         .expect("a quarantined staged epoch must still admit a lease");
     assert_eq!(lease.members, vec![(hash, staged_epoch)]);
+}
+
+/// P1-A: the exact independent-review sequence -- stage, promote, obliterate.
+/// `commit_obliterate` purges only the epoch that was current when
+/// `begin_obliterate` ran, which by then is the PROMOTED epoch, not the
+/// staged predecessor -- so the staged epoch's own disposition stays
+/// QUARANTINED, never PURGED. The epoch-disposition guard alone would
+/// therefore admit this lease; only `lock_lease_member_heads`'s Tombstoned-
+/// head check refuses it. The disposition assertion below is what makes this
+/// case prove the head check specifically, rather than merely re-running
+/// `acquire_staged_leases_refuses_a_purged_staged_member` under a different
+/// name.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn acquire_staged_leases_refuses_a_member_whose_fragment_was_obliterated_after_promotion() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let deadline = microsecond_deadline(Duration::from_secs(60));
+
+    let hash = random_hash();
+    let BeginOutcome::Admitted(stage_intent) =
+        coordinator.begin_stage(&hash).await.expect("begin stage")
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    assert_eq!(
+        coordinator
+            .commit_staged(
+                &stage_intent,
+                IoObservation::Valid(manifest(
+                    "obliterated-after-promotion/staged",
+                    0x93,
+                    EpochAuthority::Staged
+                ))
+            )
+            .await
+            .expect("commit staged"),
+        CommitVerdict::Published
+    );
+    let staged_epoch = stage_intent.epoch;
+
+    let BeginOutcome::Admitted(promotion_intent) = coordinator
+        .begin_promotion(&hash)
+        .await
+        .expect("begin promotion")
+    else {
+        panic!("a Staged head must admit begin_promotion");
+    };
+    assert_eq!(
+        coordinator
+            .commit_promotion(
+                &promotion_intent,
+                IoObservation::Valid(manifest(
+                    "obliterated-after-promotion/promoted",
+                    0x94,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit promotion"),
+        CommitVerdict::Published
+    );
+
+    let BeginOutcome::Admitted(obliterate_intent) = coordinator
+        .begin_obliterate(&hash)
+        .await
+        .expect("begin obliterate")
+    else {
+        panic!("a readable (Remote) head must admit begin_obliterate");
+    };
+    assert_eq!(
+        coordinator
+            .commit_obliterate(&obliterate_intent)
+            .await
+            .expect("commit obliterate"),
+        CommitVerdict::Published
+    );
+
+    // Prove the shape this case actually exercises BEFORE calling
+    // acquire_staged_leases: the staged epoch's disposition is still
+    // QUARANTINED, not PURGED, and the head is Tombstoned. If the disposition
+    // guard alone were asked, it would admit this lease.
+    let staged_disposition: i16 = direct
+        .query_one(
+            "SELECT disposition FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
+            &[&hash, &staged_epoch],
+        )
+        .await
+        .expect("read staged epoch disposition after obliterate")
+        .get(0);
+    assert_eq!(
+        staged_disposition,
+        schema::DISPOSITION_QUARANTINED,
+        "the staged predecessor epoch must remain QUARANTINED -- obliterate purges only the \
+         epoch that was current when it began, which by then is the promoted one, not this one"
+    );
+    let head_state: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read head after obliterate")
+        .get(0);
+    assert_eq!(
+        head_state,
+        FragmentLifecycleState::Tombstoned.bits(),
+        "the head must be Tombstoned once obliterate publishes"
+    );
+
+    let lease_id = rand::random::<[u8; 16]>().to_vec();
+    let result = coordinator
+        .acquire_staged_leases(&lease_id, &[(hash.clone(), staged_epoch)], deadline)
+        .await;
+    match result {
+        Err(DomainError::PreconditionRejected {
+            reason,
+            reason_version,
+        }) => {
+            assert_eq!(reason, STAGED_LEASE_MEMBER_NOT_STAGED);
+            assert_eq!(reason_version, 1);
+        }
+        other => panic!(
+            "expected STAGED_LEASE_MEMBER_NOT_STAGED for a staged epoch behind a tombstoned \
+             head, got {other:?}"
+        ),
+    }
+
+    let lease_rows: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_staged_leases WHERE lease_id = $1",
+            &[&lease_id],
+        )
+        .await
+        .expect("count lease rows")
+        .get(0);
+    assert_eq!(lease_rows, 0, "a refused lease must persist no lease row");
+    let member_rows: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_staged_lease_members WHERE lease_id = $1",
+            &[&lease_id],
+        )
+        .await
+        .expect("count lease member rows")
+        .get(0);
+    assert_eq!(member_rows, 0, "a refused lease must persist no member row");
+}
+
+/// P1-A's mid-flight half: `begin_obliterate` alone (no `commit_obliterate`)
+/// leaves the head `DeletingPayload`, not yet `Tombstoned`. The head check in
+/// `lock_lease_member_heads` refuses on `state.is_deleting()`, a separate
+/// branch from the `Tombstoned` equality check the sibling cases exercise --
+/// this is the only case in the file that reaches it.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn acquire_staged_leases_refuses_a_member_whose_head_is_mid_deletion() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let deadline = microsecond_deadline(Duration::from_secs(60));
+
+    let hash = random_hash();
+    let BeginOutcome::Admitted(stage_intent) =
+        coordinator.begin_stage(&hash).await.expect("begin stage")
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    assert_eq!(
+        coordinator
+            .commit_staged(
+                &stage_intent,
+                IoObservation::Valid(manifest(
+                    "mid-deletion-member/staged",
+                    0x95,
+                    EpochAuthority::Staged
+                ))
+            )
+            .await
+            .expect("commit staged"),
+        CommitVerdict::Published
+    );
+    let staged_epoch = stage_intent.epoch;
+
+    let BeginOutcome::Admitted(_obliterate_intent) = coordinator
+        .begin_obliterate(&hash)
+        .await
+        .expect("begin obliterate")
+    else {
+        panic!("a readable (Staged) head must admit begin_obliterate");
+    };
+    // Deliberately no commit_obliterate: the head must be DeletingPayload, not
+    // yet Tombstoned, so this case reaches `is_deleting()` rather than the
+    // `Tombstoned` equality check the sibling cases above exercise.
+    let head_state: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read head after begin_obliterate")
+        .get(0);
+    assert_eq!(
+        head_state,
+        FragmentLifecycleState::DeletingPayload.bits(),
+        "begin_obliterate alone must leave the head DeletingPayload, not Tombstoned"
+    );
+
+    let lease_id = rand::random::<[u8; 16]>().to_vec();
+    let result = coordinator
+        .acquire_staged_leases(&lease_id, &[(hash, staged_epoch)], deadline)
+        .await;
+    match result {
+        Err(DomainError::PreconditionRejected {
+            reason,
+            reason_version,
+        }) => {
+            assert_eq!(reason, STAGED_LEASE_MEMBER_NOT_STAGED);
+            assert_eq!(reason_version, 1);
+        }
+        other => panic!(
+            "expected STAGED_LEASE_MEMBER_NOT_STAGED for a staged epoch behind a mid-deletion \
+             head, got {other:?}"
+        ),
+    }
+}
+
+/// P1-B, made deterministic: before `lock_lease_member_heads`, the scope
+/// check inside `acquire_staged_leases` was an unlocked `SELECT` at READ
+/// COMMITTED with no head lock at all, so a concurrent `commit_obliterate`
+/// could purge the epoch between the check passing and the lease row
+/// landing. `lock_lease_member_heads`'s `FOR SHARE` closes that by
+/// serialising against whatever holds the head row's lock -- proved here by
+/// holding an external `FOR UPDATE` on the head and showing
+/// `acquire_staged_leases` genuinely blocks on it (a `tokio::time::timeout`
+/// elapses) rather than returning immediately, which is exactly what it did
+/// before the `FOR SHARE` was added.
+///
+/// The coordinator's own pool (`store()`, `pool_max` 8) and the external
+/// lock holder's pool (`own_transaction_client`, its own separate `pool_max`
+/// 4) are two disjoint, multi-connection pools. That is deliberate: if the
+/// blocked `acquire_staged_leases` call and the external lock shared a
+/// single-connection pool, a timeout here could mean nothing more than "the
+/// pool had no free connection to hand out" -- indistinguishable from the
+/// row-lock wait this test means to prove. With two separate
+/// more-than-one-connection pools, the only thing left that can make the
+/// call wait is the head's row lock itself.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn acquire_staged_leases_waits_for_a_concurrently_locked_head() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let deadline = microsecond_deadline(Duration::from_secs(60));
+
+    let hash = random_hash();
+    let BeginOutcome::Admitted(stage_intent) =
+        coordinator.begin_stage(&hash).await.expect("begin stage")
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    assert_eq!(
+        coordinator
+            .commit_staged(
+                &stage_intent,
+                IoObservation::Valid(manifest(
+                    "head-lock-wait/staged",
+                    0x96,
+                    EpochAuthority::Staged
+                ))
+            )
+            .await
+            .expect("commit staged"),
+        CommitVerdict::Published
+    );
+    let staged_epoch = stage_intent.epoch;
+
+    // Hold the head's row lock externally, on a wholly separate pool and
+    // connection from the coordinator's own.
+    let mut lock_client = own_transaction_client(&url).await;
+    let lock_tx = lock_client
+        .transaction()
+        .await
+        .expect("open external head-lock transaction");
+    lock_tx
+        .execute(
+            "SELECT 1 FROM lore_fragment_lifecycle WHERE hash = $1 FOR UPDATE",
+            &[&hash.as_slice()],
+        )
+        .await
+        .expect("lock the head externally");
+
+    let lease_id = rand::random::<[u8; 16]>().to_vec();
+    let members = vec![(hash.clone(), staged_epoch)];
+    let blocked = timeout(
+        Duration::from_secs(2),
+        coordinator.acquire_staged_leases(&lease_id, &members, deadline),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "acquire_staged_leases must block on the externally held head lock rather than return \
+         immediately -- without lock_lease_member_heads's FOR SHARE this returns right away"
+    );
+
+    // Release the external lock and confirm the very same acquire now
+    // succeeds promptly.
+    lock_tx
+        .commit()
+        .await
+        .expect("release the external head lock");
+
+    let lease = timeout(
+        Duration::from_secs(5),
+        coordinator.acquire_staged_leases(&lease_id, &members, deadline),
+    )
+    .await
+    .expect("acquire_staged_leases must complete promptly once the head lock is released")
+    .expect("a staged member with no purged/tombstoned head must admit a lease");
+    assert_eq!(lease.members, members);
 }
 
 /// `validate_lease_members` runs before any database work: a batch repeating
@@ -4329,5 +4711,226 @@ async fn revalidate_push_witness_all_or_nothing_over_a_mixed_divergent_batch() {
             reason: REQUIRED_FRAGMENT_CHANGED
         },
         "one non-equivalent member in an otherwise-equivalent batch must abort the whole push"
+    );
+}
+
+/// P2-C (WP-118 hardening review): every existing `revalidate_push_witness`
+/// case associates its fragments BEFORE capturing the witness, so the
+/// association scalar never moves in any of them --
+/// `an_association_move_outranks_a_lifecycle_move` (`coordinator.rs`'s own
+/// `mod tests`) pins the precedence offline against `classify_push_witness`
+/// directly, but nothing end-to-end proves it against the real
+/// `revalidate_push_witness` path until this case. Move BOTH scalars for the
+/// SAME required fragment: after capture, tombstone and recreate its
+/// association (association scalar, membership unchanged) and promote it to
+/// a content-equivalent successor epoch, alongside a bystander transition
+/// that moves the lifecycle scalar too. If the precedence were wrong --
+/// lifecycle checked first, or the two conditions merged into "was there any
+/// change" -- this would reach the fallback, see the required fragment
+/// readable at an equivalent epoch, and wrongly satisfy the push against an
+/// association set that (momentarily) did not contain it.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn revalidate_push_witness_aborts_when_the_association_set_moved_even_though_a_required_fragment_is_equivalent()
+ {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+
+    // The required fragment: staged, then associated BEFORE capture, exactly
+    // like the existing equivalent-epoch case -- its own create_association
+    // here does not move the scalar this test cares about after capture.
+    let hash = random_hash();
+    let BeginOutcome::Admitted(stage_intent) =
+        coordinator.begin_stage(&hash).await.expect("begin stage")
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    let staged_manifest = manifest("assoc-move/staged", 0xD0, EpochAuthority::Staged);
+    assert_eq!(
+        coordinator
+            .commit_staged(&stage_intent, IoObservation::Valid(staged_manifest.clone()))
+            .await
+            .expect("commit staged"),
+        CommitVerdict::Published
+    );
+    let original_epoch = stage_intent.epoch;
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate required fragment"),
+        CommitVerdict::Published
+    );
+
+    // A bystander whose readable-to-Missing transition is what moves the
+    // lifecycle scalar -- an equivalent promotion alone (Staged->Remote, both
+    // readable) crosses no readability boundary and moves nothing on its own.
+    let bystander_hash = random_hash();
+    let BeginOutcome::Admitted(bystander_intent) = coordinator
+        .begin_direct_write(&bystander_hash, "assoc-move/bystander")
+        .await
+        .expect("begin bystander")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &bystander_intent,
+                IoObservation::Valid(manifest(
+                    "assoc-move/bystander",
+                    0xD9,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit bystander"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&bystander_hash, &repository_id, &context)
+            .await
+            .expect("associate bystander"),
+        CommitVerdict::Published
+    );
+
+    let captured = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness")
+        .expect("repository must exist");
+
+    // Move the association scalar: tombstone and recreate the required
+    // fragment's own association. Membership ends up exactly as it was
+    // (still live, same hash/repository/context) -- only the scalar moves,
+    // which is precisely the shape a lifecycle-only check would miss.
+    assert_eq!(
+        coordinator
+            .tombstone_association(&hash, &repository_id, &context)
+            .await
+            .expect("tombstone required fragment association"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("recreate required fragment association"),
+        CommitVerdict::Published
+    );
+
+    // Promote the required fragment to a NEW epoch that is content-equivalent
+    // to the one preflight captured -- if the fallback were ever reached, the
+    // CR-031:266 equivalence allowance would accept it.
+    let BeginOutcome::Admitted(promotion_intent) = coordinator
+        .begin_promotion(&hash)
+        .await
+        .expect("begin promotion")
+    else {
+        panic!("a Staged head must admit begin_promotion");
+    };
+    assert_ne!(
+        promotion_intent.epoch, original_epoch,
+        "promotion must allocate a new epoch, not republish the staged one"
+    );
+    let mut promoted_manifest = staged_manifest.clone();
+    promoted_manifest.authority = EpochAuthority::Remote;
+    promoted_manifest.object_key = "assoc-move/promoted".to_owned();
+    promoted_manifest.manifest_id = vec![0xDA; 32];
+    assert_eq!(
+        coordinator
+            .commit_promotion(&promotion_intent, IoObservation::Valid(promoted_manifest))
+            .await
+            .expect("commit promotion"),
+        CommitVerdict::Published
+    );
+
+    // Move the lifecycle scalar via the bystander.
+    let resolved_bystander = coordinator
+        .resolve(
+            &repository_id,
+            &context,
+            std::slice::from_ref(&bystander_hash),
+        )
+        .await
+        .expect("resolve bystander");
+    let (bystander_witness, ..) = expect_readable(&resolved_bystander[0]);
+    let bystander_witness = bystander_witness.clone();
+    assert_eq!(
+        coordinator
+            .mark_missing(&bystander_witness, MissingDiagnostic::Absent)
+            .await
+            .expect("mark bystander missing"),
+        CommitVerdict::Published
+    );
+
+    // Prove, by direct SQL, that BOTH scalars actually moved -- otherwise
+    // this case silently degenerates into the existing lifecycle-only path
+    // and proves nothing about the precedence.
+    let scalars_row = direct
+        .query_one(
+            "SELECT content_association_generation, fragment_lifecycle_generation \
+               FROM lore_domain_repositories WHERE repository_id = $1",
+            &[&repository_id.as_slice()],
+        )
+        .await
+        .expect("read repository scalars after the moves");
+    let current_association: i64 = scalars_row.get(0);
+    let current_lifecycle: i64 = scalars_row.get(1);
+    assert_ne!(
+        current_association, captured.content_association_generation,
+        "the association scalar must have genuinely moved"
+    );
+    assert_ne!(
+        current_lifecycle, captured.fragment_lifecycle_generation,
+        "the lifecycle scalar must have genuinely moved too -- otherwise this case cannot \
+         distinguish an association move from a lifecycle-only one"
+    );
+
+    // The required fragment really is readable at a content-equivalent
+    // successor epoch -- the exact shape the equivalence allowance accepts.
+    let current_epoch: i64 = direct
+        .query_one(
+            "SELECT current_epoch FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read current epoch after promotion")
+        .get(0);
+    assert_eq!(current_epoch, promotion_intent.epoch);
+    assert_ne!(
+        current_epoch, original_epoch,
+        "the required fragment's current epoch must have genuinely advanced"
+    );
+
+    let required = vec![RequiredFragment {
+        hash: hash.clone(),
+        epoch: original_epoch,
+    }];
+    let mut tx_client = own_transaction_client(&url).await;
+    let tx = tx_client
+        .transaction()
+        .await
+        .expect("open push-witness transaction");
+    let mut sequence = LockSequence::new();
+    let verdict = coordinator
+        .revalidate_push_witness(&tx, &mut sequence, &repository_id, captured, &required)
+        .await
+        .expect("revalidate must not error");
+    assert_eq!(
+        verdict,
+        PushWitnessVerdict::Aborted {
+            reason: REQUIRED_FRAGMENT_CHANGED
+        },
+        "an association move must abort even though the required fragment is readable at a \
+         content-equivalent epoch -- association precedence must outrank the equivalence \
+         allowance"
     );
 }

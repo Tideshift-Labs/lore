@@ -1464,15 +1464,22 @@ impl PostgresFragmentCoordinator {
             content_association_generation: row.get("content_association_generation"),
             fragment_lifecycle_generation: row.get("fragment_lifecycle_generation"),
         };
-        if current == captured {
-            return Ok(PushWitnessVerdict::Unchanged);
-        }
-        if current.content_association_generation != captured.content_association_generation {
-            // The association set itself moved. The fallback revalidates
-            // representations, not membership, so it cannot cover this.
-            return Ok(PushWitnessVerdict::Aborted {
-                reason: REQUIRED_FRAGMENT_CHANGED,
-            });
+        // One pure decision rather than two ordered `if`s. The precedence — an
+        // association move outranks a lifecycle move even when both happened —
+        // is what keeps obliterate-then-recreate out of reach of the
+        // equivalence allowance, and as two positional branches it was
+        // protected only by a comment and provably untested. As an enum it is
+        // pinnable offline, which `classify_push_witness` tests do.
+        match classify_push_witness(captured, current) {
+            PushWitnessChange::Neither => return Ok(PushWitnessVerdict::Unchanged),
+            PushWitnessChange::AssociationMoved => {
+                // The association set itself moved. The fallback revalidates
+                // representations, not membership, so it cannot cover this.
+                return Ok(PushWitnessVerdict::Aborted {
+                    reason: REQUIRED_FRAGMENT_CHANGED,
+                });
+            }
+            PushWitnessChange::LifecycleOnly => {}
         }
         // Count first. This is the whole reason the limit is a known refusal:
         // it is checked before a single fragment row is locked, so a refused
@@ -1567,9 +1574,16 @@ impl PostgresFragmentCoordinator {
     /// hydration request.
     ///
     /// One transaction and one lease row for the whole batch, not one per
-    /// 256 KiB fragment. Lease maintenance runs in its own transaction and
-    /// never co-occurs with a domain lock, which is why the lease row needs no
-    /// position in F-032-3.
+    /// 256 KiB fragment. The lease tables themselves hold no position in
+    /// F-032-3 and need none.
+    ///
+    /// **This method is no longer outside `LockSequence`, and CR-031's recorded
+    /// exemption for it no longer holds as written.** That exemption's stated
+    /// reason was that lease maintenance takes no domain row; it now takes head
+    /// rows `FOR SHARE`, because the disposition guard below is otherwise a
+    /// plain unlocked read that nothing orders against `commit_obliterate`. See
+    /// [`lock_lease_member_heads`] for the lock-order argument and for why the
+    /// single-statement alternative does not actually serialise.
     ///
     /// # What this refuses, and why each refusal is here
     ///
@@ -1604,6 +1618,24 @@ impl PostgresFragmentCoordinator {
     ///   proved gone and a lease over them would report protection that cannot
     ///   exist. `commit_obliterate` reaches a `Staged` head and purges its
     ///   epoch, so this is a reachable state, not a theoretical one.
+    ///
+    ///   Two things follow, and the second is easy to overstate. The guard is
+    ///   **one epoch deep and not sufficient on its own**, which is why the
+    ///   head is checked too; but the head check in turn **subsumes it in every
+    ///   state reachable today**, because `commit_obliterate` is the only purge
+    ///   and it tombstones the head in the same transaction, and a `Tombstoned`
+    ///   head is terminal. So this is not two independent guards right now — it
+    ///   is one live guard plus one kept for the reachable-state set Phase 6
+    ///   introduces, where GC reclaims noncurrent and quarantined epochs
+    ///   without tombstoning anything.
+    ///
+    ///   The one-epoch-deep problem in full: `commit_obliterate` purges only the epoch
+    ///   that was current when it began, so a fragment staged, then promoted,
+    ///   then obliterated ends `Tombstoned` with its promoted epoch purged and
+    ///   its staged predecessor still merely `QUARANTINED` — leasable by the
+    ///   disposition test alone. [`lock_lease_member_heads`] refuses a
+    ///   `Tombstoned` or deleting head, which closes that without touching the
+    ///   promotion case: a promoted head is `Remote` and readable.
     /// * **A duplicate hash in `members`, or an empty batch.** The member table
     ///   is keyed `(lease_id, hash)`, so two entries for one hash would persist
     ///   as one row while the returned lease claimed both — protection silently
@@ -1666,7 +1698,12 @@ impl PostgresFragmentCoordinator {
             .map_err(|error| DomainError::from_pg("staged lease begin", error))?;
         let member_hashes: Vec<&[u8]> = members.iter().map(|(hash, _)| hash.as_slice()).collect();
         let member_epochs: Vec<i64> = members.iter().map(|(_, epoch)| *epoch).collect();
-        // Scope check first, so a refusal happens before anything is written
+        // Take the heads first. This both refuses a member whose fragment is
+        // obliterated or mid-deletion and serialises the epoch-disposition
+        // check below against the only two writers that can move it.
+        let mut sequence = LockSequence::new();
+        lock_lease_member_heads(&tx, &mut sequence, &member_hashes).await?;
+        // Scope check second, so a refusal happens before anything is written
         // and the transaction has nothing to undo.
         if tx
             .query_opt(
@@ -2090,6 +2127,150 @@ async fn lock_fragment_head(
         })
     })
     .transpose()
+}
+
+/// What a push witness comparison decided, as a value rather than a branch
+/// order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushWitnessChange {
+    /// Neither scalar moved. The fast path commits with no fragment-row read.
+    Neither,
+    /// The association scalar moved, whether or not the lifecycle scalar did
+    /// too. Always an abort.
+    AssociationMoved,
+    /// The lifecycle scalar moved and the association scalar did not. The only
+    /// case the bounded fallback may attempt.
+    LifecycleOnly,
+}
+
+/// Classify one push witness against its captured value.
+///
+/// # The precedence is the point
+///
+/// `AssociationMoved` outranks `LifecycleOnly` when **both** scalars moved, and
+/// that ordering is load-bearing for the CR-031:266 equivalence allowance
+/// rather than a stylistic choice. An obliterate-then-recreate moves both: it
+/// tombstones associations (association scalar) and crosses readability
+/// (lifecycle scalar). If such a witness were routed to the fallback, the
+/// recreated fragment could present content columns equal to the captured
+/// epoch's and be accepted as "semantically equivalent" — committing a push
+/// against an association set that no longer contains what it required.
+///
+/// As two positional `if`s this was protected by nothing but a comment: the
+/// association branch could be deleted outright with every live push case and
+/// every library test still green, because every one of those cases associates
+/// before capturing its witness, so that scalar never moves. Making it a value
+/// is what lets `an_association_move_outranks_a_lifecycle_move` pin it offline.
+fn classify_push_witness(
+    captured: PushGenerationWitness,
+    current: PushGenerationWitness,
+) -> PushWitnessChange {
+    if current.content_association_generation != captured.content_association_generation {
+        return PushWitnessChange::AssociationMoved;
+    }
+    if current.fragment_lifecycle_generation != captured.fragment_lifecycle_generation {
+        return PushWitnessChange::LifecycleOnly;
+    }
+    PushWitnessChange::Neither
+}
+
+/// Take a share lock on every lease member's head, in sorted hash order, and
+/// refuse a head that is gone or on its way out.
+///
+/// # Why a lock, and why `FOR SHARE`
+///
+/// The disposition guard this serialises is otherwise a plain unlocked
+/// `SELECT` at READ COMMITTED, which nothing orders against `commit_obliterate`
+/// — its scope check can pass, obliterate can commit `DISPOSITION_PURGED`, and
+/// the lease still lands. Every writer that mutates a `lore_fragment_epochs`
+/// disposition for a hash does so while holding that hash's head row
+/// `FOR UPDATE`: `commit_obliterate`'s purge and `commit_publication`'s
+/// predecessor quarantine are the only two, and both sit after
+/// [`lock_fragment_head`]. Holding the head is therefore sufficient to
+/// serialise **both** this function's state check and the epoch-disposition
+/// check that follows it, without locking epoch rows separately.
+///
+/// `FOR SHARE` rather than `FOR UPDATE` because concurrent hydration is the
+/// normal case: two readers leasing the same staged fragment must not queue
+/// behind each other, and share locks are mutually compatible. Only a writer
+/// blocks, and only for the few statements a lease acquire runs.
+///
+/// **Folding the check into the member `INSERT ... SELECT` would not have
+/// worked.** A single statement narrows the window but establishes no
+/// happens-before: at READ COMMITTED the `SELECT` half takes its snapshot at
+/// statement start, so an obliterate committing immediately after that scan is
+/// still invisible and the lease still lands. The race is a missing lock, not
+/// a missing atomic statement.
+///
+/// # Lock order
+///
+/// This is the first and only domain-row class the lease path takes
+/// (`LockClass::Fragments`, position 4), and the lease tables themselves hold
+/// no position, so nothing here can reach back for an earlier class and no
+/// F-032-3 inversion is expressible. It is registered with [`LockSequence`]
+/// rather than exempted, so that claim is checked rather than asserted.
+///
+/// **This changes the lease path's standing exemption.** CR-031 recorded the
+/// staged-lease transaction as sound outside `LockSequence` *because it took no
+/// domain row*. It now takes one, so the exemption's original rationale no
+/// longer applies and the registration above replaces it.
+///
+/// # What this does and does not guarantee
+///
+/// It guarantees no lease is granted over a fragment already obliterated or
+/// mid-deletion. It does **not** make an obliterate honour a lease that is
+/// already live — a writer that wins the head lock first proceeds, and
+/// draining live readers before a physical purge is Phase 6's, not closed
+/// here.
+async fn lock_lease_member_heads(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    hashes: &[&[u8]],
+) -> Result<(), DomainError> {
+    sequence.enter(LockClass::Fragments)?;
+    let mut sorted: Vec<&[u8]> = hashes.to_vec();
+    sorted.sort_unstable();
+    let rows = tx
+        .query(
+            "SELECT hash, state FROM lore_fragment_lifecycle \
+              WHERE hash = ANY($1) ORDER BY hash FOR SHARE",
+            &[&sorted],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("staged lease head lock", error))?;
+    let mut locked: BTreeMap<Vec<u8>, FragmentLifecycleState> = BTreeMap::new();
+    for row in rows {
+        locked.insert(
+            row.get("hash"),
+            FragmentLifecycleState::from_bits(row.get("state"))?,
+        );
+    }
+    for hash in &sorted {
+        // An absent head is refused rather than ignored. `FOR UPDATE`/`FOR
+        // SHARE` over zero rows locks nothing, so proceeding here would run
+        // unserialised — the trap `lock_fragment_head`'s own doc names.
+        let Some(state) = locked.get(*hash) else {
+            return Err(DomainError::PreconditionRejected {
+                reason: STAGED_LEASE_MEMBER_NOT_STAGED.to_owned(),
+                reason_version: 1,
+            });
+        };
+        // The epoch-level `DISPOSITION_PURGED` guard is exactly one epoch deep,
+        // and `commit_obliterate` purges only the epoch that was current when
+        // it began. A promoted fragment therefore leaves its staged predecessor
+        // `QUARANTINED` — admitted by design — and obliterating that fragment
+        // purges only the promoted epoch, leaving the staged one still looking
+        // leasable. Refusing on the head's state is what closes that, and it
+        // costs nothing the promotion case needs: a promoted head is `Remote`
+        // and readable.
+        if *state == FragmentLifecycleState::Tombstoned || state.is_deleting() {
+            return Err(DomainError::PreconditionRejected {
+                reason: STAGED_LEASE_MEMBER_NOT_STAGED.to_owned(),
+                reason_version: 1,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// One required fragment whose current epoch is not the one preflight
@@ -2883,6 +3064,57 @@ mod tests {
             REQUIRED_FRAGMENT_REVALIDATION_LIMIT,
             REQUIRED_FRAGMENT_CHANGED
         );
+    }
+
+    fn push_witness(association: i64, lifecycle: i64) -> PushGenerationWitness {
+        PushGenerationWitness {
+            content_association_generation: association,
+            fragment_lifecycle_generation: lifecycle,
+        }
+    }
+
+    #[test]
+    fn an_association_move_outranks_a_lifecycle_move() {
+        // THE case. Both scalars moved, which is exactly what an
+        // obliterate-then-recreate produces: it tombstones associations and
+        // crosses readability. It must abort, never reach the bounded
+        // fallback, and never be handed to the equivalence allowance -- a
+        // recreated fragment can present identical content columns and would
+        // otherwise be accepted as semantically equivalent to an epoch whose
+        // association is gone.
+        assert_eq!(
+            classify_push_witness(push_witness(1, 1), push_witness(2, 2)),
+            PushWitnessChange::AssociationMoved,
+            "an association move must outrank a simultaneous lifecycle move"
+        );
+    }
+
+    #[test]
+    fn each_push_witness_shape_classifies_to_exactly_one_outcome() {
+        assert_eq!(
+            classify_push_witness(push_witness(1, 1), push_witness(1, 1)),
+            PushWitnessChange::Neither
+        );
+        assert_eq!(
+            classify_push_witness(push_witness(1, 1), push_witness(2, 1)),
+            PushWitnessChange::AssociationMoved
+        );
+        assert_eq!(
+            classify_push_witness(push_witness(1, 1), push_witness(1, 2)),
+            PushWitnessChange::LifecycleOnly
+        );
+        // Only `LifecycleOnly` may attempt the fallback. If a fourth shape is
+        // ever added, this is where the fallback's precondition has to be
+        // re-argued rather than silently widened.
+        for (association, lifecycle) in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+            let change =
+                classify_push_witness(push_witness(1, 1), push_witness(association, lifecycle));
+            assert_eq!(
+                change == PushWitnessChange::LifecycleOnly,
+                association == 1 && lifecycle != 1,
+                "({association}, {lifecycle}) classified as {change:?}"
+            );
+        }
     }
 
     #[test]
