@@ -183,6 +183,14 @@ fn base_request(attempt_class: ProviderAttemptClass) -> ProviderAttemptRequest {
     }
 }
 
+fn request_for_attempt_number(attempt_number: u32) -> ProviderAttemptRequest {
+    assert!(attempt_number > 0, "attempt numbers are one-based");
+    let mut request = base_request(ProviderAttemptClass::Readiness);
+    request.attempt_id = uuid_v7(REQUEST_TIMESTAMP_MS, &format!("f{attempt_number:011x}"));
+    request.attempt_ordinal = attempt_number;
+    request
+}
+
 fn put_object_request() -> ProviderAttemptRequest {
     let mut request = base_request(ProviderAttemptClass::PutObject);
     request.put_body = Some(durable_put_body());
@@ -337,6 +345,34 @@ impl ProviderChargeAuthority for PendingChargeAuthority {
         _request: &ProviderChargeRequest,
     ) -> Result<ProviderChargeGrant, ProviderChargeError> {
         std::future::pending().await
+    }
+}
+
+struct PendingThenSuccessChargeAuthority {
+    pending_calls: u32,
+    calls: AtomicU32,
+}
+
+impl PendingThenSuccessChargeAuthority {
+    fn new(pending_calls: u32) -> Self {
+        Self {
+            pending_calls,
+            calls: AtomicU32::new(0),
+        }
+    }
+}
+
+impl ProviderChargeAuthority for PendingThenSuccessChargeAuthority {
+    async fn charge(
+        &self,
+        request: &ProviderChargeRequest,
+    ) -> Result<ProviderChargeGrant, ProviderChargeError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call < self.pending_calls {
+            std::future::pending().await
+        } else {
+            Ok(binding_grant(request))
+        }
     }
 }
 
@@ -1686,6 +1722,73 @@ async fn dropping_execute_while_charge_is_pending_cannot_under_report_the_charge
 }
 
 #[tokio::test]
+async fn success_after_one_cancel_reconciles_the_provisional_charge_to_exactly_one_grant() {
+    let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+        })
+    });
+    let client = client_with(
+        ProviderCapabilities::none(),
+        PendingThenSuccessChargeAuthority::new(1),
+        transport,
+    );
+    let request = base_request(ProviderAttemptClass::Readiness);
+    let mut ledger = new_ledger();
+    let mut cancelled = Box::pin(client.execute(&mut ledger, &request));
+    tokio::select! {
+        biased;
+        outcome = &mut cancelled => panic!("pending authority unexpectedly resolved: {outcome:?}"),
+        _ = tokio::time::sleep(Duration::ZERO) => {}
+    }
+    drop(cancelled);
+
+    let outcome = client.execute(&mut ledger, &request).await;
+
+    assert_eq!(outcome, Ok(ProviderAttemptOutcome::Decisive));
+    assert_eq!(ledger.committed_grant_count(), 1);
+    assert_eq!(ledger.attempt_count(), 1);
+    assert_eq!(transport_calls.get(), 1);
+}
+
+#[tokio::test]
+async fn success_after_repeated_cancels_still_reconciles_to_exactly_one_grant() {
+    let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+        })
+    });
+    let client = client_with(
+        ProviderCapabilities::none(),
+        PendingThenSuccessChargeAuthority::new(2),
+        transport,
+    );
+    let request = base_request(ProviderAttemptClass::Readiness);
+    let mut ledger = new_ledger();
+
+    for _ in 0..2 {
+        let mut cancelled = Box::pin(client.execute(&mut ledger, &request));
+        tokio::select! {
+            biased;
+            outcome = &mut cancelled => {
+                panic!("pending authority unexpectedly resolved: {outcome:?}")
+            },
+            _ = tokio::time::sleep(Duration::ZERO) => {}
+        }
+        drop(cancelled);
+    }
+
+    let outcome = client.execute(&mut ledger, &request).await;
+
+    assert_eq!(outcome, Ok(ProviderAttemptOutcome::Decisive));
+    assert_eq!(ledger.committed_grant_count(), 1);
+    assert_eq!(ledger.attempt_count(), 1);
+    assert_eq!(transport_calls.get(), 1);
+}
+
+#[tokio::test]
 async fn execute_poisons_the_ledger_when_the_grant_does_not_bind_the_attempt() {
     type Mutator = Box<dyn Fn(ProviderChargeGrant) -> ProviderChargeGrant + Sync>;
     let mutators: Vec<(&str, Mutator)> = vec![
@@ -1945,12 +2048,15 @@ async fn execute_records_one_ambiguous_attempt() {
 #[tokio::test]
 async fn execute_accumulates_counters_across_several_successful_attempts() {
     let mut ledger = new_ledger();
-    for outcome in [
+    for (index, outcome) in [
         ProviderAttemptOutcome::Decisive,
         ProviderAttemptOutcome::Decisive,
         ProviderAttemptOutcome::Decisive,
         ProviderAttemptOutcome::Ambiguous,
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let (charge_authority, _charge_calls) =
             ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
         let (transport, _transport_calls) = ScriptedTransport::new(move |_attempt| {
@@ -1961,7 +2067,10 @@ async fn execute_accumulates_counters_across_several_successful_attempts() {
         });
         let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
         client
-            .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+            .execute(
+                &mut ledger,
+                &request_for_attempt_number(u32::try_from(index + 1).expect("small fixture index")),
+            )
             .await
             .expect("attempt must succeed");
     }
@@ -2781,7 +2890,12 @@ async fn audit_for_a_malformed_request_id_is_a_ledger_request_mismatch_not_a_val
 
 /// Every terminal error path `execute` can take, applied to `ledger`'s current state through the
 /// real public API. `"none"` performs no action. Used only by the systematic matrix below.
-async fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) {
+async fn apply_terminal_action(
+    label: &str,
+    ledger: &mut ProviderAttemptLedger,
+    attempt_number: u32,
+) {
+    let request = request_for_attempt_number(attempt_number);
     match label {
         "none" => {}
         "charge_ambiguous_commit" => {
@@ -2790,9 +2904,7 @@ async fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) 
             let (transport, _calls2) =
                 ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
             let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-            let _ = client
-                .execute(ledger, &base_request(ProviderAttemptClass::Readiness))
-                .await;
+            let _ = client.execute(ledger, &request).await;
         }
         "grant_mismatch" => {
             let (charge_authority, _calls) = ScriptedChargeAuthority::new(|request| {
@@ -2803,9 +2915,7 @@ async fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) 
             let (transport, _calls2) =
                 ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
             let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-            let _ = client
-                .execute(ledger, &base_request(ProviderAttemptClass::Readiness))
-                .await;
+            let _ = client.execute(ledger, &request).await;
         }
         "transport_refused" => {
             let (charge_authority, _calls) =
@@ -2815,9 +2925,7 @@ async fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) 
                 charge_authority,
                 UnwiredProviderTransport,
             );
-            let _ = client
-                .execute(ledger, &base_request(ProviderAttemptClass::Readiness))
-                .await;
+            let _ = client.execute(ledger, &request).await;
         }
         "transport_report_inconsistent" => {
             let (charge_authority, _calls) =
@@ -2829,9 +2937,7 @@ async fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) 
                 })
             });
             let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-            let _ = client
-                .execute(ledger, &base_request(ProviderAttemptClass::Readiness))
-                .await;
+            let _ = client.execute(ledger, &request).await;
         }
         "transport_issued_unauthorized" => {
             let (charge_authority, _calls) =
@@ -2843,9 +2949,7 @@ async fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) 
                 })
             });
             let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-            let _ = client
-                .execute(ledger, &base_request(ProviderAttemptClass::Readiness))
-                .await;
+            let _ = client.execute(ledger, &request).await;
         }
         other => panic!("unknown terminal action: {other}"),
     }
@@ -3231,10 +3335,7 @@ async fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_
                         UnwiredProviderTransport,
                     );
                     let _ = client
-                        .execute(
-                            &mut base_ledger,
-                            &base_request(ProviderAttemptClass::Readiness),
-                        )
+                        .execute(&mut base_ledger, &request_for_attempt_number(1))
                         .await;
                 }
 
@@ -3242,7 +3343,7 @@ async fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_
                     let _ = base_ledger.record_no_dispatch(&no_dispatch_proof());
                 }
 
-                for outcome in &sequence {
+                for (index, outcome) in sequence.iter().enumerate() {
                     let outcome = *outcome;
                     let (charge_authority, _calls) =
                         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
@@ -3254,10 +3355,12 @@ async fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_
                     });
                     let client =
                         client_with(ProviderCapabilities::none(), charge_authority, transport);
+                    let attempt_number = u32::try_from(index + 1).expect("small fixture index")
+                        + u32::from(preceding_grant);
                     let _ = client
                         .execute(
                             &mut base_ledger,
-                            &base_request(ProviderAttemptClass::Readiness),
+                            &request_for_attempt_number(attempt_number),
                         )
                         .await;
                 }
@@ -3291,8 +3394,11 @@ async fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_
                 for terminal in TERMINAL_ACTIONS {
                     let mut ledger = base_ledger.clone();
                     let label = format!("{base_label} terminal={terminal}");
+                    let terminal_attempt_number = u32::try_from(sequence.len() + 1)
+                        .expect("small fixture sequence")
+                        + u32::from(preceding_grant);
 
-                    apply_terminal_action(terminal, &mut ledger).await;
+                    apply_terminal_action(terminal, &mut ledger, terminal_attempt_number).await;
 
                     assert_mirrors_audit_algebra(&ledger, &label);
                     reachable_states.insert(ledger_state_fingerprint(&ledger));

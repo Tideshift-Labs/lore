@@ -276,23 +276,40 @@ pub fn classify_provider_charge_commit<T, E>(
     result.map_err(|_| ProviderChargeError::AmbiguousCommit)
 }
 
-/// Whether a SQLSTATE raised by COMMIT proves an aborted transaction that may be retried.
+/// The only two safe classifications for an error returned by PostgreSQL `COMMIT`.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderChargeCommitDisposition {
+    /// PostgreSQL proves the transaction aborted, so the same attempt may be retried.
+    Retryable,
+    /// Durability cannot be proved, so the caller must conservatively count a grant.
+    Ambiguous,
+}
+
+/// Classify a SQLSTATE raised by `COMMIT` without discarding the proof that PostgreSQL aborted the
+/// transaction. Every unrecognized or absent SQLSTATE stays ambiguous.
 #[doc(hidden)]
 #[must_use]
-pub fn provider_charge_commit_sqlstate_is_retryable(code: Option<&SqlState>) -> bool {
-    matches!(
-        code,
+pub fn classify_provider_charge_commit_sqlstate(
+    code: Option<&SqlState>,
+) -> ProviderChargeCommitDisposition {
+    match code {
         Some(code)
             if code == &SqlState::T_R_SERIALIZATION_FAILURE
-                || code == &SqlState::T_R_DEADLOCK_DETECTED
-    )
+                || code == &SqlState::T_R_DEADLOCK_DETECTED =>
+        {
+            ProviderChargeCommitDisposition::Retryable
+        }
+        _ => ProviderChargeCommitDisposition::Ambiguous,
+    }
 }
 
 fn classify_commit_error(error: tokio_postgres::Error) -> ChargeExecutionError {
-    if provider_charge_commit_sqlstate_is_retryable(error.code()) {
-        ChargeExecutionError::Retryable
-    } else {
-        ChargeExecutionError::Public(ProviderChargeError::AmbiguousCommit)
+    match classify_provider_charge_commit_sqlstate(error.code()) {
+        ProviderChargeCommitDisposition::Retryable => ChargeExecutionError::Retryable,
+        ProviderChargeCommitDisposition::Ambiguous => {
+            ChargeExecutionError::Public(ProviderChargeError::AmbiguousCommit)
+        }
     }
 }
 

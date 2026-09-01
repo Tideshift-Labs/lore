@@ -902,8 +902,9 @@ pub enum ProviderChargeError {
 /// Dropping the returned future after it has started is cancellation-unsafe: the authority may
 /// still commit. A caller must therefore treat cancellation while the future is pending exactly
 /// like [`ProviderChargeError::AmbiguousCommit`]. [`GovernedProviderClient::execute`] does this
-/// with an armed ledger guard that records one conservative grant if its own future is dropped
-/// across the await.
+/// with an armed ledger guard that records one conservative grant for the exact attempt if its
+/// own future is dropped across the await. The ledger de-duplicates that attempt identity, so a
+/// later concrete retry cannot count the same possible durable charge twice.
 ///
 /// **Any error other than `AmbiguousCommit`, `AttemptAlreadyCharged`, or
 /// `RecoveredCommittedCharge` claims nothing was committed.** `AttemptAlreadyCharged` proves a
@@ -925,13 +926,17 @@ pub trait ProviderChargeAuthority {
 
 struct ChargeCancellationGuard<'a> {
     ledger: &'a mut ProviderAttemptLedger,
+    attempt_id: String,
+    attempt_ordinal: u32,
     armed: bool,
 }
 
 impl<'a> ChargeCancellationGuard<'a> {
-    fn new(ledger: &'a mut ProviderAttemptLedger) -> Self {
+    fn new(ledger: &'a mut ProviderAttemptLedger, attempt_id: &str, attempt_ordinal: u32) -> Self {
         Self {
             ledger,
+            attempt_id: attempt_id.to_string(),
+            attempt_ordinal,
             armed: true,
         }
     }
@@ -943,6 +948,11 @@ impl<'a> ChargeCancellationGuard<'a> {
     fn ledger(&mut self) -> &mut ProviderAttemptLedger {
         self.ledger
     }
+
+    fn record_committed_grant(&mut self) -> Result<(), ProviderClientError> {
+        self.ledger
+            .record_committed_grant_for(&self.attempt_id, self.attempt_ordinal)
+    }
 }
 
 impl Drop for ChargeCancellationGuard<'_> {
@@ -951,7 +961,7 @@ impl Drop for ChargeCancellationGuard<'_> {
             // Once the charge future is pending, cancellation cannot prove that no commit reached
             // PostgreSQL. Count one conservative grant. Overflow poisons the ledger inside the
             // recorder; Drop has no caller to return that error to.
-            let _ = self.ledger.record_committed_grant();
+            let _ = self.record_committed_grant();
         }
     }
 }
@@ -1134,6 +1144,7 @@ pub struct ProviderAttemptLedger {
     logical_request_id: String,
     attempt_count: u64,
     committed_grant_count: u64,
+    counted_grant_attempts: Vec<(String, u32)>,
     no_dispatch_count: u64,
     decisive_terminal_count: u64,
     ambiguous_count: u64,
@@ -1158,6 +1169,7 @@ impl ProviderAttemptLedger {
             logical_request_id: logical_request_id.to_string(),
             attempt_count: 0,
             committed_grant_count: 0,
+            counted_grant_attempts: Vec::new(),
             no_dispatch_count: 0,
             decisive_terminal_count: 0,
             ambiguous_count: 0,
@@ -1280,10 +1292,27 @@ impl ProviderAttemptLedger {
 
     // A counter that cannot be advanced leaves the ledger understating a charge or an attempt, so
     // every increment closes the ledger on overflow rather than returning a recoverable error.
-    fn record_committed_grant(&mut self) -> Result<(), ProviderClientError> {
+    fn record_committed_grant_for(
+        &mut self,
+        attempt_id: &str,
+        attempt_ordinal: u32,
+    ) -> Result<(), ProviderClientError> {
+        // Cancellation conservatively counts an unresolved charge before a concrete outcome is
+        // available. A retry of the same durable attempt identity may later prove either the one
+        // existing charge or the one newly committed charge. In both cases it is still one grant,
+        // so the ledger counts identities rather than calls to this recorder.
+        if self
+            .counted_grant_attempts
+            .iter()
+            .any(|counted| counted.0 == attempt_id && counted.1 == attempt_ordinal)
+        {
+            return Ok(());
+        }
         match self.committed_grant_count.checked_add(1) {
             Some(next) => {
                 self.committed_grant_count = next;
+                self.counted_grant_attempts
+                    .push((attempt_id.to_string(), attempt_ordinal));
                 Ok(())
             }
             None => Err(self.poison(ProviderClientError::LedgerOverflow)),
@@ -1420,7 +1449,11 @@ where
 
         // The authority contract permits the database commit to outlive a dropped future. Arm the
         // ledger before polling it, then disarm only after a concrete result is in hand.
-        let mut charge_guard = ChargeCancellationGuard::new(ledger);
+        let mut charge_guard = ChargeCancellationGuard::new(
+            ledger,
+            charge_request.attempt_id(),
+            charge_request.attempt_ordinal(),
+        );
         let charge_result = self.charge_authority.charge(&charge_request).await;
         charge_guard.disarm();
         let grant = match charge_result {
@@ -1428,11 +1461,11 @@ where
             Err(ProviderChargeError::AmbiguousCommit) => {
                 // The commit is unresolved, so conservative charging counts the grant and forbids
                 // the send. This is the valid, nonrefundable grant-without-attempt window.
-                charge_guard.ledger().record_committed_grant()?;
+                charge_guard.record_committed_grant()?;
                 return Err(ProviderClientError::ChargeAmbiguous);
             }
             Err(ProviderChargeError::RecoveredCommittedCharge) => {
-                charge_guard.ledger().record_committed_grant()?;
+                charge_guard.record_committed_grant()?;
                 return Err(ProviderClientError::ChargeRecovered);
             }
             Err(error) => return Err(ProviderClientError::ChargeRefused(error)),
@@ -1441,10 +1474,10 @@ where
         if let Err(error) = validate_grant(&charge_request, &grant) {
             // A returned grant may have committed even though it does not describe this attempt,
             // so it is counted and never refunded, and the ledger closes rather than sending.
-            charge_guard.ledger().record_committed_grant()?;
+            charge_guard.record_committed_grant()?;
             return Err(charge_guard.ledger().poison(error));
         }
-        charge_guard.ledger().record_committed_grant()?;
+        charge_guard.record_committed_grant()?;
 
         let attempt = AuthorizedProviderAttempt::new(request, &grant, self.retry_policy);
         let report = match self.transport.issue(&attempt) {
