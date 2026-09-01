@@ -207,12 +207,12 @@ pub const CELL_INSTALL_SET: [CellMigration; 18] = [
     cell_migration!(
         21,
         "0021_object_store_dispatch_budget_limiter_schema.sql",
-        "632250487652ee25505ae979c6a8eac9e62ad96b2aeea51864b320bc50953d07"
+        "3387f71079d81552e97226144e3f8526706f197d6eedb23af9af5a41ac43fb31"
     ),
     cell_migration!(
         22,
         "0022_object_store_dispatch_budget_limiter_provisioning.sql",
-        "7108e6ce39e2dedbc151c971ab95fb7d2e9d170b134886b0a385aa68ccc07bea"
+        "7d471d4524dec97f0108b57d586f99676e48721860bb78b1710b6d6a7e979c34"
     ),
 ];
 
@@ -417,7 +417,7 @@ pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 5] = [
         id: CellSchemaLayerId::BudgetLimiter,
         api_revision: "object-store-dispatch-budget-limiter-v1",
         schema_revision: "object-store-dispatch-budget-limiter-schema-v1",
-        migration_blake3_hex: "632250487652ee25505ae979c6a8eac9e62ad96b2aeea51864b320bc50953d07",
+        migration_blake3_hex: "3387f71079d81552e97226144e3f8526706f197d6eedb23af9af5a41ac43fb31",
         contract_migration: 21,
         install_function: "object_store_dispatch_budget_limiter_install_v1",
         read_state_function: "object_store_dispatch_budget_limiter_read_state_v1",
@@ -852,14 +852,14 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
 /// present and to carry the replica identity.
 pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
     hex32("f468de7d148f5335b52a10c4298d609be546801754da1d991ff0ac7e7c0da0ca"),
-    hex32("1a59d8e99e57f5e14efabf29651b8ca281efacdd682522abe93bd9f985d6fae0"),
-    hex32("d014ca2714fe75acf667a82695773f483bf6f368811a12948feaf6dfda5d9643"),
-    hex32("4ddc50a6b97d50a78f6e1fab46e9e32ab0a873375543394297d7ebe93a7ab18f"),
-    hex32("ed42d92ece81ad18483e5036faae6624dc6b901ad5dfa5107366a16cc4447b72"),
+    hex32("7ccaae88f56265bff668406b874a46dcdba51bff338d94e0f6d85d70b424f86f"),
+    hex32("309dff5388bd8a3c0fa571235ef6f880ca4431df576227528abd5aa714a93203"),
+    hex32("2eb72daf008fa334914dca61258d936491d32150dbf138876b81875f93f17b20"),
+    hex32("102799932cdff39b85a73d5af5221afd7b4be6f7b3566dfabdfd514a65fba986"),
     hex32("8ff35a1d0cc3db05335e97ee64a02a65dfcb0d7883a389d1b129cb853d123fd5"),
-    hex32("0281fd29b8d69e8cf188b7b67dd98213f7e431e8b565815c86159e0372796d7d"),
+    hex32("f6b6eb9729b97f9250ba787425423dedc567094b1268aeb1c944519b83f7bcc0"),
     hex32("3223198b12b114d8850baf20208043c7b2e5588c598e3c63d6c805a31cf876d8"),
-    hex32("3504656c27deb76352e050bf503200dd7a36446fac66192f1a0a36ae653f9f12"),
+    hex32("a6aa8b4525ea4c04fc987c52943a1376200dcf2b58ee76f55333b6b4500c4b0e"),
     hex32("971ec53fc27466c873c783701757e1434c20b383d23f081d918a2d6e4c797971"),
     hex32("b5f633ebe7a54a9d43e75d043387b67cc659395fa8f0880a5c0d869a2b90fe81"),
     hex32("444e1ca598f3a2dbe3601fdb803e2479f21b3b22fe4713d50f9a0e47fd7b73b2"),
@@ -871,7 +871,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
 /// whose exact rendering is a server-version property. A different major version is expected to
 /// fail closed here and needs a re-measured pin, not a relaxed check.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_V1: [u8; 32] =
-    hex32("940cd20fdc3ff97ef23866388d6d477d30d0eb6e07b186f2165a3b3e957f417d");
+    hex32("34f32d3fa8f7ee21ccf3abc51c5d1b613da2afbf1fd6bcf7c4e03c74cce61915");
 
 /// Const hex decoder for the pinned digests above.
 const fn hex32(text: &str) -> [u8; 32] {

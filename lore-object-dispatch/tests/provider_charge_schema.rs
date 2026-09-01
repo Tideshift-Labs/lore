@@ -8,6 +8,8 @@ use std::time::Duration;
 use lore_object_dispatch::PostgresProviderChargeConfig;
 use lore_object_dispatch::ProviderChargeError;
 use lore_object_dispatch::classify_provider_charge_commit;
+use lore_object_dispatch::provider_charge_commit_sqlstate_is_retryable;
+use tokio_postgres::error::SqlState;
 
 const MIGRATION: &str =
     include_str!("../migrations/0021_object_store_dispatch_budget_limiter_schema.sql");
@@ -20,6 +22,20 @@ fn unresolved_commit_is_always_an_ambiguous_nonrefundable_charge() {
         classify_provider_charge_commit::<(), _>(Err("connection lost after COMMIT"));
 
     assert_eq!(result, Err(ProviderChargeError::AmbiguousCommit));
+}
+
+#[test]
+fn only_provably_aborted_commit_sqlstates_are_retryable() {
+    assert!(provider_charge_commit_sqlstate_is_retryable(Some(
+        &SqlState::T_R_SERIALIZATION_FAILURE
+    )));
+    assert!(provider_charge_commit_sqlstate_is_retryable(Some(
+        &SqlState::T_R_DEADLOCK_DETECTED
+    )));
+    assert!(!provider_charge_commit_sqlstate_is_retryable(Some(
+        &SqlState::CONNECTION_FAILURE
+    )));
+    assert!(!provider_charge_commit_sqlstate_is_retryable(None));
 }
 
 #[test]
@@ -102,8 +118,11 @@ fn current_configuration_binds_the_revision_and_fence_as_one_foreign_key() {
 fn durable_grant_identity_cannot_be_reused_for_a_second_charge() {
     let grants = table_body("object_dispatch_provider_charge_grants");
 
+    assert!(grants.contains("grant_id uuid NOT NULL CHECK"));
+    assert!(grants.contains("PRIMARY KEY (grant_id)"));
+    assert!(grants.contains("CONSTRAINT object_dispatch_provider_charge_attempt_key"));
     assert!(grants.contains(
-        "PRIMARY KEY (provider_boundary_id, logical_request_id, attempt_id, attempt_ordinal)"
+        "UNIQUE (provider_boundary_id, logical_request_id, attempt_id, attempt_ordinal)"
     ));
     assert!(grants.contains(
         "charged_units object_store_retention.uint64 NOT NULL CHECK (charged_units = 1)"
@@ -127,6 +146,14 @@ fn migration_is_one_owner_scoped_forward_transaction() {
 #[test]
 fn frozen_revision_grammar_is_byte_based_and_has_the_exact_ascii_alphabet() {
     let validator = function_body("assert_dispatch_budget_revision_v1");
+    let byte_zero_start = validator
+        .find("IF index = 0 THEN")
+        .expect("byte-zero branch must be explicit");
+    let byte_zero_end = validator[byte_zero_start..]
+        .find("ELSIF NOT (")
+        .map(|offset| byte_zero_start + offset)
+        .expect("later-byte branch must be distinct");
+    let byte_zero = &validator[byte_zero_start..byte_zero_end];
 
     assert!(validator.contains("convert_to(revision, 'UTF8')"));
     assert!(validator.contains("octet_length(encoded) NOT BETWEEN 1 AND 128"));
@@ -134,6 +161,8 @@ fn frozen_revision_grammar_is_byte_based_and_has_the_exact_ascii_alphabet() {
     assert!(validator.contains("value BETWEEN 65 AND 90"));
     assert!(validator.contains("value BETWEEN 97 AND 122"));
     assert!(validator.contains("value IN (45, 46, 95)"));
+    assert!(!byte_zero.contains("value IN (45, 46, 95)"));
+    assert!(validator.contains("ELSIF NOT ("));
     assert!(!validator.contains("lower("));
     assert!(!validator.contains("normalize("));
 }

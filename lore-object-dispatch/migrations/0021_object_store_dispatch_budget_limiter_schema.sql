@@ -130,6 +130,10 @@ CREATE TABLE object_store_retention.object_dispatch_budget_bucket_state (
 );
 
 CREATE TABLE object_store_retention.object_dispatch_provider_charge_grants (
+  grant_id uuid NOT NULL CHECK (
+    (pg_catalog.get_byte(pg_catalog.uuid_send(grant_id), 6) >> 4) = 7 AND
+    (pg_catalog.get_byte(pg_catalog.uuid_send(grant_id), 8) >> 6) = 2
+  ),
   provider_boundary_id text NOT NULL,
   allocation_revision text COLLATE "C" NOT NULL,
   allocation_fence object_store_retention.uint64 NOT NULL,
@@ -140,7 +144,9 @@ CREATE TABLE object_store_retention.object_dispatch_provider_charge_grants (
   attempt_class smallint NOT NULL CHECK (attempt_class BETWEEN 1 AND 11),
   charged_units object_store_retention.uint64 NOT NULL CHECK (charged_units = 1),
   grant_committed_at_unix_ms bigint NOT NULL CHECK (grant_committed_at_unix_ms >= 0),
-  PRIMARY KEY (provider_boundary_id, logical_request_id, attempt_id, attempt_ordinal),
+  PRIMARY KEY (grant_id),
+  CONSTRAINT object_dispatch_provider_charge_attempt_key
+    UNIQUE (provider_boundary_id, logical_request_id, attempt_id, attempt_ordinal),
   FOREIGN KEY (provider_boundary_id, allocation_revision, allocation_fence)
     REFERENCES object_store_retention.object_dispatch_budget_configurations
       (provider_boundary_id, allocation_revision, allocation_fence)

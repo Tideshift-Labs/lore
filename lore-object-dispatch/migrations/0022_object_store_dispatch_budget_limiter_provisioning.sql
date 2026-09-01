@@ -90,7 +90,7 @@ DECLARE index integer;
 DECLARE value integer;
 BEGIN
   IF revision IS NULL THEN
-    RAISE EXCEPTION 'DISPATCH_BUDGET_REVISION_INVALID' USING ERRCODE = '22023';
+    RETURN;
   END IF;
   encoded := pg_catalog.convert_to(revision, 'UTF8');
   IF pg_catalog.octet_length(encoded) NOT BETWEEN 1 AND 128 THEN
@@ -343,9 +343,16 @@ SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
 DECLARE prior object_store_retention.object_dispatch_budget_configurations%ROWTYPE;
+DECLARE has_prior boolean;
 DECLARE database_now bigint;
 DECLARE dimension jsonb;
 DECLARE cap jsonb;
+DECLARE prior_bucket record;
+DECLARE prior_capacity_scaled numeric;
+DECLARE prior_refilled_scaled numeric;
+DECLARE carried_depletion_scaled numeric;
+DECLARE carried_available_scaled numeric;
+DECLARE new_capacity_scaled numeric;
 BEGIN
   PERFORM object_store_retention.assert_dispatch_maintenance_v1();
   PERFORM object_store_retention.assert_dispatch_budget_limiter_api_revision_v1(api_revision);
@@ -388,6 +395,19 @@ BEGIN
     cache_implementation_revision, cache_proof_digest, cache_effect_vector_digest
   );
 
+  IF EXISTS (
+    SELECT 1
+      FROM object_store_retention.object_dispatch_budget_configurations AS historical
+     WHERE historical.provider_boundary_id =
+           object_store_dispatch_publish_budget_configuration_v1.provider_boundary_id
+       AND historical.allocation_revision =
+           object_store_dispatch_publish_budget_configuration_v1.allocation_revision
+       AND historical.allocation_fence <>
+           object_store_dispatch_publish_budget_configuration_v1.allocation_fence
+  ) THEN
+    RAISE EXCEPTION 'DISPATCH_BUDGET_CONFIGURATION_IDENTITY_CONFLICT' USING ERRCODE = '23505';
+  END IF;
+
   SELECT configuration.* INTO prior
     FROM object_store_retention.object_dispatch_current_budget_configuration AS current_config
     JOIN object_store_retention.object_dispatch_budget_configurations AS configuration
@@ -395,8 +415,9 @@ BEGIN
    WHERE current_config.provider_boundary_id =
          object_store_dispatch_publish_budget_configuration_v1.provider_boundary_id
    FOR UPDATE OF current_config;
+  has_prior := FOUND;
 
-  IF FOUND THEN
+  IF has_prior THEN
     IF allocation_revision = prior.allocation_revision AND allocation_fence = prior.allocation_fence THEN
       IF ROW(
         hard_expires_at_unix_ms, core_schema_revision, disposition_schema_revision,
@@ -494,9 +515,47 @@ BEGIN
       (cap->>'capacityUnits')::numeric, (cap->>'refillUnits')::numeric,
       (cap->>'refillIntervalMs')::numeric
     );
+    new_capacity_scaled :=
+      (cap->>'capacityUnits')::numeric * (cap->>'refillIntervalMs')::numeric;
+    carried_available_scaled := new_capacity_scaled;
+    IF has_prior THEN
+      SELECT state.available_scaled, state.updated_at_unix_ms, old_cap.capacity_units,
+             old_cap.refill_units, old_cap.refill_interval_ms
+        INTO STRICT prior_bucket
+        FROM object_store_retention.object_dispatch_budget_bucket_state AS state
+        JOIN object_store_retention.object_dispatch_budget_caps AS old_cap
+          USING (provider_boundary_id, allocation_revision, allocation_fence, cap_class)
+       WHERE state.provider_boundary_id = prior.provider_boundary_id
+         AND state.allocation_revision = prior.allocation_revision
+         AND state.allocation_fence = prior.allocation_fence
+         AND state.cap_class = (cap->>'capClass')::smallint;
+      prior_capacity_scaled := prior_bucket.capacity_units * prior_bucket.refill_interval_ms;
+      IF database_now < prior_bucket.updated_at_unix_ms
+         OR prior_capacity_scaled > 18446744073709551615
+         OR (database_now - prior_bucket.updated_at_unix_ms) * prior_bucket.refill_units >
+            18446744073709551615
+         OR prior_bucket.available_scaled +
+            (database_now - prior_bucket.updated_at_unix_ms) * prior_bucket.refill_units >
+            18446744073709551615 THEN
+        RAISE EXCEPTION 'DISPATCH_BUDGET_PRIOR_BUCKET_UNRESOLVED' USING ERRCODE = '55000';
+      END IF;
+      prior_refilled_scaled := least(
+        prior_capacity_scaled,
+        prior_bucket.available_scaled +
+          (database_now - prior_bucket.updated_at_unix_ms) * prior_bucket.refill_units
+      );
+      carried_depletion_scaled := pg_catalog.ceil(
+        (prior_capacity_scaled - prior_refilled_scaled) *
+          (cap->>'refillIntervalMs')::numeric / prior_bucket.refill_interval_ms
+      );
+      carried_available_scaled := greatest(
+        0,
+        new_capacity_scaled - carried_depletion_scaled
+      );
+    END IF;
     INSERT INTO object_store_retention.object_dispatch_budget_bucket_state VALUES (
       provider_boundary_id, allocation_revision, allocation_fence, (cap->>'capClass')::smallint,
-      (cap->>'capacityUnits')::numeric * (cap->>'refillIntervalMs')::numeric, database_now, 1
+      carried_available_scaled, database_now, 1
     );
   END LOOP;
   INSERT INTO object_store_retention.object_dispatch_current_budget_configuration VALUES (
@@ -679,6 +738,8 @@ DECLARE refilled_scaled numeric;
 DECLARE charge_scaled numeric;
 DECLARE expected_caps smallint[];
 DECLARE refusal text;
+DECLARE grant_id uuid;
+DECLARE random_grant_hex text;
 BEGIN
   PERFORM object_store_retention.assert_dispatch_runtime_v1();
   PERFORM object_store_retention.assert_dispatch_budget_limiter_api_revision_v1(api_revision);
@@ -722,7 +783,10 @@ BEGIN
          object_store_dispatch_charge_provider_attempt_v1.allocation_revision
      AND candidate.allocation_fence = object_store_dispatch_charge_provider_attempt_v1.allocation_fence;
   database_now := object_store_retention.clock_unix_ms_v1();
-  IF database_now >= deadline_unix_ms THEN
+  IF database_now > 281474976710655 THEN
+    RAISE EXCEPTION 'DISPATCH_PROVIDER_CHARGE_REQUEST_INVALID' USING ERRCODE = '22023';
+  END IF;
+  IF database_now >= deadline_unix_ms OR deadline_unix_ms > database_now + 300000 THEN
     RETURN ROW('DEADLINE_EXCEEDED', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)::
       object_store_retention.dispatch_provider_charge_result_v1;
   END IF;
@@ -788,10 +852,21 @@ BEGIN
       object_store_retention.dispatch_provider_charge_result_v1;
   END IF;
 
-  INSERT INTO object_store_retention.object_dispatch_provider_charge_grants VALUES (
-    provider_boundary_id, allocation_revision, allocation_fence, logical_request_id, attempt_id,
-    attempt_ordinal, traffic_class, attempt_class, attempt_units, database_now
-  ) ON CONFLICT DO NOTHING;
+  random_grant_hex := pg_catalog.replace(pg_catalog.gen_random_uuid()::text, '-', '');
+  grant_id := (
+    pg_catalog.lpad(pg_catalog.to_hex(database_now), 12, '0') ||
+    '7' || pg_catalog.substring(random_grant_hex, 14, 3) ||
+    '8' || pg_catalog.substring(random_grant_hex, 18, 3) ||
+    pg_catalog.substring(random_grant_hex, 21, 12)
+  )::uuid;
+  INSERT INTO object_store_retention.object_dispatch_provider_charge_grants (
+    grant_id, provider_boundary_id, allocation_revision, allocation_fence, logical_request_id,
+    attempt_id, attempt_ordinal, traffic_class, attempt_class, charged_units,
+    grant_committed_at_unix_ms
+  ) VALUES (
+    grant_id, provider_boundary_id, allocation_revision, allocation_fence, logical_request_id,
+    attempt_id, attempt_ordinal, traffic_class, attempt_class, attempt_units, database_now
+  ) ON CONFLICT ON CONSTRAINT object_dispatch_provider_charge_attempt_key DO NOTHING;
   IF NOT FOUND THEN
     RETURN ROW('ATTEMPT_ALREADY_CHARGED', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)::
       object_store_retention.dispatch_provider_charge_result_v1;
@@ -825,7 +900,7 @@ BEGIN
        AND state.cap_class = bucket.cap_class;
   END LOOP;
   RETURN ROW(
-    'GRANTED', allocation_revision, allocation_fence, attempt_id, traffic_class, attempt_class,
+    'GRANTED', allocation_revision, allocation_fence, grant_id, traffic_class, attempt_class,
     attempt_units, logical_request_id, attempt_id, attempt_ordinal, database_now
   )::object_store_retention.dispatch_provider_charge_result_v1;
 END
@@ -851,7 +926,7 @@ BEGIN
   PERFORM object_store_retention.assert_serializable_write_v1();
   IF expected_schema_revision IS DISTINCT FROM 'object-store-dispatch-budget-limiter-schema-v1'
      OR expected_migration_blake3 IS DISTINCT FROM
-        pg_catalog.decode('632250487652ee25505ae979c6a8eac9e62ad96b2aeea51864b320bc50953d07', 'hex')
+        pg_catalog.decode('3387f71079d81552e97226144e3f8526706f197d6eedb23af9af5a41ac43fb31', 'hex')
      OR expected_install_revision IS NULL OR expected_install_revision = 0 THEN
     RAISE EXCEPTION 'DISPATCH_BUDGET_LIMITER_INSTALL_IDENTITY_INVALID' USING ERRCODE = '22023';
   END IF;

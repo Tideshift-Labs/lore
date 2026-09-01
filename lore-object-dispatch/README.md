@@ -201,10 +201,10 @@ the enrolled participant key across restarts; no typed client or runtime pool is
 
 Migrations 0021 and 0022 add WP-114 CD-4's source-dark shared cell-local limiter. The schema holds
 one current budget configuration per provider boundary, seven closed cap buckets, and one durable
-grant CAS per logical attempt. Migration 0021 is exactly 8,281 bytes with BLAKE3-256
-`632250487652ee25505ae979c6a8eac9e62ad96b2aeea51864b320bc50953d07`; migration 0022 is exactly
-53,411 bytes with BLAKE3-256
-`7108e6ce39e2dedbc151c971ab95fb7d2e9d170b134886b0a385aa68ccc07bea`.
+grant CAS with its own UUIDv7 identity. Migration 0021 is exactly 8,543 bytes with BLAKE3-256
+`3387f71079d81552e97226144e3f8526706f197d6eedb23af9af5a41ac43fb31`; migration 0022 is exactly
+57,061 bytes with BLAKE3-256
+`7d471d4524dec97f0108b57d586f99676e48721860bb78b1710b6d6a7e979c34`.
 Publication is maintenance-only, parameterized, and callable only by the authenticated maintenance
 database role. It stores distinct core, disposition, and envelope target projections and enforces
 the frozen revision grammar and exact fence sequence, the cell-scoped schema and target agreement,
@@ -215,12 +215,31 @@ platform's canonical records; a future publication adapter must authenticate and
 records before using this maintenance-only function. Charging is runtime-only and serializable. One database clock evaluates the
 deadline, hard expiry, and rolling refill. The grant CAS and all applicable bucket debits commit in
 one transaction. The physical bucket, traffic-class bucket, and listing bucket cannot split or
-partially debit. No configuration row is installed by either migration.
+partially debit. Rotation refills the prior bucket to the rotation clock, converts its remaining
+depletion into the new bucket scale without rounding capacity upward, and carries that depletion
+into the new fence. An unchanged physical ceiling therefore never reseeds at full capacity. No
+configuration row is installed by either migration.
+
+The Stage-3 digest chain has a specific proof limit. `core_record_digest`,
+`disposition_record_digest`, and `final_budget_vector_digest` are caller-supplied opaque bytes. The
+database checks their internal links but does not recompute them from `dimensions` or `cap_budgets`.
+The chain therefore proves internal consistency, not correspondence to the budget it authorizes.
+The three supplied `provider_allocation_set_revision` and `provider_allocation_set_fence` values
+are checked for agreement at publication, then retained as one stored revision and fence. The
+resolver cannot repeat that three-way agreement check. Charge-time cell scope is the
+`provider_boundary_id` alone; the resolver does not read `cell_id`.
 
 `PostgresProviderChargeAuthority` accepts a preconnected dispatch-runtime client. Composition must
 draw that client from the one dispatch pool shared by the replica's request path and drain tasks.
 It must not create a pool per limiter or worker. The recorded staging budget is three store pools
 plus one dispatch pool. At `pool_max = 5`, that is at most 20 database connections per replica.
+Provider-attempt deadlines are bounded to five minutes after the attempt UUIDv7 timestamp and to
+five minutes after the database admission clock. A grant must report a database time strictly
+before that deadline. `ATTEMPT_ALREADY_CHARGED` proves a prior durable grant and never increments
+the current ledger again. Fresh-ledger recovery is a separate error arm. A dropped `execute`
+future while a charge is pending records one conservative grant because the database commit may
+outlive cancellation. COMMIT-time serialization and deadlock SQLSTATEs prove abort and are retried;
+all other COMMIT errors remain ambiguous.
 
 ## Shared spool verifier
 

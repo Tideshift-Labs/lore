@@ -145,8 +145,7 @@ impl PostgresProviderChargeAuthority {
         let outcome = decode_charge_row(&row, request).map_err(ChargeExecutionError::Public)?;
         match outcome {
             ChargeAttempt::Granted(grant) => {
-                classify_provider_charge_commit(transaction.commit().await)
-                    .map_err(ChargeExecutionError::Public)?;
+                transaction.commit().await.map_err(classify_commit_error)?;
                 Ok(ChargeAttempt::Granted(grant))
             }
             ChargeAttempt::Refused(error) => {
@@ -211,9 +210,10 @@ fn decode_charge_row(
         "BUDGET_EXHAUSTED" => Some(ProviderChargeError::BudgetExhausted),
         "CLASS_CAP_EXHAUSTED" => Some(ProviderChargeError::ClassCapExhausted),
         "CONFIGURATION_UNRESOLVED" => Some(ProviderChargeError::ConfigurationUnresolved),
-        // The durable CAS proves this attempt already has a nonrefundable committed charge. It
-        // may not be sent again, and the fresh ledger must count the charge conservatively.
-        "ATTEMPT_ALREADY_CHARGED" => Some(ProviderChargeError::AmbiguousCommit),
+        // The durable CAS proves one earlier charge. This call did not create another one, so the
+        // current ledger must not increment again. Fresh-ledger recovery is a separate caller and
+        // uses ProviderChargeError::RecoveredCommittedCharge rather than this result.
+        "ATTEMPT_ALREADY_CHARGED" => Some(ProviderChargeError::AttemptAlreadyCharged),
         "DEADLINE_EXCEEDED" => Some(ProviderChargeError::DeadlineExceeded),
         "GRANTED" => None,
         _ => return Err(ProviderChargeError::ConfigurationUnresolved),
@@ -267,13 +267,33 @@ fn decode_charge_row(
     }))
 }
 
-/// Commit errors are never classified as ordinary availability failures. Once COMMIT begins, the
-/// client cannot prove the transaction did not become durable.
+/// A commit outcome with no PostgreSQL SQLSTATE remains ambiguous because durability cannot be
+/// proved. This helper preserves the public seam used by source-dark tests.
 #[doc(hidden)]
 pub fn classify_provider_charge_commit<T, E>(
     result: Result<T, E>,
 ) -> Result<T, ProviderChargeError> {
     result.map_err(|_| ProviderChargeError::AmbiguousCommit)
+}
+
+/// Whether a SQLSTATE raised by COMMIT proves an aborted transaction that may be retried.
+#[doc(hidden)]
+#[must_use]
+pub fn provider_charge_commit_sqlstate_is_retryable(code: Option<&SqlState>) -> bool {
+    matches!(
+        code,
+        Some(code)
+            if code == &SqlState::T_R_SERIALIZATION_FAILURE
+                || code == &SqlState::T_R_DEADLOCK_DETECTED
+    )
+}
+
+fn classify_commit_error(error: tokio_postgres::Error) -> ChargeExecutionError {
+    if provider_charge_commit_sqlstate_is_retryable(error.code()) {
+        ChargeExecutionError::Retryable
+    } else {
+        ChargeExecutionError::Public(ProviderChargeError::AmbiguousCommit)
+    }
 }
 
 fn classify_precommit_error(error: tokio_postgres::Error) -> ChargeExecutionError {

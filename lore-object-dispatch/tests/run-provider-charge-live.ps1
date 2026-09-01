@@ -22,6 +22,7 @@ $priorEnv = [Environment]::GetEnvironmentVariable($envName, 'Process')
 $tests = @(
     'live_postgres_last_unit_charges_are_atomic_and_fail_closed',
     'live_postgres_frozen_revision_grammar_and_idempotent_publication_replay',
+    'live_postgres_charge_refuses_a_non_serializable_caller',
     'live_postgres_successor_fence_and_stage3_publication_matrix',
     'live_postgres_expired_exact_publication_replays_but_charge_fails_closed',
     'live_postgres_missing_malformed_and_stage3_inconsistent_configs_fail_closed',

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use lore_object_dispatch::AuthorizedProviderAttempt;
 use lore_object_dispatch::BudgetPin;
@@ -62,6 +63,7 @@ const BUCKET: &str = "commit0-cell-nyc3";
 const REGION: &str = "nyc3";
 const ENDPOINT_HOST: &str = "nyc3.digitaloceanspaces.com";
 const REQUEST_TIMESTAMP_MS: u64 = 0x018f_3e12_a456;
+const VALID_DEADLINE_MS: i64 = REQUEST_TIMESTAMP_MS as i64 + 60_000;
 const DURABLE_BODY_SIZE: u64 = 4096;
 const DURABLE_BODY_BLAKE3: [u8; 32] = [7u8; 32];
 
@@ -174,7 +176,7 @@ fn base_request(attempt_class: ProviderAttemptClass) -> ProviderAttemptRequest {
         logical_request_id: logical_request_id(),
         attempt_id: attempt_id(),
         attempt_ordinal: 1,
-        deadline_unix_ms: i64::MAX,
+        deadline_unix_ms: VALID_DEADLINE_MS,
         budget_pin: budget_pin(),
         put_body: None,
         put_part: None,
@@ -248,7 +250,7 @@ fn binding_grant(request: &ProviderChargeRequest) -> ProviderChargeGrant {
         logical_request_id: request.logical_request_id().to_string(),
         attempt_id: request.attempt_id().to_string(),
         attempt_ordinal: request.attempt_ordinal(),
-        granted_at_database_unix_ms: 1_000,
+        granted_at_database_unix_ms: REQUEST_TIMESTAMP_MS as i64 + 1,
     }
 }
 
@@ -324,6 +326,17 @@ where
     ) -> Result<ProviderChargeGrant, ProviderChargeError> {
         self.calls.increment();
         (self.respond)(request)
+    }
+}
+
+struct PendingChargeAuthority;
+
+impl ProviderChargeAuthority for PendingChargeAuthority {
+    async fn charge(
+        &self,
+        _request: &ProviderChargeRequest,
+    ) -> Result<ProviderChargeGrant, ProviderChargeError> {
+        std::future::pending().await
     }
 }
 
@@ -1082,6 +1095,25 @@ async fn budget_revision_frozen_grammar_rejects_every_leading_punctuation_and_un
     }
 }
 
+#[test]
+fn attempt_deadline_is_bounded_to_five_minutes_from_the_attempt_identity_clock() {
+    let client = client_with(
+        ProviderCapabilities::none(),
+        UnwiredChargeAuthority,
+        UnwiredProviderTransport,
+    );
+    let mut at_bound = base_request(ProviderAttemptClass::Readiness);
+    at_bound.deadline_unix_ms = REQUEST_TIMESTAMP_MS as i64 + 300_000;
+    let mut beyond_bound = base_request(ProviderAttemptClass::Readiness);
+    beyond_bound.deadline_unix_ms = REQUEST_TIMESTAMP_MS as i64 + 300_001;
+
+    assert_eq!(client.validate_attempt(&at_bound), Ok(()));
+    assert_eq!(
+        client.validate_attempt(&beyond_bound),
+        Err(ProviderClientError::InvalidAttemptDeadline)
+    );
+}
+
 #[tokio::test]
 async fn authorize_enforces_body_presence_across_every_attempt_class() {
     let client = client_with(
@@ -1498,6 +1530,7 @@ async fn cd5_conformance_refused_charge_sends_nothing() {
         ProviderChargeError::ConfigurationUnresolved,
         ProviderChargeError::AuthorityUnavailable,
         ProviderChargeError::DeadlineExceeded,
+        ProviderChargeError::AttemptAlreadyCharged,
     ];
 
     for error in cases {
@@ -1574,6 +1607,85 @@ async fn cd5_conformance_ambiguous_commit_stays_charged_and_sends_nothing() {
 }
 
 #[tokio::test]
+async fn same_ledger_already_charged_replay_does_not_increment_the_proven_single_charge() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let response_calls = calls.clone();
+    let (charge_authority, _charge_calls) = ScriptedChargeAuthority::new(move |request| {
+        if response_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(binding_grant(request))
+        } else {
+            Err(ProviderChargeError::AttemptAlreadyCharged)
+        }
+    });
+    let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let request = base_request(ProviderAttemptClass::Readiness);
+    let mut ledger = new_ledger();
+
+    assert_eq!(
+        client.execute(&mut ledger, &request).await,
+        Ok(ProviderAttemptOutcome::Decisive)
+    );
+    assert_eq!(
+        client.execute(&mut ledger, &request).await,
+        Err(ProviderClientError::ChargeRefused(
+            ProviderChargeError::AttemptAlreadyCharged
+        ))
+    );
+    assert_eq!(ledger.committed_grant_count(), 1);
+    assert_eq!(ledger.attempt_count(), 1);
+    assert_eq!(transport_calls.get(), 1);
+}
+
+#[tokio::test]
+async fn fresh_ledger_recovery_counts_one_distinct_committed_charge_and_sends_nothing() {
+    let (charge_authority, charge_calls) =
+        ScriptedChargeAuthority::new(|_request| Err(ProviderChargeError::RecoveredCommittedCharge));
+    let (transport, transport_calls) =
+        ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let mut ledger = new_ledger();
+
+    let outcome = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
+
+    assert_eq!(outcome, Err(ProviderClientError::ChargeRecovered));
+    assert_eq!(ledger.committed_grant_count(), 1);
+    assert_eq!(ledger.attempt_count(), 0);
+    assert_eq!(ledger.poisoned(), None);
+    assert_eq!(charge_calls.get(), 1);
+    assert_eq!(transport_calls.get(), 0);
+}
+
+#[tokio::test]
+async fn dropping_execute_while_charge_is_pending_cannot_under_report_the_charge() {
+    let client = client_with(
+        ProviderCapabilities::none(),
+        PendingChargeAuthority,
+        UnwiredProviderTransport,
+    );
+    let request = base_request(ProviderAttemptClass::Readiness);
+    let mut ledger = new_ledger();
+    let mut execution = Box::pin(client.execute(&mut ledger, &request));
+
+    tokio::select! {
+        biased;
+        outcome = &mut execution => panic!("pending authority unexpectedly resolved: {outcome:?}"),
+        _ = tokio::time::sleep(Duration::ZERO) => {}
+    }
+    drop(execution);
+
+    assert_eq!(ledger.committed_grant_count(), 1);
+    assert_eq!(ledger.attempt_count(), 0);
+}
+
+#[tokio::test]
 async fn execute_poisons_the_ledger_when_the_grant_does_not_bind_the_attempt() {
     type Mutator = Box<dyn Fn(ProviderChargeGrant) -> ProviderChargeGrant + Sync>;
     let mutators: Vec<(&str, Mutator)> = vec![
@@ -1637,6 +1749,13 @@ async fn execute_poisons_the_ledger_when_the_grant_does_not_bind_the_attempt() {
             "granted_at_database_unix_ms",
             Box::new(|mut grant: ProviderChargeGrant| {
                 grant.granted_at_database_unix_ms = -1;
+                grant
+            }),
+        ),
+        (
+            "granted_at_database_unix_ms_at_deadline",
+            Box::new(|mut grant: ProviderChargeGrant| {
+                grant.granted_at_database_unix_ms = VALID_DEADLINE_MS;
                 grant
             }),
         ),
@@ -3246,7 +3365,7 @@ async fn debug_output_never_leaks_sensitive_fields() {
         logical_request_id: sentinel_logical_request_id.clone(),
         attempt_id: sentinel_attempt_id.clone(),
         attempt_ordinal: 1,
-        deadline_unix_ms: i64::MAX,
+        deadline_unix_ms: 9_999 + 60_000,
         budget_pin: budget_pin.clone(),
         put_body: Some(put_body.clone()),
         put_part: None,
@@ -3356,6 +3475,7 @@ async fn provider_client_error_display_never_contains_sensitive_values() {
         ProviderClientError::ListCapabilityNotGranted,
         ProviderClientError::InvalidRequestIdentity,
         ProviderClientError::InvalidAttemptOrdinal,
+        ProviderClientError::InvalidAttemptDeadline,
         ProviderClientError::InvalidBudgetPin,
         ProviderClientError::InvalidPutLimits,
         ProviderClientError::MultipartPartCountExceeded,
@@ -3373,6 +3493,7 @@ async fn provider_client_error_display_never_contains_sensitive_values() {
         ProviderClientError::InvalidPutPart,
         ProviderClientError::ChargeRefused(ProviderChargeError::Unwired),
         ProviderClientError::ChargeAmbiguous,
+        ProviderClientError::ChargeRecovered,
         ProviderClientError::GrantDoesNotBindAttempt,
         ProviderClientError::TransportRefused(ProviderTransportRefusal::Unwired),
         ProviderClientError::TransportReportInconsistent,
@@ -3392,7 +3513,7 @@ async fn provider_client_error_display_never_contains_sensitive_values() {
     // `LedgerAlgebraViolation` were all missing from this sweep).
     assert_eq!(
         errors.len(),
-        36,
+        38,
         "a new ProviderClientError variant must be added to this array, not only to the match \
          below"
     );
@@ -3427,6 +3548,7 @@ async fn provider_client_error_display_never_contains_sensitive_values() {
             | ProviderClientError::InvalidPutPart
             | ProviderClientError::ChargeRefused(_)
             | ProviderClientError::ChargeAmbiguous
+            | ProviderClientError::ChargeRecovered
             | ProviderClientError::GrantDoesNotBindAttempt
             | ProviderClientError::TransportRefused(_)
             | ProviderClientError::TransportReportInconsistent

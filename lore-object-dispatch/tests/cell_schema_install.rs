@@ -327,7 +327,7 @@ fn layer_contract_matches_the_frozen_sql() {
             read_state_function: "object_store_dispatch_budget_limiter_read_state_v1",
             read_state_retired_after: None,
             installed_after_migration: 22,
-            migration_blake3_hex: "632250487652ee25505ae979c6a8eac9e62ad96b2aeea51864b320bc50953d07",
+            migration_blake3_hex: "3387f71079d81552e97226144e3f8526706f197d6eedb23af9af5a41ac43fb31",
         },
     ];
 

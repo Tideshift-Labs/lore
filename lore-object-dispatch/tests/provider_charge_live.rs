@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use lore_object_dispatch::AuthorizedProviderAttempt;
 use lore_object_dispatch::BudgetPin;
@@ -89,14 +91,14 @@ async fn live_postgres_last_unit_charges_are_atomic_and_fail_closed() {
 
     set_available(&admin, 1, 1).await;
     set_available(&admin, 2, 1).await;
-    let (first, second) = concurrent_charges(&url, 1, 1).await;
+    let (first, second) = competing_charges(&url, 1, 1).await;
     assert_eq!(sorted(&first, &second), ["BUDGET_EXHAUSTED", "GRANTED"]);
     assert_eq!(grant_count(&admin).await, 1);
 
     reset_grants(&admin).await;
     set_available(&admin, 1, 2).await;
     set_available(&admin, 2, 1).await;
-    let (first, second) = concurrent_charges(&url, 1, 1).await;
+    let (first, second) = competing_charges(&url, 1, 1).await;
     assert_eq!(sorted(&first, &second), ["CLASS_CAP_EXHAUSTED", "GRANTED"]);
     assert_eq!(grant_count(&admin).await, 1);
 
@@ -104,7 +106,15 @@ async fn live_postgres_last_unit_charges_are_atomic_and_fail_closed() {
     set_available(&admin, 1, 1).await;
     set_available(&admin, 2, 0).await;
     let before = bucket_state(&admin, 1).await;
-    let refusal = charge(&url, 1, 1, Uuid::now_v7(), Uuid::now_v7(), i64::MAX).await;
+    let refusal = charge(
+        &url,
+        1,
+        1,
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        future_deadline(),
+    )
+    .await;
     assert_eq!(refusal, "CLASS_CAP_EXHAUSTED");
     assert_eq!(
         bucket_state(&admin, 1).await,
@@ -117,7 +127,15 @@ async fn live_postgres_last_unit_charges_are_atomic_and_fail_closed() {
     set_available(&admin, 2, 2).await;
     set_available(&admin, 7, 0).await;
     let shared_before_listing_refusal = bucket_state(&admin, 1).await;
-    let listing = charge(&url, 1, 9, Uuid::now_v7(), Uuid::now_v7(), i64::MAX).await;
+    let listing = charge(
+        &url,
+        1,
+        9,
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        future_deadline(),
+    )
+    .await;
     assert_eq!(listing, "CLASS_CAP_EXHAUSTED");
     assert_eq!(
         bucket_state(&admin, 1).await,
@@ -130,7 +148,7 @@ async fn live_postgres_last_unit_charges_are_atomic_and_fail_closed() {
     set_available(&admin, 2, 2).await;
     set_available(&admin, 7, 1).await;
     let shared_before_listing_race = bucket_state(&admin, 1).await;
-    let (first, second) = concurrent_charges(&url, 1, 9).await;
+    let (first, second) = competing_charges(&url, 1, 9).await;
     assert_eq!(sorted(&first, &second), ["CLASS_CAP_EXHAUSTED", "GRANTED"]);
     let shared_after_listing_race = bucket_state(&admin, 1).await;
     assert_eq!(
@@ -143,15 +161,45 @@ async fn live_postgres_last_unit_charges_are_atomic_and_fail_closed() {
 
     let deadline = charge(&url, 1, 1, Uuid::now_v7(), Uuid::now_v7(), 0).await;
     assert_eq!(deadline, "DEADLINE_EXCEEDED");
+    let database_now: i64 = admin
+        .query_one("SELECT object_store_retention.clock_unix_ms_v1()", &[])
+        .await
+        .expect("read database clock for deadline bound")
+        .get(0);
+    assert_eq!(
+        charge(
+            &url,
+            1,
+            1,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            database_now + 600_000,
+        )
+        .await,
+        "DEADLINE_EXCEEDED"
+    );
 
     let logical_request_id = Uuid::now_v7();
     let attempt_id = Uuid::now_v7();
+    let valid_deadline = future_deadline();
     assert_eq!(
-        charge(&url, 1, 1, logical_request_id, attempt_id, i64::MAX).await,
+        charge(&url, 1, 1, logical_request_id, attempt_id, valid_deadline,).await,
         "GRANTED"
     );
+    let (durable_grant_id, granted_at) = grant_record(&admin, logical_request_id, attempt_id).await;
+    assert_ne!(durable_grant_id, attempt_id);
+    assert_eq!(durable_grant_id.get_version_num(), 7);
+    assert!(granted_at < valid_deadline);
     assert_eq!(
-        charge(&url, 1, 1, logical_request_id, attempt_id, i64::MAX).await,
+        charge(
+            &url,
+            1,
+            1,
+            logical_request_id,
+            attempt_id,
+            future_deadline(),
+        )
+        .await,
         "ATTEMPT_ALREADY_CHARGED"
     );
     assert_eq!(
@@ -161,7 +209,7 @@ async fn live_postgres_last_unit_charges_are_atomic_and_fail_closed() {
             1,
             Uuid::now_v7(),
             Uuid::now_v7(),
-            i64::MAX,
+            future_deadline(),
             "other-revision",
             FENCE,
         )
@@ -185,7 +233,15 @@ async fn live_postgres_last_unit_charges_are_atomic_and_fail_closed() {
         ))
         .await
         .expect("install arithmetic-edge fixture");
-    let overflow = charge(&url, 1, 1, Uuid::now_v7(), Uuid::now_v7(), i64::MAX).await;
+    let overflow = charge(
+        &url,
+        1,
+        1,
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        future_deadline(),
+    )
+    .await;
     assert_eq!(overflow, "CONFIGURATION_UNRESOLVED");
     assert_eq!(grant_count(&admin).await, 0);
 
@@ -197,7 +253,15 @@ async fn live_postgres_last_unit_charges_are_atomic_and_fail_closed() {
         ))
         .await
         .expect("install malformed stored JSON fixture");
-    let malformed = charge(&url, 1, 1, Uuid::now_v7(), Uuid::now_v7(), i64::MAX).await;
+    let malformed = charge(
+        &url,
+        1,
+        1,
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        future_deadline(),
+    )
+    .await;
     assert_eq!(malformed, "CONFIGURATION_UNRESOLVED");
     assert_eq!(grant_count(&admin).await, 0);
 }
@@ -218,7 +282,7 @@ async fn live_postgres_frozen_revision_grammar_and_idempotent_publication_replay
     assert_eq!(error.code(), Some(&SqlState::INVALID_PARAMETER_VALUE));
     drop(invalid_first);
 
-    for accepted in ["a", "A0._-z", &"x".repeat(128)] {
+    for accepted in ["a", "0", "A0._-z", &"x".repeat(128)] {
         admin
             .query_one(
                 "SELECT object_store_retention.assert_dispatch_budget_revision_v1($1)",
@@ -232,6 +296,8 @@ async fn live_postgres_frozen_revision_grammar_and_idempotent_publication_replay
         ".leading",
         "-leading",
         "_leading",
+        "a@b",
+        "a b",
         "é",
         &"x".repeat(129),
     ] {
@@ -244,6 +310,14 @@ async fn live_postgres_frozen_revision_grammar_and_idempotent_publication_replay
             .expect_err("invalid revision must be rejected");
         assert_eq!(error.code(), Some(&SqlState::INVALID_PARAMETER_VALUE));
     }
+    let null_revision: Option<&str> = None;
+    admin
+        .query_one(
+            "SELECT object_store_retention.assert_dispatch_budget_revision_v1($1)",
+            &[&null_revision],
+        )
+        .await
+        .expect("NULL means no optional revision token and must remain accepted");
     seed_configuration(&admin).await;
     seed_configuration(&admin).await;
     assert_eq!(
@@ -253,7 +327,7 @@ async fn live_postgres_frozen_revision_grammar_and_idempotent_publication_replay
             1,
             Uuid::now_v7(),
             Uuid::now_v7(),
-            i64::MAX,
+            future_deadline(),
             "budget.Rev_1-a",
             FENCE,
         )
@@ -277,6 +351,38 @@ async fn live_postgres_frozen_revision_grammar_and_idempotent_publication_replay
 
 #[tokio::test]
 #[ignore = "requires a fresh disposable PostgreSQL 16 database"]
+async fn live_postgres_charge_refuses_a_non_serializable_caller() {
+    let url = env::var("LORE_TEST_PROVIDER_CHARGE_ATOMICITY_PG_URL")
+        .expect("runner must set LORE_TEST_PROVIDER_CHARGE_ATOMICITY_PG_URL");
+    let admin = connect(&url).await;
+    install(&admin).await;
+    seed_configuration(&admin).await;
+    let caller = connect(&url).await;
+    caller
+        .batch_execute("SET SESSION AUTHORIZATION object_dispatch_retention_runtime")
+        .await
+        .expect("assume runtime fixture identity");
+    let sql = charge_sql(
+        1,
+        1,
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        future_deadline(),
+        REVISION,
+        FENCE,
+    );
+
+    let error = caller
+        .query_one(&sql, &[])
+        .await
+        .expect_err("READ COMMITTED caller must be refused before charging");
+
+    assert_eq!(error.code(), Some(&SqlState::INVALID_TRANSACTION_STATE));
+    assert_eq!(grant_count(&admin).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database"]
 async fn live_postgres_successor_fence_and_stage3_publication_matrix() {
     let url = env::var("LORE_TEST_PROVIDER_CHARGE_ATOMICITY_PG_URL")
         .expect("runner must set LORE_TEST_PROVIDER_CHARGE_ATOMICITY_PG_URL");
@@ -284,9 +390,24 @@ async fn live_postgres_successor_fence_and_stage3_publication_matrix() {
     install(&admin).await;
     seed_configuration(&admin).await;
 
+    set_available(&admin, 1, 1).await;
     assert_eq!(
         publish_successor(&admin, "Budget.Rev_2", 2, SuccessorMutation::None).await,
         Ok("PUBLISHED".to_string())
+    );
+    let carried_available = bucket_available_at(&admin, "Budget.Rev_2", 2, 1)
+        .await
+        .parse::<u64>()
+        .expect("scaled availability fits u64");
+    assert!(
+        (INTERVAL_MS..3 * INTERVAL_MS).contains(&carried_available),
+        "rotation must carry consumed capacity, allowing only elapsed refill: {carried_available}"
+    );
+    assert!(
+        publish_successor(&admin, REVISION, 3, SuccessorMutation::None)
+            .await
+            .is_err(),
+        "a revision token cannot be reused after an intervening configuration"
     );
     admin
         .batch_execute(&format!(
@@ -303,7 +424,7 @@ async fn live_postgres_successor_fence_and_stage3_publication_matrix() {
             1,
             Uuid::now_v7(),
             Uuid::now_v7(),
-            i64::MAX,
+            future_deadline(),
             "Budget.Rev_2",
             2,
         )
@@ -604,7 +725,15 @@ async fn live_postgres_expired_exact_publication_replays_but_charge_fails_closed
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     seed_configuration_with_expiry(&admin, expiry).await;
     assert_eq!(
-        charge(&url, 1, 1, Uuid::now_v7(), Uuid::now_v7(), i64::MAX).await,
+        charge(
+            &url,
+            1,
+            1,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            future_deadline(),
+        )
+        .await,
         "CONFIGURATION_UNRESOLVED"
     );
     assert_eq!(grant_count(&admin).await, 0);
@@ -692,7 +821,15 @@ async fn live_postgres_missing_malformed_and_stage3_inconsistent_configs_fail_cl
             .await
             .unwrap_or_else(|error| panic!("install {label}: {error}"));
         assert_eq!(
-            charge(&url, 1, 1, Uuid::now_v7(), Uuid::now_v7(), i64::MAX).await,
+            charge(
+                &url,
+                1,
+                1,
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                future_deadline(),
+            )
+            .await,
             "CONFIGURATION_UNRESOLVED",
             "case: {label}"
         );
@@ -763,15 +900,25 @@ async fn live_postgres_cd5_charge_before_send_conformance_and_authority_unavaila
     assert_eq!(transport_calls.load(Ordering::SeqCst), 1);
     assert_eq!(granted_ledger.committed_grant_count(), 1);
     assert_eq!(granted_ledger.attempt_count(), 1);
+    assert_eq!(
+        client.execute(&mut granted_ledger, &granted).await,
+        Err(ProviderClientError::ChargeRefused(
+            ProviderChargeError::AttemptAlreadyCharged
+        ))
+    );
+    assert_eq!(granted_ledger.committed_grant_count(), 1);
+    assert_eq!(granted_ledger.attempt_count(), 1);
 
     let mut duplicate_ledger = ProviderAttemptLedger::new(BOUNDARY, &granted.logical_request_id)
         .expect("construct duplicate-attempt ledger");
     assert_eq!(
         client.execute(&mut duplicate_ledger, &granted).await,
-        Err(ProviderClientError::ChargeAmbiguous)
+        Err(ProviderClientError::ChargeRefused(
+            ProviderChargeError::AttemptAlreadyCharged
+        ))
     );
     assert_eq!(transport_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(duplicate_ledger.committed_grant_count(), 1);
+    assert_eq!(duplicate_ledger.committed_grant_count(), 0);
     assert_eq!(duplicate_ledger.attempt_count(), 0);
     drop(authority_connection);
 
@@ -853,7 +1000,7 @@ fn live_request(logical_request_id: Uuid, attempt_id: Uuid) -> ProviderAttemptRe
         logical_request_id: logical_request_id.to_string(),
         attempt_id: attempt_id.to_string(),
         attempt_ordinal: 1,
-        deadline_unix_ms: i64::MAX,
+        deadline_unix_ms: future_deadline(),
         budget_pin: BudgetPin {
             revision: REVISION.to_string(),
             fence: FENCE,
@@ -991,14 +1138,14 @@ fn cap_json() -> String {
         .pipe(|entries| format!("[{entries}]"))
 }
 
-async fn concurrent_charges(url: &str, traffic_class: i16, attempt_class: i16) -> (String, String) {
+async fn competing_charges(url: &str, traffic_class: i16, attempt_class: i16) -> (String, String) {
     let first = charge(
         url,
         traffic_class,
         attempt_class,
         Uuid::now_v7(),
         Uuid::now_v7(),
-        i64::MAX,
+        future_deadline(),
     );
     let second = charge(
         url,
@@ -1006,7 +1153,7 @@ async fn concurrent_charges(url: &str, traffic_class: i16, attempt_class: i16) -
         attempt_class,
         Uuid::now_v7(),
         Uuid::now_v7(),
-        i64::MAX,
+        future_deadline(),
     );
     tokio::join!(first, second)
 }
@@ -1043,17 +1190,14 @@ async fn charge_with_pin(
     revision: &str,
     fence: u64,
 ) -> String {
-    let caps = if matches!(attempt_class, 9 | 10) {
-        "ARRAY[1,2,7]::smallint[]"
-    } else {
-        "ARRAY[1,2]::smallint[]"
-    };
-    let sql = format!(
-        "SELECT (object_store_retention.object_store_dispatch_charge_provider_attempt_v1(\
-         'object-store-dispatch-budget-limiter-v1', '{BOUNDARY}', {traffic_class}::smallint,\
-         {attempt_class}::smallint, 1::bigint::object_store_retention.uint64, '{revision}',\
-         {fence}::bigint::object_store_retention.uint64, '{logical_request_id}'::uuid,\
-         '{attempt_id}'::uuid, 1, {deadline}::bigint, {caps})).result_code"
+    let sql = charge_sql(
+        traffic_class,
+        attempt_class,
+        logical_request_id,
+        attempt_id,
+        deadline,
+        revision,
+        fence,
     );
     for retry in 0..3 {
         let mut client = connect(url).await;
@@ -1078,10 +1222,34 @@ async fn charge_with_pin(
             }
             Err(error)
                 if retry < 2 && error.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => {}
-            Err(error) => panic!("execute charge: {error}"),
+            Err(error) => panic!("execute charge: {error:?}"),
         }
     }
     unreachable!("bounded retry loop always returns or panics")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn charge_sql(
+    traffic_class: i16,
+    attempt_class: i16,
+    logical_request_id: Uuid,
+    attempt_id: Uuid,
+    deadline: i64,
+    revision: &str,
+    fence: u64,
+) -> String {
+    let caps = if matches!(attempt_class, 9 | 10) {
+        "ARRAY[1,2,7]::smallint[]"
+    } else {
+        "ARRAY[1,2]::smallint[]"
+    };
+    format!(
+        "SELECT (object_store_retention.object_store_dispatch_charge_provider_attempt_v1(\
+         'object-store-dispatch-budget-limiter-v1', '{BOUNDARY}', {traffic_class}::smallint,\
+         {attempt_class}::smallint, 1::bigint::object_store_retention.uint64, '{revision}',\
+         {fence}::bigint::object_store_retention.uint64, '{logical_request_id}'::uuid,\
+         '{attempt_id}'::uuid, 1, {deadline}::bigint, {caps})).result_code"
+    )
 }
 
 async fn set_available(client: &Client, cap_class: i16, units: u64) {
@@ -1110,6 +1278,31 @@ async fn bucket_state(client: &Client, cap_class: i16) -> (String, i64) {
     (row.get(0), row.get(1))
 }
 
+async fn bucket_available_at(
+    client: &Client,
+    revision: &str,
+    fence: u64,
+    cap_class: i16,
+) -> String {
+    client
+        .query_one(
+            "SELECT available_scaled::text FROM \
+             object_store_retention.object_dispatch_budget_bucket_state \
+             WHERE provider_boundary_id = $1 AND allocation_revision = $2 \
+               AND allocation_fence = $3::bigint::object_store_retention.uint64 \
+               AND cap_class = $4",
+            &[
+                &BOUNDARY,
+                &revision,
+                &i64::try_from(fence).expect("fixture fence fits i64"),
+                &cap_class,
+            ],
+        )
+        .await
+        .expect("read exact rotated bucket state")
+        .get(0)
+}
+
 async fn reset_grants(client: &Client) {
     client
         .batch_execute("TRUNCATE object_store_retention.object_dispatch_provider_charge_grants")
@@ -1128,12 +1321,33 @@ async fn grant_count(client: &Client) -> i64 {
         .get(0)
 }
 
+async fn grant_record(client: &Client, logical_request_id: Uuid, attempt_id: Uuid) -> (Uuid, i64) {
+    let row = client
+        .query_one(
+            "SELECT grant_id, grant_committed_at_unix_ms FROM \
+             object_store_retention.object_dispatch_provider_charge_grants \
+             WHERE provider_boundary_id = $1 AND logical_request_id = $2 AND attempt_id = $3",
+            &[&BOUNDARY, &logical_request_id, &attempt_id],
+        )
+        .await
+        .expect("read durable grant identity");
+    (row.get(0), row.get(1))
+}
+
 fn sorted<'a>(first: &'a str, second: &'a str) -> [&'a str; 2] {
     if first <= second {
         [first, second]
     } else {
         [second, first]
     }
+}
+
+fn future_deadline() -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after the Unix epoch")
+        .as_millis();
+    i64::try_from(now).expect("current Unix milliseconds must fit i64") + 60_000
 }
 
 trait Pipe: Sized {

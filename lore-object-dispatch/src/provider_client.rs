@@ -77,6 +77,8 @@ pub const PROVIDER_MAX_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 pub const PROVIDER_MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// Largest number of parts one multipart upload may carry.
 pub const PROVIDER_MAX_MULTIPART_PARTS: u32 = 10_000;
+/// Longest provider-attempt admission window after the attempt UUIDv7 timestamp.
+pub const PROVIDER_ATTEMPT_DEADLINE_HORIZON_MS: i64 = 5 * 60 * 1_000;
 
 /// The closed set of physical provider attempt classes this cell may issue.
 ///
@@ -877,10 +879,16 @@ pub enum ProviderChargeError {
     AuthorityUnavailable,
     #[error("cell dispatch attempt deadline has elapsed")]
     DeadlineExceeded,
-    /// The charge transaction's commit is unresolved, or the durable CAS proves this exact
-    /// attempt was charged earlier. Conservative charging treats either case as committed and
-    /// nonrefundable, and no attempt may be issued under it.
-    #[error("cell dispatch charge is committed but no attempt may be issued under it")]
+    /// The durable CAS proves this exact attempt was charged before this call. The current ledger
+    /// must not count it again.
+    #[error("cell dispatch attempt was already charged")]
+    AttemptAlreadyCharged,
+    /// A distinct recovery caller proved that the current fresh ledger did not yet count the
+    /// durable charge. The governed client records it once and never sends under it.
+    #[error("cell dispatch charge was recovered into a fresh ledger")]
+    RecoveredCommittedCharge,
+    /// The charge transaction's commit outcome cannot be proved.
+    #[error("cell dispatch charge commit outcome is ambiguous")]
     AmbiguousCommit,
 }
 
@@ -891,10 +899,20 @@ pub enum ProviderChargeError {
 /// one transaction, and must fail closed when the budget configuration cannot be resolved rather
 /// than falling back to an unbounded rate.
 ///
-/// **Any error other than `AmbiguousCommit` claims nothing was committed.**
+/// Dropping the returned future after it has started is cancellation-unsafe: the authority may
+/// still commit. A caller must therefore treat cancellation while the future is pending exactly
+/// like [`ProviderChargeError::AmbiguousCommit`]. [`GovernedProviderClient::execute`] does this
+/// with an armed ledger guard that records one conservative grant if its own future is dropped
+/// across the await.
+///
+/// **Any error other than `AmbiguousCommit`, `AttemptAlreadyCharged`, or
+/// `RecoveredCommittedCharge` claims nothing was committed.** `AttemptAlreadyCharged` proves a
+/// prior durable charge but must not increment the current ledger again. Only a distinct recovery
+/// caller that knows it is rebuilding a fresh ledger may return `RecoveredCommittedCharge`.
 /// [`GovernedProviderClient::execute`] counts a grant against the ledger for `Ok` and for
-/// [`ProviderChargeError::AmbiguousCommit`], and for no other error. So an implementation that maps
-/// a connection drop around `COMMIT` to, say,
+/// [`ProviderChargeError::AmbiguousCommit`] or
+/// [`ProviderChargeError::RecoveredCommittedCharge`], and for no other error. So an implementation
+/// that maps a connection drop around `COMMIT` to, say,
 /// [`ProviderChargeError::AuthorityUnavailable`] makes the audit under-report a charge that may
 /// have committed. Any outcome an implementation cannot prove uncommitted must be reported as
 /// `AmbiguousCommit`, which is the conservative, nonrefundable arm.
@@ -903,6 +921,39 @@ pub trait ProviderChargeAuthority {
         &self,
         request: &ProviderChargeRequest,
     ) -> impl Future<Output = Result<ProviderChargeGrant, ProviderChargeError>> + Send;
+}
+
+struct ChargeCancellationGuard<'a> {
+    ledger: &'a mut ProviderAttemptLedger,
+    armed: bool,
+}
+
+impl<'a> ChargeCancellationGuard<'a> {
+    fn new(ledger: &'a mut ProviderAttemptLedger) -> Self {
+        Self {
+            ledger,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn ledger(&mut self) -> &mut ProviderAttemptLedger {
+        self.ledger
+    }
+}
+
+impl Drop for ChargeCancellationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Once the charge future is pending, cancellation cannot prove that no commit reached
+            // PostgreSQL. Count one conservative grant. Overflow poisons the ledger inside the
+            // recorder; Drop has no caller to return that error to.
+            let _ = self.ledger.record_committed_grant();
+        }
+    }
 }
 
 /// The shipped charge authority: it charges nothing and grants nothing.
@@ -1367,13 +1418,22 @@ where
         }
         let charge_request = self.authorize(request)?;
 
-        let grant = match self.charge_authority.charge(&charge_request).await {
+        // The authority contract permits the database commit to outlive a dropped future. Arm the
+        // ledger before polling it, then disarm only after a concrete result is in hand.
+        let mut charge_guard = ChargeCancellationGuard::new(ledger);
+        let charge_result = self.charge_authority.charge(&charge_request).await;
+        charge_guard.disarm();
+        let grant = match charge_result {
             Ok(grant) => grant,
             Err(ProviderChargeError::AmbiguousCommit) => {
                 // The commit is unresolved, so conservative charging counts the grant and forbids
                 // the send. This is the valid, nonrefundable grant-without-attempt window.
-                ledger.record_committed_grant()?;
+                charge_guard.ledger().record_committed_grant()?;
                 return Err(ProviderClientError::ChargeAmbiguous);
+            }
+            Err(ProviderChargeError::RecoveredCommittedCharge) => {
+                charge_guard.ledger().record_committed_grant()?;
+                return Err(ProviderClientError::ChargeRecovered);
             }
             Err(error) => return Err(ProviderClientError::ChargeRefused(error)),
         };
@@ -1381,10 +1441,10 @@ where
         if let Err(error) = validate_grant(&charge_request, &grant) {
             // A returned grant may have committed even though it does not describe this attempt,
             // so it is counted and never refunded, and the ledger closes rather than sending.
-            ledger.record_committed_grant()?;
-            return Err(ledger.poison(error));
+            charge_guard.ledger().record_committed_grant()?;
+            return Err(charge_guard.ledger().poison(error));
         }
-        ledger.record_committed_grant()?;
+        charge_guard.ledger().record_committed_grant()?;
 
         let attempt = AuthorizedProviderAttempt::new(request, &grant, self.retry_policy);
         let report = match self.transport.issue(&attempt) {
@@ -1393,20 +1453,28 @@ where
         };
 
         match report.provider_requests_issued {
-            0 => Err(ledger.poison(ProviderClientError::TransportReportInconsistent)),
+            0 => Err(charge_guard
+                .ledger()
+                .poison(ProviderClientError::TransportReportInconsistent)),
             1 => {
-                ledger.record_issued_attempt()?;
+                charge_guard.ledger().record_issued_attempt()?;
                 match report.outcome {
-                    ProviderAttemptOutcome::Decisive => ledger.record_decisive_terminal()?,
-                    ProviderAttemptOutcome::Ambiguous => ledger.record_ambiguous()?,
+                    ProviderAttemptOutcome::Decisive => {
+                        charge_guard.ledger().record_decisive_terminal()?
+                    }
+                    ProviderAttemptOutcome::Ambiguous => {
+                        charge_guard.ledger().record_ambiguous()?
+                    }
                 }
                 Ok(report.outcome)
             }
             _ => {
                 // Only one request was authorized and charged. The rest escaped authority, so the
                 // ledger closes and this request produces no audit.
-                ledger.record_issued_attempt()?;
-                Err(ledger.poison(ProviderClientError::TransportIssuedUnauthorizedRequests))
+                charge_guard.ledger().record_issued_attempt()?;
+                Err(charge_guard
+                    .ledger()
+                    .poison(ProviderClientError::TransportIssuedUnauthorizedRequests))
             }
         }
     }
@@ -1440,12 +1508,16 @@ where
         }
         canonical_uuid_v7_timestamp(&request.logical_request_id)
             .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
-        canonical_uuid_v7_timestamp(&request.attempt_id)
+        let attempt_timestamp = canonical_uuid_v7_timestamp(&request.attempt_id)
             .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
         if request.attempt_ordinal == 0 {
             return Err(ProviderClientError::InvalidAttemptOrdinal);
         }
-        if request.deadline_unix_ms < 0 {
+        let latest_deadline = i64::try_from(attempt_timestamp)
+            .ok()
+            .and_then(|timestamp| timestamp.checked_add(PROVIDER_ATTEMPT_DEADLINE_HORIZON_MS))
+            .ok_or(ProviderClientError::InvalidAttemptDeadline)?;
+        if request.deadline_unix_ms < 0 || request.deadline_unix_ms > latest_deadline {
             return Err(ProviderClientError::InvalidAttemptDeadline);
         }
         validate_budget_pin(&request.budget_pin)?;
@@ -1574,6 +1646,7 @@ fn validate_grant(
         || grant.attempt_id != request.attempt_id
         || grant.attempt_ordinal != request.attempt_ordinal
         || grant.granted_at_database_unix_ms < 0
+        || grant.granted_at_database_unix_ms >= request.deadline_unix_ms
     {
         return Err(ProviderClientError::GrantDoesNotBindAttempt);
     }
@@ -1602,7 +1675,7 @@ pub enum ProviderClientError {
     InvalidRequestIdentity,
     #[error("provider attempt ordinal must be positive")]
     InvalidAttemptOrdinal,
-    #[error("provider attempt deadline must be nonnegative")]
+    #[error("provider attempt deadline is outside the bounded admission window")]
     InvalidAttemptDeadline,
     #[error("provider attempt budget pin is invalid")]
     InvalidBudgetPin,
@@ -1638,6 +1711,8 @@ pub enum ProviderClientError {
     ChargeRefused(#[source] ProviderChargeError),
     #[error("cell dispatch charge committed ambiguously and no attempt may be issued under it")]
     ChargeAmbiguous,
+    #[error("cell dispatch charge was recovered and no attempt may be issued under it")]
+    ChargeRecovered,
     #[error("cell dispatch grant does not bind this attempt")]
     GrantDoesNotBindAttempt,
     #[error("cell provider transport issued nothing: {0}")]
