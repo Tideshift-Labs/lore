@@ -93,11 +93,17 @@ pub const MAX_LIFECYCLE_GENERATION_FANOUT: usize = MAX_PUSH_FRAGMENT_REVALIDATIO
 
 /// How many members one staged reader lease may cover.
 ///
-/// The third per-transaction row budget in `LockClass::Fragments`, and it exists
-/// for the same reason as the other two: `lock_lease_member_heads` takes a
-/// `FOR SHARE` row lock per member, and an unbounded lock acquisition inside one
-/// transaction is the shape that turns a large request into a latency and
-/// availability problem for everyone else on those rows.
+/// The third per-transaction row budget in `LockClass::Fragments`.
+///
+/// **This closes a consistency gap, not a measured regression.** Both siblings
+/// that take this lock class bound their row set — `revalidate_push_witness` at
+/// [`MAX_PUSH_FRAGMENT_REVALIDATIONS`] and the fanout at
+/// [`MAX_LIFECYCLE_GENERATION_FANOUT`] — while `lock_lease_member_heads` took a
+/// `FOR SHARE` row lock per member over an unbounded set. Nobody has load-tested
+/// row-lock or multixact behaviour at thousands of members, so **whether an
+/// unbounded set causes real trouble at realistic hydration sizes is unmeasured**
+/// and is not claimed here. The bound is worth having because its neighbours
+/// have one and it costs nothing, not because a hazard was demonstrated.
 ///
 /// **Set to [`MAX_PUSH_FRAGMENT_REVALIDATIONS`] deliberately**, following the
 /// precedent [`MAX_LIFECYCLE_GENERATION_FANOUT`] already set. This is not
@@ -2247,8 +2253,21 @@ fn classify_push_witness(
 /// This is the first and only domain-row class the lease path takes
 /// (`LockClass::Fragments`, position 4), and the lease tables themselves hold
 /// no position, so nothing here can reach back for an earlier class and no
-/// F-032-3 inversion is expressible. It is registered with [`LockSequence`]
-/// rather than exempted, so that claim is checked rather than asserted.
+/// F-032-3 inversion is expressible.
+///
+/// **That is a structural argument, not a machine-checked one, and an earlier
+/// version of this comment overstated it.** It claimed registering with
+/// [`LockSequence`] made the ordering "checked rather than asserted". It does
+/// not: `enter` rejects only a *downward* move, this path enters exactly one
+/// class exactly once, and a fresh sequence has no previous class to be below —
+/// so the failure branch is unreachable for every possible input. The
+/// registration currently proves nothing.
+///
+/// It is kept anyway, for the one moment it starts mattering: if this path ever
+/// takes a second class, the guard becomes live and catches an inversion for
+/// free. Documenting intent and pre-wiring that check is worth a line. What a
+/// reader must not do is treat the ordering as verified today and skip
+/// re-deriving it by hand when adding that second class.
 ///
 /// **This changes the lease path's standing exemption.** CR-031 recorded the
 /// staged-lease transaction as sound outside `LockSequence` *because it took no
@@ -2504,11 +2523,11 @@ fn validate_lease_members(members: &[(Vec<u8>, i64)]) -> Result<(), DomainError>
             "a staged reader lease must cover at least one member".to_owned(),
         ));
     }
-    // Bounded for the same reason its two `LockClass::Fragments` siblings are:
-    // every member costs a `FOR SHARE` row lock in `lock_lease_member_heads`,
-    // and an unbounded acquisition inside one transaction is the shape that
-    // makes one large request everyone else's latency problem. Refused here,
-    // before any database work, so an over-large batch takes no lock at all.
+    // Bounded because both `LockClass::Fragments` siblings bound their row set
+    // and this one did not — a consistency gap, not a measured regression; see
+    // `MAX_STAGED_LEASE_MEMBERS`, which records that behaviour at large member
+    // counts is unmeasured. Refused here, before any database work, so an
+    // over-large batch takes no lock at all.
     if members.len() > MAX_STAGED_LEASE_MEMBERS {
         return Err(DomainError::InvalidInput(format!(
             "a staged reader lease may cover at most {MAX_STAGED_LEASE_MEMBERS} members, got {}; \

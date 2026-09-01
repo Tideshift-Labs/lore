@@ -444,6 +444,35 @@ fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The two declarations every premise is asserted against.
+fn epoch_declarations() -> [(&'static str, &'static str); 2] {
+    [
+        ("migrations/0001_init.sql", MIGRATIONS_0001),
+        (
+            "fragment_schema::FRAGMENT_SCHEMA",
+            fragment_schema::FRAGMENT_SCHEMA,
+        ),
+    ]
+}
+
+/// Find one column's declaration line inside a `CREATE TABLE` body.
+///
+/// Matched by column name at the start of the line rather than by exact
+/// spacing, so a realignment of the table is a formatting change and not a test
+/// failure. A pin that fails on formatting is noise, and noise is what gets a
+/// pin deleted rather than investigated. Content is still asserted exactly by
+/// the caller.
+fn column_declaration<'a>(ddl: &'a str, table: &str, column: &str, label: &str) -> &'a str {
+    create_table_body(ddl, table)
+        .lines()
+        .find(|line| {
+            line.trim_start()
+                .strip_prefix(column)
+                .is_some_and(|rest| rest.starts_with(' '))
+        })
+        .unwrap_or_else(|| panic!("{label}: {table} does not declare {column}"))
+}
+
 /// Assert one premise against both DDL declarations at once.
 fn pin_premise(table: &str, needle: &str, why: &str) {
     for (label, ddl) in [
@@ -508,27 +537,8 @@ fn the_compared_epoch_columns_are_not_null_and_disposition_stays_closed() {
         "size_payload",
         "payload_flags",
     ] {
-        for (label, ddl) in [
-            ("migrations/0001_init.sql", MIGRATIONS_0001),
-            (
-                "fragment_schema::FRAGMENT_SCHEMA",
-                fragment_schema::FRAGMENT_SCHEMA,
-            ),
-        ] {
-            let body = create_table_body(ddl, "lore_fragment_epochs");
-            // Matched by column name at the start of a declaration line rather
-            // than by exact spacing: an alignment change is a formatting
-            // change, and a pin that fails on one is noise that gets deleted.
-            let line = body
-                .lines()
-                .find(|line| {
-                    line.trim_start()
-                        .strip_prefix(column)
-                        .is_some_and(|rest| rest.starts_with(' '))
-                })
-                .unwrap_or_else(|| {
-                    panic!("{label}: lore_fragment_epochs does not declare {column}")
-                });
+        for (label, ddl) in epoch_declarations() {
+            let line = column_declaration(ddl, "lore_fragment_epochs", column, label);
             assert!(
                 line.contains("NOT NULL"),
                 "{label}: lore_fragment_epochs.{column} must be NOT NULL. equivalent_epochs \
@@ -538,10 +548,21 @@ fn the_compared_epoch_columns_are_not_null_and_disposition_stays_closed() {
             );
         }
     }
-    pin_premise(
-        "lore_fragment_epochs",
-        "disposition   smallint    NOT NULL DEFAULT 0 CHECK (disposition IN (0, 1, 2))",
-        "acquire_staged_leases scopes members with `disposition <> DISPOSITION_PURGED`, which is \
-         a total predicate only while the vocabulary stays closed at these three values.",
-    );
+    // Matched the same way as the loop above rather than as an exact-spacing
+    // literal. The two used to disagree: this one would have broken on a
+    // realignment of the CREATE TABLE that its siblings survived, which is the
+    // inconsistency N5 named.
+    for (label, ddl) in epoch_declarations() {
+        let line = column_declaration(ddl, "lore_fragment_epochs", "disposition", label);
+        assert!(
+            line.contains("NOT NULL"),
+            "{label}: lore_fragment_epochs.disposition must be NOT NULL.\nActual: {line}"
+        );
+        assert!(
+            line.contains("CHECK (disposition IN (0, 1, 2))"),
+            "{label}: lore_fragment_epochs.disposition must stay closed at exactly (0, 1, 2). \
+             acquire_staged_leases scopes members with `disposition <> DISPOSITION_PURGED`, which \
+             is a total predicate only while the vocabulary is closed.\nActual: {line}"
+        );
+    }
 }
