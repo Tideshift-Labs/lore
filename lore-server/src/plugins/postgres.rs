@@ -99,13 +99,21 @@ pub struct PostgresStoreConfig {
     /// and is where a gateway is first built. Wiring construction now would put
     /// an unused provider boundary on the mandatory boot path, which is the
     /// false-activation shape this package has already refused once for
-    /// `readiness()`. What is live today is validation: a cell that configures
-    /// an impossible bound is refused at startup instead of at its first write.
+    /// `readiness()`.
+    ///
+    /// What is live today is refusal at construction: an impossible value fails
+    /// the store's `create()`, so a cell configured with one does not boot. The
+    /// check lives in [`parse_config`], which every `create()` and the
+    /// `validate_config` trait method both call. **It is deliberately not in
+    /// `validate_config` alone**, because that method is not on loreserver's
+    /// boot path — `server.rs` reaches `create()` directly — so a check written
+    /// only there would refuse nothing at startup while reading as though it
+    /// did.
     ///
     /// The field sits on the shared connection shape, so all three factories
-    /// validate it. Only the immutable store will consume it, but an operator
-    /// who puts it under the mutable or lock section should still be told the
-    /// value is impossible rather than that it was ignored.
+    /// refuse it. Only the immutable store will consume it, but an operator who
+    /// puts it under the mutable or lock section should still be told the value
+    /// is impossible rather than that it was ignored.
     #[serde(default = "default_fragment_in_flight_puts")]
     pub fragment_in_flight_puts: u32,
     /// How long a fragment put waits for one of those slots before failing
@@ -191,13 +199,25 @@ fn default_validate_bucket_on_startup() -> bool {
     true
 }
 
+/// Deserialize the shared Postgres store config **and** refuse any value in it
+/// that cannot be honoured.
+///
+/// Every path that reads this config shape goes through here — `validate_config`
+/// and all three `create()` bodies alike. That placement is the point:
+/// `validate_config` is **not** on loreserver's boot path (`server.rs` reaches
+/// `create()` directly, and the trait method's only callers are in
+/// `settings.rs`'s own tests), so a check written only there refuses nothing at
+/// startup. An earlier revision of this file made exactly that mistake and
+/// claimed a startup refusal it did not perform.
 fn parse_config(name: &str, config: &toml::Value) -> Result<PostgresStoreConfig, PluginError> {
-    config.clone().try_into().map_err(|e| {
+    let parsed: PostgresStoreConfig = config.clone().try_into().map_err(|e| {
         PluginError::from(PluginConfigError {
             plugin_name: name.to_string(),
             message: format!("Failed to deserialize Postgres store config: {e}"),
         })
-    })
+    })?;
+    validate_fragment_put_bound(name, &parsed)?;
+    Ok(parsed)
 }
 
 /// Build the Postgres TLS settings from config: read the optional CA PEM bundle
@@ -347,9 +367,6 @@ impl ImmutableStorePluginFactory for PostgresImmutableStorePluginFactory {
                     .to_string(),
             }));
         }
-        // CR-031's in-flight put bound, refused here rather than at a first
-        // write. The value is not consumed yet; see its field docs.
-        validate_fragment_put_bound(self.name(), &cfg)?;
         Ok(())
     }
 
@@ -380,13 +397,7 @@ impl MutableStorePluginFactory for PostgresMutableStorePluginFactory {
     }
 
     fn validate_config(&self, config: &toml::Value) -> Result<(), PluginError> {
-        let cfg = parse_config(self.name(), config)?;
-        // The bound is a field on the shared `[plugins.postgres.*]` shape, so
-        // every factory that parses that shape refuses an impossible value.
-        // Validating it only where it is consumed would let an operator set it
-        // under the wrong section and get silence.
-        validate_fragment_put_bound(self.name(), &cfg)?;
-        Ok(())
+        parse_config(self.name(), config).map(|_| ())
     }
 
     // Plugin construction is a synchronous startup-only trait method. The
@@ -437,13 +448,7 @@ impl LockStorePluginFactory for PostgresLockStorePluginFactory {
     }
 
     fn validate_config(&self, config: &toml::Value) -> Result<(), PluginError> {
-        let cfg = parse_config(self.name(), config)?;
-        // The bound is a field on the shared `[plugins.postgres.*]` shape, so
-        // every factory that parses that shape refuses an impossible value.
-        // Validating it only where it is consumed would let an operator set it
-        // under the wrong section and get silence.
-        validate_fragment_put_bound(self.name(), &cfg)?;
-        Ok(())
+        parse_config(self.name(), config).map(|_| ())
     }
 
     fn create(&self, config: &toml::Value) -> Result<Arc<dyn LockStore>, PluginError> {
@@ -561,14 +566,20 @@ bucket = "fragments"
         assert!(validate_fragment_put_bound(PLUGIN_NAME, &parsed).is_ok());
     }
 
-    /// Every factory that parses the shared connection shape refuses an
-    /// impossible bound, not only the one that will consume it. The field lives
-    /// on `PostgresStoreConfig`, so an operator can put it under any of the
-    /// three `[plugins.postgres.*]` sections; checking only the immutable
-    /// factory would make the field's "refused at startup" promise conditional
-    /// on which section it landed in.
+    /// The bad values, and the strings that must name them.
+    const IMPOSSIBLE_PUT_BOUNDS: [&str; 3] = [
+        "fragment_in_flight_puts = 0",
+        "fragment_in_flight_puts = 100000",
+        "fragment_put_admission_wait_millis = 0",
+    ];
+
+    const ADMISSION_REFUSAL: &str = "fragment lifecycle provider admission config";
+
+    /// `validate_config` refuses an impossible bound in every factory. The field
+    /// lives on `PostgresStoreConfig`, so an operator can put it under any of
+    /// the three `[plugins.postgres.*]` sections.
     #[test]
-    fn an_impossible_fragment_put_bound_is_refused_by_every_factory() {
+    fn an_impossible_fragment_put_bound_is_refused_by_every_validate_config() {
         type ValidateFn<'a> = &'a dyn Fn(&toml::Value) -> Result<(), PluginError>;
 
         let factories: [(&str, ValidateFn<'_>); 3] = [
@@ -582,19 +593,61 @@ bucket = "fragments"
                 PostgresLockStorePluginFactory.validate_config(config)
             }),
         ];
-        for extra in [
-            "fragment_in_flight_puts = 0",
-            "fragment_in_flight_puts = 100000",
-            "fragment_put_admission_wait_millis = 0",
-        ] {
+        for extra in IMPOSSIBLE_PUT_BOUNDS {
             let config = immutable_config(extra);
             for (label, validate) in &factories {
                 let error = validate(&config)
                     .expect_err("an impossible in-flight put bound must be refused");
                 assert!(
-                    format!("{error}").contains("fragment lifecycle provider admission config"),
+                    format!("{error}").contains(ADMISSION_REFUSAL),
                     "{extra} must be refused by name in the {label} factory, got {error}",
                 );
+            }
+        }
+    }
+
+    /// **This is the one that matters, and it is the one that was missing.**
+    ///
+    /// `validate_config` is not on loreserver's boot path: `server.rs` reaches
+    /// `create()` directly, and the trait method's only callers live in
+    /// `settings.rs`'s own tests. A cell configured with
+    /// `fragment_in_flight_puts = 0` therefore booted clean while this file's
+    /// docs said it was refused at startup. The check now lives in
+    /// `parse_config`, which every `create()` runs.
+    ///
+    /// No database is needed: the refusal happens while parsing, before any
+    /// connection is attempted, which is also why it is a startup refusal
+    /// rather than a first-write one. The URL below points nowhere on purpose —
+    /// if the refusal ever moved after the connect, this test would hang or
+    /// fail with a connection error instead of the admission message.
+    #[test]
+    fn an_impossible_fragment_put_bound_refuses_the_construction_path() {
+        for extra in IMPOSSIBLE_PUT_BOUNDS {
+            let config = immutable_config(extra);
+
+            match PostgresLockStorePluginFactory.create(&config) {
+                Err(error) => assert!(
+                    format!("{error}").contains(ADMISSION_REFUSAL),
+                    "{extra} must be refused by the lock store's create(), got {error}",
+                ),
+                Ok(_) => panic!("{extra} must not produce a lock store"),
+            }
+
+            // The immutable store's construction path is shared with offline
+            // maintenance, so it is checked at that seam rather than through
+            // the plugin trait's `create`, which additionally builds an S3
+            // client.
+            let immutable = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|runtime| runtime.block_on(connect_immutable_store(&config)));
+            match immutable {
+                Ok(Err(error)) => assert!(
+                    format!("{error}").contains(ADMISSION_REFUSAL),
+                    "{extra} must be refused by connect_immutable_store, got {error}",
+                ),
+                Ok(Ok(_)) => panic!("{extra} must not produce an immutable store"),
+                Err(error) => panic!("the test runtime must build: {error}"),
             }
         }
     }

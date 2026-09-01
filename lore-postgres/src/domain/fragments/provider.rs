@@ -23,10 +23,14 @@
 //!    [`DispatchRuntimeClient`](lore_object_dispatch::dispatch_client::DispatchRuntimeClient)
 //!    and requires every layer to match the artifact identity this build
 //!    expects. A gateway without an attested cell schema is not constructible
-//!    outside this crate's own tests, and the attestation carries the provider
-//!    boundary it was minted for, so a gateway addressing one cell's bucket
-//!    while holding another cell's readback is not expressible either. See
-//!    [`CellSchemaAttestation`] for what the attestation does **not** cover.
+//!    outside this crate's own tests. The attestation also carries the provider
+//!    boundary, and the gateway takes no separate one, so the pair **cannot be
+//!    re-paired after minting** — which is a narrower claim than an earlier
+//!    revision of this line made. It is not a proof that the cell database and
+//!    the bucket belong to the same cell: `attest_cell_schema` accepts whatever
+//!    boundary its caller hands it, and 0019's readback carries no boundary
+//!    identity to check it against. See [`CellSchemaAttestation`] for the full
+//!    list of what the attestation does **not** cover.
 //! 2. **Every provider attempt through the shared limiter and governed
 //!    client.** The gateway owns a
 //!    [`GovernedProviderClient`](lore_object_dispatch::GovernedProviderClient)
@@ -34,9 +38,9 @@
 //!    [`FragmentProviderGateway::execute`] is the only method that reaches it.
 //!    CD-5's kernel charges CD-4's limiter before it constructs the one value a
 //!    transport will accept, so "charged before sent" is inherited rather than
-//!    re-implemented. `fragment_provider_source_pins.rs` pins that no other
-//!    file under `domain/fragments/` names the governed client, the transport
-//!    trait, or the charge-authority trait.
+//!    re-implemented. That the *seam* is the only route is structural. That no
+//!    **other file** in this package opens a second route is a source scan, not
+//!    a structural property — see the note below.
 //! 3. **No SDK automatic retries, and no private S3 client.**
 //!    [`FragmentProviderGateway::new`] takes **no retry parameter**: it states
 //!    [`ProviderRetryPolicy::disabled`] itself, so a retrying client is not
@@ -45,6 +49,29 @@
 //!    because the crate legitimately depends on `aws-sdk-s3` for the legacy
 //!    CR-007 store; it is source-pinned instead, scoped to this package's
 //!    directory, by `fragment_provider_source_pins.rs`.
+//!
+//! # How much the source pins are worth, stated plainly
+//!
+//! Properties 1, 4 (the cap and the class allowlist), and 5 are held by the
+//! type system and the compiler: the gateway cannot be built without an
+//! attestation, cannot be told to retry, cannot be handed a foreign target, and
+//! cannot plan multipart. Those are structural and this note does not apply to
+//! them.
+//!
+//! The **package-scope** halves of properties 2 and 3 — "no other file here
+//! opens a second route" and "no private S3 client anywhere in this package" —
+//! rest on `fragment_provider_source_pins.rs`, which scans source text. **A text
+//! scan cannot express reachability.** An independent reviewer beat an earlier
+//! version of it three ways in one sitting: appending code below the test
+//! module, chaining a private type alias, and `include!`ing a file outside the
+//! scanned directory. Those three root causes are closed and each has a test
+//! that reproduces the evasion, but a fourth is not ruled out.
+//!
+//! So: those two halves are a real regression detector and a real speed bump.
+//! They are **not** "not expressible". Making them so needs the dependency
+//! graph to say it — a crate for this package that does not depend on
+//! `aws-sdk-s3` at all, which is a structural change outside this file's scope
+//! and not this file's to make.
 //! 4. **The existing 256 KiB ingress cap and a configured in-flight put
 //!    count, with no pre-body spool gate.** [`FRAGMENT_PROVIDER_INGRESS_CAP_BYTES`]
 //!    is `lore-base`'s existing [`FRAGMENT_SIZE_THRESHOLD`], not a new number.
@@ -117,6 +144,7 @@ use lore_object_dispatch::ProviderAttemptOutcome;
 use lore_object_dispatch::ProviderAttemptRequest;
 use lore_object_dispatch::ProviderCapabilities;
 use lore_object_dispatch::ProviderChargeAuthority;
+use lore_object_dispatch::ProviderChargeError;
 use lore_object_dispatch::ProviderClientError;
 use lore_object_dispatch::ProviderRetryPolicy;
 use lore_object_dispatch::ProviderTrafficClass;
@@ -255,9 +283,13 @@ impl From<FragmentProviderError> for DomainError {
     /// The ambiguous-charge arms are the ones worth reading. A charge that
     /// committed ambiguously leaves the cell budget's state unknown, so it
     /// becomes [`DomainError::OutcomeUnknown`], which this crate never retries.
-    /// Every budget refusal is [`DomainError::Transient`] so the caller backs
-    /// off rather than treating an exhausted cell budget as a permanent
-    /// failure.
+    ///
+    /// Charge refusals split three ways and **do not all become
+    /// [`DomainError::Transient`]**, which an earlier revision of this comment
+    /// claimed. `charge_refusal` below classifies the closed
+    /// [`ProviderChargeError`] set exhaustively, with no wildcard arm, so a
+    /// variant added upstream fails this build rather than silently landing in
+    /// a catch-all.
     ///
     /// **A transport-reported ambiguous outcome does not come through here at
     /// all**, and an earlier revision of this comment wrongly said it did.
@@ -268,8 +300,6 @@ impl From<FragmentProviderError> for DomainError {
     /// which operation it was in the middle of — commit `Missing`, retry with a
     /// fresh intent, or abandon. See [`FragmentProviderGateway::execute`].
     fn from(error: FragmentProviderError) -> Self {
-        use lore_object_dispatch::ProviderChargeError;
-
         match error {
             FragmentProviderError::AttestationUnavailable(_) => {
                 Self::Transient(format!("fragment provider seam: {error}"))
@@ -287,20 +317,60 @@ impl From<FragmentProviderError> for DomainError {
                 Self::Transient(format!("fragment provider seam: {error}"))
             }
             FragmentProviderError::Provider(ProviderClientError::ChargeAmbiguous)
-            | FragmentProviderError::Provider(ProviderClientError::ChargeRecovered)
-            | FragmentProviderError::Provider(ProviderClientError::ChargeRefused(
-                ProviderChargeError::AmbiguousCommit,
-            )) => Self::OutcomeUnknown(format!("fragment provider seam: {error}")),
-            FragmentProviderError::Provider(ProviderClientError::ChargeRefused(
-                ProviderChargeError::BudgetExhausted
-                | ProviderChargeError::ClassCapExhausted
-                | ProviderChargeError::AuthorityUnavailable
-                | ProviderChargeError::Unwired,
-            )) => Self::Transient(format!("fragment provider seam: {error}")),
+            | FragmentProviderError::Provider(ProviderClientError::ChargeRecovered) => {
+                Self::OutcomeUnknown(format!("fragment provider seam: {error}"))
+            }
+            FragmentProviderError::Provider(ProviderClientError::ChargeRefused(refusal)) => {
+                charge_refusal(refusal, &error)
+            }
+            // Every remaining `ProviderClientError` is a request this seam
+            // should never have built — a bad identity, a body that does not
+            // belong to its request, a ledger naming another request. They are
+            // programming faults in the caller, not conditions to retry.
             FragmentProviderError::Provider(_) => {
                 Self::Internal(format!("fragment provider seam: {error}"))
             }
         }
+    }
+}
+
+/// Classifies one CD-4 charge refusal.
+///
+/// Deliberately exhaustive over [`ProviderChargeError`] with **no wildcard arm**.
+/// The set is closed and small, and every variant means something different to a
+/// caller deciding whether to back off, stop, or never retry; a catch-all here
+/// silently mapped four of the ten to [`DomainError::Internal`] while this
+/// module's docs said budget refusals were retryable.
+fn charge_refusal(refusal: ProviderChargeError, error: &FragmentProviderError) -> DomainError {
+    let message = format!("fragment provider seam: {error}");
+    match refusal {
+        // Capacity, not correctness. The caller backs off and re-drives.
+        ProviderChargeError::BudgetExhausted
+        | ProviderChargeError::ClassCapExhausted
+        | ProviderChargeError::AuthorityUnavailable
+        | ProviderChargeError::Unwired => DomainError::Transient(message),
+
+        // The attempt's own deadline elapsed before admission. Decisive, and
+        // nothing was charged, so a fresh attempt may be taken — which is what
+        // `Transient` instructs. Re-driving the *same* attempt identity would
+        // fail the same way, and the coordinator's begin/commit split already
+        // mints a new one per pass.
+        ProviderChargeError::DeadlineExceeded => DomainError::Transient(message),
+
+        // The cell's budget configuration does not agree with the pin this
+        // attempt carries, or cannot be resolved at all. Retrying with the same
+        // pin fails forever, so this is fail-closed and not retryable: the
+        // caller must re-resolve its pin or wait for the cell to be configured.
+        ProviderChargeError::BudgetPinRejected | ProviderChargeError::ConfigurationUnresolved => {
+            DomainError::NotReady(message)
+        }
+
+        // A durable CAS proves this exact attempt was charged before. Whether
+        // the earlier attempt reached the provider is unknown, so this is the
+        // same nonrefundable, never-retried arm as an ambiguous commit.
+        ProviderChargeError::AttemptAlreadyCharged
+        | ProviderChargeError::AmbiguousCommit
+        | ProviderChargeError::RecoveredCommittedCharge => DomainError::OutcomeUnknown(message),
     }
 }
 
@@ -317,12 +387,13 @@ impl From<FragmentProviderError> for DomainError {
 /// outside this crate's tests without a real readback through the typed
 /// authority client.
 ///
-/// **The boundary travels inside the attestation, and that is the point.**
-/// [`FragmentProviderGateway::new`] takes no separate boundary argument: it
-/// uses this one. So a gateway addressing cell B's bucket while holding cell
-/// A's readback is not expressible, rather than being a check someone has to
-/// remember to write. An earlier revision passed the two independently and had
-/// exactly that hole.
+/// **The boundary travels inside the attestation, and that is the point — but
+/// read the scope.** [`FragmentProviderGateway::new`] takes no separate
+/// boundary argument: it uses this one. So the pair a caller declared at
+/// attestation time cannot be *re-paired* afterwards, which is what an earlier
+/// revision got wrong by passing the two independently. It is not a proof that
+/// the pair was right in the first place: `attest_cell_schema` charges its
+/// caller with naming the boundary, and nothing in the readback can check it.
 ///
 /// **What this does not attest, stated so a later reader does not over-read
 /// it.**
@@ -409,6 +480,15 @@ const ATTESTED_LAYERS: [CellSchemaLayerId; 4] = [
 /// Needs a real cell. Opening no route and installing nothing, it is still a
 /// database call, so it belongs to the caller's startup path and not to a
 /// constructor.
+///
+/// **What is already proved, stated precisely so this is not under-claimed
+/// either.** CD-3's own live suite (`lore-object-dispatch`'s
+/// `dispatch_client_live.rs`) drives `read_dispatcher_identity_state` against a
+/// freshly installed cell and asserts all four layers' schema revisions,
+/// digests, and install revisions — so the readback's SQL, its runtime role,
+/// and its decoding are proved. [`verify_installed_layers`] is proved offline.
+/// What is **not** proved anywhere is this function's *composition* of the two
+/// against a real cell, because no installed cell exists here to run it on.
 pub async fn attest_cell_schema(
     client: &DispatchRuntimeClient,
     boundary: CellProviderBoundary,
@@ -712,9 +792,14 @@ where
     /// Builds the governed client's request from a caller's attempt.
     ///
     /// The target comes from this gateway's own boundary and from nowhere else.
-    /// That single line is the whole of property 5, which is why it is reachable
-    /// for a test rather than buried inside [`Self::execute`].
-    pub fn build_request(&self, attempt: &FragmentProviderAttempt) -> ProviderAttemptRequest {
+    /// That single line is the whole of property 5.
+    ///
+    /// **Private.** It runs neither the class allowlist nor the ingress cap —
+    /// its callers do, ahead of it — so a `pub` version handed out a request
+    /// naming a multipart class and carrying an over-cap body. It was `pub`
+    /// only so a test could assert on the target it fills in; the tests are in
+    /// this module and do not need it public.
+    fn build_request(&self, attempt: &FragmentProviderAttempt) -> ProviderAttemptRequest {
         ProviderAttemptRequest {
             traffic_class: attempt.traffic_class,
             attempt_class: attempt.attempt_class,
@@ -1747,19 +1832,68 @@ mod tests {
         }
     }
 
+    /// Every charge refusal, named, with the class it maps to and whether it may
+    /// be re-driven. The list is exhaustive over `ProviderChargeError`; the
+    /// `charge_refusal` match is too, so a variant added upstream breaks the
+    /// build there and this list here rather than landing in a catch-all.
+    ///
+    /// The four that used to fall through untested are
+    /// `BudgetPinRejected`, `ConfigurationUnresolved`, `DeadlineExceeded`, and
+    /// `AttemptAlreadyCharged`.
     #[test]
-    fn an_exhausted_budget_is_retryable_backpressure() {
-        for error in [
-            ProviderChargeError::BudgetExhausted,
-            ProviderChargeError::ClassCapExhausted,
-            ProviderChargeError::AuthorityUnavailable,
-        ] {
+    fn every_charge_refusal_maps_to_a_named_class_and_a_stated_retryability() {
+        let expected: [(ProviderChargeError, &str, bool); 10] = [
+            (ProviderChargeError::Unwired, "Transient", true),
+            (ProviderChargeError::BudgetExhausted, "Transient", true),
+            (ProviderChargeError::ClassCapExhausted, "Transient", true),
+            (ProviderChargeError::AuthorityUnavailable, "Transient", true),
+            (ProviderChargeError::DeadlineExceeded, "Transient", true),
+            (ProviderChargeError::BudgetPinRejected, "NotReady", false),
+            (
+                ProviderChargeError::ConfigurationUnresolved,
+                "NotReady",
+                false,
+            ),
+            (
+                ProviderChargeError::AttemptAlreadyCharged,
+                "OutcomeUnknown",
+                false,
+            ),
+            (
+                ProviderChargeError::AmbiguousCommit,
+                "OutcomeUnknown",
+                false,
+            ),
+            (
+                ProviderChargeError::RecoveredCommittedCharge,
+                "OutcomeUnknown",
+                false,
+            ),
+        ];
+
+        for (refusal, class, retryable) in expected {
             let domain = DomainError::from(FragmentProviderError::Provider(
-                ProviderClientError::ChargeRefused(error),
+                ProviderClientError::ChargeRefused(refusal),
             ));
-            assert!(
+            let observed = match domain {
+                DomainError::Transient(_) => "Transient",
+                DomainError::NotReady(_) => "NotReady",
+                DomainError::OutcomeUnknown(_) => "OutcomeUnknown",
+                DomainError::Internal(_) => "Internal",
+                DomainError::InvalidInput(_) => "InvalidInput",
+                DomainError::Contention(_) => "Contention",
+                DomainError::DomainKeyBypass(_) => "DomainKeyBypass",
+                DomainError::PreconditionRejected { .. } => "PreconditionRejected",
+            };
+            assert_eq!(observed, class, "{refusal} must map to {class}");
+            assert_eq!(
                 domain.is_retryable(),
-                "{error} must be retryable, got {domain:?}"
+                retryable,
+                "{refusal} retryability must be {retryable}, got {domain:?}",
+            );
+            assert_ne!(
+                observed, "Internal",
+                "{refusal} must not reach the catch-all",
             );
         }
     }

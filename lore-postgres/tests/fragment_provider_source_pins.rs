@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! Source pins for the two WP-118 Phase 4 properties that cannot be structural.
+//! Source pins for the WP-118 Phase 4 properties that cannot be structural.
+//!
+//! # What these are, and what they are not
 //!
 //! CR-031 forbids this package from building a second provider client and from
 //! enabling SDK automatic retries. Neither can be enforced by the type system
@@ -8,17 +10,27 @@
 //!
 //! - `lore-postgres` legitimately depends on the AWS S3 SDK for the legacy
 //!   CR-007 immutable store, so a crate-level absence is not available as
-//!   evidence. The rule is therefore scoped to `src/domain/fragments/`, which is
-//!   the package CR-031 actually governs.
-//! - The retry setting is structural at the *seam*
-//!   (`FragmentProviderGateway::new` takes no retry parameter), but nothing
-//!   stops a later edit from adding one. That signature is pinned here.
+//!   evidence. The rule is scoped to `src/domain/fragments/`, which is the
+//!   package CR-031 actually governs.
+//! - The retry setting is structural at the *seam* — `FragmentProviderGateway::new`
+//!   takes no retry parameter — but nothing stops a later edit from adding one.
+//!   That signature is pinned here.
 //!
-//! These are guards over source text, and a guard over source text is only as
-//! good as its scanner. Every check below is therefore run against a mutated
-//! copy of the real file as well as the real file, so a scanner that has
-//! quietly stopped matching fails this suite instead of passing it.
+//! **These are a speed bump and a regression detector, not a proof.** A scan
+//! over source text cannot express reachability, and an independent reviewer
+//! beat an earlier version of this file three separate ways in one sitting: by
+//! appending code below the test module, by chaining a private type alias, and
+//! by `include!`ing a file outside the scanned directory. Those three root
+//! causes are closed below and each has a test that reproduces the evasion. A
+//! fourth is not ruled out. A dependency-graph fix — a crate that cannot depend
+//! on `aws-sdk-s3` at all — is the only thing that would make "not expressible"
+//! true, and it is not this file.
+//!
+//! Every check runs against a mutated copy of the real source as well as the
+//! real source, so a scanner that has quietly stopped matching fails this suite
+//! instead of passing it.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -57,8 +69,14 @@ const PRIVATE_CLIENT_TOKENS: [&str; 9] = [
     "PostgresImmutableStore",
 ];
 
-/// The governed-client surface. These may appear only in `provider.rs`, which is
-/// the package's single provider seam; anywhere else means a second route.
+/// The governed-client surface, as a coarse substring set. These may appear only
+/// in `provider.rs`.
+///
+/// The alias and signature checks do **not** use this list — they derive the
+/// dispatch surface from `provider.rs`'s own imports instead, because a hand
+/// list is a guess at the population and an earlier revision's list was missing
+/// `ProviderRetryPolicy` and `ProviderCapabilities`, which was one of the three
+/// evasions a reviewer used.
 const GOVERNED_CLIENT_TOKENS: [&str; 6] = [
     "GovernedProviderClient",
     "ProviderTransport",
@@ -86,7 +104,7 @@ const SEAM_REQUIRED_TOKENS: [&str; 5] = [
 /// Filesystem access. `provider.rs` must have none: CR-031 removed the
 /// pre-admission body spool, and a seam that can open a file is a seam that can
 /// grow one back.
-const FILESYSTEM_TOKENS: [&str; 7] = [
+const FILESYSTEM_TOKENS: [&str; 8] = [
     "std::fs",
     "tokio::fs",
     "OpenOptions",
@@ -94,7 +112,30 @@ const FILESYSTEM_TOKENS: [&str; 7] = [
     "read_to_string",
     "SpoolLayout",
     "File::",
+    "fs::",
 ];
+
+/// Compile-time source splicing. Every check here reads files from
+/// `domain/fragments/`, so a Rust item pulled in from outside it would be
+/// compiled and unscanned. That was one of the three reviewer evasions.
+///
+/// **`include_str!` and `include_bytes!` are deliberately absent.** They embed
+/// *data*, not code — nothing they name is compiled as Rust — and `schema.rs`
+/// legitimately uses `include_str!` to read `migrations/0001_init.sql` so its
+/// tests can compare the migration against the runtime DDL const. Banning them
+/// would have failed on that and invited the whole guard to be relaxed.
+const SPLICING_TOKENS: [&str; 2] = ["include!", "#[path"];
+
+/// Public type aliases in `provider.rs` that legitimately name a dispatch type,
+/// each with the reason it is safe.
+///
+/// The alias scan resolves chains transitively and refuses every tainted public
+/// alias not listed here, so adding one is a deliberate act that lands in this
+/// table with a justification rather than passing silently.
+const PERMITTED_GOVERNED_ALIASES: [(&str, &str); 1] = [(
+    "UnwiredFragmentProviderGateway",
+    "names only the two fail-closed defaults, which can neither charge nor send",
+)];
 
 fn package_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/domain/fragments")
@@ -148,17 +189,55 @@ fn strip_line_comments(text: &str) -> String {
         .join("\n")
 }
 
-/// The part of a file that ships, excluding its `#[cfg(test)]` module.
+/// The part of a file that ships: comments stripped, and every
+/// `#[cfg(test)]`-attributed item removed **by structure**.
 ///
-/// Test code legitimately names the transport trait and the spool layout: it has
-/// to, to build the doubles that prove the seam behaves. The rules here are
-/// about shipped code.
+/// **This function is the root cause a reviewer exploited, and the fix is the
+/// word "every".** It used to truncate the file at the first column-0
+/// `#[cfg(test)]`, which made *everything below the test module invisible to
+/// every check built on it* — a reviewer appended a filesystem import, a direct
+/// governed-client re-export, and a spooling method below the tests and left
+/// all thirteen pins green. Removing each attributed item and continuing past it
+/// means there is no "below" to hide in.
+///
+/// Removal walks from the attribute to the item's first `{` or `;` at the top
+/// level and takes the balanced block or the statement. That covers `mod`, `fn`,
+/// `impl`, `use`, and `const`. It is not a Rust parser: a `{`, `}` or `;` inside
+/// a string literal between the attribute and its item's opening brace would
+/// misparse. [`the_test_module_remover_keeps_everything_around_it`] pins the
+/// behaviour against the real files.
 fn shipped_code(text: &str) -> String {
     let stripped = strip_line_comments(text);
-    match stripped.find("\n#[cfg(test)]") {
-        Some(index) => stripped[..index].to_string(),
-        None => stripped,
+    let mut out = String::with_capacity(stripped.len());
+    let mut rest = stripped.as_str();
+    while let Some(index) = rest.find("#[cfg(test)]") {
+        out.push_str(&rest[..index]);
+        let tail = &rest[index..];
+        // An unterminated item means the tail is all test code.
+        rest = skip_attributed_item(tail).unwrap_or_default();
     }
+    out.push_str(rest);
+    out
+}
+
+/// Given text starting at an attribute, returns the text after the item it
+/// attaches to.
+fn skip_attributed_item(text: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (index, character) in text.char_indices() {
+        match character {
+            ';' if depth == 0 => return Some(&text[index + 1..]),
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&text[index + 1..]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The tokens `haystack` contains, in the order they were searched for.
@@ -170,25 +249,132 @@ fn hits<'a>(haystack: &str, tokens: &[&'a str]) -> Vec<&'a str> {
         .collect()
 }
 
-/// [`hits`], but each match must start a Rust identifier.
+/// Every identifier `provider.rs` imports from `lore_object_dispatch`.
 ///
-/// Substring matching is the right default for the file-level scans: it is
-/// conservative, and a false alarm there is cheap. It is wrong for the type-alias
-/// scan, because `UnwiredProviderTransport` — the shipped, correct alias's own
-/// right-hand side — contains `ProviderTransport`, and a substring rule would
-/// flag the very shape the seam is supposed to have.
-fn hits_as_identifier<'a>(haystack: &str, tokens: &[&'a str]) -> Vec<&'a str> {
-    tokens
-        .iter()
-        .copied()
-        .filter(|token| {
-            haystack.match_indices(token).any(|(index, _)| {
-                index == 0
-                    || !haystack.as_bytes()[index - 1].is_ascii_alphanumeric()
-                        && haystack.as_bytes()[index - 1] != b'_'
-            })
-        })
-        .collect()
+/// Derived rather than hand-listed. A hand list is a guess at the population it
+/// ranges over, and the earlier hand list was missing two identifiers a reviewer
+/// then used to escape. Anything the seam imports from the dispatch crate is by
+/// definition part of the surface a sibling must not reach through it.
+fn dispatch_identifiers(provider: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in provider.lines() {
+        let trimmed = line.trim();
+        let Some(path) = trimmed.strip_prefix("use lore_object_dispatch::") else {
+            continue;
+        };
+        let Some(path) = path.strip_suffix(';') else {
+            continue;
+        };
+        // `use a::b::C as D;` contributes both C and D.
+        for part in path.split(" as ") {
+            if let Some(last) = part.rsplit("::").next() {
+                let last = last.trim();
+                if !last.is_empty() {
+                    names.insert(last.to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        names.contains("GovernedProviderClient"),
+        "the derived dispatch surface must include the governed client; \
+         the import parser has stopped working",
+    );
+    names
+}
+
+/// One `type` alias: its name, whether it is public, and its right-hand side.
+struct TypeAlias {
+    name: String,
+    public: bool,
+    rhs: String,
+}
+
+/// Every `type ... = ...;` statement in `text`, public or private, each
+/// collected whole across the line breaks rustfmt may have inserted.
+///
+/// A line-scoped scan reads only `pub type Seam =` and never sees the type it
+/// names; `UnwiredFragmentProviderGateway` in `provider.rs` is exactly that
+/// shape. Private aliases are collected too, because the chain
+/// `type Inner = Governed…;` then `pub type Escape = Inner;` was a reviewer
+/// evasion: neither statement alone names a forbidden identifier publicly.
+fn type_aliases(text: &str) -> Vec<TypeAlias> {
+    let mut aliases = Vec::new();
+    let mut rest = text;
+    while let Some(offset) = rest.find("type ") {
+        let public = rest[..offset].trim_end().ends_with("pub");
+        let tail = &rest[offset + "type ".len()..];
+        let Some(end) = tail.find(';') else {
+            break;
+        };
+        let statement = &tail[..end];
+        if let Some((left, right)) = statement.split_once('=') {
+            let name = left
+                .split(['<', ' ', '\n'])
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !name.is_empty() {
+                aliases.push(TypeAlias {
+                    name,
+                    public,
+                    rhs: right.to_string(),
+                });
+            }
+        }
+        rest = &tail[end + 1..];
+    }
+    aliases
+}
+
+/// The alias names whose expansion transitively reaches a dispatch identifier.
+fn tainted_aliases(aliases: &[TypeAlias], dispatch: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut tainted: BTreeSet<String> = BTreeSet::new();
+    // Bounded fixpoint: each pass can only add, and there are finitely many
+    // aliases, so `aliases.len()` passes reach the fixpoint.
+    for _ in 0..=aliases.len() {
+        let before = tainted.len();
+        for alias in aliases {
+            if tainted.contains(&alias.name) {
+                continue;
+            }
+            let reaches_dispatch = dispatch
+                .iter()
+                .any(|identifier| names_identifier(&alias.rhs, identifier));
+            // The transitive step. Without it, `type Inner = Governed…;` plus
+            // `pub type Escape = Inner<…>;` publishes the client while neither
+            // statement names it publicly — a reviewer's evasion.
+            let reaches_tainted = tainted
+                .iter()
+                .any(|name| names_identifier(&alias.rhs, name));
+            if reaches_dispatch || reaches_tainted {
+                tainted.insert(alias.name.clone());
+            }
+        }
+        if tainted.len() == before {
+            break;
+        }
+    }
+    tainted
+}
+
+/// Whether `haystack` names `identifier` as a whole Rust identifier.
+///
+/// Substring matching is wrong here: `UnwiredProviderTransport` — the shipped,
+/// correct alias's own right-hand side — contains `ProviderTransport`, and a
+/// substring rule would flag the very shape the seam is supposed to have.
+fn names_identifier(haystack: &str, identifier: &str) -> bool {
+    haystack.match_indices(identifier).any(|(index, _)| {
+        let before_ok = index == 0 || !is_identifier_byte(haystack.as_bytes()[index - 1]);
+        let after = index + identifier.len();
+        let after_ok = after >= haystack.len() || !is_identifier_byte(haystack.as_bytes()[after]);
+        before_ok && after_ok
+    })
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// Extracts the balanced `{ ... }` or `( ... )` block that starts at the first
@@ -236,9 +422,34 @@ fn the_stripper_removes_comments_and_keeps_code() {
         shipped.contains("GovernedProviderClient"),
         "the stripper must keep the code it is scanning",
     );
+}
+
+/// **The evasion this replaced a truncation to close.**
+///
+/// `shipped_code` must remove the test module and keep going, so that code
+/// appended below it is still scanned. The two assertions are a pair: dropping
+/// the tests, and keeping what follows them.
+#[test]
+fn the_test_module_remover_keeps_everything_around_it() {
+    let provider = read("provider.rs");
+    let shipped = shipped_code(&provider);
     assert!(
         !shipped.contains("fn a_granted_charge_binds_exactly_one_issued_attempt"),
-        "shipped_code must stop at the #[cfg(test)] module",
+        "the test module must be removed",
+    );
+    assert!(
+        shipped.contains("pub async fn attest_cell_schema"),
+        "shipped items before the test module must survive",
+    );
+    assert!(
+        !shipped.contains("fn for_tests"),
+        "a #[cfg(test)] item nested inside an impl must be removed too",
+    );
+
+    let appended = format!("{provider}\nuse std::fs::OpenOptions;\n");
+    assert!(
+        shipped_code(&appended).contains("OpenOptions"),
+        "code appended below the test module must remain visible to the scan",
     );
 }
 
@@ -254,10 +465,10 @@ fn no_scanned_file_uses_a_block_comment() {
     }
 }
 
-/// Every forbidden token, injected into the real shipped source as code, must be
-/// caught; injected as a comment, it must not be. Driving the loop from the
-/// token tables rather than a hand-picked example means a token added to a table
-/// without a working match fails here.
+/// Every forbidden token, injected into the real shipped source, must be caught
+/// in each of five placements; injected as a comment, it must not be. Driving
+/// the loop from the token tables rather than a hand-picked example means a
+/// token added to a table without a working match fails here.
 #[test]
 fn the_scanner_catches_every_forbidden_token_it_claims_to() {
     let provider = shipped_code(&read("provider.rs"));
@@ -266,9 +477,6 @@ fn the_scanner_catches_every_forbidden_token_it_claims_to() {
         .chain(GOVERNED_CLIENT_TOKENS.iter())
         .chain(FILESYSTEM_TOKENS.iter())
     {
-        // Four placements, not one. The last two are the evasions a naive
-        // first-`//` cut lets through, and both were live before this file's
-        // stripper grew rule 2.
         for (placement, injected) in [
             ("a plain code line", format!("use {token};")),
             ("code after a doc line", format!("/// docs\nuse {token};")),
@@ -279,6 +487,10 @@ fn the_scanner_catches_every_forbidden_token_it_claims_to() {
             (
                 "code trailing a string literal",
                 format!("let name = \"x\"; use {token};"),
+            ),
+            (
+                "code wrapped across two lines",
+                format!("type Wrapped =\n    {token};"),
             ),
         ] {
             let mutated = format!("{provider}\n{injected}\n");
@@ -310,57 +522,16 @@ fn the_scanner_catches_every_forbidden_token_it_claims_to() {
     }
 }
 
-/// The seam must not hand its own package a way around
-/// [`only_the_provider_seam_reaches_the_governed_client`]. A `pub use` or a
-/// public type alias in `provider.rs` would let a sibling name the governed
-/// client as `provider::Something` and satisfy every check above.
+/// The scanned file list must be what is actually compiled, so a file cannot be
+/// added to the package and escape every rule.
+///
+/// Three things have to agree: the directory's contents, `mod.rs`'s module
+/// declarations, and [`PACKAGE_FILES`]. The middle one is what a bare directory
+/// listing misses — a file present but undeclared compiles into nothing, and a
+/// module declared but sourced from elsewhere compiles from a path no rule here
+/// reads.
 #[test]
-fn the_seam_re_exports_no_part_of_the_governed_client() {
-    let provider = shipped_code(&read("provider.rs"));
-    assert!(
-        !provider.contains("pub use lore_object_dispatch"),
-        "provider.rs must not re-export the dispatch crate",
-    );
-    // Scan each alias as a whole *statement*, not as a line. rustfmt wraps a
-    // long alias onto the next line — `UnwiredFragmentProviderGateway` in this
-    // very file is that shape — so a line-scoped check reads only `pub type
-    // Seam =` and never sees the type it names. That was a live bypass.
-    let mut aliases = 0;
-    for statement in type_alias_statements(&provider) {
-        aliases += 1;
-        let found = hits_as_identifier(&statement, &GOVERNED_CLIENT_TOKENS);
-        assert!(
-            found.is_empty(),
-            "a public type alias names {found:?}, which re-opens the seam: {statement}",
-        );
-    }
-    assert!(
-        aliases >= 1,
-        "the alias scan found nothing to scan, so it proves nothing",
-    );
-}
-
-/// Every `pub type ... ;` statement in `text`, each collected whole across the
-/// line breaks rustfmt may have inserted.
-fn type_alias_statements(text: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("pub type ") {
-        let tail = &rest[start..];
-        let end = match tail.find(';') {
-            Some(end) => end + 1,
-            None => panic!("unterminated `pub type` statement: {tail}"),
-        };
-        statements.push(tail[..end].to_string());
-        rest = &tail[end..];
-    }
-    statements
-}
-
-/// The file list this suite scans must be the directory's actual contents, so a
-/// new file cannot be added to the package and silently escape every rule.
-#[test]
-fn the_scanned_file_list_is_the_whole_package() {
+fn the_scanned_file_list_is_what_the_package_actually_compiles() {
     let entries = match fs::read_dir(package_dir()) {
         Ok(entries) => entries,
         Err(error) => panic!("the package directory must be readable: {error}"),
@@ -387,96 +558,40 @@ fn the_scanned_file_list_is_the_whole_package() {
         PACKAGE_FILES.map(str::to_string).to_vec(),
         "every .rs file in domain/fragments/ must be listed in PACKAGE_FILES",
     );
+
+    let mut declared: Vec<String> = shipped_code(&read("mod.rs"))
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line
+                .trim()
+                .strip_prefix("pub mod ")
+                .or(line.trim().strip_prefix("mod "))?;
+            trimmed.strip_suffix(';').map(|name| format!("{name}.rs"))
+        })
+        .collect();
+    declared.push("mod.rs".to_string());
+    declared.sort();
+    assert_eq!(
+        declared,
+        PACKAGE_FILES.map(str::to_string).to_vec(),
+        "mod.rs's module declarations must match the scanned file list exactly",
+    );
 }
 
-// ---------------------------------------------------------------------------
-// Property 3: no private S3 client, no SDK automatic retries
-// ---------------------------------------------------------------------------
-
+/// **The evasion that reached outside the directory entirely.**
+///
+/// `include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/domain/elsewhere.rs"))`
+/// compiles a file no check here reads. So does `#[path = "..."] mod`. Neither
+/// has any legitimate use in this package.
 #[test]
-fn the_package_builds_no_private_provider_client() {
+fn the_package_splices_in_no_source_from_outside_itself() {
     for file in PACKAGE_FILES {
-        let found = hits(&strip_line_comments(&read(file)), &PRIVATE_CLIENT_TOKENS);
+        let found = hits(&strip_line_comments(&read(file)), &SPLICING_TOKENS);
         assert!(
             found.is_empty(),
-            "{file} names {found:?}; WP-114's governed client is the only route to a bucket",
+            "{file} names {found:?}, which compiles source these guards never read",
         );
     }
-}
-
-#[test]
-fn only_the_provider_seam_reaches_the_governed_client() {
-    for file in PACKAGE_FILES {
-        if file == "provider.rs" {
-            continue;
-        }
-        let found = hits(&strip_line_comments(&read(file)), &GOVERNED_CLIENT_TOKENS);
-        assert!(
-            found.is_empty(),
-            "{file} names {found:?}; provider.rs is the package's only provider seam",
-        );
-    }
-    let seam = shipped_code(&read("provider.rs"));
-    for token in SEAM_REQUIRED_TOKENS {
-        assert!(
-            seam.contains(token),
-            "provider.rs must actually be the seam it claims to be, but does not name {token}",
-        );
-    }
-}
-
-/// Every `ProviderRetryPolicy::` in the file must be `::disabled`. Anything else
-/// would be a second retry setting, which is what CR-031 forbids.
-#[test]
-fn the_seam_states_exactly_one_retry_setting_and_it_is_disabled() {
-    let provider = strip_line_comments(&read("provider.rs"));
-    let mut constructions = 0;
-    for (index, _) in provider.match_indices("ProviderRetryPolicy::") {
-        constructions += 1;
-        let tail = &provider[index + "ProviderRetryPolicy::".len()..];
-        assert!(
-            tail.starts_with("disabled"),
-            "ProviderRetryPolicy is constructed as something other than disabled()",
-        );
-    }
-    assert!(
-        constructions >= 1,
-        "the seam must state its retry setting explicitly",
-    );
-}
-
-/// The constructor takes neither a retry policy nor a second boundary, so a
-/// retrying client cannot be configured through this seam and a gateway cannot
-/// address a cell other than the one its attestation was minted for.
-#[test]
-fn the_gateway_constructor_takes_neither_a_retry_policy_nor_a_second_boundary() {
-    let provider = shipped_code(&read("provider.rs"));
-    // Anchored inside the generic impl block, because `InFlightPutBound::new`
-    // occurs earlier in the file and would otherwise be the match.
-    let Some(start) = provider.find("impl<C, T> FragmentProviderGateway<C, T>") else {
-        panic!("the generic gateway impl block must exist");
-    };
-    let signature = block_after(&provider[start..], "pub fn new(", '(', ')');
-    assert!(
-        !signature.to_ascii_lowercase().contains("retry"),
-        "FragmentProviderGateway::new must not accept a retry setting, got {signature}",
-    );
-    for expected in [
-        "attestation: CellSchemaAttestation",
-        "bound: InFlightPutBound",
-    ] {
-        assert!(
-            signature.contains(expected),
-            "FragmentProviderGateway::new must still require {expected}, got {signature}",
-        );
-    }
-    // The boundary must NOT be a separate argument: it travels inside the
-    // attestation so the two cannot be paired wrongly. See
-    // `only_a_real_readback_can_mint_a_cell_schema_attestation`.
-    assert!(
-        !signature.contains("CellProviderBoundary"),
-        "the boundary must come from the attestation, not from a second argument, got {signature}",
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +659,181 @@ fn only_a_real_readback_can_mint_a_cell_schema_attestation() {
     }
 }
 
+/// The test-only constructor must stay test-only.
+///
+/// `for_tests` mints an attestation with no cell. Its `#[cfg(test)]` is what
+/// keeps that unreachable from a shipped binary, and an attribute is exactly the
+/// kind of thing a later edit drops without noticing: changing it to `pub fn`
+/// left every other pin green.
+#[test]
+fn the_test_only_attestation_constructor_stays_test_only() {
+    let raw = strip_line_comments(&read("provider.rs"));
+    let Some(index) = raw.find("fn for_tests(") else {
+        panic!("the test-only constructor must still exist");
+    };
+    let preceding = &raw[index.saturating_sub(200)..index];
+    assert!(
+        preceding.contains("#[cfg(test)]"),
+        "for_tests must carry #[cfg(test)], got the preceding text {preceding:?}",
+    );
+    assert!(
+        !raw.contains("pub fn for_tests"),
+        "for_tests must not be public outside the crate",
+    );
+    // And it must be gone from the shipped view, which is the same fact seen
+    // from the other side.
+    assert!(
+        !shipped_code(&read("provider.rs")).contains("fn for_tests"),
+        "for_tests must not appear in shipped code",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Property 3: no private S3 client, no SDK automatic retries
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_package_builds_no_private_provider_client() {
+    for file in PACKAGE_FILES {
+        let found = hits(&strip_line_comments(&read(file)), &PRIVATE_CLIENT_TOKENS);
+        assert!(
+            found.is_empty(),
+            "{file} names {found:?}; WP-114's governed client is the only route to a bucket",
+        );
+    }
+}
+
+#[test]
+fn only_the_provider_seam_reaches_the_governed_client() {
+    for file in PACKAGE_FILES {
+        if file == "provider.rs" {
+            continue;
+        }
+        let found = hits(&strip_line_comments(&read(file)), &GOVERNED_CLIENT_TOKENS);
+        assert!(
+            found.is_empty(),
+            "{file} names {found:?}; provider.rs is the package's only provider seam",
+        );
+    }
+    let seam = shipped_code(&read("provider.rs"));
+    for token in SEAM_REQUIRED_TOKENS {
+        assert!(
+            seam.contains(token),
+            "provider.rs must actually be the seam it claims to be, but does not name {token}",
+        );
+    }
+}
+
+/// **The evasion that chained a private alias.**
+///
+/// `type Inner<C,T> = GovernedProviderClient<C,T>;` followed by
+/// `pub type Escape = Inner<A,B>;` publishes the governed client without either
+/// statement publicly naming it, and a sibling then builds a second client
+/// through `provider::Escape`. The scan therefore collects private aliases too
+/// and resolves the chain transitively, and it derives the dispatch surface from
+/// `provider.rs`'s own imports rather than from a hand list that was missing two
+/// of the identifiers the reviewer used.
+#[test]
+fn the_seam_publishes_no_route_to_the_governed_client() {
+    let provider = shipped_code(&read("provider.rs"));
+    assert!(
+        !provider.contains("pub use lore_object_dispatch"),
+        "provider.rs must not re-export the dispatch crate",
+    );
+
+    let dispatch = dispatch_identifiers(&provider);
+    let aliases = type_aliases(&provider);
+    assert!(
+        !aliases.is_empty(),
+        "the alias scan found nothing to scan, so it proves nothing",
+    );
+    let tainted = tainted_aliases(&aliases, &dispatch);
+    let permitted: BTreeSet<&str> = PERMITTED_GOVERNED_ALIASES
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    for alias in &aliases {
+        if !alias.public || !tainted.contains(&alias.name) {
+            continue;
+        }
+        assert!(
+            permitted.contains(alias.name.as_str()),
+            "public alias {} reaches the dispatch surface and is not in \
+             PERMITTED_GOVERNED_ALIASES; add it there with a reason or remove it",
+            alias.name,
+        );
+    }
+    // The allowlist must describe reality, or it is a stale exemption.
+    for (name, _) in PERMITTED_GOVERNED_ALIASES {
+        assert!(
+            aliases.iter().any(|alias| alias.name == name),
+            "PERMITTED_GOVERNED_ALIASES names {name}, which no longer exists",
+        );
+    }
+
+    // A public function that hands back the governed client is the same escape
+    // with a different spelling.
+    for line in provider.lines().filter(|line| line.contains("pub fn ")) {
+        assert!(
+            !names_identifier(line, "GovernedProviderClient"),
+            "a public function exposes the governed client: {line}",
+        );
+    }
+}
+
+/// Every `ProviderRetryPolicy::` in the file must be `::disabled`. Anything else
+/// would be a second retry setting, which is what CR-031 forbids.
+#[test]
+fn the_seam_states_exactly_one_retry_setting_and_it_is_disabled() {
+    let provider = strip_line_comments(&read("provider.rs"));
+    let mut constructions = 0;
+    for (index, _) in provider.match_indices("ProviderRetryPolicy::") {
+        constructions += 1;
+        let tail = &provider[index + "ProviderRetryPolicy::".len()..];
+        assert!(
+            tail.starts_with("disabled"),
+            "ProviderRetryPolicy is constructed as something other than disabled()",
+        );
+    }
+    assert!(
+        constructions >= 1,
+        "the seam must state its retry setting explicitly",
+    );
+}
+
+/// The constructor takes neither a retry policy nor a second boundary, so a
+/// retrying client cannot be configured through this seam and a gateway cannot
+/// address a cell other than the one its attestation was minted for.
+#[test]
+fn the_gateway_constructor_takes_neither_a_retry_policy_nor_a_second_boundary() {
+    let provider = shipped_code(&read("provider.rs"));
+    // Anchored inside the generic impl block, because `InFlightPutBound::new`
+    // occurs earlier in the file and would otherwise be the match.
+    let Some(start) = provider.find("impl<C, T> FragmentProviderGateway<C, T>") else {
+        panic!("the generic gateway impl block must exist");
+    };
+    let signature = block_after(&provider[start..], "pub fn new(", '(', ')');
+    assert!(
+        !signature.to_ascii_lowercase().contains("retry"),
+        "FragmentProviderGateway::new must not accept a retry setting, got {signature}",
+    );
+    for expected in [
+        "attestation: CellSchemaAttestation",
+        "bound: InFlightPutBound",
+    ] {
+        assert!(
+            signature.contains(expected),
+            "FragmentProviderGateway::new must still require {expected}, got {signature}",
+        );
+    }
+    // The boundary must NOT be a separate argument: it travels inside the
+    // attestation so the two cannot be re-paired after minting.
+    assert!(
+        !signature.contains("CellProviderBoundary"),
+        "the boundary must come from the attestation, not from a second argument, got {signature}",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Property 4: no pre-body spool gate
 // ---------------------------------------------------------------------------
@@ -581,14 +871,18 @@ fn a_caller_supplied_attempt_carries_no_provider_target() {
 }
 
 /// The one line that supplies the target reads it from the gateway's own
-/// boundary. If a future edit moves it, this fails rather than the property
-/// silently weakening.
+/// boundary, and the builder that runs no checks is not public.
 #[test]
 fn the_seam_sources_its_target_only_from_its_own_boundary() {
     let provider = shipped_code(&read("provider.rs"));
+    assert!(
+        !provider.contains("pub fn build_request"),
+        "build_request runs neither the class allowlist nor the ingress cap, \
+         so it must not be public",
+    );
     let builder = block_after(
         &provider,
-        "pub fn build_request(&self, attempt: &FragmentProviderAttempt) -> ProviderAttemptRequest {",
+        "fn build_request(&self, attempt: &FragmentProviderAttempt) -> ProviderAttemptRequest {",
         '{',
         '}',
     );
