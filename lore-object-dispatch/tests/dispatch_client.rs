@@ -952,20 +952,98 @@ fn struct_fields(type_name: &str) -> Vec<String> {
         .map(|(name, _)| name.trim().to_string())
         .collect()
 }
+/// How one decoder must account for every field its outcome type returns.
+///
+/// The three classes are exhaustive by assertion, so a field added to an outcome cannot land
+/// unclassified: it is either name-matched against something the call submitted, bound under a
+/// different name (recorded in `renamed`), or produced by the authority (recorded in `minted`).
+struct BindingContract {
+    request_type: &'static str,
+    outcome_type: &'static str,
+    /// `(outcome field, request field, comparison operator)` for bindings whose two sides are
+    /// spelled differently. Name intersection cannot see these, and all four were deletable on a
+    /// full green run before this map existed - including the durable-body binding whose own
+    /// comment says a later reader trusts it.
+    renamed: &'static [(&'static str, &'static str, &'static str)],
+    /// Fields the authority produces. The call supplies nothing to compare them to, so they are
+    /// legitimately unbound - but they are listed, not inferred, so suppressing a real binding
+    /// means editing this list where a reader can see it.
+    minted: &'static [&'static str],
+}
+
+const BINDING_CONTRACTS: [BindingContract; 5] = [
+    BindingContract {
+        request_type: "ReservePutRequest",
+        outcome_type: "ReservePutOutcome",
+        renamed: &[],
+        minted: &[
+            "admission_clock_unix_ms",
+            "expires_at_unix_ms",
+            "reserve_put_ack_canonical_bytes",
+            "reserve_put_ack_blake3",
+        ],
+    },
+    BindingContract {
+        request_type: "PutUploadProgressRequest",
+        outcome_type: "PutUploadProgressOutcome",
+        // An inequality, not an equality: the authority may have committed a longer prefix than
+        // this call supplied, but never a shorter one.
+        renamed: &[("committed_prefix_bytes", "fsynced_prefix_bytes", ">=")],
+        minted: &[
+            "spool_object_id",
+            "committed_prefix_chunks",
+            "spool_revision",
+            "record_blake3",
+        ],
+    },
+    BindingContract {
+        request_type: "PutSpoolReadyRequest",
+        outcome_type: "PutSpoolReadyOutcome",
+        renamed: &[
+            ("committed_size", "fsynced_body_size", "=="),
+            ("committed_blake3", "fsynced_body_blake3", "=="),
+        ],
+        minted: &[
+            "spool_object_id",
+            "ready_at_unix_ms",
+            "reserve_put_ack_canonical_bytes",
+            "reserve_put_ack_blake3",
+            "spool_revision",
+            "record_blake3",
+        ],
+    },
+    BindingContract {
+        request_type: "EnrollParticipantRequest",
+        outcome_type: "EnrollParticipantOutcome",
+        renamed: &[],
+        minted: &[],
+    },
+    BindingContract {
+        request_type: "RegisterDispatcherRequest",
+        outcome_type: "RegisterDispatcherOutcome",
+        renamed: &[("lease_generation", "next_generation", "==")],
+        // 0020 mints both identity columns from the enrolled participant row.
+        minted: &[
+            "dispatcher_id",
+            "provider_boundary_id",
+            "state",
+            "record_blake3",
+        ],
+    },
+];
 
 #[test]
-fn every_decoder_binds_every_field_the_call_submitted_and_the_projection_returns() {
+fn every_decoder_accounts_for_every_field_its_projection_returns() {
     // A replay returns the authority's stored projection. If a decoder accepts one without
     // checking it names what this call submitted, an ambiguity resolution can adopt another
     // writer's record as its own result.
     //
-    // The previous version asserted only that each decode body contained `require(` and
-    // `self.request`. Deleting the `attempt_id` comparison from `PreparedReservePut::decode`
-    // survived a full green run, and `attempt_id` is precisely the field that distinguishes two
-    // attempts of one logical mutation. So the required set is *derived*: every field the outcome
-    // returns that the request or its stream identity also carries must appear in a comparison
-    // against `self.request`. Database-minted fields, which the call cannot supply, are correctly
-    // outside that set and are not demanded.
+    // Two earlier versions of this test were too weak. The first asserted only that each decode
+    // body contained `require(` and `self.request`. The second derived the required set by
+    // intersecting field *names*, which left every binding whose two sides are spelled differently
+    // outside it - four of them, all deletable on a full green run. This version keeps the
+    // derivation, adds the renamed bindings explicitly, and asserts the three classes cover the
+    // outcome type exactly, so the residual is additive and visible rather than silent.
     const SIGNATURE: &str = "fn decode(&self, row: &Row) -> Result<DispatchAccepted<Self::Outcome>, DispatchAuthorityError> {";
     let decoders: Vec<&str> = CLIENT_SOURCE
         .match_indices(SIGNATURE)
@@ -979,8 +1057,8 @@ fn every_decoder_binds_every_field_the_call_submitted_and_the_projection_returns
         .collect();
     assert_eq!(
         decoders.len(),
-        5,
-        "expected one decoder per called mutation"
+        BINDING_CONTRACTS.len(),
+        "expected one decoder per binding contract"
     );
 
     let identity_fields = struct_fields("PutStreamIdentity");
@@ -989,51 +1067,110 @@ fn every_decoder_binds_every_field_the_call_submitted_and_the_projection_returns
         "PutStreamIdentity parse found no attempt_id: {identity_fields:?}"
     );
 
-    for (index, (request_type, outcome_type, minted)) in [
-        ("ReservePutRequest", "ReservePutOutcome", &[][..]),
-        (
-            "PutUploadProgressRequest",
-            "PutUploadProgressOutcome",
-            &["spool_object_id"][..],
-        ),
-        (
-            "PutSpoolReadyRequest",
-            "PutSpoolReadyOutcome",
-            &["spool_object_id"][..],
-        ),
-        (
-            "EnrollParticipantRequest",
-            "EnrollParticipantOutcome",
-            &[][..],
-        ),
-        (
-            "RegisterDispatcherRequest",
-            "RegisterDispatcherOutcome",
-            // 0020 mints both identity columns from the enrolled participant row; the call never
-            // supplies them, so they cannot be bound and must not be demanded.
-            &["dispatcher_id", "provider_boundary_id"][..],
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let decoder = decoders[index];
-        let mut submitted = struct_fields(request_type);
-        submitted.extend(identity_fields.iter().cloned());
-        let required: Vec<String> = struct_fields(outcome_type)
-            .into_iter()
-            .filter(|field| submitted.contains(field) && !minted.contains(&field.as_str()))
+    for (decoder, contract) in decoders.iter().zip(BINDING_CONTRACTS.iter()) {
+        let request_fields = struct_fields(contract.request_type);
+        let outcome_fields = struct_fields(contract.outcome_type);
+        assert!(
+            !outcome_fields.is_empty(),
+            "{}: parsed no outcome fields",
+            contract.outcome_type
+        );
+
+        // Only a request that actually embeds a `PutStreamIdentity` contributes its fields.
+        // Applying them to every pair is what previously let `RegisterDispatcherOutcome` look
+        // correct: `provider_boundary_id` entered the submitted set through an identity the
+        // request does not have, and the `minted` entry then suppressed it again. Two errors
+        // cancelling. Derived here so the first one cannot come back.
+        let embeds_identity = request_fields.iter().any(|field| field == "identity");
+        let mut submitted = request_fields.clone();
+        if embeds_identity {
+            submitted.extend(identity_fields.iter().cloned());
+        }
+
+        let required: Vec<String> = outcome_fields
+            .iter()
+            .filter(|field| submitted.contains(field))
+            .cloned()
+            .collect();
+        let renamed_fields: Vec<String> = contract
+            .renamed
+            .iter()
+            .map(|(outcome_field, _, _)| (*outcome_field).to_string())
+            .collect();
+        let minted_fields: Vec<String> = contract.minted.iter().map(|f| (*f).to_string()).collect();
+
+        // A field the call *does* supply must never be listed as minted. This is the assertion
+        // that catches the cancelling pair above: give `RegisterDispatcherRequest` a real
+        // `provider_boundary_id` and the standing `minted` entry stops being harmless.
+        for field in &minted_fields {
+            assert!(
+                !required.contains(field),
+                "{}: `{field}` is listed as minted but the call submits it, so its binding is \
+                 being suppressed rather than being genuinely unavailable",
+                contract.outcome_type
+            );
+            assert!(
+                outcome_fields.contains(field),
+                "{}: `{field}` is listed as minted but the outcome does not return it",
+                contract.outcome_type
+            );
+        }
+        for (outcome_field, request_field, _) in contract.renamed {
+            assert!(
+                outcome_fields.contains(&(*outcome_field).to_string()),
+                "{}: renamed entry `{outcome_field}` is not a field of the outcome",
+                contract.outcome_type
+            );
+            assert!(
+                request_fields.contains(&(*request_field).to_string()),
+                "{}: renamed entry points at `{request_field}`, which the request does not carry",
+                contract.request_type
+            );
+            assert!(
+                !required.contains(&(*outcome_field).to_string()),
+                "{}: `{outcome_field}` is name-matched already and needs no renamed entry",
+                contract.outcome_type
+            );
+        }
+
+        // Exhaustiveness: every field the projection returns is accounted for by one of the three
+        // classes, so a new outcome field cannot land unclassified.
+        let mut accounted: Vec<String> = required.clone();
+        accounted.extend(renamed_fields.iter().cloned());
+        accounted.extend(minted_fields.iter().cloned());
+        let unaccounted: Vec<&String> = outcome_fields
+            .iter()
+            .filter(|field| !accounted.contains(field))
             .collect();
         assert!(
-            !required.is_empty(),
-            "{outcome_type}: derived an empty binding set, which would make this vacuous"
+            unaccounted.is_empty(),
+            "{}: fields returned but neither bound, renamed, nor recorded as minted: \
+             {unaccounted:?}",
+            contract.outcome_type
         );
+        assert!(
+            !required.is_empty() || !renamed_fields.is_empty(),
+            "{}: nothing is bound at all",
+            contract.outcome_type
+        );
+
+        // The bindings themselves.
         for field in &required {
-            let comparison = format!("value.{field} == self.request");
+            let direct = format!("value.{field} == self.request.{field}");
+            let through_identity = format!("value.{field} == self.request.identity.{field}");
+            assert!(
+                decoder.contains(&direct) || decoder.contains(&through_identity),
+                "{}: `{field}` is returned and was submitted, but the decoder does not bind it",
+                contract.outcome_type
+            );
+        }
+        for (outcome_field, request_field, operator) in contract.renamed {
+            let comparison =
+                format!("value.{outcome_field} {operator} self.request.{request_field}");
             assert!(
                 decoder.contains(&comparison),
-                "{outcome_type}: `{field}` is returned and was submitted, but the decoder does \
-                 not bind it (looked for `{comparison}`)"
+                "{}: the decoder does not carry `{comparison}`",
+                contract.outcome_type
             );
         }
     }
@@ -1232,7 +1369,29 @@ fn assert_redacted(label: &str, rendered: &str) {
     let mut redactions = 0usize;
     for line in rendered.lines() {
         let trimmed = line.trim().trim_end_matches(',');
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Openers and closers carry no value: `Name {`, `Name(`, `}`, `)`, `],`.
+        // `..` is `finish_non_exhaustive`'s marker for the fields deliberately not rendered.
+        if matches!(trimmed, "}" | ")" | "]" | "..")
+            || (trimmed.ends_with('{') || trimmed.ends_with('(') || trimmed.ends_with('['))
+                && !trimmed.contains(": ")
+        {
+            continue;
+        }
         let Some((key, value)) = trimmed.split_once(": ") else {
+            // A bare value line: a tuple-variant payload, or a sequence element. An earlier
+            // version skipped these, so a derived `Debug` on a tuple variant rendered its payload
+            // on its own line and passed - the allowlisted key licensed the `Variant(` header and
+            // the payload line had no `": "` to match. Only the weaker substring test caught that,
+            // which is exactly backwards. Nothing here legitimately renders a bare value.
+            assert!(
+                trimmed == "\"[REDACTED]\"",
+                "{label}: bare value `{trimmed}` is rendered outside any named field\n\
+                 full render:\n{rendered}"
+            );
+            redactions += 1;
             continue;
         };
         let key = key.trim();
@@ -1241,8 +1400,11 @@ fn assert_redacted(label: &str, rendered: &str) {
             redactions += 1;
             continue;
         }
-        // A nested struct header; its own fields are checked on the following lines.
-        if value.ends_with('{') {
+        // A header for a nested struct, tuple variant, or sequence. Skipping it is safe *because*
+        // its contents are checked line by line by the branches above - which is what the bare
+        // value rule added. Previously a tuple header on an allowlisted key was skipped and its
+        // payload line was skipped too, so nothing checked the payload at all.
+        if value.ends_with('{') || value.ends_with('(') || value.ends_with('[') {
             continue;
         }
         assert!(

@@ -1215,8 +1215,10 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
 // mTLS) and checks the peer's common name. The dispatch pool deliberately has no client-certificate
 // mode - CR-033 D1 dropped that contract along with the external authority database - so it cannot
 // present one, and widening the shared proxy would change a fixture another tier depends on. This
-// is the same fault against a plaintext cell-local connection, which is the posture the dispatch
-// pool actually ships (`DispatchTlsMode::Disabled`).
+// injects the same fault against a plaintext connection, `DispatchTlsMode::Disabled`. That is one
+// of the pool's two modes, not a claim about what a cell will run: the crate is source-dark, no
+// composition path selects a mode, and choosing one is CD-6's. `DispatchTlsMode::PinnedRootCa` has
+// no live coverage in this tier at all - recorded as a CD-6 obligation in WP-114.
 //
 // Only the server-to-client direction is parsed. PostgreSQL backend messages are always tagged, so
 // no startup-message special case is needed: when armed, the `CommandComplete` frame carrying
