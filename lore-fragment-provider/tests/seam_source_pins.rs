@@ -69,11 +69,23 @@ const FILESYSTEM_TOKENS: [&str; 8] = [
 
 /// The two types `GovernedProviderClient::execute` takes.
 ///
-/// **This is the load-bearing rule in this file.** Property 2 is structural
-/// because no crate outside this one can name these, so a `pub use` of either
-/// would hand the whole property away in one line — and unlike the dependency
-/// on `lore-object-dispatch`, which a reviewer would notice in a manifest, a
-/// re-export hides in an import block.
+/// Property 2 rests on no crate outside this one being able to name these, so
+/// publishing either hands away a piece of it.
+///
+/// **Three spellings, and an earlier revision checked only one.** The pin used
+/// to match lines containing `pub use `. A reviewer published both types with
+/// `pub type PublicLedger = ProviderAttemptLedger;` instead, which is not a
+/// `pub use`, and `private_interfaces` cannot object because both types are
+/// legitimately public in `lore-object-dispatch`. Paired with an accessor
+/// yielding the client, that was a working call to `execute` from
+/// `lore-postgres` while naming no dispatch type at all. So this now covers
+/// `pub use`, `pub type` right-hand sides, and `pub fn` signatures.
+///
+/// **What actually carries the property is the [`AttemptSink`] erasure, not
+/// this pin.** With the client boxed behind a private trait there is nothing to
+/// call `execute` on, so publishing the parameter types buys nothing. This is
+/// belt and braces for the case where a seam edit exposes the real types in a
+/// signature directly, and it is a text scan with all the limits of one.
 const FORBIDDEN_REEXPORTS: [&str; 2] = ["ProviderAttemptLedger", "ProviderAttemptRequest"];
 
 /// Crates whose presence in `[dependencies]` would end property 3's structural
@@ -247,26 +259,79 @@ fn the_seam_uses_no_block_comment() {
 #[test]
 fn the_seam_never_re_exports_the_types_execute_takes() {
     let shipped = shipped_code(&read("src/lib.rs"));
+
+    // Spelling 1: a `pub use`, whether direct or aliased with `as`.
     for line in shipped.lines().filter(|line| line.contains("pub use ")) {
         let found = hits(line, &FORBIDDEN_REEXPORTS);
         assert!(
             found.is_empty(),
-            "re-exporting {found:?} lets a caller elsewhere name execute's \
-             arguments, which is the entire property: {line}",
+            "re-exporting {found:?} publishes execute's arguments: {line}",
         );
     }
+
+    // Spelling 2: a public type alias. Collected as whole statements, because
+    // rustfmt wraps a long right-hand side onto the next line and a line-scoped
+    // scan would read only `pub type X =`.
+    let mut aliases = 0;
+    for statement in public_type_aliases(&shipped) {
+        aliases += 1;
+        let found = hits(&statement, &FORBIDDEN_REEXPORTS);
+        assert!(
+            found.is_empty(),
+            "a public type alias publishes {found:?}, which is the spelling a \
+             `pub use` scan missed: {statement}",
+        );
+    }
+
+    // Spelling 3: a public function signature that names either type.
+    for signature in public_fn_signatures(&shipped) {
+        let found = hits(&signature, &FORBIDDEN_REEXPORTS);
+        assert!(
+            found.is_empty(),
+            "a public signature names {found:?}, which lets a caller elsewhere \
+             obtain or pass one: {signature}",
+        );
+    }
+
     assert!(
         shipped.contains("pub use lore_object_dispatch::"),
         "the re-export block must still exist, or this check scans nothing",
     );
-    // Belt and braces: neither type may be re-exported under an alias either.
-    for forbidden in FORBIDDEN_REEXPORTS {
-        let aliased = format!("pub use lore_object_dispatch::{forbidden}");
-        assert!(
-            !shipped.contains(&aliased),
-            "{forbidden} must not be re-exported, aliased or otherwise",
-        );
+    assert!(
+        aliases + shipped.matches("pub fn ").count() > 0,
+        "the alias and signature scans found nothing to scan, so they prove nothing",
+    );
+}
+
+/// Every `pub type ... ;` statement, collected whole across rustfmt's wrapping.
+fn public_type_aliases(text: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut rest = text;
+    while let Some(offset) = rest.find("pub type ") {
+        let tail = &rest[offset..];
+        let Some(end) = tail.find(';') else {
+            break;
+        };
+        statements.push(tail[..=end].to_string());
+        rest = &tail[end + 1..];
     }
+    statements
+}
+
+/// Every `pub fn`/`pub async fn` signature, from the keyword to its opening
+/// brace, so a wrapped return type is scanned with the rest of it.
+fn public_fn_signatures(text: &str) -> Vec<String> {
+    let mut signatures = Vec::new();
+    let mut rest = text;
+    while let Some(offset) = rest.find("pub fn ").or_else(|| rest.find("pub async fn ")) {
+        let tail = &rest[offset..];
+        let Some(end) = tail.find('{') else {
+            break;
+        };
+        signatures.push(tail[..end].to_string());
+        rest = &tail[end + 1..];
+    }
+    signatures
 }
 
 // ---------------------------------------------------------------------------
@@ -390,10 +455,7 @@ fn the_seam_is_the_only_source_file_and_splices_in_nothing() {
 #[test]
 fn the_gateway_constructor_takes_neither_a_retry_policy_nor_a_second_boundary() {
     let shipped = shipped_code(&read("src/lib.rs"));
-    let Some(start) = shipped.find("impl<C, T> FragmentProviderGateway<C, T>") else {
-        panic!("the generic gateway impl block must exist");
-    };
-    let signature = block_after(&shipped[start..], "pub fn new(", '(', ')');
+    let signature = block_after(&shipped, "pub fn new<C, T>(", '(', ')');
     assert!(
         !signature.to_ascii_lowercase().contains("retry"),
         "FragmentProviderGateway::new must not accept a retry setting, got {signature}",
@@ -505,7 +567,7 @@ fn the_seam_addresses_only_its_own_boundary() {
         '}',
     );
     assert!(
-        builder.contains("target: self.client.0.boundary().target().clone()"),
+        builder.contains("target: self.client.boundary().target().clone()"),
         "build_request must take its target from this gateway's boundary, got {builder}",
     );
     assert_eq!(

@@ -74,7 +74,6 @@ pub use lore_fragment_provider::FragmentProviderError;
 pub use lore_fragment_provider::FragmentProviderGateway;
 pub use lore_fragment_provider::InFlightPutBound;
 pub use lore_fragment_provider::MAX_IN_FLIGHT_PUTS;
-pub use lore_fragment_provider::UnwiredFragmentProviderGateway;
 pub use lore_fragment_provider::attest_cell_schema;
 
 use crate::domain::errors::DomainError;

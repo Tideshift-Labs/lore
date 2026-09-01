@@ -13,13 +13,13 @@
 //! and they were deleted rather than carried. The seam's own remaining rules
 //! live in `lore-fragment-provider/tests/seam_source_pins.rs`.
 //!
-//! What is left is CR-031's no-private-provider-client rule for the four files
-//! that stayed: `coordinator.rs`, `masks.rs`, `schema.rs` and `states.rs`. That
-//! cannot be a dependency-graph fact here, because this crate legitimately
-//! depends on `aws-sdk-s3` for the legacy CR-007 immutable store. It is a scan
-//! over four files that construct no provider client at all — a far smaller
-//! surface than the package-wide version it replaces, and the honest statement
-//! is that it is regression detection, not a proof.
+//! What is left is CR-031's no-private-provider-client rule for the five files
+//! that stayed: `coordinator.rs`, `masks.rs`, `mod.rs`, `schema.rs` and
+//! `states.rs`. That cannot be a dependency-graph fact here, because this crate
+//! legitimately depends on `aws-sdk-s3` for the legacy CR-007 immutable store.
+//! It is a scan over five files that construct no provider client at all — a far
+//! smaller surface than the package-wide version it replaces, and the honest
+//! statement is that it is regression detection, not a proof.
 //!
 //! `provider.rs` is exempt and listed as such: it is an adapter of ~90 lines
 //! that names the seam crate and nothing else.
@@ -28,10 +28,17 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-/// The files this rule covers. `provider.rs` is deliberately absent — it holds
+/// The files this rule covers — every package file but one. `provider.rs` is
+/// deliberately absent, and it is the ONLY exemption: it holds
 /// only re-exports and the `DomainError` conversion, and it cannot reach a
 /// provider because this crate cannot name the types that would let it.
-const SCANNED_FILES: [&str; 4] = ["coordinator.rs", "masks.rs", "schema.rs", "states.rs"];
+const SCANNED_FILES: [&str; 5] = [
+    "coordinator.rs",
+    "masks.rs",
+    "mod.rs",
+    "schema.rs",
+    "states.rs",
+];
 
 /// Every `.rs` file expected in the package, so a new one cannot appear and
 /// escape the scan by not being listed.
@@ -105,7 +112,7 @@ fn hits<'a>(haystack: &str, tokens: &[&'a str]) -> Vec<&'a str> {
         .collect()
 }
 
-/// The four files build no private provider client.
+/// The five scanned files build no private provider client.
 #[test]
 fn the_remaining_package_files_build_no_private_provider_client() {
     for file in SCANNED_FILES {
@@ -196,12 +203,19 @@ fn the_scanned_file_list_is_what_the_package_compiles() {
         "mod.rs's module declarations must match the scanned file list exactly",
     );
 
-    // Every scanned file must be one of them, and `provider.rs` must be the only
-    // exemption — so exempting a second file is a deliberate edit here.
+    // Every package file is scanned except the ones this list names, and the
+    // list is derived rather than hardcoded.
+    //
+    // **An earlier revision hardcoded `*file != "mod.rs"` into this filter and
+    // then asserted the remainder was `["provider.rs"]`, so it reported one
+    // exemption while silently having two.** A private `aws_sdk_s3::Client` in
+    // `mod.rs` passed the whole suite. `mod.rs` is scanned now, so the assertion
+    // and the reality agree, and adding an exemption means editing this list
+    // where a reader will see it.
     let exempt: Vec<&str> = PACKAGE_FILES
         .iter()
         .copied()
-        .filter(|file| *file != "mod.rs" && !SCANNED_FILES.contains(file))
+        .filter(|file| !SCANNED_FILES.contains(file))
         .collect();
     assert_eq!(
         exempt,

@@ -80,28 +80,36 @@
 //!
 //! # What is still review-checked rather than compiler-checked
 //!
-//! Inside this crate, a new file could still misuse the governed client — the
-//! dependency is here because the seam needs it. What the crate boundary
-//! guarantees is that nothing *outside* it can, whatever this crate exposes.
-//! [`GovernedRoute`] adds a compiler check for one shape of internal mistake:
-//! an accessor handing the route out in a public signature names a private
-//! type, which `private_interfaces` reports and `-D warnings` turns into an
-//! error. Returning the raw client instead stays expressible here, so that is a
-//! speed bump within one crate, not a proof.
+//! The crate boundary alone was **not** enough, and the escalation an earlier
+//! revision recorded as merely available has since been taken. The gap it left:
+//! `execute`'s parameter types are public in `lore-object-dispatch`, so nothing
+//! stopped this crate from re-publishing them under aliases — no privacy rule
+//! can object to aliasing a public type — and an accessor could still hand out
+//! the concrete client. Alias the ledger and request, hand out the client, and
+//! `lore-postgres` calls `execute` while naming no dispatch type. That was a
+//! working exploit, not a hypothesis, and it is what made the cost worth
+//! paying.
 //!
-//! The available escalation, if that ever matters, is to erase the client
-//! behind a private trait object so this crate holds no nameable
-//! `GovernedProviderClient` at all. It costs the gateway's type parameters and
-//! a boxed future per attempt, because `ProviderChargeAuthority::charge`
-//! returns `impl Future` and is not object-safe. It is not taken now because
-//! the property it would add is about mistakes inside one small crate, and the
-//! property that matters — no caller elsewhere — is already held.
+//! [`AttemptSink`] closes it: the client is boxed behind a private trait at
+//! construction and never stored concretely, so there is nothing to hand back,
+//! and public aliases for the parameter types buy nothing because nothing
+//! yields a value to call `execute` on. An accessor returning `&dyn AttemptSink`
+//! fails with *"trait `AttemptSink` is more private than the item"* under
+//! `-D warnings`.
 //!
-//! `tests/seam_source_pins.rs` keeps the handful of rules a crate boundary does
-//! not express: no filesystem access, no retry parameter, no re-export of
-//! `execute`'s two parameter types, and the manifest staying free of the AWS
-//! SDK. Its scanner is a regression detector, and one known limit is recorded
-//! there rather than fixed.
+//! What remains review-checked is narrower: a new file **inside this crate**
+//! could construct its own `GovernedProviderClient` — the dependency is here
+//! because the seam needs it — and use it directly rather than through the
+//! gateway. That is one small crate's worth of surface, and no dependency or
+//! privacy rule reaches it.
+//!
+//! `tests/seam_source_pins.rs` keeps the rules a crate boundary does not
+//! express: no filesystem access, no retry parameter, no publication of
+//! `execute`'s two parameter types by any of three spellings, and the manifest
+//! staying free of the AWS SDK. **The trait carries the property; the pin is
+//! belt and braces** — it covers a seam edit that names the real types in a
+//! signature directly. Its scanner is a regression detector with one known
+//! limit, recorded there rather than fixed.
 //! # Dark and parameterized
 //!
 //! Nothing here is wired. [`UnwiredChargeAuthority`] and
@@ -136,6 +144,8 @@
 //! — the reads and the deletes Phases 5 and 6 also need — are unaffected and
 //! work through [`FragmentProviderGateway::execute`] as it stands.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
@@ -452,17 +462,77 @@ impl FragmentAttemptLedger {
     }
 }
 
-/// The governed client, behind a newtype private to this crate.
+/// The governed client, erased behind a trait private to this crate.
 ///
-/// **This is a defence in depth, and the docs should not oversell it.** The
-/// property that stops an outside caller invoking `execute` is that `execute`'s
-/// two parameter types are unnameable outside this crate; that holds whether or
-/// not this newtype exists. What the newtype adds is a compiler check *inside*
-/// this crate: an accessor handing the route out in a public signature names a
-/// private type, which `private_interfaces` reports and `-D warnings` turns into
-/// an error. Returning the raw `GovernedProviderClient` instead stays
-/// expressible here, so this is a speed bump within the crate, not a proof.
-struct GovernedRoute<C, T>(GovernedProviderClient<C, T>);
+/// **This is what carries "the seam is the only route" inside the crate**, and
+/// the reason it replaced a newtype is worth recording. A newtype gave the
+/// compiler one check — an accessor returning it names a private type, which
+/// `private_interfaces` refuses under `-D warnings` — but the raw
+/// `GovernedProviderClient` stayed nameable here, so an accessor returning
+/// *that* compiled. Paired with two public aliases for `execute`'s parameter
+/// types, which are legitimately public upstream and so beyond any privacy
+/// check, that was a working route from another crate: alias the ledger and
+/// request, hand out the client, call it. Six evasions of a text-level pin were
+/// found before this; the sixth is the one that made the escalation worth its
+/// cost.
+///
+/// With the client boxed behind this trait at construction and never stored
+/// concretely, there is no `GovernedProviderClient` to hand back. Public aliases
+/// for the parameter types then buy nothing, because nothing yields a value to
+/// call `execute` on, and an accessor returning `&dyn AttemptSink` fails with
+/// *"trait `AttemptSink` is more private than the item"*.
+///
+/// The cost is real and was accepted deliberately: one boxed future per attempt
+/// — `ProviderChargeAuthority::charge` returns `impl Future` and is not
+/// object-safe, so the future has to be boxed to cross a `dyn` boundary — and
+/// [`FragmentProviderGateway`] loses its type parameters. Both are cheap
+/// against a network round trip.
+trait AttemptSink: Send + Sync {
+    /// Charges and issues one attempt. Mirrors
+    /// [`GovernedProviderClient::execute`](lore_object_dispatch::GovernedProviderClient::execute)
+    /// with its future boxed.
+    fn issue<'a>(
+        &'a self,
+        ledger: &'a mut ProviderAttemptLedger,
+        request: &'a ProviderAttemptRequest,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ProviderAttemptOutcome, ProviderClientError>> + Send + 'a>,
+    >;
+
+    fn validate(&self, request: &ProviderAttemptRequest) -> Result<(), ProviderClientError>;
+
+    fn boundary(&self) -> &CellProviderBoundary;
+
+    fn retry_policy(&self) -> ProviderRetryPolicy;
+}
+
+impl<C, T> AttemptSink for GovernedProviderClient<C, T>
+where
+    C: ProviderChargeAuthority + Send + Sync,
+    T: ProviderTransport + Send + Sync,
+{
+    fn issue<'a>(
+        &'a self,
+        ledger: &'a mut ProviderAttemptLedger,
+        request: &'a ProviderAttemptRequest,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ProviderAttemptOutcome, ProviderClientError>> + Send + 'a>,
+    > {
+        Box::pin(self.execute(ledger, request))
+    }
+
+    fn validate(&self, request: &ProviderAttemptRequest) -> Result<(), ProviderClientError> {
+        self.validate_attempt(request)
+    }
+
+    fn boundary(&self) -> &CellProviderBoundary {
+        GovernedProviderClient::boundary(self)
+    }
+
+    fn retry_policy(&self) -> ProviderRetryPolicy {
+        GovernedProviderClient::retry_policy(self)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Cell schema attestation
@@ -726,27 +796,21 @@ pub struct FragmentProviderAttempt {
 // The gateway
 // ---------------------------------------------------------------------------
 
-/// The shipped, fully unwired gateway type.
-///
-/// Both type parameters fail closed on every call, so this alias names a
-/// gateway that cannot charge and cannot send.
-pub type UnwiredFragmentProviderGateway =
-    FragmentProviderGateway<UnwiredChargeAuthority, UnwiredProviderTransport>;
-
 /// This package's one route to a provider.
 ///
-/// Holds exactly one
-/// [`GovernedProviderClient`](lore_object_dispatch::GovernedProviderClient) and
-/// exposes no accessor that yields it, so admission and the ingress cap cannot
-/// be stepped around by reaching for the inner client.
-pub struct FragmentProviderGateway<C, T> {
-    client: GovernedRoute<C, T>,
+/// Holds one governed client, erased behind the private [`AttemptSink`] trait
+/// at construction, so there is no concrete client for any accessor to hand
+/// back. **The type has no parameters, and that is a consequence rather than a
+/// simplification** — see [`AttemptSink`] for what the erasure buys and what it
+/// cost.
+pub struct FragmentProviderGateway {
+    client: Box<dyn AttemptSink>,
     attestation: CellSchemaAttestation,
     bound: InFlightPutBound,
     in_flight_puts: Semaphore,
 }
 
-impl FragmentProviderGateway<UnwiredChargeAuthority, UnwiredProviderTransport> {
+impl FragmentProviderGateway {
     /// The shipped construction: an attested cell, its own boundary, and no
     /// ability to charge or send.
     ///
@@ -765,13 +829,7 @@ impl FragmentProviderGateway<UnwiredChargeAuthority, UnwiredProviderTransport> {
             UnwiredProviderTransport,
         )
     }
-}
 
-impl<C, T> FragmentProviderGateway<C, T>
-where
-    C: ProviderChargeAuthority,
-    T: ProviderTransport,
-{
     /// Builds the gateway.
     ///
     /// **Takes no retry policy.** CR-031 forbids SDK automatic retries, and the
@@ -786,15 +844,19 @@ where
     /// so this gateway addresses the cell whose schema was read back and no
     /// other. Accepting both independently left a caller free to pair them
     /// wrongly, and nothing would have said so.
-    pub fn new(
+    pub fn new<C, T>(
         attestation: CellSchemaAttestation,
         capabilities: ProviderCapabilities,
         bound: InFlightPutBound,
         charge_authority: C,
         transport: T,
-    ) -> Self {
+    ) -> Self
+    where
+        C: ProviderChargeAuthority + Send + Sync + 'static,
+        T: ProviderTransport + Send + Sync + 'static,
+    {
         Self {
-            client: GovernedRoute(GovernedProviderClient::new(
+            client: Box::new(GovernedProviderClient::new(
                 attestation.boundary().clone(),
                 capabilities,
                 ProviderRetryPolicy::disabled(),
@@ -814,12 +876,12 @@ where
 
     /// The cell boundary every attempt is addressed to.
     pub fn boundary(&self) -> &CellProviderBoundary {
-        self.client.0.boundary()
+        self.client.boundary()
     }
 
     /// The retry setting handed to every authorized attempt. Always disabled.
     pub fn retry_policy(&self) -> ProviderRetryPolicy {
-        self.client.0.retry_policy()
+        self.client.retry_policy()
     }
 
     /// The configured in-flight put bound.
@@ -859,8 +921,7 @@ where
         let _permit = self.admit(attempt.attempt_class).await?;
         let request = self.build_request(attempt);
         self.client
-            .0
-            .execute(&mut ledger.0, &request)
+            .issue(&mut ledger.0, &request)
             .await
             .map_err(FragmentProviderError::Provider)
     }
@@ -876,8 +937,7 @@ where
         Self::check_attempt_class(attempt.attempt_class)?;
         self.check_ingress_cap(attempt)?;
         self.client
-            .0
-            .validate_attempt(&self.build_request(attempt))
+            .validate(&self.build_request(attempt))
             .map_err(FragmentProviderError::Provider)
     }
 
@@ -895,7 +955,7 @@ where
         ProviderAttemptRequest {
             traffic_class: attempt.traffic_class,
             attempt_class: attempt.attempt_class,
-            target: self.client.0.boundary().target().clone(),
+            target: self.client.boundary().target().clone(),
             logical_request_id: attempt.logical_request_id.clone(),
             attempt_id: attempt.attempt_id.clone(),
             attempt_ordinal: attempt.attempt_ordinal,
@@ -959,7 +1019,7 @@ where
     }
 }
 
-impl<C, T> std::fmt::Debug for FragmentProviderGateway<C, T> {
+impl std::fmt::Debug for FragmentProviderGateway {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("FragmentProviderGateway")
@@ -1213,7 +1273,7 @@ mod tests {
     /// what was charged and what was sent without reaching through the gateway's
     /// private client.
     struct Harness {
-        gateway: FragmentProviderGateway<SharedAuthority, SharedTransport>,
+        gateway: FragmentProviderGateway,
         authority: Arc<ScriptedChargeAuthority>,
         transport: Arc<CountingTransport>,
     }
@@ -1305,11 +1365,7 @@ mod tests {
     /// for a put, the condition becomes unreachable, and an unbounded loop would
     /// hang the suite instead of reporting the regression. A hang is not a test
     /// result.
-    async fn wait_until_puts_are_saturated<C, T>(gateway: &FragmentProviderGateway<C, T>)
-    where
-        C: ProviderChargeAuthority,
-        T: ProviderTransport,
-    {
+    async fn wait_until_puts_are_saturated(gateway: &FragmentProviderGateway) {
         for _ in 0..100_000 {
             if gateway.available_put_permits() == 0 {
                 return;
@@ -1584,7 +1640,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_shipped_gateway_charges_nothing_and_sends_nothing() {
-        let gateway = UnwiredFragmentProviderGateway::unwired(
+        let gateway = FragmentProviderGateway::unwired(
             CellSchemaAttestation::for_tests(boundary()),
             ProviderCapabilities::none(),
             bound(),

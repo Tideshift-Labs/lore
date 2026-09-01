@@ -107,7 +107,6 @@ pub use provider::FragmentProviderError;
 pub use provider::FragmentProviderGateway;
 pub use provider::InFlightPutBound;
 pub use provider::MAX_IN_FLIGHT_PUTS;
-pub use provider::UnwiredFragmentProviderGateway;
 pub use provider::attest_cell_schema;
 pub use states::EpochAuthority;
 pub use states::FragmentLifecycleState;
