@@ -32,8 +32,8 @@ drift guard over the surviving proto source in the same commit as any further pr
 ## Embedded migration
 
 The cell install set is migrations 0002 and 0003 (`retention_schema`/`retention_provisioning`, the
-verified install prerequisites for the chain below) plus 0007 through 0020 (`local_authority_*`),
-sixteen artifacts in total. Migrations 0004 through 0006
+verified install prerequisites for the chain below) plus 0007 through 0022 (`local_authority_*`),
+eighteen artifacts in total. Migrations 0004 through 0006
 (`retention_readback`/`retention_mutations`/`retention_prune_receipts`)
 are deferred and not installed, alongside the pure compact-receipt, full-to-compact, and
 compact-prune planners in `compaction.rs`, `full_to_compact.rs`, and `compact_prune.rs`: correct,
@@ -199,6 +199,29 @@ only consumer, runtime, and extending its object assertion to pin the exact vali
 nondeferrable attempts foreign key. The future typed CD-3 client must use both procedures and keep
 the enrolled participant key across restarts; no typed client or runtime pool is wired yet.
 
+Migrations 0021 and 0022 add WP-114 CD-4's source-dark shared cell-local limiter. The schema holds
+one current budget configuration per provider boundary, seven closed cap buckets, and one durable
+grant CAS per logical attempt. Migration 0021 is exactly 8,281 bytes with BLAKE3-256
+`632250487652ee25505ae979c6a8eac9e62ad96b2aeea51864b320bc50953d07`; migration 0022 is exactly
+53,411 bytes with BLAKE3-256
+`7108e6ce39e2dedbc151c971ab95fb7d2e9d170b134886b0a385aa68ccc07bea`.
+Publication is maintenance-only, parameterized, and callable only by the authenticated maintenance
+database role. It stores distinct core, disposition, and envelope target projections and enforces
+the frozen revision grammar and exact fence sequence, the cell-scoped schema and target agreement,
+the headroom identity, cache completeness, supplied digest links, and the persisted predecessor/head
+revision chain. Resolution rechecks those projections and their predecessor row before any charge.
+This cell-local surface does not recreate the deleted cross-cell validator or claim to decode the
+platform's canonical records; a future publication adapter must authenticate and project those
+records before using this maintenance-only function. Charging is runtime-only and serializable. One database clock evaluates the
+deadline, hard expiry, and rolling refill. The grant CAS and all applicable bucket debits commit in
+one transaction. The physical bucket, traffic-class bucket, and listing bucket cannot split or
+partially debit. No configuration row is installed by either migration.
+
+`PostgresProviderChargeAuthority` accepts a preconnected dispatch-runtime client. Composition must
+draw that client from the one dispatch pool shared by the replica's request path and drain tasks.
+It must not create a pool per limiter or worker. The recorded staging budget is three store pools
+plus one dispatch pool. At `pool_max = 5`, that is at most 20 database connections per replica.
+
 ## Shared spool verifier
 
 `LinuxSpoolVerifier` is a source-dark, read-only observer for derived shared-spool paths. It retains
@@ -245,8 +268,9 @@ durable admission, ReservePut, and spool-ready transitions themselves.
 boundary binding, the PUT execution plan, and the charge-before-send kernel. It ships **no provider
 SDK, no credential, no endpoint route, no database connection, and no lock**, and performs no
 filesystem or network I/O. The two seams CR-033 D4 needs around a send — the charge authority and
-the S3 transport — are traits with exactly one shipped implementation each,
-`UnwiredChargeAuthority` and `UnwiredProviderTransport`, and both **fail closed on every call**.
+the S3 transport — are traits. `UnwiredChargeAuthority` and `UnwiredProviderTransport` remain the
+shipped defaults, and both **fail closed on every call**. `provider_charge.rs` supplies the explicit
+PostgreSQL authority for CD-4, but no default, flag, or composition path selects it.
 Compiling or testing this module authorizes no provider traffic; it is not activation evidence.
 `compaction.rs` exposes `pub(crate) provider_attempt_audit_is_valid` so the ledger calls the one
 frozen audit predicate instead of restating it.
@@ -316,10 +340,10 @@ never echoed, including on failure. Exit codes: `0` success, `1` refused or drif
 
 What `install` does, and what it refuses:
 
-- a database with no `object_store_retention` schema runs the full plan: the sixteen frozen artifacts
-  in order, with the retention, authority, put-reservation and dispatcher-identity install
+- a database with no `object_store_retention` schema runs the full plan: the eighteen frozen artifacts
+  in order, with the retention, authority, put-reservation, dispatcher-identity, and budget-limiter install
   procedures called at their exact points in the chain (0011 retires 0008's install entrypoint, so
-  the authority layer must be installed before 0011 is applied; 0020 installs last, after 0019);
+  the authority layer must be installed before 0011 is applied; 0022 installs last, after 0021);
 - a database that already carries the schema is **never re-migrated**. It is attested first, and the
   run is refused unless every layer already attests. Forward migrations are one-shot, so resuming a
   half-installed chain blind is how a recoverable cell becomes an unrecoverable one;
@@ -362,6 +386,10 @@ Three consequences worth knowing before reading a failure:
   invalidated by one. Migration 0020 keeps its name and result shape, adds the exact attempts-FK
   assertion through the internal helper, and narrows the public readback to runtime because no
   maintenance consumer exists.
+- **The fifth layer follows the same growth-tolerant split.** WP-114 CD-4 keeps whole-schema
+  attestation in the out-of-band installer and exposes only the budget-limiter identity tuple to
+  runtime. Its install entrypoint replays only an exact artifact/install identity over an inert
+  layer; a different identity or pre-existing budget state fails closed.
 
 The pinned manifest is a **PostgreSQL 16** pin: it carries `pg_get_functiondef` and
 `pg_get_indexdef` output, whose exact rendering is a server-version property. A different major
@@ -382,6 +410,10 @@ tests/run-local-authority-live.ps1
 # Cell-schema installer/attester live tier (WP-114 CD-1): five gates over the real
 # migrator-role install path, on its own disposable PostgreSQL 16
 tests/run-cell-schema-install-live.ps1
+
+# Shared-limiter and charge-before-send live tier (WP-114 CD-4/CD-5): exact named
+# cases against disposable PostgreSQL 16
+tests/run-provider-charge-live.ps1
 ```
 
 The library suite validates cell-authority configuration, canonical request fingerprinting, UUIDv7
@@ -391,6 +423,11 @@ Each `local_authority_*` live contract, run by exact name against a disposable, 
 provisioned PostgreSQL 16 with the matching migration installed, proves that instance's procedure
 signature, rows/bytes/retention semantics, typed absence, and replay safety against a real database
 rather than only the embedded migration bytes agreeing with the client statically.
+
+`run-provider-charge-live.ps1` proves the limiter's concurrent last-unit behavior, frozen
+revision/fence grammar, exact publication replay, stage-3 configuration checks, database-clock and
+checked-arithmetic edges, and the real PostgreSQL authority's charge-before-send integration. It
+uses no provider endpoint, credential, route, or concrete production budget pin.
 
 `run-local-authority-live.ps1` (WP-114 CD-2, Lore `1bb4ff7`) is the checked-in provisioning
 harness for this tier, modeled on the retention client's runner

@@ -4,10 +4,10 @@
 //! Out-of-band cell authority schema installer and attester (WP-114 CD-1).
 //!
 //! This module is the production install path for CR-033 D5's cell install set: migrations 0002,
-//! 0003, then 0007 through 0020. Retention migrations 0004 through 0006 are deferred and are never
+//! 0003, then 0007 through 0022. Retention migrations 0004 through 0006 are deferred and are never
 //! installed; migration 0001 does not exist. 0018 through 0020 are WP-114 CD-3's addition (CR-033
 //! D8's per-participant dispatcher identity, provisioning/readback, and database-owned monotonic
-//! registration).
+//! registration). Migrations 0021 and 0022 add CD-4's dark shared-limiter layer.
 //!
 //! Six properties this module owns, and nothing else in the crate does:
 //!
@@ -123,7 +123,7 @@ macro_rules! cell_migration {
 }
 
 /// CR-033 D5's cell install set, in install order.
-pub const CELL_INSTALL_SET: [CellMigration; 16] = [
+pub const CELL_INSTALL_SET: [CellMigration; 18] = [
     cell_migration!(
         2,
         "0002_object_store_retention_authority.sql",
@@ -204,6 +204,16 @@ pub const CELL_INSTALL_SET: [CellMigration; 16] = [
         "0020_object_store_dispatch_dispatcher_registration.sql",
         "aede4135d081a9adbec51cd41141faea81eb3b25860ab9d1968073a230aa78e9"
     ),
+    cell_migration!(
+        21,
+        "0021_object_store_dispatch_budget_limiter_schema.sql",
+        "632250487652ee25505ae979c6a8eac9e62ad96b2aeea51864b320bc50953d07"
+    ),
+    cell_migration!(
+        22,
+        "0022_object_store_dispatch_budget_limiter_provisioning.sql",
+        "7108e6ce39e2dedbc151c971ab95fb7d2e9d170b134886b0a385aa68ccc07bea"
+    ),
 ];
 
 /// Retention migrations retained, compiled, and deliberately not installed (CR-033 D5).
@@ -259,6 +269,8 @@ pub enum CellSchemaLayerId {
     PutReservation,
     /// Migrations 0018 and 0019.
     DispatcherIdentity,
+    /// Migrations 0021 and 0022.
+    BudgetLimiter,
 }
 
 impl CellSchemaLayerId {
@@ -270,6 +282,7 @@ impl CellSchemaLayerId {
             Self::Authority => "authority",
             Self::PutReservation => "put_reservation",
             Self::DispatcherIdentity => "dispatcher_identity",
+            Self::BudgetLimiter => "budget_limiter",
         }
     }
 }
@@ -314,7 +327,7 @@ pub struct CellSchemaLayer {
 }
 
 /// The layer contracts, in install order.
-pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 4] = [
+pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 5] = [
     CellSchemaLayer {
         id: CellSchemaLayerId::Retention,
         api_revision: "object-store-retention-provisioning-v1",
@@ -399,6 +412,25 @@ pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 4] = [
             "dispatcher_identity_installed_at_unix_ms",
         ],
         installed_after_migration: 19,
+    },
+    CellSchemaLayer {
+        id: CellSchemaLayerId::BudgetLimiter,
+        api_revision: "object-store-dispatch-budget-limiter-v1",
+        schema_revision: "object-store-dispatch-budget-limiter-schema-v1",
+        migration_blake3_hex: "632250487652ee25505ae979c6a8eac9e62ad96b2aeea51864b320bc50953d07",
+        contract_migration: 21,
+        install_function: "object_store_dispatch_budget_limiter_install_v1",
+        read_state_function: "object_store_dispatch_budget_limiter_read_state_v1",
+        read_state_retired_after: None,
+        read_state_retired_sqlstate: None,
+        install_retired_after: None,
+        identity_columns: [
+            "budget_limiter_schema_revision",
+            "budget_limiter_migration_blake3",
+            "budget_limiter_install_revision",
+            "budget_limiter_installed_at_unix_ms",
+        ],
+        installed_after_migration: 22,
     },
 ];
 
@@ -501,7 +533,7 @@ pub enum CellInstallStep {
     InstallLayer(usize),
 }
 
-/// The exact ordered install plan: sixteen DDL steps with the four layer installs interleaved.
+/// The exact ordered install plan: eighteen DDL steps with the five layer installs interleaved.
 ///
 /// Ordering is load-bearing. 0011 retires 0008's install entrypoint, so the authority layer must be
 /// installed while migration 0011 has not yet been applied.
@@ -806,6 +838,10 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
 /// functions and function ACLs; and the new relation changes relation ACLs. `schema`,
 /// `default_acls`, `triggers`, and `rules_and_policies` stayed unchanged, as the migration requires.
 ///
+/// Re-measured by WP-114 CD-4 after migrations 0021 and 0022 added the shared budget limiter.
+/// Relations, columns, constraints, indexes, types, functions, function ACLs, and relation ACLs
+/// moved. The namespace and the three intentionally empty catalog sections stayed unchanged.
+///
 /// One limit of this pin is worth stating where the pin lives, because a second review pass found
 /// it: `relations` carries `relreplident`, which is one letter and does not name *which* index the
 /// `'i'` refers to, and the `indexes` section does not carry `indisreplident`. So the manifest
@@ -816,14 +852,14 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
 /// present and to carry the replica identity.
 pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
     hex32("f468de7d148f5335b52a10c4298d609be546801754da1d991ff0ac7e7c0da0ca"),
-    hex32("ed934ecff7e094a35c8534ff5afd5a30a2291e6aa35e6dbd740cf7c03acd7642"),
-    hex32("5df5588a5e2c4f031d54d69e95f42c93b61f869c734efef35eb58f25746fa2f2"),
-    hex32("80ba27988cfdc0204166271a69ea3e929162329d43c89e68eda98a6e074a1a68"),
-    hex32("df90214e35d34ff2d34d2e3b53156b1866091364f9ffa8f1e237eebe6f1e80b2"),
-    hex32("2896f4ec9606fdef75a75010200db1f7a20ca5fce4202edb6eba621239085f5b"),
-    hex32("211a78b03b5d9d64ed5c5f983dc9ac976a78a41db844b749646810ef3d16cc35"),
-    hex32("cc505eaae899f99f5ce19186e80bd2a3a60abf739185c51cc95b42cbbaa028f4"),
-    hex32("0a74ddc8c28330de85f5228734329a2283c1426cc46d4917a760ef5576e484df"),
+    hex32("1a59d8e99e57f5e14efabf29651b8ca281efacdd682522abe93bd9f985d6fae0"),
+    hex32("d014ca2714fe75acf667a82695773f483bf6f368811a12948feaf6dfda5d9643"),
+    hex32("4ddc50a6b97d50a78f6e1fab46e9e32ab0a873375543394297d7ebe93a7ab18f"),
+    hex32("ed42d92ece81ad18483e5036faae6624dc6b901ad5dfa5107366a16cc4447b72"),
+    hex32("8ff35a1d0cc3db05335e97ee64a02a65dfcb0d7883a389d1b129cb853d123fd5"),
+    hex32("0281fd29b8d69e8cf188b7b67dd98213f7e431e8b565815c86159e0372796d7d"),
+    hex32("3223198b12b114d8850baf20208043c7b2e5588c598e3c63d6c805a31cf876d8"),
+    hex32("3504656c27deb76352e050bf503200dd7a36446fac66192f1a0a36ae653f9f12"),
     hex32("971ec53fc27466c873c783701757e1434c20b383d23f081d918a2d6e4c797971"),
     hex32("b5f633ebe7a54a9d43e75d043387b67cc659395fa8f0880a5c0d869a2b90fe81"),
     hex32("444e1ca598f3a2dbe3601fdb803e2479f21b3b22fe4713d50f9a0e47fd7b73b2"),
@@ -835,7 +871,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
 /// whose exact rendering is a server-version property. A different major version is expected to
 /// fail closed here and needs a re-measured pin, not a relaxed check.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_V1: [u8; 32] =
-    hex32("d28c4672e8b85fa021718a0c8c90ac5fdd5e0452f88542b3c0a97ca6d01b3264");
+    hex32("940cd20fdc3ff97ef23866388d6d477d30d0eb6e07b186f2165a3b3e957f417d");
 
 /// Const hex decoder for the pinned digests above.
 const fn hex32(text: &str) -> [u8; 32] {
@@ -994,7 +1030,7 @@ pub enum LayerInstallOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellAttestation {
     /// Each layer's identity tuple, in [`CELL_SCHEMA_LAYERS`] order.
-    pub layers: [(CellSchemaLayerId, LayerIdentity); 4],
+    pub layers: [(CellSchemaLayerId, LayerIdentity); 5],
     /// Per-section live catalog digests, in [`CELL_CATALOG_MANIFEST_SECTIONS`] order.
     pub catalog_sections: [[u8; 32]; 12],
     /// BLAKE3-256 over the whole manifest.
@@ -1024,7 +1060,7 @@ pub struct CellInstallReport {
     /// Whether this run created or replayed.
     pub disposition: CellInstallDisposition,
     /// Each layer's install-procedure outcome, in [`CELL_SCHEMA_LAYERS`] order.
-    pub layer_outcomes: [(CellSchemaLayerId, LayerInstallOutcome); 4],
+    pub layer_outcomes: [(CellSchemaLayerId, LayerInstallOutcome); 5],
     /// The attestation taken after the run.
     pub attestation: CellAttestation,
 }
@@ -1075,7 +1111,11 @@ const SCHEMA_STATE_SQL: &str = "SELECT
     dispatcher_identity_schema_revision,
     pg_catalog.encode(dispatcher_identity_migration_blake3, 'hex'),
     dispatcher_identity_install_revision::text,
-    dispatcher_identity_installed_at_unix_ms
+    dispatcher_identity_installed_at_unix_ms,
+    budget_limiter_schema_revision,
+    pg_catalog.encode(budget_limiter_migration_blake3, 'hex'),
+    budget_limiter_install_revision::text,
+    budget_limiter_installed_at_unix_ms
   FROM object_store_retention.object_dispatch_retention_schema_state
  WHERE singleton";
 
@@ -1193,7 +1233,7 @@ pub async fn apply_cell_install_plan(
 ) -> Result<
     (
         CellInstallDisposition,
-        [(CellSchemaLayerId, LayerInstallOutcome); 4],
+        [(CellSchemaLayerId, LayerInstallOutcome); 5],
     ),
     CellSchemaError,
 > {
@@ -1211,6 +1251,10 @@ pub async fn apply_cell_install_plan(
         ),
         (
             CellSchemaLayerId::DispatcherIdentity,
+            LayerInstallOutcome::Created,
+        ),
+        (
+            CellSchemaLayerId::BudgetLimiter,
             LayerInstallOutcome::Created,
         ),
     ];
@@ -1502,7 +1546,7 @@ async fn call_layer_install(
 
 async fn read_layer_identities(
     client: &Client,
-) -> Result<[(CellSchemaLayerId, LayerIdentity); 4], CellSchemaError> {
+) -> Result<[(CellSchemaLayerId, LayerIdentity); 5], CellSchemaError> {
     // 0011 revokes every privilege on the schema-state table from all three service roles, so the
     // tuples are readable only as the schema owner. The migrator is a member of the owner role by
     // the install precondition above, which is what makes this legitimate rather than a widening.
@@ -1545,6 +1589,7 @@ async fn read_layer_identities(
         (CellSchemaLayerId::Authority, LayerIdentity::Absent),
         (CellSchemaLayerId::PutReservation, LayerIdentity::Absent),
         (CellSchemaLayerId::DispatcherIdentity, LayerIdentity::Absent),
+        (CellSchemaLayerId::BudgetLimiter, LayerIdentity::Absent),
     ];
     for (index, layer) in CELL_SCHEMA_LAYERS.iter().enumerate() {
         identities[index] = (layer.id, read_layer_identity(row, index * 4, layer)?);

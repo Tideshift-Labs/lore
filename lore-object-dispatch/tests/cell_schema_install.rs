@@ -40,8 +40,9 @@ use lore_object_dispatch::cell_schema_install::validate_cell_install_set_digests
 // guard, and a source-dark check).
 // ---------------------------------------------------------------------------------------------
 
-const CELL_INSTALLED_MIGRATION_NUMBERS: [u16; 16] =
-    [2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+const CELL_INSTALLED_MIGRATION_NUMBERS: [u16; 18] = [
+    2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+];
 
 fn migrations_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations")
@@ -201,7 +202,7 @@ fn embedded_bytes_are_the_frozen_bytes() {
 #[test]
 fn plan_interleaves_layer_installs_immediately_after_their_ddl_step() {
     let plan = cell_install_plan();
-    assert_eq!(plan.len(), 20);
+    assert_eq!(plan.len(), 23);
 
     let ddl_indices: Vec<usize> = plan
         .iter()
@@ -246,11 +247,16 @@ fn plan_interleaves_layer_installs_immediately_after_their_ddl_step() {
 
     assert!(
         layer_positions.windows(2).all(|pair| pair[0] < pair[1]),
-        "layers must appear in plan order Retention, Authority, PutReservation"
+        "layers must appear in the frozen five-layer order"
     );
     assert_eq!(CELL_SCHEMA_LAYERS[0].id, CellSchemaLayerId::Retention);
     assert_eq!(CELL_SCHEMA_LAYERS[1].id, CellSchemaLayerId::Authority);
     assert_eq!(CELL_SCHEMA_LAYERS[2].id, CellSchemaLayerId::PutReservation);
+    assert_eq!(
+        CELL_SCHEMA_LAYERS[3].id,
+        CellSchemaLayerId::DispatcherIdentity
+    );
+    assert_eq!(CELL_SCHEMA_LAYERS[4].id, CellSchemaLayerId::BudgetLimiter);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -313,6 +319,16 @@ fn layer_contract_matches_the_frozen_sql() {
             installed_after_migration: 19,
             migration_blake3_hex: "a7d54d94d0fa5035872eb9b3426cbbe6471bcf9ae34ed41877542f050e1aaad9",
         },
+        Expected {
+            id: CellSchemaLayerId::BudgetLimiter,
+            api_revision: "object-store-dispatch-budget-limiter-v1",
+            schema_revision: "object-store-dispatch-budget-limiter-schema-v1",
+            install_function: "object_store_dispatch_budget_limiter_install_v1",
+            read_state_function: "object_store_dispatch_budget_limiter_read_state_v1",
+            read_state_retired_after: None,
+            installed_after_migration: 22,
+            migration_blake3_hex: "632250487652ee25505ae979c6a8eac9e62ad96b2aeea51864b320bc50953d07",
+        },
     ];
 
     assert_eq!(CELL_SCHEMA_LAYERS.len(), expected.len());
@@ -369,12 +385,16 @@ fn layer_contract_matches_the_frozen_sql() {
             migration.number,
             layer.read_state_function
         );
-        assert!(
-            sql.contains(layer.migration_blake3_hex),
-            "migration {} does not contain its own pinned digest {}",
-            migration.number,
-            layer.migration_blake3_hex
-        );
+        if layer.id == CellSchemaLayerId::BudgetLimiter {
+            assert!(sql.contains("budget_limiter_migration_blake3 = expected_migration_blake3"));
+        } else {
+            assert!(
+                sql.contains(layer.migration_blake3_hex),
+                "migration {} does not contain its own pinned digest {}",
+                migration.number,
+                layer.migration_blake3_hex
+            );
+        }
         assert!(
             sql.contains(layer.schema_revision),
             "migration {} does not contain schema revision {}",

@@ -38,13 +38,13 @@
 //!
 //! # What CD-5 deliberately does not wire
 //!
-//! The charge authority is CD-4's shared cell-local limiter and the transport is CD-6's S3 client.
-//! Neither exists. This module ships [`UnwiredChargeAuthority`] and [`UnwiredProviderTransport`],
-//! which fail closed on every call and can never report a success. They are guards, not stubs: a
-//! client assembled from them charges nothing and sends nothing, so compiling or testing this
-//! module authorizes no provider traffic. The budget pin a request carries is passed through
-//! opaquely and only checked for shape and for exact echo by the grant; CD-5 does not resolve it,
-//! because resolving it is CD-4's obligation against WP-121's unpublished per-cell envelope.
+//! CD-4's PostgreSQL authority now exists as an explicitly constructed dark implementation, while
+//! CD-6's S3 transport does not. This module still ships [`UnwiredChargeAuthority`] and
+//! [`UnwiredProviderTransport`] as the defaults; they fail closed on every call and can never report
+//! a success. They are guards, not stubs: a client assembled from them charges nothing and sends
+//! nothing, so compiling or testing this module authorizes no provider traffic. The budget pin a
+//! request carries is passed through opaquely and only checked for shape and for exact echo by the
+//! grant; the selected CD-4 authority resolves it against WP-121's unpublished per-cell envelope.
 //!
 //! One CD-5 obligation is met differently from the way WP-114 words it, and the difference is
 //! deliberate. CD-5 says to charge every attempt class "including SDK-level retries". This kernel
@@ -55,6 +55,7 @@
 //! kernel for each attempt, rather than retrying inside one.
 
 use std::fmt;
+use std::future::Future;
 
 use thiserror::Error;
 
@@ -704,6 +705,8 @@ pub struct ProviderAttemptRequest {
     pub logical_request_id: String,
     pub attempt_id: String,
     pub attempt_ordinal: u32,
+    /// Provider-attempt deadline, evaluated only against the database admission clock.
+    pub deadline_unix_ms: i64,
     pub budget_pin: BudgetPin,
     pub put_body: Option<DurableProviderPutBody>,
     pub put_part: Option<ProviderPutPart>,
@@ -719,6 +722,7 @@ impl fmt::Debug for ProviderAttemptRequest {
             .field("logical_request_id", &"[REDACTED]")
             .field("attempt_id", &"[REDACTED]")
             .field("attempt_ordinal", &self.attempt_ordinal)
+            .field("deadline_unix_ms", &self.deadline_unix_ms)
             .field("budget_pin", &self.budget_pin)
             .field("put_body", &self.put_body)
             .field("put_part", &self.put_part)
@@ -746,6 +750,7 @@ pub struct ProviderChargeRequest {
     logical_request_id: String,
     attempt_id: String,
     attempt_ordinal: u32,
+    deadline_unix_ms: i64,
 }
 
 impl ProviderChargeRequest {
@@ -783,6 +788,10 @@ impl ProviderChargeRequest {
         self.attempt_ordinal
     }
 
+    pub fn deadline_unix_ms(&self) -> i64 {
+        self.deadline_unix_ms
+    }
+
     /// Every cap this charge must consume atomically: the cell's one shared physical budget, the
     /// traffic class cap, and the stricter listing cap when the attempt is a listing.
     pub fn cap_classes(&self) -> Vec<ProviderCapClass> {
@@ -809,6 +818,7 @@ impl fmt::Debug for ProviderChargeRequest {
             .field("logical_request_id", &"[REDACTED]")
             .field("attempt_id", &"[REDACTED]")
             .field("attempt_ordinal", &self.attempt_ordinal)
+            .field("deadline_unix_ms", &self.deadline_unix_ms)
             .finish()
     }
 }
@@ -865,22 +875,26 @@ pub enum ProviderChargeError {
     ConfigurationUnresolved,
     #[error("cell dispatch charge authority is unavailable")]
     AuthorityUnavailable,
-    /// The charge transaction's commit is unresolved. Conservative charging treats it as
-    /// committed and nonrefundable, and no attempt may be issued under it.
-    #[error("cell dispatch charge commit is ambiguous")]
+    #[error("cell dispatch attempt deadline has elapsed")]
+    DeadlineExceeded,
+    /// The charge transaction's commit is unresolved, or the durable CAS proves this exact
+    /// attempt was charged earlier. Conservative charging treats either case as committed and
+    /// nonrefundable, and no attempt may be issued under it.
+    #[error("cell dispatch charge is committed but no attempt may be issued under it")]
     AmbiguousCommit,
 }
 
 /// CD-4's shared cell-local limiter, seen from the provider client.
 ///
-/// The implementation is CD-4's and does not exist. Every method must consume the cell's one shared
+/// Every implementation must consume the cell's one shared
 /// physical budget and each subordinate cap in [`ProviderChargeRequest::cap_classes`] atomically in
 /// one transaction, and must fail closed when the budget configuration cannot be resolved rather
 /// than falling back to an unbounded rate.
 ///
-/// **An error claims nothing was committed.** [`GovernedProviderClient::execute`] counts a grant
-/// against the ledger for `Ok` and for [`ProviderChargeError::AmbiguousCommit`], and for no other
-/// error. So an implementation that maps a connection drop around `COMMIT` to, say,
+/// **Any error other than `AmbiguousCommit` claims nothing was committed.**
+/// [`GovernedProviderClient::execute`] counts a grant against the ledger for `Ok` and for
+/// [`ProviderChargeError::AmbiguousCommit`], and for no other error. So an implementation that maps
+/// a connection drop around `COMMIT` to, say,
 /// [`ProviderChargeError::AuthorityUnavailable`] makes the audit under-report a charge that may
 /// have committed. Any outcome an implementation cannot prove uncommitted must be reported as
 /// `AmbiguousCommit`, which is the conservative, nonrefundable arm.
@@ -888,7 +902,7 @@ pub trait ProviderChargeAuthority {
     fn charge(
         &self,
         request: &ProviderChargeRequest,
-    ) -> Result<ProviderChargeGrant, ProviderChargeError>;
+    ) -> impl Future<Output = Result<ProviderChargeGrant, ProviderChargeError>> + Send;
 }
 
 /// The shipped charge authority: it charges nothing and grants nothing.
@@ -899,7 +913,7 @@ pub trait ProviderChargeAuthority {
 pub struct UnwiredChargeAuthority;
 
 impl ProviderChargeAuthority for UnwiredChargeAuthority {
-    fn charge(
+    async fn charge(
         &self,
         _request: &ProviderChargeRequest,
     ) -> Result<ProviderChargeGrant, ProviderChargeError> {
@@ -1321,7 +1335,7 @@ where
     /// Every failure path is fail-closed: a rejected request never charges, a charge that commits
     /// is never refunded, and a grant that does not bind the attempt closes the ledger instead of
     /// sending under it.
-    pub fn execute(
+    pub async fn execute(
         &self,
         ledger: &mut ProviderAttemptLedger,
         request: &ProviderAttemptRequest,
@@ -1353,7 +1367,7 @@ where
         }
         let charge_request = self.authorize(request)?;
 
-        let grant = match self.charge_authority.charge(&charge_request) {
+        let grant = match self.charge_authority.charge(&charge_request).await {
             Ok(grant) => grant,
             Err(ProviderChargeError::AmbiguousCommit) => {
                 // The commit is unresolved, so conservative charging counts the grant and forbids
@@ -1431,6 +1445,9 @@ where
         if request.attempt_ordinal == 0 {
             return Err(ProviderClientError::InvalidAttemptOrdinal);
         }
+        if request.deadline_unix_ms < 0 {
+            return Err(ProviderClientError::InvalidAttemptDeadline);
+        }
         validate_budget_pin(&request.budget_pin)?;
         self.validate_body(request)?;
         Ok(ProviderChargeRequest {
@@ -1442,6 +1459,7 @@ where
             logical_request_id: request.logical_request_id.clone(),
             attempt_id: request.attempt_id.clone(),
             attempt_ordinal: request.attempt_ordinal,
+            deadline_unix_ms: request.deadline_unix_ms,
         })
     }
 
@@ -1515,13 +1533,9 @@ impl<C, T> fmt::Debug for GovernedProviderClient<C, T> {
 
 /// Validates the shape of WP-121's budget-configuration revision.
 ///
-/// This is narrower than the crate's general canonical identifier: a revision is a flat token, so
-/// `/` and `:` are excluded and the length is capped well below the general 256-byte bound. CD-4
-/// must confirm the charset against WP-121's actual revision spelling when the per-cell envelope is
-/// published; narrowing here is the fail-closed direction to guess in, but it is still a guess.
-///
-/// [`validate_budget_pin`]'s `fence == 0` rejection is the same kind of guess and needs the same
-/// confirmation; the note is repeated there.
+/// This is WP-121's frozen byte grammar. It is narrower than the crate's general canonical
+/// identifier: a revision is a flat token, so `/` and `:` are excluded and the length is capped
+/// well below the general 256-byte bound. Comparison remains case-sensitive and byte-for-byte.
 fn validate_budget_revision(value: &str) -> Result<(), ProviderClientError> {
     let bytes = value.as_bytes();
     if bytes.is_empty()
@@ -1538,9 +1552,8 @@ fn validate_budget_revision(value: &str) -> Result<(), ProviderClientError> {
 
 fn validate_budget_pin(pin: &BudgetPin) -> Result<(), ProviderClientError> {
     validate_budget_revision(&pin.revision)?;
-    // Rejecting fence 0 assumes WP-121's monotonic generation starts at one. Like the revision
-    // charset, that is a fail-closed guess at an unpublished envelope: a 0-based first generation
-    // would hard-fail at admission. CD-4 confirms both against the published envelope.
+    // WP-121's frozen sequence starts at one. Rotation is enforced by the cell database and uses
+    // exact checked prior-plus-one arithmetic; this seam only rejects the out-of-domain zero.
     if pin.fence == 0 {
         return Err(ProviderClientError::InvalidBudgetPin);
     }
@@ -1589,6 +1602,8 @@ pub enum ProviderClientError {
     InvalidRequestIdentity,
     #[error("provider attempt ordinal must be positive")]
     InvalidAttemptOrdinal,
+    #[error("provider attempt deadline must be nonnegative")]
+    InvalidAttemptDeadline,
     #[error("provider attempt budget pin is invalid")]
     InvalidBudgetPin,
     #[error("provider put limits are outside the supported range")]
@@ -1620,7 +1635,7 @@ pub enum ProviderClientError {
     #[error("provider upload-part range is invalid for its body")]
     InvalidPutPart,
     #[error("cell dispatch charge was refused: {0}")]
-    ChargeRefused(ProviderChargeError),
+    ChargeRefused(#[source] ProviderChargeError),
     #[error("cell dispatch charge committed ambiguously and no attempt may be issued under it")]
     ChargeAmbiguous,
     #[error("cell dispatch grant does not bind this attempt")]

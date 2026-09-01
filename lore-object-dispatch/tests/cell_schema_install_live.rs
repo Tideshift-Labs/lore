@@ -164,10 +164,9 @@ async fn live_postgres_cell_schema_installs_clean_and_attests() {
     assert_eq!(report.attestation.replaced_functions_revoked, 4);
     assert_eq!(report.attestation.inert_tables_present, 4);
 
-    // The install set is 16 artifacts; nothing outside it may have been applied. WP-114 CD-3 added
-    // 0018 through 0020 (CR-033 D8's per-participant identity, provisioning/readback, and the
-    // runtime-only monotonic registration fence).
-    assert_eq!(CELL_INSTALL_SET.len(), 16);
+    // The install set is 18 artifacts; nothing outside it may have been applied. WP-114 CD-4 added
+    // 0021 and 0022 for the dark shared provider-budget limiter.
+    assert_eq!(CELL_INSTALL_SET.len(), 18);
 
     // An installed cell holds ZERO `pg_default_acl` rows, cluster-wide. Measured, not assumed, and
     // it is not what reading 0002 suggests: 0002:12-17 issues three `ALTER DEFAULT PRIVILEGES ...
@@ -269,11 +268,10 @@ async fn live_postgres_cell_schema_install_is_idempotent() {
         .expect("second install must replay, never re-migrate");
     assert_eq!(second.disposition, CellInstallDisposition::Replayed);
 
-    // Two of the four layer install entrypoints survive to full chain depth, and for different
-    // reasons. Retention's is never retired. Dispatcher identity's survives because 0019 asserts
-    // only the objects it names instead of manifesting the whole schema, so nothing later can
-    // invalidate it. The two dispatch layers in between are attested rather than re-executed, and
-    // say so.
+    // Three of the five layer install entrypoints survive to full chain depth. Retention's is never
+    // retired. Dispatcher identity's survives because 0019 asserts only the objects it names, and
+    // the budget limiter's exact-pin replay survives its own provisioning migration. Authority and
+    // put reservation are attested rather than re-executed, and say so.
     assert_eq!(
         second.layer_outcomes,
         [
@@ -288,6 +286,10 @@ async fn live_postgres_cell_schema_install_is_idempotent() {
             ),
             (
                 CellSchemaLayerId::DispatcherIdentity,
+                LayerInstallOutcome::Replayed
+            ),
+            (
+                CellSchemaLayerId::BudgetLimiter,
                 LayerInstallOutcome::Replayed
             ),
         ]

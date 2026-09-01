@@ -6,11 +6,12 @@
 //! (re-exported from the crate root) with in-process test doubles for the two unwired seams
 //! (`ProviderChargeAuthority`, `ProviderTransport`); no provider SDK, no database, no filesystem.
 
-use std::cell::Cell;
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 
 use lore_object_dispatch::AuthorizedProviderAttempt;
 use lore_object_dispatch::BudgetPin;
@@ -173,6 +174,7 @@ fn base_request(attempt_class: ProviderAttemptClass) -> ProviderAttemptRequest {
         logical_request_id: logical_request_id(),
         attempt_id: attempt_id(),
         attempt_ordinal: 1,
+        deadline_unix_ms: i64::MAX,
         budget_pin: budget_pin(),
         put_body: None,
         put_part: None,
@@ -281,15 +283,27 @@ fn no_dispatch_proof() -> CanonicalNoDispatchProof {
 /// caller keeps a handle to after the double itself is moved into a client.
 struct ScriptedChargeAuthority<F> {
     respond: F,
-    calls: Rc<Cell<u32>>,
+    calls: Arc<TestCounter>,
+}
+
+struct TestCounter(AtomicU32);
+
+impl TestCounter {
+    fn get(&self) -> u32 {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    fn increment(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl<F> ScriptedChargeAuthority<F>
 where
     F: Fn(&ProviderChargeRequest) -> Result<ProviderChargeGrant, ProviderChargeError>,
 {
-    fn new(respond: F) -> (Self, Rc<Cell<u32>>) {
-        let calls = Rc::new(Cell::new(0));
+    fn new(respond: F) -> (Self, Arc<TestCounter>) {
+        let calls = Arc::new(TestCounter(AtomicU32::new(0)));
         (
             Self {
                 respond,
@@ -302,13 +316,13 @@ where
 
 impl<F> ProviderChargeAuthority for ScriptedChargeAuthority<F>
 where
-    F: Fn(&ProviderChargeRequest) -> Result<ProviderChargeGrant, ProviderChargeError>,
+    F: Fn(&ProviderChargeRequest) -> Result<ProviderChargeGrant, ProviderChargeError> + Sync,
 {
-    fn charge(
+    async fn charge(
         &self,
         request: &ProviderChargeRequest,
     ) -> Result<ProviderChargeGrant, ProviderChargeError> {
-        self.calls.set(self.calls.get() + 1);
+        self.calls.increment();
         (self.respond)(request)
     }
 }
@@ -317,7 +331,7 @@ where
 /// [`ScriptedChargeAuthority`].
 struct ScriptedTransport<F> {
     respond: F,
-    calls: Rc<Cell<u32>>,
+    calls: Arc<TestCounter>,
 }
 
 impl<F> ScriptedTransport<F>
@@ -326,8 +340,8 @@ where
         &AuthorizedProviderAttempt<'_>,
     ) -> Result<ProviderAttemptReport, ProviderTransportRefusal>,
 {
-    fn new(respond: F) -> (Self, Rc<Cell<u32>>) {
-        let calls = Rc::new(Cell::new(0));
+    fn new(respond: F) -> (Self, Arc<TestCounter>) {
+        let calls = Arc::new(TestCounter(AtomicU32::new(0)));
         (
             Self {
                 respond,
@@ -348,7 +362,7 @@ where
         &self,
         attempt: &AuthorizedProviderAttempt<'_>,
     ) -> Result<ProviderAttemptReport, ProviderTransportRefusal> {
-        self.calls.set(self.calls.get() + 1);
+        self.calls.increment();
         (self.respond)(attempt)
     }
 }
@@ -357,8 +371,8 @@ where
 // 1. CellProviderBoundary::new
 // ---------------------------------------------------------------------------------------------
 
-#[test]
-fn cell_provider_boundary_accepts_a_realistic_do_spaces_configuration() {
+#[tokio::test]
+async fn cell_provider_boundary_accepts_a_realistic_do_spaces_configuration() {
     let boundary = boundary();
 
     assert_eq!(boundary.provider_boundary_id(), BOUNDARY_ID);
@@ -367,8 +381,8 @@ fn cell_provider_boundary_accepts_a_realistic_do_spaces_configuration() {
     assert_eq!(boundary.target().endpoint_host, ENDPOINT_HOST);
 }
 
-#[test]
-fn cell_provider_boundary_rejects_every_invalid_bucket_shape() {
+#[tokio::test]
+async fn cell_provider_boundary_rejects_every_invalid_bucket_shape() {
     let too_long = "a".repeat(64);
     let cases: [(&str, &str); 13] = [
         ("ab", "shorter than 3 bytes"),
@@ -395,8 +409,8 @@ fn cell_provider_boundary_rejects_every_invalid_bucket_shape() {
     }
 }
 
-#[test]
-fn cell_provider_boundary_rejects_every_invalid_region_shape() {
+#[tokio::test]
+async fn cell_provider_boundary_rejects_every_invalid_region_shape() {
     let too_long = "a".repeat(64);
     let cases: [(&str, &str); 5] = [
         ("", "empty"),
@@ -415,8 +429,8 @@ fn cell_provider_boundary_rejects_every_invalid_region_shape() {
     }
 }
 
-#[test]
-fn cell_provider_boundary_rejects_every_invalid_endpoint_host_shape() {
+#[tokio::test]
+async fn cell_provider_boundary_rejects_every_invalid_endpoint_host_shape() {
     let long_label_host = format!("{}.example.com", "a".repeat(64));
     let over_253_host = vec!["aa"; 85].join(".");
     assert!(over_253_host.len() > 253, "fixture must exceed 253 bytes");
@@ -442,8 +456,8 @@ fn cell_provider_boundary_rejects_every_invalid_endpoint_host_shape() {
     }
 }
 
-#[test]
-fn cell_provider_boundary_accepts_a_single_label_endpoint_host() {
+#[tokio::test]
+async fn cell_provider_boundary_accepts_a_single_label_endpoint_host() {
     let boundary = CellProviderBoundary::new(BOUNDARY_ID, BUCKET, REGION, "minio")
         .expect("single-label host must validate");
     assert_eq!(boundary.target().endpoint_host, "minio");
@@ -461,8 +475,8 @@ fn cell_provider_boundary_accepts_a_single_label_endpoint_host() {
     );
 }
 
-#[test]
-fn cell_provider_boundary_rejects_non_canonical_boundary_ids() {
+#[tokio::test]
+async fn cell_provider_boundary_rejects_non_canonical_boundary_ids() {
     let cases: [(&str, &str); 3] = [
         ("", "empty"),
         ("-cell.nyc3", "leading non-alphanumeric"),
@@ -482,8 +496,8 @@ fn cell_provider_boundary_rejects_non_canonical_boundary_ids() {
 // 2. CellProviderBoundary::validate_target
 // ---------------------------------------------------------------------------------------------
 
-#[test]
-fn validate_target_accepts_an_exact_match_and_rejects_by_precedence() {
+#[tokio::test]
+async fn validate_target_accepts_an_exact_match_and_rejects_by_precedence() {
     let boundary = boundary();
     assert!(boundary.validate_target(&target_value()).is_ok());
 
@@ -552,8 +566,8 @@ fn assert_ranges_tile(plan: PutObjectPlan, body_size: u64) {
     );
 }
 
-#[test]
-fn plan_put_object_is_single_shot_at_and_below_the_threshold() {
+#[tokio::test]
+async fn plan_put_object_is_single_shot_at_and_below_the_threshold() {
     let limits = put_limits();
 
     assert_eq!(
@@ -568,16 +582,16 @@ fn plan_put_object_is_single_shot_at_and_below_the_threshold() {
     );
 }
 
-#[test]
-fn plan_put_object_becomes_multipart_one_byte_past_the_threshold() {
+#[tokio::test]
+async fn plan_put_object_becomes_multipart_one_byte_past_the_threshold() {
     let limits = put_limits();
     let plan = plan_put_object(limits.multipart_threshold_bytes + 1, &limits)
         .expect("must plan a multipart body");
     assert!(matches!(plan, PutObjectPlan::Multipart { .. }));
 }
 
-#[test]
-fn plan_put_object_computes_exact_multiple_part_arithmetic_and_tiles_the_body() {
+#[tokio::test]
+async fn plan_put_object_computes_exact_multiple_part_arithmetic_and_tiles_the_body() {
     let limits = put_limits();
     let body_size = limits.part_size_bytes * 4;
 
@@ -594,8 +608,8 @@ fn plan_put_object_computes_exact_multiple_part_arithmetic_and_tiles_the_body() 
     assert_ranges_tile(plan, body_size);
 }
 
-#[test]
-fn plan_put_object_computes_remainder_part_arithmetic_and_tiles_the_body() {
+#[tokio::test]
+async fn plan_put_object_computes_remainder_part_arithmetic_and_tiles_the_body() {
     let limits = put_limits();
     let remainder = 1024 * 1024;
     let body_size = limits.part_size_bytes * 3 + remainder;
@@ -613,8 +627,8 @@ fn plan_put_object_computes_remainder_part_arithmetic_and_tiles_the_body() {
     assert_ranges_tile(plan, body_size);
 }
 
-#[test]
-fn planned_attempt_count_matches_single_shot_and_multipart_expansion() {
+#[tokio::test]
+async fn planned_attempt_count_matches_single_shot_and_multipart_expansion() {
     let limits = put_limits();
 
     let single = plan_put_object(0, &limits).expect("must plan");
@@ -625,8 +639,8 @@ fn planned_attempt_count_matches_single_shot_and_multipart_expansion() {
     assert_eq!(multipart.planned_attempt_count(), 4 + 2);
 }
 
-#[test]
-fn attempt_class_at_walks_create_parts_complete_and_never_names_abort() {
+#[tokio::test]
+async fn attempt_class_at_walks_create_parts_complete_and_never_names_abort() {
     let limits = put_limits();
     let body_size = limits.part_size_bytes * 4;
     let plan = plan_put_object(body_size, &limits).expect("must plan");
@@ -667,8 +681,8 @@ fn attempt_class_at_walks_create_parts_complete_and_never_names_abort() {
     assert_eq!(single.attempt_class_at(1), None);
 }
 
-#[test]
-fn part_range_is_none_outside_the_plan_and_always_none_for_single_shot() {
+#[tokio::test]
+async fn part_range_is_none_outside_the_plan_and_always_none_for_single_shot() {
     let limits = put_limits();
     let body_size = limits.part_size_bytes * 4;
     let plan = plan_put_object(body_size, &limits).expect("must plan");
@@ -681,8 +695,8 @@ fn part_range_is_none_outside_the_plan_and_always_none_for_single_shot() {
     assert_eq!(single.part_range(1), None);
 }
 
-#[test]
-fn plan_put_object_rejects_bodies_needing_more_parts_than_max_parts() {
+#[tokio::test]
+async fn plan_put_object_rejects_bodies_needing_more_parts_than_max_parts() {
     let limits = ProviderPutLimits {
         multipart_threshold_bytes: PROVIDER_MIN_PART_SIZE_BYTES,
         part_size_bytes: PROVIDER_MIN_PART_SIZE_BYTES,
@@ -696,8 +710,8 @@ fn plan_put_object_rejects_bodies_needing_more_parts_than_max_parts() {
     );
 }
 
-#[test]
-fn plan_put_object_rejects_limits_outside_the_supported_range() {
+#[tokio::test]
+async fn plan_put_object_rejects_limits_outside_the_supported_range() {
     let base = put_limits();
 
     let mut too_small_part = base;
@@ -746,8 +760,8 @@ fn plan_put_object_rejects_limits_outside_the_supported_range() {
 /// `part_range`'s variants are public, so a caller can hand it a `Multipart` plan `plan_put_object`
 /// would never mint. Its own arithmetic must be checked rather than trusted, and answer `None`
 /// for a plan whose own numbers do not fit -- not panic or silently wrap.
-#[test]
-fn part_range_returns_none_when_a_hand_built_plans_offset_multiplication_overflows() {
+#[tokio::test]
+async fn part_range_returns_none_when_a_hand_built_plans_offset_multiplication_overflows() {
     let plan = PutObjectPlan::Multipart {
         body_size: u64::MAX,
         part_size_bytes: u64::MAX,
@@ -759,8 +773,8 @@ fn part_range_returns_none_when_a_hand_built_plans_offset_multiplication_overflo
     assert_eq!(plan.part_range(3), None);
 }
 
-#[test]
-fn part_range_returns_none_when_offset_plus_length_overflows() {
+#[tokio::test]
+async fn part_range_returns_none_when_offset_plus_length_overflows() {
     let plan = PutObjectPlan::Multipart {
         body_size: u64::MAX,
         part_size_bytes: u64::MAX / 2,
@@ -773,8 +787,9 @@ fn part_range_returns_none_when_offset_plus_length_overflows() {
     assert_eq!(plan.part_range(2), None);
 }
 
-#[test]
-fn part_range_well_formed_plans_from_plan_put_object_are_unaffected_by_the_checked_arithmetic() {
+#[tokio::test]
+async fn part_range_well_formed_plans_from_plan_put_object_are_unaffected_by_the_checked_arithmetic()
+ {
     let limits = put_limits();
     let body_size = limits.part_size_bytes * 4;
     let plan = plan_put_object(body_size, &limits).expect("must plan");
@@ -785,8 +800,8 @@ fn part_range_well_formed_plans_from_plan_put_object_are_unaffected_by_the_check
 // 4. bind_durable_put_body
 // ---------------------------------------------------------------------------------------------
 
-#[test]
-fn bind_durable_put_body_succeeds_for_a_ready_put_key_and_echoes_every_field() {
+#[tokio::test]
+async fn bind_durable_put_body_succeeds_for_a_ready_put_key_and_echoes_every_field() {
     let key = put_spool_key(&logical_request_id(), &attempt_id());
     let ledger = ready_ledger_view_for(&key);
     let body = bind_durable_put_body(&spool_layout(), &key, &ledger).expect("must bind");
@@ -800,8 +815,8 @@ fn bind_durable_put_body_succeeds_for_a_ready_put_key_and_echoes_every_field() {
     assert_eq!(body.provider_boundary_id(), key.provider_boundary_id);
 }
 
-#[test]
-fn bind_durable_put_body_requires_a_ready_ledger_row() {
+#[tokio::test]
+async fn bind_durable_put_body_requires_a_ready_ledger_row() {
     let key = put_spool_key(&logical_request_id(), &attempt_id());
 
     for ledger in [
@@ -822,8 +837,8 @@ fn bind_durable_put_body_requires_a_ready_ledger_row() {
     }
 }
 
-#[test]
-fn bind_durable_put_body_rejects_a_ready_row_with_the_wrong_handle() {
+#[tokio::test]
+async fn bind_durable_put_body_rejects_a_ready_row_with_the_wrong_handle() {
     let key = put_spool_key(&logical_request_id(), &attempt_id());
     let ledger = LedgerSpoolView::Ready {
         opaque_handle: "wrong-handle".to_string(),
@@ -837,8 +852,8 @@ fn bind_durable_put_body_rejects_a_ready_row_with_the_wrong_handle() {
     );
 }
 
-#[test]
-fn bind_durable_put_body_rejects_a_result_kind_key_before_deriving_paths() {
+#[tokio::test]
+async fn bind_durable_put_body_rejects_a_result_kind_key_before_deriving_paths() {
     // An empty boundary ID would also fail path derivation (InvalidSpoolKey). Using it here
     // proves the kind check runs first: if derivation ran first, this would report
     // InvalidSpoolKey instead of InvalidSpoolKind.
@@ -856,8 +871,8 @@ fn bind_durable_put_body_rejects_a_result_kind_key_before_deriving_paths() {
     );
 }
 
-#[test]
-fn bind_durable_put_body_rejects_non_canonical_spool_keys() {
+#[tokio::test]
+async fn bind_durable_put_body_rejects_non_canonical_spool_keys() {
     let ledger = LedgerSpoolView::Absent;
 
     let mut bad_logical = put_spool_key(&logical_request_id(), &attempt_id());
@@ -886,8 +901,8 @@ fn bind_durable_put_body_rejects_non_canonical_spool_keys() {
 // 5. GovernedProviderClient::authorize
 // ---------------------------------------------------------------------------------------------
 
-#[test]
-fn authorize_gates_listing_classes_on_the_capability_and_leaves_others_unaffected() {
+#[tokio::test]
+async fn authorize_gates_listing_classes_on_the_capability_and_leaves_others_unaffected() {
     let without_listing = client_with(
         ProviderCapabilities::none(),
         UnwiredChargeAuthority,
@@ -918,8 +933,8 @@ fn authorize_gates_listing_classes_on_the_capability_and_leaves_others_unaffecte
     }
 }
 
-#[test]
-fn authorize_requires_canonical_uuid_v7_identities_and_a_positive_ordinal() {
+#[tokio::test]
+async fn authorize_requires_canonical_uuid_v7_identities_and_a_positive_ordinal() {
     let client = client_with(
         ProviderCapabilities::none(),
         UnwiredChargeAuthority,
@@ -948,8 +963,8 @@ fn authorize_requires_canonical_uuid_v7_identities_and_a_positive_ordinal() {
     );
 }
 
-#[test]
-fn authorize_requires_a_canonical_nonzero_budget_pin() {
+#[tokio::test]
+async fn authorize_requires_a_canonical_nonzero_budget_pin() {
     let client = client_with(
         ProviderCapabilities::none(),
         UnwiredChargeAuthority,
@@ -981,8 +996,8 @@ fn authorize_requires_a_canonical_nonzero_budget_pin() {
 /// Budget-pin revisions go through a narrower validator than the crate's general canonical
 /// identifier: `/` and `:` are excluded, the cap is 128 bytes (not 256), and the first byte must
 /// be ASCII alphanumeric.
-#[test]
-fn authorize_rejects_budget_pin_revisions_outside_the_narrow_charset() {
+#[tokio::test]
+async fn authorize_rejects_budget_pin_revisions_outside_the_narrow_charset() {
     let client = client_with(
         ProviderCapabilities::none(),
         UnwiredChargeAuthority,
@@ -1030,8 +1045,45 @@ fn authorize_rejects_budget_pin_revisions_outside_the_narrow_charset() {
     assert!(client.validate_attempt(&at_the_128_byte_boundary).is_ok());
 }
 
-#[test]
-fn authorize_enforces_body_presence_across_every_attempt_class() {
+#[tokio::test]
+async fn budget_revision_frozen_grammar_accepts_exact_byte_boundaries_and_later_punctuation() {
+    let client = client_with(
+        ProviderCapabilities::none(),
+        UnwiredChargeAuthority,
+        UnwiredProviderTransport,
+    );
+
+    for revision in ["A", "a", "0", "A._-z", &"x".repeat(128)] {
+        let mut request = attempt_request_for(ProviderAttemptClass::Readiness);
+        request.budget_pin.revision = revision.to_string();
+        assert!(
+            client.validate_attempt(&request).is_ok(),
+            "frozen grammar must accept {revision:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn budget_revision_frozen_grammar_rejects_every_leading_punctuation_and_unicode_bytes() {
+    let client = client_with(
+        ProviderCapabilities::none(),
+        UnwiredChargeAuthority,
+        UnwiredProviderTransport,
+    );
+
+    for revision in [".a", "_a", "-a", "é", "e\u{301}"] {
+        let mut request = attempt_request_for(ProviderAttemptClass::Readiness);
+        request.budget_pin.revision = revision.to_string();
+        assert_eq!(
+            client.validate_attempt(&request),
+            Err(ProviderClientError::InvalidBudgetPin),
+            "frozen grammar must reject {revision:?} without Unicode normalization"
+        );
+    }
+}
+
+#[tokio::test]
+async fn authorize_enforces_body_presence_across_every_attempt_class() {
     let client = client_with(
         ProviderCapabilities::none().with_listing(),
         UnwiredChargeAuthority,
@@ -1059,8 +1111,8 @@ fn authorize_enforces_body_presence_across_every_attempt_class() {
     }
 }
 
-#[test]
-fn authorize_requires_a_part_range_only_for_upload_part() {
+#[tokio::test]
+async fn authorize_requires_a_part_range_only_for_upload_part() {
     let client = client_with(
         ProviderCapabilities::none().with_listing(),
         UnwiredChargeAuthority,
@@ -1092,8 +1144,8 @@ fn authorize_requires_a_part_range_only_for_upload_part() {
     }
 }
 
-#[test]
-fn authorize_validates_the_upload_part_range_against_its_body() {
+#[tokio::test]
+async fn authorize_validates_the_upload_part_range_against_its_body() {
     let client = client_with(
         ProviderCapabilities::none(),
         UnwiredChargeAuthority,
@@ -1179,8 +1231,9 @@ fn authorize_validates_the_upload_part_range_against_its_body() {
 /// A part is non-final exactly when `offset + length < body.size`. Only a non-final part is held
 /// to the provider's minimum part size; the final part (ending exactly at `body.size`) may be any
 /// positive length.
-#[test]
-fn authorize_requires_the_provider_minimum_for_a_non_final_upload_part_but_not_the_final_one() {
+#[tokio::test]
+async fn authorize_requires_the_provider_minimum_for_a_non_final_upload_part_but_not_the_final_one()
+{
     let client = client_with(
         ProviderCapabilities::none(),
         UnwiredChargeAuthority,
@@ -1233,8 +1286,8 @@ fn authorize_requires_the_provider_minimum_for_a_non_final_upload_part_but_not_t
     assert!(client.validate_attempt(&one_byte_final).is_ok());
 }
 
-#[test]
-fn authorize_rejects_a_put_body_bound_to_a_different_request_or_boundary() {
+#[tokio::test]
+async fn authorize_rejects_a_put_body_bound_to_a_different_request_or_boundary() {
     let client = client_with(
         ProviderCapabilities::none(),
         UnwiredChargeAuthority,
@@ -1324,16 +1377,16 @@ impl CapturedChargeRequest {
 /// let it charge outside any ledger). Asserting what the authority actually receives through a real
 /// `execute` call is better coverage than asserting a helper's return value: it proves the request
 /// reaches the authority, not merely that some function computed it.
-fn capture_charge_request_with_boundary(
+async fn capture_charge_request_with_boundary(
     boundary: CellProviderBoundary,
     capabilities: ProviderCapabilities,
     request: &ProviderAttemptRequest,
     label: &str,
 ) -> CapturedChargeRequest {
-    let captured: Rc<RefCell<Option<CapturedChargeRequest>>> = Rc::new(RefCell::new(None));
+    let captured: Arc<Mutex<Option<CapturedChargeRequest>>> = Arc::new(Mutex::new(None));
     let captured_for_closure = captured.clone();
     let (charge_authority, _calls) = ScriptedChargeAuthority::new(move |charge_request| {
-        *captured_for_closure.borrow_mut() =
+        *captured_for_closure.lock().expect("capture lock") =
             Some(CapturedChargeRequest::from_request(charge_request));
         Err(ProviderChargeError::Unwired)
     });
@@ -1348,31 +1401,36 @@ fn capture_charge_request_with_boundary(
     let mut ledger = ProviderAttemptLedger::new(&provider_boundary_id, &request.logical_request_id)
         .expect("request's own logical_request_id must be a valid ledger identity");
 
-    match client.execute(&mut ledger, request) {
+    match client.execute(&mut ledger, request).await {
         Err(ProviderClientError::ChargeRefused(ProviderChargeError::Unwired)) => {}
         other => panic!("{label}: expected the scripted Unwired refusal, got {other:?}"),
     }
 
     captured
-        .borrow_mut()
+        .lock()
+        .expect("capture lock")
         .take()
         .unwrap_or_else(|| panic!("{label}: charge authority must have been called"))
 }
 
-fn capture_charge_request(request: &ProviderAttemptRequest, label: &str) -> CapturedChargeRequest {
+async fn capture_charge_request(
+    request: &ProviderAttemptRequest,
+    label: &str,
+) -> CapturedChargeRequest {
     capture_charge_request_with_boundary(
         boundary(),
         ProviderCapabilities::none().with_listing(),
         request,
         label,
     )
+    .await
 }
 
-#[test]
-fn execute_charges_a_request_that_echoes_the_attempt_and_charges_one_unit() {
+#[tokio::test]
+async fn cd5_conformance_grant_binds_exactly_one_provider_attempt() {
     for class in ProviderAttemptClass::ALL {
         let request = attempt_request_for(class);
-        let charge = capture_charge_request(&request, &format!("{class:?}"));
+        let charge = capture_charge_request(&request, &format!("{class:?}")).await;
 
         assert_eq!(charge.attempt_units, 1, "{class:?}");
         assert_eq!(charge.provider_boundary_id, BOUNDARY_ID, "{class:?}");
@@ -1399,13 +1457,13 @@ fn execute_charges_a_request_that_echoes_the_attempt_and_charges_one_unit() {
 // 6. ProviderChargeRequest::cap_classes
 // ---------------------------------------------------------------------------------------------
 
-#[test]
-fn cap_classes_always_start_with_the_shared_budget_and_include_exactly_the_matching_caps() {
+#[tokio::test]
+async fn cap_classes_always_start_with_the_shared_budget_and_include_exactly_the_matching_caps() {
     for traffic_class in ProviderTrafficClass::ALL {
         for attempt_class in ProviderAttemptClass::ALL {
             let mut request = attempt_request_for(attempt_class);
             request.traffic_class = traffic_class;
-            let charge = capture_charge_request(&request, &format!("{attempt_class:?}"));
+            let charge = capture_charge_request(&request, &format!("{attempt_class:?}")).await;
             let caps = &charge.cap_classes;
 
             assert_eq!(caps.first(), Some(&ProviderCapClass::SharedPhysicalBudget));
@@ -1430,8 +1488,8 @@ fn cap_classes_always_start_with_the_shared_budget_and_include_exactly_the_match
 // 7. execute: the charge-before-send kernel and the ledger
 // ---------------------------------------------------------------------------------------------
 
-#[test]
-fn execute_refuses_every_charge_error_before_touching_the_ledger_or_transport() {
+#[tokio::test]
+async fn cd5_conformance_refused_charge_sends_nothing() {
     let cases = [
         ProviderChargeError::Unwired,
         ProviderChargeError::BudgetPinRejected,
@@ -1439,6 +1497,7 @@ fn execute_refuses_every_charge_error_before_touching_the_ledger_or_transport() 
         ProviderChargeError::ClassCapExhausted,
         ProviderChargeError::ConfigurationUnresolved,
         ProviderChargeError::AuthorityUnavailable,
+        ProviderChargeError::DeadlineExceeded,
     ];
 
     for error in cases {
@@ -1449,7 +1508,9 @@ fn execute_refuses_every_charge_error_before_touching_the_ledger_or_transport() 
         let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
         let mut ledger = new_ledger();
 
-        let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+        let outcome = client
+            .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+            .await;
 
         assert_eq!(
             outcome,
@@ -1467,8 +1528,8 @@ fn execute_refuses_every_charge_error_before_touching_the_ledger_or_transport() 
     }
 }
 
-#[test]
-fn unwired_charge_authority_and_transport_are_the_shipped_fail_closed_guards() {
+#[tokio::test]
+async fn unwired_charge_authority_and_transport_are_the_shipped_fail_closed_guards() {
     let client = client_with(
         ProviderCapabilities::none(),
         UnwiredChargeAuthority,
@@ -1476,7 +1537,9 @@ fn unwired_charge_authority_and_transport_are_the_shipped_fail_closed_guards() {
     );
     let mut ledger = new_ledger();
 
-    let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let outcome = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
 
     assert_eq!(
         outcome,
@@ -1489,8 +1552,8 @@ fn unwired_charge_authority_and_transport_are_the_shipped_fail_closed_guards() {
     assert_eq!(ledger.poisoned(), None);
 }
 
-#[test]
-fn execute_counts_an_ambiguous_commit_as_a_charged_grant_without_an_attempt() {
+#[tokio::test]
+async fn cd5_conformance_ambiguous_commit_stays_charged_and_sends_nothing() {
     let (charge_authority, charge_calls) =
         ScriptedChargeAuthority::new(|_request| Err(ProviderChargeError::AmbiguousCommit));
     let (transport, transport_calls) =
@@ -1498,7 +1561,9 @@ fn execute_counts_an_ambiguous_commit_as_a_charged_grant_without_an_attempt() {
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
     let mut ledger = new_ledger();
 
-    let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let outcome = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
 
     assert_eq!(outcome, Err(ProviderClientError::ChargeAmbiguous));
     assert_eq!(ledger.committed_grant_count(), 1);
@@ -1508,9 +1573,9 @@ fn execute_counts_an_ambiguous_commit_as_a_charged_grant_without_an_attempt() {
     assert_eq!(transport_calls.get(), 0);
 }
 
-#[test]
-fn execute_poisons_the_ledger_when_the_grant_does_not_bind_the_attempt() {
-    type Mutator = Box<dyn Fn(ProviderChargeGrant) -> ProviderChargeGrant>;
+#[tokio::test]
+async fn execute_poisons_the_ledger_when_the_grant_does_not_bind_the_attempt() {
+    type Mutator = Box<dyn Fn(ProviderChargeGrant) -> ProviderChargeGrant + Sync>;
     let mutators: Vec<(&str, Mutator)> = vec![
         (
             "traffic_class",
@@ -1592,7 +1657,9 @@ fn execute_poisons_the_ledger_when_the_grant_does_not_bind_the_attempt() {
         let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
         let mut ledger = new_ledger();
 
-        let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+        let outcome = client
+            .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+            .await;
 
         assert_eq!(
             outcome,
@@ -1611,8 +1678,8 @@ fn execute_poisons_the_ledger_when_the_grant_does_not_bind_the_attempt() {
     }
 }
 
-#[test]
-fn execute_reports_transport_refusal_while_keeping_the_grant_charged() {
+#[tokio::test]
+async fn execute_reports_transport_refusal_while_keeping_the_grant_charged() {
     let (charge_authority, _charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
     let client = client_with(
@@ -1622,7 +1689,9 @@ fn execute_reports_transport_refusal_while_keeping_the_grant_charged() {
     );
     let mut ledger = new_ledger();
 
-    let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let outcome = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
 
     assert_eq!(
         outcome,
@@ -1641,8 +1710,8 @@ fn execute_reports_transport_refusal_while_keeping_the_grant_charged() {
     assert_eq!(audit.attempt_count, 0);
 }
 
-#[test]
-fn execute_poisons_when_transport_reports_success_with_zero_requests_issued() {
+#[tokio::test]
+async fn execute_poisons_when_transport_reports_success_with_zero_requests_issued() {
     let (charge_authority, _charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
     let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
@@ -1654,7 +1723,9 @@ fn execute_poisons_when_transport_reports_success_with_zero_requests_issued() {
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
     let mut ledger = new_ledger();
 
-    let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let outcome = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
 
     assert_eq!(
         outcome,
@@ -1669,8 +1740,8 @@ fn execute_poisons_when_transport_reports_success_with_zero_requests_issued() {
     assert_eq!(transport_calls.get(), 1);
 }
 
-#[test]
-fn execute_poisons_when_transport_issues_more_requests_than_authorized() {
+#[tokio::test]
+async fn execute_poisons_when_transport_issues_more_requests_than_authorized() {
     let (charge_authority, _charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
     let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
@@ -1682,7 +1753,9 @@ fn execute_poisons_when_transport_issues_more_requests_than_authorized() {
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
     let mut ledger = new_ledger();
 
-    let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let outcome = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
 
     assert_eq!(
         outcome,
@@ -1696,8 +1769,8 @@ fn execute_poisons_when_transport_issues_more_requests_than_authorized() {
     );
 }
 
-#[test]
-fn execute_records_one_decisive_attempt() {
+#[tokio::test]
+async fn execute_records_one_decisive_attempt() {
     let (charge_authority, _charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
     let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
@@ -1709,7 +1782,9 @@ fn execute_records_one_decisive_attempt() {
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
     let mut ledger = new_ledger();
 
-    let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let outcome = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
 
     assert_eq!(outcome, Ok(ProviderAttemptOutcome::Decisive));
     assert_eq!(ledger.attempt_count(), 1);
@@ -1721,8 +1796,8 @@ fn execute_records_one_decisive_attempt() {
     assert_eq!(transport_calls.get(), 1);
 }
 
-#[test]
-fn execute_records_one_ambiguous_attempt() {
+#[tokio::test]
+async fn execute_records_one_ambiguous_attempt() {
     let (charge_authority, _charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
     let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
@@ -1734,7 +1809,9 @@ fn execute_records_one_ambiguous_attempt() {
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
     let mut ledger = new_ledger();
 
-    let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let outcome = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
 
     assert_eq!(outcome, Ok(ProviderAttemptOutcome::Ambiguous));
     assert_eq!(ledger.attempt_count(), 1);
@@ -1746,8 +1823,8 @@ fn execute_records_one_ambiguous_attempt() {
     assert_eq!(transport_calls.get(), 1);
 }
 
-#[test]
-fn execute_accumulates_counters_across_several_successful_attempts() {
+#[tokio::test]
+async fn execute_accumulates_counters_across_several_successful_attempts() {
     let mut ledger = new_ledger();
     for outcome in [
         ProviderAttemptOutcome::Decisive,
@@ -1766,6 +1843,7 @@ fn execute_accumulates_counters_across_several_successful_attempts() {
         let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
         client
             .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+            .await
             .expect("attempt must succeed");
     }
 
@@ -1777,8 +1855,8 @@ fn execute_accumulates_counters_across_several_successful_attempts() {
     assert_eq!(ledger.poisoned(), None);
 }
 
-#[test]
-fn execute_returns_the_same_poison_and_calls_neither_seam_again() {
+#[tokio::test]
+async fn execute_returns_the_same_poison_and_calls_neither_seam_again() {
     let (charge_authority, charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
     let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
@@ -1790,12 +1868,16 @@ fn execute_returns_the_same_poison_and_calls_neither_seam_again() {
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
     let mut ledger = new_ledger();
 
-    let first = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let first = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
     assert_eq!(first, Err(ProviderClientError::TransportReportInconsistent));
     assert_eq!(charge_calls.get(), 1);
     assert_eq!(transport_calls.get(), 1);
 
-    let second = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let second = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
     assert_eq!(
         second,
         Err(ProviderClientError::TransportReportInconsistent)
@@ -1812,8 +1894,8 @@ fn execute_returns_the_same_poison_and_calls_neither_seam_again() {
     );
 }
 
-#[test]
-fn execute_hands_the_transport_the_exact_authorized_permit() {
+#[tokio::test]
+async fn execute_hands_the_transport_the_exact_authorized_permit() {
     let request = upload_part_request();
     let expected_target = target_value();
     let expected_opaque_handle = durable_put_body().opaque_handle().to_string();
@@ -1852,7 +1934,7 @@ fn execute_hands_the_transport_the_exact_authorized_permit() {
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
     let mut ledger = new_ledger();
 
-    let outcome = client.execute(&mut ledger, &request);
+    let outcome = client.execute(&mut ledger, &request).await;
 
     assert_eq!(outcome, Ok(ProviderAttemptOutcome::Decisive));
     assert_eq!(transport_calls.get(), 1);
@@ -1874,8 +1956,8 @@ fn execute_hands_the_transport_the_exact_authorized_permit() {
 // ledger. See `execute_on_a_poisoned_ledger_reports_mismatch_for_a_different_request_but_still_the_poison_for_its_own`
 // below for the case this order actually distinguishes from poison-first.
 
-#[test]
-fn ledger_new_validates_boundary_and_request_identity_and_exposes_them() {
+#[tokio::test]
+async fn ledger_new_validates_boundary_and_request_identity_and_exposes_them() {
     let ledger = ProviderAttemptLedger::new(BOUNDARY_ID, &logical_request_id())
         .expect("valid boundary and request identity must construct");
     assert_eq!(ledger.provider_boundary_id(), BOUNDARY_ID);
@@ -1895,8 +1977,8 @@ fn ledger_new_validates_boundary_and_request_identity_and_exposes_them() {
 /// attempt request B on the same ledger. Request B must be refused, and the ledger's counters must
 /// still describe only request A -- the two-request accumulation the finding reported is no longer
 /// possible.
-#[test]
-fn a_ledger_that_completed_one_request_refuses_to_accumulate_a_second_requests_attempts() {
+#[tokio::test]
+async fn a_ledger_that_completed_one_request_refuses_to_accumulate_a_second_requests_attempts() {
     let request_a = base_request(ProviderAttemptClass::Readiness);
     let mut ledger = ProviderAttemptLedger::new(BOUNDARY_ID, &request_a.logical_request_id)
         .expect("valid ledger identity for request A");
@@ -1916,6 +1998,7 @@ fn a_ledger_that_completed_one_request_refuses_to_accumulate_a_second_requests_a
     );
     client_a
         .execute(&mut ledger, &request_a)
+        .await
         .expect("request A's attempt must succeed");
 
     assert_eq!(ledger.attempt_count(), 1);
@@ -1940,7 +2023,7 @@ fn a_ledger_that_completed_one_request_refuses_to_accumulate_a_second_requests_a
         transport_b,
     );
 
-    let outcome = client_b.execute(&mut ledger, &request_b);
+    let outcome = client_b.execute(&mut ledger, &request_b).await;
 
     assert_eq!(outcome, Err(ProviderClientError::LedgerRequestMismatch));
     assert_eq!(
@@ -1978,8 +2061,9 @@ fn a_ledger_that_completed_one_request_refuses_to_accumulate_a_second_requests_a
     );
 }
 
-#[test]
-fn execute_refuses_an_attempt_naming_a_different_logical_request_than_the_ledger_is_bound_to() {
+#[tokio::test]
+async fn execute_refuses_an_attempt_naming_a_different_logical_request_than_the_ledger_is_bound_to()
+{
     let mut ledger = ProviderAttemptLedger::new(BOUNDARY_ID, &logical_request_id())
         .expect("valid ledger identity");
 
@@ -1996,7 +2080,7 @@ fn execute_refuses_an_attempt_naming_a_different_logical_request_than_the_ledger
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
 
-    let outcome = client.execute(&mut ledger, &request);
+    let outcome = client.execute(&mut ledger, &request).await;
 
     assert_eq!(outcome, Err(ProviderClientError::LedgerRequestMismatch));
     assert_eq!(ledger.poisoned(), None);
@@ -2015,8 +2099,9 @@ fn execute_refuses_an_attempt_naming_a_different_logical_request_than_the_ledger
         .expect("audit must be accepted by the frozen encoder");
 }
 
-#[test]
-fn execute_refuses_an_attempt_when_the_ledger_is_bound_to_a_different_boundary_than_the_client() {
+#[tokio::test]
+async fn execute_refuses_an_attempt_when_the_ledger_is_bound_to_a_different_boundary_than_the_client()
+ {
     let mut ledger = ProviderAttemptLedger::new("cell.other.primary", &logical_request_id())
         .expect("valid ledger identity for a different boundary");
 
@@ -2034,7 +2119,7 @@ fn execute_refuses_an_attempt_when_the_ledger_is_bound_to_a_different_boundary_t
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
 
-    let outcome = client.execute(&mut ledger, &request);
+    let outcome = client.execute(&mut ledger, &request).await;
 
     assert_eq!(outcome, Err(ProviderClientError::LedgerRequestMismatch));
     assert_eq!(ledger.poisoned(), None);
@@ -2052,8 +2137,8 @@ fn execute_refuses_an_attempt_when_the_ledger_is_bound_to_a_different_boundary_t
 
 /// Regression guard that the binding check is not over-tight: a ledger bound to exactly the
 /// attempt's request and boundary still works end to end.
-#[test]
-fn execute_succeeds_when_the_ledger_is_bound_to_exactly_the_attempts_request_and_boundary() {
+#[tokio::test]
+async fn execute_succeeds_when_the_ledger_is_bound_to_exactly_the_attempts_request_and_boundary() {
     let request = base_request(ProviderAttemptClass::Readiness);
     let mut ledger = ProviderAttemptLedger::new(BOUNDARY_ID, &request.logical_request_id)
         .expect("valid ledger identity matching the request");
@@ -2068,7 +2153,7 @@ fn execute_succeeds_when_the_ledger_is_bound_to_exactly_the_attempts_request_and
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
 
-    let outcome = client.execute(&mut ledger, &request);
+    let outcome = client.execute(&mut ledger, &request).await;
 
     assert_eq!(outcome, Ok(ProviderAttemptOutcome::Decisive));
     assert_eq!(ledger.attempt_count(), 1);
@@ -2081,8 +2166,8 @@ fn execute_succeeds_when_the_ledger_is_bound_to_exactly_the_attempts_request_and
 /// capability gate. Binding the ledger to a different logical request than the attempt proves the
 /// ledger/request binding wins: it is checked before `authorize`, not merely whichever error a
 /// combined check happens to sort first.
-#[test]
-fn execute_refuses_the_ledger_mismatch_before_authorize_even_when_the_request_would_also_fail_validation()
+#[tokio::test]
+async fn execute_refuses_the_ledger_mismatch_before_authorize_even_when_the_request_would_also_fail_validation()
  {
     let mut ledger = ProviderAttemptLedger::new(BOUNDARY_ID, &other_logical_request_id())
         .expect("valid ledger identity for a different request");
@@ -2097,7 +2182,7 @@ fn execute_refuses_the_ledger_mismatch_before_authorize_even_when_the_request_wo
         ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
 
-    let outcome = client.execute(&mut ledger, &request);
+    let outcome = client.execute(&mut ledger, &request).await;
 
     assert_eq!(outcome, Err(ProviderClientError::LedgerRequestMismatch));
     assert_eq!(charge_calls.get(), 0);
@@ -2111,8 +2196,9 @@ fn execute_refuses_the_ledger_mismatch_before_authorize_even_when_the_request_wo
 /// does not have. Paired with `execute_refuses_after_a_recorded_no_dispatch_without_poisoning_the_ledger`
 /// (Section 9), which pins the other direction on the same kind of ledger: an attempt naming the
 /// ledger's *own* request after the same no-dispatch still reports `DispatchAfterNoDispatch`.
-#[test]
-fn execute_reports_the_ledger_mismatch_before_dispatch_after_no_dispatch_on_a_no_dispatch_ledger() {
+#[tokio::test]
+async fn execute_reports_the_ledger_mismatch_before_dispatch_after_no_dispatch_on_a_no_dispatch_ledger()
+ {
     let mut ledger = new_ledger();
     ledger
         .record_no_dispatch(&no_dispatch_proof())
@@ -2127,7 +2213,7 @@ fn execute_reports_the_ledger_mismatch_before_dispatch_after_no_dispatch_on_a_no
         ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
 
-    let outcome = client.execute(&mut ledger, &request);
+    let outcome = client.execute(&mut ledger, &request).await;
 
     assert_eq!(outcome, Err(ProviderClientError::LedgerRequestMismatch));
     assert_eq!(ledger.poisoned(), None);
@@ -2148,8 +2234,8 @@ fn execute_reports_the_ledger_mismatch_before_dispatch_after_no_dispatch_on_a_no
 /// exactly how the two functions' orders were able to disagree unnoticed. Neither call reaches the
 /// charge authority or the transport, and the ledger's poison/counters are unchanged by either --
 /// a rejected call never mutates.
-#[test]
-fn execute_on_a_poisoned_ledger_reports_mismatch_for_a_different_request_but_still_the_poison_for_its_own()
+#[tokio::test]
+async fn execute_on_a_poisoned_ledger_reports_mismatch_for_a_different_request_but_still_the_poison_for_its_own()
  {
     let (charge_authority, charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
@@ -2163,7 +2249,9 @@ fn execute_on_a_poisoned_ledger_reports_mismatch_for_a_different_request_but_sti
     let mut ledger = new_ledger();
 
     // Poison the ledger.
-    let poisoning = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let poisoning = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
     assert_eq!(
         poisoning,
         Err(ProviderClientError::TransportReportInconsistent)
@@ -2183,7 +2271,7 @@ fn execute_on_a_poisoned_ledger_reports_mismatch_for_a_different_request_but_sti
     different_request.logical_request_id = other_logical_request_id();
     different_request.attempt_id = other_attempt_id();
 
-    let mismatch_outcome = client.execute(&mut ledger, &different_request);
+    let mismatch_outcome = client.execute(&mut ledger, &different_request).await;
     assert_eq!(
         mismatch_outcome,
         Err(ProviderClientError::LedgerRequestMismatch)
@@ -2210,8 +2298,9 @@ fn execute_on_a_poisoned_ledger_reports_mismatch_for_a_different_request_but_sti
     );
 
     // The ledger's own bound request: identity matches, so the poison still surfaces, unchanged.
-    let own_request_outcome =
-        client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let own_request_outcome = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
     assert_eq!(
         own_request_outcome,
         Err(ProviderClientError::TransportReportInconsistent)
@@ -2259,8 +2348,8 @@ fn execute_on_a_poisoned_ledger_reports_mismatch_for_a_different_request_but_sti
 // 9. ProviderAttemptLedger::record_no_dispatch and audit
 // ---------------------------------------------------------------------------------------------
 
-#[test]
-fn record_no_dispatch_succeeds_once_then_refuses_a_second_call() {
+#[tokio::test]
+async fn record_no_dispatch_succeeds_once_then_refuses_a_second_call() {
     let mut ledger = new_ledger();
 
     assert!(ledger.record_no_dispatch(&no_dispatch_proof()).is_ok());
@@ -2277,8 +2366,8 @@ fn record_no_dispatch_succeeds_once_then_refuses_a_second_call() {
 /// provider, so ANY issued attempt forbids it -- including one whose outcome was merely
 /// `Ambiguous` rather than a decisive terminal. Recording a no-dispatch after an ambiguous attempt
 /// would let the audit claim a dispatched request never dispatched.
-#[test]
-fn record_no_dispatch_refuses_after_any_issued_attempt_decisive_or_ambiguous() {
+#[tokio::test]
+async fn record_no_dispatch_refuses_after_any_issued_attempt_decisive_or_ambiguous() {
     for outcome in [
         ProviderAttemptOutcome::Decisive,
         ProviderAttemptOutcome::Ambiguous,
@@ -2295,6 +2384,7 @@ fn record_no_dispatch_refuses_after_any_issued_attempt_decisive_or_ambiguous() {
         let mut ledger = new_ledger();
         client
             .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+            .await
             .unwrap_or_else(|error| panic!("{outcome:?} attempt must succeed: {error}"));
 
         assert_eq!(
@@ -2308,8 +2398,8 @@ fn record_no_dispatch_refuses_after_any_issued_attempt_decisive_or_ambiguous() {
 
 /// A committed grant that never reached the wire is exactly the case a no-dispatch proof records
 /// -- unlike an issued attempt, it must not forbid recording one.
-#[test]
-fn record_no_dispatch_is_still_allowed_after_a_committed_grant_that_never_reached_the_wire() {
+#[tokio::test]
+async fn record_no_dispatch_is_still_allowed_after_a_committed_grant_that_never_reached_the_wire() {
     let (charge_authority, _charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
     let client = client_with(
@@ -2319,7 +2409,9 @@ fn record_no_dispatch_is_still_allowed_after_a_committed_grant_that_never_reache
     );
     let mut ledger = new_ledger();
 
-    let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let outcome = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
     assert_eq!(
         outcome,
         Err(ProviderClientError::TransportRefused(
@@ -2347,8 +2439,8 @@ fn record_no_dispatch_is_still_allowed_after_a_committed_grant_that_never_reache
 /// `record_no_dispatch` itself refuses (an issued attempt after a no-dispatch): `execute` refuses
 /// the call, but the ledger stays open and unpoisoned, keeping the truthful
 /// `{no_dispatch: 1, attempt: 0}` audit finalizable rather than destroying it.
-#[test]
-fn execute_refuses_after_a_recorded_no_dispatch_without_poisoning_the_ledger() {
+#[tokio::test]
+async fn execute_refuses_after_a_recorded_no_dispatch_without_poisoning_the_ledger() {
     let mut ledger = new_ledger();
     ledger
         .record_no_dispatch(&no_dispatch_proof())
@@ -2364,7 +2456,9 @@ fn execute_refuses_after_a_recorded_no_dispatch_without_poisoning_the_ledger() {
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
 
-    let outcome = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let outcome = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
 
     assert_eq!(outcome, Err(ProviderClientError::DispatchAfterNoDispatch));
     assert_eq!(
@@ -2398,8 +2492,8 @@ fn execute_refuses_after_a_recorded_no_dispatch_without_poisoning_the_ledger() {
         .expect("the truthful no-dispatch audit must still be accepted by the frozen encoder");
 }
 
-#[test]
-fn record_no_dispatch_returns_the_poison_on_a_poisoned_ledger() {
+#[tokio::test]
+async fn record_no_dispatch_returns_the_poison_on_a_poisoned_ledger() {
     let (charge_authority, _charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
     let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
@@ -2410,7 +2504,9 @@ fn record_no_dispatch_returns_the_poison_on_a_poisoned_ledger() {
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
     let mut ledger = new_ledger();
-    let _ = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let _ = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
     assert_eq!(
         ledger.poisoned(),
         Some(ProviderClientError::TransportReportInconsistent)
@@ -2433,8 +2529,8 @@ fn record_no_dispatch_returns_the_poison_on_a_poisoned_ledger() {
 // `LedgerRequestMismatch` instead -- never leaking this ledger's poison to a caller asking about
 // someone else's request. Keep both cases below if this ordering is ever touched again.
 
-#[test]
-fn audit_for_returns_the_poison_for_the_bound_request_id_on_a_poisoned_ledger() {
+#[tokio::test]
+async fn audit_for_returns_the_poison_for_the_bound_request_id_on_a_poisoned_ledger() {
     let (charge_authority, _charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
     let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
@@ -2445,7 +2541,9 @@ fn audit_for_returns_the_poison_for_the_bound_request_id_on_a_poisoned_ledger() 
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
     let mut ledger = new_ledger();
-    let _ = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let _ = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
     assert_eq!(
         ledger.poisoned(),
         Some(ProviderClientError::TransportReportInconsistent)
@@ -2457,8 +2555,8 @@ fn audit_for_returns_the_poison_for_the_bound_request_id_on_a_poisoned_ledger() 
     );
 }
 
-#[test]
-fn audit_for_returns_a_ledger_request_mismatch_for_a_different_id_on_a_poisoned_ledger() {
+#[tokio::test]
+async fn audit_for_returns_a_ledger_request_mismatch_for_a_different_id_on_a_poisoned_ledger() {
     let (charge_authority, _charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
     let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
@@ -2469,7 +2567,9 @@ fn audit_for_returns_a_ledger_request_mismatch_for_a_different_id_on_a_poisoned_
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
     let mut ledger = new_ledger();
-    let _ = client.execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness));
+    let _ = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
     assert_eq!(
         ledger.poisoned(),
         Some(ProviderClientError::TransportReportInconsistent)
@@ -2491,8 +2591,8 @@ fn audit_for_returns_a_ledger_request_mismatch_for_a_different_id_on_a_poisoned_
 // without knowing whose they are. `audit_for` closes that half by requiring the caller to name the
 // request, and refusing unless it is exactly the ledger's own bound request.
 
-#[test]
-fn audit_for_the_bound_request_id_returns_ok_with_the_expected_counters() {
+#[tokio::test]
+async fn audit_for_the_bound_request_id_returns_ok_with_the_expected_counters() {
     let (charge_authority, _calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
     let (transport, _calls2) = ScriptedTransport::new(|_attempt| {
@@ -2505,6 +2605,7 @@ fn audit_for_the_bound_request_id_returns_ok_with_the_expected_counters() {
     let mut ledger = new_ledger();
     client
         .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await
         .expect("attempt must succeed");
 
     let audit = ledger
@@ -2517,8 +2618,8 @@ fn audit_for_the_bound_request_id_returns_ok_with_the_expected_counters() {
     assert_eq!(audit.no_dispatch_count, 0);
 }
 
-#[test]
-fn audit_for_a_different_valid_uuidv7_request_id_is_a_ledger_request_mismatch() {
+#[tokio::test]
+async fn audit_for_a_different_valid_uuidv7_request_id_is_a_ledger_request_mismatch() {
     let ledger = new_ledger();
 
     assert_eq!(
@@ -2527,8 +2628,8 @@ fn audit_for_a_different_valid_uuidv7_request_id_is_a_ledger_request_mismatch() 
     );
 }
 
-#[test]
-fn audit_for_a_malformed_request_id_is_a_ledger_request_mismatch_not_a_validation_error() {
+#[tokio::test]
+async fn audit_for_a_malformed_request_id_is_a_ledger_request_mismatch_not_a_validation_error() {
     let ledger = new_ledger();
 
     // audit_for compares the caller-supplied id against the ledger's own bound id by equality; it
@@ -2561,7 +2662,7 @@ fn audit_for_a_malformed_request_id_is_a_ledger_request_mismatch_not_a_validatio
 
 /// Every terminal error path `execute` can take, applied to `ledger`'s current state through the
 /// real public API. `"none"` performs no action. Used only by the systematic matrix below.
-fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) {
+async fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) {
     match label {
         "none" => {}
         "charge_ambiguous_commit" => {
@@ -2570,7 +2671,9 @@ fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) {
             let (transport, _calls2) =
                 ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
             let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-            let _ = client.execute(ledger, &base_request(ProviderAttemptClass::Readiness));
+            let _ = client
+                .execute(ledger, &base_request(ProviderAttemptClass::Readiness))
+                .await;
         }
         "grant_mismatch" => {
             let (charge_authority, _calls) = ScriptedChargeAuthority::new(|request| {
@@ -2581,7 +2684,9 @@ fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) {
             let (transport, _calls2) =
                 ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
             let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-            let _ = client.execute(ledger, &base_request(ProviderAttemptClass::Readiness));
+            let _ = client
+                .execute(ledger, &base_request(ProviderAttemptClass::Readiness))
+                .await;
         }
         "transport_refused" => {
             let (charge_authority, _calls) =
@@ -2591,7 +2696,9 @@ fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) {
                 charge_authority,
                 UnwiredProviderTransport,
             );
-            let _ = client.execute(ledger, &base_request(ProviderAttemptClass::Readiness));
+            let _ = client
+                .execute(ledger, &base_request(ProviderAttemptClass::Readiness))
+                .await;
         }
         "transport_report_inconsistent" => {
             let (charge_authority, _calls) =
@@ -2603,7 +2710,9 @@ fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) {
                 })
             });
             let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-            let _ = client.execute(ledger, &base_request(ProviderAttemptClass::Readiness));
+            let _ = client
+                .execute(ledger, &base_request(ProviderAttemptClass::Readiness))
+                .await;
         }
         "transport_issued_unauthorized" => {
             let (charge_authority, _calls) =
@@ -2615,7 +2724,9 @@ fn apply_terminal_action(label: &str, ledger: &mut ProviderAttemptLedger) {
                 })
             });
             let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
-            let _ = client.execute(ledger, &base_request(ProviderAttemptClass::Readiness));
+            let _ = client
+                .execute(ledger, &base_request(ProviderAttemptClass::Readiness))
+                .await;
         }
         other => panic!("unknown terminal action: {other}"),
     }
@@ -2979,8 +3090,8 @@ fn expected_reachable_states() -> HashSet<(u64, u64, u64, u64, u64, String)> {
 /// say nothing about how many distinct audited states that actually reaches, so this test does not
 /// assert a restated case count. It fingerprints every reachable state instead ([`
 /// ledger_state_fingerprint`]) and pins the exact resulting set against [`expected_reachable_states`].
-#[test]
-fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_audit_algebra() {
+#[tokio::test]
+async fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_audit_algebra() {
     let mut reachable_states = HashSet::new();
 
     for preceding_grant in [false, true] {
@@ -3000,10 +3111,12 @@ fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_audit_
                         charge_authority,
                         UnwiredProviderTransport,
                     );
-                    let _ = client.execute(
-                        &mut base_ledger,
-                        &base_request(ProviderAttemptClass::Readiness),
-                    );
+                    let _ = client
+                        .execute(
+                            &mut base_ledger,
+                            &base_request(ProviderAttemptClass::Readiness),
+                        )
+                        .await;
                 }
 
                 if preceding_no_dispatch {
@@ -3022,10 +3135,12 @@ fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_audit_
                     });
                     let client =
                         client_with(ProviderCapabilities::none(), charge_authority, transport);
-                    let _ = client.execute(
-                        &mut base_ledger,
-                        &base_request(ProviderAttemptClass::Readiness),
-                    );
+                    let _ = client
+                        .execute(
+                            &mut base_ledger,
+                            &base_request(ProviderAttemptClass::Readiness),
+                        )
+                        .await;
                 }
 
                 // Trailing axis: attempt a no-dispatch immediately after the sequence, on a clone
@@ -3058,7 +3173,7 @@ fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_audit_
                     let mut ledger = base_ledger.clone();
                     let label = format!("{base_label} terminal={terminal}");
 
-                    apply_terminal_action(terminal, &mut ledger);
+                    apply_terminal_action(terminal, &mut ledger).await;
 
                     assert_mirrors_audit_algebra(&ledger, &label);
                     reachable_states.insert(ledger_state_fingerprint(&ledger));
@@ -3084,8 +3199,8 @@ fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_audit_
 // 10. Redaction
 // ---------------------------------------------------------------------------------------------
 
-#[test]
-fn debug_output_never_leaks_sensitive_fields() {
+#[tokio::test]
+async fn debug_output_never_leaks_sensitive_fields() {
     let sentinel_boundary_id = "cell.sentinel.redact.7e2";
     let sentinel_bucket = "sentinel-redact-bucket-9f3";
     let sentinel_region = "sentinel-redact-region-2b7";
@@ -3131,6 +3246,7 @@ fn debug_output_never_leaks_sensitive_fields() {
         logical_request_id: sentinel_logical_request_id.clone(),
         attempt_id: sentinel_attempt_id.clone(),
         attempt_ordinal: 1,
+        deadline_unix_ms: i64::MAX,
         budget_pin: budget_pin.clone(),
         put_body: Some(put_body.clone()),
         put_part: None,
@@ -3153,7 +3269,8 @@ fn debug_output_never_leaks_sensitive_fields() {
         ProviderCapabilities::none(),
         &request,
         "sentinel redaction fixture",
-    );
+    )
+    .await;
     let grant = ProviderChargeGrant {
         grant_id: sentinel_grant_id.clone(),
         traffic_class: charge_request.traffic_class,
@@ -3207,8 +3324,8 @@ fn debug_output_never_leaks_sensitive_fields() {
 /// `ProviderAttemptRequest`, `ProviderChargeRequest`, `ProviderChargeGrant`, `BudgetPin`) all have.
 /// This test was written red and turned green by that impl. Adding a field to the ledger without
 /// extending the impl reopens it, which is what this guards.
-#[test]
-fn ledger_debug_output_must_not_leak_the_boundary_or_request_identity() {
+#[tokio::test]
+async fn ledger_debug_output_must_not_leak_the_boundary_or_request_identity() {
     let sentinel_boundary_id = "cell.sentinel.ledger-redact.7e2";
     let sentinel_logical_request_id = uuid_v7(9_999, "dddddddddddd");
     let ledger = ProviderAttemptLedger::new(sentinel_boundary_id, &sentinel_logical_request_id)
@@ -3226,8 +3343,8 @@ fn ledger_debug_output_must_not_leak_the_boundary_or_request_identity() {
     );
 }
 
-#[test]
-fn provider_client_error_display_never_contains_sensitive_values() {
+#[tokio::test]
+async fn provider_client_error_display_never_contains_sensitive_values() {
     let errors = [
         ProviderClientError::InvalidProviderBoundaryId,
         ProviderClientError::InvalidBucketName,
@@ -3292,6 +3409,7 @@ fn provider_client_error_display_never_contains_sensitive_values() {
             | ProviderClientError::ListCapabilityNotGranted
             | ProviderClientError::InvalidRequestIdentity
             | ProviderClientError::InvalidAttemptOrdinal
+            | ProviderClientError::InvalidAttemptDeadline
             | ProviderClientError::InvalidBudgetPin
             | ProviderClientError::InvalidPutLimits
             | ProviderClientError::MultipartPartCountExceeded
@@ -3350,8 +3468,8 @@ fn assert_distinct_labels(labels: &[&str]) {
     assert_eq!(sorted.len(), labels.len(), "labels: {labels:?}");
 }
 
-#[test]
-fn attempt_class_all_has_eleven_entries_with_distinct_metric_labels() {
+#[tokio::test]
+async fn attempt_class_all_has_eleven_entries_with_distinct_metric_labels() {
     assert_eq!(ProviderAttemptClass::ALL.len(), 11);
     let labels: Vec<&str> = ProviderAttemptClass::ALL
         .iter()
@@ -3360,8 +3478,8 @@ fn attempt_class_all_has_eleven_entries_with_distinct_metric_labels() {
     assert_distinct_labels(&labels);
 }
 
-#[test]
-fn traffic_class_all_has_five_entries_with_distinct_metric_labels() {
+#[tokio::test]
+async fn traffic_class_all_has_five_entries_with_distinct_metric_labels() {
     assert_eq!(ProviderTrafficClass::ALL.len(), 5);
     let labels: Vec<&str> = ProviderTrafficClass::ALL
         .iter()
@@ -3370,8 +3488,8 @@ fn traffic_class_all_has_five_entries_with_distinct_metric_labels() {
     assert_distinct_labels(&labels);
 }
 
-#[test]
-fn is_listing_is_true_for_exactly_the_two_listing_classes() {
+#[tokio::test]
+async fn is_listing_is_true_for_exactly_the_two_listing_classes() {
     for class in ProviderAttemptClass::ALL {
         let expected = matches!(
             class,
@@ -3381,8 +3499,8 @@ fn is_listing_is_true_for_exactly_the_two_listing_classes() {
     }
 }
 
-#[test]
-fn carries_object_body_is_true_for_exactly_put_object_and_upload_part() {
+#[tokio::test]
+async fn carries_object_body_is_true_for_exactly_put_object_and_upload_part() {
     for class in ProviderAttemptClass::ALL {
         let expected = matches!(
             class,
@@ -3392,8 +3510,8 @@ fn carries_object_body_is_true_for_exactly_put_object_and_upload_part() {
     }
 }
 
-#[test]
-fn every_provider_cap_class_metric_label_is_distinct() {
+#[tokio::test]
+async fn every_provider_cap_class_metric_label_is_distinct() {
     let caps = [
         ProviderCapClass::SharedPhysicalBudget,
         ProviderCapClass::TrafficDrain,
