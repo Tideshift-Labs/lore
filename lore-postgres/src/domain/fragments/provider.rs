@@ -20,9 +20,17 @@
 //! - **The seam is the only route to the provider.** `lore-postgres` does not
 //!   depend on `lore-object-dispatch`, and the seam crate does not re-export
 //!   `ProviderAttemptLedger` or `ProviderAttemptRequest` — the two parameters of
-//!   the governed client's `execute`. So no code here can call it, whatever
-//!   value it holds and whatever accessor the seam might grow. That is the
-//!   whole mechanism; gateway privacy is not carrying it.
+//!   the governed client's `execute`. So no code here can **construct** those
+//!   arguments, whatever value it holds and whatever accessor the seam might
+//!   grow. That is the whole mechanism; gateway privacy is not carrying it.
+//!
+//!   **The claim is about the arguments, not the call.** An earlier revision
+//!   said "no code here can call it", which is false and checkably so:
+//!   `g.inner().execute(todo!(), todo!())` compiles here, because `todo!()`
+//!   diverges and coerces to any type. It panics before reaching a provider,
+//!   and a real ledger or request cannot be built — naming either here is
+//!   `error[E0603]: struct ProviderAttemptLedger is private`. Keep the narrow
+//!   wording: no provider attempt can be issued from this crate.
 //!
 //! Only `provider.rs` moved. The rest of `domain/fragments/` cannot follow it:
 //! the coordinator needs `DomainError`, `lock_order`, `schema::STATE_LIVE` and
@@ -31,13 +39,29 @@
 //! Cargo cycle. Breaking that would mean extracting the shared domain core,
 //! which is a WP-116 seam rather than WP-118's.
 //!
-//! # What is deliberately not here
+//! # What is deliberately not here — two Phase 5 obligations, same shape
 //!
-//! Nothing constructs a gateway. The I/O phase between a `begin_*` and its
-//! commit is driven by a function this package does not yet have, because its
-//! shape depends on where Phase 5 mints the spool row and that needs a real
-//! cell. **Named Phase 5 obligation**, and the honest state until then is that
-//! the seam has no entry point.
+//! **1. Nothing constructs a gateway.** The I/O phase between a `begin_*` and
+//! its commit is driven by a function this package does not yet have, because
+//! its shape depends on where Phase 5 mints the spool row and that needs a real
+//! cell.
+//!
+//! **2. `attest_cell_schema` is currently uncallable from outside the seam
+//! crate.** It takes a `&DispatchRuntimeClient`, and that type's only
+//! constructor takes a `DispatchRuntimePool` which the seam does not
+//! re-export — so nothing here or in `lore-server` can build a client to hand
+//! it. Verified, not inferred: `error[E0425]: cannot find type
+//! DispatchRuntimePool in crate lore_fragment_provider`. It costs nothing today
+//! because the seam is dark and nothing attests, and it bites the first time
+//! Phase 5 attests a cell.
+//!
+//! **Both are unresolved and neither is designed here.** They are the same
+//! shape — something in the seam has to hand out a way in — and the fix for the
+//! second could be a re-exported pool, a seam-owned wrapper, or a constructor
+//! taking connection parameters. Which one is right depends on where Phase 5
+//! gets its pool, which needs a real cell. Naming them is the honest state;
+//! guessing at the shape would be the false-activation move this package has
+//! already refused twice.
 
 pub use lore_fragment_provider::CellSchemaAttestation;
 pub use lore_fragment_provider::DEFAULT_IN_FLIGHT_PUTS;

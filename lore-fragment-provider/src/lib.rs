@@ -43,13 +43,26 @@
 //!    revision claimed.** `execute` takes a `ProviderAttemptLedger` and a
 //!    `ProviderAttemptRequest`. This crate does not re-export either, and
 //!    `lore-postgres` does not depend on `lore-object-dispatch`, so no caller
-//!    there can name the arguments — and a caller that cannot name an
-//!    argument cannot make the call, whatever value it is holding and whatever
-//!    accessor this crate might grow. Privacy is *not* what carries this: an
-//!    inherent method resolves without the caller naming, or depending on, the
-//!    defining crate, which is why a `pub fn inner(&self) -> &GovernedProviderClient`
-//!    plus `gateway.inner().execute(…)` compiled cleanly before the split and
-//!    is now two compile errors.
+//!    there can **construct** those arguments. Privacy is *not* what carries
+//!    this: an inherent method resolves without the caller naming, or
+//!    depending on, the defining crate, which is why a
+//!    `pub fn inner(&self) -> &GovernedProviderClient` plus
+//!    `gateway.inner().execute(…)` compiled cleanly before the split.
+//!
+//!    **"Cannot construct the arguments", not "cannot write the call", and the
+//!    difference is load-bearing.** An earlier revision of this paragraph said
+//!    the latter, which is false: `g.inner().execute(todo!(), todo!())` still
+//!    compiles from `lore-postgres`, because `todo!()` diverges and coerces to
+//!    any type. What is impossible is producing a real ledger or request:
+//!    naming either from `lore-postgres` is
+//!    `error[E0603]: struct ProviderAttemptLedger is private`, because the
+//!    import below is private to this crate. So such a call panics before it
+//!    reaches the provider, and no attempt can be issued.
+//!
+//!    The guarantee is about the arguments and only about the arguments. Do not
+//!    re-flatten it into a claim about the call expression: the flattened
+//!    version is checkably wrong, and a guarantee that is checkably wrong is
+//!    worse than a narrower one that holds.
 //! 3. **No SDK automatic retries, and no private S3 client.**
 //!    [`FragmentProviderGateway::new`] takes **no retry parameter**: it states
 //!    [`ProviderRetryPolicy::disabled`] itself, so a retrying client is not
@@ -136,10 +149,16 @@ use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 /// [`ProviderAttemptRequest`] are never re-exported.** They are exactly the two
 /// parameters of
 /// [`GovernedProviderClient::execute`](lore_object_dispatch::GovernedProviderClient::execute),
-/// so a crate that cannot name them cannot call it — whatever value it is
-/// holding, and regardless of any accessor this crate might grow. `lore-postgres`
-/// does not depend on `lore-object-dispatch`, so these re-exports are the only
-/// dispatch vocabulary it has.
+/// so a crate that cannot name them cannot **construct** them, and cannot make
+/// a call that does anything — whatever value it is holding, and regardless of
+/// any accessor this crate might grow. `lore-postgres` does not depend on
+/// `lore-object-dispatch`, so these re-exports are the only dispatch vocabulary
+/// it has.
+///
+/// The precise form matters: a call *expression* naming `execute` is still
+/// writable there with divergent arguments, and it panics rather than
+/// dispatching. See the crate docs for why the narrower claim is the one to
+/// keep.
 ///
 /// Everything below is safe under that rule because none of it is a parameter
 /// of `execute`. Anything added here must be checked against the same rule, and

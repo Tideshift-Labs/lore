@@ -27,6 +27,16 @@
 //!   (`tests/fragment_provider_source_pins.rs`) — over four files that build no
 //!   provider client at all, rather than over a whole package.
 //!
+//! The companion rule — that the seam is the only route to a provider — is
+//! held the same way and stated the same carefully. `lore-postgres` does not
+//! depend on `lore-object-dispatch`, and the seam does not re-export
+//! `ProviderAttemptLedger` or `ProviderAttemptRequest`, so nothing here can
+//! **construct** the arguments the governed client's `execute` takes. That is
+//! deliberately narrower than "nothing here can call it": a call expression
+//! with divergent arguments still compiles and panics, and the wider claim
+//! would be checkably false. No provider attempt can be issued from this
+//! crate, which is the property that matters.
+//!
 //! `domain/fragments/` is the separately owned WP-118 package, nested under
 //! `domain/` so it can share that lock order and pool. WP-116 yielded it for
 //! the serialized `SCHEMA-118` window and owns the final-push coordinator that
