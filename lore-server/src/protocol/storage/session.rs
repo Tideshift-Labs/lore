@@ -31,9 +31,10 @@ pub(crate) const MAX_CONCURRENT_SESSIONS: u32 = 10_000;
 /// reconnects onto a different one is not protected by the disjointness above at all: it is
 /// protected only by the two sequences having started somewhere far apart, which is why the seed
 /// is random rather than 1. The odds that a stale id happens to name a live session in the other
-/// process are roughly that process's live session count over 2^32 — with
-/// [`MAX_CONCURRENT_SESSIONS`] that is about one in two million per attempt, not one in four
-/// billion. Small, and not a guarantee.
+/// process are roughly that process's live session count over 2^32. At
+/// [`MAX_CONCURRENT_SESSIONS`] that is 10,000 / 2^32, or about one in 429,497 per attempt, not one
+/// in four billion. This is small enough for the random seed to remain a useful cross-process
+/// mitigation, but it is not the isolation guarantee. The client generation check is.
 ///
 /// It holds *until the sequence wraps*. [`SessionMap::allocate`] redraws against the occupancy of
 /// its own map only, because that is the only map it can see; it cannot tell that a sibling
@@ -72,6 +73,9 @@ pub struct SessionEntry {
 pub struct SessionMap {
     entries: DashMap<u32, SessionEntry>,
     authorized_repos: DashSet<RepositoryId>,
+    /// Admission slots claimed before allocation. Unlike `DashMap::len` followed by insert, the
+    /// compare-and-swap makes the limit one atomic decision across concurrent starts.
+    active_sessions: AtomicU32,
 }
 
 #[derive(Debug, PartialEq)]
@@ -118,7 +122,6 @@ impl SessionMap {
         entry: SessionEntry,
     ) -> Result<u32, SessionError> {
         const DRAWS: usize = 8;
-        let mut entry = Some(entry);
         for _ in 0..DRAWS {
             let id = sequence.fetch_add(1, Ordering::Relaxed);
             if id == 0 {
@@ -130,9 +133,6 @@ impl SessionMap {
             )]
             let vacancy = self.entries.entry(id);
             if let dashmap::mapref::entry::Entry::Vacant(vacant) = vacancy {
-                let Some(entry) = entry.take() else {
-                    return Err(SessionError::CounterExhausted);
-                };
                 vacant.insert(entry);
                 return Ok(id);
             }
@@ -149,9 +149,11 @@ impl SessionMap {
         user_id: String,
         permissions: Vec<String>,
     ) -> Result<(u32, String), SessionError> {
-        if self.entries.len() >= MAX_CONCURRENT_SESSIONS as usize {
-            return Err(SessionError::LimitReached);
-        }
+        self.active_sessions
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CONCURRENT_SESSIONS).then_some(active + 1)
+            })
+            .map_err(|_| SessionError::LimitReached)?;
 
         let correlation_id = if correlation_id.is_empty() {
             uuid::Uuid::new_v4().to_string()
@@ -162,12 +164,18 @@ impl SessionMap {
         // Allocated before the repository is authorized, so a failure to allocate leaves nothing
         // behind. Authorizing first would add the repository to this connection's Copy-source
         // scope for a session that then failed to exist.
-        let session_id = self.allocate(SessionEntry {
+        let session_id = match self.allocate(SessionEntry {
             repository,
             correlation_id: correlation_id.clone(),
             user_id,
             permissions,
-        })?;
+        }) {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                self.active_sessions.fetch_sub(1, Ordering::Release);
+                return Err(error);
+            }
+        };
 
         self.authorized_repos.insert(repository);
 
@@ -178,7 +186,10 @@ impl SessionMap {
     /// for Copy source-repo checks.
     pub fn stop(&self, session_id: u32) -> Result<(), SessionError> {
         match self.entries.remove(&session_id) {
-            Some(_) => Ok(()),
+            Some(_) => {
+                self.active_sessions.fetch_sub(1, Ordering::Release);
+                Ok(())
+            }
             None => Err(SessionError::NotFound),
         }
     }
@@ -196,6 +207,9 @@ impl SessionMap {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Barrier;
+
     use rand::random;
 
     use super::*;
@@ -543,5 +557,46 @@ mod tests {
         map.stop(ids[0]).unwrap();
         map.start(repo, "freed".into(), String::new(), Vec::new())
             .unwrap();
+    }
+
+    /// A length check followed by insert lets every caller below the limit pass at once. Seed one
+    /// slot below the cap and release a group together: exactly one may claim the final slot.
+    #[test]
+    fn concurrent_starts_cannot_overbook_the_session_limit() {
+        const CONTENDERS: usize = 32;
+        let map = Arc::new(SessionMap::default());
+        map.active_sessions
+            .store(MAX_CONCURRENT_SESSIONS - 1, Ordering::Release);
+        let barrier = Arc::new(Barrier::new(CONTENDERS));
+
+        let successes = std::thread::scope(|scope| {
+            let handles = (0..CONTENDERS)
+                .map(|index| {
+                    let map = map.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        map.start(
+                            random(),
+                            format!("concurrent-{index}"),
+                            String::new(),
+                            Vec::new(),
+                        )
+                        .is_ok()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|success| *success)
+                .count()
+        });
+
+        assert_eq!(successes, 1, "only the final admission slot may be claimed");
+        assert_eq!(
+            map.active_sessions.load(Ordering::Acquire),
+            MAX_CONCURRENT_SESSIONS
+        );
     }
 }

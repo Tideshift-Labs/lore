@@ -292,7 +292,7 @@ pub async fn handle_put(
                 Err(StoreError::SlowDown(_)) => Err(MessageHandleError::SlowDown),
                 Err(err) => {
                     warn!(error = ?err, {ADDRESS} = %address, "Failed to put fragment for address");
-                    Err(MessageHandleError::StoreFailure)
+                    Err(MessageHandleError::from(err))
                 }
             }
         })

@@ -45,6 +45,7 @@ pub enum QuicServiceError {
     NotFound = 4,
     Oversized = 5,
     SlowDown = 100,
+    OutcomeUnknown = 101,
     // service specific implementations can use 200-299
     ImplementationReserved = RESERVED_ERROR_CODE_START,
     ImplementationReservedEnd = 299,
@@ -84,6 +85,8 @@ pub enum QuicClientError {
     NotFound,
     #[error("Oversized fragment rejected by server")]
     Oversized,
+    #[error("Server reported that a lower transport lost the mutable operation outcome")]
+    OutcomeUnknown,
     /// The session id offered was not issued on the connection the command was about to be
     /// written to. Raised at the write boundary, before any byte is framed, so the command was
     /// not dispatched and the caller's session layer can resolve a replacement and try again.

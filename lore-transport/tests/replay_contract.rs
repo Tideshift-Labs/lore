@@ -30,8 +30,9 @@
 // `lore-transport/src/replay.rs`'s `storage_replay_class` before writing this fixture.
 //
 // CORRECTION 2 (2026-08-30): `DispatchState` gained a third variant, `DispatchedAndAnswered` --
-// the server received the command and answered with an error, which is not ambiguous (an
-// ordinary refusal, not a lost write). Verified against `lore-transport/src/replay.rs` directly.
+// the server received the command and answered with an error, which is not transport-ambiguous.
+// The answer must still be returned rather than used as replay authority: a handler can apply one
+// durable step before a later step fails. Verified against `lore-transport/src/replay.rs` directly.
 // The exhaustive match below (`is_ambiguous`) had to grow to cover it, which is exactly the
 // no-default guard this fixture exists to provide.
 
@@ -166,11 +167,11 @@ fn is_ambiguous(state: DispatchState) -> bool {
     match state {
         DispatchState::NotDispatched => false,
         DispatchState::DispatchedResponseLost => true,
-        // The server received the command and declined it. Not ambiguous -- the operation did
-        // not take effect, so it is an ordinary failure, not an unresolvable write. Collapsing
-        // this into `DispatchedResponseLost` would report a plain refusal (`NotFound`,
-        // `SlowDown`, a server error status) arriving during a reconnect race as
-        // `OutcomeUnknown`, which is a false positive the caller cannot safely reconcile away.
+        // The server received the command and answered. Not transport-ambiguous, but also not
+        // replay authority: the handler may have applied one durable step before returning a
+        // later error. Collapsing this into `DispatchedResponseLost` would report an answer as
+        // `OutcomeUnknown`; treating it like `NotDispatched` would risk applying the command
+        // twice. The caller must receive the original answer unchanged.
         DispatchState::DispatchedAndAnswered => false,
     }
 }

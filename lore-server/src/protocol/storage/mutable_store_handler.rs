@@ -75,7 +75,7 @@ pub async fn handle_mutable_store(
                 Err(StoreError::SlowDown(_)) => Err(MessageHandleError::SlowDown),
                 Err(err) => {
                     warn!(error = ?err, "Failed to store mutable key: {}", key);
-                    Err(MessageHandleError::StoreFailure)
+                    Err(MessageHandleError::from(err))
                 }
             }
         })

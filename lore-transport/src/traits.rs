@@ -266,6 +266,34 @@ pub trait Storage: Send + Sync {
     /// sessions outlive its connections has to say so by returning a constant.
     fn connection_generation(&self) -> u32;
 
+    /// Advance a live transport into the generation-before-epoch reconnect interval.
+    ///
+    /// This seam exists only for the cross-crate wire regression tests. Production callers cannot
+    /// name it, and non-QUIC test transports fail instead of silently simulating the wrong layer.
+    #[cfg(feature = "test_seams")]
+    async fn advance_generation_before_epoch_for_test(&self) -> Result<(), ProtocolError> {
+        Err(ProtocolError::internal(
+            "storage transport does not expose the generation test seam",
+        ))
+    }
+
+    #[cfg(feature = "test_seams")]
+    fn arm_session_send_pause_for_test(&self) -> Result<(), ProtocolError> {
+        Err(ProtocolError::internal(
+            "storage transport does not expose the session send pause seam",
+        ))
+    }
+
+    #[cfg(feature = "test_seams")]
+    async fn wait_for_session_send_pause_for_test(&self) -> Result<(), ProtocolError> {
+        Err(ProtocolError::internal(
+            "storage transport does not expose the session send pause seam",
+        ))
+    }
+
+    #[cfg(feature = "test_seams")]
+    fn resume_session_send_for_test(&self) {}
+
     /// [`Storage::put`], reporting a dispatched request whose response was lost as
     /// [`MutableOutcome::Unknown`] instead of an error.
     ///

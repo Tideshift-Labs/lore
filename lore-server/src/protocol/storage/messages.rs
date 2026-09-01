@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::error::Error;
 use std::fmt::Debug;
 use std::string::FromUtf8Error;
 use std::sync::Arc;
@@ -75,6 +76,8 @@ pub enum MessageHandleError {
     QueryResultSizeMismatch,
     #[error("Store operation failed")]
     StoreFailure,
+    #[error("Store operation outcome is unknown")]
+    OutcomeUnknown,
     #[error("Server overloaded, slow down")]
     SlowDown,
     #[error("Fragment or blob exceeded size limit")]
@@ -94,12 +97,26 @@ pub enum MessageHandleError {
 impl From<StoreError> for MessageHandleError {
     fn from(value: StoreError) -> Self {
         warn!("Received store error: {value:?}");
+        if error_chain_contains::<lore_transport::OutcomeUnknown>(&value) {
+            return MessageHandleError::OutcomeUnknown;
+        }
         match value {
             StoreError::SlowDown(_) => MessageHandleError::SlowDown,
             StoreError::Oversized(_) => MessageHandleError::Oversized,
             _ => MessageHandleError::StoreFailure,
         }
     }
+}
+
+fn error_chain_contains<T: Error + 'static>(error: &(dyn Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        if source.downcast_ref::<T>().is_some() {
+            return true;
+        }
+        current = source.source();
+    }
+    false
 }
 
 #[async_trait]

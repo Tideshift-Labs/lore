@@ -1009,6 +1009,55 @@ impl Connection {
         Ok(connections[counter].clone())
     }
 
+    /// Advance every storage transport into the generation-before-epoch reconnect interval.
+    ///
+    /// Tests use this through the same outer [`Connection`] that owns their real
+    /// [`StorageSession`]. Keeping the seam here avoids forging a second client path that would
+    /// not exercise session retry control flow.
+    #[cfg(feature = "test_seams")]
+    pub async fn advance_storage_generation_before_epoch_for_test(
+        self: &Arc<Self>,
+    ) -> Result<(), ProtocolError> {
+        self.ensure_storage_connected().await?;
+        let connector = self.storage_connector()?;
+        for storage in connector.connections() {
+            storage.advance_generation_before_epoch_for_test().await?;
+        }
+        Ok(())
+    }
+
+    /// Arm the next session-bearing storage send to pause before its write-boundary check.
+    #[cfg(feature = "test_seams")]
+    pub async fn arm_storage_session_send_pause_for_test(
+        self: &Arc<Self>,
+    ) -> Result<(), ProtocolError> {
+        self.ensure_storage_connected().await?;
+        let connector = self.storage_connector()?;
+        for storage in connector.connections() {
+            storage.arm_session_send_pause_for_test()?;
+        }
+        Ok(())
+    }
+
+    /// Wait for the armed storage send to reach the write boundary.
+    #[cfg(feature = "test_seams")]
+    pub async fn wait_for_storage_session_send_pause_for_test(
+        self: &Arc<Self>,
+    ) -> Result<(), ProtocolError> {
+        let storage = self.storage().await?;
+        storage.wait_for_session_send_pause_for_test().await
+    }
+
+    /// Resume every storage send held at the write-boundary seam.
+    #[cfg(feature = "test_seams")]
+    pub fn resume_storage_session_send_for_test(&self) -> Result<(), ProtocolError> {
+        let connector = self.storage_connector()?;
+        for storage in connector.connections() {
+            storage.resume_session_send_for_test();
+        }
+        Ok(())
+    }
+
     /// Creates or reuses a `SessionPool` for the given partition and correlation
     /// ID, returning a round-robin-picked session from it. The pool is pinned in
     /// the connection's session cache so the `Weak` in `StorageConnector` stays

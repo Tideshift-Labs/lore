@@ -271,6 +271,7 @@ fn quic_error(message_error: &MessageHandleError) -> QuicServiceError {
         }
         MessageHandleError::SlowDown => QuicServiceError::SlowDown,
         MessageHandleError::Oversized => QuicServiceError::Oversized,
+        MessageHandleError::OutcomeUnknown => QuicServiceError::OutcomeUnknown,
         _ => QuicServiceError::Failed,
     }
 }
@@ -358,6 +359,7 @@ pub fn message_handle_error_to_label(value: &MessageHandleError) -> &'static str
         MessageHandleError::NotConnected => "NotConnected",
         MessageHandleError::QueryResultSizeMismatch => "QueryResultSizeMismatch",
         MessageHandleError::StoreFailure => "StoreFailure",
+        MessageHandleError::OutcomeUnknown => "OutcomeUnknown",
         MessageHandleError::AuthorizationFailure(_) => "AuthorizationFailure",
         MessageHandleError::MissingToken => "MissingToken",
         MessageHandleError::BranchProtected => "BranchProtected",
@@ -390,7 +392,8 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
         | MessageHandleError::Metadata
         | MessageHandleError::HashFailed
         | MessageHandleError::InvalidFragment
-        | MessageHandleError::SessionLimitReached => false,
+        | MessageHandleError::SessionLimitReached
+        | MessageHandleError::OutcomeUnknown => false,
         MessageHandleError::HandlerTimeout
         | MessageHandleError::InternalError
         | MessageHandleError::NotImplemented

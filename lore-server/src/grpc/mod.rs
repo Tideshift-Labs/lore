@@ -149,6 +149,10 @@ pub fn map_message_handle_error_to_status(
             Code::Internal,
             message.unwrap_or_else(|| "Store failure".into()),
         ),
+        MessageHandleError::OutcomeUnknown => (
+            Code::Aborted,
+            message.unwrap_or_else(|| "Store operation outcome is unknown".into()),
+        ),
         MessageHandleError::SlowDown => (
             Code::ResourceExhausted,
             message.unwrap_or_else(|| "slowdown".into()),

@@ -30,6 +30,8 @@ mod quic_session_rebind_tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -115,6 +117,18 @@ mod quic_session_rebind_tests {
         grace_period: Duration,
     }
 
+    /// Holds a real server error after the handler has produced it but before the QUIC framework
+    /// writes the error response. This lets a test move the client connection generation while
+    /// the answered request is still in flight, without replacing the loopback connection or
+    /// changing the server result.
+    #[derive(Clone)]
+    struct HoldAnsweredError {
+        opcode: u8,
+        notify_answered: Arc<tokio::sync::Notify>,
+        release_answer: Arc<tokio::sync::Notify>,
+        armed: Arc<AtomicBool>,
+    }
+
     /// Delegates every `QuicService` call to a real `StorageServiceV4`, recording
     /// `(opcode, session_id)` off the header of every inbound command first, and optionally
     /// severing one command's response deterministically (see [`SeverResponse`]).
@@ -122,6 +136,7 @@ mod quic_session_rebind_tests {
         inner: StorageServiceV4,
         log: Log,
         sever: Option<SeverResponse>,
+        hold_answered_error: Option<HoldAnsweredError>,
     }
 
     #[async_trait]
@@ -156,6 +171,14 @@ mod quic_session_rebind_tests {
                 _ => None,
             };
             let result = self.inner.run_request_handler(context, request).await;
+            if result.is_err()
+                && let Some(hold) = &self.hold_answered_error
+                && opcode == Some(hold.opcode)
+                && hold.armed.swap(false, Ordering::Relaxed)
+            {
+                hold.notify_answered.notify_one();
+                hold.release_answer.notified().await;
+            }
             if result.is_ok()
                 && let Some(sever) = &self.sever
                 && opcode == Some(sever.opcode)
@@ -209,7 +232,7 @@ mod quic_session_rebind_tests {
             mutable_store: Arc<dyn MutableStore>,
             log: Log,
         ) -> Self {
-            Self::with_sever(immutable_store, mutable_store, log, None)
+            Self::with_controls(immutable_store, mutable_store, log, None, None)
         }
 
         fn with_sever(
@@ -217,6 +240,31 @@ mod quic_session_rebind_tests {
             mutable_store: Arc<dyn MutableStore>,
             log: Log,
             sever: Option<SeverResponse>,
+        ) -> Self {
+            Self::with_controls(immutable_store, mutable_store, log, sever, None)
+        }
+
+        fn with_answered_error_hold(
+            immutable_store: Arc<dyn ImmutableStore>,
+            mutable_store: Arc<dyn MutableStore>,
+            log: Log,
+            hold_answered_error: HoldAnsweredError,
+        ) -> Self {
+            Self::with_controls(
+                immutable_store,
+                mutable_store,
+                log,
+                None,
+                Some(hold_answered_error),
+            )
+        }
+
+        fn with_controls(
+            immutable_store: Arc<dyn ImmutableStore>,
+            mutable_store: Arc<dyn MutableStore>,
+            log: Log,
+            sever: Option<SeverResponse>,
+            hold_answered_error: Option<HoldAnsweredError>,
         ) -> Self {
             let mut service_store = ServiceStore::default();
             service_store.add_service(
@@ -233,6 +281,7 @@ mod quic_session_rebind_tests {
                         inner,
                         log: log.clone(),
                         sever: sever.clone(),
+                        hold_answered_error: hold_answered_error.clone(),
                     };
                     Box::new(StreamHandler::new(Arc::new(service), context, 100, None))
                         as Box<dyn StreamDataHandler>
@@ -408,6 +457,47 @@ mod quic_session_rebind_tests {
         )
         .expect("quinn server start");
         (server, notify_processed)
+    }
+
+    /// A recording server that holds the first real error answer for `opcode` until the test
+    /// releases it. The returned notifications form a deterministic hand-off: await `answered`,
+    /// move the client generation, then notify `release` so the original server answer reaches
+    /// the caller.
+    fn start_answer_holding_quic_server(
+        udp: std::net::UdpSocket,
+        immutable: Arc<dyn ImmutableStore>,
+        mutable: Arc<dyn MutableStore>,
+        log: Log,
+        opcode: Command,
+    ) -> (
+        QuinnServer,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let notify_answered = Arc::new(tokio::sync::Notify::new());
+        let release_answer = Arc::new(tokio::sync::Notify::new());
+        let hold = HoldAnsweredError {
+            opcode: opcode as u8,
+            notify_answered: notify_answered.clone(),
+            release_answer: release_answer.clone(),
+            armed: Arc::new(AtomicBool::new(true)),
+        };
+        let (cert_file, pkey_file, _ca) = server_certs().expect("test certificate paths");
+        let server = QuinnServer::start(
+            QuinnConfigBuilder::new()
+                .socket(udp)
+                .cert_file(cert_file)
+                .pkey_file(pkey_file)
+                .stream_handler_factory(Box::new(
+                    RecordingHandlerFactory::with_answered_error_hold(
+                        immutable, mutable, log, hold,
+                    ),
+                ))
+                .build()
+                .expect("quinn config"),
+        )
+        .expect("quinn server start");
+        (server, notify_answered, release_answer)
     }
 
     /// Rebind a UDP socket on the exact port a just-closed QUIC server used. UDP has no TIME_WAIT,
@@ -1385,6 +1475,197 @@ mod quic_session_rebind_tests {
                     assert_no_bytes_after_severed_command(&log.lock().unwrap(), opcode as u8);
                     let _ = &immutable; // kept alive for the duration of the loop iteration
                 }
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// A real server error answer is never replay authority. The path-less in-memory immutable
+    /// store makes `Verify` return the storage service's generic failure after the request has
+    /// reached the server. Move the connection generation while that answer is held in flight,
+    /// then require the original error and exactly one observed Verify dispatch.
+    #[tokio::test]
+    async fn answered_mutable_no_replay_error_is_not_redispatched_when_generation_moves()
+    -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (tcp, udp) = bind_matched_pair();
+                let addr: SocketAddr = tcp.local_addr().unwrap();
+                let port = addr.port();
+                let _grpc_shutdown = start_grpc_backend(tcp, addr).await;
+
+                let (immutable, mutable) = fresh_stores().await;
+                let log: Log = Arc::new(StdMutex::new(Vec::new()));
+                let (_server, notify_answered, release_answer) = start_answer_holding_quic_server(
+                    udp,
+                    immutable,
+                    mutable,
+                    log.clone(),
+                    Command::Verify,
+                );
+
+                let partition = random::<RepositoryId>();
+                let connection = lore_revision::protocol::connect(
+                    &format!("lore://127.0.0.1:{port}"),
+                    "",
+                    partition,
+                )
+                .await?;
+                let session = connection.session(partition, "answered-generation").await?;
+
+                // Verify needs a real stored address to reach the path-less-store failure. A
+                // missing address would return modeled NotFound, which takes a separate fixed
+                // classifier arm and would not exercise the answered generic-error branch.
+                let (fragment, address, payload) = random_fragment();
+                session
+                    .put(address, fragment, Some(payload))
+                    .await
+                    .expect("seed put should succeed");
+
+                let session_for_verify = session.clone();
+                #[allow(clippy::disallowed_methods)]
+                let verify_task =
+                    tokio::spawn(
+                        async move { session_for_verify.verify_outcome(&address, true).await },
+                    );
+
+                tokio::time::timeout(SEVER_SIGNAL_TIMEOUT, notify_answered.notified())
+                    .await
+                    .expect("server did not produce the expected Verify error answer");
+                connection
+                    .advance_storage_generation_before_epoch_for_test()
+                    .await
+                    .expect("QUIC generation seam should be available");
+                release_answer.notify_one();
+
+                let error = tokio::time::timeout(SEVER_SIGNAL_TIMEOUT, verify_task)
+                    .await
+                    .expect("answered Verify must return instead of hanging")
+                    .expect("verify task should not panic")
+                    .expect_err("the server's real Verify failure must reach the caller");
+
+                let snapshot = log.lock().unwrap().clone();
+                let verify_dispatches = snapshot
+                    .iter()
+                    .filter(|observed| observed.opcode == Command::Verify as u8)
+                    .count();
+                assert_eq!(
+                    verify_dispatches, 1,
+                    "an answered MutableNoReplay error must not be redispatched after the \
+                     generation moves; observed: {snapshot:?}"
+                );
+                assert!(
+                    snapshot
+                        .iter()
+                        .any(|observed| observed.opcode == Command::Verify as u8),
+                    "the server must have observed the Verify bytes before its answer was held"
+                );
+                assert!(
+                    error.to_string().contains("Server returned error code"),
+                    "the original answered server error must reach the caller, got {error:?}"
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// The companion positive control for the retry gate. Pause after the old session id has
+    /// resolved but before the QUIC write lock, move the generation, and resume. The first send
+    /// must be refused as `NotDispatched`; the session layer then rebinds and performs the one
+    /// server-observed MutableStore dispatch.
+    #[tokio::test]
+    async fn not_dispatched_generation_mover_rebinds_and_retries_once() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (tcp, udp) = bind_matched_pair();
+                let addr: SocketAddr = tcp.local_addr().unwrap();
+                let port = addr.port();
+                let _grpc_shutdown = start_grpc_backend(tcp, addr).await;
+
+                let (immutable, mutable) = fresh_stores().await;
+                let log: Log = Arc::new(StdMutex::new(Vec::new()));
+                let _server =
+                    start_recording_quic_server(udp, immutable, mutable.clone(), log.clone());
+
+                let partition = random::<RepositoryId>();
+                let connection = lore_revision::protocol::connect(
+                    &format!("lore://127.0.0.1:{port}"),
+                    "",
+                    partition,
+                )
+                .await?;
+                let session = connection
+                    .session(partition, "not-dispatched-generation")
+                    .await?;
+                connection
+                    .arm_storage_session_send_pause_for_test()
+                    .await
+                    .expect("QUIC pre-write pause should arm");
+
+                let key = random::<Hash>();
+                let value = random::<Hash>();
+                let session_for_store = session.clone();
+                #[allow(clippy::disallowed_methods)]
+                let store_task = tokio::spawn(async move {
+                    session_for_store
+                        .mutable_store_outcome(key, value, KeyType::Untyped)
+                        .await
+                });
+
+                tokio::time::timeout(
+                    SEVER_SIGNAL_TIMEOUT,
+                    connection.wait_for_storage_session_send_pause_for_test(),
+                )
+                .await
+                .expect("MutableStore did not reach the armed pre-write pause")
+                .expect("QUIC pre-write pause should be available");
+                connection
+                    .advance_storage_generation_before_epoch_for_test()
+                    .await
+                    .expect("QUIC generation seam should be available");
+                connection
+                    .resume_storage_session_send_for_test()
+                    .expect("paused MutableStore should resume");
+
+                let outcome = tokio::time::timeout(SEVER_SIGNAL_TIMEOUT, store_task)
+                    .await
+                    .expect("the rebound MutableStore must complete")
+                    .expect("mutable store task should not panic")
+                    .expect("a genuinely NotDispatched command should rebind and retry");
+                assert!(
+                    !outcome.is_unknown(),
+                    "the only server-observed MutableStore dispatch returned Applied"
+                );
+
+                let snapshot = log.lock().unwrap().clone();
+                let mutable_store_dispatches = snapshot
+                    .iter()
+                    .filter(|observed| observed.opcode == Command::MutableStore as u8)
+                    .count();
+                let authorize_dispatches = snapshot
+                    .iter()
+                    .filter(|observed| observed.opcode == Command::Authorize as u8)
+                    .count();
+                assert_eq!(
+                    mutable_store_dispatches, 1,
+                    "the refused NotDispatched attempt must emit no bytes; only the rebound retry \
+                     reaches the server, observed: {snapshot:?}"
+                );
+                assert_eq!(
+                    authorize_dispatches, 2,
+                    "the generation move must add exactly one replacement session_start before \
+                     the one MutableStore dispatch, observed: {snapshot:?}"
+                );
+
+                let stored = mutable
+                    .load(partition, key, KeyType::Untyped)
+                    .await
+                    .expect("the rebound MutableStore should apply");
+                assert_eq!(stored, value);
 
                 Ok(())
             })

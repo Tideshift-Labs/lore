@@ -121,7 +121,7 @@ pub async fn handle_copy(
                 Err(err) if err.is_address_not_found() => Err(MessageHandleError::FragmentNotFound),
                 Err(err) => {
                     warn!(error = ?err, "Failed to copy fragment");
-                    Err(MessageHandleError::StoreFailure)
+                    Err(MessageHandleError::from(err))
                 }
             }
         })

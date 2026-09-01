@@ -58,26 +58,20 @@ pub enum DispatchState {
     DispatchedResponseLost,
     /// The server received the command and answered with an error.
     ///
-    /// Not ambiguous: an error response is the server declining the operation, so the
-    /// operation did not take effect and the command may be sent again under its normal
-    /// policy. Collapsing this into [`DispatchState::DispatchedResponseLost`] would report an
-    /// ordinary refusal as an unresolvable write.
+    /// The answer removes transport ambiguity, but it does not prove the operation had no
+    /// effect. A handler can apply one durable step and then fail on a later step. The error is
+    /// therefore returned to the caller and is never a basis for redispatch. A server that knows
+    /// a lower transport lost the outcome must report that separately as [`OutcomeUnknown`].
     DispatchedAndAnswered,
 }
 
 /// A dispatched mutable command whose response was lost.
 ///
-/// This is the frozen typed boundary WP-120 consumes. It is deliberately not a message to
-/// parse and not a reclassification of some other error: a consumer matches on this type and
-/// gets the operation's identity, and nothing here asserts whether the operation committed.
-///
-/// The transport has no attempt receipt for these commands, so it cannot resolve the
-/// ambiguity by asking. A later lifecycle query or readback reports the state *now*, which is
-/// conflict context for the adopting caller, not attribution of this attempt.
+/// The transport has no attempt receipt for these commands. A later read reports current state,
+/// not proof of whether this attempt committed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutcomeUnknown {
-    /// The command whose outcome is unknown, by its wire name (see
-    /// [`crate::quic::storage_service::command_name`]).
+    /// The command whose wire response was lost.
     pub command: &'static str,
 }
 

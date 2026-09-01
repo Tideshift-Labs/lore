@@ -9,6 +9,8 @@ use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "test_seams")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -362,6 +364,12 @@ pub struct QuicConnection {
     /// bounded. Recording it here instead keeps the answer reachable from the one place that can
     /// act on it — inside the read lock, immediately before the writer is taken.
     sessions: dashmap::DashMap<u32, u32>,
+    #[cfg(feature = "test_seams")]
+    pause_next_session_send: AtomicBool,
+    #[cfg(feature = "test_seams")]
+    session_send_paused: Semaphore,
+    #[cfg(feature = "test_seams")]
+    resume_session_send: Semaphore,
     max_reconnects: Option<u32>,
     reconnect_guard: Semaphore,
     counter: AtomicU32,
@@ -390,6 +398,12 @@ impl QuicConnection {
             epoch: AtomicU32::new(1),
             generation: AtomicU32::new(1),
             sessions: dashmap::DashMap::new(),
+            #[cfg(feature = "test_seams")]
+            pause_next_session_send: AtomicBool::new(false),
+            #[cfg(feature = "test_seams")]
+            session_send_paused: Semaphore::new(0),
+            #[cfg(feature = "test_seams")]
+            resume_session_send: Semaphore::new(0),
             max_reconnects: None,
             reconnect_guard: Semaphore::new(1),
             counter: AtomicU32::new(0),
@@ -440,6 +454,47 @@ impl QuicConnection {
     #[cfg(feature = "test_seams")]
     pub fn register_session_for_test(&self, session_id: u32, generation: u32) {
         self.register_session(session_id, generation);
+    }
+
+    /// Move to the exact reconnect interval in which replacement streams are installed but the
+    /// completed-reconnect epoch is not yet published. Tests only.
+    ///
+    /// This advances the generation and invalidates its session registry under the same write
+    /// lock used by a real reconnect. It deliberately leaves the underlying loopback connection
+    /// and epoch in place so an in-flight request can return its real server answer while the
+    /// session layer observes that its generation moved.
+    #[cfg(feature = "test_seams")]
+    pub async fn advance_generation_before_epoch_for_test(&self) {
+        let _connection = self.connection.write().await;
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.sessions.clear();
+    }
+
+    /// Pause the next session-bearing send after session resolution but before the connection
+    /// read lock and write-boundary check. Tests only.
+    #[cfg(feature = "test_seams")]
+    pub fn arm_session_send_pause_for_test(&self) -> Result<(), ProtocolError> {
+        self.pause_next_session_send
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| ProtocolError::internal("session send pause is already armed"))
+    }
+
+    /// Wait until the armed session-bearing send reaches its pause. Tests only.
+    #[cfg(feature = "test_seams")]
+    pub async fn wait_for_session_send_pause_for_test(&self) -> Result<(), ProtocolError> {
+        self.session_send_paused
+            .acquire()
+            .await
+            .map_err(|_| ProtocolError::internal("session send pause closed"))?
+            .forget();
+        Ok(())
+    }
+
+    /// Release a session-bearing send held by [`Self::arm_session_send_pause_for_test`].
+    #[cfg(feature = "test_seams")]
+    pub fn resume_session_send_for_test(&self) {
+        self.resume_session_send.add_permits(1);
     }
 
     /// Forget a session that has been stopped, or whose stop was attempted.
@@ -536,10 +591,9 @@ pub enum SendWithReconnectError {
     Disconnected,
     #[error("Reconnect to server failed")]
     ReconnectFailed,
-    /// The connection was replaced while this command was in flight, and the command was not
-    /// dispatched (or is safe to repeat). Its session id belongs to the connection that is
-    /// gone, so the send is not retried here: the session-aware layer has to resolve a
-    /// replacement session first. See [`crate::session::StorageSession`].
+    /// A session-bearing send was refused before dispatch because its id belongs to the
+    /// connection that is gone. The send is not retried here: the session-aware layer has to
+    /// resolve a replacement session first. See [`crate::session::StorageSession`].
     #[error("Connection replaced; session must be rebound before this command is sent again")]
     SessionRebindRequired,
     /// The request was dispatched on the connection that was then replaced, and its response
@@ -611,7 +665,8 @@ impl SendFailure {
         }
     }
 
-    /// An error the server sent back. The command reached it and it declined.
+    /// An error the server sent back. The command reached it; the answer does not prove the
+    /// handler had no effect.
     fn answered(error: QuicClientError) -> Self {
         Self {
             error,
@@ -716,7 +771,7 @@ where
         chunks,
         unknown,
         epoch,
-        failure.error,
+        failure,
     ))
     .await
 }
@@ -756,6 +811,24 @@ where
         return Verdict::Unknown;
     }
 
+    // A peer can lose the response from its own lower transport and report that fact through the
+    // storage protocol. The answer reached this client, but the mutation's outcome is still
+    // unknown. Preserve that result instead of flattening it into a replayable answered error.
+    if matches!(failure.error, QuicClientError::OutcomeUnknown) {
+        return Verdict::Unknown;
+    }
+
+    // An answered error is never evidence that redispatch is safe. Some handlers durably apply
+    // one step before a later step returns the error. A sibling reconnect moving the epoch while
+    // the answer is in flight does not change that fact, so return the answer before consulting
+    // either reconnect counter.
+    if failure.dispatched == DispatchState::DispatchedAndAnswered {
+        return Verdict::Failed(service_client.map_send_error(
+            request_type,
+            SendWithReconnectError::ClientError(failure.error.clone()),
+        ));
+    }
+
     match failure.error {
         // Answers from the server that reconnecting cannot change. Bubble them up.
         QuicClientError::SlowDown
@@ -782,8 +855,9 @@ where
             service_client
                 .map_send_error(request_type, SendWithReconnectError::SessionRebindRequired),
         ),
-        // The server did answer, but the answer may be a consequence of something else
-        // replacing the connection under us.
+        // Other transport failures. Only a proven pre-dispatch failure may ask the session layer
+        // to rebind. A response-lost read is replayable by policy, but this frame no longer has
+        // proof that the operation itself never reached the wire.
         _ => {
             let epoch_current = service_client.quic().epoch.load(Ordering::Relaxed);
             if epoch_current == 0 {
@@ -800,12 +874,21 @@ where
                 ));
             }
             // The connection was replaced while this command was in flight, by somebody else's
-            // reconnect. Whatever id it carried belongs to the connection that is gone, so
-            // nothing is resent here; the session-aware layer resolves a replacement first.
-            Verdict::Failed(
-                service_client
-                    .map_send_error(request_type, SendWithReconnectError::SessionRebindRequired),
-            )
+            // reconnect. Only a failure before dispatch may use that replacement as retry
+            // authority. Every other failure returns its original error.
+            if failure.dispatched == DispatchState::NotDispatched {
+                Verdict::Failed(
+                    service_client.map_send_error(
+                        request_type,
+                        SendWithReconnectError::SessionRebindRequired,
+                    ),
+                )
+            } else {
+                Verdict::Failed(service_client.map_send_error(
+                    request_type,
+                    SendWithReconnectError::ClientError(failure.error.clone()),
+                ))
+            }
         }
     }
 }
@@ -823,7 +906,7 @@ async fn reconnect_and_retry<ServiceClientType, Sink, const LEN: usize, const HI
     chunks: impl Fn() -> [Bytes; LEN],
     unknown: Sink,
     epoch: u32,
-    first_error: QuicClientError,
+    first_failure: SendFailure,
 ) -> Result<Bytes, ServiceClientType::ErrorType>
 where
     ServiceClientType: ServiceClient,
@@ -849,10 +932,20 @@ where
     // session id from the old one is meaningless to it and must never go on the wire, so the
     // session-aware layer resolves a replacement before anything is sent.
     if session_id != 0 {
-        return Err(service_client
-            .map_send_error(request_type, SendWithReconnectError::SessionRebindRequired));
+        return Err(
+            if first_failure.dispatched == DispatchState::NotDispatched {
+                service_client
+                    .map_send_error(request_type, SendWithReconnectError::SessionRebindRequired)
+            } else {
+                service_client.map_send_error(
+                    request_type,
+                    SendWithReconnectError::ClientError(first_failure.error),
+                )
+            },
+        );
     }
 
+    let first_error = first_failure.error;
     let epoch = service_client.quic().epoch.load(Ordering::Relaxed);
     let failure = {
         let Some(_permit) = service_client.acquire_command_permit().await else {
@@ -1755,6 +1848,18 @@ async fn send_command_tracked<const HIGH_PRIORITY: bool>(
         connection.created.elapsed().as_millis() as u64,
         Ordering::Relaxed,
     );
+
+    #[cfg(feature = "test_seams")]
+    if session_id != 0
+        && connection
+            .pause_next_session_send
+            .swap(false, Ordering::AcqRel)
+    {
+        connection.session_send_paused.add_permits(1);
+        if let Ok(permit) = connection.resume_session_send.acquire().await {
+            permit.forget();
+        }
+    }
 
     let (command_id, writer, rx, _inflight) = {
         let connection_lock = connection.connection.read().await;

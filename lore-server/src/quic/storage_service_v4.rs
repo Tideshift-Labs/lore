@@ -80,6 +80,7 @@ fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
             QuicServiceError::SlowDown
         }
         MessageHandleError::Oversized => QuicServiceError::Oversized,
+        MessageHandleError::OutcomeUnknown => QuicServiceError::OutcomeUnknown,
         _ => QuicServiceError::Failed,
     }
 }

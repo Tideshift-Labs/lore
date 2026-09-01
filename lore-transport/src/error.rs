@@ -2,6 +2,15 @@
 // SPDX-License-Identifier: MIT
 use lore_base::error::*;
 use lore_error_set::prelude::*;
+use thiserror::Error;
+
+/// Typed proof that a session-bearing command was refused before dispatch.
+///
+/// This stays inside `ProtocolError::Internal`. Making it an error-set variant would widen every
+/// strict-forward target in the client API even though only the session layer may act on it.
+#[derive(Debug, Clone, Error)]
+#[error("Connection replaced; session must be rebound before this command is sent again")]
+pub(crate) struct SessionRebindRequired;
 
 #[error_set(clone)]
 pub enum ProtocolError {
@@ -14,6 +23,17 @@ pub enum ProtocolError {
     NoRemote,
     NotSupported,
     Oversized,
+}
+
+pub(crate) fn is_session_rebind_required(error: &ProtocolError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if source.downcast_ref::<SessionRebindRequired>().is_some() {
+            return true;
+        }
+        current = source.source();
+    }
+    false
 }
 
 impl From<tonic::Status> for ProtocolError {

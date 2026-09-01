@@ -321,6 +321,7 @@ fn handle_error(status: QuicErrorStatus) -> QuicClientError {
         x if x == QuicServiceError::NotAuthorized as u32 => QuicClientError::NotAuthorized,
         x if x == QuicServiceError::NotFound as u32 => QuicClientError::NotFound,
         x if x == QuicServiceError::Oversized as u32 => QuicClientError::Oversized,
+        x if x == QuicServiceError::OutcomeUnknown as u32 => QuicClientError::OutcomeUnknown,
         _ => QuicClientError::ServerError(status),
     }
 }
@@ -346,6 +347,10 @@ mod tests {
         assert!(matches!(
             handle_error(QuicServiceError::Oversized as u32),
             QuicClientError::Oversized
+        ));
+        assert!(matches!(
+            handle_error(QuicServiceError::OutcomeUnknown as u32),
+            QuicClientError::OutcomeUnknown
         ));
     }
 

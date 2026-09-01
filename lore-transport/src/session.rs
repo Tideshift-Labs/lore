@@ -298,20 +298,13 @@ impl StorageSession {
     /// Run one storage operation, allowing a single rebound retry when the connection was
     /// replaced while the command was in flight.
     ///
-    /// Retrying here is safe only because of what the transport does *not* return on this
-    /// path. A mutable command that was dispatched and then lost its response never comes back
-    /// as an error — it comes back as [`MutableOutcome::Unknown`], which is an `Ok` and leaves
-    /// this loop untouched. The same is true of a response that arrived but could not be read:
-    /// `mutable_cas` and `verify` report that as unknown rather than as an error, precisely
-    /// because it describes a write that landed.
-    ///
-    /// So an error reaching this loop means the request did not reach the wire, or the server
-    /// answered it and declined. Note what that does *not* say, because an earlier version of
-    /// this comment said it and was wrong: a server error does not prove nothing was applied.
-    /// It proves an answer arrived. Repeating such a command is safe only where the server's
-    /// refusal is also its whole effect, which is the case for the refusals that reach here —
-    /// and it is why the retry is gated below on the binding rather than on anything about the
-    /// error. Widening what may be retried means re-checking this paragraph first.
+    /// Retrying here is safe only when the transport returns its distinct
+    /// [`crate::error::SessionRebindRequired`] proof. That error is produced from
+    /// [`crate::replay::DispatchState::NotDispatched`] at the write boundary. Every answered error is returned,
+    /// even if a sibling reconnect moved the generation before this task resumed: an answer
+    /// proves only that the server received the command, not that the handler had no effect.
+    /// A dispatched mutable command whose response was lost returns
+    /// [`MutableOutcome::Unknown`] and also leaves this loop untouched.
     ///
     /// That is why every mutable operation below runs its `_outcome` form through here and
     /// collapses the unknown to an error *afterwards*, rather than calling the plain form and
@@ -357,8 +350,13 @@ impl StorageSession {
             //
             // A zero epoch is consulted for its own separate meaning: reconnection has given up,
             // so there is nothing to rebind onto and spending the last attempt is waste.
+            let not_dispatched = crate::error::is_session_rebind_required(&error);
             let replaced = sent_on != storage.connection_generation();
-            if attempts_left == 0 || !replaced || storage.connection_epoch() == GAVE_UP_EPOCH {
+            if attempts_left == 0
+                || !not_dispatched
+                || !replaced
+                || storage.connection_epoch() == GAVE_UP_EPOCH
+            {
                 return Err(error);
             }
 

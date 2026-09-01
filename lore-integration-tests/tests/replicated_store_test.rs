@@ -4,20 +4,46 @@
 mod replicated_store_tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::sync::Weak;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use async_trait::async_trait;
     use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::Partition;
+    use lore_revision::fragment;
     use lore_revision::util::time::RetryPolicy;
+    use lore_server::protocol::replication_store::copy::ImmutableCopy;
+    use lore_server::protocol::replication_store::get::Get;
+    use lore_server::protocol::replication_store::get_metadata::GetMetadata;
+    use lore_server::protocol::replication_store::obliterate::Obliterate;
+    use lore_server::protocol::replication_store::obliterate::ObliterateResponse;
+    use lore_server::protocol::replication_store::put::Put;
+    use lore_server::protocol::replication_store::query::Query;
+    use lore_server::protocol::replication_store::query::QueryResponse;
     use lore_server::quic::quinn::QuinnConfigBuilder;
     use lore_server::quic::quinn::QuinnServer;
     use lore_server::quic::replication_store_service::client::ReplicationStoreClient;
+    use lore_server::quic::replication_store_service::client::ReplicationStoreClientError;
+    use lore_server::quic::replication_store_service::client::StoreClient;
     use lore_server::quic::replication_store_service::client_container::ClientContainerConfig;
+    use lore_server::quic::replication_store_service::client_container::ClientFactory;
     use lore_server::quic::replication_store_service::client_container::QuicClientFactory;
     use lore_server::quic::tests::TestHandlerFactory;
     use lore_server::store::replicated_store::ReplicatedStore;
+    use lore_storage::StoreGetData;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
+    use lore_transport::OutcomeUnknown;
+    use lore_transport::ProtocolError;
+    use lore_transport::connection::Connection;
+    use lore_transport::connection::SuppliedCredentials;
     use lore_transport::quic::client::CertificateSettings;
+    use lore_transport::quic::client::ConnectionStats;
+    use lore_transport::quic::storage_service::client::StorageClient;
+    use lore_transport::replay::MutableOutcome;
+    use lore_transport::traits::Storage;
 
     use crate::setup_execution;
 
@@ -124,6 +150,193 @@ mod replicated_store_tests {
                         .over_wire(),
                 )
                 .await;
+            })
+            .await;
+    }
+
+    struct OutcomeUnknownClient {
+        put_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl StoreClient for OutcomeUnknownClient {
+        async fn connection_stats(&self) -> Option<ConnectionStats> {
+            None
+        }
+
+        async fn put(&self, _request: Put) -> Result<(), ReplicationStoreClientError> {
+            self.put_calls.fetch_add(1, Ordering::Relaxed);
+            Err(ReplicationStoreClientError::OutcomeUnknown(
+                OutcomeUnknown { command: "put" },
+            ))
+        }
+
+        async fn obliterate(
+            &self,
+            _request: Obliterate,
+        ) -> Result<ObliterateResponse, ReplicationStoreClientError> {
+            unreachable!("the outcome-unknown fixture only drives put")
+        }
+
+        async fn get(&self, _request: Get) -> Result<StoreGetData, ReplicationStoreClientError> {
+            unreachable!("the outcome-unknown fixture only drives put")
+        }
+
+        async fn get_metadata(
+            &self,
+            _request: GetMetadata,
+        ) -> Result<StoreGetData, ReplicationStoreClientError> {
+            unreachable!("the outcome-unknown fixture only drives put")
+        }
+
+        async fn local_put(&self, _request: Put) -> Result<(), ReplicationStoreClientError> {
+            unreachable!("the outcome-unknown fixture only drives put")
+        }
+
+        async fn local_get(
+            &self,
+            _request: Get,
+        ) -> Result<StoreGetData, ReplicationStoreClientError> {
+            unreachable!("the outcome-unknown fixture only drives put")
+        }
+
+        async fn local_get_metadata(
+            &self,
+            _request: GetMetadata,
+        ) -> Result<StoreGetData, ReplicationStoreClientError> {
+            unreachable!("the outcome-unknown fixture only drives put")
+        }
+
+        async fn query(
+            &self,
+            _request: Query,
+        ) -> Result<QueryResponse, ReplicationStoreClientError> {
+            unreachable!("the outcome-unknown fixture only drives put")
+        }
+
+        async fn local_query(
+            &self,
+            _request: Query,
+        ) -> Result<QueryResponse, ReplicationStoreClientError> {
+            unreachable!("the outcome-unknown fixture only drives put")
+        }
+
+        async fn copy(&self, _request: ImmutableCopy) -> Result<(), ReplicationStoreClientError> {
+            unreachable!("the outcome-unknown fixture only drives put")
+        }
+    }
+
+    struct OutcomeUnknownFactory {
+        put_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ClientFactory for OutcomeUnknownFactory {
+        type Output = OutcomeUnknownClient;
+
+        async fn make_client(
+            &self,
+            _initial_cwnd: Option<u64>,
+        ) -> Result<Self::Output, ProtocolError> {
+            Ok(OutcomeUnknownClient {
+                put_calls: self.put_calls.clone(),
+            })
+        }
+    }
+
+    /// A peer's typed ambiguous outcome must cross the complete storage-service boundary as an
+    /// ambiguous client outcome, not as an answered error that the session layer could replay.
+    /// `ReplicatedStore` is the real immutable backend of `StorageServiceV4`; the concrete QUIC
+    /// client opens a session and sends a real Put frame through it.
+    #[tokio::test]
+    async fn peer_outcome_unknown_is_not_exposed_as_a_replayable_answered_error() {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let put_calls = Arc::new(AtomicUsize::new(0));
+                let factory = OutcomeUnknownFactory {
+                    put_calls: put_calls.clone(),
+                };
+                let store = ReplicatedStore::new(
+                    Arc::new(factory),
+                    ClientContainerConfig {
+                        regenerate_retry_policy: RetryPolicy::builder()
+                            .with_initial_backoff_millis(1)
+                            .with_max_backoff_millis(1)
+                            .with_limit(1)
+                            .build(),
+                        connection_lost_sleep: Duration::from_millis(1),
+                    },
+                    Duration::from_secs(60),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("ReplicatedStore creation should succeed");
+
+                let local_immutable = lore_storage::local::immutable_store::create(
+                    None::<&str>,
+                    ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local immutable store");
+                let local_mutable = lore_storage::local::mutable_store::create(
+                    None::<&str>,
+                    lore_storage::MutableStoreSettings::default(),
+                    local_immutable,
+                )
+                .await
+                .expect("local mutable store");
+
+                let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind udp");
+                let addr = udp.local_addr().expect("udp local addr");
+                let (cert_file, pkey_file, _ca) =
+                    lore_server::quic::tests::server_certs().expect("test certificate paths");
+                let _server = QuinnServer::start(
+                    QuinnConfigBuilder::new()
+                        .socket(udp)
+                        .cert_file(cert_file)
+                        .pkey_file(pkey_file)
+                        .stream_handler_factory(Box::new(TestHandlerFactory::new(
+                            store,
+                            local_mutable,
+                        )))
+                        .build()
+                        .expect("quinn config"),
+                )
+                .expect("quinn server start");
+
+                let partition = Partition::from([0x51; 16]);
+                let credentials = Arc::new(SuppliedCredentials::default());
+                let client = StorageClient::connect(
+                    Weak::<Connection>::new(),
+                    &format!("quic://127.0.0.1:{}", addr.port()),
+                    String::new(),
+                    "",
+                    "",
+                    partition,
+                    &credentials,
+                )
+                .await
+                .expect("storage client connection");
+                let session_id = client
+                    .session_start(partition, "outcome-unknown")
+                    .await
+                    .expect("storage session start");
+
+                let (fragment, address, payload) = fragment::generate_random();
+                let outcome = client
+                    .put_outcome(session_id, address, fragment, Some(payload))
+                    .await
+                    .expect("the typed wire outcome is not a transport error");
+
+                assert!(matches!(outcome, MutableOutcome::Unknown(_)));
+                assert_eq!(
+                    put_calls.load(Ordering::Relaxed),
+                    1,
+                    "the storage service must issue the peer mutation exactly once"
+                );
             })
             .await;
     }

@@ -86,7 +86,7 @@ pub async fn handle_mutable_cas(
                 Err(StoreError::SlowDown(_)) => Err(MessageHandleError::SlowDown),
                 Err(err) => {
                     warn!(error = ?err, "Failed to CAS mutable key: {}", key);
-                    Err(MessageHandleError::StoreFailure)
+                    Err(MessageHandleError::from(err))
                 }
             }
         })

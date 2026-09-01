@@ -618,17 +618,11 @@ pub fn map_client_error_to_store_error(
             // If we get here, treat it as an internal error.
             StoreError::internal("connection failed")
         }
-        // Deliberately NOT mapped to the same error as `ConnectionFailed`. That one says the
-        // request did not happen; this one says it may have, and the peer's state has to be
-        // re-read rather than assumed. `StoreError` carries no ambiguous-outcome shape today, so
-        // the distinction survives as far as this boundary and no further — the caller-side
-        // reconciliation that would consume it is WP-118/WP-120's, and is named as an unadopted
-        // residual in WP-108's handoff rather than half-built here. The message is explicit so
-        // an operator reading a log is not told the write did not land.
+        // Preserve the typed source through the opaque store boundary. The storage protocol
+        // recognizes it before mapping the error to its dedicated wire status.
         ReplicationStoreClientError::OutcomeUnknown(unknown) => StoreError::internal_with_context(
             unknown,
-            "replication request was dispatched and its response lost; whether the peer applied \
-             it is unknown",
+            "replication request was dispatched and its response lost",
         ),
     }
 }

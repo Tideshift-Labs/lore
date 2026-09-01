@@ -311,13 +311,10 @@ impl StorageClient {
         };
 
         if payload.len() != size_of::<Hash>() {
-            // Reported as unknown, not as an error, and the difference is a retry. The swap was
-            // dispatched and the server answered it, so it may well have been applied; only its
-            // result is unreadable. A plain `Err` here says "this call produced no result",
-            // which `StorageSession::attempt` is entitled to treat as repeatable — and repeating
-            // a compare-and-swap that already moved the key is the defect the whole replay
-            // contract exists to prevent. `Unknown` carries the one instruction that is true
-            // either way: do not repeat it, read the key back.
+            // Reported as unknown, not as an error. The swap was dispatched and the server
+            // answered it, so it may well have been applied; only its result is unreadable. A
+            // plain error would no longer cause a retry, but it would still erase the typed
+            // ambiguity that tells an adopting caller to reconcile. `Unknown` keeps that fact.
             lore_debug!(
                 "mutable_cas: invalid server response, expected {} bytes got {}",
                 size_of::<Hash>(),
@@ -379,7 +376,7 @@ impl StorageClient {
         if payload.len() != 2 {
             // Unknown rather than an error, for the reason given at the same point in
             // `send_mutable_cas`: the server answered, so a healing verify may already have
-            // written, and only the result is unreadable. An error here would be repeatable.
+            // written, and only the result is unreadable. Preserve that typed ambiguity.
             lore_debug!(
                 "verify: invalid server payload for address {address}, got {} bytes",
                 payload.len()
@@ -436,8 +433,11 @@ impl ServiceClient for StorageClient {
             // happen: a caller that needs to tell "never reached the server" from "may have
             // been applied" opts into the typed path, and one that has not is unchanged by
             // this library knowing the difference.
-            SendWithReconnectError::SessionRebindRequired
-            | SendWithReconnectError::OutcomeUnknown(_) => ProtocolError::from(Disconnected),
+            SendWithReconnectError::SessionRebindRequired => ProtocolError::internal_with_context(
+                crate::error::SessionRebindRequired,
+                "storage command was not dispatched",
+            ),
+            SendWithReconnectError::OutcomeUnknown(_) => ProtocolError::from(Disconnected),
             SendWithReconnectError::ReconnectFailed => {
                 if let Some(connection) = self.connection.upgrade() {
                     connection.stale.store(true, Ordering::Relaxed);
@@ -913,6 +913,27 @@ impl Storage for StorageClient {
     /// does, which is why the session layer binds to this one.
     fn connection_generation(&self) -> u32 {
         self.quic.connection_generation()
+    }
+
+    #[cfg(feature = "test_seams")]
+    async fn advance_generation_before_epoch_for_test(&self) -> Result<(), ProtocolError> {
+        self.quic.advance_generation_before_epoch_for_test().await;
+        Ok(())
+    }
+
+    #[cfg(feature = "test_seams")]
+    fn arm_session_send_pause_for_test(&self) -> Result<(), ProtocolError> {
+        self.quic.arm_session_send_pause_for_test()
+    }
+
+    #[cfg(feature = "test_seams")]
+    async fn wait_for_session_send_pause_for_test(&self) -> Result<(), ProtocolError> {
+        self.quic.wait_for_session_send_pause_for_test().await
+    }
+
+    #[cfg(feature = "test_seams")]
+    fn resume_session_send_for_test(&self) {
+        self.quic.resume_session_send_for_test();
     }
 
     async fn close(&self) {
