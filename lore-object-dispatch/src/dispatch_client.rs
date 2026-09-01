@@ -268,6 +268,12 @@ pub enum DispatchAuthorityError {
     OperationTimeout,
     #[error("cell authority commit outcome could not be resolved")]
     AmbiguousCommit,
+    /// The cell database refused a new connection because the instance is at `max_connections`.
+    /// Named rather than folded into [`Self::AuthorityUnavailable`] because this is exactly the
+    /// failure the per-replica connection budget exists to prevent, and the learning that budget
+    /// cites records it being misdiagnosed three times over precisely because it arrived generic.
+    #[error("cell database has no connection slots left")]
+    ConnectionSlotsExhausted,
     #[error("cell authority is unavailable")]
     AuthorityUnavailable,
 }
@@ -287,6 +293,7 @@ impl DispatchAuthorityError {
                 | Self::OperationTimeout
                 | Self::RetryExhausted
                 | Self::AuthorityUnavailable
+                | Self::ConnectionSlotsExhausted
                 | Self::CapacityExhausted
         )
     }
@@ -1225,6 +1232,8 @@ fn refusal_for_sqlstate(code: &SqlState) -> DispatchAuthorityError {
         DispatchAuthorityError::CounterOverflow
     } else if code == &SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE {
         DispatchAuthorityError::SchemaUnavailable
+    } else if code == &SqlState::TOO_MANY_CONNECTIONS {
+        DispatchAuthorityError::ConnectionSlotsExhausted
     } else if code == &SqlState::INSUFFICIENT_RESOURCES {
         DispatchAuthorityError::CapacityExhausted
     } else if code == &SqlState::INVALID_TRANSACTION_STATE {
@@ -1813,6 +1822,22 @@ mod tests {
             refusal_for_sqlstate(&SqlState::INSUFFICIENT_PRIVILEGE),
             DispatchAuthorityError::Unauthorized
         );
+    }
+
+    #[test]
+    fn connection_exhaustion_is_named_and_kept_apart_from_admission_capacity() {
+        // 53300 is the instance out of connection slots - the failure the per-replica budget
+        // exists to prevent. 53000 is the authority refusing an admission. Folding them together
+        // would repeat the misdiagnosis the cited learning records.
+        assert_eq!(
+            refusal_for_sqlstate(&SqlState::TOO_MANY_CONNECTIONS),
+            DispatchAuthorityError::ConnectionSlotsExhausted
+        );
+        assert_eq!(
+            refusal_for_sqlstate(&SqlState::INSUFFICIENT_RESOURCES),
+            DispatchAuthorityError::CapacityExhausted
+        );
+        assert!(DispatchAuthorityError::ConnectionSlotsExhausted.is_transient());
     }
 
     #[test]

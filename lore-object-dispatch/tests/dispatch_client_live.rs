@@ -18,11 +18,16 @@
 //! `tests/run-local-authority-live.ps1`, which distinguishes PASS, FAIL and NOT RUN; an `--ignored`
 //! run with no environment set exits early with 0 passed, which is NOT RUN and never evidence.
 //!
-//! **Not proved here.** An injected lost-`COMMIT` fault. That needs the fault proxy the retention
-//! tier carries, and without it the ambiguity-resolution path is pinned only by the offline tier in
-//! `tests/dispatch_client.rs`. What *is* proved is the authoritative read that resolution performs:
-//! re-issuing an identical call returns `REPLAY` bound to the same descriptor.
+//! Two faults are injected rather than waited for: SQLSTATE `40001`, through a trigger, to drive
+//! the retry budget; and a lost `COMMIT`, through the plaintext proxy at the bottom of this file,
+//! to drive the ambiguity path end to end. The retention tier's own fault proxy could not be reused
+//! for the second: its downstream listener requires a client certificate, and the dispatch pool has
+//! no client-certificate mode because CR-033 D1 dropped that contract with the external authority
+//! database.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore_object_dispatch::DispatchAuthorityError;
@@ -48,6 +53,10 @@ use lore_proto::lore::object_dispatch::v1::ObjectStoreQuotaUnitsV1;
 use lore_proto::lore::object_dispatch::v1::PutReservationStateV1;
 use lore_proto::lore::object_dispatch::v1::PutSpoolReadyV1;
 use lore_proto::lore::object_dispatch::v1::ReservePutAckV1;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 
@@ -81,6 +90,9 @@ const RETRY_INSTANCE: &str = "instance-b-1";
 const EXHAUST_KEY: [u8; 32] = [0xcc; 32];
 const EXHAUST_DISPATCHER_ID: &str = "dispatcher-c";
 const EXHAUST_INSTANCE: &str = "instance-c-1";
+const AMBIGUOUS_KEY: [u8; 32] = [0xee; 32];
+const AMBIGUOUS_DISPATCHER_ID: &str = "dispatcher-e";
+const AMBIGUOUS_INSTANCE: &str = "instance-e-1";
 
 fn uuid_text(timestamp: u64, tail: &str) -> String {
     let padded = format!("{timestamp:012x}");
@@ -416,6 +428,12 @@ fn registration_request_for(
     }
 }
 
+fn database_name(url: &str) -> String {
+    url.rsplit_once('/')
+        .map(|(_, database)| database.to_string())
+        .expect("database name from the runner URL")
+}
+
 fn pool_config(
     base_url: &str,
     role: DispatchPoolRole,
@@ -671,6 +689,9 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
         EXHAUST_KEY.to_vec(),
         registration_record_preimage(RETRY_DISPATCHER_ID, 1, RETRY_INSTANCE),
         registration_record_preimage(EXHAUST_DISPATCHER_ID, 1, EXHAUST_INSTANCE),
+        // The lost-COMMIT coverage below.
+        AMBIGUOUS_KEY.to_vec(),
+        registration_record_preimage(AMBIGUOUS_DISPATCHER_ID, 1, AMBIGUOUS_INSTANCE),
     ] {
         let digest = *blake3::hash(&preimage).as_bytes();
         vectors.push((preimage, digest));
@@ -969,6 +990,86 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
         .await
         .expect("remove the injection trigger");
 
+    // ---------------------------------------------------------------------------------------
+    // The ambiguity path, executed rather than read.
+    //
+    // A plaintext proxy drops the `CommandComplete` for one `COMMIT` and closes the connection.
+    // The server committed; the client's `COMMIT` never completes, so `classify_commit` sees an
+    // error with no SQLSTATE and the outcome is genuinely unknown. `run_mutation` then sets
+    // `ambiguity_seen`, poisons the session, and spends its next attempt on the authoritative
+    // re-issue, which finds the record already present and answers `REPLAY`.
+    //
+    // Every arm this exercises - `commit_sent` true, `classify_commit`'s no-SQLSTATE branch,
+    // `ambiguity_seen`, the poisoned lease, `after_ambiguity()` - had no behavioural coverage
+    // before; they were pinned only by source-text assertions.
+    // ---------------------------------------------------------------------------------------
+    let direct = url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('@'))
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(host, _)| host.to_string())
+        .expect("host:port from the runner URL");
+    let proxy = LostCommitProxy::start(direct).await;
+    let mut through_proxy = pool_config(
+        &url,
+        DispatchPoolRole::Runtime,
+        Duration::from_millis(5_000),
+    );
+    through_proxy.postgres_url = format!(
+        "postgresql://{}@127.0.0.1:{}/{}?sslmode=disable",
+        DispatchPoolRole::Runtime.role_name(),
+        proxy.port,
+        database_name(&url),
+    );
+    let ambiguous_client = DispatchRuntimeClient::new(
+        DispatchRuntimePool::new(through_proxy).expect("proxied runtime pool"),
+    )
+    .expect("proxied runtime client");
+
+    maintenance
+        .enroll_dispatcher_participant(&EnrollParticipantRequest {
+            provider_boundary_id: REGISTRATION_BOUNDARY.into(),
+            dispatcher_id: AMBIGUOUS_DISPATCHER_ID.into(),
+            participant_key_blake3: *blake3::hash(&AMBIGUOUS_KEY).as_bytes(),
+        })
+        .await
+        .expect("enrol the ambiguity participant");
+
+    proxy.drop_next_commit_response();
+    let resolved = ambiguous_client
+        .register_dispatcher(&registration_request_for(
+            AMBIGUOUS_KEY,
+            1,
+            AMBIGUOUS_INSTANCE,
+        ))
+        .await
+        .expect("the ambiguous commit resolves");
+    assert!(
+        proxy.fault_fired(),
+        "the proxy never dropped a COMMIT response, so this proved nothing"
+    );
+    assert_eq!(
+        resolved.disposition,
+        DispatchDisposition::ReplayedAfterAmbiguousCommit,
+        "an unresolved COMMIT that had in fact committed must resolve to a replay"
+    );
+    assert_eq!(resolved.value.dispatcher_id, AMBIGUOUS_DISPATCHER_ID);
+    assert_eq!(resolved.value.lease_generation, 1);
+
+    // The first attempt really did commit, exactly once - the resolution adopted it rather than
+    // writing a second effect.
+    let rows: i64 = admin
+        .query_one(
+            "SELECT pg_catalog.count(*) FROM object_store_retention.object_dispatch_dispatchers
+             WHERE dispatcher_id = $1",
+            &[&AMBIGUOUS_DISPATCHER_ID],
+        )
+        .await
+        .expect("count the ambiguity participant's rows")
+        .get(0);
+    assert_eq!(rows, 1, "the resolution wrote a second effect");
+
     // 0013: admission, then its replay.
     let reserve = reserve_request();
     let reserved_outcome = runtime.reserve_put(&reserve).await.expect("reserve put");
@@ -1104,4 +1205,141 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
         backends <= DECLARED_RUNTIME_SLOTS,
         "runtime role holds {backends} backends against {DECLARED_RUNTIME_SLOTS} declared slots"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A plaintext lost-`COMMIT` fault proxy
+//
+// The retention tier's `RetentionFaultProxy` already injects this fault, but its downstream
+// listener requires a client certificate (`WebPkiClientVerifier::builder(..).build()` is mandatory
+// mTLS) and checks the peer's common name. The dispatch pool deliberately has no client-certificate
+// mode - CR-033 D1 dropped that contract along with the external authority database - so it cannot
+// present one, and widening the shared proxy would change a fixture another tier depends on. This
+// is the same fault against a plaintext cell-local connection, which is the posture the dispatch
+// pool actually ships (`DispatchTlsMode::Disabled`).
+//
+// Only the server-to-client direction is parsed. PostgreSQL backend messages are always tagged, so
+// no startup-message special case is needed: when armed, the `CommandComplete` frame carrying
+// `COMMIT` is dropped and the connection is closed instead of forwarded. The server has committed;
+// the client never learns it did. That is exactly the state `AmbiguousCommit` exists for.
+// ---------------------------------------------------------------------------------------------
+
+struct LostCommitProxy {
+    port: u16,
+    arm: Arc<AtomicBool>,
+    fired: Arc<AtomicBool>,
+    _task: AbortOnDropHandle<()>,
+}
+
+impl LostCommitProxy {
+    async fn start(upstream: String) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind lost-commit proxy");
+        let port = listener.local_addr().expect("proxy address").port();
+        let arm = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
+        let task_arm = Arc::clone(&arm);
+        let task_fired = Arc::clone(&fired);
+        let task = AbortOnDropHandle::new(lore_base::lore_spawn!(
+            "dispatch-lost-commit-proxy",
+            async move {
+                let mut connections = Vec::new();
+                while let Ok((downstream, _)) = listener.accept().await {
+                    let upstream = upstream.clone();
+                    let arm = Arc::clone(&task_arm);
+                    let fired = Arc::clone(&task_fired);
+                    connections.push(AbortOnDropHandle::new(lore_base::lore_spawn!(
+                        "dispatch-lost-commit-connection",
+                        async move {
+                            if let Ok(server) = TcpStream::connect(&upstream).await {
+                                relay(downstream, server, arm, fired).await;
+                            }
+                        }
+                    )));
+                }
+            }
+        ));
+        Self {
+            port,
+            arm,
+            fired,
+            _task: task,
+        }
+    }
+
+    /// Drop the next `COMMIT` response instead of forwarding it, once.
+    fn drop_next_commit_response(&self) {
+        self.fired.store(false, Ordering::Release);
+        self.arm.store(true, Ordering::Release);
+    }
+
+    fn fault_fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+}
+
+async fn relay(
+    downstream: TcpStream,
+    upstream: TcpStream,
+    arm: Arc<AtomicBool>,
+    fired: Arc<AtomicBool>,
+) {
+    let (mut downstream_read, mut downstream_write) = downstream.into_split();
+    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+    let forward = async move {
+        // Client to server is copied verbatim; nothing about the fault depends on it.
+        let _ = tokio::io::copy(&mut downstream_read, &mut upstream_write).await;
+    };
+    let backward = async move {
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read = match upstream_read.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => read,
+            };
+            buffer.extend_from_slice(&chunk[..read]);
+            let mut offset = 0usize;
+            while buffer.len() - offset >= 5 {
+                let tag = buffer[offset];
+                let Ok(length) = <[u8; 4]>::try_from(&buffer[offset + 1..offset + 5]) else {
+                    return;
+                };
+                let length = u32::from_be_bytes(length) as usize;
+                if length < 4 {
+                    return;
+                }
+                let total = 1 + length;
+                if buffer.len() - offset < total {
+                    break;
+                }
+                let is_commit_complete = tag == b'C'
+                    && &buffer[offset + 5..offset + total] == b"COMMIT\0"
+                    && arm.swap(false, Ordering::AcqRel);
+                if is_commit_complete {
+                    // The server committed. Close without forwarding, so the client's `COMMIT`
+                    // never completes and its outcome is genuinely unknown to it.
+                    fired.store(true, Ordering::Release);
+                    return;
+                }
+                if downstream_write
+                    .write_all(&buffer[offset..offset + total])
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                offset += total;
+            }
+            buffer.drain(..offset);
+            if downstream_write.flush().await.is_err() {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        () = forward => {}
+        () = backward => {}
+    }
 }

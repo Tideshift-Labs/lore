@@ -335,16 +335,24 @@ is not its own role, so a maintenance credential cannot reach a runtime mutation
 `STAGING_DISPATCH_CONNECTION_BUDGET` carry it: per replica, three `lore-postgres` store pools plus
 one dispatch-runtime pool, all against the same cell database, none coordinating; at staging's
 `pool_max = 5` that is `(3 + 1) * 5 = 20` connections per replica, before the control plane's own
-pools on the same instance. `DispatchRuntimePool::new` refuses a `pool_max` above the budget it is
-given. What it cannot check is the sum across a process: a pool sees only itself, so two pools each
+pools on the same instance. The sizing rule and the failure mode it prevents are
+`lorehub/docs/learnings/do-managed-pg-connection-budget.md`: an instance sized for the app pools
+alone rather than the full consumer set was exhausted at `max_connections = 25`, and the exhaustion
+surfaced as SQLSTATE `53300` in three unrelated-looking failures rather than as an obvious pool
+error — which is why `53300` has its own named arm here rather than falling to the generic one.
+`DispatchRuntimePool::new` refuses a `pool_max` above the budget it is given. What it cannot check is the sum across a process: a pool sees only itself, so two pools each
 declaring `dispatch_pools: 1` are individually valid and jointly over. Making the sum true is a
 composition-time obligation, recorded as a named residual in WP-114 CD-3.
 
 **Closed decoding.** Each procedure returns `CREATED`/`REPLAY` or `APPLIED`/`REPLAY`, and each
 failure is a `RAISE EXCEPTION` with a frozen message literal and a SQLSTATE. An unrecognized result
 code is `UnrecognizedResultCode`, never a default. Conditions map through one closed table; an
-unrecognized SQLSTATE fails closed as `AuthorityUnavailable`. Every decoded projection is bound back
-to the descriptor its call submitted before it is returned.
+unrecognized SQLSTATE fails closed as `AuthorityUnavailable`. Before a projection is returned, every
+field it carries that the call also supplied is compared against what was supplied — which is the
+whole projection except the fields the authority mints itself (0020's `dispatcher_id` and
+`provider_boundary_id` come from the enrolled participant row, so the call has nothing to compare
+them to). That set is derived from the request and outcome types rather than hand-listed, so a
+binding dropped from any decoder fails the offline tier.
 
 **The bounded-execution envelope (CR-033 D1), verbatim.** Every transaction opens with
 `SET LOCAL statement_timeout` and `lock_timeout`. Read-only transactions are never retried.
@@ -503,9 +511,12 @@ rather than only the embedded migration bytes agreeing with the client staticall
 calls through the public client API, connecting as the authority roles themselves rather than
 assuming them with `SET SESSION AUTHORIZATION`, and injects SQLSTATE `40001` through a trigger to
 drive the retry loop itself - two conflicts then success on the third attempt, on a `pool_max = 1`
-pool so a retry loop that retained its lease across the backoff would fail closed instead. An injected lost-`COMMIT` fault
-is NOT RUN: it needs the fault proxy the retention tier carries, so the ambiguity-resolution path
-remains pinned only offline.
+pool so a retry loop that retained its lease across the backoff would fail closed instead. It also
+injects a lost `COMMIT`, through a plaintext fault proxy in the same file, and proves the whole
+ambiguity path end to end: the server commits, the client never learns it did, and the next attempt's
+authoritative re-issue resolves it to `ReplayedAfterAmbiguousCommit` having written exactly one row.
+The retention tier's own fault proxy could not be reused - its downstream listener requires a client
+certificate, and the dispatch pool has no client-certificate mode.
 
 `run-provider-charge-live.ps1` proves the limiter's concurrent last-unit behavior, frozen
 revision/fence grammar, exact publication replay, stage-3 configuration checks, database-clock and

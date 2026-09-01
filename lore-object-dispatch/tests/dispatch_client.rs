@@ -29,14 +29,19 @@ use lore_object_dispatch::DispatchRecordLimits;
 use lore_object_dispatch::DispatchRuntimeClient;
 use lore_object_dispatch::DispatchRuntimePool;
 use lore_object_dispatch::DispatchTlsMode;
+use lore_object_dispatch::EnrollParticipantOutcome;
 use lore_object_dispatch::EnrollParticipantRequest;
 use lore_object_dispatch::PUT_SPOOL_READY_API_REVISION_V1;
 use lore_object_dispatch::PUT_UPLOAD_PROGRESS_API_REVISION_V1;
+use lore_object_dispatch::PutSpoolReadyOutcome;
 use lore_object_dispatch::PutSpoolReadyRequest;
 use lore_object_dispatch::PutStreamIdentity;
+use lore_object_dispatch::PutUploadProgressOutcome;
 use lore_object_dispatch::PutUploadProgressRequest;
 use lore_object_dispatch::RESERVE_PUT_API_REVISION_V1;
+use lore_object_dispatch::RegisterDispatcherOutcome;
 use lore_object_dispatch::RegisterDispatcherRequest;
+use lore_object_dispatch::ReservePutOutcome;
 use lore_object_dispatch::ReservePutQuotaScope;
 use lore_object_dispatch::ReservePutRequest;
 use lore_object_dispatch::STAGING_DISPATCH_CONNECTION_BUDGET;
@@ -862,7 +867,7 @@ fn every_transaction_sets_both_local_timeouts() {
     let mutation = section(
         CLIENT_SOURCE,
         "async fn mutate_on_lease",
-        "/// Resolve a commit",
+        "/// One read-only transaction",
     );
     assert!(mutation.contains("batch_execute(&preamble)"));
     let read = section(CLIENT_SOURCE, "async fn read_on_lease", "// ------");
@@ -933,32 +938,104 @@ fn only_a_commit_with_no_sqlstate_is_ambiguous_and_it_is_resolved_not_reported()
     );
 }
 
+/// The `pub` field names of a struct declared in the client, in declaration order.
+fn struct_fields(type_name: &str) -> Vec<String> {
+    let body = section(
+        CLIENT_SOURCE,
+        &format!("pub struct {type_name} {{"),
+        "\n}\n",
+    );
+    body.lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("pub "))
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, _)| name.trim().to_string())
+        .collect()
+}
+
 #[test]
-fn every_decoder_binds_its_projection_to_the_descriptor_the_call_submitted() {
-    // A replay returns the authority's stored projection. If a decoder accepted it without
-    // checking it names what this call submitted, an ambiguity resolution could adopt another
-    // writer's record as its own result. This is a structural pin: it proves each decoder performs
-    // a binding check against `self.request`, not that the check covers every field.
+fn every_decoder_binds_every_field_the_call_submitted_and_the_projection_returns() {
+    // A replay returns the authority's stored projection. If a decoder accepts one without
+    // checking it names what this call submitted, an ambiguity resolution can adopt another
+    // writer's record as its own result.
+    //
+    // The previous version asserted only that each decode body contained `require(` and
+    // `self.request`. Deleting the `attempt_id` comparison from `PreparedReservePut::decode`
+    // survived a full green run, and `attempt_id` is precisely the field that distinguishes two
+    // attempts of one logical mutation. So the required set is *derived*: every field the outcome
+    // returns that the request or its stream identity also carries must appear in a comparison
+    // against `self.request`. Database-minted fields, which the call cannot supply, are correctly
+    // outside that set and are not demanded.
     const SIGNATURE: &str = "fn decode(&self, row: &Row) -> Result<DispatchAccepted<Self::Outcome>, DispatchAuthorityError> {";
     let decoders: Vec<&str> = CLIENT_SOURCE
         .match_indices(SIGNATURE)
         .map(|(index, _)| {
             let tail = &CLIENT_SOURCE[index..];
-            let end = tail.find("\n    }\n").map_or(tail.len(), |offset| offset);
+            let end = tail
+                .find("\n    }\n")
+                .unwrap_or_else(|| panic!("a decode body is unterminated"));
             &tail[..end]
         })
         .collect();
     assert_eq!(
         decoders.len(),
         5,
-        "expected one decoder per called mutation, found {}",
-        decoders.len()
+        "expected one decoder per called mutation"
     );
-    for decoder in decoders {
+
+    let identity_fields = struct_fields("PutStreamIdentity");
+    assert!(
+        identity_fields.contains(&"attempt_id".to_string()),
+        "PutStreamIdentity parse found no attempt_id: {identity_fields:?}"
+    );
+
+    for (index, (request_type, outcome_type, minted)) in [
+        ("ReservePutRequest", "ReservePutOutcome", &[][..]),
+        (
+            "PutUploadProgressRequest",
+            "PutUploadProgressOutcome",
+            &["spool_object_id"][..],
+        ),
+        (
+            "PutSpoolReadyRequest",
+            "PutSpoolReadyOutcome",
+            &["spool_object_id"][..],
+        ),
+        (
+            "EnrollParticipantRequest",
+            "EnrollParticipantOutcome",
+            &[][..],
+        ),
+        (
+            "RegisterDispatcherRequest",
+            "RegisterDispatcherOutcome",
+            // 0020 mints both identity columns from the enrolled participant row; the call never
+            // supplies them, so they cannot be bound and must not be demanded.
+            &["dispatcher_id", "provider_boundary_id"][..],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let decoder = decoders[index];
+        let mut submitted = struct_fields(request_type);
+        submitted.extend(identity_fields.iter().cloned());
+        let required: Vec<String> = struct_fields(outcome_type)
+            .into_iter()
+            .filter(|field| submitted.contains(field) && !minted.contains(&field.as_str()))
+            .collect();
         assert!(
-            decoder.contains("require(") && decoder.contains("self.request"),
-            "a decoder accepts a projection without binding it to the submitted call"
+            !required.is_empty(),
+            "{outcome_type}: derived an empty binding set, which would make this vacuous"
         );
+        for field in &required {
+            let comparison = format!("value.{field} == self.request");
+            assert!(
+                decoder.contains(&comparison),
+                "{outcome_type}: `{field}` is returned and was submitted, but the decoder does \
+                 not bind it (looked for `{comparison}`)"
+            );
+        }
     }
 }
 
@@ -1011,7 +1088,7 @@ fn a_wall_clock_timeout_before_commit_is_sent_is_a_refusal_not_an_ambiguity() {
     let body = section(
         CLIENT_SOURCE,
         "async fn mutate_on_lease",
-        "/// Resolve a commit",
+        "/// One read-only transaction",
     );
     let store = body
         .find("commit_sent.store(true, Ordering::SeqCst);")
@@ -1115,7 +1192,23 @@ fn quota() -> ReservePutQuotaScope {
 /// list of known-secret substrings is deliberate: a substring list only catches the values the test
 /// author thought to plant, and an earlier version of this test missed a mutation that swapped a
 /// redacted field for an unredacted one because the newly disclosed value was not on the list.
-const RENDERABLE_KEYS: [&str; 12] = [
+const RENDERABLE_KEYS: [&str; 26] = [
+    // Pool configuration. None of these name a subject; the URL and the CA bundle, which do, are
+    // redacted by their own `Debug` impls and are checked by this same allowlist.
+    "role",
+    "pool_max",
+    "connect_timeout",
+    "acquire_timeout",
+    "statement_timeout",
+    "lock_timeout",
+    "tls",
+    "budget",
+    "store_pools",
+    "dispatch_pools",
+    "statement_timeout_ms",
+    "lock_timeout_ms",
+    "operation_timeout",
+    "connections_per_replica",
     // Bounds and limits, which describe the schema rather than the subject.
     "limits",
     "maximum_identity_bytes",
@@ -1239,35 +1332,115 @@ fn no_request_type_discloses_an_identifier_or_a_boundary_id_through_debug() {
 }
 
 #[test]
-fn no_outcome_type_or_error_discloses_an_identifier_through_display_or_debug() {
-    // Outcome types are constructed only by the decoder, so their redaction is pinned through the
-    // Debug impls' own source shape rather than a fabricated value.
-    for outcome in [
-        "impl fmt::Debug for ReservePutOutcome",
-        "impl fmt::Debug for PutUploadProgressOutcome",
-        "impl fmt::Debug for PutSpoolReadyOutcome",
-        "impl fmt::Debug for EnrollParticipantOutcome",
-        "impl fmt::Debug for RegisterDispatcherOutcome",
-    ] {
-        let body = section(CLIENT_SOURCE, outcome, "}\n\n");
-        for identifier in [
-            "logical_request_id",
-            "attempt_id",
-            "upload_id",
-            "spool_object_id",
-            "provider_boundary_id",
-            "dispatcher_id",
-            "durable_handle",
-        ] {
-            if let Some(index) = body.find(&format!("\"{identifier}\"")) {
-                let line = &body[index..body[index..].find('\n').map_or(body.len(), |e| index + e)];
-                assert!(
-                    line.contains("[REDACTED]"),
-                    "{outcome}: {identifier} is rendered, not redacted: {line}"
-                );
+fn no_outcome_type_discloses_an_identifier_through_debug() {
+    // Constructed values, checked by the same structural rule the request types get. The previous
+    // version grepped each `Debug` impl for seven hard-coded field names, which is the same "list
+    // of what the author thought to plant" that the request-side test already failed at, moved
+    // from values to field names: rendering `upload_fence` and the ACK bytes raw survived a full
+    // green run. Every outcome field is `pub`, so nothing here depends on the decoder.
+    assert_redacted(
+        "ReservePutOutcome",
+        &format!(
+            "{:#?}",
+            ReservePutOutcome {
+                spool_object_id: Uuid::from_u128(0x7777_8888_9999_aaaa_bbbb_cccc_dddd_eeee),
+                logical_request_id: Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888),
+                attempt_id: Uuid::from_u128(0x9999_aaaa_bbbb_cccc_dddd_eeee_ffff_0000),
+                upload_id: Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+                upload_fence: 987_654_321,
+                admission_clock_unix_ms: 2000,
+                expires_at_unix_ms: 3000,
+                reserve_put_ack_canonical_bytes: b"boundary-secret".to_vec(),
+                reserve_put_ack_blake3: [7; 32],
             }
-        }
-    }
+        ),
+    );
+    assert_redacted(
+        "PutUploadProgressOutcome",
+        &format!(
+            "{:#?}",
+            PutUploadProgressOutcome {
+                spool_object_id: Uuid::from_u128(0x7777_8888_9999_aaaa_bbbb_cccc_dddd_eeee),
+                logical_request_id: Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888),
+                attempt_id: Uuid::from_u128(0x9999_aaaa_bbbb_cccc_dddd_eeee_ffff_0000),
+                upload_id: Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+                upload_fence: 987_654_321,
+                committed_prefix_bytes: 987_654_321,
+                committed_prefix_chunks: 987_654_321,
+                spool_revision: 987_654_321,
+                record_blake3: [7; 32],
+            }
+        ),
+    );
+    assert_redacted(
+        "PutSpoolReadyOutcome",
+        &format!(
+            "{:#?}",
+            PutSpoolReadyOutcome {
+                spool_object_id: Uuid::from_u128(0x7777_8888_9999_aaaa_bbbb_cccc_dddd_eeee),
+                logical_request_id: Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888),
+                attempt_id: Uuid::from_u128(0x9999_aaaa_bbbb_cccc_dddd_eeee_ffff_0000),
+                upload_id: Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+                upload_fence: 987_654_321,
+                durable_handle: "handle-secret".into(),
+                committed_size: 987_654_321,
+                committed_blake3: [7; 32],
+                ready_at_unix_ms: 2000,
+                reserve_put_ack_canonical_bytes: b"boundary-secret".to_vec(),
+                reserve_put_ack_blake3: [7; 32],
+                spool_revision: 987_654_321,
+                record_blake3: [7; 32],
+            }
+        ),
+    );
+    assert_redacted(
+        "EnrollParticipantOutcome",
+        &format!(
+            "{:#?}",
+            EnrollParticipantOutcome {
+                provider_boundary_id: "boundary-secret".into(),
+                dispatcher_id: "instance-secret".into(),
+            }
+        ),
+    );
+    assert_redacted(
+        "RegisterDispatcherOutcome",
+        &format!(
+            "{:#?}",
+            RegisterDispatcherOutcome {
+                dispatcher_id: "instance-secret".into(),
+                lease_generation: 987_654_321,
+                provider_boundary_id: "boundary-secret".into(),
+                service_instance_id: "instance-secret".into(),
+                dispatcher_fence: 987_654_321,
+                state: 1,
+                record_blake3: [7; 32],
+            }
+        ),
+    );
+}
+
+#[test]
+fn no_pool_type_discloses_its_url_or_tls_material_through_debug() {
+    // Same structural rule again. The pool's own unit tests substring-check for the planted host
+    // and password, which is the weaker form; this checks the set of rendered fields.
+    let mut config = pool_config(DispatchPoolRole::Runtime);
+    config.postgres_url = format!(
+        "postgresql://{DISPATCH_RUNTIME_ROLE}:boundary-secret@handle-secret:5432/cell?sslmode=require"
+    );
+    config.tls = DispatchTlsMode::PinnedRootCa("instance-secret".into());
+    assert_redacted("DispatchPoolConfig", &format!("{config:#?}"));
+
+    let mut plaintext = pool_config(DispatchPoolRole::Runtime);
+    plaintext.postgres_url = format!(
+        "postgresql://{DISPATCH_RUNTIME_ROLE}:boundary-secret@handle-secret:5432/cell?sslmode=disable"
+    );
+    let pool = DispatchRuntimePool::new(plaintext).expect("pool");
+    assert_redacted("DispatchRuntimePool", &format!("{pool:#?}"));
+}
+
+#[test]
+fn no_error_variant_carries_a_value_that_display_could_leak() {
     // No error variant carries a value at all, so no `Display` can leak one.
     let enum_body = section(
         CLIENT_SOURCE,
@@ -1361,14 +1534,17 @@ fn the_connection_budget_statement_is_present_and_arithmetically_true() {
             "the budget statement omits {fragment}"
         );
     }
-    // The learning the statement cites still exists at the path it names.
-    let learning =
-        workspace_root().join("lorehub/docs/learnings/do-managed-pg-connection-budget.md");
-    assert!(
-        learning.is_file(),
-        "the cited connection-budget learning is missing at {}",
-        learning.display()
-    );
+    // Cross-checked against the crate's own README, which is inside the repo. An earlier version
+    // resolved `<lore>/../lorehub/docs/learnings/` and asserted the cited learning existed on
+    // disk, which made `cargo test -p lore-object-dispatch` fail in any fork checkout outside this
+    // container layout. The fork is meant to stand alone, so no test here reaches outside it.
+    let readme = include_str!("../README.md");
+    for fragment in ["(3 + 1) * 5 = 20", "do-managed-pg-connection-budget.md"] {
+        assert!(
+            readme.contains(fragment),
+            "the crate README no longer carries the budget fragment {fragment}"
+        );
+    }
 }
 
 #[test]
@@ -1472,19 +1648,20 @@ fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn workspace_root() -> PathBuf {
-    crate_root()
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .expect("workspace container root")
-}
-
+/// The slice of `source` from `start_marker` up to the next `end_marker`.
+///
+/// **Both markers must be found.** An earlier version fell back to the end of the file when the end
+/// marker was missing, so a marker left stale by a refactor silently widened the "function body" to
+/// the whole file tail - including `#[cfg(test)]` - and the assertions over it kept passing for the
+/// wrong reason. A silent degrade in a source-text tier is how two unfalsifiable guarantees got
+/// through review, so this fails loudly instead.
 fn section<'a>(source: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
     let start = source
         .find(start_marker)
         .unwrap_or_else(|| panic!("missing section start: {start_marker}"));
     let rest = &source[start..];
-    let end = rest.find(end_marker).unwrap_or(rest.len());
+    let end = rest.find(end_marker).unwrap_or_else(|| {
+        panic!("missing section end `{end_marker}` after start `{start_marker}`")
+    });
     &rest[..end]
 }
