@@ -40,14 +40,19 @@
 //! names are not re-exported either — so the gateway it holds can only be the
 //! unwired one.
 //!
-//! **Scope: this is a fact about crate manifests, not a global one.** Any crate
-//! that adds `lore-object-dispatch` to its own `Cargo.toml` can build a
-//! provider client and issue attempts without touching the seam at all, and
-//! nothing inside the seam can stop it. What holds today is that no caller in
-//! the crates that exist can, enforced by this crate's dependency list and the
-//! seam's manifest and no-re-export pins. Stated narrowly on purpose: a
-//! guarantee written wider than the property is what produced six evasions of
-//! the version this replaced.
+//! **Scope: the seam crate is the trust boundary.** No caller outside it can
+//! reach the provider, and that is compiler-enforced. Two things sit outside
+//! the guarantee, both deliberately: a crate that adds `lore-object-dispatch`
+//! to its own manifest can build a client without touching the seam, and inside
+//! the seam a deliberate new public API — a forwarding method over locally
+//! aliased types — can widen the boundary. The second is review-checked and no
+//! source pin can hold it, because it is a property of a method body rather
+//! than a declaration.
+//!
+//! Stated this narrowly on purpose. Seven rounds of evasions came from claims
+//! written wider than the property they held, and at some point "someone
+//! editing the trust boundary can widen the trust boundary" stops being a
+//! defect and becomes the definition of the boundary.
 //!
 //! `domain/fragments/` is the separately owned WP-118 package, nested under
 //! `domain/` so it can share that lock order and pool. WP-116 yielded it for

@@ -38,15 +38,25 @@
 //!   seam re-exports, so the gateway this crate holds can only ever be the
 //!   unwired one.
 //!
-//! **And the scope, stated as narrowly as it is true.** This is a fact about
-//! *this crate's manifest*, not a global one. Any crate that adds
-//! `lore-object-dispatch` to its own `Cargo.toml` can construct a
-//! `GovernedProviderClient` and issue attempts without touching the seam, and
-//! nothing in the seam can prevent that. What holds is that no caller in the
-//! crates that exist today can — `lore-postgres` does not depend on the
-//! dispatch crate and `lore-server` has no reference to it — enforced by this
-//! crate's dependency list plus the seam's own manifest and no-re-export pins.
-//! A new crate opting in is a manifest edit no pin here can see.
+//! **And the scope, stated as narrowly as it is true.** The seam crate is the
+//! trust boundary, and the guarantee is about *crates*, not about the seam's
+//! internals:
+//!
+//! - **No caller outside the seam can reach the provider.** The parameter types
+//!   are unnameable here and no client value is obtainable; both are
+//!   compiler-enforced. That covers this crate and `lore-server`.
+//! - **A crate that opts in is outside the guarantee.** Anything that adds
+//!   `lore-object-dispatch` to its own `Cargo.toml` can build a client and issue
+//!   attempts without touching the seam. A manifest edit, which no pin sees.
+//! - **Inside the seam, a deliberate new public API can widen the boundary** —
+//!   a forwarding method over locally aliased types would expose the call.
+//!   Review-checked, not compiler-checked, and no source pin can hold it,
+//!   because it is a property of a method body rather than a declaration.
+//!
+//! What enforces the first bullet is this crate's dependency list plus the
+//! seam's manifest, no-re-export and trait-privacy pins. The pins raise the
+//! cost of widening the boundary by accident; they do not stop it being done on
+//! purpose, and the record says so rather than claiming the last inch.
 //!
 //! Only `provider.rs` moved. The rest of `domain/fragments/` cannot follow it:
 //! the coordinator needs `DomainError`, `lock_order`, `schema::STATE_LIVE` and

@@ -10,10 +10,12 @@
 //! - "only the seam reaches the governed client" and "the seam publishes no
 //!   route to it" — `lore-postgres` does not depend on `lore-object-dispatch`,
 //!   and the client is erased behind [`AttemptSink`], so a caller there cannot
-//!   construct `execute`'s arguments and has nothing to call it on. A scan for
-//!   aliases and accessors was guarding a property the compiler now holds.
-//!   (Narrow wording on purpose: a call expression with divergent arguments is
-//!   still writable and panics. See the crate docs.)
+//!   construct `execute`'s arguments and no accessor can hand it anything
+//!   callable. A scan for aliases and accessors was guarding a property the
+//!   compiler now holds. (Narrow wording on purpose: a call expression with
+//!   divergent arguments is still writable and panics, and a *deliberate*
+//!   forwarding method written here would widen the boundary. See the crate
+//!   docs for where the line is.)
 //! - "the package builds no private provider client" — for *this* crate that is
 //!   the dependency graph. The four files still in `lore-postgres` keep a
 //!   reduced version of that scan, in that crate's own pins file.
@@ -21,7 +23,10 @@
 //!   `include!`/`#[path]` refusal, the alias resolver, the four-placement
 //!   self-proof — went with them, except what the rules below still need.
 //!
-//! Four rules remain, and each is here because nothing else holds it.
+//! Five rules remain, and each is here because nothing else holds it: no
+//! publication of the fourteen types the re-export assessment depends on, the
+//! erasure trait staying private, no AWS SDK in the manifest, no filesystem
+//! access, and the constructor signature.
 //!
 //! # Known limit, recorded rather than fixed
 //!
@@ -81,10 +86,11 @@ const FILESYSTEM_TOKENS: [&str; 8] = [
 /// right-hand sides, and `pub fn` signatures.
 ///
 /// **What carries claim 1 is the [`AttemptSink`] erasure, not this pin.** With
-/// the client boxed behind a private trait there is nothing to call `execute`
-/// on, so publishing its parameter types buys nothing. Claims 2 through 4 have
-/// no such backstop: they rest on these names being absent and on nothing else,
-/// which is why the list is the whole of their enforcement.
+/// the client boxed behind a private trait, no accessor can hand out anything
+/// callable, so publishing its parameter types buys an outside caller nothing.
+/// Claims 2 through 4 have no such backstop: they rest on these names being
+/// absent and on nothing else, which is why the list is the whole of their
+/// enforcement.
 ///
 /// **Built by asking, for each claim, "what would have to be re-exported to
 /// make this false, and is that type covered?"** That sweep found the list had
@@ -422,6 +428,39 @@ fn public_fn_signatures(text: &str) -> Vec<String> {
     signatures
 }
 
+/// `AttemptSink` must stay private, because one word is the whole difference.
+///
+/// **Claim protected: no accessor can hand out anything callable.** That rests
+/// entirely on the trait being private — `private_interfaces` refuses
+/// `pub fn inner(&self) -> &dyn AttemptSink` only while it is. Adding `pub` to
+/// the declaration is a single token that silently removes the erasure's entire
+/// protection: clippy stays at zero errors, this suite stayed at 9/9, and the
+/// exploit builds.
+///
+/// This is the same class as every other finding in this campaign — a property
+/// resting on something nobody checks — and the cheapest possible edit to make
+/// by accident, which is exactly why it is worth a pin.
+#[test]
+fn the_erasure_trait_stays_private() {
+    let shipped = shipped_code(&read("src/lib.rs"));
+    assert!(
+        shipped.contains("\ntrait AttemptSink"),
+        "AttemptSink must be declared, and declared private",
+    );
+    for widened in [
+        "pub trait AttemptSink",
+        "pub(crate) trait AttemptSink",
+        "pub(super) trait AttemptSink",
+    ] {
+        assert!(
+            !shipped.contains(widened),
+            "AttemptSink is declared as `{widened}`, which falsifies \"no accessor \
+             can hand out anything callable\": `private_interfaces` refuses an \
+             accessor returning it only while the trait is private",
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rule 2: property 3's structural form depends on a manifest
 // ---------------------------------------------------------------------------
@@ -462,6 +501,18 @@ fn the_seam_manifest_admits_no_provider_sdk() {
 /// A crate boundary does not prevent `std::fs`, and CR-031's no-pre-admission-spool
 /// rule needs it to. The seam supplies no durable body of its own; the caller
 /// brings one.
+///
+/// **A corroborating lint exists, narrowly.** `clippy::items_after_test_module`
+/// also catches code appended *below* the test module, but only under
+/// `--all-targets`: the lint fires on the lib **test** target, and without that
+/// flag there is no test module for anything to be after. It is easy to miss
+/// even then, because `dead_code` fails the lib target first and cargo stops
+/// before printing it — which is why an earlier attempt to reproduce it saw
+/// only `dead_code` and wrongly concluded it did not fire. Both observations
+/// were right; they were about different targets.
+///
+/// It says nothing about the same code placed *above* the tests, so this pin
+/// remains the real guard and the lint is corroboration, not a second one.
 ///
 /// **This rule deliberately does not use [`shipped_code`].** It scans the whole
 /// comment-stripped file, tests included, so the `#[cfg(test)]` walk — and the

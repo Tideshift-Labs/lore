@@ -97,11 +97,30 @@
 //! fails with *"trait `AttemptSink` is more private than the item"* under
 //! `-D warnings`.
 //!
-//! What remains review-checked is narrower: a new file **inside this crate**
-//! could construct its own `GovernedProviderClient` — the dependency is here
-//! because the seam needs it — and use it directly rather than through the
-//! gateway. That is one small crate's worth of surface, and no dependency or
-//! privacy rule reaches it.
+//! # Where the boundary actually is
+//!
+//! **The seam crate is the trust boundary.** No caller outside it can reach the
+//! provider: the parameter types are unnameable and no client value is
+//! obtainable, and both are compiler-enforced.
+//!
+//! **Inside the seam, a deliberate new public API can widen it.** A forwarding
+//! method — `pub async fn issue_raw(&self, ledger: &mut PublicLedger, request:
+//! &PublicRequest)` over locally aliased types, calling `self.client.issue`
+//! internally — would expose exactly that call. That is review-checked, not
+//! compiler-checked, and **no source pin can hold it**, because it is a property
+//! of a method body rather than of a declaration. The pins raise the cost of
+//! doing it by accident; they do not stop it being done on purpose.
+//!
+//! An earlier revision said there was "nothing to call `execute` on". That is
+//! not quite true and the difference is the last inch of this claim: you do not
+//! need a value, you need a method, and this crate can write one. Seven rounds
+//! of evasions came from claiming an inch more than was held, so the line is
+//! drawn here — at the crate, not inside it.
+//!
+//! The same applies to a new file here constructing its own
+//! `GovernedProviderClient`; the dependency is present because the seam needs
+//! it. At some point "someone editing the trust boundary can widen the trust
+//! boundary" stops being a defect and becomes the definition of the boundary.
 //!
 //! # The scope of the guarantee, stated as narrowly as it is true
 //!
