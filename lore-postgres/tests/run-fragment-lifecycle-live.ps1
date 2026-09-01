@@ -76,7 +76,23 @@ $inventory = @(
             'revalidate_push_witness_aborts_when_a_required_fragment_is_no_longer_readable',
             'revalidate_push_witness_aborts_when_a_required_fragments_epoch_advanced',
             'revalidate_push_witness_refuses_over_the_revalidation_limit_before_locking_any_fragment_row',
+            # CR-031:266 (INV-EF P2-2): the semantically-equivalent-epoch push fallback allowance.
+            'revalidate_push_witness_accepts_a_required_fragment_promoted_to_a_semantically_equivalent_epoch',
+            'revalidate_push_witness_aborts_when_the_new_epoch_describes_different_content',
+            # Pre-Phase-5 hardening review: equivalent_epochs' all-or-nothing rule over a real
+            # two-fragment batch, plus a required fragment whose captured epoch was never published.
+            'revalidate_push_witness_all_or_nothing_over_a_mixed_divergent_batch',
+            'revalidate_push_witness_aborts_when_the_captured_epoch_was_never_published',
             'acquire_staged_leases_and_release_round_trip_a_batch_with_a_monotonic_reader_fence',
+            # INV-EF P2-5/P2-6: acquire_staged_leases's three new refusals plus duplicate-lease_id replay.
+            'acquire_staged_leases_refuses_a_lease_id_that_is_not_the_schema_length',
+            'acquire_staged_leases_refuses_a_member_that_is_not_a_staged_epoch',
+            'a_duplicate_staged_lease_id_replays_the_existing_lease_and_refuses_a_different_batch',
+            # Pre-Phase-5 hardening review: the DISPOSITION_PURGED clause (both directions) and
+            # validate_lease_members' duplicate-hash/empty-batch refusals.
+            'acquire_staged_leases_refuses_a_purged_staged_member',
+            'acquire_staged_leases_admits_a_quarantined_staged_member',
+            'acquire_staged_leases_refuses_a_duplicate_hash_batch_and_an_empty_batch',
             'commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tombstones_the_head',
             'commit_obliterate_fences_a_stale_intent_and_mutates_nothing',
             'enable_lifecycle_refuses_on_a_not_ready_cell_and_succeeds_once_ready',

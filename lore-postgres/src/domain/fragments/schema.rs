@@ -31,6 +31,16 @@ pub const BACKFILL_VERIFIED: i16 = 2;
 /// Cutover marker set; lifecycle routing may be requested.
 pub const BACKFILL_CUTOVER: i16 = 3;
 
+/// Exact byte length of `lore_fragment_staged_leases.lease_id`.
+///
+/// The DDL below carries the same bound as `octet_length(lease_id) = 16`. This
+/// constant exists so the coordinator can refuse a wrong-length id as typed
+/// [`crate::domain::errors::DomainError::InvalidInput`] **before** any database
+/// work, rather than letting the CHECK surface a bare 23514 the caller cannot
+/// act on (INV-EF P2-6). `the_staged_lease_id_length_matches_the_schema_check`
+/// pins the two together.
+pub const STAGED_LEASE_ID_LEN: usize = 16;
+
 /// `lore_fragment_associations.state`: the association is live and readable.
 pub const ASSOCIATION_LIVE: i16 = 0;
 /// `lore_fragment_associations.state`: tombstoned.
@@ -351,6 +361,28 @@ mod tests {
             FRAGMENT_SCHEMA_VERSION,
             "the migration's fragment schema-state seed has drifted from \
              FRAGMENT_SCHEMA_VERSION; a schema change is two edits in one commit"
+        );
+    }
+
+    /// [`STAGED_LEASE_ID_LEN`] and the DDL's `octet_length(lease_id) = 16`
+    /// CHECK are the same bound written twice: the Rust side turns a
+    /// wrong-length id into typed `InvalidInput` before any database work, and
+    /// the CHECK is the backstop for anything that reaches the table another
+    /// way. Drift between them would let the Rust guard admit an id the
+    /// database then refuses with a bare 23514, which is exactly the shape
+    /// INV-EF P2-6 flagged.
+    #[test]
+    fn the_staged_lease_id_length_matches_the_schema_check() {
+        let expected = format!("octet_length(lease_id) = {STAGED_LEASE_ID_LEN}");
+        assert!(
+            FRAGMENT_SCHEMA.contains(&expected),
+            "FRAGMENT_SCHEMA must carry `{expected}`; STAGED_LEASE_ID_LEN and the CHECK have drifted"
+        );
+        let migration = include_str!("../../../migrations/0001_init.sql");
+        assert!(
+            migration.contains(&expected),
+            "migrations/0001_init.sql must carry `{expected}` too; a schema change is two edits \
+             in one commit"
         );
     }
 

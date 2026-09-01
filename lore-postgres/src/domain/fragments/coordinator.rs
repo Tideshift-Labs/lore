@@ -400,7 +400,8 @@ pub enum PushWitnessVerdict {
     /// Neither scalar moved. Commit with no fragment-row read at all.
     Unchanged,
     /// The lifecycle scalar moved and every exact required fragment is still
-    /// readable at its captured epoch. The push may commit.
+    /// readable, at its captured epoch or at a semantically equivalent one.
+    /// The push may commit.
     FallbackSatisfied {
         /// How many fragment rows the fallback actually revalidated.
         revalidated: usize,
@@ -418,8 +419,9 @@ pub enum PushWitnessVerdict {
 /// locked**, so it is a known no-commit refusal rather than an ambiguous abort.
 pub const REQUIRED_FRAGMENT_REVALIDATION_LIMIT: &str = "required_fragment_revalidation_limit";
 
-/// Reason code for a required fragment that is no longer readable at its
-/// captured epoch.
+/// Reason code for a required fragment that is no longer readable, or is
+/// readable only at an epoch that is not semantically equivalent to the one
+/// preflight captured.
 pub const REQUIRED_FRAGMENT_CHANGED: &str = "required_fragment_changed";
 
 /// A fragment the push requires, at the exact epoch preflight resolved it to.
@@ -434,6 +436,24 @@ pub struct RequiredFragment {
 // ---------------------------------------------------------------------------
 // Staged reader leases
 // ---------------------------------------------------------------------------
+
+/// [`DomainError::PreconditionRejected`] reason for a lease whose member set
+/// names something other than a live `Staged` epoch of this cell — a `Remote`
+/// epoch, an epoch that does not exist, or one whose bytes are already proved
+/// gone (`DISPOSITION_PURGED`).
+pub const STAGED_LEASE_MEMBER_NOT_STAGED: &str = "staged_lease_member_not_staged";
+
+/// Reason for a duplicate `lease_id` whose row has vanished between the
+/// conflicting insert and the replay read. See [`replay_staged_lease`].
+pub const STAGED_LEASE_VANISHED: &str = "staged_lease_vanished";
+
+/// Reason for a duplicate `lease_id` whose member set is not the one the
+/// existing lease covers. An id collision, not a retry.
+pub const STAGED_LEASE_MEMBER_SET_MISMATCH: &str = "staged_lease_member_set_mismatch";
+
+/// Reason for a duplicate `lease_id` naming a lease that is already terminal.
+/// A released lease is never resurrected.
+pub const STAGED_LEASE_ALREADY_RELEASED: &str = "staged_lease_already_released";
 
 /// A batched durable reader lease over one hydration request's staged
 /// fragments.
@@ -1412,6 +1432,13 @@ impl PostgresFragmentCoordinator {
     /// fallback, in sorted hash order, in one set-based query. A request above
     /// [`MAX_PUSH_FRAGMENT_REVALIDATIONS`] is refused **before** any fragment
     /// row is taken, so the refusal is known-no-commit rather than ambiguous.
+    ///
+    /// A required fragment satisfies the fallback when its head is readable
+    /// **and** its current epoch is the one preflight captured *or one
+    /// semantically equivalent to it* — CR-031:266's allowance, decided by
+    /// [`equivalent_epochs`], which is what lets a push survive an unrelated
+    /// `Staged`->`Remote` promotion of a fragment it requires. Deciding it
+    /// costs one extra statement and only when an epoch actually moved.
     pub async fn revalidate_push_witness(
         &self,
         tx: &Transaction<'_>,
@@ -1496,6 +1523,12 @@ impl PostgresFragmentCoordinator {
                 (row.get("current_epoch"), row.get("state")),
             );
         }
+        // Required fragments whose head is readable but at a *different* epoch
+        // than preflight saw. CR-031:266 allows these through only when the new
+        // epoch is semantically equivalent; `equivalent_epochs` below decides
+        // that, and the common case leaves this empty and issues no extra
+        // query at all.
+        let mut divergent: Vec<DivergentEpoch<'_>> = Vec::new();
         for item in &sorted {
             let Some((epoch, state)) = observed.get(&item.hash) else {
                 return Ok(PushWitnessVerdict::Aborted {
@@ -1503,11 +1536,23 @@ impl PostgresFragmentCoordinator {
                 });
             };
             let state = FragmentLifecycleState::from_bits(*state)?;
-            if !state.is_readable() || *epoch != item.epoch {
+            if !state.is_readable() {
                 return Ok(PushWitnessVerdict::Aborted {
                     reason: REQUIRED_FRAGMENT_CHANGED,
                 });
             }
+            if *epoch != item.epoch {
+                divergent.push(DivergentEpoch {
+                    hash: &item.hash,
+                    captured: item.epoch,
+                    current: *epoch,
+                });
+            }
+        }
+        if !divergent.is_empty() && !equivalent_epochs(tx, &divergent).await? {
+            return Ok(PushWitnessVerdict::Aborted {
+                reason: REQUIRED_FRAGMENT_CHANGED,
+            });
         }
         Ok(PushWitnessVerdict::FallbackSatisfied {
             revalidated: sorted.len(),
@@ -1525,31 +1570,164 @@ impl PostgresFragmentCoordinator {
     /// 256 KiB fragment. Lease maintenance runs in its own transaction and
     /// never co-occurs with a domain lock, which is why the lease row needs no
     /// position in F-032-3.
+    ///
+    /// # What this refuses, and why each refusal is here
+    ///
+    /// INV-EF P2-6 found this method enforcing nothing it depends on. All three
+    /// gaps are closed here, before Phase 5 gives it a caller:
+    ///
+    /// * **Wrong-length `lease_id`.** Refused as
+    ///   [`DomainError::InvalidInput`] before any database work, against
+    ///   [`schema::STAGED_LEASE_ID_LEN`]. The DDL's
+    ///   `octet_length(lease_id) = 16` CHECK stays as the backstop, but a
+    ///   caller must not have to read a bare 23514 to learn it passed a
+    ///   16-byte-shaped argument that was not 16 bytes.
+    /// * **A member that is not a live `Staged` epoch.** The "Staged only"
+    ///   scoping was convention: nothing stopped a lease being opened over a
+    ///   `Remote` epoch, or over an epoch that does not exist at all. Every
+    ///   member is now checked against its own `lore_fragment_epochs` row and
+    ///   must carry [`schema::AUTHORITY_STAGED`].
+    ///
+    ///   The check is against the **epoch's** authority and deliberately not
+    ///   against the head. A reader that resolved to a staged epoch and is
+    ///   overtaken by a promotion still holds that staged path and still needs
+    ///   its bytes kept, so requiring `lore_fragment_lifecycle.current_epoch`
+    ///   to still name the member would refuse exactly the lease the reader
+    ///   most needs. An epoch row's `authority` is never rewritten once
+    ///   published, so it is a stable fact to enforce against.
+    ///
+    ///   `disposition` is checked in exactly one direction:
+    ///   [`schema::DISPOSITION_QUARANTINED`] is **admitted**, because a
+    ///   superseded staged epoch whose reader is still mid-hydration is
+    ///   precisely what a lease exists to protect, while
+    ///   [`schema::DISPOSITION_PURGED`] is **refused**, because those bytes are
+    ///   proved gone and a lease over them would report protection that cannot
+    ///   exist. `commit_obliterate` reaches a `Staged` head and purges its
+    ///   epoch, so this is a reachable state, not a theoretical one.
+    /// * **A duplicate hash in `members`, or an empty batch.** The member table
+    ///   is keyed `(lease_id, hash)`, so two entries for one hash would persist
+    ///   as one row while the returned lease claimed both — protection silently
+    ///   dropped for the other epoch, and a faithful retry then refused as a
+    ///   member-set mismatch. An empty batch would create a live lease
+    ///   protecting nothing that a reaper must later clean. Both are
+    ///   [`DomainError::InvalidInput`], refused before any database work.
+    /// * **A duplicate `lease_id`.** See the idempotency rule below.
+    ///
+    /// # Duplicate `lease_id`: a replay returns the existing lease unchanged
+    ///
+    /// Every fence-carrying peer in this module is idempotent under retry; this
+    /// method was the exception, failing a duplicate with a bare primary-key
+    /// violation. A lost commit acknowledgement is a first-class outcome here
+    /// (that is what [`DomainError::OutcomeUnknown`] exists for), so a caller
+    /// that retries the same `lease_id` must get its lease back rather than an
+    /// error — otherwise a lease it may already hold looks like a failure to
+    /// acquire one.
+    ///
+    /// The deliberate choice is **return the existing lease exactly as it
+    /// stands**, with its original `reader_fence` and `deadline`, and refuse
+    /// anything that is not a faithful replay:
+    ///
+    /// * A duplicate never allocates a second reader fence and never moves the
+    ///   deadline. Extending a lease is a different operation, and letting a
+    ///   retry do it silently would let a caller keep bytes alive forever by
+    ///   re-acquiring.
+    /// * A duplicate over a **different member set** is refused. That is an id
+    ///   collision, not a retry, and returning success would hand the caller
+    ///   protection over members the lease does not cover.
+    /// * A duplicate over an **already-released** lease is refused. `terminal`
+    ///   is what tells cleanup it may act, so a released lease must not be
+    ///   resurrected into something that reads as live protection.
+    ///
+    /// **The scope of that last guarantee is the row's lifetime, and no
+    /// longer.** Once a reaper deletes a terminal or hard-expired lease row,
+    /// its id is indistinguishable from one never used, and a later acquire
+    /// with that id creates a fresh lease. Nothing here records a retired id,
+    /// and nothing should until the reaper exists to define what retirement
+    /// means — that is Phase 6's. What this method does guarantee is that it
+    /// never *itself* turns a released lease back into a live one:
+    /// [`replay_staged_lease`] refuses a vanished row decisively rather than
+    /// retryably, so a caller cannot loop its way from
+    /// [`STAGED_LEASE_ALREADY_RELEASED`] into a new lease under the same id.
+    ///
+    /// The sequence value burnt by a refused or replayed acquire is a gap, and
+    /// gaps are valid: a fence is an ordering token, not a count.
     pub async fn acquire_staged_leases(
         &self,
         lease_id: &[u8],
         members: &[(Vec<u8>, i64)],
         deadline: SystemTime,
     ) -> Result<StagedReaderLease, DomainError> {
+        validate_lease_id(lease_id)?;
+        validate_lease_members(members)?;
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
             .await
             .map_err(|error| DomainError::from_pg("staged lease begin", error))?;
+        let member_hashes: Vec<&[u8]> = members.iter().map(|(hash, _)| hash.as_slice()).collect();
+        let member_epochs: Vec<i64> = members.iter().map(|(_, epoch)| *epoch).collect();
+        // Scope check first, so a refusal happens before anything is written
+        // and the transaction has nothing to undo.
+        if tx
+            .query_opt(
+                "SELECT member.hash FROM unnest($1::bytea[], $2::bigint[]) AS member(hash, epoch) \
+                   LEFT JOIN lore_fragment_epochs AS e \
+                     ON e.hash = member.hash AND e.epoch = member.epoch \
+                        AND e.authority = $3 AND e.disposition <> $4 \
+                  WHERE e.hash IS NULL LIMIT 1",
+                &[
+                    &member_hashes,
+                    &member_epochs,
+                    &schema::AUTHORITY_STAGED,
+                    &schema::DISPOSITION_PURGED,
+                ],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("staged lease member scope", error))?
+            .is_some()
+        {
+            return Err(DomainError::PreconditionRejected {
+                reason: STAGED_LEASE_MEMBER_NOT_STAGED.to_owned(),
+                reason_version: 1,
+            });
+        }
         let reader_fence = next_fence(&tx).await?;
-        tx.execute(
-            "INSERT INTO lore_fragment_staged_leases (lease_id, reader_fence, deadline) \
-             VALUES ($1, $2, $3)",
-            &[&lease_id, &reader_fence, &deadline],
-        )
-        .await
-        .map_err(|error| DomainError::from_pg("staged lease insert", error))?;
+        let inserted = tx
+            .execute(
+                "INSERT INTO lore_fragment_staged_leases (lease_id, reader_fence, deadline) \
+                 VALUES ($1, $2, $3) ON CONFLICT (lease_id) DO NOTHING",
+                &[&lease_id, &reader_fence, &deadline],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("staged lease insert", error))?;
+        if inserted == 0 {
+            let existing = replay_staged_lease(&tx, lease_id, members).await?;
+            // Deliberately not `classify_commit`. That maps a lost
+            // acknowledgement to `OutcomeUnknown`, which is the right answer
+            // only for a transaction that may have published something. This
+            // one wrote nothing — it read the existing lease and its members —
+            // so telling the caller its outcome is unknown would invent doubt
+            // about a lease this call never created.
+            tx.commit()
+                .await
+                .map_err(|error| DomainError::from_pg("staged lease replay commit", error))?;
+            return Ok(existing);
+        }
         // One round trip for the whole batch, not one per member. This is the
         // read path: a hydration of one large asset is thousands of 256 KiB
         // fragments, and a statement each would put the per-fragment write cost
         // back that batching the lease exists to remove.
-        let member_hashes: Vec<Vec<u8>> = members.iter().map(|(hash, _)| hash.clone()).collect();
-        let member_epochs: Vec<i64> = members.iter().map(|(_, epoch)| *epoch).collect();
+        //
+        // The `ON CONFLICT (lease_id, hash)` arm below is now unreachable
+        // through this method, and the honest reason to keep it is defence in
+        // depth rather than a race it handles. `validate_lease_members` refuses
+        // a repeated hash, and a concurrent acquire under the same `lease_id`
+        // loses the lease-row insert above and returns through the replay path
+        // without ever reaching this statement — so no caller of this method
+        // can produce the conflict. It stays because dropping it would turn a
+        // future second writer of this table into a 23505 at the worst moment,
+        // not because it is doing work today.
+        //
         // The `$1::bytea` cast is defensive, not load-bearing. A review flagged
         // an uncast `$1` in an `INSERT ... SELECT` target list as a certain
         // 42P08; preparing both forms against PostgreSQL 16 shows it is not —
@@ -1578,7 +1756,15 @@ impl PostgresFragmentCoordinator {
 
     /// Mark one lease terminal. Cleanup of a staged epoch waits for every lease
     /// over it to be terminal or hard-expired.
+    ///
+    /// The `lease_id` is length-checked here for the same reason it is on
+    /// acquire. An **absent** lease is deliberately *not* an error: a release
+    /// is the caller relinquishing protection, so a lease already reaped for
+    /// hard expiry, or already released, is the outcome the caller asked for.
+    /// Refusing would turn a normal reap race into a spurious failure on the
+    /// one path whose whole job is to let go.
     pub async fn release_staged_lease(&self, lease_id: &[u8]) -> Result<(), DomainError> {
+        validate_lease_id(lease_id)?;
         let client = self.checkout().await?;
         client
             .execute(
@@ -1904,6 +2090,240 @@ async fn lock_fragment_head(
         })
     })
     .transpose()
+}
+
+/// One required fragment whose current epoch is not the one preflight
+/// captured.
+///
+/// Named fields rather than a tuple because the two `i64`s are trivially
+/// transposable and a transposition here would compare the wrong pair of epoch
+/// rows without failing anything loudly.
+struct DivergentEpoch<'a> {
+    /// The FragmentId.
+    hash: &'a [u8],
+    /// The epoch preflight saw.
+    captured: i64,
+    /// The epoch the head names now.
+    current: i64,
+}
+
+/// Decide CR-031:266's "semantically equivalent current epoch" for every
+/// required fragment whose epoch moved between preflight and the final push.
+///
+/// # The rule
+///
+/// Two epochs of one FragmentId are semantically equivalent when their
+/// `lore_fragment_epochs` rows describe the **same content**: identical
+/// `decoded_hash`, `size_content`, `size_payload`, and `payload_flags`. None of
+/// those four columns is ever rewritten after publication — `disposition` and
+/// `validated_at` are the only mutable columns on the row, so "the epoch row is
+/// immutable" is too strong a claim, but the compared columns are.
+///
+/// Comparing `decoded_hash` is load-bearing rather than belt-and-braces:
+/// nothing in this module enforces that two epochs of one FragmentId decode to
+/// the same content, so it cannot be assumed from the hash alone.
+///
+/// The two epochs may differ in `authority` and `object_key`, and that
+/// difference is the whole point — it is exactly a `Staged`->`Remote`
+/// promotion, which re-publishes the same bytes under a new epoch because
+/// epoch rows are immutable and the remote object is a different
+/// representation of the same fragment (see
+/// [`PostgresFragmentCoordinator::begin_promotion`]).
+///
+/// `manifest_id` is deliberately **not** compared. It is a caller-supplied
+/// opaque identity for one representation, so a promotion may legitimately
+/// carry a new one; requiring equality there would leave the allowance dead in
+/// the one case CR-031 names.
+///
+/// # What still aborts
+///
+/// Everything else. A repair successor that re-encoded the payload moves
+/// `payload_flags` or `size_payload` and is "different". A required fragment
+/// with no row at its captured epoch is "different" — that row is retained
+/// through quarantine and purge, so its absence means the caller's epoch was
+/// never real here. The readability check in the caller runs first and is
+/// untouched, so missing, deleting, and tombstoned heads never reach this.
+///
+/// This is a strict widening of what commits: every set this accepts was
+/// previously an `ABORTED` the caller had to re-preflight for, and no set it
+/// rejects was previously accepted.
+///
+/// # Why the allowance is safe, and what it depends on
+///
+/// The caller aborts unconditionally when the **association** scalar moved, one
+/// statement before the count check and long before this runs. That ordering is
+/// load-bearing rather than incidental: it is what keeps an obliterate-then-
+/// recreate — which tombstones associations and so always moves that scalar —
+/// out of reach of this function. Keep the association check ahead of the
+/// fallback if this is ever reshuffled; without it, equivalence over content
+/// columns alone would not be enough.
+///
+/// Quarantine cannot forge equivalence either: a publication quarantines only
+/// epochs below the one it publishes, so a readable head's current epoch is
+/// never quarantined or purged.
+///
+/// # Cost
+///
+/// One extra statement, and only when at least one epoch actually moved. The
+/// unchanged fast path and the all-epochs-match fallback issue nothing.
+///
+/// It takes no lock of its own, and does not need one. The caller already holds
+/// `FOR UPDATE` on every head it is asking about, so the `current_epoch` values
+/// this statement is keyed on cannot move underneath it; the compared columns
+/// are never rewritten; and at READ COMMITTED this statement sees one coherent
+/// snapshot of rows that were already committed when the head lock was taken.
+/// It therefore adds no lock class and cannot invert F-032-3.
+async fn equivalent_epochs(
+    tx: &Transaction<'_>,
+    divergent: &[DivergentEpoch<'_>],
+) -> Result<bool, DomainError> {
+    let hashes: Vec<&[u8]> = divergent.iter().map(|item| item.hash).collect();
+    let captured: Vec<i64> = divergent.iter().map(|item| item.captured).collect();
+    let current: Vec<i64> = divergent.iter().map(|item| item.current).collect();
+    let matched: i64 = tx
+        .query_one(
+            "SELECT count(*)::bigint FROM unnest($1::bytea[], $2::bigint[], $3::bigint[]) \
+                    AS required(hash, captured_epoch, current_epoch) \
+                    JOIN lore_fragment_epochs AS was \
+                      ON was.hash = required.hash AND was.epoch = required.captured_epoch \
+                    JOIN lore_fragment_epochs AS now \
+                      ON now.hash = required.hash AND now.epoch = required.current_epoch \
+              WHERE was.decoded_hash  = now.decoded_hash \
+                AND was.size_content  = now.size_content \
+                AND was.size_payload  = now.size_payload \
+                AND was.payload_flags = now.payload_flags",
+            &[&hashes, &captured, &current],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("push fallback epoch equivalence", error))?
+        .get(0);
+    // All or nothing: one non-equivalent member aborts the whole push. Compare
+    // in `i64` rather than narrowing `matched` to `usize`, so an impossible
+    // negative count cannot be flattened into a silent abort.
+    Ok(i64::try_from(divergent.len()).is_ok_and(|expected| matched == expected))
+}
+
+/// Refuse a wrong-length `lease_id` before any database work.
+///
+/// [`schema::STAGED_LEASE_ID_LEN`] and the DDL's `octet_length(lease_id) = 16`
+/// CHECK are the same bound; this is the typed half, so the caller gets
+/// [`DomainError::InvalidInput`] (never retryable, never a partial write)
+/// instead of a bare 23514 from the table (INV-EF P2-6).
+fn validate_lease_id(lease_id: &[u8]) -> Result<(), DomainError> {
+    if lease_id.len() != schema::STAGED_LEASE_ID_LEN {
+        return Err(DomainError::InvalidInput(format!(
+            "staged lease id must be exactly {} bytes, got {}",
+            schema::STAGED_LEASE_ID_LEN,
+            lease_id.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a member batch the lease schema cannot represent faithfully.
+///
+/// `lore_fragment_staged_lease_members` is keyed `(lease_id, hash)`, so a batch
+/// repeating one hash at two epochs persists as **one** row while the returned
+/// [`StagedReaderLease`] claims both — the second epoch reads as protected and
+/// is not, and a faithful retry of the same batch then compares two proposed
+/// members against one stored member and is refused as a mismatch. One hash
+/// resolves to one epoch per hydration request, so a repeat is a caller defect
+/// rather than a shape to accommodate.
+///
+/// An empty batch is refused for a smaller reason: it publishes a live lease
+/// that protects nothing, which a reaper then has to clean. A caller with no
+/// staged fragments takes no lease.
+fn validate_lease_members(members: &[(Vec<u8>, i64)]) -> Result<(), DomainError> {
+    if members.is_empty() {
+        return Err(DomainError::InvalidInput(
+            "a staged reader lease must cover at least one member".to_owned(),
+        ));
+    }
+    let mut seen: BTreeSet<&[u8]> = BTreeSet::new();
+    for (hash, _) in members {
+        if !seen.insert(hash.as_slice()) {
+            return Err(DomainError::InvalidInput(format!(
+                "staged lease member hash {} appears more than once; the member table is keyed \
+                 (lease_id, hash) and cannot hold two epochs for one hash",
+                hex_lower(hash)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a duplicate `acquire_staged_leases` against the lease that already
+/// holds that id.
+///
+/// A faithful replay — same member set, lease not yet terminal — returns the
+/// **existing** lease: its original `reader_fence` and `deadline`, not the ones
+/// this attempt proposed. Anything else is refused, because it is an id
+/// collision rather than a retry. See `acquire_staged_leases`' own doc for why
+/// each of the two refusals is the safe choice.
+async fn replay_staged_lease(
+    tx: &Transaction<'_>,
+    lease_id: &[u8],
+    members: &[(Vec<u8>, i64)],
+) -> Result<StagedReaderLease, DomainError> {
+    let Some(row) = tx
+        .query_opt(
+            "SELECT reader_fence, deadline, terminal FROM lore_fragment_staged_leases \
+              WHERE lease_id = $1 FOR UPDATE",
+            &[&lease_id],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("staged lease replay read", error))?
+    else {
+        // The insert conflicted, so the row existed a statement ago. Only a
+        // concurrent reaper can have removed it in between, and a lease this
+        // acquire never established is not one it may report as held.
+        //
+        // Decisive, not retryable, and that is the point. A retryable error
+        // here would be re-driven straight back into `acquire_staged_leases`,
+        // where the insert now succeeds and publishes a **new live lease under
+        // the same id** — turning a just-reaped, possibly released lease back
+        // into live protection, which is exactly what
+        // `STAGED_LEASE_ALREADY_RELEASED` refuses one statement earlier. The
+        // caller's remedy is a new lease id, never a retry of this one.
+        return Err(DomainError::PreconditionRejected {
+            reason: STAGED_LEASE_VANISHED.to_owned(),
+            reason_version: 1,
+        });
+    };
+    if row.get::<_, bool>("terminal") {
+        return Err(DomainError::PreconditionRejected {
+            reason: STAGED_LEASE_ALREADY_RELEASED.to_owned(),
+            reason_version: 1,
+        });
+    }
+    let existing_members = tx
+        .query(
+            "SELECT hash, epoch FROM lore_fragment_staged_lease_members WHERE lease_id = $1",
+            &[&lease_id],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("staged lease replay members", error))?;
+    // Set comparison, not sequence comparison: the caller's batch order is its
+    // own business and a reordered retry is still the same lease.
+    let existing: BTreeSet<(Vec<u8>, i64)> = existing_members
+        .iter()
+        .map(|row| (row.get("hash"), row.get("epoch")))
+        .collect();
+    let proposed: BTreeSet<(Vec<u8>, i64)> = members.iter().cloned().collect();
+    if existing != proposed {
+        return Err(DomainError::PreconditionRejected {
+            reason: STAGED_LEASE_MEMBER_SET_MISMATCH.to_owned(),
+            reason_version: 1,
+        });
+    }
+    Ok(StagedReaderLease {
+        lease_id: lease_id.to_vec(),
+        reader_fence: row.get("reader_fence"),
+        deadline: row.get("deadline"),
+        // Proven equal as a set just above, so this is the caller's own
+        // ordering of the same members the lease holds.
+        members: members.to_vec(),
+    })
 }
 
 /// Allocate one monotonic epoch or fence. Gaps are valid.
@@ -2462,6 +2882,68 @@ mod tests {
         assert_ne!(
             REQUIRED_FRAGMENT_REVALIDATION_LIMIT,
             REQUIRED_FRAGMENT_CHANGED
+        );
+    }
+
+    #[test]
+    fn a_lease_id_must_be_exactly_the_schema_length() {
+        // Both guards are pure and refuse before any database work, so they
+        // belong offline rather than only behind an `#[ignore]` live case.
+        assert!(validate_lease_id(&[0u8; schema::STAGED_LEASE_ID_LEN]).is_ok());
+        for length in [
+            0,
+            schema::STAGED_LEASE_ID_LEN - 1,
+            schema::STAGED_LEASE_ID_LEN + 1,
+        ] {
+            assert!(
+                matches!(
+                    validate_lease_id(&vec![0u8; length]),
+                    Err(DomainError::InvalidInput(_))
+                ),
+                "a {length}-byte lease id must be refused as InvalidInput"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lease_member_batch_is_non_empty_and_names_each_hash_once() {
+        let first = vec![1u8; 32];
+        let second = vec![2u8; 32];
+        assert!(validate_lease_members(&[(first.clone(), 4), (second.clone(), 5)]).is_ok());
+        assert!(
+            matches!(
+                validate_lease_members(&[]),
+                Err(DomainError::InvalidInput(_))
+            ),
+            "an empty batch publishes a lease that protects nothing"
+        );
+        // The member table is keyed (lease_id, hash), so this batch would
+        // persist one row while the returned lease claimed two.
+        assert!(
+            matches!(
+                validate_lease_members(&[(first.clone(), 4), (first, 9)]),
+                Err(DomainError::InvalidInput(_))
+            ),
+            "one hash at two epochs must be refused, not silently deduplicated"
+        );
+    }
+
+    #[test]
+    fn every_staged_lease_refusal_reason_is_a_distinct_code() {
+        // These land in a receipt's reason field, so a collision would make two
+        // different refusals indistinguishable to the caller that has to decide
+        // between retrying with a new id and fixing its batch.
+        let reasons = [
+            STAGED_LEASE_MEMBER_NOT_STAGED,
+            STAGED_LEASE_MEMBER_SET_MISMATCH,
+            STAGED_LEASE_ALREADY_RELEASED,
+            STAGED_LEASE_VANISHED,
+        ];
+        let distinct: BTreeSet<&str> = reasons.into_iter().collect();
+        assert_eq!(
+            distinct.len(),
+            reasons.len(),
+            "{reasons:?} are not distinct"
         );
     }
 }

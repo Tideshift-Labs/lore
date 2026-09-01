@@ -38,6 +38,10 @@ use lore_postgres::domain::fragments::PushWitnessVerdict;
 use lore_postgres::domain::fragments::REQUIRED_FRAGMENT_CHANGED;
 use lore_postgres::domain::fragments::REQUIRED_FRAGMENT_REVALIDATION_LIMIT;
 use lore_postgres::domain::fragments::RequiredFragment;
+use lore_postgres::domain::fragments::STAGED_LEASE_ALREADY_RELEASED;
+use lore_postgres::domain::fragments::STAGED_LEASE_MEMBER_NOT_STAGED;
+use lore_postgres::domain::fragments::STAGED_LEASE_MEMBER_SET_MISMATCH;
+use lore_postgres::domain::fragments::StagedReaderLease;
 use lore_postgres::domain::fragments::schema;
 use lore_postgres::domain::fragments::states::FragmentLifecycleState;
 use lore_postgres::domain::lock_order::LockClass;
@@ -97,6 +101,21 @@ fn uuid_v7_at(time: SystemTime) -> Uuid {
         elapsed.as_secs(),
         elapsed.subsec_nanos(),
     ))
+}
+
+/// PostgreSQL `timestamptz` is microsecond-precision; a `SystemTime` with a
+/// sub-microsecond remainder (Windows' `SystemTime::now()` is 100 ns
+/// resolution) would silently lose precision on a round trip through the
+/// database, breaking an exact deadline-equality assertion for a reason that
+/// has nothing to do with the coordinator's own logic. Truncate before using
+/// a deadline in an assertion that reads it back from a stored row.
+fn microsecond_deadline(offset: Duration) -> SystemTime {
+    let since_epoch = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("test timestamp follows epoch");
+    let micros =
+        u64::try_from(since_epoch.as_micros()).expect("test timestamp fits in u64 microseconds");
+    SystemTime::UNIX_EPOCH + Duration::from_micros(micros) + offset
 }
 
 fn binding(method: &str) -> OperationBinding {
@@ -1975,6 +1994,387 @@ async fn revalidate_push_witness_refuses_over_the_revalidation_limit_before_lock
     drop(tx); // never committed; the function made no writes to roll back
 }
 
+/// CR-031:266 (INV-EF P2-2): a required fragment promoted from `Staged` to a
+/// `Remote` epoch that is semantically equivalent -- same `decoded_hash`,
+/// `size_content`, `size_payload`, and `payload_flags` -- must satisfy the
+/// push fallback even though its epoch genuinely advanced and its
+/// `object_key`/`manifest_id` changed (deliberately not compared).
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn revalidate_push_witness_accepts_a_required_fragment_promoted_to_a_semantically_equivalent_epoch()
+ {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+
+    // The required fragment: staged, then associated BEFORE capture, so its
+    // association does not itself move the content-association scalar after
+    // the witness is taken.
+    let hash = random_hash();
+    let BeginOutcome::Admitted(stage_intent) =
+        coordinator.begin_stage(&hash).await.expect("begin stage")
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    let staged_manifest = manifest("equivalent-epoch/staged", 0xC0, EpochAuthority::Staged);
+    assert_eq!(
+        coordinator
+            .commit_staged(&stage_intent, IoObservation::Valid(staged_manifest.clone()))
+            .await
+            .expect("commit staged"),
+        CommitVerdict::Published
+    );
+    let original_epoch = stage_intent.epoch;
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate"),
+        CommitVerdict::Published
+    );
+
+    // A bystander, also associated before capture, whose later transition is
+    // the only thing that moves the lifecycle scalar (a Staged->Remote
+    // promotion crosses no readability boundary and moves nothing on its own).
+    let bystander_hash = random_hash();
+    let BeginOutcome::Admitted(bystander_intent) = coordinator
+        .begin_direct_write(&bystander_hash, "equivalent-epoch/bystander")
+        .await
+        .expect("begin bystander")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &bystander_intent,
+                IoObservation::Valid(manifest(
+                    "equivalent-epoch/bystander",
+                    0xC9,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit bystander"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&bystander_hash, &repository_id, &context)
+            .await
+            .expect("associate bystander"),
+        CommitVerdict::Published
+    );
+
+    let captured = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness")
+        .expect("repository must exist");
+
+    // Promote the required fragment: a NEW epoch, a different `object_key`
+    // and `manifest_id`, but identical decoded_hash/size_content/size_payload/
+    // payload_flags.
+    let BeginOutcome::Admitted(promotion_intent) = coordinator
+        .begin_promotion(&hash)
+        .await
+        .expect("begin promotion")
+    else {
+        panic!("a Staged head must admit begin_promotion");
+    };
+    assert_ne!(
+        promotion_intent.epoch, original_epoch,
+        "promotion must allocate a new epoch, not republish the staged one"
+    );
+    let mut promoted_manifest = staged_manifest.clone();
+    promoted_manifest.authority = EpochAuthority::Remote;
+    promoted_manifest.object_key = "equivalent-epoch/promoted".to_owned();
+    promoted_manifest.manifest_id = vec![0xCA; 32];
+    assert_ne!(
+        promoted_manifest.manifest_id, staged_manifest.manifest_id,
+        "the successor manifest id must genuinely differ from the staged one"
+    );
+    assert_eq!(
+        coordinator
+            .commit_promotion(&promotion_intent, IoObservation::Valid(promoted_manifest))
+            .await
+            .expect("commit promotion"),
+        CommitVerdict::Published
+    );
+
+    // Move the lifecycle scalar so the call reaches the fallback rather than
+    // short-circuiting on `Unchanged`.
+    let resolved_bystander = coordinator
+        .resolve(
+            &repository_id,
+            &context,
+            std::slice::from_ref(&bystander_hash),
+        )
+        .await
+        .expect("resolve bystander");
+    let (bystander_witness, ..) = expect_readable(&resolved_bystander[0]);
+    let bystander_witness = bystander_witness.clone();
+    assert_eq!(
+        coordinator
+            .mark_missing(&bystander_witness, MissingDiagnostic::Absent)
+            .await
+            .expect("mark bystander missing"),
+        CommitVerdict::Published
+    );
+
+    // The epoch really did advance -- this is what stops the case from
+    // silently degenerating into the exact-match path.
+    let current_epoch: i64 = direct
+        .query_one(
+            "SELECT current_epoch FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read current epoch after promotion")
+        .get(0);
+    assert_ne!(
+        current_epoch, original_epoch,
+        "the required fragment's current epoch must have genuinely advanced"
+    );
+    assert_eq!(current_epoch, promotion_intent.epoch);
+
+    let required = vec![RequiredFragment {
+        hash,
+        epoch: original_epoch,
+    }];
+    let mut tx_client = own_transaction_client(&url).await;
+    let tx = tx_client
+        .transaction()
+        .await
+        .expect("open push-witness transaction");
+    let mut sequence = LockSequence::new();
+
+    let verdict = coordinator
+        .revalidate_push_witness(&tx, &mut sequence, &repository_id, captured, &required)
+        .await
+        .expect("revalidate must not error");
+    assert_eq!(
+        verdict,
+        PushWitnessVerdict::FallbackSatisfied { revalidated: 1 }
+    );
+}
+
+/// CR-031:266's equivalence allowance is narrow: a successor epoch whose
+/// manifest differs in `decoded_hash` or `payload_flags` describes different
+/// content and must abort, even though the head is still readable and
+/// `size_content`/`size_payload` are unchanged.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn revalidate_push_witness_aborts_when_the_new_epoch_describes_different_content() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+
+    async fn stage_and_associate(
+        coordinator: &PostgresFragmentCoordinator,
+        repository_id: &[u8],
+        context: &[u8],
+        key_prefix: &str,
+        seed: u8,
+    ) -> (Vec<u8>, i64, FragmentManifest) {
+        let hash = random_hash();
+        let BeginOutcome::Admitted(stage_intent) =
+            coordinator.begin_stage(&hash).await.expect("begin stage")
+        else {
+            panic!("a fresh hash must admit a stage begin");
+        };
+        let staged_manifest = manifest(
+            &format!("{key_prefix}/staged"),
+            seed,
+            EpochAuthority::Staged,
+        );
+        assert_eq!(
+            coordinator
+                .commit_staged(&stage_intent, IoObservation::Valid(staged_manifest.clone()))
+                .await
+                .expect("commit staged"),
+            CommitVerdict::Published
+        );
+        assert_eq!(
+            coordinator
+                .create_association(&hash, repository_id, context)
+                .await
+                .expect("associate"),
+            CommitVerdict::Published
+        );
+        (hash, stage_intent.epoch, staged_manifest)
+    }
+
+    let (hash_a, original_epoch_a, staged_manifest_a) = stage_and_associate(
+        &coordinator,
+        &repository_id,
+        &context,
+        "content-changed/hash",
+        0xE0,
+    )
+    .await;
+    let (hash_b, original_epoch_b, staged_manifest_b) = stage_and_associate(
+        &coordinator,
+        &repository_id,
+        &context,
+        "content-changed/flags",
+        0xE1,
+    )
+    .await;
+
+    let bystander_hash = random_hash();
+    let BeginOutcome::Admitted(bystander_intent) = coordinator
+        .begin_direct_write(&bystander_hash, "content-changed/bystander")
+        .await
+        .expect("begin bystander")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &bystander_intent,
+                IoObservation::Valid(manifest(
+                    "content-changed/bystander",
+                    0xE9,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit bystander"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&bystander_hash, &repository_id, &context)
+            .await
+            .expect("associate bystander"),
+        CommitVerdict::Published
+    );
+
+    let captured = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness")
+        .expect("repository must exist");
+
+    // A: promote with a different decoded_hash.
+    let BeginOutcome::Admitted(promotion_a) = coordinator
+        .begin_promotion(&hash_a)
+        .await
+        .expect("begin promotion a")
+    else {
+        panic!("a Staged head must admit begin_promotion");
+    };
+    let mut promoted_a = staged_manifest_a.clone();
+    promoted_a.authority = EpochAuthority::Remote;
+    promoted_a.object_key = "content-changed/promoted-hash".to_owned();
+    promoted_a.manifest_id = vec![0xEA; 32];
+    promoted_a.decoded_hash = vec![0xFF; 32];
+    assert_ne!(promoted_a.decoded_hash, staged_manifest_a.decoded_hash);
+    assert_eq!(
+        coordinator
+            .commit_promotion(&promotion_a, IoObservation::Valid(promoted_a))
+            .await
+            .expect("commit promotion a"),
+        CommitVerdict::Published
+    );
+
+    // B: promote with a different payload_flags.
+    let BeginOutcome::Admitted(promotion_b) = coordinator
+        .begin_promotion(&hash_b)
+        .await
+        .expect("begin promotion b")
+    else {
+        panic!("a Staged head must admit begin_promotion");
+    };
+    let mut promoted_b = staged_manifest_b.clone();
+    promoted_b.authority = EpochAuthority::Remote;
+    promoted_b.object_key = "content-changed/promoted-flags".to_owned();
+    promoted_b.manifest_id = vec![0xEB; 32];
+    promoted_b.payload_flags = staged_manifest_b.payload_flags ^ 0x01;
+    assert_ne!(promoted_b.payload_flags, staged_manifest_b.payload_flags);
+    assert_eq!(
+        coordinator
+            .commit_promotion(&promotion_b, IoObservation::Valid(promoted_b))
+            .await
+            .expect("commit promotion b"),
+        CommitVerdict::Published
+    );
+
+    // Move the lifecycle scalar so both revalidations below reach the
+    // fallback branch rather than short-circuiting on `Unchanged`.
+    let resolved_bystander = coordinator
+        .resolve(
+            &repository_id,
+            &context,
+            std::slice::from_ref(&bystander_hash),
+        )
+        .await
+        .expect("resolve bystander");
+    let (bystander_witness, ..) = expect_readable(&resolved_bystander[0]);
+    let bystander_witness = bystander_witness.clone();
+    assert_eq!(
+        coordinator
+            .mark_missing(&bystander_witness, MissingDiagnostic::Absent)
+            .await
+            .expect("mark bystander missing"),
+        CommitVerdict::Published
+    );
+
+    for (hash, original_epoch, label) in [
+        (hash_a, original_epoch_a, "decoded_hash"),
+        (hash_b, original_epoch_b, "payload_flags"),
+    ] {
+        let current_epoch: i64 = direct
+            .query_one(
+                "SELECT current_epoch FROM lore_fragment_lifecycle WHERE hash = $1",
+                &[&hash],
+            )
+            .await
+            .expect("read current epoch after promotion")
+            .get(0);
+        assert_ne!(
+            current_epoch, original_epoch,
+            "{label}: the epoch must have genuinely advanced, or this case would silently \
+             degenerate into the exact-match path"
+        );
+
+        let required = vec![RequiredFragment {
+            hash,
+            epoch: original_epoch,
+        }];
+        let mut tx_client = own_transaction_client(&url).await;
+        let tx = tx_client
+            .transaction()
+            .await
+            .expect("open push-witness transaction");
+        let mut sequence = LockSequence::new();
+
+        let verdict = coordinator
+            .revalidate_push_witness(&tx, &mut sequence, &repository_id, captured, &required)
+            .await
+            .expect("revalidate must not error");
+        assert_eq!(
+            verdict,
+            PushWitnessVerdict::Aborted {
+                reason: REQUIRED_FRAGMENT_CHANGED
+            },
+            "{label} divergence must abort the push, not fall through the equivalence allowance"
+        );
+    }
+}
+
 /// P1-2 item 2: `acquire_staged_leases`/`release_staged_lease` round trip over
 /// a **batch** of several staged fragments -- one lease row covering many
 /// members is the whole design point, not one lease per fragment.
@@ -2084,6 +2484,354 @@ async fn acquire_staged_leases_and_release_round_trip_a_batch_with_a_monotonic_r
         .expect("read lease b terminal flag")
         .get(0);
     assert!(!lease_b_terminal);
+}
+
+/// INV-EF P2-6: a `lease_id` whose length is not [`schema::STAGED_LEASE_ID_LEN`]
+/// must be refused as [`DomainError::InvalidInput`] before any database work,
+/// on both `acquire_staged_leases` and `release_staged_lease`.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn acquire_staged_leases_refuses_a_lease_id_that_is_not_the_schema_length() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let deadline = microsecond_deadline(Duration::from_secs(60));
+
+    let short_id: Vec<u8> = vec![0u8; schema::STAGED_LEASE_ID_LEN - 1];
+    let long_id: Vec<u8> = vec![0u8; schema::STAGED_LEASE_ID_LEN + 1];
+
+    for bad_id in [short_id.clone(), long_id.clone()] {
+        let result = coordinator
+            .acquire_staged_leases(&bad_id, &[], deadline)
+            .await;
+        assert!(
+            matches!(result, Err(DomainError::InvalidInput(_))),
+            "expected InvalidInput for a {}-byte lease id, got {:?}",
+            bad_id.len(),
+            result
+        );
+        let lease_rows: i64 = direct
+            .query_one(
+                "SELECT count(*)::bigint FROM lore_fragment_staged_leases WHERE lease_id = $1",
+                &[&bad_id],
+            )
+            .await
+            .expect("count lease rows for a wrong-length id")
+            .get(0);
+        assert_eq!(
+            lease_rows, 0,
+            "a wrong-length lease id must be refused before any database write"
+        );
+    }
+
+    // `release_staged_lease` carries the same guard.
+    let release_result = coordinator.release_staged_lease(&short_id).await;
+    assert!(
+        matches!(release_result, Err(DomainError::InvalidInput(_))),
+        "expected InvalidInput from release_staged_lease for a wrong-length id, got {:?}",
+        release_result
+    );
+}
+
+/// INV-EF P2-5: every member of an `acquire_staged_leases` batch must name a
+/// row in `lore_fragment_epochs` carrying [`schema::AUTHORITY_STAGED`] -- a
+/// `Remote` epoch and a fabricated `(hash, epoch)` naming nothing are both
+/// refused, and an all-staged batch still succeeds.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn acquire_staged_leases_refuses_a_member_that_is_not_a_staged_epoch() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let deadline = microsecond_deadline(Duration::from_secs(60));
+
+    fn assert_member_not_staged(result: &Result<StagedReaderLease, DomainError>) {
+        match result {
+            Err(DomainError::PreconditionRejected {
+                reason,
+                reason_version,
+            }) => {
+                assert_eq!(reason, STAGED_LEASE_MEMBER_NOT_STAGED);
+                assert_eq!(*reason_version, 1);
+            }
+            other => panic!("expected STAGED_LEASE_MEMBER_NOT_STAGED, got {other:?}"),
+        }
+    }
+
+    let staged_hash = random_hash();
+    let BeginOutcome::Admitted(stage_intent) = coordinator
+        .begin_stage(&staged_hash)
+        .await
+        .expect("begin stage")
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    assert_eq!(
+        coordinator
+            .commit_staged(
+                &stage_intent,
+                IoObservation::Valid(manifest(
+                    "staged-lease-scope/staged",
+                    0x11,
+                    EpochAuthority::Staged
+                ))
+            )
+            .await
+            .expect("commit staged"),
+        CommitVerdict::Published
+    );
+    let staged_member = (staged_hash, stage_intent.epoch);
+
+    let remote_hash = random_hash();
+    let BeginOutcome::Admitted(remote_intent) = coordinator
+        .begin_direct_write(&remote_hash, "staged-lease-scope/remote")
+        .await
+        .expect("begin remote")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &remote_intent,
+                IoObservation::Valid(manifest(
+                    "staged-lease-scope/remote",
+                    0x12,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit remote"),
+        CommitVerdict::Published
+    );
+    let remote_member = (remote_hash, remote_intent.epoch);
+
+    let fabricated_member = (random_hash(), 1i64);
+
+    let lease_id_remote = rand::random::<[u8; 16]>().to_vec();
+    let remote_result = coordinator
+        .acquire_staged_leases(
+            &lease_id_remote,
+            &[staged_member.clone(), remote_member],
+            deadline,
+        )
+        .await;
+    assert_member_not_staged(&remote_result);
+    let remote_lease_rows: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_staged_leases WHERE lease_id = $1",
+            &[&lease_id_remote],
+        )
+        .await
+        .expect("count lease rows after a Remote-member refusal")
+        .get(0);
+    assert_eq!(remote_lease_rows, 0);
+    let remote_member_rows: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_staged_lease_members WHERE lease_id = $1",
+            &[&lease_id_remote],
+        )
+        .await
+        .expect("count member rows after a Remote-member refusal")
+        .get(0);
+    assert_eq!(remote_member_rows, 0);
+
+    let lease_id_fabricated = rand::random::<[u8; 16]>().to_vec();
+    let fabricated_result = coordinator
+        .acquire_staged_leases(
+            &lease_id_fabricated,
+            &[staged_member.clone(), fabricated_member],
+            deadline,
+        )
+        .await;
+    assert_member_not_staged(&fabricated_result);
+    let fabricated_lease_rows: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_staged_leases WHERE lease_id = $1",
+            &[&lease_id_fabricated],
+        )
+        .await
+        .expect("count lease rows after a fabricated-member refusal")
+        .get(0);
+    assert_eq!(fabricated_lease_rows, 0);
+    let fabricated_member_rows: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_staged_lease_members WHERE lease_id = $1",
+            &[&lease_id_fabricated],
+        )
+        .await
+        .expect("count member rows after a fabricated-member refusal")
+        .get(0);
+    assert_eq!(fabricated_member_rows, 0);
+
+    let lease_id_ok = rand::random::<[u8; 16]>().to_vec();
+    let ok_lease = coordinator
+        .acquire_staged_leases(&lease_id_ok, std::slice::from_ref(&staged_member), deadline)
+        .await
+        .expect("an all-staged batch must acquire");
+    assert_eq!(ok_lease.members, vec![staged_member.clone()]);
+    // The returned struct alone cannot fail here -- `StagedReaderLease.members`
+    // is copied straight back from the input in `acquire_staged_leases`'s
+    // success arm, so it would read correct even if zero member rows had been
+    // written. Read the persisted row directly, the same way the refusal legs
+    // above prove a NON-write.
+    let ok_member_rows: Vec<(Vec<u8>, i64)> = direct
+        .query(
+            "SELECT hash, epoch FROM lore_fragment_staged_lease_members WHERE lease_id = $1",
+            &[&lease_id_ok],
+        )
+        .await
+        .expect("read persisted members for the all-staged batch")
+        .into_iter()
+        .map(|row| (row.get("hash"), row.get("epoch")))
+        .collect();
+    assert_eq!(
+        ok_member_rows,
+        vec![staged_member],
+        "the all-staged batch must actually persist its member row, not just echo the input"
+    );
+}
+
+/// INV-EF P2-6: a duplicate `lease_id` faithfully replays the existing lease
+/// (same fence, same deadline, order-independent member set) rather than
+/// colliding on a bare primary key; a genuinely different member set or an
+/// already-released lease are each refused with their own reason code.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn a_duplicate_staged_lease_id_replays_the_existing_lease_and_refuses_a_different_batch() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+
+    let mut members = Vec::new();
+    for seed in 0u8..2 {
+        let hash = random_hash();
+        let BeginOutcome::Admitted(intent) =
+            coordinator.begin_stage(&hash).await.expect("begin stage")
+        else {
+            panic!("a fresh hash must admit a stage begin");
+        };
+        assert_eq!(
+            coordinator
+                .commit_staged(
+                    &intent,
+                    IoObservation::Valid(manifest(
+                        &format!("duplicate-lease/member-{seed}"),
+                        0x30 + seed,
+                        EpochAuthority::Staged
+                    ))
+                )
+                .await
+                .expect("commit staged member"),
+            CommitVerdict::Published
+        );
+        members.push((hash, intent.epoch));
+    }
+    let extra_hash = random_hash();
+    let BeginOutcome::Admitted(extra_intent) = coordinator
+        .begin_stage(&extra_hash)
+        .await
+        .expect("begin stage extra")
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    assert_eq!(
+        coordinator
+            .commit_staged(
+                &extra_intent,
+                IoObservation::Valid(manifest(
+                    "duplicate-lease/extra",
+                    0x32,
+                    EpochAuthority::Staged
+                ))
+            )
+            .await
+            .expect("commit staged extra"),
+        CommitVerdict::Published
+    );
+
+    let lease_id = rand::random::<[u8; 16]>().to_vec();
+    let first_deadline = microsecond_deadline(Duration::from_secs(60));
+    let first_lease = coordinator
+        .acquire_staged_leases(&lease_id, &members, first_deadline)
+        .await
+        .expect("acquire first lease");
+
+    // Re-acquire the SAME id with the same members in a DIFFERENT order and a
+    // LATER deadline: a replay allocates no second fence and never extends.
+    let mut reordered = members.clone();
+    reordered.reverse();
+    let later_deadline = microsecond_deadline(Duration::from_secs(3600));
+    let replay = coordinator
+        .acquire_staged_leases(&lease_id, &reordered, later_deadline)
+        .await
+        .expect("a faithful replay must succeed");
+    assert_eq!(
+        replay.reader_fence, first_lease.reader_fence,
+        "a replay must not allocate a second reader fence"
+    );
+    assert_eq!(
+        replay.deadline, first_lease.deadline,
+        "a replay must not extend the deadline"
+    );
+
+    let stored_row = direct
+        .query_one(
+            "SELECT reader_fence, deadline FROM lore_fragment_staged_leases WHERE lease_id = $1",
+            &[&lease_id],
+        )
+        .await
+        .expect("read stored lease row after replay");
+    let stored_fence: i64 = stored_row.get(0);
+    let stored_deadline: SystemTime = stored_row.get(1);
+    assert_eq!(stored_fence, first_lease.reader_fence);
+    assert_eq!(stored_deadline, first_lease.deadline);
+
+    // A duplicate id over a DIFFERENT member set is an id collision, not a
+    // retry.
+    let mut different_members = members.clone();
+    different_members.push((extra_hash, extra_intent.epoch));
+    let mismatch_result = coordinator
+        .acquire_staged_leases(&lease_id, &different_members, first_deadline)
+        .await;
+    match mismatch_result {
+        Err(DomainError::PreconditionRejected {
+            reason,
+            reason_version,
+        }) => {
+            assert_eq!(reason, STAGED_LEASE_MEMBER_SET_MISMATCH);
+            assert_eq!(reason_version, 1);
+        }
+        other => panic!("expected STAGED_LEASE_MEMBER_SET_MISMATCH, got {other:?}"),
+    }
+
+    // A duplicate id over an already-released lease must not be resurrected.
+    coordinator
+        .release_staged_lease(&lease_id)
+        .await
+        .expect("release lease");
+    let released_result = coordinator
+        .acquire_staged_leases(&lease_id, &members, first_deadline)
+        .await;
+    match released_result {
+        Err(DomainError::PreconditionRejected {
+            reason,
+            reason_version,
+        }) => {
+            assert_eq!(reason, STAGED_LEASE_ALREADY_RELEASED);
+            assert_eq!(reason_version, 1);
+        }
+        other => panic!("expected STAGED_LEASE_ALREADY_RELEASED, got {other:?}"),
+    }
 }
 
 /// P1-2 item 3: `commit_obliterate` purges the epoch's disposition, deletes
@@ -2947,4 +3695,639 @@ async fn begin_obliterate_on_a_non_readable_head_moves_the_association_scalar_fo
              {label}'s lifecycle scalar must not move"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// WP-118 pre-Phase-5 hardening review: STAGED_LEASE_MEMBER_NOT_STAGED's
+// disposition clause, validate_lease_members, and equivalent_epochs' all-or-
+// nothing rule over a real multi-fragment batch.
+// ---------------------------------------------------------------------------
+
+/// Reviewer finding A1: a `Staged` epoch whose bytes have been proved gone
+/// (`DISPOSITION_PURGED`, reached via `begin_obliterate`/`commit_obliterate`
+/// on a `Staged` head) must be refused the same way a `Remote` or fabricated
+/// member is -- a lease over purged bytes would report protection that
+/// cannot exist.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn acquire_staged_leases_refuses_a_purged_staged_member() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let deadline = microsecond_deadline(Duration::from_secs(60));
+
+    let hash = random_hash();
+    let BeginOutcome::Admitted(stage_intent) =
+        coordinator.begin_stage(&hash).await.expect("begin stage")
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    assert_eq!(
+        coordinator
+            .commit_staged(
+                &stage_intent,
+                IoObservation::Valid(manifest(
+                    "purged-staged-member/staged",
+                    0x90,
+                    EpochAuthority::Staged
+                ))
+            )
+            .await
+            .expect("commit staged"),
+        CommitVerdict::Published
+    );
+    let staged_epoch = stage_intent.epoch;
+
+    let BeginOutcome::Admitted(obliterate_intent) = coordinator
+        .begin_obliterate(&hash)
+        .await
+        .expect("begin obliterate")
+    else {
+        panic!("a readable (Staged) head must admit begin_obliterate");
+    };
+    assert_eq!(
+        coordinator
+            .commit_obliterate(&obliterate_intent)
+            .await
+            .expect("commit obliterate"),
+        CommitVerdict::Published
+    );
+
+    let lease_id = rand::random::<[u8; 16]>().to_vec();
+    let result = coordinator
+        .acquire_staged_leases(&lease_id, &[(hash, staged_epoch)], deadline)
+        .await;
+    match result {
+        Err(DomainError::PreconditionRejected {
+            reason,
+            reason_version,
+        }) => {
+            assert_eq!(reason, STAGED_LEASE_MEMBER_NOT_STAGED);
+            assert_eq!(reason_version, 1);
+        }
+        other => panic!(
+            "expected STAGED_LEASE_MEMBER_NOT_STAGED for a purged staged epoch, got {other:?}"
+        ),
+    }
+}
+
+/// Reviewer finding A1's other half: a `Staged` epoch that has been
+/// quarantined by a later promotion (its successor now `Remote`, itself
+/// still `DISPOSITION_QUARANTINED`, never `DISPOSITION_PURGED`) must still be
+/// admitted. This is what stops the disposition clause from over-correcting
+/// into refusing every superseded staged epoch, not only purged ones -- a
+/// reader still mid-hydration against a quarantined staged epoch is exactly
+/// what the lease protects.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn acquire_staged_leases_admits_a_quarantined_staged_member() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let deadline = microsecond_deadline(Duration::from_secs(60));
+
+    let hash = random_hash();
+    let BeginOutcome::Admitted(stage_intent) =
+        coordinator.begin_stage(&hash).await.expect("begin stage")
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    assert_eq!(
+        coordinator
+            .commit_staged(
+                &stage_intent,
+                IoObservation::Valid(manifest(
+                    "quarantined-staged-member/staged",
+                    0x91,
+                    EpochAuthority::Staged
+                ))
+            )
+            .await
+            .expect("commit staged"),
+        CommitVerdict::Published
+    );
+    let staged_epoch = stage_intent.epoch;
+
+    let BeginOutcome::Admitted(promotion_intent) = coordinator
+        .begin_promotion(&hash)
+        .await
+        .expect("begin promotion")
+    else {
+        panic!("a Staged head must admit begin_promotion");
+    };
+    assert_eq!(
+        coordinator
+            .commit_promotion(
+                &promotion_intent,
+                IoObservation::Valid(manifest(
+                    "quarantined-staged-member/promoted",
+                    0x92,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit promotion"),
+        CommitVerdict::Published
+    );
+
+    // Confirm the staged epoch really is quarantined now -- not purged, and
+    // not (still) current-eligible -- so this case cannot silently degenerate
+    // into "any disposition is fine" or coincide with the purged case above.
+    let disposition: i16 = direct
+        .query_one(
+            "SELECT disposition FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
+            &[&hash, &staged_epoch],
+        )
+        .await
+        .expect("read staged epoch disposition after promotion")
+        .get(0);
+    assert_eq!(
+        disposition,
+        schema::DISPOSITION_QUARANTINED,
+        "the staged predecessor epoch must be quarantined once its promotion publishes"
+    );
+
+    let lease_id = rand::random::<[u8; 16]>().to_vec();
+    let lease = coordinator
+        .acquire_staged_leases(&lease_id, &[(hash.clone(), staged_epoch)], deadline)
+        .await
+        .expect("a quarantined staged epoch must still admit a lease");
+    assert_eq!(lease.members, vec![(hash, staged_epoch)]);
+}
+
+/// `validate_lease_members` runs before any database work: a batch repeating
+/// one hash at two epochs, and an empty batch, are both refused as
+/// [`DomainError::InvalidInput`] with zero rows written. Neither epoch here
+/// needs to be real -- the refusal is purely about the shape of the input
+/// tuples, which is exactly what makes it a pure, DB-independent guard.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn acquire_staged_leases_refuses_a_duplicate_hash_batch_and_an_empty_batch() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let deadline = microsecond_deadline(Duration::from_secs(60));
+
+    let hash = random_hash();
+    let duplicate_hash_batch = vec![(hash.clone(), 1i64), (hash, 2i64)];
+    let lease_id_duplicate = rand::random::<[u8; 16]>().to_vec();
+    let duplicate_result = coordinator
+        .acquire_staged_leases(&lease_id_duplicate, &duplicate_hash_batch, deadline)
+        .await;
+    assert!(
+        matches!(duplicate_result, Err(DomainError::InvalidInput(_))),
+        "expected InvalidInput for a duplicate-hash batch, got {duplicate_result:?}"
+    );
+    let duplicate_lease_rows: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_staged_leases WHERE lease_id = $1",
+            &[&lease_id_duplicate],
+        )
+        .await
+        .expect("count lease rows for a duplicate-hash batch")
+        .get(0);
+    assert_eq!(
+        duplicate_lease_rows, 0,
+        "a duplicate-hash batch must be refused before any database write"
+    );
+
+    let lease_id_empty = rand::random::<[u8; 16]>().to_vec();
+    let empty_result = coordinator
+        .acquire_staged_leases(&lease_id_empty, &[], deadline)
+        .await;
+    assert!(
+        matches!(empty_result, Err(DomainError::InvalidInput(_))),
+        "expected InvalidInput for an empty batch, got {empty_result:?}"
+    );
+    let empty_lease_rows: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_staged_leases WHERE lease_id = $1",
+            &[&lease_id_empty],
+        )
+        .await
+        .expect("count lease rows for an empty batch")
+        .get(0);
+    assert_eq!(
+        empty_lease_rows, 0,
+        "an empty batch must be refused before any database write"
+    );
+}
+
+/// A required fragment whose CAPTURED epoch was never published for that hash
+/// at all (not merely superseded) must abort, even though the head is
+/// genuinely readable at some other epoch. `equivalent_epochs` joins
+/// `lore_fragment_epochs` on the captured epoch; when that row does not
+/// exist, the join drops the pair, `matched` falls short of `divergent.len()`,
+/// and the all-or-nothing rule aborts the whole push.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn revalidate_push_witness_aborts_when_the_captured_epoch_was_never_published() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+
+    let hash = random_hash();
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, "captured-epoch-missing/key")
+        .await
+        .expect("begin")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(
+                    "captured-epoch-missing/key",
+                    0x93,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit"),
+        CommitVerdict::Published
+    );
+    let real_epoch = intent.epoch;
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate"),
+        CommitVerdict::Published
+    );
+
+    let captured = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness")
+        .expect("repository must exist");
+
+    // Move the lifecycle scalar via a bystander so the call reaches the
+    // fallback rather than short-circuiting on `Unchanged`.
+    let bystander_hash = random_hash();
+    let BeginOutcome::Admitted(bystander_intent) = coordinator
+        .begin_direct_write(&bystander_hash, "captured-epoch-missing/bystander")
+        .await
+        .expect("begin bystander")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &bystander_intent,
+                IoObservation::Valid(manifest(
+                    "captured-epoch-missing/bystander",
+                    0x94,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit bystander"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&bystander_hash, &repository_id, &context)
+            .await
+            .expect("associate bystander"),
+        CommitVerdict::Published
+    );
+    let resolved_bystander = coordinator
+        .resolve(
+            &repository_id,
+            &context,
+            std::slice::from_ref(&bystander_hash),
+        )
+        .await
+        .expect("resolve bystander");
+    let (bystander_witness, ..) = expect_readable(&resolved_bystander[0]);
+    let bystander_witness = bystander_witness.clone();
+    assert_eq!(
+        coordinator
+            .mark_missing(&bystander_witness, MissingDiagnostic::Absent)
+            .await
+            .expect("mark bystander missing"),
+        CommitVerdict::Published
+    );
+
+    // A captured epoch guaranteed never published for this hash: far outside
+    // any value this test's own fence sequence could reach, and distinct from
+    // the real current epoch.
+    let never_published_epoch = real_epoch + 1_000_000_000;
+    assert_ne!(never_published_epoch, real_epoch);
+    let required = vec![RequiredFragment {
+        hash,
+        epoch: never_published_epoch,
+    }];
+
+    let mut tx_client = own_transaction_client(&url).await;
+    let tx = tx_client
+        .transaction()
+        .await
+        .expect("open push-witness transaction");
+    let mut sequence = LockSequence::new();
+    let verdict = coordinator
+        .revalidate_push_witness(&tx, &mut sequence, &repository_id, captured, &required)
+        .await
+        .expect("revalidate must not error");
+    assert_eq!(
+        verdict,
+        PushWitnessVerdict::Aborted {
+            reason: REQUIRED_FRAGMENT_CHANGED
+        }
+    );
+}
+
+/// `equivalent_epochs`' all-or-nothing rule (`matched == divergent.len()`)
+/// cannot be discriminated by a one-element `required` slice -- both branches
+/// of the boolean collapse to the same answer at `len() == 1`. A genuine
+/// two-fragment batch is required: two fragments both promoted equivalently
+/// pins the exact `revalidated: 2` count, and swapping one of them for a
+/// non-equivalent promotion must abort the WHOLE push, not just the one
+/// fragment that diverged.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn revalidate_push_witness_all_or_nothing_over_a_mixed_divergent_batch() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+
+    async fn stage_and_associate(
+        coordinator: &PostgresFragmentCoordinator,
+        repository_id: &[u8],
+        context: &[u8],
+        key_prefix: &str,
+        seed: u8,
+    ) -> (Vec<u8>, i64, FragmentManifest) {
+        let hash = random_hash();
+        let BeginOutcome::Admitted(stage_intent) =
+            coordinator.begin_stage(&hash).await.expect("begin stage")
+        else {
+            panic!("a fresh hash must admit a stage begin");
+        };
+        let staged_manifest = manifest(
+            &format!("{key_prefix}/staged"),
+            seed,
+            EpochAuthority::Staged,
+        );
+        assert_eq!(
+            coordinator
+                .commit_staged(&stage_intent, IoObservation::Valid(staged_manifest.clone()))
+                .await
+                .expect("commit staged"),
+            CommitVerdict::Published
+        );
+        assert_eq!(
+            coordinator
+                .create_association(&hash, repository_id, context)
+                .await
+                .expect("associate"),
+            CommitVerdict::Published
+        );
+        (hash, stage_intent.epoch, staged_manifest)
+    }
+
+    let (hash_a, original_epoch_a, staged_manifest_a) = stage_and_associate(
+        &coordinator,
+        &repository_id,
+        &context,
+        "mixed-batch/a-equivalent",
+        0xA0,
+    )
+    .await;
+    let (hash_b, original_epoch_b, staged_manifest_b) = stage_and_associate(
+        &coordinator,
+        &repository_id,
+        &context,
+        "mixed-batch/b-equivalent",
+        0xA1,
+    )
+    .await;
+    let (hash_c, original_epoch_c, staged_manifest_c) = stage_and_associate(
+        &coordinator,
+        &repository_id,
+        &context,
+        "mixed-batch/c-divergent",
+        0xA2,
+    )
+    .await;
+
+    let bystander_hash = random_hash();
+    let BeginOutcome::Admitted(bystander_intent) = coordinator
+        .begin_direct_write(&bystander_hash, "mixed-batch/bystander")
+        .await
+        .expect("begin bystander")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &bystander_intent,
+                IoObservation::Valid(manifest(
+                    "mixed-batch/bystander",
+                    0xA9,
+                    EpochAuthority::Remote
+                ))
+            )
+            .await
+            .expect("commit bystander"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&bystander_hash, &repository_id, &context)
+            .await
+            .expect("associate bystander"),
+        CommitVerdict::Published
+    );
+
+    let captured = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness")
+        .expect("repository must exist");
+
+    // A and B: promote equivalently (identical decoded_hash/size_content/
+    // size_payload/payload_flags; different object_key and manifest_id).
+    for (hash, staged_manifest, key) in [
+        (&hash_a, &staged_manifest_a, "mixed-batch/a-promoted"),
+        (&hash_b, &staged_manifest_b, "mixed-batch/b-promoted"),
+    ] {
+        let BeginOutcome::Admitted(promotion_intent) = coordinator
+            .begin_promotion(hash)
+            .await
+            .expect("begin promotion")
+        else {
+            panic!("a Staged head must admit begin_promotion");
+        };
+        let mut promoted = staged_manifest.clone();
+        promoted.authority = EpochAuthority::Remote;
+        promoted.object_key = key.to_owned();
+        promoted.manifest_id = vec![0xAF; 32];
+        assert_eq!(
+            coordinator
+                .commit_promotion(&promotion_intent, IoObservation::Valid(promoted))
+                .await
+                .expect("commit promotion"),
+            CommitVerdict::Published
+        );
+    }
+
+    // C: promote with a different decoded_hash -- genuinely different content.
+    let BeginOutcome::Admitted(promotion_c) = coordinator
+        .begin_promotion(&hash_c)
+        .await
+        .expect("begin promotion c")
+    else {
+        panic!("a Staged head must admit begin_promotion");
+    };
+    let mut promoted_c = staged_manifest_c.clone();
+    promoted_c.authority = EpochAuthority::Remote;
+    promoted_c.object_key = "mixed-batch/c-promoted".to_owned();
+    promoted_c.manifest_id = vec![0xCA; 32];
+    promoted_c.decoded_hash = vec![0xFF; 32];
+    assert_ne!(promoted_c.decoded_hash, staged_manifest_c.decoded_hash);
+    assert_eq!(
+        coordinator
+            .commit_promotion(&promotion_c, IoObservation::Valid(promoted_c))
+            .await
+            .expect("commit promotion c"),
+        CommitVerdict::Published
+    );
+
+    // Move the lifecycle scalar so both revalidations below reach the
+    // fallback branch rather than short-circuiting on `Unchanged`.
+    let resolved_bystander = coordinator
+        .resolve(
+            &repository_id,
+            &context,
+            std::slice::from_ref(&bystander_hash),
+        )
+        .await
+        .expect("resolve bystander");
+    let (bystander_witness, ..) = expect_readable(&resolved_bystander[0]);
+    let bystander_witness = bystander_witness.clone();
+    assert_eq!(
+        coordinator
+            .mark_missing(&bystander_witness, MissingDiagnostic::Absent)
+            .await
+            .expect("mark bystander missing"),
+        CommitVerdict::Published
+    );
+
+    // Every epoch really did advance -- this is what stops the case from
+    // silently degenerating into an exact-match path for any of the three.
+    for (hash, original_epoch, label) in [
+        (&hash_a, original_epoch_a, "a"),
+        (&hash_b, original_epoch_b, "b"),
+        (&hash_c, original_epoch_c, "c"),
+    ] {
+        let current_epoch: i64 = direct
+            .query_one(
+                "SELECT current_epoch FROM lore_fragment_lifecycle WHERE hash = $1",
+                &[hash],
+            )
+            .await
+            .expect("read current epoch after promotion")
+            .get(0);
+        assert_ne!(
+            current_epoch, original_epoch,
+            "{label}: the epoch must have genuinely advanced"
+        );
+    }
+
+    // Part 1: two REQUIRED fragments, both promoted equivalently -- the
+    // fallback's exact revalidated count is pinned at 2, not just some
+    // positive number, or the length of an incidentally-1-element slice.
+    let both_equivalent = vec![
+        RequiredFragment {
+            hash: hash_a.clone(),
+            epoch: original_epoch_a,
+        },
+        RequiredFragment {
+            hash: hash_b.clone(),
+            epoch: original_epoch_b,
+        },
+    ];
+    let mut tx_client = own_transaction_client(&url).await;
+    let tx = tx_client
+        .transaction()
+        .await
+        .expect("open push-witness transaction");
+    let mut sequence = LockSequence::new();
+    let verdict = coordinator
+        .revalidate_push_witness(
+            &tx,
+            &mut sequence,
+            &repository_id,
+            captured,
+            &both_equivalent,
+        )
+        .await
+        .expect("revalidate must not error");
+    assert_eq!(
+        verdict,
+        PushWitnessVerdict::FallbackSatisfied { revalidated: 2 }
+    );
+    // Neither `tx` nor `tx_client` was ever committed, so `tx`'s `FOR UPDATE`
+    // lock on hash_a's and hash_b's rows is still held until dropped. Part 2
+    // below re-locks hash_a in a SEPARATE transaction on a separate pool --
+    // without an explicit drop here, shadowing `tx`/`tx_client` with new `let`
+    // bindings does not free them (Rust drops shadowed values at end of
+    // scope, not at shadowing), and Part 2 would block forever waiting on a
+    // lock this same test still holds. Revert-checked: removing these two
+    // `drop`s reproduces the hang deterministically.
+    drop(tx);
+    drop(tx_client);
+
+    // Part 2: swap B for C (non-equivalent). One equivalent member and one
+    // non-equivalent member in the SAME batch must abort the whole push, not
+    // just skip the bad one.
+    let mixed = vec![
+        RequiredFragment {
+            hash: hash_a,
+            epoch: original_epoch_a,
+        },
+        RequiredFragment {
+            hash: hash_c,
+            epoch: original_epoch_c,
+        },
+    ];
+    let mut tx_client = own_transaction_client(&url).await;
+    let tx = tx_client
+        .transaction()
+        .await
+        .expect("open push-witness transaction");
+    let mut sequence = LockSequence::new();
+    let verdict = coordinator
+        .revalidate_push_witness(&tx, &mut sequence, &repository_id, captured, &mixed)
+        .await
+        .expect("revalidate must not error");
+    assert_eq!(
+        verdict,
+        PushWitnessVerdict::Aborted {
+            reason: REQUIRED_FRAGMENT_CHANGED
+        },
+        "one non-equivalent member in an otherwise-equivalent batch must abort the whole push"
+    );
 }
