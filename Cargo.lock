@@ -2867,6 +2867,7 @@ dependencies = [
  "hex",
  "lore-aws",
  "lore-base",
+ "lore-object-dispatch",
  "lore-revision",
  "lore-storage",
  "lore-telemetry",

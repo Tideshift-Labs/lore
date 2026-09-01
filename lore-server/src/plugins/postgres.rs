@@ -25,6 +25,7 @@ use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
 use lore_postgres::domain::PostgresDomainStore;
+use lore_postgres::domain::fragments::InFlightPutBound;
 use lore_postgres::pool::TlsConfig;
 use lore_postgres::store::immutable_store::ObjectStoreSettings;
 use lore_postgres::store::immutable_store::PostgresImmutableStore;
@@ -85,6 +86,32 @@ pub struct PostgresStoreConfig {
     /// everything in Postgres.
     #[serde(default)]
     pub object_store: Option<ObjectStoreConfig>,
+    /// CR-031's bounded concurrent in-flight put count for the WP-118 fragment
+    /// lifecycle provider seam.
+    ///
+    /// CR-031 removed the pre-admission body spool (R-BLOCK-3) and bounds
+    /// memory and provider pressure with the existing 256 KiB ingress cap plus
+    /// this count instead, which is why the number is configuration rather than
+    /// a constant.
+    ///
+    /// **Nothing constructs a gateway from this yet, deliberately.** Phase 4
+    /// builds the seam; Phase 5 routes the coordinator into the immutable store
+    /// and is where a gateway is first built. Wiring construction now would put
+    /// an unused provider boundary on the mandatory boot path, which is the
+    /// false-activation shape this package has already refused once for
+    /// `readiness()`. What is live today is validation: a cell that configures
+    /// an impossible bound is refused at startup instead of at its first write.
+    ///
+    /// The field sits on the shared connection shape, so all three factories
+    /// validate it. Only the immutable store will consume it, but an operator
+    /// who puts it under the mutable or lock section should still be told the
+    /// value is impossible rather than that it was ignored.
+    #[serde(default = "default_fragment_in_flight_puts")]
+    pub fragment_in_flight_puts: u32,
+    /// How long a fragment put waits for one of those slots before failing
+    /// closed. Milliseconds; must be positive.
+    #[serde(default = "default_fragment_put_admission_wait_millis")]
+    pub fragment_put_admission_wait_millis: u64,
 }
 
 /// S3-compatible object-storage sub-config for immutable fragment objects.
@@ -121,6 +148,35 @@ fn default_pool_max() -> u32 {
 
 fn default_domain_pool_max() -> u32 {
     4
+}
+
+fn default_fragment_in_flight_puts() -> u32 {
+    lore_postgres::domain::fragments::DEFAULT_IN_FLIGHT_PUTS
+}
+
+fn default_fragment_put_admission_wait_millis() -> u64 {
+    5_000
+}
+
+/// Validates CR-031's in-flight put configuration through the same type the
+/// seam itself takes, so the startup check and the runtime bound cannot drift.
+fn validate_fragment_put_bound(
+    name: &str,
+    cfg: &PostgresStoreConfig,
+) -> Result<InFlightPutBound, PluginError> {
+    InFlightPutBound::new(
+        cfg.fragment_in_flight_puts,
+        std::time::Duration::from_millis(cfg.fragment_put_admission_wait_millis),
+    )
+    .map_err(|error| {
+        PluginError::from(PluginConfigError {
+            plugin_name: name.to_string(),
+            message: format!(
+                "Invalid fragment lifecycle provider admission config \
+                 (fragment_in_flight_puts, fragment_put_admission_wait_millis): {error}"
+            ),
+        })
+    })
 }
 
 fn default_slow_threshold() -> u64 {
@@ -291,6 +347,9 @@ impl ImmutableStorePluginFactory for PostgresImmutableStorePluginFactory {
                     .to_string(),
             }));
         }
+        // CR-031's in-flight put bound, refused here rather than at a first
+        // write. The value is not consumed yet; see its field docs.
+        validate_fragment_put_bound(self.name(), &cfg)?;
         Ok(())
     }
 
@@ -321,7 +380,13 @@ impl MutableStorePluginFactory for PostgresMutableStorePluginFactory {
     }
 
     fn validate_config(&self, config: &toml::Value) -> Result<(), PluginError> {
-        parse_config(self.name(), config).map(|_| ())
+        let cfg = parse_config(self.name(), config)?;
+        // The bound is a field on the shared `[plugins.postgres.*]` shape, so
+        // every factory that parses that shape refuses an impossible value.
+        // Validating it only where it is consumed would let an operator set it
+        // under the wrong section and get silence.
+        validate_fragment_put_bound(self.name(), &cfg)?;
+        Ok(())
     }
 
     // Plugin construction is a synchronous startup-only trait method. The
@@ -372,7 +437,13 @@ impl LockStorePluginFactory for PostgresLockStorePluginFactory {
     }
 
     fn validate_config(&self, config: &toml::Value) -> Result<(), PluginError> {
-        parse_config(self.name(), config).map(|_| ())
+        let cfg = parse_config(self.name(), config)?;
+        // The bound is a field on the shared `[plugins.postgres.*]` shape, so
+        // every factory that parses that shape refuses an impossible value.
+        // Validating it only where it is consumed would let an operator set it
+        // under the wrong section and get silence.
+        validate_fragment_put_bound(self.name(), &cfg)?;
+        Ok(())
     }
 
     fn create(&self, config: &toml::Value) -> Result<Arc<dyn LockStore>, PluginError> {
@@ -452,6 +523,104 @@ mod tests {
             verdict, expected,
             "lore-server's `oodle` feature must forward to lore-postgres/oodle; \
              without it the coordinator misreports a decodable Oodle2 object as unrepairable"
+        );
+    }
+
+    // CR-031's in-flight put bound. Validation is the only live behavior here —
+    // no gateway is constructed until Phase 5 — so these pin that an impossible
+    // bound is refused at startup and that the default is the seam's own.
+
+    fn immutable_config(extra: &str) -> toml::Value {
+        // The extra keys go above the `[object_store]` header on purpose: a TOML
+        // key after a table header belongs to that table, so appending would
+        // have set `object_store.fragment_in_flight_puts` and proved nothing.
+        let text = format!(
+            r#"
+url = "postgres://localhost/lore"
+{extra}
+[object_store]
+bucket = "fragments"
+"#
+        );
+        match toml::from_str(&text) {
+            Ok(config) => config,
+            Err(error) => panic!("fixture config must parse: {error}"),
+        }
+    }
+
+    #[test]
+    fn the_fragment_in_flight_put_bound_defaults_to_the_seams_own_default() {
+        let parsed: PostgresStoreConfig = match immutable_config("").try_into() {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("fixture config must deserialize: {error}"),
+        };
+        assert_eq!(
+            parsed.fragment_in_flight_puts,
+            lore_postgres::domain::fragments::DEFAULT_IN_FLIGHT_PUTS,
+        );
+        assert!(validate_fragment_put_bound(PLUGIN_NAME, &parsed).is_ok());
+    }
+
+    /// Every factory that parses the shared connection shape refuses an
+    /// impossible bound, not only the one that will consume it. The field lives
+    /// on `PostgresStoreConfig`, so an operator can put it under any of the
+    /// three `[plugins.postgres.*]` sections; checking only the immutable
+    /// factory would make the field's "refused at startup" promise conditional
+    /// on which section it landed in.
+    #[test]
+    fn an_impossible_fragment_put_bound_is_refused_by_every_factory() {
+        type ValidateFn<'a> = &'a dyn Fn(&toml::Value) -> Result<(), PluginError>;
+
+        let factories: [(&str, ValidateFn<'_>); 3] = [
+            ("immutable", &|config| {
+                PostgresImmutableStorePluginFactory.validate_config(config)
+            }),
+            ("mutable", &|config| {
+                PostgresMutableStorePluginFactory.validate_config(config)
+            }),
+            ("lock", &|config| {
+                PostgresLockStorePluginFactory.validate_config(config)
+            }),
+        ];
+        for extra in [
+            "fragment_in_flight_puts = 0",
+            "fragment_in_flight_puts = 100000",
+            "fragment_put_admission_wait_millis = 0",
+        ] {
+            let config = immutable_config(extra);
+            for (label, validate) in &factories {
+                let error = validate(&config)
+                    .expect_err("an impossible in-flight put bound must be refused");
+                assert!(
+                    format!("{error}").contains("fragment lifecycle provider admission config"),
+                    "{extra} must be refused by name in the {label} factory, got {error}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_valid_fragment_put_bound_passes_config_validation() {
+        let config = immutable_config(
+            "fragment_in_flight_puts = 16\nfragment_put_admission_wait_millis = 250",
+        );
+        assert!(
+            PostgresImmutableStorePluginFactory
+                .validate_config(&config)
+                .is_ok()
+        );
+        let parsed: PostgresStoreConfig = match config.try_into() {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("fixture config must deserialize: {error}"),
+        };
+        let bound = match validate_fragment_put_bound(PLUGIN_NAME, &parsed) {
+            Ok(bound) => bound,
+            Err(error) => panic!("a valid bound must validate: {error}"),
+        };
+        assert_eq!(bound.permits(), 16);
+        assert_eq!(
+            bound.acquire_timeout(),
+            std::time::Duration::from_millis(250)
         );
     }
 

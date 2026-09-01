@@ -43,6 +43,10 @@ rustls-pemfile = "2"
 opentelemetry = { workspace = true }
 lore-aws = { workspace = true }
 lore-base = { workspace = true }
+# CR-031 Phase 4: the WP-114 cell-local authority client, shared limiter, and
+# governed provider client. This crate consumes them; it never builds a second
+# provider client. `[SERVER]`-only, and unreachable from the `lore` CLI graph.
+lore-object-dispatch = { workspace = true }
 lore-revision = { workspace = true }
 lore-storage = { workspace = true }
 lore-telemetry = { workspace = true }
