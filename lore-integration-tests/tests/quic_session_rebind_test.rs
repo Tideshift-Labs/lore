@@ -1525,11 +1525,9 @@ mod quic_session_rebind_tests {
                     .expect("seed put should succeed");
 
                 let session_for_verify = session.clone();
-                #[allow(clippy::disallowed_methods)]
-                let verify_task =
-                    tokio::spawn(
-                        async move { session_for_verify.verify_outcome(&address, true).await },
-                    );
+                let verify_task = lore_base::lore_spawn!(async move {
+                    session_for_verify.verify_outcome(&address, true).await
+                });
 
                 tokio::time::timeout(SEVER_SIGNAL_TIMEOUT, notify_answered.notified())
                     .await
@@ -1609,8 +1607,7 @@ mod quic_session_rebind_tests {
                 let key = random::<Hash>();
                 let value = random::<Hash>();
                 let session_for_store = session.clone();
-                #[allow(clippy::disallowed_methods)]
-                let store_task = tokio::spawn(async move {
+                let store_task = lore_base::lore_spawn!(async move {
                     session_for_store
                         .mutable_store_outcome(key, value, KeyType::Untyped)
                         .await

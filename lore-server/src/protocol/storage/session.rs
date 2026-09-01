@@ -104,11 +104,7 @@ impl SessionMap {
     /// one of them occupied means something is wrong that a longer loop will not fix.
     /// `entry` is inserted under the id this returns, inside the same vacant-entry claim, so no
     /// concurrent `start` can be handed the same number between the check and the insert.
-    fn allocate(&self, entry: SessionEntry) -> Result<u32, SessionError> {
-        self.allocate_from(&NEXT_SESSION_ID, entry)
-    }
-
-    /// [`SessionMap::allocate`] against an arbitrary sequence.
+    /// Allocate against an arbitrary sequence.
     ///
     /// Split out for one reason: [`NEXT_SESSION_ID`] is a process-wide `static`, and a test that
     /// reset it would corrupt every other test drawing from it in the same binary. Passing the
@@ -149,6 +145,24 @@ impl SessionMap {
         user_id: String,
         permissions: Vec<String>,
     ) -> Result<(u32, String), SessionError> {
+        self.start_from(
+            &NEXT_SESSION_ID,
+            repository,
+            correlation_id,
+            user_id,
+            permissions,
+        )
+    }
+
+    /// [`SessionMap::start`] against an arbitrary sequence for deterministic allocation tests.
+    fn start_from(
+        &self,
+        sequence: &AtomicU32,
+        repository: RepositoryId,
+        correlation_id: String,
+        user_id: String,
+        permissions: Vec<String>,
+    ) -> Result<(u32, String), SessionError> {
         self.active_sessions
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_CONCURRENT_SESSIONS).then_some(active + 1)
@@ -164,12 +178,15 @@ impl SessionMap {
         // Allocated before the repository is authorized, so a failure to allocate leaves nothing
         // behind. Authorizing first would add the repository to this connection's Copy-source
         // scope for a session that then failed to exist.
-        let session_id = match self.allocate(SessionEntry {
-            repository,
-            correlation_id: correlation_id.clone(),
-            user_id,
-            permissions,
-        }) {
+        let session_id = match self.allocate_from(
+            sequence,
+            SessionEntry {
+                repository,
+                correlation_id: correlation_id.clone(),
+                user_id,
+                permissions,
+            },
+        ) {
             Ok(session_id) => session_id,
             Err(error) => {
                 self.active_sessions.fetch_sub(1, Ordering::Release);
@@ -451,6 +468,7 @@ mod tests {
     fn stop_unknown_returns_not_found() {
         let map = SessionMap::default();
         assert_eq!(map.stop(999), Err(SessionError::NotFound));
+        assert_eq!(map.active_sessions.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -460,7 +478,13 @@ mod tests {
             .start(random(), "corr-1".into(), String::new(), Vec::new())
             .unwrap();
         map.stop(id).unwrap();
+        assert_eq!(map.active_sessions.load(Ordering::Acquire), 0);
         assert_eq!(map.stop(id), Err(SessionError::NotFound));
+        assert_eq!(
+            map.active_sessions.load(Ordering::Acquire),
+            0,
+            "a second stop must not decrement the admission count below zero"
+        );
     }
 
     #[test]
@@ -597,6 +621,40 @@ mod tests {
         assert_eq!(
             map.active_sessions.load(Ordering::Acquire),
             MAX_CONCURRENT_SESSIONS
+        );
+    }
+
+    #[test]
+    fn allocation_failure_refunds_the_claimed_session_slot() {
+        const OCCUPIED: u32 = 8;
+        let map = SessionMap::default();
+        let sequence = AtomicU32::new(500);
+        for id in 500..500 + OCCUPIED {
+            map.entries.insert(
+                id,
+                SessionEntry {
+                    repository: random(),
+                    correlation_id: format!("occupant-{id}"),
+                    user_id: String::new(),
+                    permissions: Vec::new(),
+                },
+            );
+        }
+        map.active_sessions.store(OCCUPIED, Ordering::Release);
+
+        let result = map.start_from(
+            &sequence,
+            random(),
+            "must-fail".into(),
+            String::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(result, Err(SessionError::CounterExhausted));
+        assert_eq!(
+            map.active_sessions.load(Ordering::Acquire),
+            OCCUPIED,
+            "failed allocation must refund the admission slot it claimed"
         );
     }
 }
