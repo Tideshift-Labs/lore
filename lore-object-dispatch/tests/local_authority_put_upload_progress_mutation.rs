@@ -220,13 +220,27 @@ fn helpers_and_tables_are_revoked_and_artifact_is_source_dark() {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
         &mut sources,
     );
+    // Narrowed by WP-114 CD-3, recorded in WP-114: `src/dispatch_client.rs` is the sanctioned
+    // typed caller of this procedure and is the one file allowed to name it. Every other crate
+    // source is still held to source-dark.
+    let sanctioned = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("dispatch_client.rs");
+    let mut sanctioned_seen = false;
     for path in sources {
         let source = std::fs::read_to_string(&path).expect("read production source");
-        assert!(
-            !source.contains("object_store_dispatch_put_upload_progress_v1("),
-            "runtime source {} calls source-dark mutation",
-            path.display()
-        );
+        // The exemption is per-check, not per-file: the typed client may name the procedure, and
+        // is still held to every other assertion in this loop. Skipping the whole body would have
+        // let it embed the frozen migration bytes unnoticed.
+        if path == sanctioned {
+            sanctioned_seen = source.contains("object_store_dispatch_put_upload_progress_v1(");
+        } else {
+            assert!(
+                !source.contains("object_store_dispatch_put_upload_progress_v1("),
+                "runtime source {} calls source-dark mutation",
+                path.display()
+            );
+        }
         if path.file_name().and_then(|name| name.to_str())
             != Some("local_authority_put_upload_progress_mutation.rs")
         {
@@ -237,6 +251,10 @@ fn helpers_and_tables_are_revoked_and_artifact_is_source_dark() {
             );
         }
     }
+    assert!(
+        sanctioned_seen,
+        "the typed client no longer calls this procedure; the exclusion above is now unearned"
+    );
 }
 
 const RETENTION_DIGEST: &str = "f86d1a574cab9346ef39843fed6ffb849cafe5967881a45d0c6d89028780f6dd";

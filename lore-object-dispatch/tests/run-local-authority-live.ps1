@@ -3,7 +3,7 @@
 
 <#
 .SYNOPSIS
-Provisions a disposable PostgreSQL 16 and runs the eleven `local_authority_*` cell-authority live
+Provisions a disposable PostgreSQL 16 and runs the twelve cell-authority live
 tests in lore-object-dispatch by exact name, reporting pass/fail/NOT RUN distinctly.
 
 .DESCRIPTION
@@ -11,12 +11,12 @@ WP-114 CD-2: the local-authority live tests are `#[ignore]` fixtures gated on pe
 `LORE_TEST_LOCAL_*_PG_URL` environment variables with no provisioning script before this file
 existed. WP-114 CD-3 added the two `local_authority_dispatcher_identity_*` tests (schema and
 provisioning) for the per-participant dispatcher-identity edge (0018-0020; CR-033 D8), bringing
-the total from nine to eleven. This runner:
+the total from nine to eleven, and WP-114 CD-3's typed-client tier took it to twelve. This runner:
 
-  1. Cross-checks its own eleven-entry name/target/env-var map against
+  1. Cross-checks its own twelve-entry name/target/env-var map against
      `cargo test -p lore-object-dispatch -- --ignored --list` (ground truth, not the README)
-     before touching Docker. A known test missing from the catalog, or an unknown
-     `local_authority_*` ignored test appearing in it, is a hard failure -- this is what keeps a
+     before touching Docker. A known test missing from the catalog, or an ignored test appearing in a target this
+     runner owns that its map does not name, is a hard failure -- this is what keeps a
      renamed or newly added live test from silently going NOT RUN or silently unexercised.
   2. Checks for a colliding container: any container already carrying the
      `com.tideshift.lore.local-authority-live` label is a hard failure, printed with its name,
@@ -31,18 +31,31 @@ the total from nine to eleven. This runner:
      observer can check whether the owning process is actually still alive before ever treating a
      labelled container as safe to remove.
   4. Creates the four cluster-wide `object_dispatch_retention_*` roles once, idempotently, and
-     shares that one container/cluster across all eleven tests plus the install-chain-proof
-     database (twelve databases total). This is safe specifically because a role census across
-     all eleven test bodies (`grep`-verified) found zero `ALTER ROLE`, `DROP ROLE`, cross-role
-     `GRANT ... TO`, `CREATEDB`, `SUPERUSER`, or `BYPASSRLS` -- the one `ALTER ROLE` hit in the
-     crate is a string literal inside `local_authority_schema.rs`'s forbidden-keyword assertion
-     list, not an execution, and that file has no live test. Every `REVOKE`/`GRANT EXECUTE` is
-     object-scoped and schema-qualified (`ON ALL TABLES IN SCHEMA object_store_retention`, `ON
-     FUNCTION`, `ON TYPE`, ...), and `SET SESSION AUTHORIZATION` is session-local. The only
-     cluster-level effect any test has is the identical idempotent `CREATE ROLE ... NOLOGIN`
-     guard, which is convergent and is state every test wants anyway. One container per test was
-     not needed.
-  5. Creates twelve databases: one per live test, plus `local_install_chain_proof`.
+     shares that one container/cluster across all twelve tests plus the install-chain-proof
+     database (thirteen databases total). This is safe specifically because a role census across
+     all twelve test bodies found zero `DROP ROLE`, `CREATEDB`, `SUPERUSER`, or `BYPASSRLS`. Every
+     `REVOKE`/`GRANT EXECUTE` is object-scoped and schema-qualified (`ON ALL TABLES IN SCHEMA
+     object_store_retention`, `ON FUNCTION`, `ON TYPE`, ...), and `SET SESSION AUTHORIZATION` is
+     session-local.
+
+     **Two cluster-level effects the census does find, both accepted deliberately.** The earlier
+     wording claimed "zero cross-role `GRANT ... TO`" as well; that was never true and is corrected
+     here rather than restated. Eleven of the twelve test bodies execute `GRANT
+     object_dispatch_retention_owner TO CURRENT_USER` -- they must, because every migration begins
+     `SET LOCAL ROLE object_dispatch_retention_owner` and the acting superuser needs membership to
+     assume it. It is convergent, additive, and grants a NOLOGIN role with no cluster privileges.
+     Second, WP-114 CD-3's `dispatch_client_live.rs` executes `ALTER ROLE
+     object_dispatch_retention_runtime LOGIN` and the same for maintenance, because the typed
+     client's pool carries its own credential and connects *as* the authority role rather than
+     assuming it with `SET SESSION AUTHORIZATION`. That one is likewise convergent and additive: it
+     grants no membership, no `CREATEDB`, no `SUPERUSER`, no `BYPASSRLS`, and revokes nothing, and
+     the eleven `SET SESSION AUTHORIZATION` tests are unaffected by a role gaining `LOGIN`. Both
+     effects outlive their test but not the run: the container is disposable and is removed at the
+     end, so neither reaches a cluster anyone else uses. One container per test is still not needed.
+
+     The `ALTER ROLE` line in `local_authority_schema.rs` remains a string literal inside a
+     forbidden-keyword assertion list, not an execution.
+  5. Creates thirteen databases: one per live test, plus `local_install_chain_proof`.
   6. Installs the CD-1 cell install set (0002, 0003, then 0007 through 0022, in that exact
      order, resolved by numeric prefix) into `local_install_chain_proof` and asserts the CD-1
      "expected inert state": four of the five tables 0002 creates -- the ones inert while
@@ -62,7 +75,7 @@ the total from nine to eleven. This runner:
      `object_store_dispatch_put_reservation_read_state_v1` for the 0010/0011 layer), and proves
      drift fails closed on both. Two things that layer does *not* cover, recorded here because
      nothing else covers them either: 0003's retention-layer readback
-     (`object_store_retention_read_state_v1`) has no live caller among the eleven (grep-verified,
+     (`object_store_retention_read_state_v1`) has no live caller among the twelve (grep-verified,
      zero hits), and migrations 0012-0017 have no dedicated `read_state` procedure at all --
      they are codecs and mutations, attested behaviorally by their own live tests instead.
      WP-114 CD-3's 0019 adds the chain's one growth-tolerant readback
@@ -81,10 +94,10 @@ the total from nine to eleven. This runner:
      (`local_install_chain_proof`) database receives 0018-0022 and the inert-state assertion.
   7. Pre-installs migrations 0002 and 0009 (only) into the `local_codec` database, matching
      `local_authority_canonical_codec.rs`'s own stated requirement -- it is the one live test
-     that does not self-provision its schema. The other ten tests self-provision their roles
+     that does not self-provision its schema. The other eleven tests self-provision their roles
      (idempotently) and self-install their own required migration subset from their own
      `include_str!`'d copies, so their databases are handed over empty.
-  8. Runs the eleven tests by exact name, serially, via
+  8. Runs the twelve tests by exact name, serially, via
      `cargo test -p lore-object-dispatch --test <target> -- --ignored --exact <name>`.
   9. Parses each invocation's `running N tests` and `test result: ... P passed; F failed`
      lines. A test whose filter matched zero tests is reported NOT RUN, never as a pass.
@@ -186,6 +199,15 @@ $tests = @(
         Target   = 'local_authority_dispatcher_identity_provisioning'
         Name     = 'live_postgres_dispatcher_identity_readback_authorizes_by_role_and_fails_closed_on_catalog_drift'
         Database = 'local_dispatcher_identity_provisioning'
+    },
+    @{
+        # WP-114 CD-3's typed cell-authority client. The only entry whose target is not
+        # `local_authority_*`: it drives the procedures through the public client API rather than
+        # through raw SQL, and it connects as the authority roles themselves.
+        EnvVar   = 'LORE_TEST_LOCAL_DISPATCH_CLIENT_PG_URL'
+        Target   = 'dispatch_client_live'
+        Name     = 'live_postgres_typed_client_agrees_with_every_called_cell_procedure'
+        Database = 'local_dispatch_client'
     }
 )
 
@@ -348,19 +370,28 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
         }
     }
 
-    $localAuthorityCatalog = @($catalog | Where-Object { $_.Target -like 'local_authority_*' })
-    $unknownLocalAuthority = @($localAuthorityCatalog | Where-Object {
+    # This runner owns every `local_authority_*` target plus any other target its own map names --
+    # WP-114 CD-3's `dispatch_client_live` is the first of those. Deriving ownership from the map
+    # rather than from the name prefix keeps a newly added ignored test inside an owned target
+    # failing closed here instead of being silently accepted.
+    $ownedTargets = @($Tests | ForEach-Object { $_.Target } | Sort-Object -Unique)
+    $ownedCatalog = @($catalog | Where-Object {
+            $_.Target -like 'local_authority_*' -or $ownedTargets -contains $_.Target
+        })
+    $unknownOwned = @($ownedCatalog | Where-Object {
             $candidate = $_
             -not @($Tests | Where-Object { $_.Target -eq $candidate.Target -and $_.Name -eq $candidate.Name })
         })
-    if ($unknownLocalAuthority.Count -gt 0) {
-        $descriptions = ($unknownLocalAuthority | ForEach-Object { "$($_.Name) ($($_.Target))" }) -join '; '
-        $message = "found local_authority_* ignored test(s) unknown to this harness: $descriptions -- " +
+    if ($unknownOwned.Count -gt 0) {
+        $descriptions = ($unknownOwned | ForEach-Object { "$($_.Name) ($($_.Target))" }) -join '; '
+        $message = "found ignored test(s) in a target this harness owns but does not know: $descriptions -- " +
         'update the harness''s test map (and provision its database) before trusting a green run'
         throw $message
     }
 
-    $otherCatalog = @($catalog | Where-Object { $_.Target -notlike 'local_authority_*' })
+    $otherCatalog = @($catalog | Where-Object {
+            -not ($_.Target -like 'local_authority_*' -or $ownedTargets -contains $_.Target)
+        })
     $unexpectedOther = @($otherCatalog | Where-Object { $knownOtherIgnoredTests -notcontains $_.Name })
     if ($unexpectedOther.Count -gt 0) {
         $descriptions = ($unexpectedOther | ForEach-Object { "$($_.Name) ($($_.Target))" }) -join '; '
@@ -373,7 +404,7 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
         Write-Warning "the other live tiers' ignored-test count changed: expected $($knownOtherIgnoredTests.Count), found $($otherCatalog.Count) (missing: $($missing -join ', '))"
     }
 
-    $catalogMessage = "Ignored-test catalog: $($catalog.Count) total ($($localAuthorityCatalog.Count) local_authority_* known, $($otherCatalog.Count) in the other known live tiers). " +
+    $catalogMessage = "Ignored-test catalog: $($catalog.Count) total ($($ownedCatalog.Count) owned by this harness, $($otherCatalog.Count) in the other known live tiers). " +
     "spool_verifier's Linux-only live test is #[cfg(target_os = 'linux')]-gated and does not compile " +
     'into this Windows binary at all, so it cannot appear in this catalog; it is NOT RUN by static ' +
     'knowledge of the source, not because this harness observed and skipped it.'
@@ -657,22 +688,22 @@ WHERE n.nspname = 'object_store_retention'
 
     $results | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
 
-    # Assert what this is meant to prove: that all eleven actually reported PASS, not merely that
-    # the (fixed-size) $tests map produced eleven result rows -- a count check against $results
+    # Assert what this is meant to prove: that all twelve actually reported PASS, not merely that
+    # the (fixed-size) $tests map produced twelve result rows -- a count check against $results
     # would only ever catch $tests itself being resized, which is not an execution guarantee.
     # $ran -ne 1 above is what actually proves each test executed for real rather than matching
     # nothing under --exact.
     $passCount = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
     $failures = @($results | Where-Object { $_.Status -ne 'PASS' })
-    if ($passCount -ne 11) {
-        Write-Warning "$passCount of 11 local-authority live tests passed; $($failures.Count) did not:"
+    if ($passCount -ne 12) {
+        Write-Warning "$passCount of 12 local-authority live tests passed; $($failures.Count) did not:"
         foreach ($failure in $failures) {
             Write-Warning "  $($failure.Test): $($failure.Status)"
         }
     }
     else {
         $runPassed = $true
-        Write-Host "All 11 local-authority live tests passed."
+        Write-Host "All 12 local-authority live tests passed."
     }
 }
 finally {

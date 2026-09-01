@@ -383,6 +383,18 @@ fn artifact_is_embedded_and_source_dark_without_runtime_calls() {
         src_root.join("cell_schema_install.rs"),
         src_root.join("bin").join("cell-schema-install.rs"),
     ];
+    // Narrowed by WP-114 CD-3, recorded in WP-114. `src/dispatch_client.rs` is the sanctioned typed
+    // caller of the three runtime- and maintenance-callable entrypoints, so it is exempted for
+    // exactly those three, by exact path, for the same reason the installer is. It is **not**
+    // exempted for `..._install_v1`: installing a layer stays the out-of-band installer's alone,
+    // and this test still fails closed if the typed client ever names it.
+    let typed_client = src_root.join("dispatch_client.rs");
+    const TYPED_CLIENT_ENTRYPOINTS: [&str; 3] = [
+        "object_store_dispatch_dispatcher_identity_read_state_v1",
+        "object_store_dispatch_enroll_dispatcher_participant_v1",
+        "object_store_dispatch_register_dispatcher_v1",
+    ];
+    let mut typed_client_seen = 0usize;
     for path in sources {
         if installer_paths.contains(&path) {
             continue;
@@ -394,6 +406,12 @@ fn artifact_is_embedded_and_source_dark_without_runtime_calls() {
             "object_store_dispatch_enroll_dispatcher_participant_v1",
             "object_store_dispatch_register_dispatcher_v1",
         ] {
+            if path == typed_client && TYPED_CLIENT_ENTRYPOINTS.contains(&entrypoint) {
+                if source.contains(entrypoint) {
+                    typed_client_seen += 1;
+                }
+                continue;
+            }
             assert!(
                 !source.contains(entrypoint),
                 "runtime source {} calls {entrypoint}",
@@ -401,6 +419,12 @@ fn artifact_is_embedded_and_source_dark_without_runtime_calls() {
             );
         }
     }
+    assert_eq!(
+        typed_client_seen,
+        TYPED_CLIENT_ENTRYPOINTS.len(),
+        "the typed client no longer calls all three entrypoints; the exemption above is now \
+         broader than what it earns"
+    );
 }
 
 #[test]

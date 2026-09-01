@@ -7,9 +7,12 @@ into loreserver composition and cannot authorize provider traffic or first-seen 
 
 There is no separate dispatcher process, no in-cell mTLS service, and no surviving RPC (CR-033 D1,
 2026-08-28). The cell dispatch authority is the retained PostgreSQL procedures below, installed in
-the cell database and called directly by every loreserver replica and drain worker through a typed
-Rust client linked into `lore-postgres`. That client consumes `lore-postgres`'s existing connection
-pool rather than a separately configured one; the external-endpoint connection contract (single ASCII
+the cell database and called directly by every loreserver replica and drain worker through the typed
+Rust client in `dispatch_client.rs`. That client uses a **fourth, separately credentialed** pool of
+its own (`dispatch_pool.rs`), not `lore-postgres`'s existing store pools: CR-033 D1's original
+"consume the existing pool" is unimplementable, because every retained mutation asserts
+`session_user = 'object_dispatch_retention_runtime'` and grants `EXECUTE` only to that role, while a
+store pool connects as the store identity. The external-endpoint connection contract (single ASCII
 DNS host, `sslmode=require`, pinned CA, mandatory client certificate) was written for an authority
 database outside every cell and does not survive now that the authority is the cell's own database.
 Redaction and the closed retry classification do survive: connection strings, PEM material,
@@ -311,6 +314,60 @@ rather than merely discouraged. `record_no_dispatch` still cannot bind its proof
 section and CR-033 D4 for the governing spec and disposition; this file states only the module's
 boundary.
 
+## Typed cell-authority client and dispatch-runtime pool (WP-114 CD-3)
+
+`dispatch_client.rs` is the crate's only typed path to the retained cell procedures: 0013's
+`ReservePut` admission, 0015's non-final upload progress, 0017's `SPOOL_READY` transition, 0020's
+maintenance-only participant enrollment and runtime-only dispatcher registration, and 0019's
+runtime-callable installed-layer readback. `dispatch_pool.rs` owns the connection pool underneath
+it. Both are source-dark: no composition path constructs either, and compiling or testing them
+opens no cell connection.
+
+**Two credentials, two clients.** Every 0013/0015/0017 mutation and 0020's registration assert
+`session_user = 'object_dispatch_retention_runtime'`; 0020's enrollment asserts the maintenance
+role. `lore-postgres`'s CR-007 store pools connect as the store identity and so cannot carry any of
+these calls — that is why CR-033 D1's "consume the existing pool" is unimplementable and a fourth
+pool exists. `DispatchRuntimeClient` refuses a pool that is not the runtime identity and
+`DispatchMaintenanceClient` refuses one that is not maintenance, and a pool refuses a URL whose user
+is not its own role, so a maintenance credential cannot reach a runtime mutation by mistake.
+
+**The connection budget, stated.** `DISPATCH_CONNECTION_BUDGET_STATEMENT` and
+`STAGING_DISPATCH_CONNECTION_BUDGET` carry it: per replica, three `lore-postgres` store pools plus
+one dispatch-runtime pool, all against the same cell database, none coordinating; at staging's
+`pool_max = 5` that is `(3 + 1) * 5 = 20` connections per replica, before the control plane's own
+pools on the same instance. `DispatchRuntimePool::new` refuses a `pool_max` above the budget it is
+given. What it cannot check is the sum across a process: a pool sees only itself, so two pools each
+declaring `dispatch_pools: 1` are individually valid and jointly over. Making the sum true is a
+composition-time obligation, recorded as a named residual in WP-114 CD-3.
+
+**Closed decoding.** Each procedure returns `CREATED`/`REPLAY` or `APPLIED`/`REPLAY`, and each
+failure is a `RAISE EXCEPTION` with a frozen message literal and a SQLSTATE. An unrecognized result
+code is `UnrecognizedResultCode`, never a default. Conditions map through one closed table; an
+unrecognized SQLSTATE fails closed as `AuthorityUnavailable`. Every decoded projection is bound back
+to the descriptor its call submitted before it is returned.
+
+**The bounded-execution envelope (CR-033 D1), verbatim.** Every transaction opens with
+`SET LOCAL statement_timeout` and `lock_timeout`. Read-only transactions are never retried.
+Mutations run exactly three attempts, retrying only `40001` and `40P01` after 25 ms then 100 ms,
+with the pooled session released before each sleep. Note that 0015 and 0017 raise their own
+`..._CONFLICT` conditions *as* `40001` deliberately, so the retry classification claims them before
+the condition table does.
+
+**Provable versus unprovable outcomes.** `DispatchDisposition` has four arms, not two: `Applied`
+and `Replayed` for a commit that was observed, and `AppliedAfterAmbiguousCommit` /
+`ReplayedAfterAmbiguousCommit` for one that was not. A `COMMIT` that returns a SQLSTATE is
+PostgreSQL proving it aborted, so it keeps its own arm; only a `COMMIT` with no SQLSTATE is
+ambiguous, and that one is *resolved* rather than reported — the client reconnects and re-issues the
+identical call, which is the operation-specific authoritative read for all five procedures, since
+each answers `REPLAY` when its record already exists. A wall-clock timeout is likewise split: the
+client records the instant `COMMIT` reaches the wire, so a timeout before that is a plain
+`OperationTimeout` on a transaction it can prove was never asked to commit. `AmbiguousCommit` is
+reached only when resolution itself fails, and it is deliberately not reported as transient.
+
+**Redaction.** No connection string, PEM, PostgreSQL diagnostic, parameter value, identifier, or
+boundary id reaches `Display`, `Debug`, `Error::source`, tracing, or a detached task's log. Error
+variants carry `&'static str` or nothing at all.
+
 ## Out-of-band cell schema install (WP-114 CD-1)
 
 `cell_schema_install.rs` and the one-shot `cell-schema-install` binary are the production install
@@ -423,7 +480,7 @@ cargo clippy -p lore-object-dispatch --all-targets -- -D warnings --no-deps
 cargo test -p lore-object-dispatch
 
 # Local-authority live tier: supported path (stands up disposable PostgreSQL 16,
-# installs the CD-1 set, runs all eleven by exact name, reports PASS/FAIL/NOT RUN)
+# installs the CD-1 set, runs all twelve by exact name, reports PASS/FAIL/NOT RUN)
 tests/run-local-authority-live.ps1
 
 # Cell-schema installer/attester live tier (WP-114 CD-1): five gates over the real
@@ -441,7 +498,14 @@ numeric transfer, closed result decoding, migration identity, and transient-erro
 Each `local_authority_*` live contract, run by exact name against a disposable, separately
 provisioned PostgreSQL 16 with the matching migration installed, proves that instance's procedure
 signature, rows/bytes/retention semantics, typed absence, and replay safety against a real database
-rather than only the embedded migration bytes agreeing with the client statically.
+rather than only the embedded migration bytes agreeing with the client statically. WP-114 CD-3's
+`dispatch_client_live` is the twelfth case in that tier: it drives every procedure the typed client
+calls through the public client API, connecting as the authority roles themselves rather than
+assuming them with `SET SESSION AUTHORIZATION`, and injects SQLSTATE `40001` through a trigger to
+drive the retry loop itself - two conflicts then success on the third attempt, on a `pool_max = 1`
+pool so a retry loop that retained its lease across the backoff would fail closed instead. An injected lost-`COMMIT` fault
+is NOT RUN: it needs the fault proxy the retention tier carries, so the ambiguity-resolution path
+remains pinned only offline.
 
 `run-provider-charge-live.ps1` proves the limiter's concurrent last-unit behavior, frozen
 revision/fence grammar, exact publication replay, stage-3 configuration checks, database-clock and
@@ -451,8 +515,9 @@ uses no provider endpoint, credential, route, or concrete production budget pin.
 `run-local-authority-live.ps1` (WP-114 CD-2, Lore `1bb4ff7`) is the checked-in provisioning
 harness for this tier, modeled on the retention client's runner
 (`tests/run-retention-client-live.ps1`). It grew from nine tests and ten databases to eleven and
-twelve at WP-114 CD-3 (migrations 0018/0019's schema and provisioning live cases), and is currently
-11/11 PASS, exit 0, container removed, dangling-volume count unchanged. It installs the CD-1 set
+twelve at WP-114 CD-3 (migrations 0018/0019's schema and provisioning live cases), then to twelve
+and thirteen when the same step added the typed-client case, and is currently
+12/12 PASS, exit 0, container removed, dangling-volume count unchanged. It installs the CD-1 set
 into a dedicated `local_install_chain_proof` database to run the WP-114 CD-1 inert-state assertion;
 the `local_authority_put_spool_ready_mutation` live test separately self-installs the full chain via
 compile-time `include_str!`. Full verification detail is in CR-033's "Verification: the retained
@@ -488,7 +553,7 @@ found, refusal on seven distinct catalog drift classes each caught in its own ma
 the revoke-after-replacement path restoring the exact pinned ACL state. Verified 5/5 PASS.
 
 Limitations, updated through CD-3: `object_store_retention_read_state_v1` (0003's readback) still
-has no live caller among CD-2's eleven `local_authority_*` tests, but `cell-schema-install attest`
+has no live caller among the runner's twelve tests, but `cell-schema-install attest`
 above is now a live caller. The first of WP-114 CD-1's two named readback gaps is closed. The second
 is not: migrations 0012-0017 still have no `read_state` procedure, and on a fully installed cell
 0011's existing put-reservation readback fails closed (`55000`) rather than merely omitting them,

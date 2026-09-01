@@ -300,14 +300,33 @@ fn artifact_is_embedded_only_and_runtime_source_dark() {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
         &mut sources,
     );
+    // Narrowed by WP-114 CD-3, recorded in WP-114: `src/dispatch_client.rs` is the sanctioned
+    // typed caller of this procedure, so it is the one file allowed to name it - the same shape as
+    // the installer exclusion in the dispatcher-identity tier. The claim this test still makes, and
+    // the one that matters, is that no OTHER crate source calls it. That the typed client itself is
+    // composed nowhere is asserted by `tests/dispatch_client.rs`.
+    let sanctioned = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("dispatch_client.rs");
+    let mut sanctioned_seen = false;
     for path in sources {
         let source = std::fs::read_to_string(&path).expect("read production source");
-        assert!(
-            !source.contains("object_store_dispatch_reserve_put_v1("),
-            "runtime source {} calls source-dark mutation",
-            path.display()
-        );
+        // The exemption is per-check, not per-file, so any assertion added to this loop later still
+        // applies to the typed client.
+        if path == sanctioned {
+            sanctioned_seen = source.contains("object_store_dispatch_reserve_put_v1(");
+        } else {
+            assert!(
+                !source.contains("object_store_dispatch_reserve_put_v1("),
+                "runtime source {} calls source-dark mutation",
+                path.display()
+            );
+        }
     }
+    assert!(
+        sanctioned_seen,
+        "the typed client no longer calls this procedure; the exclusion above is now unearned"
+    );
 }
 
 const RETENTION_DIGEST: &str = "f86d1a574cab9346ef39843fed6ffb849cafe5967881a45d0c6d89028780f6dd";

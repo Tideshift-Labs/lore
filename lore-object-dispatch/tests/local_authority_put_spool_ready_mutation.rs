@@ -191,19 +191,37 @@ fn source_dark_and_no_filesystem_or_provider_wiring() {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
         &mut files,
     );
+    // Narrowed by WP-114 CD-3, recorded in WP-114: `src/dispatch_client.rs` is the sanctioned
+    // typed caller of this procedure and is the one file allowed to name it. Every other crate
+    // source is still held to source-dark.
+    let sanctioned = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("dispatch_client.rs");
+    let mut sanctioned_seen = false;
     for path in files {
         let text = std::fs::read_to_string(&path).expect("source");
-        assert!(
-            !text.contains("object_store_dispatch_put_spool_ready_v1("),
-            "runtime call {}",
-            path.display()
-        );
+        // The exemption is per-check, not per-file: the typed client may name the procedure, and
+        // is still held to every other assertion in this loop. Skipping the whole body would have
+        // let it embed the frozen migration bytes unnoticed.
+        if path == sanctioned {
+            sanctioned_seen = text.contains("object_store_dispatch_put_spool_ready_v1(");
+        } else {
+            assert!(
+                !text.contains("object_store_dispatch_put_spool_ready_v1("),
+                "runtime call {}",
+                path.display()
+            );
+        }
         if path.file_name().and_then(|v| v.to_str())
             != Some("local_authority_put_spool_ready_mutation.rs")
         {
             assert!(!text.contains("LOCAL_AUTHORITY_PUT_SPOOL_READY_MUTATION_MIGRATION_V1"));
         }
     }
+    assert!(
+        sanctioned_seen,
+        "the typed client no longer calls this procedure; the exclusion above is now unearned"
+    );
     for forbidden in [
         "tokio_postgres",
         "rename(",
