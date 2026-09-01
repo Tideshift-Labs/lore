@@ -32,6 +32,22 @@
 //!   `error[E0603]: struct ProviderAttemptLedger is private`. Keep the narrow
 //!   wording: no provider attempt can be issued from this crate.
 //!
+//!   This crate also cannot supply a transport of its own:
+//!   `impl ProviderTransport for …` needs `AuthorizedProviderAttempt`,
+//!   `ProviderAttemptReport` and `ProviderTransportRefusal`, none of which the
+//!   seam re-exports, so the gateway this crate holds can only ever be the
+//!   unwired one.
+//!
+//! **And the scope, stated as narrowly as it is true.** This is a fact about
+//! *this crate's manifest*, not a global one. Any crate that adds
+//! `lore-object-dispatch` to its own `Cargo.toml` can construct a
+//! `GovernedProviderClient` and issue attempts without touching the seam, and
+//! nothing in the seam can prevent that. What holds is that no caller in the
+//! crates that exist today can — `lore-postgres` does not depend on the
+//! dispatch crate and `lore-server` has no reference to it — enforced by this
+//! crate's dependency list plus the seam's own manifest and no-re-export pins.
+//! A new crate opting in is a manifest edit no pin here can see.
+//!
 //! Only `provider.rs` moved. The rest of `domain/fragments/` cannot follow it:
 //! the coordinator needs `DomainError`, `lock_order`, `schema::STATE_LIVE` and
 //! `pool::ensure_schema` from this crate, and Phase 5 routes this crate's

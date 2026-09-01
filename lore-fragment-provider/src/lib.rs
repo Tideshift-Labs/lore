@@ -103,6 +103,28 @@
 //! gateway. That is one small crate's worth of surface, and no dependency or
 //! privacy rule reaches it.
 //!
+//! # The scope of the guarantee, stated as narrowly as it is true
+//!
+//! **This is a per-crate manifest fact, not a global one.** "No caller outside
+//! the seam can invoke `execute`" is false as a general claim. Any crate that
+//! adds `lore-object-dispatch` to its own `Cargo.toml` can name `execute`'s
+//! parameters — and, more to the point, can construct its own
+//! `GovernedProviderClient` and issue attempts without touching this seam at
+//! all. Nothing done inside this crate prevents that, and nothing could.
+//!
+//! What actually holds today is narrower and checkable: **no caller in the
+//! crates that exist today can**, because `lore-postgres` does not depend on
+//! `lore-object-dispatch` and `lore-server` has no reference to it either.
+//! What enforces it is the manifest pin in
+//! `lore-fragment-provider/tests/seam_source_pins.rs` — which fails if the AWS
+//! SDK or `lore-postgres` appears in this crate's shipped dependencies — and
+//! the no-re-export pin beside it. A *new* crate opting in is a manifest edit
+//! that no pin here can see.
+//!
+//! The narrower claim is the one to carry. Six evasions of a broader one were
+//! found before the erasure above; a guarantee stated wider than the property
+//! is what produced every one of them.
+//!
 //! `tests/seam_source_pins.rs` keeps the rules a crate boundary does not
 //! express: no filesystem access, no retry parameter, no publication of
 //! `execute`'s two parameter types by any of three spellings, and the manifest
@@ -173,6 +195,29 @@ use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 /// Everything below is safe under that rule because none of it is a parameter
 /// of `execute`. Anything added here must be checked against the same rule, and
 /// `tests/seam_source_pins.rs` fails if the two forbidden types appear.
+///
+/// # Two properties this list has that are worth stating, not leaving implicit
+///
+/// **The re-exported traits are nameable as bounds but unimplementable outside
+/// this crate.** `ProviderTransport::issue` takes an `AuthorizedProviderAttempt`
+/// and returns a `ProviderAttemptReport` or a `ProviderTransportRefusal`, and
+/// none of those three is re-exported: an `impl ProviderTransport for …` in
+/// `lore-postgres` is three `E0425`s through this crate's namespace, or three
+/// `E0433`s reaching for `lore_object_dispatch` directly. `ProviderChargeAuthority`
+/// is the same. So `lore-postgres` can hold only an **unwired** gateway — it
+/// cannot inject a transport of its own, which would be a private provider
+/// client under another name. That fell out of what was not re-exported rather
+/// than being designed, and it is recorded here so a later edit does not
+/// re-export one of the three and quietly lose it.
+///
+/// **[`DispatchRuntimeClient`] is a bound, not a capability.** It cannot be
+/// constructed outside this crate (its pool is not re-exported and no other
+/// factory returns one), cannot be obtained from elsewhere, and none of its four
+/// mutations can be called because every request type is unnameable. The one
+/// reachable method is the argument-free `read_dispatcher_identity_state`,
+/// yielding installed schema revisions, digests and timestamps — the values
+/// [`FragmentProviderError::AttestationMismatch`] already documents as fixed and
+/// non-sensitive, and which CD-3's live suite asserts in the clear.
 pub use lore_object_dispatch::BudgetPin;
 pub use lore_object_dispatch::CellProviderBoundary;
 pub use lore_object_dispatch::DurableProviderPutBody;

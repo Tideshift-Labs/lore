@@ -35,7 +35,19 @@
 //! deliberately narrower than "nothing here can call it": a call expression
 //! with divergent arguments still compiles and panics, and the wider claim
 //! would be checkably false. No provider attempt can be issued from this
-//! crate, which is the property that matters.
+//! crate, which is the property that matters. This crate also cannot supply a
+//! transport of its own, because the three types `ProviderTransport::issue`
+//! names are not re-exported either — so the gateway it holds can only be the
+//! unwired one.
+//!
+//! **Scope: this is a fact about crate manifests, not a global one.** Any crate
+//! that adds `lore-object-dispatch` to its own `Cargo.toml` can build a
+//! provider client and issue attempts without touching the seam at all, and
+//! nothing inside the seam can stop it. What holds today is that no caller in
+//! the crates that exist can, enforced by this crate's dependency list and the
+//! seam's manifest and no-re-export pins. Stated narrowly on purpose: a
+//! guarantee written wider than the property is what produced six evasions of
+//! the version this replaced.
 //!
 //! `domain/fragments/` is the separately owned WP-118 package, nested under
 //! `domain/` so it can share that lock order and pool. WP-116 yielded it for
