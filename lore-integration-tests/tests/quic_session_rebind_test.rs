@@ -1975,18 +1975,11 @@ mod quic_session_rebind_tests {
                 let conn2 = raw_quic_connection(port).await;
                 let id_b = raw_session_start(&conn2, partition_b, "r1-conn2").await;
 
-                // Post-fix: session ids come from one process-wide sequence
-                // (`NEXT_SESSION_ID`), so two live sessions on two DIFFERENT connections can
-                // never collide any more -- the opposite of the pre-fix precondition this test
-                // used to assert. If this ever fires, the server-side allocator has regressed
-                // back toward per-connection numbering. Do not additionally assert anything
-                // about the MAGNITUDE of either id -- see this file's Phase C header comment
-                // (`NEXT_SESSION_ID` starts at a random `u32`).
-                assert_ne!(
-                    id_a, id_b,
-                    "two connections' session ids must never collide once session ids come from \
-                     one process-wide sequence (NEXT_SESSION_ID)"
-                );
+                // Keep the observed ids diagnostic rather than making disjointness a precondition.
+                // That lets this test reach the forged Put and its real outcome assertion on a
+                // pre-fix server where the ids collide. Process-wide allocation is pinned directly
+                // by `two_maps_never_issue_the_same_session_id` in the server unit tests.
+                eprintln!("R1 observed session ids: connection 1={id_a}, connection 2={id_b}");
 
                 // Simulate a client whose bookkeeping already (incorrectly) believes id_a is
                 // valid to send here -- see the doc comment above. Real production code never
@@ -2093,12 +2086,9 @@ mod quic_session_rebind_tests {
                 let conn2 = raw_quic_connection(port).await;
                 let id_b = raw_session_start(&conn2, partition_b, "r2-conn2").await;
 
-                // Post-fix: see R1's comment on the same assertion.
-                assert_ne!(
-                    id_a, id_b,
-                    "two connections' session ids must never collide once session ids come from \
-                     one process-wide sequence (NEXT_SESSION_ID)"
-                );
+                // See R1: id disjointness is diagnostic here so a pre-fix server reaches the
+                // forged Stop and fails at the actual outcome assertion.
+                eprintln!("R2 observed session ids: connection 1={id_a}, connection 2={id_b}");
 
                 // Simulate a client whose bookkeeping already (incorrectly) believes id_a is
                 // valid to send here -- see R1's doc comment for why this is deliberate.
