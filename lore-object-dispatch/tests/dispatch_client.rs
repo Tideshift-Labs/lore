@@ -968,6 +968,15 @@ struct BindingContract {
     /// Fields the authority produces. The call supplies nothing to compare them to, so they are
     /// legitimately unbound - but they are listed, not inferred, so suppressing a real binding
     /// means editing this list where a reader can see it.
+    ///
+    /// **The anti-suppression assert below covers the name-matched half only.** `required` is the
+    /// name intersection, so a *renamed* field is never in it: moving an entry out of `renamed`
+    /// into `minted` and deleting its source binding leaves the suite green. No text-level
+    /// assertion can close that, because once the binding is deleted there is no string left for a
+    /// test to look for. Machine-checked: a field the call submits under its own name cannot be
+    /// listed here. Review-checked: a field listed here that is really bound under another name.
+    /// Moving anything into this list is a claim that the authority alone produces it, and that
+    /// claim is only ever as good as the diff it lands in.
     minted: &'static [&'static str],
 }
 
@@ -1068,6 +1077,16 @@ fn every_decoder_accounts_for_every_field_its_projection_returns() {
     );
 
     for (decoder, contract) in decoders.iter().zip(BINDING_CONTRACTS.iter()) {
+        // The pairing above is positional. Each decoder names the type it builds, so check it
+        // rather than trusting source order: reordering the table would otherwise surface as
+        // "fields returned but neither bound..." and send a reader looking at the wrong thing.
+        assert!(
+            decoder.contains(&format!("let value = {} {{", contract.outcome_type)),
+            "binding contract order does not match decoder order: expected the decoder that \
+             builds {}, but this one builds something else",
+            contract.outcome_type
+        );
+
         let request_fields = struct_fields(contract.request_type);
         let outcome_fields = struct_fields(contract.outcome_type);
         assert!(
