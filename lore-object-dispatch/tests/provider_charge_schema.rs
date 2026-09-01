@@ -6,17 +6,13 @@
 use std::time::Duration;
 
 use lore_object_dispatch::PostgresProviderChargeConfig;
-use lore_object_dispatch::ProviderChargeCommitDisposition;
 use lore_object_dispatch::ProviderChargeError;
 use lore_object_dispatch::classify_provider_charge_commit;
-use lore_object_dispatch::classify_provider_charge_commit_sqlstate;
-use tokio_postgres::error::SqlState;
 
 const MIGRATION: &str =
     include_str!("../migrations/0021_object_store_dispatch_budget_limiter_schema.sql");
 const PROVISIONING: &str =
     include_str!("../migrations/0022_object_store_dispatch_budget_limiter_provisioning.sql");
-const PROVIDER_CHARGE_SOURCE: &str = include_str!("../src/provider_charge.rs");
 
 #[test]
 fn unresolved_commit_is_always_an_ambiguous_nonrefundable_charge() {
@@ -24,47 +20,6 @@ fn unresolved_commit_is_always_an_ambiguous_nonrefundable_charge() {
         classify_provider_charge_commit::<(), _>(Err("connection lost after COMMIT"));
 
     assert_eq!(result, Err(ProviderChargeError::AmbiguousCommit));
-}
-
-#[test]
-fn only_provably_aborted_commit_sqlstates_are_retryable() {
-    assert_eq!(
-        classify_provider_charge_commit_sqlstate(Some(&SqlState::T_R_SERIALIZATION_FAILURE)),
-        ProviderChargeCommitDisposition::Retryable
-    );
-    assert_eq!(
-        classify_provider_charge_commit_sqlstate(Some(&SqlState::T_R_DEADLOCK_DETECTED)),
-        ProviderChargeCommitDisposition::Retryable
-    );
-    assert_eq!(
-        classify_provider_charge_commit_sqlstate(Some(&SqlState::CONNECTION_FAILURE)),
-        ProviderChargeCommitDisposition::Ambiguous
-    );
-    assert_eq!(
-        classify_provider_charge_commit_sqlstate(None),
-        ProviderChargeCommitDisposition::Ambiguous
-    );
-}
-
-#[test]
-fn postgres_commit_error_adapter_delegates_to_the_pinned_disposition_classifier() {
-    let start = PROVIDER_CHARGE_SOURCE
-        .find("fn classify_commit_error(")
-        .expect("commit-error adapter must exist");
-    let rest = &PROVIDER_CHARGE_SOURCE[start..];
-    let end = rest
-        .find("\n}\n\nfn classify_precommit_error")
-        .expect("commit-error adapter must remain separate from pre-COMMIT classification");
-    let adapter = &rest[..end];
-
-    assert!(adapter.contains("match classify_provider_charge_commit_sqlstate(error.code())"));
-    assert!(
-        adapter.contains(
-            "ProviderChargeCommitDisposition::Retryable => ChargeExecutionError::Retryable"
-        )
-    );
-    assert!(adapter.contains("ProviderChargeCommitDisposition::Ambiguous =>"));
-    assert!(adapter.contains("ProviderChargeError::AmbiguousCommit"));
 }
 
 #[test]

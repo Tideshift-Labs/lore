@@ -156,9 +156,7 @@ pub use payload_purge::validate_and_encode_object_store_payload_purge_reservatio
 pub use provider_charge::PROVIDER_CHARGE_API_REVISION_V1;
 pub use provider_charge::PostgresProviderChargeAuthority;
 pub use provider_charge::PostgresProviderChargeConfig;
-pub use provider_charge::ProviderChargeCommitDisposition;
 pub use provider_charge::classify_provider_charge_commit;
-pub use provider_charge::classify_provider_charge_commit_sqlstate;
 pub use provider_client::AuthorizedProviderAttempt;
 pub use provider_client::BudgetPin;
 pub use provider_client::CellProviderBoundary;

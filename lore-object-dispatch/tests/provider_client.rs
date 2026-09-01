@@ -1789,6 +1789,64 @@ async fn success_after_repeated_cancels_still_reconciles_to_exactly_one_grant() 
 }
 
 #[tokio::test]
+async fn same_attempt_id_with_distinct_ordinals_counts_two_grants_and_two_attempts() {
+    let (charge_authority, _charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let first = base_request(ProviderAttemptClass::Readiness);
+    let mut second = base_request(ProviderAttemptClass::Readiness);
+    second.attempt_ordinal = 2;
+    let mut ledger = new_ledger();
+
+    assert_eq!(
+        client.execute(&mut ledger, &first).await,
+        Ok(ProviderAttemptOutcome::Decisive)
+    );
+    assert_eq!(
+        client.execute(&mut ledger, &second).await,
+        Ok(ProviderAttemptOutcome::Decisive)
+    );
+    assert_eq!(ledger.committed_grant_count(), 2);
+    assert_eq!(ledger.attempt_count(), 2);
+    assert_eq!(transport_calls.get(), 2);
+}
+
+#[tokio::test]
+async fn distinct_attempt_ids_with_same_ordinal_count_two_grants_and_two_attempts() {
+    let (charge_authority, _charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let first = base_request(ProviderAttemptClass::Readiness);
+    let mut second = base_request(ProviderAttemptClass::Readiness);
+    second.attempt_id = other_attempt_id();
+    let mut ledger = new_ledger();
+
+    assert_eq!(
+        client.execute(&mut ledger, &first).await,
+        Ok(ProviderAttemptOutcome::Decisive)
+    );
+    assert_eq!(
+        client.execute(&mut ledger, &second).await,
+        Ok(ProviderAttemptOutcome::Decisive)
+    );
+    assert_eq!(ledger.committed_grant_count(), 2);
+    assert_eq!(ledger.attempt_count(), 2);
+    assert_eq!(transport_calls.get(), 2);
+}
+
+#[tokio::test]
 async fn execute_poisons_the_ledger_when_the_grant_does_not_bind_the_attempt() {
     type Mutator = Box<dyn Fn(ProviderChargeGrant) -> ProviderChargeGrant + Sync>;
     let mutators: Vec<(&str, Mutator)> = vec![

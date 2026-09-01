@@ -145,7 +145,10 @@ impl PostgresProviderChargeAuthority {
         let outcome = decode_charge_row(&row, request).map_err(ChargeExecutionError::Public)?;
         match outcome {
             ChargeAttempt::Granted(grant) => {
-                transaction.commit().await.map_err(classify_commit_error)?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| classify_commit_sqlstate(error.code()))?;
                 Ok(ChargeAttempt::Granted(grant))
             }
             ChargeAttempt::Refused(error) => {
@@ -193,6 +196,7 @@ enum ChargeAttempt {
     Refused(ProviderChargeError),
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum ChargeExecutionError {
     Retryable,
     Public(ProviderChargeError),
@@ -276,40 +280,17 @@ pub fn classify_provider_charge_commit<T, E>(
     result.map_err(|_| ProviderChargeError::AmbiguousCommit)
 }
 
-/// The only two safe classifications for an error returned by PostgreSQL `COMMIT`.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProviderChargeCommitDisposition {
-    /// PostgreSQL proves the transaction aborted, so the same attempt may be retried.
-    Retryable,
-    /// Durability cannot be proved, so the caller must conservatively count a grant.
-    Ambiguous,
-}
-
 /// Classify a SQLSTATE raised by `COMMIT` without discarding the proof that PostgreSQL aborted the
 /// transaction. Every unrecognized or absent SQLSTATE stays ambiguous.
-#[doc(hidden)]
-#[must_use]
-pub fn classify_provider_charge_commit_sqlstate(
-    code: Option<&SqlState>,
-) -> ProviderChargeCommitDisposition {
+fn classify_commit_sqlstate(code: Option<&SqlState>) -> ChargeExecutionError {
     match code {
         Some(code)
             if code == &SqlState::T_R_SERIALIZATION_FAILURE
                 || code == &SqlState::T_R_DEADLOCK_DETECTED =>
         {
-            ProviderChargeCommitDisposition::Retryable
+            ChargeExecutionError::Retryable
         }
-        _ => ProviderChargeCommitDisposition::Ambiguous,
-    }
-}
-
-fn classify_commit_error(error: tokio_postgres::Error) -> ChargeExecutionError {
-    match classify_provider_charge_commit_sqlstate(error.code()) {
-        ProviderChargeCommitDisposition::Retryable => ChargeExecutionError::Retryable,
-        ProviderChargeCommitDisposition::Ambiguous => {
-            ChargeExecutionError::Public(ProviderChargeError::AmbiguousCommit)
-        }
+        _ => ChargeExecutionError::Public(ProviderChargeError::AmbiguousCommit),
     }
 }
 
@@ -389,5 +370,30 @@ const fn cap_class_code(value: ProviderCapClass) -> i16 {
         ProviderCapClass::TrafficRepair => 5,
         ProviderCapClass::TrafficOperator => 6,
         ProviderCapClass::List => 7,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_provably_aborted_commit_sqlstates_are_retryable() {
+        assert_eq!(
+            classify_commit_sqlstate(Some(&SqlState::T_R_SERIALIZATION_FAILURE)),
+            ChargeExecutionError::Retryable
+        );
+        assert_eq!(
+            classify_commit_sqlstate(Some(&SqlState::T_R_DEADLOCK_DETECTED)),
+            ChargeExecutionError::Retryable
+        );
+        assert_eq!(
+            classify_commit_sqlstate(Some(&SqlState::CONNECTION_FAILURE)),
+            ChargeExecutionError::Public(ProviderChargeError::AmbiguousCommit)
+        );
+        assert_eq!(
+            classify_commit_sqlstate(None),
+            ChargeExecutionError::Public(ProviderChargeError::AmbiguousCommit)
+        );
     }
 }
