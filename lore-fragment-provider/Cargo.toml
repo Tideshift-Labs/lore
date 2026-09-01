@@ -1,0 +1,36 @@
+# Copyright 2026 Tideshift Labs
+# SPDX-License-Identifier: MIT
+[package]
+name = "lore-fragment-provider"
+edition = "2024"
+version.workspace = true
+publish = false
+
+# CR-031/WP-118 Phase 4: the fragment lifecycle package's one provider seam.
+#
+# This crate exists to make two CR-031 rules facts about the dependency graph
+# rather than facts about a source scan:
+#
+#   1. No private provider client. `aws-sdk-s3`, `aws-config`, `aws-smithy-*`
+#      and `lore-aws` are absent below, so building one here is a compile
+#      error, not a review finding.
+#   2. The seam is the only route to the provider. `GovernedProviderClient::execute`
+#      takes a `ProviderAttemptLedger` and a `ProviderAttemptRequest`; this
+#      crate does not re-export either, and `lore-postgres` does not depend on
+#      `lore-object-dispatch`, so no caller there can name the arguments —
+#      whatever value it is holding.
+#
+# It deliberately does NOT depend on `lore-postgres`. That direction is what
+# keeps the graph acyclic once Phase 5 routes `lore-postgres`'s immutable store
+# through the fragment coordinator, which is the edge that made a
+# whole-of-`domain/fragments/` split impossible.
+[dependencies]
+hex = { workspace = true }
+lore-base = { workspace = true }
+lore-object-dispatch = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+# Test-only. The seam itself spawns nothing; the admission tests do.
+lore-base = { workspace = true }

@@ -9,6 +9,7 @@ members = [
     "lore-credential",
     "lore-error-set",
     "lore-error-set-macro",
+    "lore-fragment-provider",
     "lore-hashicorp",
     "lore-integration-tests",
     "lore-io",
@@ -32,6 +33,7 @@ lore = { path = "lore" }
 lore-aws = { path = "lore-aws" }
 lore-postgres = { path = "lore-postgres" }
 lore-base = { path = "lore-base" }
+lore-fragment-provider = { path = "lore-fragment-provider" }
 lore-credential = { path = "lore-credential" }
 lore-error-set = { path = "lore-error-set" }
 lore-error-set-macro = { path = "lore-error-set-macro" }

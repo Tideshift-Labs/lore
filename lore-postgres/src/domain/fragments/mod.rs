@@ -13,13 +13,19 @@
 //! quota, or retry policy of its own, and it builds **no private provider
 //! client**: WP-114's governed client is the only route to a bucket.
 //!
-//! **That last claim changed shape at Phase 4 and the wording is deliberate.**
-//! Through Phases 2 and 3 it read "this module has no S3 dependency, so a
-//! reviewer can check that by construction". Phase 4 gives the package one
-//! provider seam ([`provider`]), which necessarily depends on WP-114's governed
-//! client, so a dependency-absence argument no longer covers the package as a
-//! whole. It still covers the coordinator, which has no provider dependency at
-//! all; for the rest the guard is `tests/fragment_provider_source_pins.rs`.
+//! **How that last claim is held changed twice, and the current wording is
+//! exact.** Through Phases 2 and 3 it was "this module has no S3 dependency, so
+//! a reviewer can check that by construction". Phase 4 first made it a source
+//! scan, which an independent reviewer beat five times. It is now split:
+//!
+//! - The seam lives in its own crate, [`lore_fragment_provider`], whose
+//!   dependency graph contains no `aws-sdk-s3`, `aws-config`, `aws-smithy-*` or
+//!   `lore-aws`. A private provider client there is a **compile error**.
+//! - `coordinator.rs`, `masks.rs`, `schema.rs` and `states.rs` stay here, in a
+//!   crate that legitimately depends on `aws-sdk-s3` for the legacy CR-007
+//!   store. For those four files the rule is still a **source pin**
+//!   (`tests/fragment_provider_source_pins.rs`) — over four files that build no
+//!   provider client at all, rather than over a whole package.
 //!
 //! `domain/fragments/` is the separately owned WP-118 package, nested under
 //! `domain/` so it can share that lock order and pool. WP-116 yielded it for
@@ -31,22 +37,21 @@
 //! Phases 2 and 3: the migration-owned schema, readiness, the batched resolver,
 //! and the begin/commit pairs with their witnesses and lock order.
 //!
-//! Phase 4: [`provider`], the one seam through which this package may reach a
-//! provider, built on WP-114's CD-3 typed authority client, CD-4 shared
-//! limiter, and CD-5 governed provider client. It is dark and parameterized —
-//! no bucket, region, endpoint, credential, budget pin, or route is named here,
-//! the shipped charge authority and transport both fail closed, and no caller
-//! constructs a gateway. The provider-*consuming* operations (repair through
-//! the governed client, version-aware physical purge, backfill) are Phases 5
-//! onward and are still not here.
+//! Phase 4: [`provider`], the adapter onto [`lore_fragment_provider`]. The seam
+//! itself is that crate; this package holds only the names its consumers need
+//! and the translation onto CR-029's `DomainError`. It is dark and
+//! parameterized — no bucket, region, endpoint, credential, budget pin, or
+//! route is named anywhere, the shipped charge authority and transport both
+//! fail closed, and nothing constructs a gateway. The provider-*consuming*
+//! operations (repair through the governed client, version-aware physical
+//! purge, backfill) are Phases 5 onward and are still not here.
 //!
-//! The no-second-provider-client rule stays checkable by construction for the
-//! coordinator: `coordinator.rs` has no provider dependency at all, and
-//! [`provider`] reaches a bucket only through WP-114's governed client. That
-//! the package holds no private S3 client is pinned by
-//! `tests/fragment_provider_source_pins.rs`, because `lore-postgres` as a crate
-//! legitimately depends on `aws-sdk-s3` for the legacy CR-007 store and a
-//! crate-level absence is therefore not available as evidence.
+//! **Why only `provider.rs` moved.** The coordinator needs `DomainError`,
+//! `lock_order`, `schema::STATE_LIVE` and `pool::ensure_schema` from this
+//! crate, and Phase 5 routes this crate's immutable store back into the
+//! coordinator — so a whole-package split is a Cargo cycle, verified rather
+//! than assumed. Breaking it would mean extracting the shared domain core,
+//! which is a WP-116 seam.
 
 pub mod coordinator;
 pub mod masks;
@@ -85,7 +90,9 @@ pub use provider::CellSchemaAttestation;
 pub use provider::DEFAULT_IN_FLIGHT_PUTS;
 pub use provider::FRAGMENT_PROVIDER_ATTEMPT_CLASSES;
 pub use provider::FRAGMENT_PROVIDER_INGRESS_CAP_BYTES;
+pub use provider::FragmentAttemptLedger;
 pub use provider::FragmentProviderAttempt;
+pub use provider::FragmentProviderDisposition;
 pub use provider::FragmentProviderError;
 pub use provider::FragmentProviderGateway;
 pub use provider::InFlightPutBound;

@@ -2732,6 +2732,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lore-fragment-provider"
+version = "0.9.1-nightly"
+dependencies = [
+ "hex",
+ "lore-base",
+ "lore-object-dispatch",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "lore-hashicorp"
 version = "0.9.1-nightly"
 dependencies = [
@@ -2867,7 +2878,7 @@ dependencies = [
  "hex",
  "lore-aws",
  "lore-base",
- "lore-object-dispatch",
+ "lore-fragment-provider",
  "lore-revision",
  "lore-storage",
  "lore-telemetry",
