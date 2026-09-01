@@ -1821,9 +1821,9 @@ mod quic_session_rebind_tests {
     // `lore-transport`'s `test_seams` cargo feature (enabled for this crate in
     // `lore-integration-tests/Cargo.toml`) -- forging that state deliberately, from this one
     // named door, is how the server half of the fix gets exercised on its own, independent of
-    // the client layer it must not depend on. The client gate's own correctness is pinned
-    // separately and deterministically in `lore-transport/src/quic/client.rs`'s
-    // `quic::client::tests::a_session_id_stops_being_current_once_its_generation_is_replaced`.
+    // the client layer it must not depend on. The client gate's production-path enforcement is
+    // pinned separately by `not_dispatched_generation_mover_rebinds_and_retries_once`, which
+    // exercises `send_command_tracked` and fails if its write-boundary guard is removed.
     //
     // No test here may assume a session id is small, starts at a fixed value, or is contiguous
     // with another -- `NEXT_SESSION_ID` starts at a random `u32` and is shared with whatever

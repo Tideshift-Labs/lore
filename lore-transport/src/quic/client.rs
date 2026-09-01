@@ -2288,12 +2288,13 @@ mod tests {
         (quinn_connection, accept_task)
     }
 
-    /// The INV-EO P0-1 client-side pin, isolated from the (non-deterministic) reconnect race
-    /// itself: `session_is_current` must answer purely from `generation`/`sessions`, so this
-    /// drives it directly rather than trying to force a real reconnect mid-command.
+    /// Predicate-level coverage for the INV-EO P0-1 client-side gate:
+    /// `session_is_current` must answer purely from `generation`/`sessions`.
     ///
-    /// This is the client half of the two-layer fix; the server half (no two `SessionMap`s ever
-    /// issue the same id) is pinned independently by
+    /// The enforcement pin is `not_dispatched_generation_mover_rebinds_and_retries_once` in
+    /// `quic_session_rebind_test.rs`: it exercises `send_command_tracked` through the production
+    /// path and fails if the write-boundary guard is removed. The server half (no two
+    /// `SessionMap`s ever issue the same id) is pinned independently by
     /// `lore-server/src/protocol/storage/session.rs`'s `two_maps_never_issue_the_same_session_id`,
     /// and the end-to-end wire behavior (both layers composed, through a real loopback server)
     /// by `lore-integration-tests/tests/quic_session_rebind_test.rs`'s R1/R2.
