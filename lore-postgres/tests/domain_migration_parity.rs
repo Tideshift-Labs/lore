@@ -393,3 +393,142 @@ async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_cat
     drop_throwaway_database(&admin_url, &migration_db).await;
     drop_throwaway_database(&admin_url, &runtime_db).await;
 }
+
+// ---------------------------------------------------------------------------
+// Offline premise pins (INV-EF fix-round addendum)
+// ---------------------------------------------------------------------------
+//
+// Three schema facts that Rust guards in `domain/fragments/coordinator.rs`
+// silently depend on. Each is a premise, not a preference: if the DDL drifts,
+// the guard above it stops being sound while every existing test stays green,
+// because nothing else reads these shapes.
+//
+// These run in the DEFAULT tier -- no `#[ignore]`, no database. The live parity
+// case above proves the two declarations AGREE with each other; it cannot prove
+// either one still says the thing a Rust invariant was built on. That is what
+// these add, and it is why they belong beside it rather than inside it.
+//
+// Both declarations are checked. `migrations/0001_init.sql` is the
+// out-of-band provisioning path and `fragment_schema::FRAGMENT_SCHEMA` is the
+// boot-time path; a premise that held in only one of them would be exactly the
+// drift the crate's "two declarations, one shape" rule exists to catch.
+
+/// Cut one `CREATE TABLE` body out of a DDL blob so a premise is asserted
+/// against the table it belongs to.
+///
+/// A bare `contains` over the whole file would let `PRIMARY KEY (hash, epoch)`
+/// be satisfied by some unrelated table declaring the same pair, which is the
+/// failure mode that makes a text pin worthless.
+fn create_table_body<'a>(ddl: &'a str, table: &str) -> &'a str {
+    let marker = format!("CREATE TABLE IF NOT EXISTS {table} (");
+    let start = ddl
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{table} is not declared in this DDL"));
+    let rest = &ddl[start + marker.len()..];
+    let end = rest
+        .find("\n);")
+        .unwrap_or_else(|| panic!("{table}'s CREATE TABLE body is not terminated"));
+    &rest[..end]
+}
+
+/// Assert one premise against both DDL declarations at once.
+fn pin_premise(table: &str, needle: &str, why: &str) {
+    for (label, ddl) in [
+        ("migrations/0001_init.sql", MIGRATIONS_0001),
+        (
+            "fragment_schema::FRAGMENT_SCHEMA",
+            fragment_schema::FRAGMENT_SCHEMA,
+        ),
+    ] {
+        let body = create_table_body(ddl, table);
+        assert!(
+            body.contains(needle),
+            "{label}: {table} must declare `{needle}`.\n{why}\nActual body:\n{body}"
+        );
+    }
+}
+
+/// `validate_lease_members` refuses a batch repeating one hash. That refusal is
+/// justified by exactly one thing: the member table holds one row per
+/// `(lease_id, hash)`, so a second epoch for the same hash would be dropped by
+/// the `ON CONFLICT` arm while the returned lease claimed it. Widen this key
+/// and the Rust validation is guarding nothing.
+#[test]
+fn the_staged_lease_member_key_is_lease_id_and_hash() {
+    pin_premise(
+        "lore_fragment_staged_lease_members",
+        "PRIMARY KEY (lease_id, hash)",
+        "coordinator.rs's validate_lease_members refuses a duplicate hash on the strength of \
+         this key alone; a wider key makes that refusal meaningless and a narrower one makes it \
+         insufficient.",
+    );
+}
+
+/// `equivalent_epochs` compares `count(*)` from a two-way join against
+/// `divergent.len()`. That arithmetic is only sound because `(hash, epoch)`
+/// identifies at most one epoch row, so each input row contributes at most one
+/// join row. Without the key, a duplicated epoch row would inflate the count
+/// and a non-equivalent member could be masked by an equivalent one.
+#[test]
+fn the_fragment_epoch_key_is_hash_and_epoch() {
+    pin_premise(
+        "lore_fragment_epochs",
+        "PRIMARY KEY (hash, epoch)",
+        "coordinator.rs's equivalent_epochs compares a join count against the input length; that \
+         is a one-row-per-input assumption and this key is the only thing enforcing it.",
+    );
+}
+
+/// The four columns `equivalent_epochs` compares must be `NOT NULL`, and
+/// `disposition` must stay a closed three-value vocabulary.
+///
+/// SQL equality over a NULL yields NULL, not true, so a nullable compared
+/// column would silently drop rows from the match count and turn an equivalent
+/// pair into an abort — failing safe, but for a reason no reader could see. The
+/// `disposition` CHECK is what lets the lease scope test `<> DISPOSITION_PURGED`
+/// as a total predicate rather than one of an open set.
+#[test]
+fn the_compared_epoch_columns_are_not_null_and_disposition_stays_closed() {
+    for column in [
+        "decoded_hash",
+        "size_content",
+        "size_payload",
+        "payload_flags",
+    ] {
+        for (label, ddl) in [
+            ("migrations/0001_init.sql", MIGRATIONS_0001),
+            (
+                "fragment_schema::FRAGMENT_SCHEMA",
+                fragment_schema::FRAGMENT_SCHEMA,
+            ),
+        ] {
+            let body = create_table_body(ddl, "lore_fragment_epochs");
+            // Matched by column name at the start of a declaration line rather
+            // than by exact spacing: an alignment change is a formatting
+            // change, and a pin that fails on one is noise that gets deleted.
+            let line = body
+                .lines()
+                .find(|line| {
+                    line.trim_start()
+                        .strip_prefix(column)
+                        .is_some_and(|rest| rest.starts_with(' '))
+                })
+                .unwrap_or_else(|| {
+                    panic!("{label}: lore_fragment_epochs does not declare {column}")
+                });
+            assert!(
+                line.contains("NOT NULL"),
+                "{label}: lore_fragment_epochs.{column} must be NOT NULL. equivalent_epochs \
+                 compares it with `=`, and SQL equality over NULL is NULL rather than true, so a \
+                 nullable column would silently drop the row from the match count and turn an \
+                 equivalent pair into an abort.\nActual: {line}"
+            );
+        }
+    }
+    pin_premise(
+        "lore_fragment_epochs",
+        "disposition   smallint    NOT NULL DEFAULT 0 CHECK (disposition IN (0, 1, 2))",
+        "acquire_staged_leases scopes members with `disposition <> DISPOSITION_PURGED`, which is \
+         a total predicate only while the vocabulary stays closed at these three values.",
+    );
+}

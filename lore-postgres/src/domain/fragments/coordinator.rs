@@ -445,6 +445,16 @@ pub const STAGED_LEASE_MEMBER_NOT_STAGED: &str = "staged_lease_member_not_staged
 
 /// Reason for a duplicate `lease_id` whose row has vanished between the
 /// conflicting insert and the replay read. See [`replay_staged_lease`].
+///
+/// **Phase 6 obligation, deliberately uncovered.** Neither tier pins this, and
+/// that is a decision rather than an oversight: the only thing that can delete
+/// a lease row is the expiry reaper, which does not exist yet. Nor can
+/// `reader_fence`'s ordering against cleanup be settled without that consumer —
+/// there is nothing yet that reads the fence and decides whether a staged epoch
+/// is safe to reclaim. Manufacturing a test against an absent consumer would
+/// pin this branch's shape while proving nothing about the contract it exists
+/// to serve. Phase 6 owns both: covering this branch, and stating what
+/// `reader_fence` must order against.
 pub const STAGED_LEASE_VANISHED: &str = "staged_lease_vanished";
 
 /// Reason for a duplicate `lease_id` whose member set is not the one the
@@ -1556,7 +1566,7 @@ impl PostgresFragmentCoordinator {
                 });
             }
         }
-        if !divergent.is_empty() && !equivalent_epochs(tx, &divergent).await? {
+        if !divergent.is_empty() && !equivalent_epochs(tx, captured, current, &divergent).await? {
             return Ok(PushWitnessVerdict::Aborted {
                 reason: REQUIRED_FRAGMENT_CHANGED,
             });
@@ -2331,13 +2341,20 @@ struct DivergentEpoch<'a> {
 ///
 /// # Why the allowance is safe, and what it depends on
 ///
-/// The caller aborts unconditionally when the **association** scalar moved, one
-/// statement before the count check and long before this runs. That ordering is
-/// load-bearing rather than incidental: it is what keeps an obliterate-then-
-/// recreate — which tombstones associations and so always moves that scalar —
-/// out of reach of this function. Keep the association check ahead of the
-/// fallback if this is ever reshuffled; without it, equivalence over content
-/// columns alone would not be enough.
+/// The caller aborts unconditionally when the **association** scalar moved,
+/// before the count check and long before this runs. That is load-bearing
+/// rather than incidental: it is what keeps an obliterate-then-recreate — which
+/// tombstones associations and so always moves that scalar — out of reach of
+/// this function. Equivalence over content columns alone would not be enough.
+///
+/// That dependency is no longer positional. This function takes both witnesses
+/// and `debug_assert_eq!`s the association scalar itself, so the precondition
+/// is an argument it checks rather than an ordering a reader has to notice, and
+/// [`classify_push_witness`] makes the precedence a value rather than a branch
+/// order. A release build compiles the assertion out, which is why the
+/// classifier — not the assertion — is the actual enforcement; the assertion is
+/// what makes a reordering fail a `cargo test` run instead of only the live
+/// tier.
 ///
 /// Quarantine cannot forge equivalence either: a publication quarantines only
 /// epochs below the one it publishes, so a readable head's current epoch is
@@ -2356,8 +2373,22 @@ struct DivergentEpoch<'a> {
 /// It therefore adds no lock class and cannot invert F-032-3.
 async fn equivalent_epochs(
     tx: &Transaction<'_>,
+    captured: PushGenerationWitness,
+    current: PushGenerationWitness,
     divergent: &[DivergentEpoch<'_>],
 ) -> Result<bool, DomainError> {
+    // The precondition, checked here rather than left to a reader noticing the
+    // caller's branch order. Taking both witnesses turns "the association check
+    // happens earlier in the function" from an ordering into an argument this
+    // function verifies. `cargo test` builds debug, so a reordering that let an
+    // association-moved witness reach the allowance trips this in the default
+    // tier — no live database required.
+    debug_assert_eq!(
+        captured.content_association_generation, current.content_association_generation,
+        "equivalent_epochs must never see a witness whose association scalar moved: the fallback \
+         revalidates representations, not membership, so an obliterate-then-recreate could present \
+         equal content columns and be accepted against an association set that no longer holds it"
+    );
     let hashes: Vec<&[u8]> = divergent.iter().map(|item| item.hash).collect();
     let captured: Vec<i64> = divergent.iter().map(|item| item.captured).collect();
     let current: Vec<i64> = divergent.iter().map(|item| item.current).collect();
