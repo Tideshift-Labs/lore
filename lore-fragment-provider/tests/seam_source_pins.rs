@@ -8,10 +8,12 @@
 //! deleted rather than carried:
 //!
 //! - "only the seam reaches the governed client" and "the seam publishes no
-//!   route to it" — `lore-postgres` does not depend on `lore-object-dispatch`
-//!   and this crate does not re-export `execute`'s parameter types, so a caller
-//!   there cannot make the call. A scan for aliases, accessors and re-exports
-//!   was guarding a property the compiler now holds.
+//!   route to it" — `lore-postgres` does not depend on `lore-object-dispatch`,
+//!   and the client is erased behind [`AttemptSink`], so a caller there cannot
+//!   construct `execute`'s arguments and has nothing to call it on. A scan for
+//!   aliases and accessors was guarding a property the compiler now holds.
+//!   (Narrow wording on purpose: a call expression with divergent arguments is
+//!   still writable and panics. See the crate docs.)
 //! - "the package builds no private provider client" — for *this* crate that is
 //!   the dependency graph. The four files still in `lore-postgres` keep a
 //!   reduced version of that scan, in that crate's own pins file.
@@ -67,26 +69,110 @@ const FILESYSTEM_TOKENS: [&str; 8] = [
     "fs::",
 ];
 
-/// The two types `GovernedProviderClient::execute` takes.
+/// Every entry is a type whose publication would falsify a named claim in the
+/// seam's authorised re-export assessment, paired with the claim it protects.
 ///
-/// Property 2 rests on no crate outside this one being able to name these, so
-/// publishing either hands away a piece of it.
+/// **Three spellings, because an earlier revision checked only one.** The pin
+/// used to match lines containing `pub use `. A reviewer published both of
+/// `execute`'s parameter types with `pub type PublicLedger =
+/// ProviderAttemptLedger;` instead — not a `pub use`, and beyond
+/// `private_interfaces`, which cannot object to aliasing a type that is
+/// legitimately public upstream. So this covers `pub use`, `pub type`
+/// right-hand sides, and `pub fn` signatures.
 ///
-/// **Three spellings, and an earlier revision checked only one.** The pin used
-/// to match lines containing `pub use `. A reviewer published both types with
-/// `pub type PublicLedger = ProviderAttemptLedger;` instead, which is not a
-/// `pub use`, and `private_interfaces` cannot object because both types are
-/// legitimately public in `lore-object-dispatch`. Paired with an accessor
-/// yielding the client, that was a working call to `execute` from
-/// `lore-postgres` while naming no dispatch type at all. So this now covers
-/// `pub use`, `pub type` right-hand sides, and `pub fn` signatures.
+/// **What carries claim 1 is the [`AttemptSink`] erasure, not this pin.** With
+/// the client boxed behind a private trait there is nothing to call `execute`
+/// on, so publishing its parameter types buys nothing. Claims 2 through 4 have
+/// no such backstop: they rest on these names being absent and on nothing else,
+/// which is why the list is the whole of their enforcement.
 ///
-/// **What actually carries the property is the [`AttemptSink`] erasure, not
-/// this pin.** With the client boxed behind a private trait there is nothing to
-/// call `execute` on, so publishing the parameter types buys nothing. This is
-/// belt and braces for the case where a seam edit exposes the real types in a
-/// signature directly, and it is a text scan with all the limits of one.
-const FORBIDDEN_REEXPORTS: [&str; 2] = ["ProviderAttemptLedger", "ProviderAttemptRequest"];
+/// **Built by asking, for each claim, "what would have to be re-exported to
+/// make this false, and is that type covered?"** That sweep found the list had
+/// been two entries covering one claim, while three further claims rested on
+/// types nothing checked — including `DispatchRuntimePool`, the single type that
+/// turns `DispatchRuntimeClient` from a bound into a capability and thereby
+/// unlocks the rest. A claim resting on something nobody checks is the shape
+/// every finding in this campaign has taken.
+const FORBIDDEN_REEXPORTS: [(&str, &str); 14] = [
+    // Claim 1: `execute`'s parameters are unnameable outside this crate, so no
+    // caller elsewhere can construct them. This is property 2 itself.
+    (
+        "ProviderAttemptLedger",
+        "execute's parameters stay unnameable",
+    ),
+    (
+        "ProviderAttemptRequest",
+        "execute's parameters stay unnameable",
+    ),
+    // Claim 2: `DispatchRuntimeClient` is a *bound*, not a capability. It rests
+    // on the pool being unnameable, so nothing outside can construct a client —
+    // and on the four request types being unnameable, so none of the mutations
+    // can be called on one that is handed in. `DispatchMaintenanceClient` takes
+    // the same pool and is listed with them.
+    (
+        "DispatchRuntimePool",
+        "a dispatch client cannot be constructed",
+    ),
+    (
+        "DispatchMaintenanceClient",
+        "a dispatch client cannot be constructed",
+    ),
+    ("ReservePutRequest", "dispatch mutations cannot be called"),
+    (
+        "PutUploadProgressRequest",
+        "dispatch mutations cannot be called",
+    ),
+    (
+        "PutSpoolReadyRequest",
+        "dispatch mutations cannot be called",
+    ),
+    (
+        "RegisterDispatcherRequest",
+        "dispatch mutations cannot be called",
+    ),
+    // Claim 3: `ProviderTransport` is nameable as a bound but unimplementable
+    // outside this crate, so no other crate can inject a transport — which would
+    // be a private provider client under another name.
+    (
+        "AuthorizedProviderAttempt",
+        "ProviderTransport stays unimplementable",
+    ),
+    (
+        "ProviderAttemptReport",
+        "ProviderTransport stays unimplementable",
+    ),
+    (
+        "ProviderTransportRefusal",
+        "ProviderTransport stays unimplementable",
+    ),
+    // Claim 4: the same for `ProviderChargeAuthority`, so the only gateway
+    // another crate can build is the unwired one.
+    (
+        "ProviderChargeRequest",
+        "ProviderChargeAuthority stays unimplementable",
+    ),
+    (
+        "ProviderChargeGrant",
+        "ProviderChargeAuthority stays unimplementable",
+    ),
+    (
+        "ProviderChargeError",
+        "ProviderChargeAuthority stays unimplementable",
+    ),
+];
+
+/// Just the type names, for scanning.
+fn forbidden_reexport_names() -> Vec<&'static str> {
+    FORBIDDEN_REEXPORTS.iter().map(|(name, _)| *name).collect()
+}
+
+/// The claim an offending type would falsify, for the failure message.
+fn claim_for(name: &str) -> &'static str {
+    match FORBIDDEN_REEXPORTS.iter().find(|(ty, _)| *ty == name) {
+        Some((_, claim)) => claim,
+        None => "an unrecorded claim",
+    }
+}
 
 /// Crates whose presence in `[dependencies]` would end property 3's structural
 /// form. `lore-aws` is permitted as a **dev-dependency**: `masks.rs`'s
@@ -262,10 +348,11 @@ fn the_seam_never_re_exports_the_types_execute_takes() {
 
     // Spelling 1: a `pub use`, whether direct or aliased with `as`.
     for line in shipped.lines().filter(|line| line.contains("pub use ")) {
-        let found = hits(line, &FORBIDDEN_REEXPORTS);
+        let found = hits(line, &forbidden_reexport_names());
         assert!(
             found.is_empty(),
-            "re-exporting {found:?} publishes execute's arguments: {line}",
+            "re-exporting {found:?} falsifies \"{}\": {line}",
+            claim_for(found.first().copied().unwrap_or_default()),
         );
     }
 
@@ -275,21 +362,22 @@ fn the_seam_never_re_exports_the_types_execute_takes() {
     let mut aliases = 0;
     for statement in public_type_aliases(&shipped) {
         aliases += 1;
-        let found = hits(&statement, &FORBIDDEN_REEXPORTS);
+        let found = hits(&statement, &forbidden_reexport_names());
         assert!(
             found.is_empty(),
-            "a public type alias publishes {found:?}, which is the spelling a \
-             `pub use` scan missed: {statement}",
+            "a public type alias publishes {found:?} and falsifies \"{}\" — the \
+             spelling a `pub use` scan missed: {statement}",
+            claim_for(found.first().copied().unwrap_or_default()),
         );
     }
 
-    // Spelling 3: a public function signature that names either type.
+    // Spelling 3: a public function signature naming one of them.
     for signature in public_fn_signatures(&shipped) {
-        let found = hits(&signature, &FORBIDDEN_REEXPORTS);
+        let found = hits(&signature, &forbidden_reexport_names());
         assert!(
             found.is_empty(),
-            "a public signature names {found:?}, which lets a caller elsewhere \
-             obtain or pass one: {signature}",
+            "a public signature names {found:?} and falsifies \"{}\": {signature}",
+            claim_for(found.first().copied().unwrap_or_default()),
         );
     }
 
