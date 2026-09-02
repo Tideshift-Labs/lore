@@ -181,7 +181,7 @@ async fn rebuild_postgres_metering(settings: &Settings) -> Result<u64> {
     let plugin_config =
         resolve_plugin_config_with_fallback(&settings.plugins, mode, "immutable_store")
             .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
-    let store = plugins::postgres::connect_immutable_store(&plugin_config)
+    let store = plugins::postgres::connect_immutable_store(&plugin_config, None)
         .await
         .map_err(|e| anyhow!("Failed to create Postgres immutable store: {e}"))?;
 
@@ -979,6 +979,7 @@ async fn configure_immutable_store_via_plugin(
     registry: &PluginRegistry,
     settings: &Settings,
     topology: Option<Arc<dyn Topology + Send + Sync>>,
+    fragment_activation: Option<plugins::postgres::FragmentProviderActivation>,
 ) -> Result<Arc<dyn ImmutableStore>> {
     let mode = &settings.immutable_store.mode;
 
@@ -1027,11 +1028,66 @@ async fn configure_immutable_store_via_plugin(
 
             info!(mode, "Creating immutable store via plugin system");
 
+            if mode == "postgres" {
+                let store =
+                    plugins::postgres::connect_immutable_store(&plugin_config, fragment_activation)
+                        .await
+                        .map_err(|e| {
+                            anyhow!("Failed to create immutable store plugin '{mode}': {e}")
+                        })?;
+                return Ok(Arc::new(store));
+            }
+
             registry
                 .create_immutable_store(mode, &plugin_config)
                 .map_err(|e| anyhow!("Failed to create immutable store plugin '{mode}': {e}"))
         }
     }
+}
+
+fn resolved_postgres_store_config(settings: &Settings, store_type: &str) -> Result<toml::Value> {
+    resolve_plugin_config_with_fallback(&settings.plugins, "postgres", store_type).ok_or_else(|| {
+        anyhow!(
+            "fragment_provider requires a resolved [plugins.postgres.{store_type}] configuration"
+        )
+    })
+}
+
+fn postgres_fragment_process_pool_inventory(
+    settings: &Settings,
+) -> Result<Option<lore_postgres::domain::fragments::FragmentProcessPoolInventory>> {
+    if settings.immutable_store.mode != "postgres" {
+        return Ok(None);
+    }
+    let immutable_config = resolved_postgres_store_config(settings, "immutable_store")?;
+    if !plugins::postgres::fragment_provider_enabled(&immutable_config)
+        .map_err(|error| anyhow!("Invalid Postgres immutable store configuration: {error}"))?
+    {
+        return Ok(None);
+    }
+    if settings.mutable_store.mode != "postgres" {
+        return Err(anyhow!(
+            "enabled fragment_provider requires mutable_store.mode = 'postgres' so its actual pool maximum and lifecycle coordinator are available"
+        ));
+    }
+    if settings
+        .lock_store
+        .as_ref()
+        .map(|store| store.mode.as_str())
+        != Some("postgres")
+    {
+        return Err(anyhow!(
+            "enabled fragment_provider requires lock_store.mode = 'postgres' so its actual pool maximum is available"
+        ));
+    }
+    let mutable_config = resolved_postgres_store_config(settings, "mutable_store")?;
+    let lock_config = resolved_postgres_store_config(settings, "lock_store")?;
+    plugins::postgres::fragment_process_pool_inventory(
+        &immutable_config,
+        &mutable_config,
+        &lock_config,
+    )
+    .map_err(|error| anyhow!("Invalid Postgres process pool inventory: {error}"))
 }
 
 async fn configure_mutable_store_via_plugin(
@@ -1904,16 +1960,58 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         info!("Running in single-node mode (no topology configured)");
     }
 
-    let immutable_store =
-        configure_immutable_store_via_plugin(&plugin_registry, &settings, topology.clone()).await?;
+    // Only an enabled governed fragment route needs the lifecycle coordinator
+    // before immutable-store construction. Absent and disabled configurations
+    // preserve the legacy boot order exactly: immutable first, domain second.
+    let fragment_process_pool_inventory = postgres_fragment_process_pool_inventory(&settings)?
+        .map(lore_postgres::domain::fragments::FragmentProcessPoolInventory::validate)
+        .transpose()
+        .map_err(|error| anyhow!("Invalid Postgres process pool inventory: {error}"))?;
+    let (immutable_store, configured_domain) =
+        if let Some(process_pool_inventory) = fragment_process_pool_inventory {
+            let configured_domain = crate::domain::configure_domain_context(&settings).await?;
+            let coordinator = configured_domain
+            .fragment_coordinator
+            .clone()
+            .ok_or_else(|| {
+                anyhow!(
+                    "enabled fragment_provider requires the Postgres fragment lifecycle coordinator"
+                )
+            })?;
+            let expected_database_identity =
+                configured_domain.database_identity.clone().ok_or_else(|| {
+                    anyhow!(
+                        "enabled fragment_provider requires the attested Postgres database identity"
+                    )
+                })?;
+            let fragment_activation = plugins::postgres::FragmentProviderActivation::new(
+                coordinator,
+                process_pool_inventory,
+                expected_database_identity,
+            );
+            let immutable_store = configure_immutable_store_via_plugin(
+                &plugin_registry,
+                &settings,
+                topology.clone(),
+                Some(fragment_activation),
+            )
+            .await?;
+            (immutable_store, configured_domain)
+        } else {
+            let immutable_store = configure_immutable_store_via_plugin(
+                &plugin_registry,
+                &settings,
+                topology.clone(),
+                None,
+            )
+            .await?;
+            let configured_domain = crate::domain::configure_domain_context(&settings).await?;
+            (immutable_store, configured_domain)
+        };
 
-    // CR-029: the domain coordinator is built here, not inside the gRPC launch
-    // task, so a readiness refusal over an incomplete backfill aborts startup
-    // instead of being logged from a spawned task.
-    // It is deliberately built before the mutable store: readiness arms the
-    // one enforcement handle that the concrete Postgres store must receive
-    // before publication behind `Arc<dyn MutableStore>`.
-    let configured_domain = crate::domain::configure_domain_context(&settings).await?;
+    // CR-029: the domain coordinator is built before mutable-store publication
+    // on both branches, so readiness still arms the one enforcement handle the
+    // concrete Postgres mutable store must receive.
     let mutable_context = MutableStorePluginContext {
         domain_enforcement: configured_domain.mutable_enforcement.clone(),
     };

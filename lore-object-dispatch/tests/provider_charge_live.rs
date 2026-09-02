@@ -16,9 +16,15 @@ use std::time::UNIX_EPOCH;
 use lore_object_dispatch::AuthorizedProviderAttempt;
 use lore_object_dispatch::BudgetPin;
 use lore_object_dispatch::CellProviderBoundary;
+use lore_object_dispatch::DispatchConnectionBudget;
+use lore_object_dispatch::DispatchDatabaseIdentity;
+use lore_object_dispatch::DispatchPoolConfig;
+use lore_object_dispatch::DispatchPoolRole;
+use lore_object_dispatch::DispatchRuntimePool;
+use lore_object_dispatch::DispatchTlsMode;
 use lore_object_dispatch::GovernedProviderClient;
+use lore_object_dispatch::MeteredProviderAttemptRequest;
 use lore_object_dispatch::PostgresProviderChargeAuthority;
-use lore_object_dispatch::PostgresProviderChargeConfig;
 use lore_object_dispatch::ProviderAttemptClass;
 use lore_object_dispatch::ProviderAttemptLedger;
 use lore_object_dispatch::ProviderAttemptOutcome;
@@ -849,23 +855,18 @@ async fn live_postgres_cd5_charge_before_send_conformance_and_authority_unavaila
     let admin = connect(&url).await;
     install(&admin).await;
     seed_configuration(&admin).await;
+    let expected_database_identity = read_database_identity(&admin).await;
 
-    let LiveDatabase {
-        client: authority_client,
-        _connection: authority_connection,
-    } = connect(&url).await;
-    authority_client
-        .batch_execute("SET SESSION AUTHORIZATION object_dispatch_retention_runtime")
-        .await
-        .expect("assume runtime fixture identity");
-    let authority = PostgresProviderChargeAuthority::new(
-        authority_client,
-        PostgresProviderChargeConfig {
-            statement_timeout: Duration::from_secs(5),
-            lock_timeout: Duration::from_secs(5),
-        },
-    )
-    .expect("construct real PostgreSQL charge authority");
+    let runtime_pool = Arc::new(
+        DispatchRuntimePool::new(pool_config(
+            &url,
+            Duration::from_secs(5),
+            expected_database_identity,
+        ))
+        .expect("construct shared runtime pool"),
+    );
+    let authority = PostgresProviderChargeAuthority::new(Arc::clone(&runtime_pool))
+        .expect("construct real PostgreSQL charge authority from shared pool");
     let transport_calls = Arc::new(AtomicU32::new(0));
     let client = GovernedProviderClient::new(
         live_boundary(),
@@ -877,10 +878,15 @@ async fn live_postgres_cd5_charge_before_send_conformance_and_authority_unavaila
 
     set_available(&admin, 1, 0).await;
     let refused = live_request(Uuid::now_v7(), Uuid::now_v7());
+    let refused_metered = MeteredProviderAttemptRequest::try_from(refused.clone())
+        .expect("readiness must be metered");
     let mut refused_ledger = ProviderAttemptLedger::new(BOUNDARY, &refused.logical_request_id)
         .expect("construct refused ledger");
     assert_eq!(
-        client.execute(&mut refused_ledger, &refused).await,
+        client
+            .execute(&mut refused_ledger, &refused_metered, &())
+            .await
+            .map(|execution| execution.outcome),
         Err(ProviderClientError::ChargeRefused(
             ProviderChargeError::BudgetExhausted
         ))
@@ -891,17 +897,25 @@ async fn live_postgres_cd5_charge_before_send_conformance_and_authority_unavaila
     set_available(&admin, 1, 1).await;
     set_available(&admin, 2, 1).await;
     let granted = live_request(Uuid::now_v7(), Uuid::now_v7());
+    let granted_metered = MeteredProviderAttemptRequest::try_from(granted.clone())
+        .expect("readiness must be metered");
     let mut granted_ledger = ProviderAttemptLedger::new(BOUNDARY, &granted.logical_request_id)
         .expect("construct granted ledger");
     assert_eq!(
-        client.execute(&mut granted_ledger, &granted).await,
+        client
+            .execute(&mut granted_ledger, &granted_metered, &())
+            .await
+            .map(|execution| execution.outcome),
         Ok(ProviderAttemptOutcome::Decisive)
     );
     assert_eq!(transport_calls.load(Ordering::SeqCst), 1);
     assert_eq!(granted_ledger.committed_grant_count(), 1);
     assert_eq!(granted_ledger.attempt_count(), 1);
     assert_eq!(
-        client.execute(&mut granted_ledger, &granted).await,
+        client
+            .execute(&mut granted_ledger, &granted_metered, &())
+            .await
+            .map(|execution| execution.outcome),
         Err(ProviderClientError::ChargeRefused(
             ProviderChargeError::AttemptAlreadyCharged
         ))
@@ -912,7 +926,10 @@ async fn live_postgres_cd5_charge_before_send_conformance_and_authority_unavaila
     let mut duplicate_ledger = ProviderAttemptLedger::new(BOUNDARY, &granted.logical_request_id)
         .expect("construct duplicate-attempt ledger");
     assert_eq!(
-        client.execute(&mut duplicate_ledger, &granted).await,
+        client
+            .execute(&mut duplicate_ledger, &granted_metered, &())
+            .await
+            .map(|execution| execution.outcome),
         Err(ProviderClientError::ChargeRefused(
             ProviderChargeError::AttemptAlreadyCharged
         ))
@@ -920,33 +937,20 @@ async fn live_postgres_cd5_charge_before_send_conformance_and_authority_unavaila
     assert_eq!(transport_calls.load(Ordering::SeqCst), 1);
     assert_eq!(duplicate_ledger.committed_grant_count(), 0);
     assert_eq!(duplicate_ledger.attempt_count(), 0);
-    drop(authority_connection);
-
-    let LiveDatabase {
-        client: dead_client,
-        _connection: dead_connection,
-    } = connect(&url).await;
-    dead_client
-        .batch_execute("SET SESSION AUTHORIZATION object_dispatch_retention_runtime")
-        .await
-        .expect("assume runtime fixture identity");
-    let backend_pid: i32 = dead_client
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .expect("read authority backend pid")
-        .get(0);
     admin
-        .execute("SELECT pg_terminate_backend($1)", &[&backend_pid])
+        .batch_execute("ALTER ROLE object_dispatch_retention_runtime NOLOGIN")
         .await
-        .expect("terminate authority backend");
-    let dead_authority = PostgresProviderChargeAuthority::new(
-        dead_client,
-        PostgresProviderChargeConfig {
-            statement_timeout: Duration::from_secs(1),
-            lock_timeout: Duration::from_secs(1),
-        },
-    )
-    .expect("construct terminated authority");
+        .expect("disable fresh runtime logins");
+    let unavailable_pool = Arc::new(
+        DispatchRuntimePool::new(pool_config(
+            &url,
+            Duration::from_secs(1),
+            expected_database_identity,
+        ))
+        .expect("construct unavailable runtime pool"),
+    );
+    let dead_authority = PostgresProviderChargeAuthority::new(unavailable_pool)
+        .expect("construct unavailable authority");
     let dead_calls = Arc::new(AtomicU32::new(0));
     let dead_governed = GovernedProviderClient::new(
         live_boundary(),
@@ -956,12 +960,14 @@ async fn live_postgres_cd5_charge_before_send_conformance_and_authority_unavaila
         CountingTransport(dead_calls.clone()),
     );
     let unavailable = live_request(Uuid::now_v7(), Uuid::now_v7());
+    let unavailable_metered = MeteredProviderAttemptRequest::try_from(unavailable.clone())
+        .expect("readiness must be metered");
     let mut unavailable_ledger =
         ProviderAttemptLedger::new(BOUNDARY, &unavailable.logical_request_id)
             .expect("construct unavailable ledger");
     assert_eq!(
         dead_governed
-            .execute(&mut unavailable_ledger, &unavailable)
+            .execute(&mut unavailable_ledger, &unavailable_metered, &())
             .await,
         Err(ProviderClientError::ChargeRefused(
             ProviderChargeError::AuthorityUnavailable
@@ -969,22 +975,77 @@ async fn live_postgres_cd5_charge_before_send_conformance_and_authority_unavaila
     );
     assert_eq!(dead_calls.load(Ordering::SeqCst), 0);
     assert_eq!(unavailable_ledger.committed_grant_count(), 0);
-    drop(dead_connection);
+    admin
+        .batch_execute("ALTER ROLE object_dispatch_retention_runtime LOGIN")
+        .await
+        .expect("restore runtime login");
 }
 
 struct CountingTransport(Arc<AtomicU32>);
 
 impl ProviderTransport for CountingTransport {
-    fn issue(
-        &self,
-        _attempt: &AuthorizedProviderAttempt<'_>,
-    ) -> Result<ProviderAttemptReport, ProviderTransportRefusal> {
+    type Operation = ();
+    type Response = ();
+
+    async fn issue<'a>(
+        &'a self,
+        _attempt: &'a AuthorizedProviderAttempt<'a>,
+        _operation: &'a Self::Operation,
+    ) -> Result<ProviderAttemptReport<Self::Response>, ProviderTransportRefusal> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     }
+}
+
+fn pool_config(
+    base_url: &str,
+    statement_timeout: Duration,
+    expected_database_identity: DispatchDatabaseIdentity,
+) -> DispatchPoolConfig {
+    let without_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    let host_and_path = without_scheme
+        .split_once('@')
+        .map(|(_, rest)| rest)
+        .unwrap_or(without_scheme);
+    DispatchPoolConfig {
+        postgres_url: format!(
+            "postgresql://{}@{host_and_path}?sslmode=disable",
+            DispatchPoolRole::Runtime.role_name()
+        ),
+        role: DispatchPoolRole::Runtime,
+        expected_database_identity,
+        pool_max: 1,
+        connect_timeout: Duration::from_secs(10),
+        acquire_timeout: Duration::from_secs(10),
+        statement_timeout,
+        lock_timeout: Duration::from_secs(1),
+        tls: DispatchTlsMode::Disabled,
+        budget: DispatchConnectionBudget::new(1, 1, 1, 1, 1).expect("live process budget"),
+    }
+}
+
+async fn read_database_identity(client: &Client) -> DispatchDatabaseIdentity {
+    let row = client
+        .query_one(
+            "SELECT (SELECT system_identifier::text FROM pg_control_system()),
+                    (SELECT oid FROM pg_database WHERE datname = current_database())",
+            &[],
+        )
+        .await
+        .expect("read physical database identity");
+    let system_identifier = row
+        .get::<_, String>(0)
+        .parse()
+        .expect("canonical PostgreSQL system identifier");
+    DispatchDatabaseIdentity::new(system_identifier, row.get(1))
+        .expect("nonzero physical database identity")
 }
 
 fn live_boundary() -> CellProviderBoundary {
@@ -1055,6 +1116,10 @@ async fn install(client: &Client) {
         )
         .await
         .expect("create fixture roles");
+    client
+        .batch_execute("ALTER ROLE object_dispatch_retention_runtime LOGIN")
+        .await
+        .expect("allow the runtime pool to connect as its own role");
     for migration in [
         MIGRATION_0002,
         MIGRATION_0003,

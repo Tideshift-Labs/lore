@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -26,6 +27,8 @@ use lore_storage::StoreError;
 use lore_storage::StoreGetData;
 use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
+use lore_storage::StoreRepositoryStats;
+use lore_storage::errors::NotSupported;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::drop_record::DropRecord;
@@ -644,6 +647,18 @@ impl ImmutableStore for GrpcReplica {
         Ok(())
     }
 
+    /// Explicitly pinned because the legacy gRPC replica protocol has no
+    /// repository-statistics operation. A trait-default change must not create
+    /// an accidental local lifecycle bypass.
+    async fn repository_stats(
+        self: Arc<Self>,
+        _partition: Partition,
+    ) -> Result<StoreRepositoryStats, StoreError> {
+        Err(StoreError::from(NotSupported {
+            operation: "repository_stats".to_owned(),
+        }))
+    }
+
     async fn copy(
         self: Arc<Self>,
         _source_partition: Partition,
@@ -773,24 +788,22 @@ mod tests {
         Ok(())
     }
 
-    /// `GrpcReplica` forwards every operation to a remote server over its own
-    /// wire protocol (`ReplicationClient`) and has no `repository_stats` RPC
-    /// on that protocol to forward through — it inherits the trait default.
+    /// `GrpcReplica` has no `repository_stats` RPC on its wire protocol, so its
+    /// explicit override reports `NotSupported` without touching the client.
     /// A cell wired to forward through this replica therefore reports
     /// `NotSupported` for storage-stats metering even when the store it
     /// forwards to could compute the real number; this pins that as the
-    /// intended (if silent) behavior rather than an oversight. The mock
-    /// client needs no `.expect_*()` here — the default method never touches
-    /// `self.client`.
+    /// intended behavior rather than inheriting a future trait default. The
+    /// mock client needs no `.expect_*()` because the override never touches it.
     #[tokio::test]
-    async fn repository_stats_inherits_the_trait_default() {
+    async fn repository_stats_explicit_override_returns_not_supported() {
         let client = MockReplicationClientImpl::default();
         let store = GrpcReplica::new(client);
 
         let err = Arc::new(store)
             .repository_stats(Partition::default())
             .await
-            .expect_err("GrpcReplica has no repository_stats override");
+            .expect_err("GrpcReplica explicitly refuses repository_stats");
 
         assert!(matches!(err, StoreError::NotSupported(_)));
     }

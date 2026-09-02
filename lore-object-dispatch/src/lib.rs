@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Dark, server-only object-store dispatch authority primitives.
+//! Server-only object-store dispatch authority primitives.
 //!
-//! This crate is not wired into loreserver composition. Its source cannot authorize provider
-//! traffic or first-seen admission until the WP-121 deployment and calibration gates are current.
+//! The opt-in Phase 5 `fragment_provider` composition uses this crate's dispatch pool, typed
+//! authority client, shared limiter, and governed provider client for direct fragment traffic.
+//! Absent or disabled configuration keeps that route dark. The retained spool, drain, retention,
+//! and migration artifacts remain source-dark until their later activation work supplies an
+//! explicit composition path.
 
 pub mod cell_schema_install;
 pub mod compact_prune;
@@ -88,6 +91,8 @@ pub use dispatch_client::DISPATCHER_IDENTITY_API_REVISION_V1;
 pub use dispatch_client::DISPATCHER_REGISTRATION_API_REVISION_V1;
 pub use dispatch_client::DispatchAccepted;
 pub use dispatch_client::DispatchAuthorityError;
+pub use dispatch_client::DispatchDatabaseIdentity;
+pub use dispatch_client::DispatchDatabaseIdentityError;
 pub use dispatch_client::DispatchDisposition;
 pub use dispatch_client::DispatchMaintenanceClient;
 pub use dispatch_client::DispatchRecordLimits;
@@ -111,6 +116,7 @@ pub use dispatch_client::ReservePutQuotaScope;
 pub use dispatch_client::ReservePutRequest;
 pub use dispatch_pool::DISPATCH_CONNECTION_BUDGET_STATEMENT;
 pub use dispatch_pool::DISPATCH_MAINTENANCE_ROLE;
+pub use dispatch_pool::DISPATCH_PROCESS_CONNECTION_LIMIT;
 pub use dispatch_pool::DISPATCH_RUNTIME_ROLE;
 pub use dispatch_pool::DispatchConnectionBudget;
 pub use dispatch_pool::DispatchPoolConfig;
@@ -118,7 +124,6 @@ pub use dispatch_pool::DispatchPoolError;
 pub use dispatch_pool::DispatchPoolRole;
 pub use dispatch_pool::DispatchRuntimePool;
 pub use dispatch_pool::DispatchTlsMode;
-pub use dispatch_pool::STAGING_DISPATCH_CONNECTION_BUDGET;
 pub use fetch_lease::CanonicalObjectStoreFetchHead;
 pub use fetch_lease::CanonicalObjectStoreFetchLease;
 pub use fetch_lease::CanonicalObjectStoreFetchOwnerRevocationEvidence;
@@ -192,19 +197,21 @@ pub use payload_purge::decide_object_store_payload_purge_cas;
 pub use payload_purge::validate_and_encode_object_store_payload_purge_reservation;
 pub use provider_charge::PROVIDER_CHARGE_API_REVISION_V1;
 pub use provider_charge::PostgresProviderChargeAuthority;
-pub use provider_charge::PostgresProviderChargeConfig;
 pub use provider_charge::classify_provider_charge_commit;
 pub use provider_client::AuthorizedProviderAttempt;
+pub use provider_client::AuthorizedProviderGet;
 pub use provider_client::BudgetPin;
 pub use provider_client::CellProviderBoundary;
 pub use provider_client::DurableProviderPutBody;
 pub use provider_client::GovernedProviderClient;
+pub use provider_client::MeteredProviderAttemptRequest;
 pub use provider_client::PROVIDER_ATTEMPT_DEADLINE_HORIZON_MS;
 pub use provider_client::PROVIDER_MAX_MULTIPART_PARTS;
 pub use provider_client::PROVIDER_MAX_PART_SIZE_BYTES;
 pub use provider_client::PROVIDER_MAX_SINGLE_PUT_BYTES;
 pub use provider_client::PROVIDER_MIN_PART_SIZE_BYTES;
 pub use provider_client::ProviderAttemptClass;
+pub use provider_client::ProviderAttemptExecution;
 pub use provider_client::ProviderAttemptLedger;
 pub use provider_client::ProviderAttemptOutcome;
 pub use provider_client::ProviderAttemptReport;
@@ -216,6 +223,9 @@ pub use provider_client::ProviderChargeError;
 pub use provider_client::ProviderChargeGrant;
 pub use provider_client::ProviderChargeRequest;
 pub use provider_client::ProviderClientError;
+pub use provider_client::ProviderDirectPutAttemptRequest;
+pub use provider_client::ProviderGetAttemptRequest;
+pub use provider_client::ProviderGetTransport;
 pub use provider_client::ProviderPutLimits;
 pub use provider_client::ProviderPutPart;
 pub use provider_client::ProviderRetryPolicy;
@@ -227,6 +237,7 @@ pub use provider_client::PutObjectPlan;
 pub use provider_client::UnwiredChargeAuthority;
 pub use provider_client::UnwiredProviderTransport;
 pub use provider_client::bind_durable_put_body;
+pub use provider_client::bind_durable_put_body_from_ready;
 pub use provider_client::plan_put_object;
 pub use request::AuthenticatedConsumerIdentity;
 pub use request::DurablePutSpoolExpectation;

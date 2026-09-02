@@ -2735,6 +2735,7 @@ dependencies = [
 name = "lore-fragment-provider"
 version = "0.9.1-nightly"
 dependencies = [
+ "blake3",
  "hex",
  "lore-base",
  "lore-object-dispatch",

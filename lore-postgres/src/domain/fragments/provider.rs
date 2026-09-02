@@ -32,11 +32,10 @@
 //!   `error[E0603]: struct ProviderAttemptLedger is private`. Keep the narrow
 //!   wording: no provider attempt can be issued from this crate.
 //!
-//!   This crate also cannot supply a transport of its own:
-//!   `impl ProviderTransport for …` needs `AuthorizedProviderAttempt`,
-//!   `ProviderAttemptReport` and `ProviderTransportRefusal`, none of which the
-//!   seam re-exports, so the gateway this crate holds can only ever be the
-//!   unwired one.
+//!   This crate can implement the seam's safe transport ports, but it cannot
+//!   mint their opaque request values. The seam creates those values only
+//!   after admission and authorization, so the adapter cannot invoke a real
+//!   send by itself.
 //!
 //! **And the scope, stated as narrowly as it is true.** The seam crate is the
 //! trust boundary, and the guarantee is about *crates*, not about the seam's
@@ -65,41 +64,53 @@
 //! Cargo cycle. Breaking that would mean extracting the shared domain core,
 //! which is a WP-116 seam rather than WP-118's.
 //!
-//! # What is deliberately not here — two Phase 5 obligations, same shape
+//! # Constructed and attested, but not activated by the server
 //!
-//! **1. Nothing constructs a gateway.** The I/O phase between a `begin_*` and
-//! its commit is driven by a function this package does not yet have, because
-//! its shape depends on where Phase 5 mints the spool row and that needs a real
-//! cell.
+//! [`FragmentProviderEntry::connect`] is the seam-owned composition door. It
+//! privately constructs the shared dispatch pool and typed client, attests the
+//! installed cell schema, and builds the governed gateway. The Postgres S3
+//! adapter implements the seam's opaque transport ports, and the immutable
+//! store has the coordinated lifecycle route.
 //!
-//! **2. `attest_cell_schema` is currently uncallable from outside the seam
-//! crate.** It takes a `&DispatchRuntimeClient`, and that type's only
-//! constructor takes a `DispatchRuntimePool` which the seam does not
-//! re-export — so nothing here or in `lore-server` can build a client to hand
-//! it. Verified, not inferred: `error[E0425]: cannot find type
-//! DispatchRuntimePool in crate lore_fragment_provider`. It costs nothing today
-//! because the seam is dark and nothing attests, and it bites the first time
-//! Phase 5 attests a cell.
-//!
-//! **Both are unresolved and neither is designed here.** They are the same
-//! shape — something in the seam has to hand out a way in — and the fix for the
-//! second could be a re-exported pool, a seam-owned wrapper, or a constructor
-//! taking connection parameters. Which one is right depends on where Phase 5
-//! gets its pool, which needs a real cell. Naming them is the honest state;
-//! guessing at the shape would be the false-activation move this package has
-//! already refused twice.
+//! `lore-server` constructs and activates that route only for a complete,
+//! explicitly enabled deployment configuration after lifecycle readiness and
+//! the exact process-wide pool inventory pass. Absent, disabled, incomplete,
+//! or over-budget configurations never receive a provider entry.
 
+pub use lore_fragment_provider::AdmittedFragmentAttempt;
+pub use lore_fragment_provider::BudgetPin;
+pub use lore_fragment_provider::CellProviderBoundary;
 pub use lore_fragment_provider::CellSchemaAttestation;
 pub use lore_fragment_provider::DEFAULT_IN_FLIGHT_PUTS;
 pub use lore_fragment_provider::FRAGMENT_PROVIDER_ATTEMPT_CLASSES;
 pub use lore_fragment_provider::FRAGMENT_PROVIDER_INGRESS_CAP_BYTES;
 pub use lore_fragment_provider::FragmentAttemptLedger;
+pub use lore_fragment_provider::FragmentDatabaseIdentity;
+pub use lore_fragment_provider::FragmentDatabaseIdentityError;
+pub use lore_fragment_provider::FragmentDirectPutOperation;
+pub use lore_fragment_provider::FragmentDispatchRuntimeConfig;
+pub use lore_fragment_provider::FragmentDispatchTls;
+pub use lore_fragment_provider::FragmentGetAttempt;
+pub use lore_fragment_provider::FragmentGetExecution;
+pub use lore_fragment_provider::FragmentGetOperation;
+pub use lore_fragment_provider::FragmentGetResponse;
+pub use lore_fragment_provider::FragmentProcessPoolInventory;
+pub use lore_fragment_provider::FragmentProviderActivationError;
 pub use lore_fragment_provider::FragmentProviderAttempt;
 pub use lore_fragment_provider::FragmentProviderDisposition;
+pub use lore_fragment_provider::FragmentProviderEntry;
 pub use lore_fragment_provider::FragmentProviderError;
 pub use lore_fragment_provider::FragmentProviderGateway;
+pub use lore_fragment_provider::FragmentTransportExecution;
+pub use lore_fragment_provider::FragmentTransportOperation;
+pub use lore_fragment_provider::FragmentTransportResponse;
 pub use lore_fragment_provider::InFlightPutBound;
 pub use lore_fragment_provider::MAX_IN_FLIGHT_PUTS;
+pub use lore_fragment_provider::ProviderAttemptClass;
+pub use lore_fragment_provider::ProviderAttemptOutcome;
+pub use lore_fragment_provider::ProviderCapabilities;
+pub use lore_fragment_provider::ProviderTrafficClass;
+pub use lore_fragment_provider::ValidatedFragmentProcessPoolInventory;
 pub use lore_fragment_provider::attest_cell_schema;
 
 use crate::domain::errors::DomainError;
@@ -196,14 +207,13 @@ mod tests {
     }
 
     /// The `From` impl actually routes through the seam's classification rather
-    /// than deciding for itself. Uses errors this crate can construct, which is
-    /// three of the five classes.
+    /// than deciding for itself. Uses the two runtime errors this crate can construct
+    /// without naming the private dispatch vocabulary.
     #[test]
     fn the_conversion_takes_its_class_from_the_seams_disposition() {
         for error in [
             FragmentProviderError::IngressCapExceeded,
             FragmentProviderError::PutAdmissionTimedOut,
-            FragmentProviderError::AttestationMismatch { layer: "retention" },
         ] {
             let disposition = error.disposition();
             let through_conversion = DomainError::from(error.clone());

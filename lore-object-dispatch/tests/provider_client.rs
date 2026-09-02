@@ -21,6 +21,7 @@ use lore_object_dispatch::CellProviderBoundary;
 use lore_object_dispatch::DurableProviderPutBody;
 use lore_object_dispatch::GovernedProviderClient;
 use lore_object_dispatch::LedgerSpoolView;
+use lore_object_dispatch::MeteredProviderAttemptRequest;
 use lore_object_dispatch::NoDispatchProofFields;
 use lore_object_dispatch::NoDispatchReason;
 use lore_object_dispatch::ObjectStoreCompactReceiptLimits;
@@ -29,6 +30,7 @@ use lore_object_dispatch::PROVIDER_MAX_PART_SIZE_BYTES;
 use lore_object_dispatch::PROVIDER_MAX_SINGLE_PUT_BYTES;
 use lore_object_dispatch::PROVIDER_MIN_PART_SIZE_BYTES;
 use lore_object_dispatch::ProviderAttemptClass;
+use lore_object_dispatch::ProviderAttemptExecution;
 use lore_object_dispatch::ProviderAttemptLedger;
 use lore_object_dispatch::ProviderAttemptOutcome;
 use lore_object_dispatch::ProviderAttemptReport;
@@ -222,18 +224,63 @@ fn client_with<C, T>(
     capabilities: ProviderCapabilities,
     charge_authority: C,
     transport: T,
-) -> GovernedProviderClient<C, T>
+) -> UnitOperationClient<C, T>
 where
     C: ProviderChargeAuthority,
-    T: ProviderTransport,
+    T: ProviderTransport<Operation = ()>,
 {
-    GovernedProviderClient::new(
+    UnitOperationClient(GovernedProviderClient::new(
         boundary(),
         capabilities,
         ProviderRetryPolicy::disabled(),
         charge_authority,
         transport,
-    )
+    ))
+}
+
+struct UnitOperationClient<C, T>(GovernedProviderClient<C, T>);
+
+impl<C, T> UnitOperationClient<C, T>
+where
+    C: ProviderChargeAuthority,
+    T: ProviderTransport<Operation = ()>,
+{
+    async fn execute(
+        &self,
+        ledger: &mut ProviderAttemptLedger,
+        request: &ProviderAttemptRequest,
+    ) -> Result<ProviderAttemptOutcome, ProviderClientError> {
+        let request = MeteredProviderAttemptRequest::try_from(request.clone())?;
+        self.0
+            .execute(ledger, &request, &())
+            .await
+            .map(|execution| execution.outcome)
+    }
+
+    async fn execute_with_response(
+        &self,
+        ledger: &mut ProviderAttemptLedger,
+        request: &ProviderAttemptRequest,
+    ) -> Result<ProviderAttemptExecution<T::Response>, ProviderClientError> {
+        let request = MeteredProviderAttemptRequest::try_from(request.clone())?;
+        self.0.execute(ledger, &request, &()).await
+    }
+
+    fn validate_attempt(
+        &self,
+        request: &ProviderAttemptRequest,
+    ) -> Result<(), ProviderClientError> {
+        let request = MeteredProviderAttemptRequest::try_from(request.clone())?;
+        self.0.validate_attempt(&request)
+    }
+}
+
+impl<C, T> std::ops::Deref for UnitOperationClient<C, T> {
+    type Target = GovernedProviderClient<C, T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// A ledger bound to the default boundary and logical request identity every fixture in this file
@@ -387,7 +434,7 @@ impl<F> ScriptedTransport<F>
 where
     F: Fn(
         &AuthorizedProviderAttempt<'_>,
-    ) -> Result<ProviderAttemptReport, ProviderTransportRefusal>,
+    ) -> Result<ProviderAttemptReport<()>, ProviderTransportRefusal>,
 {
     fn new(respond: F) -> (Self, Arc<TestCounter>) {
         let calls = Arc::new(TestCounter(AtomicU32::new(0)));
@@ -404,15 +451,60 @@ where
 impl<F> ProviderTransport for ScriptedTransport<F>
 where
     F: Fn(
-        &AuthorizedProviderAttempt<'_>,
-    ) -> Result<ProviderAttemptReport, ProviderTransportRefusal>,
+            &AuthorizedProviderAttempt<'_>,
+        ) -> Result<ProviderAttemptReport<()>, ProviderTransportRefusal>
+        + Send
+        + Sync,
 {
-    fn issue(
-        &self,
-        attempt: &AuthorizedProviderAttempt<'_>,
-    ) -> Result<ProviderAttemptReport, ProviderTransportRefusal> {
+    type Operation = ();
+    type Response = ();
+
+    async fn issue<'a>(
+        &'a self,
+        attempt: &'a AuthorizedProviderAttempt<'a>,
+        _operation: &'a Self::Operation,
+    ) -> Result<ProviderAttemptReport<()>, ProviderTransportRefusal> {
         self.calls.increment();
         (self.respond)(attempt)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TypedResponseTransport {
+    outcome: ProviderAttemptOutcome,
+    provider_requests_issued: u32,
+    response: &'static str,
+}
+
+impl ProviderTransport for TypedResponseTransport {
+    type Operation = ();
+    type Response = &'static str;
+
+    async fn issue<'a>(
+        &'a self,
+        _attempt: &'a AuthorizedProviderAttempt<'a>,
+        _operation: &'a Self::Operation,
+    ) -> Result<ProviderAttemptReport<Self::Response>, ProviderTransportRefusal> {
+        Ok(ProviderAttemptReport {
+            outcome: self.outcome,
+            provider_requests_issued: self.provider_requests_issued,
+            response: self.response,
+        })
+    }
+}
+
+struct PendingProviderTransport;
+
+impl ProviderTransport for PendingProviderTransport {
+    type Operation = ();
+    type Response = &'static str;
+
+    async fn issue<'a>(
+        &'a self,
+        _attempt: &'a AuthorizedProviderAttempt<'a>,
+        _operation: &'a Self::Operation,
+    ) -> Result<ProviderAttemptReport<Self::Response>, ProviderTransportRefusal> {
+        std::future::pending().await
     }
 }
 
@@ -968,7 +1060,16 @@ async fn authorize_gates_listing_classes_on_the_capability_and_leaves_others_una
         let result_without = without_listing.validate_attempt(&request);
         let result_with = with_listing.validate_attempt(&request);
 
-        if class.is_listing() {
+        if class == ProviderAttemptClass::GetObject {
+            assert_eq!(
+                result_without,
+                Err(ProviderClientError::GetObjectRequiresReadOnlyPath)
+            );
+            assert_eq!(
+                result_with,
+                Err(ProviderClientError::GetObjectRequiresReadOnlyPath)
+            );
+        } else if class.is_listing() {
             assert_eq!(
                 result_without,
                 Err(ProviderClientError::ListCapabilityNotGranted),
@@ -1159,6 +1260,13 @@ async fn authorize_enforces_body_presence_across_every_attempt_class() {
     );
 
     for class in ProviderAttemptClass::ALL {
+        if class == ProviderAttemptClass::GetObject {
+            assert_eq!(
+                client.validate_attempt(&attempt_request_for(class)),
+                Err(ProviderClientError::GetObjectRequiresReadOnlyPath)
+            );
+            continue;
+        }
         if class.carries_object_body() {
             let mut missing = attempt_request_for(class);
             missing.put_body = None;
@@ -1204,9 +1312,14 @@ async fn authorize_requires_a_part_range_only_for_upload_part() {
             offset: 0,
             length: 1,
         });
+        let expected = if class == ProviderAttemptClass::GetObject {
+            ProviderClientError::GetObjectRequiresReadOnlyPath
+        } else {
+            ProviderClientError::PutPartNotPermitted
+        };
         assert_eq!(
             client.validate_attempt(&request),
-            Err(ProviderClientError::PutPartNotPermitted),
+            Err(expected),
             "{class:?}"
         );
     }
@@ -1469,7 +1582,9 @@ async fn capture_charge_request_with_boundary(
     let mut ledger = ProviderAttemptLedger::new(&provider_boundary_id, &request.logical_request_id)
         .expect("request's own logical_request_id must be a valid ledger identity");
 
-    match client.execute(&mut ledger, request).await {
+    let metered = MeteredProviderAttemptRequest::try_from(request.clone())
+        .unwrap_or_else(|error| panic!("{label}: request must be metered: {error}"));
+    match client.execute(&mut ledger, &metered, &()).await {
         Err(ProviderClientError::ChargeRefused(ProviderChargeError::Unwired)) => {}
         other => panic!("{label}: expected the scripted Unwired refusal, got {other:?}"),
     }
@@ -1496,7 +1611,12 @@ async fn capture_charge_request(
 
 #[tokio::test]
 async fn cd5_conformance_grant_binds_exactly_one_provider_attempt() {
-    for class in ProviderAttemptClass::ALL {
+    let metered_classes: Vec<_> = ProviderAttemptClass::ALL
+        .into_iter()
+        .filter(|class| *class != ProviderAttemptClass::GetObject)
+        .collect();
+    assert_eq!(metered_classes.len(), 10);
+    for class in metered_classes {
         let request = attempt_request_for(class);
         let charge = capture_charge_request(&request, &format!("{class:?}")).await;
 
@@ -1527,8 +1647,13 @@ async fn cd5_conformance_grant_binds_exactly_one_provider_attempt() {
 
 #[tokio::test]
 async fn cap_classes_always_start_with_the_shared_budget_and_include_exactly_the_matching_caps() {
+    let metered_classes: Vec<_> = ProviderAttemptClass::ALL
+        .into_iter()
+        .filter(|class| *class != ProviderAttemptClass::GetObject)
+        .collect();
+    assert_eq!(metered_classes.len(), 10);
     for traffic_class in ProviderTrafficClass::ALL {
-        for attempt_class in ProviderAttemptClass::ALL {
+        for attempt_class in metered_classes.iter().copied() {
             let mut request = attempt_request_for(attempt_class);
             request.traffic_class = traffic_class;
             let charge = capture_charge_request(&request, &format!("{attempt_class:?}")).await;
@@ -1598,6 +1723,63 @@ async fn cd5_conformance_refused_charge_sends_nothing() {
 }
 
 #[tokio::test]
+async fn every_one_of_the_ten_metered_classes_calls_authority_exactly_once() {
+    let metered_classes: Vec<_> = ProviderAttemptClass::ALL
+        .into_iter()
+        .filter(|class| *class != ProviderAttemptClass::GetObject)
+        .collect();
+    assert_eq!(metered_classes.len(), 10);
+
+    for class in metered_classes {
+        let (charge_authority, charge_calls) =
+            ScriptedChargeAuthority::new(|_request| Err(ProviderChargeError::Unwired));
+        let (transport, transport_calls) =
+            ScriptedTransport::new(|_attempt| unreachable!("refused charge must not send"));
+        let client = client_with(
+            ProviderCapabilities::none().with_listing(),
+            charge_authority,
+            transport,
+        );
+        let request = attempt_request_for(class);
+        let mut ledger = new_ledger();
+
+        assert_eq!(
+            client.execute(&mut ledger, &request).await,
+            Err(ProviderClientError::ChargeRefused(
+                ProviderChargeError::Unwired
+            )),
+            "{class:?}"
+        );
+        assert_eq!(charge_calls.get(), 1, "{class:?}");
+        assert_eq!(transport_calls.get(), 0, "{class:?}");
+        assert_eq!(ledger.committed_grant_count(), 0, "{class:?}");
+        assert_eq!(ledger.attempt_count(), 0, "{class:?}");
+    }
+}
+
+#[tokio::test]
+async fn get_is_rejected_before_the_metered_authority_can_be_called() {
+    let (charge_authority, charge_calls) =
+        ScriptedChargeAuthority::new(|_request| panic!("GetObject reached the metered authority"));
+    let (transport, transport_calls) =
+        ScriptedTransport::new(|_attempt| unreachable!("GetObject must use execute_get"));
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let mut ledger = new_ledger();
+
+    assert_eq!(
+        client
+            .execute(
+                &mut ledger,
+                &attempt_request_for(ProviderAttemptClass::GetObject),
+            )
+            .await,
+        Err(ProviderClientError::GetObjectRequiresReadOnlyPath)
+    );
+    assert_eq!(charge_calls.get(), 0);
+    assert_eq!(transport_calls.get(), 0);
+}
+
+#[tokio::test]
 async fn unwired_charge_authority_and_transport_are_the_shipped_fail_closed_guards() {
     let client = client_with(
         ProviderCapabilities::none(),
@@ -1637,6 +1819,7 @@ async fn cd5_conformance_ambiguous_commit_stays_charged_and_sends_nothing() {
     assert_eq!(outcome, Err(ProviderClientError::ChargeAmbiguous));
     assert_eq!(ledger.committed_grant_count(), 1);
     assert_eq!(ledger.attempt_count(), 0);
+    assert_eq!(ledger.ambiguous_count(), 0);
     assert_eq!(ledger.poisoned(), None);
     assert_eq!(charge_calls.get(), 1);
     assert_eq!(transport_calls.get(), 0);
@@ -1657,6 +1840,7 @@ async fn same_ledger_already_charged_replay_does_not_increment_the_proven_single
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -1727,6 +1911,7 @@ async fn success_after_one_cancel_reconciles_the_provisional_charge_to_exactly_o
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client = client_with(
@@ -1758,6 +1943,7 @@ async fn success_after_repeated_cancels_still_reconciles_to_exactly_one_grant() 
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client = client_with(
@@ -1796,6 +1982,7 @@ async fn same_attempt_id_with_distinct_ordinals_counts_two_grants_and_two_attemp
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -1825,6 +2012,7 @@ async fn distinct_attempt_ids_with_same_ordinal_count_two_grants_and_two_attempt
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -1991,6 +2179,86 @@ async fn execute_reports_transport_refusal_while_keeping_the_grant_charged() {
 }
 
 #[tokio::test]
+async fn exactly_one_report_returns_the_response_bound_to_that_attempt() {
+    let (charge_authority, _charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let client = client_with(
+        ProviderCapabilities::none(),
+        charge_authority,
+        TypedResponseTransport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+            response: "response-for-this-attempt",
+        },
+    );
+    let mut ledger = new_ledger();
+
+    let execution = client
+        .execute_with_response(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await
+        .expect("one authorized request must return its bound response");
+
+    assert_eq!(execution.outcome, ProviderAttemptOutcome::Decisive);
+    assert_eq!(execution.response, "response-for-this-attempt");
+    assert_eq!(ledger.attempt_count(), 1);
+    assert_eq!(ledger.ambiguous_count(), 0);
+}
+
+#[tokio::test]
+async fn zero_and_multiple_request_reports_expose_no_transport_response() {
+    for (issued, expected) in [
+        (0, ProviderClientError::TransportReportInconsistent),
+        (2, ProviderClientError::TransportIssuedUnauthorizedRequests),
+    ] {
+        let (charge_authority, _charge_calls) =
+            ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+        let client = client_with(
+            ProviderCapabilities::none(),
+            charge_authority,
+            TypedResponseTransport {
+                outcome: ProviderAttemptOutcome::Decisive,
+                provider_requests_issued: issued,
+                response: "must-not-escape",
+            },
+        );
+        let mut ledger = new_ledger();
+
+        let result = client
+            .execute_with_response(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+            .await;
+
+        assert_eq!(result, Err(expected), "issued request count: {issued}");
+    }
+}
+
+#[tokio::test]
+async fn dropping_a_pending_transport_after_grant_records_one_ambiguous_attempt() {
+    let (charge_authority, _charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let client = client_with(
+        ProviderCapabilities::none(),
+        charge_authority,
+        PendingProviderTransport,
+    );
+    let request = base_request(ProviderAttemptClass::Readiness);
+    let mut ledger = new_ledger();
+    let mut execution = Box::pin(client.execute_with_response(&mut ledger, &request));
+
+    tokio::select! {
+        biased;
+        result = &mut execution => panic!("pending transport unexpectedly resolved: {result:?}"),
+        _ = tokio::time::sleep(Duration::ZERO) => {}
+    }
+    drop(execution);
+
+    assert_eq!(ledger.committed_grant_count(), 1);
+    assert_eq!(ledger.attempt_count(), 1);
+    assert_eq!(ledger.ambiguous_count(), 1);
+    assert_eq!(ledger.decisive_terminal_count(), 0);
+    assert_eq!(ledger.poisoned(), None);
+}
+
+#[tokio::test]
 async fn execute_poisons_when_transport_reports_success_with_zero_requests_issued() {
     let (charge_authority, _charge_calls) =
         ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
@@ -1998,6 +2266,7 @@ async fn execute_poisons_when_transport_reports_success_with_zero_requests_issue
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 0,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2028,6 +2297,7 @@ async fn execute_poisons_when_transport_issues_more_requests_than_authorized() {
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 2,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2057,6 +2327,7 @@ async fn execute_records_one_decisive_attempt() {
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2084,6 +2355,7 @@ async fn execute_records_one_ambiguous_attempt() {
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Ambiguous,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2121,6 +2393,7 @@ async fn execute_accumulates_counters_across_several_successful_attempts() {
             Ok(ProviderAttemptReport {
                 outcome,
                 provider_requests_issued: 1,
+                response: (),
             })
         });
         let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2149,6 +2422,7 @@ async fn execute_returns_the_same_poison_and_calls_neither_seam_again() {
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 0,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2215,6 +2489,7 @@ async fn execute_hands_the_transport_the_exact_authorized_permit() {
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2275,6 +2550,7 @@ async fn a_ledger_that_completed_one_request_refuses_to_accumulate_a_second_requ
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client_a = client_with(
@@ -2301,6 +2577,7 @@ async fn a_ledger_that_completed_one_request_refuses_to_accumulate_a_second_requ
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client_b = client_with(
@@ -2362,6 +2639,7 @@ async fn execute_refuses_an_attempt_naming_a_different_logical_request_than_the_
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2401,6 +2679,7 @@ async fn execute_refuses_an_attempt_when_the_ledger_is_bound_to_a_different_boun
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2435,6 +2714,7 @@ async fn execute_succeeds_when_the_ledger_is_bound_to_exactly_the_attempts_reque
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2529,6 +2809,7 @@ async fn execute_on_a_poisoned_ledger_reports_mismatch_for_a_different_request_b
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 0,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2664,6 +2945,7 @@ async fn record_no_dispatch_refuses_after_any_issued_attempt_decisive_or_ambiguo
             Ok(ProviderAttemptReport {
                 outcome,
                 provider_requests_issued: 1,
+                response: (),
             })
         });
         let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2738,6 +3020,7 @@ async fn execute_refuses_after_a_recorded_no_dispatch_without_poisoning_the_ledg
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2786,6 +3069,7 @@ async fn record_no_dispatch_returns_the_poison_on_a_poisoned_ledger() {
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 0,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2823,6 +3107,7 @@ async fn audit_for_returns_the_poison_for_the_bound_request_id_on_a_poisoned_led
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 0,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2849,6 +3134,7 @@ async fn audit_for_returns_a_ledger_request_mismatch_for_a_different_id_on_a_poi
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 0,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2885,6 +3171,7 @@ async fn audit_for_the_bound_request_id_returns_ok_with_the_expected_counters() 
         Ok(ProviderAttemptReport {
             outcome: ProviderAttemptOutcome::Decisive,
             provider_requests_issued: 1,
+            response: (),
         })
     });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -2992,6 +3279,7 @@ async fn apply_terminal_action(
                 Ok(ProviderAttemptReport {
                     outcome: ProviderAttemptOutcome::Decisive,
                     provider_requests_issued: 0,
+                    response: (),
                 })
             });
             let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -3004,6 +3292,7 @@ async fn apply_terminal_action(
                 Ok(ProviderAttemptReport {
                     outcome: ProviderAttemptOutcome::Decisive,
                     provider_requests_issued: 2,
+                    response: (),
                 })
             });
             let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
@@ -3409,6 +3698,7 @@ async fn every_ledger_state_reachable_through_the_public_api_matches_the_frozen_
                         Ok(ProviderAttemptReport {
                             outcome,
                             provider_requests_issued: 1,
+                            response: (),
                         })
                     });
                     let client =
@@ -3655,6 +3945,9 @@ async fn provider_client_error_display_never_contains_sensitive_values() {
         ProviderClientError::PutPartRequired,
         ProviderClientError::PutPartNotPermitted,
         ProviderClientError::InvalidPutPart,
+        ProviderClientError::DirectPutBodyOutOfBounds,
+        ProviderClientError::DirectPutBodyBindingMismatch,
+        ProviderClientError::GetObjectRequiresReadOnlyPath,
         ProviderClientError::ChargeRefused(ProviderChargeError::Unwired),
         ProviderClientError::ChargeAmbiguous,
         ProviderClientError::ChargeRecovered,
@@ -3677,7 +3970,7 @@ async fn provider_client_error_display_never_contains_sensitive_values() {
     // `LedgerAlgebraViolation` were all missing from this sweep).
     assert_eq!(
         errors.len(),
-        38,
+        41,
         "a new ProviderClientError variant must be added to this array, not only to the match \
          below"
     );
@@ -3710,6 +4003,9 @@ async fn provider_client_error_display_never_contains_sensitive_values() {
             | ProviderClientError::PutPartRequired
             | ProviderClientError::PutPartNotPermitted
             | ProviderClientError::InvalidPutPart
+            | ProviderClientError::DirectPutBodyOutOfBounds
+            | ProviderClientError::DirectPutBodyBindingMismatch
+            | ProviderClientError::GetObjectRequiresReadOnlyPath
             | ProviderClientError::ChargeRefused(_)
             | ProviderClientError::ChargeAmbiguous
             | ProviderClientError::ChargeRecovered

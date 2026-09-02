@@ -28,6 +28,7 @@ use lore_postgres::domain::fragments::EpochAuthority;
 use lore_postgres::domain::fragments::EpochWitness;
 use lore_postgres::domain::fragments::FragmentLifecycleReadiness;
 use lore_postgres::domain::fragments::FragmentManifest;
+use lore_postgres::domain::fragments::FragmentQueryRequest;
 use lore_postgres::domain::fragments::FragmentResolution;
 use lore_postgres::domain::fragments::FragmentVerdict;
 use lore_postgres::domain::fragments::IoObservation;
@@ -42,6 +43,7 @@ use lore_postgres::domain::fragments::STAGED_LEASE_ALREADY_RELEASED;
 use lore_postgres::domain::fragments::STAGED_LEASE_MEMBER_NOT_STAGED;
 use lore_postgres::domain::fragments::STAGED_LEASE_MEMBER_SET_MISMATCH;
 use lore_postgres::domain::fragments::StagedReaderLease;
+use lore_postgres::domain::fragments::coordinator::DirectWriteKind;
 use lore_postgres::domain::fragments::schema;
 use lore_postgres::domain::fragments::states::FragmentLifecycleState;
 use lore_postgres::domain::lock_order::LockClass;
@@ -56,6 +58,225 @@ use tokio_postgres::Client;
 use uuid::NoContext;
 use uuid::Timestamp;
 use uuid::Uuid;
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn normal_direct_write_uses_legacy_key_and_missing_reoffer_uses_repair_epoch_key() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let hash = rand::random::<[u8; 32]>();
+    let legacy_key = hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    let BeginOutcome::Admitted(first) = coordinator
+        .begin_direct_write(&hash, &legacy_key)
+        .await
+        .expect("begin ordinary direct write")
+    else {
+        panic!("fresh hash must admit its ordinary direct write");
+    };
+    assert_eq!(first.object_key, legacy_key);
+    assert_eq!(first.direct_write_kind(), Some(DirectWriteKind::Normal));
+
+    let assertion_client = client(&url).await;
+    let persisted_normal = assertion_client
+        .query_one(
+            "SELECT current_epoch, state, last_fence, active_operation \
+             FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash.as_slice()],
+        )
+        .await
+        .expect("read persisted normal intent");
+    assert_eq!(
+        persisted_normal.get::<_, i16>("state"),
+        FragmentLifecycleState::PreparingRemote.bits()
+    );
+    assert_eq!(
+        persisted_normal.get::<_, Vec<u8>>("active_operation"),
+        b"wp118-direct-v1N"
+    );
+
+    assertion_client
+        .execute(
+            "UPDATE lore_fragment_lifecycle SET active_operation = NULL WHERE hash = $1",
+            &[&hash.as_slice()],
+        )
+        .await
+        .expect("remove persisted lineage token");
+    let missing_token = coordinator
+        .begin_direct_write(&hash, &legacy_key)
+        .await
+        .expect_err("a PreparingRemote head with no lineage token must fail closed");
+    assert_eq!(
+        missing_token,
+        DomainError::NotReady("PreparingRemote head has no direct-write lineage token".to_owned())
+    );
+
+    assertion_client
+        .execute(
+            "UPDATE lore_fragment_lifecycle SET active_operation = $2 WHERE hash = $1",
+            &[&hash.as_slice(), &b"wp118-direct-v1X".as_slice()],
+        )
+        .await
+        .expect("install unknown persisted lineage token");
+    let unknown_token = coordinator
+        .begin_direct_write(&hash, &legacy_key)
+        .await
+        .expect_err("a PreparingRemote head with an unknown lineage token must fail closed");
+    assert_eq!(
+        unknown_token,
+        DomainError::NotReady(
+            "PreparingRemote head has an unknown direct-write lineage token".to_owned()
+        )
+    );
+
+    assertion_client
+        .execute(
+            "UPDATE lore_fragment_lifecycle SET active_operation = $2 WHERE hash = $1",
+            &[&hash.as_slice(), &b"wp118-direct-v1N".as_slice()],
+        )
+        .await
+        .expect("restore normal persisted lineage token");
+
+    let restarted = store_with_pool(&url, 8).await.fragment_coordinator();
+    let BeginOutcome::Admitted(normal_retry) = restarted
+        .begin_direct_write(&hash, &legacy_key)
+        .await
+        .expect("resume ordinary direct write after restart")
+    else {
+        panic!("PreparingRemote normal write must resume");
+    };
+    assert_eq!(normal_retry.epoch, first.epoch);
+    assert_eq!(normal_retry.fence, first.fence);
+    assert_eq!(normal_retry.object_key, first.object_key);
+    assert_eq!(
+        normal_retry.direct_write_kind(),
+        Some(DirectWriteKind::Normal)
+    );
+    assert_eq!(
+        restarted
+            .commit_remote(&first, IoObservation::Unusable(MissingDiagnostic::Absent))
+            .await
+            .expect("publish Missing observation"),
+        CommitVerdict::Published
+    );
+
+    let BeginOutcome::Admitted(repair) = coordinator
+        .begin_direct_write(&hash, &legacy_key)
+        .await
+        .expect("re-offer Missing fragment")
+    else {
+        panic!("Missing head must admit a repair successor");
+    };
+    assert_ne!(repair.object_key, legacy_key);
+    assert_eq!(repair.object_key, format!("{legacy_key}.r{}", repair.epoch));
+    assert_eq!(repair.direct_write_kind(), Some(DirectWriteKind::Repair));
+
+    let persisted_repair = assertion_client
+        .query_one(
+            "SELECT current_epoch, state, last_fence, active_operation \
+             FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash.as_slice()],
+        )
+        .await
+        .expect("read persisted repair intent");
+    assert_eq!(
+        persisted_repair.get::<_, i16>("state"),
+        FragmentLifecycleState::PreparingRemote.bits()
+    );
+    assert_eq!(
+        persisted_repair.get::<_, i64>("current_epoch"),
+        repair.epoch
+    );
+    assert_eq!(persisted_repair.get::<_, i64>("last_fence"), repair.fence);
+    assert_eq!(
+        persisted_repair.get::<_, Vec<u8>>("active_operation"),
+        b"wp118-direct-v1R"
+    );
+
+    let repaired_restart = store_with_pool(&url, 8).await.fragment_coordinator();
+    let BeginOutcome::Admitted(repair_retry) = repaired_restart
+        .begin_direct_write(&hash, &legacy_key)
+        .await
+        .expect("resume repair after restart")
+    else {
+        panic!("PreparingRemote repair must resume");
+    };
+    assert_eq!(repair_retry.epoch, repair.epoch);
+    assert_eq!(repair_retry.fence, repair.fence);
+    assert_eq!(repair_retry.object_key, repair.object_key);
+    assert_ne!(repair_retry.object_key, legacy_key);
+    assert_eq!(
+        repair_retry.direct_write_kind(),
+        Some(DirectWriteKind::Repair)
+    );
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn payload_free_coordinated_preflight_distinguishes_exact_readable_from_new_publication() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository = create_repository(&store).await;
+    let context = random_context();
+    let readable_hash = random_hash();
+    let object_key = readable_hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&readable_hash, &object_key)
+        .await
+        .expect("begin readable fixture")
+    else {
+        panic!("fresh fixture must admit");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(&object_key, 0x41, EpochAuthority::Remote)),
+            )
+            .await
+            .expect("publish readable fixture"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&readable_hash, &repository, &context)
+            .await
+            .expect("associate readable fixture"),
+        CommitVerdict::Published
+    );
+
+    let new_hash = random_hash();
+    let resolved = coordinator
+        .resolve(
+            &repository,
+            &context,
+            &[readable_hash.clone(), new_hash.clone()],
+        )
+        .await
+        .expect("resolve payload-free preflight matrix");
+    expect_readable(&resolved[0]);
+    expect_absent(&resolved[1]);
+    assert!(matches!(
+        coordinator
+            .begin_direct_write(&readable_hash, &object_key)
+            .await
+            .expect("deduplicate readable fixture"),
+        BeginOutcome::AlreadyReadable(_)
+    ));
+}
 
 fn pg_url() -> Option<String> {
     std::env::var("LORE_TEST_PG_URL").ok()
@@ -192,6 +413,12 @@ fn random_hash() -> Vec<u8> {
     rand::random::<[u8; 32]>().to_vec()
 }
 
+fn legacy_key(hash: &[u8]) -> String {
+    hash.iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
 fn random_context() -> Vec<u8> {
     rand::random::<[u8; 16]>().to_vec()
 }
@@ -248,7 +475,7 @@ async fn resolver_returns_the_identical_verdict_whether_asked_singly_or_batched(
 
     let readable_hash = random_hash();
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&readable_hash, "resolver-agreement/readable")
+        .begin_direct_write(&readable_hash, &legacy_key(&readable_hash))
         .await
         .expect("begin readable")
     else {
@@ -341,7 +568,7 @@ async fn stale_association_rejection_comes_from_repository_tombstone_not_generat
     let repository_id = create_repository(&store).await;
     let hash = random_hash();
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&hash, "generation-drift/key")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin")
     else {
@@ -408,7 +635,7 @@ async fn stale_association_rejection_comes_from_repository_tombstone_not_generat
     let repository_id_2 = create_repository(&store).await;
     let hash_2 = random_hash();
     let BeginOutcome::Admitted(intent_2) = coordinator
-        .begin_direct_write(&hash_2, "tombstoned-association/key")
+        .begin_direct_write(&hash_2, &legacy_key(&hash_2))
         .await
         .expect("begin 2")
     else {
@@ -467,7 +694,7 @@ async fn a_positive_read_requires_both_a_live_association_and_a_readable_current
     // Case A: a live association, but the head is not readable (Missing).
     let missing_hash = random_hash();
     let BeginOutcome::Admitted(intent_a) = coordinator
-        .begin_direct_write(&missing_hash, "half-missing/key")
+        .begin_direct_write(&missing_hash, &legacy_key(&missing_hash))
         .await
         .expect("begin missing")
     else {
@@ -494,7 +721,7 @@ async fn a_positive_read_requires_both_a_live_association_and_a_readable_current
     // Case B: a readable head, but no association at all.
     let unassociated_hash = random_hash();
     let BeginOutcome::Admitted(intent_b) = coordinator
-        .begin_direct_write(&unassociated_hash, "half-unassociated/key")
+        .begin_direct_write(&unassociated_hash, &legacy_key(&unassociated_hash))
         .await
         .expect("begin unassociated")
     else {
@@ -518,7 +745,7 @@ async fn a_positive_read_requires_both_a_live_association_and_a_readable_current
     // Positive control: both halves present.
     let positive_hash = random_hash();
     let BeginOutcome::Admitted(intent_c) = coordinator
-        .begin_direct_write(&positive_hash, "half-both/key")
+        .begin_direct_write(&positive_hash, &legacy_key(&positive_hash))
         .await
         .expect("begin positive")
     else {
@@ -579,7 +806,7 @@ async fn a_blocked_io_phase_does_not_hold_the_one_connection_pool() {
     let hash = random_hash();
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&hash, "one-connection/direct")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin on a one-connection pool")
     else {
@@ -647,11 +874,10 @@ async fn two_independently_constructed_coordinators_race_one_fresh_head_and_exac
     async fn race_attempt(
         coordinator: PostgresFragmentCoordinator,
         hash: Vec<u8>,
-        key: String,
         manifest: FragmentManifest,
     ) -> bool {
         match coordinator
-            .begin_direct_write(&hash, &key)
+            .begin_direct_write(&hash, &legacy_key(&hash))
             .await
             .expect("begin must not error")
         {
@@ -670,13 +896,11 @@ async fn two_independently_constructed_coordinators_race_one_fresh_head_and_exac
         race_attempt(
             coordinator_a.clone(),
             hash.clone(),
-            "race/a".to_owned(),
             manifest("race/a", 0xA1, EpochAuthority::Remote),
         ),
         race_attempt(
             coordinator_b.clone(),
             hash.clone(),
-            "race/b".to_owned(),
             manifest("race/b", 0xB2, EpochAuthority::Remote),
         ),
     );
@@ -707,11 +931,12 @@ async fn two_independently_constructed_coordinators_race_one_fresh_head_and_exac
     assert_eq!(b_won, resolved_manifest.object_key == "race/b");
 }
 
-/// Item 6a: a competing direct write independently turns a late commit into
-/// `Fenced` with zero mutation.
+/// A direct-write retry against a persisted PreparingRemote head reuses the
+/// exact witness. Once one copy commits, the late copy is fenced and cannot
+/// publish a second epoch row.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn a_stale_witness_from_a_competing_direct_write_fences_a_late_commit_with_zero_mutation() {
+async fn a_replayed_direct_write_reuses_the_witness_and_a_late_commit_mutates_nothing() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -720,54 +945,61 @@ async fn a_stale_witness_from_a_competing_direct_write_fences_a_late_commit_with
     let direct = client(&url).await;
     let hash = random_hash();
 
-    let BeginOutcome::Admitted(stale_intent) = coordinator
-        .begin_direct_write(&hash, "competing-write/stale")
+    let BeginOutcome::Admitted(first_intent) = coordinator
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
-        .expect("begin stale")
+        .expect("begin direct write")
     else {
         panic!("a fresh hash must admit a direct write");
     };
 
-    // While the stale intent's I/O is imagined in flight, a second direct
-    // write on the same hash fully begins and commits first.
-    let BeginOutcome::Admitted(winning_intent) = coordinator
-        .begin_direct_write(&hash, "competing-write/winner")
+    let restarted = store_with_pool(&url, 8).await.fragment_coordinator();
+    let BeginOutcome::Admitted(replayed_intent) = restarted
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
-        .expect("begin winner")
+        .expect("replay persisted direct write")
     else {
-        panic!("a non-readable, non-deleting head must still admit a new begin");
+        panic!("PreparingRemote must replay as admitted");
     };
+    assert_eq!(replayed_intent.epoch, first_intent.epoch);
+    assert_eq!(replayed_intent.fence, first_intent.fence);
+    assert_eq!(replayed_intent.object_key, first_intent.object_key);
+    assert_eq!(
+        replayed_intent.direct_write_kind(),
+        first_intent.direct_write_kind()
+    );
+
     let winner_manifest = manifest("competing-write/winner", 0x10, EpochAuthority::Remote);
     assert_eq!(
-        coordinator
-            .commit_remote(&winning_intent, IoObservation::Valid(winner_manifest))
+        restarted
+            .commit_remote(&replayed_intent, IoObservation::Valid(winner_manifest))
             .await
-            .expect("winner commit"),
+            .expect("replayed commit"),
         CommitVerdict::Published
     );
 
     let stale_manifest = manifest("competing-write/stale", 0x20, EpochAuthority::Remote);
     let late = coordinator
-        .commit_remote(&stale_intent, IoObservation::Valid(stale_manifest))
+        .commit_remote(&first_intent, IoObservation::Valid(stale_manifest))
         .await
         .expect("late commit must not error");
     assert_eq!(
         late,
         CommitVerdict::Fenced,
-        "a competing direct write must fence the delayed commit"
+        "the delayed copy of a replayed direct write must be fenced after publication"
     );
 
     let epoch_rows: i64 = direct
         .query_one(
             "SELECT count(*)::bigint FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
-            &[&hash, &stale_intent.epoch],
+            &[&hash, &first_intent.epoch],
         )
         .await
         .expect("count stale epoch rows")
         .get(0);
     assert_eq!(
-        epoch_rows, 0,
-        "a fenced commit must publish zero rows for its own epoch"
+        epoch_rows, 1,
+        "replay and late fencing must leave exactly the one published epoch row"
     );
 }
 
@@ -785,7 +1017,7 @@ async fn a_stale_witness_from_a_competing_obliterate_fences_a_late_commit_with_z
     let hash = random_hash();
 
     let BeginOutcome::Admitted(stale_intent) = coordinator
-        .begin_direct_write(&hash, "competing-obliterate/stale")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin stale")
     else {
@@ -851,7 +1083,7 @@ async fn a_stale_witness_from_a_competing_repair_fences_a_late_commit_with_zero_
 
     // Get the head to Missing first.
     let BeginOutcome::Admitted(setup_intent) = coordinator
-        .begin_direct_write(&hash, "competing-repair/legacy")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin setup")
     else {
@@ -941,7 +1173,7 @@ async fn a_readable_to_unreadable_transition_bumps_every_live_associated_reposit
 
     let hash = random_hash();
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&hash, "fanout/key")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin fanout fragment")
     else {
@@ -1025,7 +1257,7 @@ async fn two_concurrent_transitions_over_an_overlapping_fanout_do_not_deadlock()
     async fn publish(coordinator: &PostgresFragmentCoordinator, key: &str, seed: u8) -> Vec<u8> {
         let hash = random_hash();
         let BeginOutcome::Admitted(intent) = coordinator
-            .begin_direct_write(&hash, key)
+            .begin_direct_write(&hash, &legacy_key(&hash))
             .await
             .expect("begin overlap fragment")
         else {
@@ -1140,7 +1372,7 @@ async fn a_repair_on_a_missing_fragment_with_a_live_association_bumps_its_reposi
     let hash = random_hash();
 
     let BeginOutcome::Admitted(setup) = coordinator
-        .begin_direct_write(&hash, "repair-with-association/legacy")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin setup")
     else {
@@ -1226,7 +1458,7 @@ async fn an_obliterate_on_a_readable_fragment_with_a_live_association_bumps_its_
     let hash = random_hash();
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&hash, "obliterate-with-association/key")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin")
     else {
@@ -1302,7 +1534,7 @@ async fn readiness_reports_zero_unresolved_rows_for_a_preparing_head_and_a_missi
 
     let preparing_hash = random_hash();
     let BeginOutcome::Admitted(_preparing_intent) = coordinator
-        .begin_direct_write(&preparing_hash, "readiness-preparing/key")
+        .begin_direct_write(&preparing_hash, &legacy_key(&preparing_hash))
         .await
         .expect("begin preparing")
     else {
@@ -1319,7 +1551,7 @@ async fn readiness_reports_zero_unresolved_rows_for_a_preparing_head_and_a_missi
 
     let missing_hash = random_hash();
     let BeginOutcome::Admitted(missing_intent) = coordinator
-        .begin_direct_write(&missing_hash, "readiness-missing/key")
+        .begin_direct_write(&missing_hash, &legacy_key(&missing_hash))
         .await
         .expect("begin missing")
     else {
@@ -1583,7 +1815,7 @@ async fn revalidate_push_witness_is_satisfied_by_the_fallback_when_the_lifecycle
         let hash = random_hash();
         let key = format!("push-fallback/required-{seed}");
         let BeginOutcome::Admitted(intent) = coordinator
-            .begin_direct_write(&hash, &key)
+            .begin_direct_write(&hash, &legacy_key(&hash))
             .await
             .expect("begin required fragment")
         else {
@@ -1616,7 +1848,7 @@ async fn revalidate_push_witness_is_satisfied_by_the_fallback_when_the_lifecycle
     // transition is the only thing that moves the lifecycle scalar.
     let bystander_hash = random_hash();
     let BeginOutcome::Admitted(bystander_intent) = coordinator
-        .begin_direct_write(&bystander_hash, "push-fallback/bystander")
+        .begin_direct_write(&bystander_hash, &legacy_key(&bystander_hash))
         .await
         .expect("begin bystander")
     else {
@@ -1700,7 +1932,7 @@ async fn revalidate_push_witness_aborts_when_a_required_fragment_is_no_longer_re
     let hash = random_hash();
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&hash, "push-abort/removed")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin")
     else {
@@ -1784,7 +2016,7 @@ async fn revalidate_push_witness_aborts_when_a_required_fragments_epoch_advanced
     let hash = random_hash();
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&hash, "push-abort/repaired")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin")
     else {
@@ -1908,7 +2140,7 @@ async fn revalidate_push_witness_refuses_over_the_revalidation_limit_before_lock
     let hash = random_hash();
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&hash, "push-abort/limit")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin")
     else {
@@ -2043,7 +2275,7 @@ async fn revalidate_push_witness_accepts_a_required_fragment_promoted_to_a_seman
     // promotion crosses no readability boundary and moves nothing on its own).
     let bystander_hash = random_hash();
     let BeginOutcome::Admitted(bystander_intent) = coordinator
-        .begin_direct_write(&bystander_hash, "equivalent-epoch/bystander")
+        .begin_direct_write(&bystander_hash, &legacy_key(&bystander_hash))
         .await
         .expect("begin bystander")
     else {
@@ -2234,7 +2466,7 @@ async fn revalidate_push_witness_aborts_when_the_new_epoch_describes_different_c
 
     let bystander_hash = random_hash();
     let BeginOutcome::Admitted(bystander_intent) = coordinator
-        .begin_direct_write(&bystander_hash, "content-changed/bystander")
+        .begin_direct_write(&bystander_hash, &legacy_key(&bystander_hash))
         .await
         .expect("begin bystander")
     else {
@@ -2590,7 +2822,7 @@ async fn acquire_staged_leases_refuses_a_member_that_is_not_a_staged_epoch() {
 
     let remote_hash = random_hash();
     let BeginOutcome::Admitted(remote_intent) = coordinator
-        .begin_direct_write(&remote_hash, "staged-lease-scope/remote")
+        .begin_direct_write(&remote_hash, &legacy_key(&remote_hash))
         .await
         .expect("begin remote")
     else {
@@ -2848,7 +3080,7 @@ async fn commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tom
     let hash = random_hash();
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&hash, "obliterate-commit/key")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin")
     else {
@@ -2945,7 +3177,7 @@ async fn commit_obliterate_fences_a_stale_intent_and_mutates_nothing() {
     let hash = random_hash();
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&hash, "obliterate-stale/key")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin")
     else {
@@ -3316,7 +3548,7 @@ async fn a_successful_repair_quarantines_the_predecessor_epoch_and_marks_the_suc
     let hash = random_hash();
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&hash, "quarantine/predecessor")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin predecessor")
     else {
@@ -3428,6 +3660,352 @@ async fn a_successful_repair_quarantines_the_predecessor_epoch_and_marks_the_suc
 }
 
 // ---------------------------------------------------------------------------
+// Phase 5 guarded copy association.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn query_matches_distinguish_exact_context_partition_and_unreadable_rows_in_one_batch() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository_id = create_repository(&store).await;
+    let exact_context = random_context();
+    let other_context = random_context();
+    let readable_hash = random_hash();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&readable_hash, &legacy_key(&readable_hash))
+        .await
+        .expect("begin readable")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(
+                    "query-matches/readable",
+                    0xa0,
+                    EpochAuthority::Remote,
+                )),
+            )
+            .await
+            .expect("commit readable"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&readable_hash, &repository_id, &exact_context)
+            .await
+            .expect("associate readable"),
+        CommitVerdict::Published
+    );
+
+    let missing_hash = random_hash();
+    let BeginOutcome::Admitted(missing_intent) = coordinator
+        .begin_direct_write(&missing_hash, &legacy_key(&missing_hash))
+        .await
+        .expect("begin missing")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &missing_intent,
+                IoObservation::Unusable(MissingDiagnostic::Absent),
+            )
+            .await
+            .expect("commit missing"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&missing_hash, &repository_id, &exact_context)
+            .await
+            .expect("associate missing for diagnostic retention"),
+        CommitVerdict::Published
+    );
+
+    let absent_hash = random_hash();
+    let requested = vec![
+        FragmentQueryRequest {
+            hash: readable_hash.clone(),
+            context: exact_context.clone(),
+        },
+        FragmentQueryRequest {
+            hash: readable_hash.clone(),
+            context: other_context,
+        },
+        FragmentQueryRequest {
+            hash: missing_hash.clone(),
+            context: exact_context.clone(),
+        },
+        FragmentQueryRequest {
+            hash: absent_hash.clone(),
+            context: exact_context,
+        },
+    ];
+    let matches = coordinator
+        .resolve_query_matches(&repository_id, &requested)
+        .await
+        .expect("resolve query matches");
+
+    assert_eq!(
+        matches.len(),
+        requested.len(),
+        "batch cardinality must be exact"
+    );
+    assert_eq!(matches[0].hash, readable_hash);
+    assert!(
+        matches[0].exact_context_readable,
+        "exact context is MatchFull"
+    );
+    assert!(matches[0].partition_readable);
+    assert_eq!(matches[1].hash, readable_hash);
+    assert!(!matches[1].exact_context_readable);
+    assert!(
+        matches[1].partition_readable,
+        "same repository and readable hash in another context is MatchPartition"
+    );
+    assert_eq!(matches[2].hash, missing_hash);
+    assert!(!matches[2].exact_context_readable);
+    assert!(
+        !matches[2].partition_readable,
+        "an association alone cannot make a Missing head partition-readable"
+    );
+    assert_eq!(matches[3].hash, absent_hash);
+    assert!(!matches[3].exact_context_readable);
+    assert!(!matches[3].partition_readable);
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn guarded_association_requires_the_exact_readable_witness() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let repository_id = create_repository(&store).await;
+    let source_context = random_context();
+    let destination_context = random_context();
+    let stale_context = random_context();
+    let missing_context = random_context();
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, &legacy_key(&hash))
+        .await
+        .expect("begin readable")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(
+                    "guarded-association/readable",
+                    0xa1,
+                    EpochAuthority::Remote,
+                )),
+            )
+            .await
+            .expect("commit readable"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &source_context)
+            .await
+            .expect("associate source context"),
+        CommitVerdict::Published
+    );
+
+    let resolution = coordinator
+        .resolve(&repository_id, &source_context, std::slice::from_ref(&hash))
+        .await
+        .expect("resolve readable witness");
+    let (witness, _, _) = expect_readable(&resolution[0]);
+    let witness = witness.clone();
+
+    assert_eq!(
+        coordinator
+            .create_association_if_current(&witness, &repository_id, &destination_context)
+            .await
+            .expect("guarded association"),
+        CommitVerdict::Published,
+        "the exact readable witness must insert and bump atomically"
+    );
+
+    let mut stale = witness.clone();
+    stale.fence += 1;
+    assert_eq!(
+        coordinator
+            .create_association_if_current(&stale, &repository_id, &stale_context)
+            .await
+            .expect("stale guarded association"),
+        CommitVerdict::Fenced
+    );
+
+    assert_eq!(
+        coordinator
+            .mark_missing(&witness, MissingDiagnostic::Absent)
+            .await
+            .expect("mark missing"),
+        CommitVerdict::Published
+    );
+    let missing_row = direct
+        .query_one(
+            "SELECT current_epoch, state, manifest_id, last_fence \
+               FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read exact Missing witness");
+    let missing_witness = EpochWitness {
+        hash: hash.clone(),
+        epoch: missing_row.get("current_epoch"),
+        state: FragmentLifecycleState::from_bits(missing_row.get("state"))
+            .expect("stored Missing state must decode"),
+        manifest_id: missing_row.get("manifest_id"),
+        fence: missing_row.get("last_fence"),
+    };
+    assert_eq!(missing_witness.state, FragmentLifecycleState::Missing);
+    assert_eq!(
+        coordinator
+            .create_association_if_current(&missing_witness, &repository_id, &missing_context)
+            .await
+            .expect("missing guarded association"),
+        CommitVerdict::Fenced,
+        "Missing is never admissible even when the witness exactly matches it"
+    );
+
+    let forbidden_rows: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_associations \
+              WHERE hash = $1 AND repository_id = $2 AND context = ANY($3::bytea[])",
+            &[
+                &hash,
+                &repository_id.as_slice(),
+                &vec![stale_context, missing_context],
+            ],
+        )
+        .await
+        .expect("count refused association rows")
+        .get(0);
+    assert_eq!(
+        forbidden_rows, 0,
+        "stale and Missing refusals must leave no association residue"
+    );
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn guarded_association_cannot_race_mark_missing_into_a_successful_residue() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let repository_id = create_repository(&store).await;
+    let source_context = random_context();
+    let racing_context = random_context();
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, &legacy_key(&hash))
+        .await
+        .expect("begin readable")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(
+                    "guarded-association/race",
+                    0xa2,
+                    EpochAuthority::Remote,
+                )),
+            )
+            .await
+            .expect("commit readable"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &source_context)
+            .await
+            .expect("associate source context"),
+        CommitVerdict::Published
+    );
+    let resolution = coordinator
+        .resolve(&repository_id, &source_context, std::slice::from_ref(&hash))
+        .await
+        .expect("resolve readable witness");
+    let (witness, _, _) = expect_readable(&resolution[0]);
+    let witness = witness.clone();
+
+    let mut lock_client = own_transaction_client(&url).await;
+    let lock_tx = lock_client
+        .transaction()
+        .await
+        .expect("open external repository-lock transaction");
+    lock_tx
+        .execute(
+            "SELECT 1 FROM lore_domain_repositories WHERE repository_id = $1 FOR UPDATE",
+            &[&repository_id.as_slice()],
+        )
+        .await
+        .expect("lock repository externally");
+
+    let mark_missing = coordinator.mark_missing(&witness, MissingDiagnostic::Absent);
+    let guarded = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        coordinator
+            .create_association_if_current(&witness, &repository_id, &racing_context)
+            .await
+    };
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        lock_tx
+            .commit()
+            .await
+            .expect("release external repository lock");
+    };
+    let (missing_result, guarded_result, ()) = tokio::join!(mark_missing, guarded, release);
+
+    assert_eq!(
+        missing_result.expect("mark missing race result"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        guarded_result.expect("guarded association race result"),
+        CommitVerdict::Fenced,
+        "the later guarded insert must recheck after taking repository then head locks"
+    );
+    let residue: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_associations \
+              WHERE hash = $1 AND repository_id = $2 AND context = $3",
+            &[&hash, &repository_id.as_slice(), &racing_context],
+        )
+        .await
+        .expect("count racing association residue")
+        .get(0);
+    assert_eq!(residue, 0, "a fenced racing insert must leave no row");
+}
+
+// ---------------------------------------------------------------------------
 // INV-EF P1-1 regression: begin_obliterate's fanout race (fixed at 76033cb).
 // ---------------------------------------------------------------------------
 
@@ -3464,7 +4042,7 @@ async fn a_concurrent_create_association_landing_between_the_plan_and_the_head_l
 
     // A non-readable head: Missing, from a failed first write.
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&hash, "p1-1-race/key")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin")
     else {
@@ -3630,7 +4208,7 @@ async fn begin_obliterate_on_a_non_readable_head_moves_the_association_scalar_fo
     let hash = random_hash();
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&hash, "p1-1-nonrace/key")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin")
     else {
@@ -4322,7 +4900,7 @@ async fn revalidate_push_witness_aborts_when_the_captured_epoch_was_never_publis
 
     let hash = random_hash();
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_direct_write(&hash, "captured-epoch-missing/key")
+        .begin_direct_write(&hash, &legacy_key(&hash))
         .await
         .expect("begin")
     else {
@@ -4361,7 +4939,7 @@ async fn revalidate_push_witness_aborts_when_the_captured_epoch_was_never_publis
     // fallback rather than short-circuiting on `Unchanged`.
     let bystander_hash = random_hash();
     let BeginOutcome::Admitted(bystander_intent) = coordinator
-        .begin_direct_write(&bystander_hash, "captured-epoch-missing/bystander")
+        .begin_direct_write(&bystander_hash, &legacy_key(&bystander_hash))
         .await
         .expect("begin bystander")
     else {
@@ -4515,7 +5093,7 @@ async fn revalidate_push_witness_all_or_nothing_over_a_mixed_divergent_batch() {
 
     let bystander_hash = random_hash();
     let BeginOutcome::Admitted(bystander_intent) = coordinator
-        .begin_direct_write(&bystander_hash, "mixed-batch/bystander")
+        .begin_direct_write(&bystander_hash, &legacy_key(&bystander_hash))
         .await
         .expect("begin bystander")
     else {
@@ -4773,7 +5351,7 @@ async fn revalidate_push_witness_aborts_when_the_association_set_moved_even_thou
     // readable) crosses no readability boundary and moves nothing on its own.
     let bystander_hash = random_hash();
     let BeginOutcome::Admitted(bystander_intent) = coordinator
-        .begin_direct_write(&bystander_hash, "assoc-move/bystander")
+        .begin_direct_write(&bystander_hash, &legacy_key(&bystander_hash))
         .await
         .expect("begin bystander")
     else {

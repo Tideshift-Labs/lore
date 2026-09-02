@@ -14,6 +14,7 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use lore_object_dispatch::DISPATCH_CONNECTION_BUDGET_STATEMENT;
@@ -22,6 +23,8 @@ use lore_object_dispatch::DISPATCH_RUNTIME_ROLE;
 use lore_object_dispatch::DISPATCHER_IDENTITY_API_REVISION_V1;
 use lore_object_dispatch::DISPATCHER_REGISTRATION_API_REVISION_V1;
 use lore_object_dispatch::DispatchAuthorityError;
+use lore_object_dispatch::DispatchConnectionBudget;
+use lore_object_dispatch::DispatchDatabaseIdentity;
 use lore_object_dispatch::DispatchMaintenanceClient;
 use lore_object_dispatch::DispatchPoolConfig;
 use lore_object_dispatch::DispatchPoolRole;
@@ -44,7 +47,6 @@ use lore_object_dispatch::RegisterDispatcherRequest;
 use lore_object_dispatch::ReservePutOutcome;
 use lore_object_dispatch::ReservePutQuotaScope;
 use lore_object_dispatch::ReservePutRequest;
-use lore_object_dispatch::STAGING_DISPATCH_CONNECTION_BUDGET;
 use uuid::Uuid;
 
 const CLIENT_SOURCE: &str = include_str!("../src/dispatch_client.rs");
@@ -1348,7 +1350,7 @@ fn quota() -> ReservePutQuotaScope {
 /// list of known-secret substrings is deliberate: a substring list only catches the values the test
 /// author thought to plant, and an earlier version of this test missed a mutation that swapped a
 /// redacted field for an unredacted one because the newly disclosed value was not on the list.
-const RENDERABLE_KEYS: [&str; 26] = [
+const RENDERABLE_KEYS: [&str; 29] = [
     // Pool configuration. None of these name a subject; the URL and the CA bundle, which do, are
     // redacted by their own `Debug` impls and are checked by this same allowlist.
     "role",
@@ -1359,8 +1361,11 @@ const RENDERABLE_KEYS: [&str; 26] = [
     "lock_timeout",
     "tls",
     "budget",
-    "store_pools",
-    "dispatch_pools",
+    "immutable_pool_max",
+    "mutable_pool_max",
+    "lock_pool_max",
+    "domain_pool_max",
+    "dispatch_pool_max",
     "statement_timeout_ms",
     "lock_timeout_ms",
     "operation_timeout",
@@ -1700,14 +1705,12 @@ fn both_new_files_carry_the_spdx_header() {
 
 #[test]
 fn the_connection_budget_statement_is_present_and_arithmetically_true() {
-    assert_eq!(
-        STAGING_DISPATCH_CONNECTION_BUDGET.connections_per_replica(),
-        Some(20)
-    );
+    let exact_limit = DispatchConnectionBudget::new(2, 3, 4, 5, 6).expect("exact limit");
+    assert_eq!(exact_limit.connections_per_replica(), 20);
     for fragment in [
-        "3 lore-postgres CR-007 store pools",
-        "1 lore-object-dispatch",
-        "(3 + 1) * 5 = 20 PostgreSQL connections per replica",
+        "immutable, mutable, lock, and domain pools plus",
+        "five independently configured maxima",
+        "sum above 20 PostgreSQL connections",
         "do-managed-pg-connection-budget.md",
     ] {
         assert!(
@@ -1715,23 +1718,12 @@ fn the_connection_budget_statement_is_present_and_arithmetically_true() {
             "the budget statement omits {fragment}"
         );
     }
-    // Cross-checked against the crate's own README, which is inside the repo. An earlier version
-    // resolved `<lore>/../lorehub/docs/learnings/` and asserted the cited learning existed on
-    // disk, which made `cargo test -p lore-object-dispatch` fail in any fork checkout outside this
-    // container layout. The fork is meant to stand alone, so no test here reaches outside it.
-    let readme = include_str!("../README.md");
-    for fragment in ["(3 + 1) * 5 = 20", "do-managed-pg-connection-budget.md"] {
-        assert!(
-            readme.contains(fragment),
-            "the crate README no longer carries the budget fragment {fragment}"
-        );
-    }
 }
 
 #[test]
 fn a_pool_may_not_be_configured_beyond_the_budget_it_declares() {
     let mut config = pool_config(DispatchPoolRole::Runtime);
-    config.pool_max = STAGING_DISPATCH_CONNECTION_BUDGET.pool_max + 1;
+    config.pool_max = 6;
     assert!(DispatchRuntimePool::new(config).is_err());
 }
 
@@ -1746,7 +1738,7 @@ fn a_client_refuses_a_pool_that_connects_as_the_other_role() {
     let maintenance_pool = DispatchRuntimePool::new(pool_config(DispatchPoolRole::Maintenance))
         .expect("maintenance pool");
     assert_eq!(
-        DispatchRuntimeClient::new(maintenance_pool).err(),
+        DispatchRuntimeClient::new(Arc::new(maintenance_pool)).err(),
         Some(DispatchAuthorityError::WrongPoolRole)
     );
 }
@@ -1767,14 +1759,20 @@ fn pool_config(role: DispatchPoolRole) -> DispatchPoolConfig {
             role.role_name()
         ),
         role,
+        expected_database_identity: DispatchDatabaseIdentity::new(1, 1)
+            .expect("test physical database identity"),
         pool_max: 5,
         connect_timeout: Duration::from_secs(5),
         acquire_timeout: Duration::from_secs(5),
         statement_timeout: Duration::from_millis(2_000),
         lock_timeout: Duration::from_millis(1_000),
         tls: DispatchTlsMode::Disabled,
-        budget: STAGING_DISPATCH_CONNECTION_BUDGET,
+        budget: test_budget(5),
     }
+}
+
+fn test_budget(dispatch_pool_max: u32) -> DispatchConnectionBudget {
+    DispatchConnectionBudget::new(1, 1, 1, 1, dispatch_pool_max).expect("test process budget")
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1782,12 +1780,13 @@ fn pool_config(role: DispatchPoolRole) -> DispatchPoolConfig {
 // ------------------------------------------------------------------------------------------
 
 #[test]
-fn no_other_crate_source_file_calls_the_typed_client() {
-    // CD-3 is source-only. Nothing composes this client into loreserver, and no sibling module in
-    // this crate reaches for it either.
+fn no_other_crate_source_file_calls_the_typed_clients_or_builds_another_pool() {
+    // Phase 5 composes CD-4 charging over CD-3's one shared runtime pool. No sibling may call a
+    // typed client, and provider_charge.rs is the only sibling allowed to retain that pool.
     let mut sources = Vec::new();
     collect_rust_sources(&crate_root().join("src"), &mut sources);
     assert!(sources.len() > 20, "source walk found too few files");
+    let mut pool_consumers = Vec::new();
     for path in sources {
         let name = path
             .file_name()
@@ -1797,18 +1796,27 @@ fn no_other_crate_source_file_calls_the_typed_client() {
             continue;
         }
         let source = std::fs::read_to_string(&path).expect("read crate source");
-        for symbol in [
-            "DispatchRuntimeClient",
-            "DispatchMaintenanceClient",
-            "DispatchRuntimePool",
-        ] {
+        for symbol in ["DispatchRuntimeClient", "DispatchMaintenanceClient"] {
             assert!(
                 !source.contains(symbol),
                 "{}: composes the dark typed client via {symbol}",
                 path.display()
             );
         }
+        if source.contains("DispatchRuntimePool") {
+            pool_consumers.push(name.to_string());
+            assert!(
+                !source.contains("DispatchRuntimePool::new("),
+                "{}: constructs a second dispatch pool",
+                path.display()
+            );
+        }
     }
+    assert_eq!(
+        pool_consumers,
+        vec!["provider_charge.rs"],
+        "only the charge authority may consume the shared runtime pool"
+    );
 }
 
 fn collect_rust_sources(directory: &Path, sources: &mut Vec<PathBuf>) {

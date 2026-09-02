@@ -20,6 +20,8 @@ use lore_storage::StoreError;
 use lore_storage::StoreGetData;
 use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
+use lore_storage::StoreRepositoryStats;
+use lore_storage::errors::NotSupported;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::observe::Observe;
 use lore_transport::ProtocolError;
@@ -502,6 +504,18 @@ where
 
     async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
         Ok(())
+    }
+
+    /// Explicitly pinned because the replication protocol has no repository
+    /// statistics message. Do not inherit a future trait default that could
+    /// answer outside the authoritative remote lifecycle route.
+    async fn repository_stats(
+        self: Arc<Self>,
+        _partition: Partition,
+    ) -> Result<StoreRepositoryStats, StoreError> {
+        Err(StoreError::from(NotSupported {
+            operation: "repository_stats".to_owned(),
+        }))
     }
 
     #[lore_macro::lore_instrument]
@@ -1957,15 +1971,14 @@ mod tests {
 
         use super::*;
 
-        /// `ReplicatedStore` forwards every operation to a remote server over
-        /// its own wire protocol (`StoreClient`) and has no `repository_stats`
-        /// message on that protocol — it inherits the trait default. A cell
+        /// `ReplicatedStore` has no `repository_stats` message on its wire
+        /// protocol, so its explicit override reports `NotSupported`. A cell
         /// wired to forward through this store therefore reports
         /// `NotSupported` for storage-stats metering even when the store it
         /// forwards to could compute the real number; this pins that as the
-        /// intended (if silent) behavior rather than an oversight.
+        /// intended behavior rather than inheriting a future trait default.
         #[tokio::test]
-        async fn repository_stats_inherits_the_trait_default() {
+        async fn repository_stats_explicit_override_returns_not_supported() {
             let execution =
                 crate::util::setup_execution("test", String::default(), String::default());
             LORE_CONTEXT
@@ -1975,7 +1988,7 @@ mod tests {
                     let err = store
                         .repository_stats(Partition::default())
                         .await
-                        .expect_err("ReplicatedStore has no repository_stats override");
+                        .expect_err("ReplicatedStore explicitly refuses repository_stats");
 
                     assert!(matches!(err, StoreError::NotSupported(_)));
                 })

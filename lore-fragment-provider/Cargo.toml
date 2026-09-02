@@ -25,6 +25,7 @@ publish = false
 # through the fragment coordinator, which is the edge that made a
 # whole-of-`domain/fragments/` split impossible.
 [dependencies]
+blake3 = { workspace = true }
 hex = { workspace = true }
 lore-base = { workspace = true }
 lore-object-dispatch = { workspace = true }

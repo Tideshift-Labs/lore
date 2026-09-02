@@ -91,6 +91,9 @@ pub const MAX_PUSH_FRAGMENT_REVALIDATIONS: usize = 4_096;
 /// real shared-hash distribution before wider rollout.
 pub const MAX_LIFECYCLE_GENERATION_FANOUT: usize = MAX_PUSH_FRAGMENT_REVALIDATIONS;
 
+const DIRECT_WRITE_NORMAL_OPERATION: [u8; 16] = *b"wp118-direct-v1N";
+const DIRECT_WRITE_REPAIR_OPERATION: [u8; 16] = *b"wp118-direct-v1R";
+
 /// How many members one staged reader lease may cover.
 ///
 /// The third per-transaction row budget in `LockClass::Fragments`.
@@ -299,6 +302,42 @@ pub struct FragmentResolution {
     pub verdict: FragmentVerdict,
 }
 
+/// Batched projection for [`ImmutableStore::query`](lore_storage::ImmutableStore::query).
+/// Both booleans come from the same set-based statement and the same canonical
+/// readability joins as [`PostgresFragmentCoordinator::resolve`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentQueryMatch {
+    pub hash: Vec<u8>,
+    pub exact_context_readable: bool,
+    pub partition_readable: bool,
+}
+
+/// One exact repository-context fragment lookup requested by
+/// [`PostgresFragmentCoordinator::resolve_query_matches`].
+///
+/// Named fields keep the hash/context binding explicit at the API and SQL
+/// projection boundaries. Both values are byte identities, so a positional
+/// tuple would compile unchanged if a caller accidentally swapped them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentQueryRequest {
+    pub hash: Vec<u8>,
+    pub context: Vec<u8>,
+}
+
+/// Distinct readable-fragment accounting for one live repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentRepositoryStats {
+    pub fragment_count: u64,
+    pub payload_bytes: u64,
+    pub content_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopedFragmentResolution {
+    resolution: FragmentResolution,
+    exact_context_readable: bool,
+}
+
 /// The verdict for one fragment in one repository/context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FragmentVerdict {
@@ -346,9 +385,29 @@ pub struct FragmentIntent {
     pub object_key: String,
     /// Which authority the published epoch will name.
     pub authority: EpochAuthority,
+    /// Direct-write lineage recovered from the durable active-operation token.
+    /// `None` for stage, promotion, and obliteration intents.
+    direct_write_kind: Option<DirectWriteKind>,
     /// The head as captured at begin, for post-I/O revalidation. `None` when
     /// this operation created the head.
     pub captured: Option<EpochWitness>,
+}
+
+impl FragmentIntent {
+    /// Whether this intent is an ordinary first publication or a repair
+    /// successor. Survives a `PreparingRemote` retry and process restart.
+    pub fn direct_write_kind(&self) -> Option<DirectWriteKind> {
+        self.direct_write_kind
+    }
+}
+
+/// The immutable-key lineage of one direct remote publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectWriteKind {
+    /// Normal first publication at the legacy bare-hash key.
+    Normal,
+    /// Successor to a diagnosed `Missing` head at an immutable epoch key.
+    Repair,
 }
 
 /// Outcome of a `begin_*` call.
@@ -780,14 +839,167 @@ impl PostgresFragmentCoordinator {
         context: &[u8],
         hashes: &[Vec<u8>],
     ) -> Result<Vec<FragmentResolution>, DomainError> {
-        if hashes.is_empty() {
+        let requested = hashes
+            .iter()
+            .cloned()
+            .map(|hash| FragmentQueryRequest {
+                hash,
+                context: context.to_vec(),
+            })
+            .collect::<Vec<_>>();
+        Ok(self
+            .resolve_scoped(repository_id, &requested)
+            .await?
+            .into_iter()
+            .map(|scoped| {
+                if scoped.exact_context_readable {
+                    scoped.resolution
+                } else {
+                    FragmentResolution {
+                        hash: scoped.resolution.hash,
+                        verdict: FragmentVerdict::Absent,
+                    }
+                }
+            })
+            .collect())
+    }
+
+    /// Resolve exact-context and repository-partition matches together.
+    /// One statement covers the whole batch and one ordinal row is returned for
+    /// every request, so concurrent lifecycle changes cannot make the two
+    /// projections disagree within one call.
+    pub async fn resolve_query_matches(
+        &self,
+        repository_id: &[u8],
+        requested: &[FragmentQueryRequest],
+    ) -> Result<Vec<FragmentQueryMatch>, DomainError> {
+        Ok(self
+            .resolve_scoped(repository_id, requested)
+            .await?
+            .into_iter()
+            .map(|scoped| FragmentQueryMatch {
+                hash: scoped.resolution.hash,
+                exact_context_readable: scoped.exact_context_readable,
+                partition_readable: scoped.resolution.verdict.is_readable(),
+            })
+            .collect())
+    }
+
+    /// Resolve a readable hash anywhere in the live repository partition.
+    /// This preserves the zero-context source form accepted by
+    /// `ImmutableStore::copy` while still using the same scoped resolver and
+    /// canonical readability joins as exact-context reads.
+    pub async fn resolve_partition(
+        &self,
+        repository_id: &[u8],
+        hashes: &[Vec<u8>],
+    ) -> Result<Vec<FragmentResolution>, DomainError> {
+        let requested = hashes
+            .iter()
+            .cloned()
+            .map(|hash| FragmentQueryRequest {
+                hash,
+                context: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        Ok(self
+            .resolve_scoped(repository_id, &requested)
+            .await?
+            .into_iter()
+            .map(|scoped| scoped.resolution)
+            .collect())
+    }
+
+    /// Aggregate only fragments that satisfy the same repository,
+    /// association, head, manifest, and disposition clauses as `resolve`.
+    /// Manifest sizes are immutable authority, so no provider I/O or repair
+    /// transaction is needed on this read path.
+    pub async fn repository_stats(
+        &self,
+        repository_id: &[u8],
+    ) -> Result<FragmentRepositoryStats, DomainError> {
+        let client = self.checkout().await?;
+        let row = client
+            .query_one(
+                "WITH readable AS ( \
+                     SELECT DISTINCT a.hash, e.size_payload, e.size_content \
+                       FROM lore_fragment_associations AS a \
+                       JOIN lore_domain_repositories AS r ON r.repository_id = a.repository_id \
+                       JOIN lore_fragment_lifecycle AS l ON l.hash = a.hash \
+                       JOIN lore_fragment_epochs AS e \
+                         ON e.hash = l.hash AND e.epoch = l.current_epoch \
+                      WHERE a.repository_id = $1 \
+                        AND a.state = $2 \
+                        AND r.state = $3 \
+                        AND a.repository_generation <= r.generation \
+                        AND l.state = ANY($5) \
+                        AND l.manifest_id = e.manifest_id \
+                        AND e.disposition = $4 \
+                 ) \
+                 SELECT count(*)::bigint AS fragment_count, \
+                        coalesce(sum(size_payload), 0)::bigint AS payload_bytes, \
+                        coalesce(sum(size_content), 0)::bigint AS content_bytes \
+                   FROM readable",
+                &[
+                    &repository_id,
+                    &schema::ASSOCIATION_LIVE,
+                    &STATE_LIVE,
+                    &schema::DISPOSITION_CURRENT_ELIGIBLE,
+                    &FragmentLifecycleState::readable_bits().as_slice(),
+                ],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("fragment repository stats", error))?;
+        let read = |column: &str| -> Result<u64, DomainError> {
+            let value: i64 = row.try_get(column).map_err(|error| {
+                DomainError::Internal(format!(
+                    "fragment repository stats column {column}: {error}"
+                ))
+            })?;
+            u64::try_from(value).map_err(|_| {
+                DomainError::Internal(format!(
+                    "fragment repository stats column {column} is negative"
+                ))
+            })
+        };
+        Ok(FragmentRepositoryStats {
+            fragment_count: read("fragment_count")?,
+            payload_bytes: read("payload_bytes")?,
+            content_bytes: read("content_bytes")?,
+        })
+    }
+
+    async fn resolve_scoped(
+        &self,
+        repository_id: &[u8],
+        requested: &[FragmentQueryRequest],
+    ) -> Result<Vec<ScopedFragmentResolution>, DomainError> {
+        if requested.is_empty() {
             return Ok(Vec::new());
         }
+        let hashes = requested
+            .iter()
+            .map(|request| request.hash.as_slice())
+            .collect::<Vec<_>>();
+        let contexts = requested
+            .iter()
+            .map(|request| request.context.as_slice())
+            .collect::<Vec<_>>();
         let client = self.checkout().await?;
         let rows = client
             .query(
-                "SELECT a.hash               AS hash, \
-                        a.association_epoch  AS association_epoch, \
+                "WITH requested AS ( \
+                     SELECT request.hash, request.context, request.ordinality \
+                       FROM unnest($2::bytea[], $3::bytea[]) WITH ORDINALITY \
+                            AS request(hash, context, ordinality) \
+                 ) \
+                 SELECT request.ordinality     AS ordinality, \
+                        request.hash           AS hash, \
+                        bool_or(a.context = request.context) AS exact_context_readable, \
+                        coalesce( \
+                            min(a.association_epoch) FILTER (WHERE a.context = request.context), \
+                            min(a.association_epoch) \
+                        ) AS association_epoch, \
                         l.current_epoch      AS current_epoch, \
                         l.state              AS state, \
                         l.manifest_id        AS manifest_id, \
@@ -798,24 +1010,28 @@ impl PostgresFragmentCoordinator {
                         e.size_content       AS size_content, \
                         e.decoded_hash       AS decoded_hash, \
                         e.payload_flags      AS payload_flags \
-                   FROM lore_fragment_associations AS a \
+                   FROM requested AS request \
+                   JOIN lore_fragment_associations AS a ON a.hash = request.hash \
                    JOIN lore_domain_repositories   AS r ON r.repository_id = a.repository_id \
                    JOIN lore_fragment_lifecycle    AS l ON l.hash = a.hash \
                    JOIN lore_fragment_epochs       AS e \
                         ON e.hash = l.hash AND e.epoch = l.current_epoch \
                   WHERE a.repository_id = $1 \
-                    AND a.context       = $2 \
-                    AND a.hash          = ANY($3) \
                     AND a.state         = $4 \
                     AND r.state         = $5 \
                     AND a.repository_generation <= r.generation \
                     AND l.state = ANY($7) \
                     AND l.manifest_id = e.manifest_id \
-                    AND e.disposition = $6",
+                    AND e.disposition = $6 \
+                  GROUP BY request.ordinality, request.hash, l.current_epoch, l.state, \
+                           l.manifest_id, l.last_fence, e.authority, e.object_key, \
+                           e.manifest_id, e.size_payload, e.size_content, e.decoded_hash, \
+                           e.payload_flags \
+                  ORDER BY request.ordinality",
                 &[
                     &repository_id,
-                    &context,
                     &hashes,
+                    &contexts,
                     &schema::ASSOCIATION_LIVE,
                     &STATE_LIVE,
                     &schema::DISPOSITION_CURRENT_ELIGIBLE,
@@ -825,47 +1041,57 @@ impl PostgresFragmentCoordinator {
             .await
             .map_err(|error| DomainError::from_pg("fragment resolve", error))?;
 
-        let mut readable: BTreeMap<Vec<u8>, FragmentVerdict> = BTreeMap::new();
+        let mut readable: BTreeMap<i64, (bool, FragmentVerdict)> = BTreeMap::new();
         for row in rows {
             let hash: Vec<u8> = row.get("hash");
             let state = FragmentLifecycleState::from_bits(row.get("state"))?;
             let authority = EpochAuthority::from_bits(row.get("authority"))?;
             let manifest_id: Vec<u8> = row.get("manifest_id");
             readable.insert(
-                hash.clone(),
-                FragmentVerdict::Readable {
-                    witness: EpochWitness {
-                        hash,
-                        epoch: row.get("current_epoch"),
-                        state,
-                        manifest_id: Some(manifest_id.clone()),
-                        fence: row.get("last_fence"),
+                row.get("ordinality"),
+                (
+                    row.get("exact_context_readable"),
+                    FragmentVerdict::Readable {
+                        witness: EpochWitness {
+                            hash,
+                            epoch: row.get("current_epoch"),
+                            state,
+                            manifest_id: Some(manifest_id.clone()),
+                            fence: row.get("last_fence"),
+                        },
+                        manifest: FragmentManifest {
+                            authority,
+                            object_key: row.get("object_key"),
+                            manifest_id,
+                            size_payload: row.get("size_payload"),
+                            size_content: row.get("size_content"),
+                            decoded_hash: row.get("decoded_hash"),
+                            payload_flags: row.get("payload_flags"),
+                        },
+                        association_epoch: row.get("association_epoch"),
                     },
-                    manifest: FragmentManifest {
-                        authority,
-                        object_key: row.get("object_key"),
-                        manifest_id,
-                        size_payload: row.get("size_payload"),
-                        size_content: row.get("size_content"),
-                        decoded_hash: row.get("decoded_hash"),
-                        payload_flags: row.get("payload_flags"),
-                    },
-                    association_epoch: row.get("association_epoch"),
-                },
+                ),
             );
         }
 
         // Answer in the caller's order, with a verdict for every hash asked
         // about. A missing row is `Absent`, indistinguishable from a fenced or
         // tombstoned one on purpose.
-        Ok(hashes
+        Ok(requested
             .iter()
-            .map(|hash| FragmentResolution {
-                hash: hash.clone(),
-                verdict: readable
-                    .get(hash)
-                    .cloned()
-                    .unwrap_or(FragmentVerdict::Absent),
+            .enumerate()
+            .map(|(index, request)| {
+                let ordinal = i64::try_from(index + 1).unwrap_or(i64::MAX);
+                let (exact_context_readable, verdict) = readable
+                    .remove(&ordinal)
+                    .unwrap_or((false, FragmentVerdict::Absent));
+                ScopedFragmentResolution {
+                    resolution: FragmentResolution {
+                        hash: request.hash.clone(),
+                        verdict,
+                    },
+                    exact_context_readable,
+                }
             })
             .collect())
     }
@@ -886,6 +1112,11 @@ impl PostgresFragmentCoordinator {
         hash: &[u8],
         legacy_object_key: &str,
     ) -> Result<BeginOutcome, DomainError> {
+        if legacy_object_key != legacy_hash_key(hash) {
+            return Err(DomainError::InvalidInput(
+                "direct write legacy object key does not match the fragment hash".to_owned(),
+            ));
+        }
         self.begin_publication(hash, EpochAuthority::Remote, Some(legacy_object_key))
             .await
     }
@@ -938,6 +1169,7 @@ impl PostgresFragmentCoordinator {
             fence,
             object_key,
             authority: EpochAuthority::Remote,
+            direct_write_kind: Some(DirectWriteKind::Repair),
             captured: Some(EpochWitness {
                 hash: hash.to_vec(),
                 epoch: head.current_epoch,
@@ -1032,6 +1264,7 @@ impl PostgresFragmentCoordinator {
             fence,
             object_key: legacy_hash_key(hash),
             authority: EpochAuthority::Remote,
+            direct_write_kind: None,
             captured: Some(EpochWitness {
                 hash: hash.to_vec(),
                 epoch: head.current_epoch,
@@ -1229,6 +1462,63 @@ impl PostgresFragmentCoordinator {
         Ok(CommitVerdict::Published)
     }
 
+    /// Bind an association only while the exact readable head captured by a
+    /// resolver still holds. This is the copy/dedup publication path: unlike
+    /// [`Self::create_association`], it refuses `Missing` and every other
+    /// witness movement atomically with the insert.
+    pub async fn create_association_if_current(
+        &self,
+        witness: &EpochWitness,
+        repository_id: &[u8],
+        context: &[u8],
+    ) -> Result<CommitVerdict, DomainError> {
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| DomainError::from_pg("guarded association begin", error))?;
+        let mut sequence = LockSequence::new();
+        let Some(repository) =
+            crate::domain::lock_order::lock_repository(&tx, &mut sequence, repository_id).await?
+        else {
+            return Ok(CommitVerdict::Fenced);
+        };
+        if repository.state != STATE_LIVE {
+            return Ok(CommitVerdict::Fenced);
+        }
+        let Some(head) = lock_fragment_head(&tx, &mut sequence, &witness.hash).await? else {
+            return Ok(CommitVerdict::Fenced);
+        };
+        if !head.matches(witness) || !head.state.is_readable() {
+            return Ok(CommitVerdict::Fenced);
+        }
+        sequence.enter(LockClass::Associations)?;
+        let association_epoch = next_fence(&tx).await?;
+        tx.execute(
+            "INSERT INTO lore_fragment_associations ( \
+                 hash, repository_id, context, association_epoch, state, repository_generation \
+             ) VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (hash, repository_id, context) DO UPDATE \
+                SET association_epoch     = EXCLUDED.association_epoch, \
+                    state                 = EXCLUDED.state, \
+                    repository_generation = EXCLUDED.repository_generation, \
+                    updated_at            = clock_timestamp()",
+            &[
+                &witness.hash,
+                &repository_id,
+                &context,
+                &association_epoch,
+                &schema::ASSOCIATION_LIVE,
+                &repository.generation,
+            ],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("guarded association insert", error))?;
+        bump_association_generation(&tx, repository_id).await?;
+        classify_commit(tx.commit().await, "guarded association commit")?;
+        Ok(CommitVerdict::Published)
+    }
+
     /// Tombstone one association and move the repository's association scalar.
     pub async fn tombstone_association(
         &self,
@@ -1367,6 +1657,7 @@ impl PostgresFragmentCoordinator {
             fence,
             object_key,
             authority: EpochAuthority::Remote,
+            direct_write_kind: None,
             captured: Some(EpochWitness {
                 hash: hash.to_vec(),
                 epoch: head.current_epoch,
@@ -1894,13 +2185,74 @@ impl PostgresFragmentCoordinator {
                     head.state.label()
                 )));
             }
+            if authority == EpochAuthority::Remote
+                && head.state == FragmentLifecycleState::PreparingRemote
+            {
+                let (object_key, direct_write_kind) = match head.active_operation.as_deref() {
+                    Some(token) if token == DIRECT_WRITE_NORMAL_OPERATION => (
+                        legacy_object_key
+                            .ok_or_else(|| {
+                                DomainError::NotReady(
+                                    "PreparingRemote normal publication has no validated legacy key"
+                                        .to_owned(),
+                                )
+                            })?
+                            .to_owned(),
+                        DirectWriteKind::Normal,
+                    ),
+                    Some(token) if token == DIRECT_WRITE_REPAIR_OPERATION => (
+                        repair_epoch_key(hash, head.current_epoch),
+                        DirectWriteKind::Repair,
+                    ),
+                    Some(_) => {
+                        return Err(DomainError::NotReady(
+                            "PreparingRemote head has an unknown direct-write lineage token"
+                                .to_owned(),
+                        ));
+                    }
+                    None => {
+                        return Err(DomainError::NotReady(
+                            "PreparingRemote head has no direct-write lineage token".to_owned(),
+                        ));
+                    }
+                };
+                let intent = FragmentIntent {
+                    hash: hash.to_vec(),
+                    epoch: head.current_epoch,
+                    fence: head.last_fence,
+                    object_key,
+                    authority,
+                    direct_write_kind: Some(direct_write_kind),
+                    captured: Some(EpochWitness {
+                        hash: hash.to_vec(),
+                        epoch: head.current_epoch,
+                        state: head.state,
+                        manifest_id: head.manifest_id.clone(),
+                        fence: head.last_fence,
+                    }),
+                };
+                classify_commit(tx.commit().await, "publication resume commit")?;
+                return Ok(BeginOutcome::Admitted(Box::new(intent)));
+            }
         }
         let epoch = next_fence(&tx).await?;
         let fence = next_fence(&tx).await?;
-        let object_key = match legacy_object_key {
-            Some(key) => key.to_owned(),
-            None => staged_epoch_key(hash, epoch),
-        };
+        let (object_key, direct_write_kind) =
+            match (legacy_object_key, existing.as_ref().map(|head| head.state)) {
+                // Re-offering bytes for a Missing head is a first-class repair.
+                // It must never overwrite the legacy normal-write key: the
+                // predecessor remains immutable evidence and the successor gets
+                // its own epoch key.
+                (Some(_), Some(FragmentLifecycleState::Missing)) => {
+                    (repair_epoch_key(hash, epoch), Some(DirectWriteKind::Repair))
+                }
+                (Some(key), _) => (key.to_owned(), Some(DirectWriteKind::Normal)),
+                (None, _) => (staged_epoch_key(hash, epoch), None),
+            };
+        let active_operation = direct_write_kind.map(|kind| match kind {
+            DirectWriteKind::Normal => DIRECT_WRITE_NORMAL_OPERATION.to_vec(),
+            DirectWriteKind::Repair => DIRECT_WRITE_REPAIR_OPERATION.to_vec(),
+        });
         let preparing = match authority {
             EpochAuthority::Staged => FragmentLifecycleState::PreparingStage,
             EpochAuthority::Remote => FragmentLifecycleState::PreparingRemote,
@@ -1908,15 +2260,16 @@ impl PostgresFragmentCoordinator {
         tx.execute(
             "INSERT INTO lore_fragment_lifecycle ( \
                  hash, current_epoch, state, manifest_id, last_fence, active_operation \
-             ) VALUES ($1, $2, $3, NULL, $4, NULL) \
+             ) VALUES ($1, $2, $3, NULL, $4, $5) \
              ON CONFLICT (hash) DO UPDATE \
                 SET current_epoch    = EXCLUDED.current_epoch, \
                     state            = EXCLUDED.state, \
                     manifest_id      = NULL, \
                     last_fence       = EXCLUDED.last_fence, \
+                    active_operation = EXCLUDED.active_operation, \
                     diagnostic_class = 0, \
                     updated_at       = clock_timestamp()",
-            &[&hash, &epoch, &preparing.bits(), &fence],
+            &[&hash, &epoch, &preparing.bits(), &fence, &active_operation],
         )
         .await
         .map_err(|error| DomainError::from_pg("publication intent insert", error))?;
@@ -1927,6 +2280,7 @@ impl PostgresFragmentCoordinator {
             fence,
             object_key,
             authority,
+            direct_write_kind,
             captured: existing.map(|head| EpochWitness {
                 hash: hash.to_vec(),
                 epoch: head.current_epoch,
@@ -2125,6 +2479,7 @@ struct FragmentHeadLock {
     state: FragmentLifecycleState,
     manifest_id: Option<Vec<u8>>,
     last_fence: i64,
+    active_operation: Option<Vec<u8>>,
 }
 
 impl FragmentHeadLock {
@@ -2158,7 +2513,7 @@ async fn lock_fragment_head(
     sequence.enter(LockClass::Fragments)?;
     let row = tx
         .query_opt(
-            "SELECT current_epoch, state, manifest_id, last_fence \
+            "SELECT current_epoch, state, manifest_id, last_fence, active_operation \
                FROM lore_fragment_lifecycle WHERE hash = $1 FOR UPDATE",
             &[&hash],
         )
@@ -2170,6 +2525,7 @@ async fn lock_fragment_head(
             state: FragmentLifecycleState::from_bits(row.get("state"))?,
             manifest_id: row.get("manifest_id"),
             last_fence: row.get("last_fence"),
+            active_operation: row.get("active_operation"),
         })
     })
     .transpose()
@@ -2634,13 +2990,13 @@ async fn next_fence(tx: &Transaction<'_>) -> Result<i64, DomainError> {
 /// Stamp the head with the fence this operation was issued at, so a delayed
 /// commit can tell whether anything linearized in between.
 ///
-/// It deliberately does **not** write `active_operation`. That column is
-/// CR-031's "active operation" model field and stays reserved and NULL until
-/// Phase 5 plumbs the CR-029 domain operation ID down to this layer; there is
-/// no operation identity in scope here to put in it, and writing the fence
-/// there would make a diagnostic column lie about what it holds. The naming is
-/// deliberate — an earlier `set_active_operation` name claimed a write this
-/// function never made.
+/// It deliberately does **not** write `active_operation`. Phase 5 uses that
+/// column for the direct-publication lineage token, while the other operations
+/// that call this helper have no operation identity in scope. Clearing or
+/// replacing the token here would lose a recoverable `PreparingRemote`
+/// publication's exact object-key lineage. The naming is deliberate: an
+/// earlier `set_active_operation` name claimed a write this function never
+/// made.
 async fn stamp_operation_fence(
     tx: &Transaction<'_>,
     hash: &[u8],
@@ -3005,6 +3361,7 @@ mod tests {
             state,
             manifest_id: Some(vec![9u8; 32]),
             last_fence: fence,
+            active_operation: None,
         }
     }
 

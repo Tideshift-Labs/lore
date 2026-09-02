@@ -1,17 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! The fourth, separately credentialed dispatch-runtime connection pool (WP-114 CD-3).
+//! The separately credentialed dispatch-runtime connection pool (WP-114 CD-3), one of the five
+//! steady-state pools against a cell database.
 //!
 //! CR-033 D1 made the cell's own PostgreSQL database the dispatch authority. Every retained
 //! mutation asserts `session_user = 'object_dispatch_retention_runtime'` and grants `EXECUTE` only
-//! to that role, and 0020's enrollment asserts the maintenance role, so `lore-postgres`'s existing
-//! CR-007 store pools cannot carry these calls: they connect as the store identity. This module
-//! owns the extra pool, its credential identity check, and its bounded-execution settings.
+//! to that role, and 0020's enrollment asserts the maintenance role, so `lore-postgres`'s
+//! immutable, mutable, lock, and domain pools cannot carry these calls. This module owns the fifth
+//! pool, its credential identity check, and its bounded-execution settings.
 //!
-//! The pool is source-dark. Constructing it opens connections to whatever database the caller
-//! names; it installs no schema, publishes no configuration, and is not wired into loreserver
-//! composition.
+//! The opt-in Phase 5 `fragment_provider` composition constructs one shared runtime pool after
+//! configuration, process-budget, and lifecycle preflight. The pool itself still installs no
+//! schema and publishes no configuration. Constructing it opens connections only to the database
+//! named by its caller and enforces the caller's expected physical database identity.
 
 use std::fmt;
 use std::io::Cursor;
@@ -28,86 +30,125 @@ use tokio_postgres::config::SslMode;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tokio_util::task::AbortOnDropHandle;
 
+use crate::dispatch_client::DATABASE_IDENTITY_SQL;
+use crate::dispatch_client::DispatchDatabaseIdentity;
+use crate::dispatch_client::DispatchDatabaseIdentityError;
+use crate::dispatch_client::decode_database_identity;
+
 /// The PostgreSQL role every 0013/0015/0017 mutation and 0020 registration asserts.
 pub const DISPATCH_RUNTIME_ROLE: &str = "object_dispatch_retention_runtime";
 
 /// The PostgreSQL role 0020's participant enrollment asserts.
 pub const DISPATCH_MAINTENANCE_ROLE: &str = "object_dispatch_retention_maintenance";
 
+/// Hard ceiling for all PostgreSQL pools one loreserver process opens against its cell database.
+pub const DISPATCH_PROCESS_CONNECTION_LIMIT: u32 = 20;
+
 /// The connection-budget statement this pool is sized against, stated rather than implied.
 ///
-/// CR-033 D1 makes the cell database the dispatch authority, so a loreserver replica in a cell
-/// opens this fourth pool beside `lore-postgres`'s three CR-007 store pools. All four target the
-/// same cell database and none of them coordinate on connections, so a replica's ceiling is the
-/// **sum** of their `pool_max` values, not the largest of them. At staging's `pool_max = 5` that is
-/// `(3 store pools + 1 dispatch pool) * 5 = 20` connections per replica, before the control plane's
-/// own pools on the same instance are counted.
+/// CR-033 D1 makes the cell database the dispatch authority. A loreserver replica therefore opens
+/// this pool beside `lore-postgres`'s immutable, mutable, lock, and domain pools. All five target
+/// the same cell database and none coordinate on connections, so the process ceiling is the sum of
+/// their independently configured maxima, not a shared or inferred `pool_max`.
 ///
 /// This is `lorehub/docs/learnings/do-managed-pg-connection-budget.md`'s finding: a managed
 /// instance sized for the app pools alone rather than the full consumer set was exhausted at
 /// `max_connections = 25`, and the exhaustion surfaced as SQLSTATE `53300` in three
 /// unrelated-looking failures rather than as an obvious pool error.
 pub const DISPATCH_CONNECTION_BUDGET_STATEMENT: &str = "\
-Per loreserver replica in a cell: 3 lore-postgres CR-007 store pools + 1 lore-object-dispatch \
-dispatch-runtime pool, all against the same cell database, none coordinating on connections. \
-At staging's pool_max = 5 that is (3 + 1) * 5 = 20 PostgreSQL connections per replica. The managed \
+Per loreserver process in a cell: lore-postgres immutable, mutable, lock, and domain pools plus \
+one lore-object-dispatch dispatch-runtime pool, all against the same cell database and none \
+coordinating on connections. Composition must add the five independently configured maxima and \
+refuse a sum above 20 PostgreSQL connections before constructing the dispatch pool. The managed \
 instance must be sized for that sum across every replica plus every other consumer of the same \
 instance, per lorehub/docs/learnings/do-managed-pg-connection-budget.md.";
 
 /// The per-replica pool arithmetic behind [`DISPATCH_CONNECTION_BUDGET_STATEMENT`].
 ///
-/// A [`DispatchPoolConfig`] is refused when its `pool_max` exceeds the budget it declares, so one
-/// pool cannot quietly grow past what its own configuration says.
-///
-/// **What this does not enforce, and where that lands.** The budget is supplied by the caller, and
-/// a pool can only see itself: nothing here counts how many dispatch pools a process actually
-/// opens, or checks that `store_pools` matches what `lore-postgres` really built. Two pools each
-/// declaring `dispatch_pools: 1` are each individually valid and together exceed the stated
-/// twenty. Making the sum true is a composition-time obligation that lands with the loreserver
-/// wiring in CD-6, not something this crate can check from inside one pool, and it is recorded as
-/// a named residual in WP-114 CD-3 rather than left implied.
-///
-/// [`STAGING_DISPATCH_CONNECTION_BUDGET`] describes the request path: three store pools and the
-/// **one** runtime dispatch pool a replica keeps open. A maintenance pool is not part of that
-/// steady state - 0020's enrollment is an out-of-band operator action, like the schema installer -
-/// so a process that opens one must declare its own budget rather than reusing this constant.
+/// Its fields are private so composition cannot bypass the checked constructor or omit a pool by
+/// silently declaring zero. A maintenance pool is not part of this steady-state inventory: 0020's
+/// enrollment is an out-of-band operator action, like the schema installer, and must account for
+/// its own connection separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DispatchConnectionBudget {
-    /// `lore-postgres`'s CR-007 store pools on the same cell database.
-    pub store_pools: u32,
-    /// Dispatch-runtime pools this crate opens. One per replica.
-    pub dispatch_pools: u32,
-    /// The `pool_max` each of those pools is configured with.
-    pub pool_max: u32,
+    immutable_pool_max: u32,
+    mutable_pool_max: u32,
+    lock_pool_max: u32,
+    domain_pool_max: u32,
+    dispatch_pool_max: u32,
+    connections_per_replica: u32,
 }
 
-/// Staging's shape: three store pools, one dispatch pool, `pool_max = 5`, so 20 per replica.
-pub const STAGING_DISPATCH_CONNECTION_BUDGET: DispatchConnectionBudget = DispatchConnectionBudget {
-    store_pools: 3,
-    dispatch_pools: 1,
-    pool_max: 5,
-};
-
 impl DispatchConnectionBudget {
-    /// Total PostgreSQL connections one loreserver replica may hold open against the cell database.
-    pub const fn connections_per_replica(self) -> Option<u32> {
-        match self.store_pools.checked_add(self.dispatch_pools) {
-            Some(pools) => pools.checked_mul(self.pool_max),
-            None => None,
-        }
-    }
-
-    fn validate(self) -> Result<u32, DispatchPoolError> {
-        if self.dispatch_pools == 0 || self.pool_max == 0 {
+    /// Validate an exact process inventory before any dispatch pool or connection is constructed.
+    pub fn new(
+        immutable_pool_max: u32,
+        mutable_pool_max: u32,
+        lock_pool_max: u32,
+        domain_pool_max: u32,
+        dispatch_pool_max: u32,
+    ) -> Result<Self, DispatchPoolError> {
+        if [
+            immutable_pool_max,
+            mutable_pool_max,
+            lock_pool_max,
+            domain_pool_max,
+            dispatch_pool_max,
+        ]
+        .contains(&0)
+        {
             return Err(DispatchPoolError::InvalidConfiguration(
-                "connection budget must allow at least one dispatch pool of at least one \
-                 connection",
+                "every declared process pool maximum must be positive",
             ));
         }
-        self.connections_per_replica()
+
+        let connections_per_replica = immutable_pool_max
+            .checked_add(mutable_pool_max)
+            .and_then(|total| total.checked_add(lock_pool_max))
+            .and_then(|total| total.checked_add(domain_pool_max))
+            .and_then(|total| total.checked_add(dispatch_pool_max))
             .ok_or(DispatchPoolError::InvalidConfiguration(
-                "connection budget overflows a per-replica connection count",
-            ))
+                "process pool inventory overflows the connection count",
+            ))?;
+        if connections_per_replica > DISPATCH_PROCESS_CONNECTION_LIMIT {
+            return Err(DispatchPoolError::InvalidConfiguration(
+                "process pool inventory exceeds the hard per-process connection limit",
+            ));
+        }
+
+        Ok(Self {
+            immutable_pool_max,
+            mutable_pool_max,
+            lock_pool_max,
+            domain_pool_max,
+            dispatch_pool_max,
+            connections_per_replica,
+        })
+    }
+
+    pub const fn immutable_pool_max(self) -> u32 {
+        self.immutable_pool_max
+    }
+
+    pub const fn mutable_pool_max(self) -> u32 {
+        self.mutable_pool_max
+    }
+
+    pub const fn lock_pool_max(self) -> u32 {
+        self.lock_pool_max
+    }
+
+    pub const fn domain_pool_max(self) -> u32 {
+        self.domain_pool_max
+    }
+
+    pub const fn dispatch_pool_max(self) -> u32 {
+        self.dispatch_pool_max
+    }
+
+    /// Total PostgreSQL connections one loreserver process may hold against the cell database.
+    pub const fn connections_per_replica(self) -> u32 {
+        self.connections_per_replica
     }
 }
 
@@ -148,7 +189,10 @@ pub struct DispatchPoolConfig {
     pub postgres_url: String,
     /// Which authority identity this pool connects as.
     pub role: DispatchPoolRole,
-    /// Concurrent connections this pool may hold. Bounded by `budget.pool_max`.
+    /// Physical cell database every newly opened connection must attest before
+    /// it can enter the pool or reach a caller.
+    pub expected_database_identity: DispatchDatabaseIdentity,
+    /// Concurrent connections this pool may hold. Must exactly match the inventory declaration.
     pub pool_max: u32,
     pub connect_timeout: Duration,
     /// Time a caller waits for a pool slot before failing closed.
@@ -158,7 +202,7 @@ pub struct DispatchPoolConfig {
     /// `SET LOCAL lock_timeout` for every transaction the client opens.
     pub lock_timeout: Duration,
     pub tls: DispatchTlsMode,
-    /// The per-replica budget this pool's `pool_max` is checked against.
+    /// The checked process inventory this pool's `pool_max` is checked against.
     pub budget: DispatchConnectionBudget,
 }
 
@@ -168,6 +212,10 @@ impl fmt::Debug for DispatchPoolConfig {
             .debug_struct("DispatchPoolConfig")
             .field("postgres_url", &"[REDACTED]")
             .field("role", &self.role)
+            .field(
+                "expected_database_identity",
+                &self.expected_database_identity,
+            )
             .field("pool_max", &self.pool_max)
             .field("connect_timeout", &self.connect_timeout)
             .field("acquire_timeout", &self.acquire_timeout)
@@ -213,6 +261,12 @@ pub enum DispatchPoolError {
     PoolExhausted,
     #[error("dispatch pool could not open a cell database connection")]
     ConnectFailed,
+    #[error("dispatch pool could not read the physical database identity")]
+    DatabaseIdentityReadFailed,
+    #[error("dispatch pool received a malformed physical database identity")]
+    DatabaseIdentityMalformed,
+    #[error("dispatch pool connection reached a different physical database")]
+    DatabaseIdentityMismatch,
 }
 
 /// One pooled PostgreSQL connection.
@@ -221,11 +275,15 @@ struct DispatchSession {
     _connection_task: AbortOnDropHandle<()>,
 }
 
-/// The fourth, separately credentialed pool.
+/// The separately credentialed dispatch pool beside the immutable, mutable, lock, and domain
+/// pools in the exact five-pool steady-state inventory.
 ///
 /// Connections are opened on demand up to `pool_max` and returned to the idle set when a lease is
 /// dropped. A lease the caller marks poisoned is closed rather than reused, which is what the
 /// bounded-execution envelope's reconnect-after-ambiguity step needs.
+///
+/// Runtime consumers share one `Arc<DispatchRuntimePool>`. Cloning that `Arc` adds a client handle,
+/// not another pool or another copy of the declared connection budget.
 pub struct DispatchRuntimePool {
     config: DispatchPoolConfig,
     permits: Semaphore,
@@ -252,15 +310,15 @@ impl fmt::Debug for DispatchRuntimePool {
 impl DispatchRuntimePool {
     /// Validate the configuration and build an empty pool. No connection is opened here.
     pub fn new(config: DispatchPoolConfig) -> Result<Self, DispatchPoolError> {
-        let connections_per_replica = config.budget.validate()?;
+        let connections_per_replica = config.budget.connections_per_replica();
         if config.pool_max == 0 {
             return Err(DispatchPoolError::InvalidConfiguration(
                 "dispatch pool_max must be positive",
             ));
         }
-        if config.pool_max > config.budget.pool_max {
+        if config.pool_max != config.budget.dispatch_pool_max() {
             return Err(DispatchPoolError::InvalidConfiguration(
-                "dispatch pool_max exceeds the declared per-replica connection budget",
+                "dispatch pool_max does not match the declared process inventory",
             ));
         }
         let statement_timeout_ms = whole_millis(
@@ -306,7 +364,8 @@ impl DispatchRuntimePool {
         self.operation_timeout
     }
 
-    /// Connections one replica may hold across all four pools, per the declared budget.
+    /// Connections one replica may hold across immutable, mutable, lock, domain, and dispatch
+    /// pools, per the declared budget.
     pub const fn connections_per_replica(&self) -> u32 {
         self.connections_per_replica
     }
@@ -351,24 +410,32 @@ impl DispatchRuntimePool {
 
     async fn connect(&self) -> Result<DispatchSession, DispatchPoolError> {
         let (postgres, tls) = connection_material(&self.config)?;
-        let (client, connection) =
-            tokio::time::timeout(self.config.connect_timeout, postgres.connect(tls))
+        tokio::time::timeout(self.config.connect_timeout, async {
+            let (client, connection) = postgres
+                .connect(tls)
                 .await
-                .map_err(|_| DispatchPoolError::ConnectTimeout)?
                 .map_err(|_| DispatchPoolError::ConnectFailed)?;
-        let connection_task = AbortOnDropHandle::new(lore_base::lore_spawn!(
-            "object-store-dispatch-postgres",
-            async move {
-                if connection.await.is_err() {
-                    // No PostgreSQL diagnostic reaches the log line.
-                    tracing::error!("object-store dispatch PostgreSQL connection ended");
+            let connection_task = AbortOnDropHandle::new(lore_base::lore_spawn!(
+                "object-store-dispatch-postgres",
+                async move {
+                    if connection.await.is_err() {
+                        // No PostgreSQL diagnostic reaches the log line.
+                        tracing::error!("object-store dispatch PostgreSQL connection ended");
+                    }
                 }
-            }
-        ));
-        Ok(DispatchSession {
-            client,
-            _connection_task: connection_task,
+            ));
+            attest_open_connection_database_identity(
+                &client,
+                self.config.expected_database_identity,
+            )
+            .await?;
+            Ok(DispatchSession {
+                client,
+                _connection_task: connection_task,
+            })
         })
+        .await
+        .map_err(|_| DispatchPoolError::ConnectTimeout)?
     }
 
     async fn release(&self, session: DispatchSession) {
@@ -380,6 +447,29 @@ impl DispatchRuntimePool {
             idle.push(session);
         }
     }
+}
+
+/// Attest the just-opened physical connection before it becomes a pool
+/// session. This exact `Client` is queried and, on any refusal, dropped with
+/// its connection task rather than admitted to the idle set or returned to a
+/// caller.
+async fn attest_open_connection_database_identity(
+    client: &Client,
+    expected: DispatchDatabaseIdentity,
+) -> Result<(), DispatchPoolError> {
+    let row = client
+        .query_one(DATABASE_IDENTITY_SQL, &[])
+        .await
+        .map_err(|_| DispatchPoolError::DatabaseIdentityReadFailed)?;
+    let actual = decode_database_identity(&row).map_err(|error| match error {
+        DispatchDatabaseIdentityError::Malformed => DispatchPoolError::DatabaseIdentityMalformed,
+        DispatchDatabaseIdentityError::Mismatch => DispatchPoolError::DatabaseIdentityMismatch,
+        DispatchDatabaseIdentityError::Read(_) => DispatchPoolError::DatabaseIdentityReadFailed,
+    })?;
+    if actual != expected {
+        return Err(DispatchPoolError::DatabaseIdentityMismatch);
+    }
+    Ok(())
 }
 
 /// A borrowed pool connection. Dropping it returns the connection; [`DispatchLease::poison`]
@@ -514,25 +604,27 @@ mod tests {
                 "postgres://{DISPATCH_RUNTIME_ROLE}:secret@cell.invalid:5432/lorecell?sslmode=disable"
             ),
             role: DispatchPoolRole::Runtime,
+            expected_database_identity: DispatchDatabaseIdentity::new(1, 1)
+                .expect("test physical database identity"),
             pool_max: 5,
             connect_timeout: Duration::from_secs(5),
             acquire_timeout: Duration::from_secs(5),
             statement_timeout: Duration::from_millis(2_000),
             lock_timeout: Duration::from_millis(1_000),
             tls: DispatchTlsMode::Disabled,
-            budget: STAGING_DISPATCH_CONNECTION_BUDGET,
+            budget: DispatchConnectionBudget::new(1, 2, 3, 4, 5).expect("test process budget"),
         }
     }
 
     #[test]
-    fn staging_budget_is_twenty_connections_per_replica() {
-        assert_eq!(
-            STAGING_DISPATCH_CONNECTION_BUDGET.connections_per_replica(),
-            Some(20)
-        );
-        assert_eq!(STAGING_DISPATCH_CONNECTION_BUDGET.store_pools, 3);
-        assert_eq!(STAGING_DISPATCH_CONNECTION_BUDGET.dispatch_pools, 1);
-        assert_eq!(STAGING_DISPATCH_CONNECTION_BUDGET.pool_max, 5);
+    fn exact_five_pool_budget_is_twenty_connections_per_replica() {
+        let budget = DispatchConnectionBudget::new(2, 3, 4, 5, 6).expect("exact process budget");
+        assert_eq!(budget.immutable_pool_max, 2);
+        assert_eq!(budget.mutable_pool_max, 3);
+        assert_eq!(budget.lock_pool_max, 4);
+        assert_eq!(budget.domain_pool_max, 5);
+        assert_eq!(budget.dispatch_pool_max, 6);
+        assert_eq!(budget.connections_per_replica(), 20);
     }
 
     #[test]
@@ -542,7 +634,7 @@ mod tests {
         assert_eq!(
             DispatchRuntimePool::new(value).err(),
             Some(DispatchPoolError::InvalidConfiguration(
-                "dispatch pool_max exceeds the declared per-replica connection budget"
+                "dispatch pool_max does not match the declared process inventory"
             ))
         );
     }
@@ -578,7 +670,7 @@ mod tests {
         );
         let pool = DispatchRuntimePool::new(value).expect("maintenance pool");
         assert_eq!(pool.role(), DispatchPoolRole::Maintenance);
-        assert_eq!(pool.connections_per_replica(), 20);
+        assert_eq!(pool.connections_per_replica(), 15);
     }
 
     #[test]
@@ -713,6 +805,8 @@ mod tests {
     async fn acquire_fails_closed_when_the_cell_database_is_unreachable() {
         let mut value = config();
         value.pool_max = 1;
+        value.budget =
+            DispatchConnectionBudget::new(1, 2, 3, 4, 1).expect("single-slot test budget");
         value.acquire_timeout = Duration::from_millis(20);
         let pool = DispatchRuntimePool::new(value).expect("pool");
         assert!(matches!(

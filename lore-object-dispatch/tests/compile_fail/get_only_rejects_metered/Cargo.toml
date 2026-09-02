@@ -1,0 +1,23 @@
+[package]
+name = "get-only-rejects-metered"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+lore-object-dispatch = { path = "../../.." }
+lore-fragment-provider = { path = "../../../../lore-fragment-provider" }
+
+[[bin]]
+name = "direct-put-cannot-name-attempt-class"
+path = "src/direct_put_cannot_name_attempt_class.rs"
+
+[[bin]]
+name = "fragment-put-before-admission"
+path = "src/fragment_put_before_admission.rs"
+
+[[bin]]
+name = "fragment-general-token-cannot-put"
+path = "src/fragment_general_token_cannot_put.rs"

@@ -31,9 +31,13 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore_object_dispatch::DispatchAuthorityError;
+use lore_object_dispatch::DispatchConnectionBudget;
+use lore_object_dispatch::DispatchDatabaseIdentity;
+use lore_object_dispatch::DispatchDatabaseIdentityError;
 use lore_object_dispatch::DispatchDisposition;
 use lore_object_dispatch::DispatchMaintenanceClient;
 use lore_object_dispatch::DispatchPoolConfig;
+use lore_object_dispatch::DispatchPoolError;
 use lore_object_dispatch::DispatchPoolRole;
 use lore_object_dispatch::DispatchRecordLimits;
 use lore_object_dispatch::DispatchRuntimeClient;
@@ -47,7 +51,6 @@ use lore_object_dispatch::RegisterDispatcherRequest;
 use lore_object_dispatch::ReservePutAckLimits;
 use lore_object_dispatch::ReservePutQuotaScope;
 use lore_object_dispatch::ReservePutRequest;
-use lore_object_dispatch::STAGING_DISPATCH_CONNECTION_BUDGET;
 use lore_object_dispatch::validate_and_encode_object_store_reserve_put_ack;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreQuotaUnitsV1;
 use lore_proto::lore::object_dispatch::v1::PutReservationStateV1;
@@ -438,6 +441,7 @@ fn pool_config(
     base_url: &str,
     role: DispatchPoolRole,
     statement_timeout: Duration,
+    expected_database_identity: DispatchDatabaseIdentity,
 ) -> DispatchPoolConfig {
     // The runner hands out `postgresql://postgres@localhost:PORT/DB`. Swap the user for the
     // authority role this pool must connect as, and pin `sslmode=disable` for the plaintext
@@ -456,13 +460,14 @@ fn pool_config(
             role.role_name()
         ),
         role,
+        expected_database_identity,
         pool_max: 2,
         connect_timeout: Duration::from_secs(10),
         acquire_timeout: Duration::from_secs(10),
         statement_timeout,
         lock_timeout: Duration::from_millis(2_000),
         tls: DispatchTlsMode::Disabled,
-        budget: STAGING_DISPATCH_CONNECTION_BUDGET,
+        budget: DispatchConnectionBudget::new(1, 1, 1, 1, 2).expect("live process budget"),
     }
 }
 
@@ -704,20 +709,67 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
     // ---------------------------------------------------------------------------------------
     // The typed client takes over from here. Nothing below uses SET SESSION AUTHORIZATION.
     // ---------------------------------------------------------------------------------------
-    let runtime = DispatchRuntimeClient::new(
+    let identity_row = admin
+        .query_one(
+            "SELECT (SELECT system_identifier::text FROM pg_control_system()),
+                    (SELECT oid FROM pg_database WHERE datname = current_database())",
+            &[],
+        )
+        .await
+        .expect("read expected physical database identity");
+    let system_identifier: u64 = identity_row
+        .get::<_, String>(0)
+        .parse()
+        .expect("Postgres system identifier");
+    let database_oid: u32 = identity_row.get(1);
+    let expected = DispatchDatabaseIdentity::new(system_identifier, database_oid)
+        .expect("expected physical identity");
+
+    let runtime_pool = Arc::new(
         DispatchRuntimePool::new(pool_config(
             &url,
             DispatchPoolRole::Runtime,
             Duration::from_millis(5_000),
+            expected,
         ))
         .expect("runtime pool"),
+    );
+    let runtime = DispatchRuntimeClient::new(runtime_pool).expect("runtime client");
+
+    // The separately credentialed runtime URL is not compared as text. The client proves the
+    // physical cluster and database, then refuses either independently changed component.
+    runtime
+        .attest_database_identity(expected)
+        .await
+        .expect("the role-specific URL reaches the expected database");
+    let other_database = DispatchDatabaseIdentity::new(
+        system_identifier,
+        database_oid.checked_add(1).expect("database OID headroom"),
     )
-    .expect("runtime client");
+    .expect("different database identity");
+    assert_eq!(
+        runtime.attest_database_identity(other_database).await,
+        Err(DispatchDatabaseIdentityError::Mismatch),
+        "a different database in the same cluster must refuse",
+    );
+    let other_system = DispatchDatabaseIdentity::new(
+        system_identifier
+            .checked_add(1)
+            .expect("system identifier headroom"),
+        database_oid,
+    )
+    .expect("different cluster identity");
+    assert_eq!(
+        runtime.attest_database_identity(other_system).await,
+        Err(DispatchDatabaseIdentityError::Mismatch),
+        "a different cluster must refuse",
+    );
     let maintenance = DispatchMaintenanceClient::new(
         DispatchRuntimePool::new(pool_config(
             &url,
             DispatchPoolRole::Maintenance,
             Duration::from_millis(5_000),
+            expected,
         ))
         .expect("maintenance pool"),
     )
@@ -900,12 +952,15 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
         &url,
         DispatchPoolRole::Runtime,
         Duration::from_millis(5_000),
+        expected,
     );
     single_slot.pool_max = 1;
+    single_slot.budget =
+        DispatchConnectionBudget::new(1, 1, 1, 1, 1).expect("single-slot live process budget");
     single_slot.acquire_timeout = Duration::from_millis(500);
-    let retrying = DispatchRuntimeClient::new(
+    let retrying = DispatchRuntimeClient::new(Arc::new(
         DispatchRuntimePool::new(single_slot).expect("single-slot runtime pool"),
-    )
+    ))
     .expect("single-slot runtime client");
 
     // Each probe registers a participant of its own. 0018 admits one ACTIVE dispatcher per
@@ -1015,6 +1070,7 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
         &url,
         DispatchPoolRole::Runtime,
         Duration::from_millis(5_000),
+        expected,
     );
     through_proxy.postgres_url = format!(
         "postgresql://{}@127.0.0.1:{}/{}?sslmode=disable",
@@ -1022,10 +1078,14 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
         proxy.port,
         database_name(&url),
     );
-    let ambiguous_client = DispatchRuntimeClient::new(
+    let ambiguous_client = DispatchRuntimeClient::new(Arc::new(
         DispatchRuntimePool::new(through_proxy).expect("proxied runtime pool"),
-    )
+    ))
     .expect("proxied runtime client");
+    ambiguous_client
+        .attest_database_identity(expected)
+        .await
+        .expect("the 127.0.0.1 proxy alias reaches the same physical database");
 
     maintenance
         .enroll_dispatcher_participant(&EnrollParticipantRequest {
@@ -1159,14 +1219,15 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
     // `SET LOCAL lock_timeout` statement that follows the one-millisecond budget in the same
     // preamble. Both are `57014` and both mean the same thing here - the `SET LOCAL` landed and is
     // being enforced - which is the claim being made.
-    let impatient = DispatchRuntimeClient::new(
+    let impatient = DispatchRuntimeClient::new(Arc::new(
         DispatchRuntimePool::new(pool_config(
             &url,
             DispatchPoolRole::Runtime,
             Duration::from_millis(1),
+            expected,
         ))
         .expect("impatient runtime pool"),
-    )
+    ))
     .expect("impatient runtime client");
     let mut other = reserve_request();
     other.spool_object_id = parse(&uuid_text(1004, "0523456789ab"));
@@ -1205,6 +1266,80 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
         backends <= DECLARED_RUNTIME_SLOTS,
         "runtime role holds {backends} backends against {DECLARED_RUNTIME_SLOTS} declared slots"
     );
+
+    // This destructive probe is deliberately last and targets only the runner's disposable
+    // database. The first call above admitted a connection to the expected physical database
+    // through a role-specific URL. Recreating that same URL's database changes only its OID. The
+    // same pool must attest the replacement connection before any authority procedure can run.
+    let database = database_name(&url);
+    let quoted_database = format!("\"{}\"", database.replace('"', "\"\""));
+    let maintenance_url = url
+        .rsplit_once('/')
+        .map(|(server, _)| format!("{server}/postgres"))
+        .expect("runner URL has a database path");
+    let (control, control_connection) =
+        tokio_postgres::connect(&maintenance_url, tokio_postgres::NoTls)
+            .await
+            .expect("connect outside the disposable database");
+    let _control_task = AbortOnDropHandle::new(lore_base::lore_spawn!(
+        "dispatch-client-live-control-postgres",
+        async move {
+            let _ = control_connection.await;
+        }
+    ));
+    control
+        .execute(
+            "SELECT pg_catalog.pg_terminate_backend(pid)
+             FROM pg_catalog.pg_stat_activity
+             WHERE datname = $1 AND pid <> pg_catalog.pg_backend_pid()",
+            &[&database],
+        )
+        .await
+        .expect("terminate every first-incarnation database backend");
+    control
+        .batch_execute(&format!("DROP DATABASE {quoted_database} WITH (FORCE)"))
+        .await
+        .expect("drop the first physical database incarnation");
+    control
+        .batch_execute(&format!("CREATE DATABASE {quoted_database}"))
+        .await
+        .expect("recreate the same URL with a new database OID");
+    let recreated_url = format!(
+        "postgresql://postgres@{}?sslmode=disable",
+        url.split_once('@')
+            .map(|(_, target)| target)
+            .expect("runner URL carries a role")
+    );
+    let (recreated, recreated_connection) =
+        tokio_postgres::connect(&recreated_url, tokio_postgres::NoTls)
+            .await
+            .expect("connect recreated disposable database");
+    let _recreated_task = AbortOnDropHandle::new(lore_base::lore_spawn!(
+        "dispatch-client-live-recreated-postgres",
+        async move {
+            let _ = recreated_connection.await;
+        }
+    ));
+    let recreated_oid: u32 = recreated
+        .query_one(
+            "SELECT oid FROM pg_database WHERE datname = current_database()",
+            &[],
+        )
+        .await
+        .expect("read recreated database OID")
+        .get(0);
+    assert_ne!(
+        recreated_oid, database_oid,
+        "the replacement must be a distinct physical database"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        runtime.read_dispatcher_identity_state().await,
+        Err(DispatchAuthorityError::Pool(
+            DispatchPoolError::DatabaseIdentityMismatch
+        )),
+        "connection #2 reached an authority call without per-open physical attestation"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1215,10 +1350,10 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
 // mTLS) and checks the peer's common name. The dispatch pool deliberately has no client-certificate
 // mode - CR-033 D1 dropped that contract along with the external authority database - so it cannot
 // present one, and widening the shared proxy would change a fixture another tier depends on. This
-// injects the same fault against a plaintext connection, `DispatchTlsMode::Disabled`. That is one
-// of the pool's two modes, not a claim about what a cell will run: the crate is source-dark, no
-// composition path selects a mode, and choosing one is CD-6's. `DispatchTlsMode::PinnedRootCa` has
-// no live coverage in this tier at all - recorded as a CD-6 obligation in WP-114.
+// injects the same fault against a plaintext connection, `DispatchTlsMode::Disabled`. This fixture
+// does not model the Phase 5 server configuration: enabled `fragment_provider` composition always
+// selects `DispatchTlsMode::PinnedRootCa` and refuses other TLS modes. This lost-commit tier does
+// not exercise the pinned-CA handshake.
 //
 // Only the server-to-client direction is parsed. PostgreSQL backend messages are always tagged, so
 // no startup-message special case is needed: when armed, the `CommandComplete` frame carrying

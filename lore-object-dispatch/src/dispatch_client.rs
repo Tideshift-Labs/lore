@@ -26,10 +26,12 @@
 //! **Redaction.** No connection string, PEM, PostgreSQL diagnostic, parameter value, identifier, or
 //! boundary id reaches `Display`, `Debug`, `Error::source`, tracing, or a detached task's log.
 //!
-//! The module is source-dark. It opens no provider route, installs no schema, and is not wired into
-//! loreserver composition.
+//! The opt-in Phase 5 `fragment_provider` composition constructs this client over its one shared
+//! dispatch-runtime pool. The client opens no provider route and installs no schema. Retained
+//! authority operations that have no composition caller remain source-dark.
 
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -196,6 +198,10 @@ FROM (SELECT object_store_retention.object_store_dispatch_dispatcher_identity_re
   $1
 ) AS r) q";
 
+pub(crate) const DATABASE_IDENTITY_SQL: &str = "SELECT
+  (SELECT system_identifier::text FROM pg_control_system()) AS system_identifier,
+  (SELECT oid FROM pg_database WHERE datname = current_database()) AS database_oid";
+
 /// Why a cell-authority call refused, or could not be completed.
 ///
 /// Every variant is a fixed shape. None carries a connection string, a PEM, a PostgreSQL
@@ -289,6 +295,7 @@ impl DispatchAuthorityError {
             self,
             Self::Pool(DispatchPoolError::ConnectTimeout)
                 | Self::Pool(DispatchPoolError::ConnectFailed)
+                | Self::Pool(DispatchPoolError::DatabaseIdentityReadFailed)
                 | Self::Pool(DispatchPoolError::PoolExhausted)
                 | Self::OperationTimeout
                 | Self::RetryExhausted
@@ -297,6 +304,55 @@ impl DispatchAuthorityError {
                 | Self::CapacityExhausted
         )
     }
+}
+
+/// Exact physical PostgreSQL database identity, independent of URL spelling or connection role.
+///
+/// `system_identifier` distinguishes PostgreSQL clusters and the database OID distinguishes two
+/// databases inside one cluster. Both fields are private so an invalid zero identity cannot be
+/// constructed without passing through [`Self::new`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DispatchDatabaseIdentity {
+    system_identifier: u64,
+    database_oid: u32,
+}
+
+impl fmt::Debug for DispatchDatabaseIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DispatchDatabaseIdentity")
+            .field("system_identifier", &"[REDACTED]")
+            .field("database_oid", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl DispatchDatabaseIdentity {
+    pub fn new(
+        system_identifier: u64,
+        database_oid: u32,
+    ) -> Result<Self, DispatchDatabaseIdentityError> {
+        if system_identifier == 0 || database_oid == 0 {
+            return Err(DispatchDatabaseIdentityError::Malformed);
+        }
+        Ok(Self {
+            system_identifier,
+            database_oid,
+        })
+    }
+}
+
+/// Why physical database identity attestation could not prove co-location.
+///
+/// No variant carries either identity value, a URL, a role, or a PostgreSQL diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DispatchDatabaseIdentityError {
+    #[error("dispatch database identity could not be read: {0}")]
+    Read(#[source] DispatchAuthorityError),
+    #[error("dispatch database identity is malformed")]
+    Malformed,
+    #[error("dispatch runtime database does not match the expected cell database")]
+    Mismatch,
 }
 
 /// How an accepted call reached its result.
@@ -734,17 +790,37 @@ pub struct DispatcherIdentityState {
 /// The runtime-identity client: 0013, 0015, 0017, 0020's registration, and 0019's readback.
 #[derive(Debug)]
 pub struct DispatchRuntimeClient {
-    pool: DispatchRuntimePool,
+    pool: Arc<DispatchRuntimePool>,
 }
 
 impl DispatchRuntimeClient {
     /// Refuses a pool that does not connect as the runtime role, so a maintenance credential cannot
     /// be routed into a runtime mutation.
-    pub fn new(pool: DispatchRuntimePool) -> Result<Self, DispatchAuthorityError> {
+    pub fn new(pool: Arc<DispatchRuntimePool>) -> Result<Self, DispatchAuthorityError> {
         if pool.role() != DispatchPoolRole::Runtime {
             return Err(DispatchAuthorityError::WrongPoolRole);
         }
         Ok(Self { pool })
+    }
+
+    /// Prove that this separately credentialed pool reaches the expected physical database.
+    ///
+    /// Read-only and never retried. URL equality is intentionally irrelevant: different aliases,
+    /// TLS parameters, and roles are accepted when PostgreSQL reports the same cluster identifier
+    /// and database OID.
+    pub async fn attest_database_identity(
+        &self,
+        expected: DispatchDatabaseIdentity,
+    ) -> Result<(), DispatchDatabaseIdentityError> {
+        let params: [&(dyn ToSql + Sync); 0] = [];
+        let row = read_once(&self.pool, DATABASE_IDENTITY_SQL, &params)
+            .await
+            .map_err(DispatchDatabaseIdentityError::Read)?;
+        let actual = decode_database_identity(&row)?;
+        if actual != expected {
+            return Err(DispatchDatabaseIdentityError::Mismatch);
+        }
+        Ok(())
     }
 
     /// 0013: admit one PUT reservation.
@@ -792,6 +868,24 @@ impl DispatchRuntimeClient {
         let row = read_once(&self.pool, DISPATCHER_IDENTITY_READ_STATE_SQL, &params).await?;
         decode_dispatcher_identity_state(&row)
     }
+}
+
+pub(crate) fn decode_database_identity(
+    row: &Row,
+) -> Result<DispatchDatabaseIdentity, DispatchDatabaseIdentityError> {
+    let system_identifier = row
+        .try_get::<_, String>("system_identifier")
+        .map_err(|_| DispatchDatabaseIdentityError::Malformed)?;
+    let parsed_system_identifier = system_identifier
+        .parse::<u64>()
+        .map_err(|_| DispatchDatabaseIdentityError::Malformed)?;
+    if parsed_system_identifier.to_string() != system_identifier {
+        return Err(DispatchDatabaseIdentityError::Malformed);
+    }
+    let database_oid = row
+        .try_get::<_, u32>("database_oid")
+        .map_err(|_| DispatchDatabaseIdentityError::Malformed)?;
+    DispatchDatabaseIdentity::new(parsed_system_identifier, database_oid)
 }
 
 /// The maintenance-identity client: 0020's participant enrollment, and nothing else.

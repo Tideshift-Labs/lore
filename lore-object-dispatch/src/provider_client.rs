@@ -12,57 +12,62 @@
 //!   [`CellProviderBoundary`] must match its bucket, region, and endpoint host exactly, on every
 //!   drain, repair, read, fallback, and operator path alike. There is no fallback route and no
 //!   second bucket. The check bounds what this client *authorizes*: a transport that ignored
-//!   [`AuthorizedProviderAttempt::target`] and addressed something else would still escape, so
-//!   CD-6 owes a client built against the cell's one fixed endpoint, and that remains its
-//!   obligation rather than something proved here.
-//! - **Charge before send.** [`GovernedProviderClient::execute`] charges the CD-4 authority first
-//!   and only then constructs an [`AuthorizedProviderAttempt`]. That permit is the sole input to
-//!   [`ProviderTransport::issue`] and cannot be constructed outside this crate, so a transport can
-//!   never be handed an attempt that was not charged.
-//! - **One authorized attempt per grant.** A transport reports how many provider requests it
+//!   either [`AuthorizedProviderAttempt::target`] or [`AuthorizedProviderGet::target`] and
+//!   addressed something else would still escape this kernel. Phase 5 composition supplies a
+//!   transport bound to the cell's one fixed endpoint; the generic kernel cannot prove the
+//!   behavior of an arbitrary replacement transport.
+//! - **Charge before a metered send.** [`GovernedProviderClient::execute`] charges the CD-4
+//!   authority first and only then constructs an [`AuthorizedProviderAttempt`]. That permit is the
+//!   sole input to [`ProviderTransport::issue`] and cannot be constructed outside this crate, so a
+//!   metered transport can never be handed an attempt that was not charged. `GetObject` is the one
+//!   explicit exception: [`GovernedProviderClient::execute_get`] accepts a GET-only request, mints
+//!   the distinct [`AuthorizedProviderGet`] token, and touches neither the authority nor a durable
+//!   attempt ledger.
+//! - **One provider request per authorization.** A transport reports how many provider requests it
 //!   issued, and anything other than one is a fail-closed error. This bounds what a transport may
 //!   do *and admit to*; it is not, on its own, proof that the SDK's automatic retry is off, because
 //!   a retry inside the SDK happens below the transport's one call and would be reported honestly
-//!   as one. Disabling automatic retry is CD-6's construction obligation on the real client, and
-//!   [`ProviderRetryPolicy`] is the declaration it must be built from. What this side can prove is
-//!   narrower and still worth having: a transport cannot issue several requests under one grant and
-//!   report them without closing the ledger.
+//!   as one. Phase 5 constructs the real client with automatic retry disabled and counts connector
+//!   attempts. [`ProviderRetryPolicy`] is the declaration every real transport must be built from.
+//!   Metered violations close the ledger; GET has no durable ledger and rejects the report locally
+//!   before exposing its response.
 //! - **No refund.** [`ProviderAttemptLedger`] has no refund path at all. A committed grant that
 //!   never reached the provider stays charged, which is the valid, nonrefundable
 //!   grant-without-attempt window; conservative charging explicitly does not claim exact-once.
 //!
 //! Nothing here is durable outcome authority. A provider report, including a listing or a
-//! read-after-write observation, only ever produces a [`ProviderAttemptOutcome`], which converts
-//! into no terminal result, no receipt, and no lifecycle transition. The cell database's committed
-//! result row remains the only outcome authority.
+//! read-after-write observation, produces a [`ProviderAttemptExecution`] whose outcome and response
+//! convert into no terminal result, no receipt, and no lifecycle transition. The cell database's
+//! committed result row remains the only outcome authority.
 //!
-//! # What CD-5 deliberately does not wire
+//! # Fail-closed defaults and runtime construction
 //!
-//! CD-4's PostgreSQL authority now exists as an explicitly constructed dark implementation, while
-//! CD-6's S3 transport does not. This module still ships [`UnwiredChargeAuthority`] and
-//! [`UnwiredProviderTransport`] as the defaults; they fail closed on every call and can never report
-//! a success. They are guards, not stubs: a client assembled from them charges nothing and sends
-//! nothing, so compiling or testing this module authorizes no provider traffic. The budget pin a
-//! request carries is passed through opaquely and only checked for shape and for exact echo by the
-//! grant; the selected CD-4 authority resolves it against WP-121's unpublished per-cell envelope.
+//! Phase 5 composition explicitly constructs the PostgreSQL charge authority and retry-disabled S3
+//! transport. This module still ships [`UnwiredChargeAuthority`] and [`UnwiredProviderTransport`]
+//! as fail-closed defaults; they reject every call and can never report success. They are guards,
+//! not stubs: a client assembled from them charges nothing and sends nothing. The budget pin a
+//! metered request carries is passed through opaquely and checked for shape and exact echo by the
+//! grant; the selected authority resolves it against WP-121's unpublished per-cell envelope. GET
+//! has no budget pin.
 //!
-//! One CD-5 obligation is met differently from the way WP-114 words it, and the difference is
-//! deliberate. CD-5 says to charge every attempt class "including SDK-level retries". This kernel
-//! instead makes an SDK-level retry a contract violation: one grant authorizes exactly one request,
-//! and a transport that admits to more closes the ledger. Charging a retry the caller cannot
-//! enumerate in advance would need the charge to happen after the send, which is the opposite of
-//! charge-before-send. CD-6 must therefore build its client with retry disabled and re-enter this
-//! kernel for each attempt, rather than retrying inside one.
+//! `GetObject` is the sole unmetered class under the revised owner decision. Every other class still
+//! charges before send. An SDK-level retry remains a contract violation on both paths: charging a
+//! retry the caller cannot enumerate in advance would happen after the send, while an unmetered GET
+//! retry would defeat exact one-wire-request enforcement. The Phase 5 transport therefore builds
+//! both paths with retry disabled and re-enters the appropriate kernel for each attempt.
 
 use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
 
+use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use thiserror::Error;
 
 use crate::compaction::ObjectStoreProviderAttemptAudit;
 use crate::compaction::provider_attempt_audit_is_valid;
 use crate::contract::canonical_uuid_v7_timestamp;
 use crate::contract::validate_canonical_id;
+use crate::dispatch_client::PutSpoolReadyOutcome;
 use crate::no_dispatch::CanonicalNoDispatchProof;
 use crate::spool::LedgerSpoolView;
 use crate::spool::SpoolLayout;
@@ -82,9 +87,9 @@ pub const PROVIDER_ATTEMPT_DEADLINE_HORIZON_MS: i64 = 5 * 60 * 1_000;
 
 /// The closed set of physical provider attempt classes this cell may issue.
 ///
-/// These are *physical* attempts, one charged operation each, not the logical operations of
-/// `object_store_request_v1`. One logical PUT expands into a create, its parts, and a complete,
-/// and CR-033 D4 charges each of them.
+/// These are *physical* attempts, not the logical operations of `object_store_request_v1`. One
+/// logical PUT expands into a create, its parts, and a complete, and CR-033 D4 charges each of them.
+/// `GetObject` is the one read-only class that uses the separate unmetered GET path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderAttemptClass {
     /// Bucket readiness probe (`HeadBucket`).
@@ -571,10 +576,11 @@ pub fn plan_put_object(
 
 /// A PUT body proven durable in the cell's spool and bound to the request that owns it.
 ///
-/// The only constructor is [`bind_durable_put_body`], and it accepts only a ledger row already in
-/// [`LedgerSpoolView::Ready`]. A PUT attempt cannot be assembled without one, so the governed
-/// client cannot send a body that is not durably spooled, and cannot send one request's body under
-/// another request's identity.
+/// Construction goes through [`bind_durable_put_body`] or
+/// [`bind_durable_put_body_from_ready`], which delegates to it. Both accept only a ledger row
+/// already in [`LedgerSpoolView::Ready`]. A PUT attempt cannot be assembled without one, so the
+/// governed client cannot send a body that is not durably spooled, and cannot send one request's
+/// body under another request's identity.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DurableProviderPutBody {
     provider_boundary_id: String,
@@ -669,6 +675,34 @@ pub fn bind_durable_put_body(
     })
 }
 
+/// Binds CD-3's typed spool-ready result to the PUT body an attempt may send.
+///
+/// This is a filesystem-free adapter onto [`bind_durable_put_body`]. It reconstructs that
+/// function's layout, PUT key, and ready ledger view, so the same canonical-key, UUIDv7, ready-state,
+/// and derived-handle checks remain authoritative. The ready result's spool-object, upload,
+/// timestamp, ACK, revision, and record fields are outside the existing durable-body proof; this
+/// helper neither treats them as new authority nor silently weakens the proof to accommodate them.
+pub fn bind_durable_put_body_from_ready(
+    shared_spool_root: PathBuf,
+    provider_boundary_id: &str,
+    ready: &PutSpoolReadyOutcome,
+) -> Result<DurableProviderPutBody, ProviderClientError> {
+    let layout =
+        SpoolLayout::new(shared_spool_root).map_err(|_| ProviderClientError::InvalidSpoolKey)?;
+    let key = SpoolObjectKey {
+        provider_boundary_id: provider_boundary_id.to_string(),
+        logical_request_id: ready.logical_request_id.to_string(),
+        attempt_id: ready.attempt_id.to_string(),
+        kind: SpoolObjectKind::Put,
+    };
+    let ledger = LedgerSpoolView::Ready {
+        opaque_handle: ready.durable_handle.clone(),
+        size: ready.committed_size,
+        blake3: ready.committed_blake3,
+    };
+    bind_durable_put_body(&layout, &key, &ledger)
+}
+
 /// The byte range of one multipart part.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProviderPutPart {
@@ -686,6 +720,20 @@ pub struct ProviderPutPart {
 pub struct BudgetPin {
     pub revision: String,
     pub fence: u64,
+}
+
+impl BudgetPin {
+    /// Build one validated pin using the same grammar every governed charge
+    /// checks. Composition code uses this to refuse malformed deployment
+    /// configuration at boot rather than on the first provider attempt.
+    pub fn new(revision: &str, fence: u64) -> Result<Self, ProviderClientError> {
+        let pin = Self {
+            revision: revision.to_owned(),
+            fence,
+        };
+        validate_budget_pin(&pin)?;
+        Ok(pin)
+    }
 }
 
 impl fmt::Debug for BudgetPin {
@@ -732,10 +780,92 @@ impl fmt::Debug for ProviderAttemptRequest {
     }
 }
 
+/// A provider attempt that must pass through the shared charge authority before dispatch.
+///
+/// The wrapper has no `GetObject` representation. Callers must use
+/// [`ProviderGetAttemptRequest`] and [`GovernedProviderClient::execute_get`] for that one
+/// read-only operation, so changing a branch inside the governed client cannot accidentally send a
+/// GET through the database limiter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeteredProviderAttemptRequest(ProviderAttemptRequest);
+
+impl TryFrom<ProviderAttemptRequest> for MeteredProviderAttemptRequest {
+    type Error = ProviderClientError;
+
+    fn try_from(request: ProviderAttemptRequest) -> Result<Self, Self::Error> {
+        if request.attempt_class == ProviderAttemptClass::GetObject {
+            return Err(ProviderClientError::GetObjectRequiresReadOnlyPath);
+        }
+        Ok(Self(request))
+    }
+}
+
+/// One direct, bounded `PutObject` attempt.
+///
+/// The type has no attempt-class, part-range, durable-handle, or arbitrary body-source field. It
+/// therefore cannot represent HEAD, GET, LIST, DELETE, readiness, or multipart traffic. Actual
+/// bytes enter only through [`GovernedProviderClient::execute_direct_put`], where their size and
+/// BLAKE3 are exact-bound before the shared charge authority is called.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderDirectPutAttemptRequest {
+    pub traffic_class: ProviderTrafficClass,
+    pub target: ProviderTarget,
+    pub logical_request_id: String,
+    pub attempt_id: String,
+    pub attempt_ordinal: u32,
+    pub deadline_unix_ms: i64,
+    pub budget_pin: BudgetPin,
+    pub declared_size: u64,
+    pub declared_blake3: [u8; 32],
+}
+
+impl fmt::Debug for ProviderDirectPutAttemptRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderDirectPutAttemptRequest")
+            .field("traffic_class", &self.traffic_class)
+            .field("target", &self.target)
+            .field("logical_request_id", &"[REDACTED]")
+            .field("attempt_id", &"[REDACTED]")
+            .field("attempt_ordinal", &self.attempt_ordinal)
+            .field("deadline_unix_ms", &self.deadline_unix_ms)
+            .field("budget_pin", &self.budget_pin)
+            .field("declared_size", &self.declared_size)
+            .field("declared_blake3", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// One unmetered, read-only `GetObject` attempt.
+///
+/// The type deliberately contains no attempt class, traffic class, budget pin, deadline, durable
+/// body, or part range. It therefore cannot express any charged operation or trigger provider
+/// budget admission by construction.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderGetAttemptRequest {
+    pub target: ProviderTarget,
+    pub logical_request_id: String,
+    pub attempt_id: String,
+    pub attempt_ordinal: u32,
+}
+
+impl fmt::Debug for ProviderGetAttemptRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderGetAttemptRequest")
+            .field("target", &self.target)
+            .field("logical_request_id", &"[REDACTED]")
+            .field("attempt_id", &"[REDACTED]")
+            .field("attempt_ordinal", &self.attempt_ordinal)
+            .finish()
+    }
+}
+
 /// What the governed client asks CD-4's limiter to charge.
 ///
-/// Constructed only by [`GovernedProviderClient::execute`], after the boundary, capability, and
-/// body checks pass, so a charge request always describes an attempt this cell may make.
+/// Constructed only by [`GovernedProviderClient::execute`], from a
+/// [`MeteredProviderAttemptRequest`] after the boundary, capability, and body checks pass, so a
+/// charge request always describes a metered attempt this cell may make.
 ///
 /// Deliberately not `Clone`, and deliberately without a public constructor. This value is the only
 /// thing a [`ProviderChargeAuthority`] will charge, so an implementation that could retain a copy
@@ -966,10 +1096,54 @@ impl Drop for ChargeCancellationGuard<'_> {
     }
 }
 
+/// Conservatively accounts for a transport future dropped after its charged attempt was handed to
+/// the transport but before a concrete report was returned.
+///
+/// Cancellation cannot prove that no request reached the provider. The ledger therefore records
+/// one possible issued attempt and one ambiguous outcome. A concrete refusal disarms this guard
+/// before taking the existing no-send refusal path, because that refusal is the transport's claim
+/// that it issued nothing.
+struct TransportCancellationGuard<'a> {
+    ledger: &'a mut ProviderAttemptLedger,
+    armed: bool,
+}
+
+impl<'a> TransportCancellationGuard<'a> {
+    fn new(ledger: &'a mut ProviderAttemptLedger) -> Self {
+        Self {
+            ledger,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn ledger(&mut self) -> &mut ProviderAttemptLedger {
+        self.ledger
+    }
+
+    fn record_possible_ambiguous_attempt(&mut self) -> Result<(), ProviderClientError> {
+        self.ledger.record_issued_attempt()?;
+        self.ledger.record_ambiguous()
+    }
+}
+
+impl Drop for TransportCancellationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Drop cannot return an overflow error. The counter recorder poisons the ledger before
+            // returning one, so ignoring it here remains fail closed.
+            let _ = self.record_possible_ambiguous_attempt();
+        }
+    }
+}
+
 /// The shipped charge authority: it charges nothing and grants nothing.
 ///
-/// This is the fail-closed guard that keeps CD-5 source-dark. It is not a stub that fakes a
-/// success, and it has no configuration that could turn it into one.
+/// This is the fail-closed guard for a gateway built without explicit runtime activation. It is
+/// not a stub that fakes a success, and it has no configuration that could turn it into one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UnwiredChargeAuthority;
 
@@ -982,20 +1156,142 @@ impl ProviderChargeAuthority for UnwiredChargeAuthority {
     }
 }
 
+#[derive(Clone, Copy)]
+enum MeteredAttemptInput<'a> {
+    Durable(&'a ProviderAttemptRequest),
+    DirectPut {
+        request: &'a ProviderDirectPutAttemptRequest,
+        body: &'a [u8],
+    },
+}
+
+impl MeteredAttemptInput<'_> {
+    fn logical_request_id(&self) -> &str {
+        match self {
+            Self::Durable(request) => &request.logical_request_id,
+            Self::DirectPut { request, .. } => &request.logical_request_id,
+        }
+    }
+}
+
+struct ValidatedDirectPutBody<'a> {
+    bytes: &'a [u8],
+    size: u64,
+    blake3: [u8; 32],
+}
+
+struct ProviderChargeFields<'a> {
+    traffic_class: ProviderTrafficClass,
+    attempt_class: ProviderAttemptClass,
+    target: &'a ProviderTarget,
+    logical_request_id: &'a str,
+    attempt_id: &'a str,
+    attempt_ordinal: u32,
+    deadline_unix_ms: i64,
+    budget_pin: &'a BudgetPin,
+}
+
+enum PreparedMeteredAttempt<'a> {
+    Durable(&'a ProviderAttemptRequest),
+    DirectPut {
+        request: &'a ProviderDirectPutAttemptRequest,
+        body: ValidatedDirectPutBody<'a>,
+    },
+}
+
+impl PreparedMeteredAttempt<'_> {
+    fn traffic_class(&self) -> ProviderTrafficClass {
+        match self {
+            Self::Durable(request) => request.traffic_class,
+            Self::DirectPut { request, .. } => request.traffic_class,
+        }
+    }
+
+    fn attempt_class(&self) -> ProviderAttemptClass {
+        match self {
+            Self::Durable(request) => request.attempt_class,
+            Self::DirectPut { .. } => ProviderAttemptClass::PutObject,
+        }
+    }
+
+    fn target(&self) -> &ProviderTarget {
+        match self {
+            Self::Durable(request) => &request.target,
+            Self::DirectPut { request, .. } => &request.target,
+        }
+    }
+
+    fn logical_request_id(&self) -> &str {
+        match self {
+            Self::Durable(request) => &request.logical_request_id,
+            Self::DirectPut { request, .. } => &request.logical_request_id,
+        }
+    }
+
+    fn attempt_id(&self) -> &str {
+        match self {
+            Self::Durable(request) => &request.attempt_id,
+            Self::DirectPut { request, .. } => &request.attempt_id,
+        }
+    }
+
+    fn attempt_ordinal(&self) -> u32 {
+        match self {
+            Self::Durable(request) => request.attempt_ordinal,
+            Self::DirectPut { request, .. } => request.attempt_ordinal,
+        }
+    }
+
+    fn durable_put_body(&self) -> Option<&DurableProviderPutBody> {
+        match self {
+            Self::Durable(request) => request.put_body.as_ref(),
+            Self::DirectPut { .. } => None,
+        }
+    }
+
+    fn put_part(&self) -> Option<ProviderPutPart> {
+        match self {
+            Self::Durable(request) => request.put_part,
+            Self::DirectPut { .. } => None,
+        }
+    }
+
+    fn direct_put_body(&self) -> Option<&ValidatedDirectPutBody<'_>> {
+        match self {
+            Self::DirectPut { body, .. } => Some(body),
+            Self::Durable(_) => None,
+        }
+    }
+}
+
+impl fmt::Debug for PreparedMeteredAttempt<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Durable(request) => formatter.debug_tuple("Durable").field(request).finish(),
+            Self::DirectPut { request, body } => formatter
+                .debug_struct("DirectPut")
+                .field("request", request)
+                .field("body_size", &body.size)
+                .field("body_blake3", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
 /// A charged attempt a transport may issue, and the only thing a transport is ever handed.
 ///
 /// The constructor is crate-private, so no code outside this crate can build one. That is the
 /// no-bypass property CR-033 D1 leaves reviewable by construction now that caller identity is
 /// database-role identity rather than an mTLS binding.
 pub struct AuthorizedProviderAttempt<'a> {
-    request: &'a ProviderAttemptRequest,
+    request: PreparedMeteredAttempt<'a>,
     grant: &'a ProviderChargeGrant,
     retry_policy: ProviderRetryPolicy,
 }
 
 impl<'a> AuthorizedProviderAttempt<'a> {
     fn new(
-        request: &'a ProviderAttemptRequest,
+        request: PreparedMeteredAttempt<'a>,
         grant: &'a ProviderChargeGrant,
         retry_policy: ProviderRetryPolicy,
     ) -> Self {
@@ -1007,35 +1303,51 @@ impl<'a> AuthorizedProviderAttempt<'a> {
     }
 
     pub fn traffic_class(&self) -> ProviderTrafficClass {
-        self.request.traffic_class
+        self.request.traffic_class()
     }
 
     pub fn attempt_class(&self) -> ProviderAttemptClass {
-        self.request.attempt_class
+        self.request.attempt_class()
     }
 
     pub fn target(&self) -> &ProviderTarget {
-        &self.request.target
+        self.request.target()
     }
 
     pub fn logical_request_id(&self) -> &str {
-        &self.request.logical_request_id
+        self.request.logical_request_id()
     }
 
     pub fn attempt_id(&self) -> &str {
-        &self.request.attempt_id
+        self.request.attempt_id()
     }
 
     pub fn attempt_ordinal(&self) -> u32 {
-        self.request.attempt_ordinal
+        self.request.attempt_ordinal()
     }
 
     pub fn put_body(&self) -> Option<&DurableProviderPutBody> {
-        self.request.put_body.as_ref()
+        self.request.durable_put_body()
     }
 
     pub fn put_part(&self) -> Option<ProviderPutPart> {
-        self.request.put_part
+        self.request.put_part()
+    }
+
+    /// The direct PUT bytes exact-bound before this attempt's charge.
+    ///
+    /// Durable spool attempts and every non-direct class return `None`. The bytes cannot be
+    /// observed by a transport until a valid grant has been returned and exact-matched.
+    pub fn direct_put_body(&self) -> Option<&[u8]> {
+        self.request.direct_put_body().map(|body| body.bytes)
+    }
+
+    pub fn direct_put_size(&self) -> Option<u64> {
+        self.request.direct_put_body().map(|body| body.size)
+    }
+
+    pub fn direct_put_blake3(&self) -> Option<&[u8; 32]> {
+        self.request.direct_put_body().map(|body| &body.blake3)
     }
 
     pub fn grant(&self) -> &ProviderChargeGrant {
@@ -1058,6 +1370,55 @@ impl fmt::Debug for AuthorizedProviderAttempt<'_> {
     }
 }
 
+/// An unmetered, read-only GET that passed the cell-boundary and identity checks.
+///
+/// This is deliberately a different token from [`AuthorizedProviderAttempt`]. It has no grant and
+/// its crate-private constructor accepts only [`ProviderGetAttemptRequest`], so it cannot authorize
+/// HEAD, PUT, LIST, DELETE, readiness, or multipart traffic.
+pub struct AuthorizedProviderGet<'a> {
+    request: &'a ProviderGetAttemptRequest,
+    retry_policy: ProviderRetryPolicy,
+}
+
+impl<'a> AuthorizedProviderGet<'a> {
+    fn new(request: &'a ProviderGetAttemptRequest, retry_policy: ProviderRetryPolicy) -> Self {
+        Self {
+            request,
+            retry_policy,
+        }
+    }
+
+    pub fn target(&self) -> &ProviderTarget {
+        &self.request.target
+    }
+
+    pub fn logical_request_id(&self) -> &str {
+        &self.request.logical_request_id
+    }
+
+    pub fn attempt_id(&self) -> &str {
+        &self.request.attempt_id
+    }
+
+    pub fn attempt_ordinal(&self) -> u32 {
+        self.request.attempt_ordinal
+    }
+
+    /// The automatic-retry setting the GET transport's client must have been built with.
+    pub fn retry_policy(&self) -> ProviderRetryPolicy {
+        self.retry_policy
+    }
+}
+
+impl fmt::Debug for AuthorizedProviderGet<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizedProviderGet")
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
 /// What the provider did with one issued attempt.
 ///
 /// This is not a durable outcome. It records whether the provider's response was definite, never
@@ -1066,19 +1427,33 @@ impl fmt::Debug for AuthorizedProviderAttempt<'_> {
 pub enum ProviderAttemptOutcome {
     /// The provider returned a definite response, success or definite failure.
     Decisive,
-    /// No definite response was observed. The charge stands and the effect is unknown.
+    /// No definite response was observed. The effect is unknown and any applicable charge stands.
     Ambiguous,
 }
 
-/// A transport's report on one authorized attempt.
+/// A transport's report on one authorized attempt, with its operation-specific response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProviderAttemptReport {
+pub struct ProviderAttemptReport<R> {
     pub outcome: ProviderAttemptOutcome,
     /// How many requests the transport actually put on the wire for this one authorized attempt.
     ///
     /// Exactly one is authorized. A transport whose SDK retried internally reports more than one
-    /// and is rejected, because the extra requests were never charged.
+    /// and is rejected, because the extra requests were not independently authorized.
     pub provider_requests_issued: u32,
+    /// The response produced by this exact authorized request.
+    pub response: R,
+}
+
+/// One governed provider execution, returned only after the transport report passed accounting.
+///
+/// A response is never surfaced for a zero-request or multi-request report. Keeping it beside the
+/// outcome also prevents a concurrent or cancelled caller from observing a stale side-channel
+/// response that was not accepted by this execution. Metered calls also record it in their durable
+/// attempt ledger; GET deliberately has no such ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderAttemptExecution<R> {
+    pub outcome: ProviderAttemptOutcome,
+    pub response: R,
 }
 
 /// A transport's assertion that it issued nothing.
@@ -1091,15 +1466,40 @@ pub enum ProviderTransportRefusal {
     Unwired,
 }
 
-/// CD-6's one governed S3 client for the cell's bucket, seen from the charge kernel.
+/// The governed provider transport for the cell's bucket, seen from the charge kernel.
 ///
 /// An implementation must build its SDK client with automatic retry disabled, must issue exactly
 /// one request per call, and must never address anything but the attempt's [`ProviderTarget`].
 pub trait ProviderTransport {
-    fn issue(
-        &self,
-        attempt: &AuthorizedProviderAttempt<'_>,
-    ) -> Result<ProviderAttemptReport, ProviderTransportRefusal>;
+    type Operation: Send + Sync;
+    type Response: Send;
+
+    fn issue<'a>(
+        &'a self,
+        attempt: &'a AuthorizedProviderAttempt<'a>,
+        operation: &'a Self::Operation,
+    ) -> impl Future<
+        Output = Result<ProviderAttemptReport<Self::Response>, ProviderTransportRefusal>,
+    > + Send
+    + 'a;
+}
+
+/// The retry-disabled transport surface for the one unmetered provider operation, `GetObject`.
+///
+/// The associated operation type belongs to this GET-only trait. Implementations receive only an
+/// [`AuthorizedProviderGet`], never a charged attempt or a general operation-class enum.
+pub trait ProviderGetTransport {
+    type Operation: Send + Sync;
+    type Response: Send;
+
+    fn issue_get<'a>(
+        &'a self,
+        attempt: &'a AuthorizedProviderGet<'a>,
+        operation: &'a Self::Operation,
+    ) -> impl Future<
+        Output = Result<ProviderAttemptReport<Self::Response>, ProviderTransportRefusal>,
+    > + Send
+    + 'a;
 }
 
 /// The shipped transport: it issues nothing.
@@ -1111,10 +1511,27 @@ pub trait ProviderTransport {
 pub struct UnwiredProviderTransport;
 
 impl ProviderTransport for UnwiredProviderTransport {
-    fn issue(
-        &self,
-        _attempt: &AuthorizedProviderAttempt<'_>,
-    ) -> Result<ProviderAttemptReport, ProviderTransportRefusal> {
+    type Operation = ();
+    type Response = ();
+
+    async fn issue<'a>(
+        &'a self,
+        _attempt: &'a AuthorizedProviderAttempt<'a>,
+        _operation: &'a Self::Operation,
+    ) -> Result<ProviderAttemptReport<()>, ProviderTransportRefusal> {
+        Err(ProviderTransportRefusal::Unwired)
+    }
+}
+
+impl ProviderGetTransport for UnwiredProviderTransport {
+    type Operation = ();
+    type Response = ();
+
+    async fn issue_get<'a>(
+        &'a self,
+        _attempt: &'a AuthorizedProviderGet<'a>,
+        _operation: &'a Self::Operation,
+    ) -> Result<ProviderAttemptReport<()>, ProviderTransportRefusal> {
         Err(ProviderTransportRefusal::Unwired)
     }
 }
@@ -1418,8 +1835,40 @@ where
     pub async fn execute(
         &self,
         ledger: &mut ProviderAttemptLedger,
-        request: &ProviderAttemptRequest,
-    ) -> Result<ProviderAttemptOutcome, ProviderClientError> {
+        request: &MeteredProviderAttemptRequest,
+        operation: &T::Operation,
+    ) -> Result<ProviderAttemptExecution<T::Response>, ProviderClientError> {
+        self.execute_metered(ledger, MeteredAttemptInput::Durable(&request.0), operation)
+            .await
+    }
+
+    /// Charges and issues one direct, bounded `PutObject`.
+    ///
+    /// The request type fixes the attempt class by omission. Actual bytes enter here, after the
+    /// fragment seam's admission token is expected to have been acquired, and are exact-bound to
+    /// the declared size and BLAKE3 before the charge authority is called. The authorized transport
+    /// token carrying those bytes is constructed only after a valid grant is returned.
+    pub async fn execute_direct_put(
+        &self,
+        ledger: &mut ProviderAttemptLedger,
+        request: &ProviderDirectPutAttemptRequest,
+        body: &[u8],
+        operation: &T::Operation,
+    ) -> Result<ProviderAttemptExecution<T::Response>, ProviderClientError> {
+        self.execute_metered(
+            ledger,
+            MeteredAttemptInput::DirectPut { request, body },
+            operation,
+        )
+        .await
+    }
+
+    async fn execute_metered(
+        &self,
+        ledger: &mut ProviderAttemptLedger,
+        input: MeteredAttemptInput<'_>,
+        operation: &T::Operation,
+    ) -> Result<ProviderAttemptExecution<T::Response>, ProviderClientError> {
         // Identity first, ahead of the poison flag and the no-dispatch guard alike, and the same
         // order `ProviderAttemptLedger::audit_for` uses: "is this even my ledger" precedes every
         // question about the state that ledger is in, so a caller holding the wrong one is told
@@ -1429,7 +1878,7 @@ where
         // binding has to be checked here or nowhere. Refused before anything is charged or sent,
         // and so without closing the ledger.
         if ledger.provider_boundary_id() != self.boundary.provider_boundary_id
-            || ledger.logical_request_id() != request.logical_request_id
+            || ledger.logical_request_id() != input.logical_request_id()
         {
             return Err(ProviderClientError::LedgerRequestMismatch);
         }
@@ -1445,7 +1894,7 @@ where
         if ledger.no_dispatch_count() != 0 {
             return Err(ProviderClientError::DispatchAfterNoDispatch);
         }
-        let charge_request = self.authorize(request)?;
+        let (charge_request, prepared) = self.authorize_input(input)?;
 
         // The authority contract permits the database commit to outlive a dropped future. Arm the
         // ledger before polling it, then disarm only after a concrete result is in hand.
@@ -1479,33 +1928,43 @@ where
         }
         charge_guard.record_committed_grant()?;
 
-        let attempt = AuthorizedProviderAttempt::new(request, &grant, self.retry_policy);
-        let report = match self.transport.issue(&attempt) {
+        let attempt = AuthorizedProviderAttempt::new(prepared, &grant, self.retry_policy);
+        let mut transport_guard = TransportCancellationGuard::new(charge_guard.ledger());
+        let report = match self.transport.issue(&attempt, operation).await {
             Ok(report) => report,
-            Err(refusal) => return Err(ProviderClientError::TransportRefused(refusal)),
+            Err(refusal) => {
+                transport_guard.disarm();
+                return Err(ProviderClientError::TransportRefused(refusal));
+            }
         };
+        transport_guard.disarm();
+        let ProviderAttemptReport {
+            outcome,
+            provider_requests_issued,
+            response,
+        } = report;
 
-        match report.provider_requests_issued {
-            0 => Err(charge_guard
+        match provider_requests_issued {
+            0 => Err(transport_guard
                 .ledger()
                 .poison(ProviderClientError::TransportReportInconsistent)),
             1 => {
-                charge_guard.ledger().record_issued_attempt()?;
-                match report.outcome {
+                transport_guard.ledger().record_issued_attempt()?;
+                match outcome {
                     ProviderAttemptOutcome::Decisive => {
-                        charge_guard.ledger().record_decisive_terminal()?
+                        transport_guard.ledger().record_decisive_terminal()?
                     }
                     ProviderAttemptOutcome::Ambiguous => {
-                        charge_guard.ledger().record_ambiguous()?
+                        transport_guard.ledger().record_ambiguous()?
                     }
                 }
-                Ok(report.outcome)
+                Ok(ProviderAttemptExecution { outcome, response })
             }
             _ => {
                 // Only one request was authorized and charged. The rest escaped authority, so the
                 // ledger closes and this request produces no audit.
-                charge_guard.ledger().record_issued_attempt()?;
-                Err(charge_guard
+                transport_guard.ledger().record_issued_attempt()?;
+                Err(transport_guard
                     .ledger()
                     .poison(ProviderClientError::TransportIssuedUnauthorizedRequests))
             }
@@ -1515,7 +1974,7 @@ where
     /// Validates a request against the cell boundary, the capability gate, and the body rules,
     /// without charging or sending anything.
     ///
-    /// This is the public half of [`Self::authorize`]. It deliberately does not hand back the
+    /// This is the public half of [`Self::authorize_metered`]. It deliberately does not hand back the
     /// [`ProviderChargeRequest`], because that value is the only thing a
     /// [`ProviderChargeAuthority`] will charge, and a caller holding both it and the authority
     /// could charge outside any ledger — producing a committed grant the audit reports as zero,
@@ -1523,48 +1982,91 @@ where
     /// and no `Clone`, charging outside a ledger is unreachable rather than merely discouraged.
     pub fn validate_attempt(
         &self,
-        request: &ProviderAttemptRequest,
+        request: &MeteredProviderAttemptRequest,
     ) -> Result<(), ProviderClientError> {
-        self.authorize(request)?;
+        self.authorize_metered(&request.0)?;
         Ok(())
+    }
+
+    fn authorize_input<'a>(
+        &self,
+        input: MeteredAttemptInput<'a>,
+    ) -> Result<(ProviderChargeRequest, PreparedMeteredAttempt<'a>), ProviderClientError> {
+        match input {
+            MeteredAttemptInput::Durable(request) => Ok((
+                self.authorize_metered(request)?,
+                PreparedMeteredAttempt::Durable(request),
+            )),
+            MeteredAttemptInput::DirectPut { request, body } => {
+                let charge = self.authorize_charge(ProviderChargeFields {
+                    traffic_class: request.traffic_class,
+                    attempt_class: ProviderAttemptClass::PutObject,
+                    target: &request.target,
+                    logical_request_id: &request.logical_request_id,
+                    attempt_id: &request.attempt_id,
+                    attempt_ordinal: request.attempt_ordinal,
+                    deadline_unix_ms: request.deadline_unix_ms,
+                    budget_pin: &request.budget_pin,
+                })?;
+                let body = validate_direct_put_body(request, body)?;
+                Ok((charge, PreparedMeteredAttempt::DirectPut { request, body }))
+            }
+        }
     }
 
     /// Validates a request against the cell boundary, the capability gate, and the body rules, and
     /// returns the charge it implies. Charges nothing and sends nothing.
-    fn authorize(
+    fn authorize_metered(
         &self,
         request: &ProviderAttemptRequest,
     ) -> Result<ProviderChargeRequest, ProviderClientError> {
-        self.boundary.validate_target(&request.target)?;
-        if request.attempt_class.is_listing() && !self.capabilities.listing {
+        let charge = self.authorize_charge(ProviderChargeFields {
+            traffic_class: request.traffic_class,
+            attempt_class: request.attempt_class,
+            target: &request.target,
+            logical_request_id: &request.logical_request_id,
+            attempt_id: &request.attempt_id,
+            attempt_ordinal: request.attempt_ordinal,
+            deadline_unix_ms: request.deadline_unix_ms,
+            budget_pin: &request.budget_pin,
+        })?;
+        self.validate_body(request)?;
+        Ok(charge)
+    }
+
+    fn authorize_charge(
+        &self,
+        fields: ProviderChargeFields<'_>,
+    ) -> Result<ProviderChargeRequest, ProviderClientError> {
+        self.boundary.validate_target(fields.target)?;
+        if fields.attempt_class.is_listing() && !self.capabilities.listing {
             return Err(ProviderClientError::ListCapabilityNotGranted);
         }
-        canonical_uuid_v7_timestamp(&request.logical_request_id)
+        canonical_uuid_v7_timestamp(fields.logical_request_id)
             .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
-        let attempt_timestamp = canonical_uuid_v7_timestamp(&request.attempt_id)
+        let attempt_timestamp = canonical_uuid_v7_timestamp(fields.attempt_id)
             .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
-        if request.attempt_ordinal == 0 {
+        if fields.attempt_ordinal == 0 {
             return Err(ProviderClientError::InvalidAttemptOrdinal);
         }
         let latest_deadline = i64::try_from(attempt_timestamp)
             .ok()
             .and_then(|timestamp| timestamp.checked_add(PROVIDER_ATTEMPT_DEADLINE_HORIZON_MS))
             .ok_or(ProviderClientError::InvalidAttemptDeadline)?;
-        if request.deadline_unix_ms < 0 || request.deadline_unix_ms > latest_deadline {
+        if fields.deadline_unix_ms < 0 || fields.deadline_unix_ms > latest_deadline {
             return Err(ProviderClientError::InvalidAttemptDeadline);
         }
-        validate_budget_pin(&request.budget_pin)?;
-        self.validate_body(request)?;
+        validate_budget_pin(fields.budget_pin)?;
         Ok(ProviderChargeRequest {
             provider_boundary_id: self.boundary.provider_boundary_id.clone(),
-            traffic_class: request.traffic_class,
-            attempt_class: request.attempt_class,
+            traffic_class: fields.traffic_class,
+            attempt_class: fields.attempt_class,
             attempt_units: 1,
-            budget_pin: request.budget_pin.clone(),
-            logical_request_id: request.logical_request_id.clone(),
-            attempt_id: request.attempt_id.clone(),
-            attempt_ordinal: request.attempt_ordinal,
-            deadline_unix_ms: request.deadline_unix_ms,
+            budget_pin: fields.budget_pin.clone(),
+            logical_request_id: fields.logical_request_id.to_string(),
+            attempt_id: fields.attempt_id.to_string(),
+            attempt_ordinal: fields.attempt_ordinal,
+            deadline_unix_ms: fields.deadline_unix_ms,
         })
     }
 
@@ -1625,6 +2127,49 @@ where
     }
 }
 
+impl<C, T> GovernedProviderClient<C, T>
+where
+    T: ProviderGetTransport,
+{
+    /// Issues one unmetered, read-only `GetObject` without a database charge or durable ledger.
+    ///
+    /// The request type carries no budget pin, deadline, traffic class, grant, or general attempt
+    /// class. This method has no [`ProviderChargeAuthority`] bound and never reads the stored charge
+    /// authority. Exact one-wire-request enforcement remains process-local: a report of zero or
+    /// more than one request is rejected before its response can be surfaced.
+    pub async fn execute_get(
+        &self,
+        request: &ProviderGetAttemptRequest,
+        operation: &T::Operation,
+    ) -> Result<ProviderAttemptExecution<T::Response>, ProviderClientError> {
+        self.boundary.validate_target(&request.target)?;
+        canonical_uuid_v7_timestamp(&request.logical_request_id)
+            .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
+        canonical_uuid_v7_timestamp(&request.attempt_id)
+            .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
+        if request.attempt_ordinal == 0 {
+            return Err(ProviderClientError::InvalidAttemptOrdinal);
+        }
+
+        let attempt = AuthorizedProviderGet::new(request, self.retry_policy);
+        let ProviderAttemptReport {
+            outcome,
+            provider_requests_issued,
+            response,
+        } = self
+            .transport
+            .issue_get(&attempt, operation)
+            .await
+            .map_err(ProviderClientError::TransportRefused)?;
+
+        match provider_requests_issued {
+            0 => Err(ProviderClientError::TransportReportInconsistent),
+            1 => Ok(ProviderAttemptExecution { outcome, response }),
+            _ => Err(ProviderClientError::TransportIssuedUnauthorizedRequests),
+        }
+    }
+}
+
 impl<C, T> fmt::Debug for GovernedProviderClient<C, T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1634,6 +2179,25 @@ impl<C, T> fmt::Debug for GovernedProviderClient<C, T> {
             .field("retry_policy", &self.retry_policy)
             .finish()
     }
+}
+
+fn validate_direct_put_body<'a>(
+    request: &ProviderDirectPutAttemptRequest,
+    body: &'a [u8],
+) -> Result<ValidatedDirectPutBody<'a>, ProviderClientError> {
+    if body.is_empty() || body.len() > FRAGMENT_SIZE_THRESHOLD {
+        return Err(ProviderClientError::DirectPutBodyOutOfBounds);
+    }
+    let size = body.len() as u64;
+    let body_blake3 = *blake3::hash(body).as_bytes();
+    if request.declared_size != size || request.declared_blake3 != body_blake3 {
+        return Err(ProviderClientError::DirectPutBodyBindingMismatch);
+    }
+    Ok(ValidatedDirectPutBody {
+        bytes: body,
+        size,
+        blake3: body_blake3,
+    })
 }
 
 /// Validates the shape of WP-121's budget-configuration revision.
@@ -1712,6 +2276,12 @@ pub enum ProviderClientError {
     InvalidAttemptDeadline,
     #[error("provider attempt budget pin is invalid")]
     InvalidBudgetPin,
+    #[error("GetObject must use the unmetered read-only provider path")]
+    GetObjectRequiresReadOnlyPath,
+    #[error("provider direct put body must contain between one byte and the fragment size limit")]
+    DirectPutBodyOutOfBounds,
+    #[error("provider direct put body does not match its declared size and BLAKE3")]
+    DirectPutBodyBindingMismatch,
     #[error("provider put limits are outside the supported range")]
     InvalidPutLimits,
     #[error("provider multipart plan exceeds the permitted part count")]
@@ -1752,7 +2322,7 @@ pub enum ProviderClientError {
     TransportRefused(ProviderTransportRefusal),
     #[error("cell provider transport reported a successful call that issued no request")]
     TransportReportInconsistent,
-    #[error("cell provider transport issued more requests than were charged")]
+    #[error("cell provider transport issued more requests than were authorized")]
     TransportIssuedUnauthorizedRequests,
     #[error(
         "provider attempt ledger already recorded a no-dispatch, attempt, or decisive terminal"

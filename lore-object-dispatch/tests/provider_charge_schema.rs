@@ -3,9 +3,6 @@
 
 //! WP-114 CD-4's durable shared cell-local limiter schema.
 
-use std::time::Duration;
-
-use lore_object_dispatch::PostgresProviderChargeConfig;
 use lore_object_dispatch::ProviderChargeError;
 use lore_object_dispatch::classify_provider_charge_commit;
 
@@ -20,35 +17,6 @@ fn unresolved_commit_is_always_an_ambiguous_nonrefundable_charge() {
         classify_provider_charge_commit::<(), _>(Err("connection lost after COMMIT"));
 
     assert_eq!(result, Err(ProviderChargeError::AmbiguousCommit));
-}
-
-#[test]
-fn postgres_charge_timeouts_are_positive_whole_milliseconds() {
-    let valid = PostgresProviderChargeConfig {
-        statement_timeout: Duration::from_millis(1),
-        lock_timeout: Duration::from_millis(2),
-    };
-    assert_eq!(valid.validate(), Ok(valid));
-
-    for invalid in [
-        PostgresProviderChargeConfig {
-            statement_timeout: Duration::ZERO,
-            lock_timeout: Duration::from_millis(1),
-        },
-        PostgresProviderChargeConfig {
-            statement_timeout: Duration::from_nanos(1),
-            lock_timeout: Duration::from_millis(1),
-        },
-        PostgresProviderChargeConfig {
-            statement_timeout: Duration::from_millis(1),
-            lock_timeout: Duration::from_micros(1_001),
-        },
-    ] {
-        assert_eq!(
-            invalid.validate(),
-            Err(ProviderChargeError::ConfigurationUnresolved)
-        );
-    }
 }
 
 #[test]

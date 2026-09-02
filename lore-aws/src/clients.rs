@@ -349,6 +349,7 @@ impl AwsClientBuilder<WantsService> {
     }
 
     pub fn s3_with_path_style(self, force_path_style: bool) -> AwsClientBuilder<WantsBuckets> {
+        let resolved_endpoint_url = self.0.config.endpoint_url().map(str::to_owned);
         let s3_config = aws_sdk_s3::config::Builder::from(&self.0.config)
             .force_path_style(force_path_style)
             .build();
@@ -358,6 +359,7 @@ impl AwsClientBuilder<WantsService> {
             client: S3::new(
                 aws_sdk_s3::Client::from_conf(s3_config),
                 Duration::from_millis(self.0.slow_operation_threshold),
+                resolved_endpoint_url,
             ),
             buckets: vec![],
         })

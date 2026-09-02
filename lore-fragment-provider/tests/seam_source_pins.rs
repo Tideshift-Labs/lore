@@ -24,7 +24,7 @@
 //!   self-proof — went with them, except what the rules below still need.
 //!
 //! Five rules remain, and each is here because nothing else holds it: no
-//! publication of the fourteen types the re-export assessment depends on, the
+//! publication of the eighteen types the re-export assessment depends on, the
 //! erasure trait staying private, no AWS SDK in the manifest, no filesystem
 //! access, and the constructor signature.
 //!
@@ -63,15 +63,31 @@ use std::path::PathBuf;
 
 /// Filesystem access. The seam must have none: CR-031 removed the pre-admission
 /// body spool, and a crate boundary does not prevent `std::fs`.
-const FILESYSTEM_TOKENS: [&str; 8] = [
+const FILESYSTEM_TOKENS: [&str; 7] = [
     "std::fs",
     "tokio::fs",
     "OpenOptions",
     "create_dir",
     "read_to_string",
-    "SpoolLayout",
     "File::",
     "fs::",
+];
+
+/// WP-114 retains durable PUT reservation/spooling, but WP-118's bounded
+/// fragment seam must not import, project, call, or publish that capability.
+const PHASE5_DURABLE_PUT_TOKENS: [&str; 12] = [
+    "FragmentReservePutQuota",
+    "FragmentReservePutRequest",
+    "FragmentPutSpoolReady",
+    "ReservedFragmentPutAttempt",
+    "ReadyFragmentPutAttempt",
+    "ReservePutRequest",
+    "PutSpoolReadyRequest",
+    "bind_durable_put_body_from_ready",
+    "reserve_put(",
+    "put_spool_ready(",
+    "SpoolLayout",
+    "DurablePutSpoolExpectation",
 ];
 
 /// Every entry is a type whose publication would falsify a named claim in the
@@ -99,7 +115,7 @@ const FILESYSTEM_TOKENS: [&str; 8] = [
 /// turns `DispatchRuntimeClient` from a bound into a capability and thereby
 /// unlocks the rest. A claim resting on something nobody checks is the shape
 /// every finding in this campaign has taken.
-const FORBIDDEN_REEXPORTS: [(&str, &str); 14] = [
+const FORBIDDEN_REEXPORTS: [(&str, &str); 19] = [
     // Claim 1: `execute`'s parameters are unnameable outside this crate, so no
     // caller elsewhere can construct them. This is property 2 itself.
     (
@@ -109,6 +125,18 @@ const FORBIDDEN_REEXPORTS: [(&str, &str); 14] = [
     (
         "ProviderAttemptRequest",
         "execute's parameters stay unnameable",
+    ),
+    (
+        "MeteredProviderAttemptRequest",
+        "the charged execute capability stays behind AttemptSink",
+    ),
+    (
+        "ProviderDirectPutAttemptRequest",
+        "the raw direct PUT dispatch capability stays behind AttemptSink",
+    ),
+    (
+        "ProviderGetAttemptRequest",
+        "the raw GET dispatch capability stays behind AttemptSink",
     ),
     // Claim 2: `DispatchRuntimeClient` is a *bound*, not a capability. It rests
     // on the pool being unnameable, so nothing outside can construct a client —
@@ -144,12 +172,20 @@ const FORBIDDEN_REEXPORTS: [(&str, &str); 14] = [
         "ProviderTransport stays unimplementable",
     ),
     (
+        "AuthorizedProviderGet",
+        "ProviderGetTransport stays unimplementable",
+    ),
+    (
         "ProviderAttemptReport",
         "ProviderTransport stays unimplementable",
     ),
     (
         "ProviderTransportRefusal",
         "ProviderTransport stays unimplementable",
+    ),
+    (
+        "ProviderGetTransport",
+        "the raw GET transport stays unavailable outside the seam",
     ),
     // Claim 4: the same for `ProviderChargeAuthority`, so the only gateway
     // another crate can build is the unwired one.
@@ -461,6 +497,27 @@ fn the_erasure_trait_stays_private() {
     }
 }
 
+#[test]
+fn raw_direct_put_request_construction_stays_inside_the_admitted_put_execution() {
+    let shipped = shipped_code(&read("src/lib.rs"));
+    assert_eq!(
+        shipped.matches("ProviderDirectPutAttemptRequest {").count(),
+        1,
+        "the raw direct PUT request must have exactly one construction site"
+    );
+    let admitted = block_after(&shipped, "impl AdmittedFragmentPutAttempt<'_>", '{', '}');
+    assert!(admitted.contains("ProviderDirectPutAttemptRequest {"));
+
+    let opaque = block_after(
+        &shipped,
+        "pub struct FragmentDirectPutRequest<'a>",
+        '{',
+        '}',
+    );
+    assert!(!opaque.contains("pub authorized:"));
+    assert!(!opaque.contains("pub operation:"));
+}
+
 // ---------------------------------------------------------------------------
 // Rule 2: property 3's structural form depends on a manifest
 // ---------------------------------------------------------------------------
@@ -518,32 +575,27 @@ fn the_seam_manifest_admits_no_provider_sdk() {
 /// comment-stripped file, tests included, so the `#[cfg(test)]` walk — and the
 /// desynchronisation recorded as this file's known limit — cannot hide anything
 /// from it. That costs nothing here: the seam's own tests touch no filesystem
-/// either. `SpoolLayout` is the one exception, because the put-body fixture
-/// constructs one to derive a path without opening anything, so it is checked
-/// against shipped code alone and named as the exception rather than dropped.
+/// either.
 #[test]
 fn the_seam_performs_no_filesystem_work() {
     let whole_file = strip_line_comments(&read("src/lib.rs"));
-    let unconditional: Vec<&str> = FILESYSTEM_TOKENS
-        .iter()
-        .copied()
-        .filter(|token| *token != "SpoolLayout")
-        .collect();
-    let found = hits(&whole_file, &unconditional);
+    let found = hits(&whole_file, &FILESYSTEM_TOKENS);
     assert!(
         found.is_empty(),
         "the seam names {found:?} somewhere in the file; CR-031 adds no \
          pre-admission body spool",
     );
+}
 
-    assert!(
-        whole_file.contains("SpoolLayout"),
-        "the put-body fixture is expected to name SpoolLayout; if it stopped, \
-         drop the exception below rather than leaving it unexplained",
+#[test]
+fn the_phase5_seam_has_no_durable_reservation_or_spool_capability() {
+    let found = hits(
+        &shipped_code(&read("src/lib.rs")),
+        &PHASE5_DURABLE_PUT_TOKENS,
     );
     assert!(
-        !shipped_code(&read("src/lib.rs")).contains("SpoolLayout"),
-        "shipped code must not derive a spool path",
+        found.is_empty(),
+        "the bounded fragment seam names WP-114 durable PUT capability {found:?}",
     );
 }
 

@@ -29,7 +29,8 @@ exercises that contract, at the `lore-postgres` layer.
 
 [CmdletBinding()]
 param(
-    [switch]$KeepOnFailure
+    [switch]$KeepOnFailure,
+    [string[]]$OnlyCase = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -55,12 +56,14 @@ $inventory = @(
         Exact         = $true
         ExactPrefixes = @()
         Cases         = @(
+            'normal_direct_write_uses_legacy_key_and_missing_reoffer_uses_repair_epoch_key',
+            'payload_free_coordinated_preflight_distinguishes_exact_readable_from_new_publication',
             'resolver_returns_the_identical_verdict_whether_asked_singly_or_batched',
             'stale_association_rejection_comes_from_repository_tombstone_not_generation_drift',
             'a_positive_read_requires_both_a_live_association_and_a_readable_current_epoch',
             'a_blocked_io_phase_does_not_hold_the_one_connection_pool',
             'two_independently_constructed_coordinators_race_one_fresh_head_and_exactly_one_wins',
-            'a_stale_witness_from_a_competing_direct_write_fences_a_late_commit_with_zero_mutation',
+            'a_replayed_direct_write_reuses_the_witness_and_a_late_commit_mutates_nothing',
             'a_stale_witness_from_a_competing_obliterate_fences_a_late_commit_with_zero_mutation',
             'a_stale_witness_from_a_competing_repair_fences_a_late_commit_with_zero_mutation',
             'a_readable_to_unreadable_transition_bumps_every_live_associated_repository_atomically',
@@ -108,6 +111,9 @@ $inventory = @(
             'enable_lifecycle_refuses_with_the_roll_forward_diagnostic_when_schema_version_exceeds_the_binary',
             'abandon_promotion_leaves_the_head_staged_and_readable_and_moves_no_repository_lifecycle_generation',
             'a_successful_repair_quarantines_the_predecessor_epoch_and_marks_the_successor_current_eligible',
+            'query_matches_distinguish_exact_context_partition_and_unreadable_rows_in_one_batch',
+            'guarded_association_requires_the_exact_readable_witness',
+            'guarded_association_cannot_race_mark_missing_into_a_successful_residue',
             # INV-EF P1-1: the begin_obliterate fanout race (fixed at 76033cb).
             'a_concurrent_create_association_landing_between_the_plan_and_the_head_lock_is_refused_with_zero_mutation',
             'begin_obliterate_on_a_non_readable_head_moves_the_association_scalar_for_every_live_associated_repository'
@@ -137,6 +143,17 @@ $results = @(
         }
     }
 )
+
+$unknownCases = @($OnlyCase | Where-Object { $_ -notin $results.Test })
+if ($unknownCases.Count -ne 0) {
+    throw "unknown -OnlyCase value(s): [$($unknownCases -join ', ')]"
+}
+$selectedResults = if ($OnlyCase.Count -eq 0) {
+    @($results)
+}
+else {
+    @($results | Where-Object { $_.Test -in $OnlyCase })
+}
 
 $priorPgUrl = [Environment]::GetEnvironmentVariable('LORE_TEST_PG_URL', 'Process')
 
@@ -301,7 +318,7 @@ try {
     Push-Location $loreRoot
     try {
         $testOrdinal = 0
-        foreach ($result in $results) {
+        foreach ($result in $selectedResults) {
             $testOrdinal += 1
             $databaseName = "wp118_fragment_$($testOrdinal)_$($runId.Substring(0, 12))"
             Invoke-Checked docker @(
@@ -367,8 +384,8 @@ try {
         Pop-Location
     }
 
-    $passCount = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
-    if ($passCount -eq $results.Count) {
+    $passCount = @($selectedResults | Where-Object { $_.Status -eq 'PASS' }).Count
+    if ($passCount -eq $selectedResults.Count) {
         $runPassed = $true
     }
 }

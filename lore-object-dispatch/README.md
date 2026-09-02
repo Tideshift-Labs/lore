@@ -1,21 +1,22 @@
 # lore-object-dispatch
 
-Server-only object-store dispatch authority primitives. The crate is dark source: it is not linked
-into loreserver composition and cannot authorize provider traffic or first-seen admission.
+Server-only object-store dispatch authority primitives. WP-118 Phase 5 composes them behind the
+opt-in `fragment_provider` block. The block defaults dark and authorizes no traffic when absent or
+disabled.
 
 ## Composition: in-process cell authority
 
 There is no separate dispatcher process, no in-cell mTLS service, and no surviving RPC (CR-033 D1,
 2026-08-28). The cell dispatch authority is the retained PostgreSQL procedures below, installed in
-the cell database and called directly by every loreserver replica and drain worker through the typed
-Rust client in `dispatch_client.rs`. That client uses a **fourth, separately credentialed** pool of
-its own (`dispatch_pool.rs`), not `lore-postgres`'s existing store pools: CR-033 D1's original
-"consume the existing pool" is unimplementable, because every retained mutation asserts
+the cell database and called by the enabled loreserver direct path through the typed Rust client in
+`dispatch_client.rs`. Future drain workers share that path and pool. The client uses a separately
+credentialed pool of its own
+(`dispatch_pool.rs`), not a `lore-postgres` store pool, because every retained mutation asserts
 `session_user = 'object_dispatch_retention_runtime'` and grants `EXECUTE` only to that role, while a
-store pool connects as the store identity. The external-endpoint connection contract (single ASCII
-DNS host, `sslmode=require`, pinned CA, mandatory client certificate) was written for an authority
-database outside every cell and does not survive now that the authority is the cell's own database.
-Redaction and the closed retry classification do survive: connection strings, PEM material,
+store pool connects as the store identity. Enabled composition requires one ASCII DNS host,
+`sslmode=require`, a pinned CA, and hostname verification. Omitted, disabled, or preferred TLS is
+refused. The dispatch pool attests the expected `(system_identifier, database_oid)` on every new
+connection. Connection strings, PEM material,
 PostgreSQL diagnostics, and parameter values never reach `Display`, `Debug`, `Error::source`,
 tracing, or detached-task logs.
 
@@ -232,10 +233,11 @@ are checked for agreement at publication, then retained as one stored revision a
 resolver cannot repeat that three-way agreement check. Charge-time cell scope is the
 `provider_boundary_id` alone; the resolver does not read `cell_id`.
 
-`PostgresProviderChargeAuthority` accepts a preconnected dispatch-runtime client. Composition must
-draw that client from the one dispatch pool shared by the replica's request path and drain tasks.
-It must not create a pool per limiter or worker. The recorded staging budget is three store pools
-plus one dispatch pool. At `pool_max = 5`, that is at most 20 database connections per replica.
+`PostgresProviderChargeAuthority` accepts a preconnected dispatch-runtime client. Composition draws
+that client from the one dispatch pool shared by the replica's request path and future drain tasks.
+It does not create a pool per limiter or worker. The hard process inventory is the immutable,
+mutable, lock, domain, and dispatch pools. Every maximum is positive and their checked sum cannot
+exceed 20.
 Provider-attempt deadlines are bounded to five minutes after the attempt UUIDv7 timestamp and to
 five minutes after the database admission clock. A grant must report a database time strictly
 before that deadline. `ATTEMPT_ALREADY_CHARGED` proves a prior durable grant and never increments
@@ -287,13 +289,11 @@ durable admission, ReservePut, and spool-ready transitions themselves.
 ## Governed provider client (WP-114 CD-5)
 
 `provider_client.rs` is the crate's only place a provider attempt may be authorized: the cell
-boundary binding, the PUT execution plan, and the charge-before-send kernel. It ships **no provider
-SDK, no credential, no endpoint route, no database connection, and no lock**, and performs no
-filesystem or network I/O. The two seams CR-033 D4 needs around a send — the charge authority and
-the S3 transport — are traits. `UnwiredChargeAuthority` and `UnwiredProviderTransport` remain the
-shipped defaults, and both **fail closed on every call**. `provider_charge.rs` supplies the explicit
-PostgreSQL authority for CD-4, but no default, flag, or composition path selects it.
-Compiling or testing this module authorizes no provider traffic; it is not activation evidence.
+boundary binding, PUT execution plan, and charge-before-send kernel. It ships no SDK or credential.
+WP-118 Phase 5 selects its PostgreSQL authority and retry-disabled S3 transport only when
+`fragment_provider` is enabled. Fragment GET uses the governed target without entering the charge
+authority. PUT and the other ten metered classes charge before send. This composition is source
+wiring, not deployment or activation evidence.
 `compaction.rs` exposes `pub(crate) provider_attempt_audit_is_valid` so the ledger calls the one
 frozen audit predicate instead of restating it.
 
@@ -320,29 +320,24 @@ boundary.
 `ReservePut` admission, 0015's non-final upload progress, 0017's `SPOOL_READY` transition, 0020's
 maintenance-only participant enrollment and runtime-only dispatcher registration, and 0019's
 runtime-callable installed-layer readback. `dispatch_pool.rs` owns the connection pool underneath
-it. Both are source-dark: no composition path constructs either, and compiling or testing them
-opens no cell connection.
+it. Phase 5 constructs one shared pool only for an enabled, complete configuration. Absent or
+disabled configuration preserves the legacy path and opens no dispatch connection.
 
 **Two credentials, two clients.** Every 0013/0015/0017 mutation and 0020's registration assert
 `session_user = 'object_dispatch_retention_runtime'`; 0020's enrollment asserts the maintenance
-role. `lore-postgres`'s CR-007 store pools connect as the store identity and so cannot carry any of
-these calls — that is why CR-033 D1's "consume the existing pool" is unimplementable and a fourth
-pool exists. `DispatchRuntimeClient` refuses a pool that is not the runtime identity and
+role. `lore-postgres`'s CR-007 store pools connect as the store identity and so cannot carry these
+calls. `DispatchRuntimeClient` refuses a pool that is not the runtime identity and
 `DispatchMaintenanceClient` refuses one that is not maintenance, and a pool refuses a URL whose user
 is not its own role, so a maintenance credential cannot reach a runtime mutation by mistake.
 
-**The connection budget, stated.** `DISPATCH_CONNECTION_BUDGET_STATEMENT` and
-`STAGING_DISPATCH_CONNECTION_BUDGET` carry it: per replica, three `lore-postgres` store pools plus
-one dispatch-runtime pool, all against the same cell database, none coordinating; at staging's
-`pool_max = 5` that is `(3 + 1) * 5 = 20` connections per replica, before the control plane's own
-pools on the same instance. The sizing rule and the failure mode it prevents are
+**The connection budget, stated.** `DispatchConnectionBudget` checks the resolved immutable,
+mutable, lock, domain, and dispatch pool maxima before any dispatch connection. Each must be
+positive. Checked addition must succeed and the sum must not exceed the hard process cap of 20.
+The configured dispatch maximum must equal the dispatch pool's own maximum. The sizing rule is
 `lorehub/docs/learnings/do-managed-pg-connection-budget.md`: an instance sized for the app pools
 alone rather than the full consumer set was exhausted at `max_connections = 25`, and the exhaustion
 surfaced as SQLSTATE `53300` in three unrelated-looking failures rather than as an obvious pool
-error — which is why `53300` has its own named arm here rather than falling to the generic one.
-`DispatchRuntimePool::new` refuses a `pool_max` above the budget it is given. What it cannot check is the sum across a process: a pool sees only itself, so two pools each
-declaring `dispatch_pools: 1` are individually valid and jointly over. Making the sum true is a
-composition-time obligation, recorded as a named residual in WP-114 CD-3.
+error, which is why `53300` has its own named arm instead of falling to the generic one.
 
 **Closed decoding.** Each procedure returns `CREATED`/`REPLAY` or `APPLIED`/`REPLAY`, and each
 failure is a `RAISE EXCEPTION` with a frozen message literal and a SQLSTATE. An unrecognized result
@@ -563,7 +558,7 @@ re-migrates nor moves the catalog, refusal on a truncated chain with the schema 
 found, refusal on seven distinct catalog drift classes each caught in its own manifest section, and
 the revoke-after-replacement path restoring the exact pinned ACL state. Verified 5/5 PASS.
 
-Limitations, updated through CD-3: `object_store_retention_read_state_v1` (0003's readback) still
+Limitations: `object_store_retention_read_state_v1` (0003's readback) still
 has no live caller among the runner's twelve tests, but `cell-schema-install attest`
 above is now a live caller. The first of WP-114 CD-1's two named readback gaps is closed. The second
 is not: migrations 0012-0017 still have no `read_state` procedure, and on a fully installed cell
@@ -571,7 +566,6 @@ is not: migrations 0012-0017 still have no `read_state` procedure, and on a full
 alongside 0011's outright revoke of the 0008 readback (`42501`). The Rust attester carries those
 layers instead, behaviourally, not through catalog readback. Migration 0019's dispatcher-identity
 readback does not share that gap: it is a live caller for every layer named above it, itself
-included, and CD-2 carries live cases for both its schema and provisioning halves. What CD-3 still
-owes is the typed cell-authority client and dispatch-runtime pool that would call these procedures
-from a running loreserver; until that lands, every gate above proves the schema and its readback,
-not that anything calls it at runtime.
+included, and CD-2 carries live cases for both its schema and provisioning halves. Phase 5 now calls
+the runtime readback and attests the exact physical database identity before schema, charging, or
+provider routing. CD-6 and CD-7 still owe drain and shared-filesystem write-behind behavior.

@@ -23,15 +23,18 @@
 //! `lore-aws` features that are out of scope for this crate (CR-007 §"Out of
 //! scope": the byte target is just "an S3-compatible store").
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
+use aws_smithy_types::retry::RetryConfig;
 use bytes::Bytes;
 use bytes::BytesMut;
 use deadpool_postgres::Pool;
@@ -65,6 +68,41 @@ use lore_storage::errors::AddressNotFound;
 use lore_storage::errors::SlowDown;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
 use tokio_postgres::Transaction;
+
+use crate::domain::fragments::BeginOutcome;
+use crate::domain::fragments::BudgetPin;
+use crate::domain::fragments::CONTENT_STRUCTURE_MASK;
+use crate::domain::fragments::CellProviderBoundary;
+use crate::domain::fragments::CommitVerdict;
+use crate::domain::fragments::DecodeSupport;
+use crate::domain::fragments::ENCODING_MASK;
+use crate::domain::fragments::EpochAuthority;
+use crate::domain::fragments::FragmentAttemptLedger;
+use crate::domain::fragments::FragmentDirectPutOperation;
+use crate::domain::fragments::FragmentDispatchRuntimeConfig;
+use crate::domain::fragments::FragmentGetAttempt;
+use crate::domain::fragments::FragmentGetOperation;
+use crate::domain::fragments::FragmentGetResponse;
+use crate::domain::fragments::FragmentManifest;
+use crate::domain::fragments::FragmentProviderActivationError;
+use crate::domain::fragments::FragmentProviderAttempt;
+use crate::domain::fragments::FragmentProviderDisposition;
+use crate::domain::fragments::FragmentProviderEntry;
+use crate::domain::fragments::FragmentProviderError;
+use crate::domain::fragments::FragmentQueryRequest;
+use crate::domain::fragments::FragmentTransportOperation;
+use crate::domain::fragments::FragmentTransportResponse;
+use crate::domain::fragments::FragmentVerdict;
+use crate::domain::fragments::InFlightPutBound;
+use crate::domain::fragments::IoObservation;
+use crate::domain::fragments::MissingDiagnostic;
+use crate::domain::fragments::PostgresFragmentCoordinator;
+use crate::domain::fragments::ProviderAttemptClass;
+use crate::domain::fragments::ProviderAttemptOutcome;
+use crate::domain::fragments::ProviderCapabilities;
+use crate::domain::fragments::ProviderTrafficClass;
+use crate::domain::fragments::coordinator::DirectWriteKind;
+use crate::domain::fragments::decodable_encoding;
 
 /// Self-bootstrapping schema. The `(hash, repository, context)` primary key is
 /// the association identity; its B-tree also serves the leftmost-prefix
@@ -121,12 +159,80 @@ pub struct ObjectStoreSettings {
     pub validate_bucket_on_startup: bool,
 }
 
+/// Closed configuration refusals from the retry-disabled physical S3 adapter.
+///
+/// These are startup classifications, not provider outcomes. No variant
+/// carries a credential, endpoint, bucket, region, or SDK configuration value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PostgresFragmentTransportConfigError {
+    #[error("fragment provider S3 client has no resolved retry configuration")]
+    MissingRetryConfiguration,
+    #[error("fragment provider S3 client automatic retry is not disabled")]
+    RetryEnabled,
+    #[error("fragment provider S3 client has no trustworthy resolved region")]
+    MissingResolvedRegion,
+    #[error("fragment provider target has an invalid normalized region")]
+    InvalidTargetRegion,
+    #[error("fragment provider target region does not match resolved S3 client")]
+    RegionMismatch,
+    #[error("fragment provider S3 client has no trustworthy resolved endpoint")]
+    MissingResolvedEndpoint,
+    #[error("fragment provider target has an invalid normalized endpoint")]
+    InvalidTargetEndpoint,
+    #[error("fragment provider target endpoint does not match resolved S3 client")]
+    EndpointMismatch,
+}
+
+/// Closed startup failures while attaching the governed fragment route.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PostgresFragmentProviderActivationError {
+    #[error("fragment provider bucket does not match immutable store bucket")]
+    BucketMismatch,
+    #[error("fragment provider requires an explicit resolved S3 endpoint")]
+    MissingResolvedEndpoint,
+    #[error("fragment provider S3 transport configuration failed: {0}")]
+    Transport(
+        #[from]
+        #[source]
+        PostgresFragmentTransportConfigError,
+    ),
+    #[error("fragment provider seam activation failed: {0}")]
+    Provider(
+        #[from]
+        #[source]
+        FragmentProviderActivationError,
+    ),
+}
+
+impl From<PostgresFragmentProviderActivationError> for StoreError {
+    fn from(error: PostgresFragmentProviderActivationError) -> Self {
+        StoreError::internal_with_context(error, "fragment provider activation failed")
+    }
+}
+
 /// Postgres-backed immutable store with authoritative fragment representations on S3 objects.
 pub struct PostgresImmutableStore {
     pool: Pool,
     s3: S3Impl,
     bucket: String,
     instruments: crate::metrics::Instruments,
+    fragment_route: FragmentLifecycleRoute,
+    io_timeout: Duration,
+}
+
+enum FragmentLifecycleRoute {
+    Legacy,
+    Coordinated {
+        coordinator: PostgresFragmentCoordinator,
+        provider: Arc<FragmentProviderEntry>,
+        budget_pin: BudgetPin,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct CoordinatedProvider<'a> {
+    entry: &'a FragmentProviderEntry,
+    budget_pin: &'a BudgetPin,
 }
 
 /// Mutable lifecycle state. Representation flags and sizes never live here.
@@ -181,11 +287,14 @@ impl PostgresImmutableStore {
         let pool = crate::pool::build_pool(pg_url, pool_max, tls)?;
         crate::pool::ensure_schema(&pool, SCHEMA).await?;
 
-        // Build the S3-compatible byte client via lore-aws's client builder so
-        // endpoint / region / path-style handling matches the AWS backend.
+        // Build the legacy S3-compatible byte client with its existing retry
+        // policy. Coordinated mode derives its separate retry-disabled client
+        // from this client's resolved configuration only when that route is
+        // selected.
+        let http_settings = HttpClientSettings::default();
         let builder = Box::pin(
             AwsClientBuilder::builder()
-                .with_http_settings(&HttpClientSettings::default())
+                .with_http_settings(&http_settings)
                 .maybe_endpoint(object.endpoint_url.clone())
                 .maybe_region(object.region.clone())
                 .with_timeout_config(
@@ -207,12 +316,79 @@ impl PostgresImmutableStore {
             .await
             .map_err(|e| format!("failed to build S3 client: {e}"))?;
 
+        let io_timeout = Duration::from_millis(object.timeout_millis);
         Ok(Self {
             pool,
             s3,
             bucket: object.bucket,
             instruments: crate::metrics::Instruments::new("immutable"),
+            fragment_route: FragmentLifecycleRoute::Legacy,
+            io_timeout,
         })
+    }
+
+    /// Select the coordinator-owned route after server boot has proved the
+    /// lifecycle schema complete, enabled, and ready and constructed the one
+    /// attested provider entry. Absent or disabled cells never call this.
+    pub fn with_fragment_lifecycle(
+        mut self,
+        coordinator: PostgresFragmentCoordinator,
+        provider: Arc<FragmentProviderEntry>,
+        budget_pin: BudgetPin,
+    ) -> Self {
+        self.fragment_route = FragmentLifecycleRoute::Coordinated {
+            coordinator,
+            provider,
+            budget_pin,
+        };
+        self
+    }
+
+    /// Build the one governed provider entry around a distinct SDK client, then
+    /// select the coordinator route. The new client clones the legacy client's
+    /// resolved configuration and overrides only automatic retry, so credentials,
+    /// endpoint, region, timeouts, and path-style behavior cannot drift. Server
+    /// boot calls this only after readiness chose complete+enabled lifecycle mode.
+    pub async fn with_fragment_provider(
+        self,
+        coordinator: PostgresFragmentCoordinator,
+        budget_pin: BudgetPin,
+        dispatch: FragmentDispatchRuntimeConfig,
+        boundary: CellProviderBoundary,
+        capabilities: ProviderCapabilities,
+        in_flight_puts: InFlightPutBound,
+    ) -> Result<Self, PostgresFragmentProviderActivationError> {
+        let target = boundary.target().clone();
+        if target.bucket != self.bucket {
+            return Err(PostgresFragmentProviderActivationError::BucketMismatch);
+        }
+        let resolved_endpoint_url = self
+            .s3
+            .resolved_endpoint_url()
+            .ok_or(PostgresFragmentProviderActivationError::MissingResolvedEndpoint)?;
+        let provider_config = self
+            .s3
+            .sdk_client()
+            .config()
+            .to_builder()
+            .retry_config(RetryConfig::disabled())
+            .build();
+        let transport = super::fragment_transport::PostgresFragmentS3Transport::new(
+            aws_sdk_s3::Client::from_conf(provider_config),
+            target.bucket,
+            target.region,
+            target.endpoint_host,
+            &resolved_endpoint_url,
+        )?;
+        let provider = FragmentProviderEntry::connect(
+            dispatch,
+            boundary,
+            capabilities,
+            in_flight_puts,
+            transport,
+        )
+        .await?;
+        Ok(self.with_fragment_lifecycle(coordinator, Arc::new(provider), budget_pin))
     }
 
     fn hash_key(hash: Hash) -> String {
@@ -503,6 +679,622 @@ impl PostgresImmutableStore {
         tx.commit().await.map_err(db_err)
     }
 
+    fn fragment_from_manifest(manifest: &FragmentManifest) -> Result<Fragment, MissingDiagnostic> {
+        Ok(Fragment {
+            flags: u32::try_from(manifest.payload_flags)
+                .map_err(|_| MissingDiagnostic::InvalidStructure)?,
+            size_payload: u32::try_from(manifest.size_payload)
+                .map_err(|_| MissingDiagnostic::InvalidStructure)?,
+            size_content: u64::try_from(manifest.size_content)
+                .map_err(|_| MissingDiagnostic::InvalidStructure)?,
+        })
+    }
+
+    /// Validate a stored representation in the required order: shared
+    /// structural validators, supported-decoder selection, decode, then
+    /// semantic comparison with the immutable manifest and requested hash.
+    fn validate_candidate(
+        requested_hash: Hash,
+        manifest: &FragmentManifest,
+        fragment: Fragment,
+        payload: Bytes,
+    ) -> Result<(Fragment, Bytes), MissingDiagnostic> {
+        lore_storage::validate_fragment_metadata(&fragment)
+            .map_err(|_| MissingDiagnostic::InvalidStructure)?;
+        if lore_storage::validate_fragment_payload(&fragment, payload.len()).is_err() {
+            return Err(if payload.len() < fragment.size_payload as usize {
+                MissingDiagnostic::Truncated
+            } else {
+                MissingDiagnostic::InvalidStructure
+            });
+        }
+        if fragment.flags & FragmentFlags::PayloadFragmented.bits() != 0 {
+            lore_storage::validate_fragment_list(&fragment, &payload)
+                .map_err(|_| MissingDiagnostic::InvalidStructure)?;
+        }
+
+        match decodable_encoding(fragment.flags) {
+            DecodeSupport::Supported => {}
+            DecodeSupport::RecognizedUnsupported => {
+                return Err(MissingDiagnostic::UnrepairableEncoding);
+            }
+            DecodeSupport::Undefined => return Err(MissingDiagnostic::InvalidStructure),
+        }
+
+        let decoded = if fragment.flags & ENCODING_MASK == 0 {
+            payload.clone()
+        } else {
+            lore_storage::decompress(fragment, payload.as_ref())
+                .map_err(|_| MissingDiagnostic::Corrupt)?
+                .1
+                .freeze()
+        };
+        let persisted_flags = fragment.flags & (CONTENT_STRUCTURE_MASK | ENCODING_MASK);
+        let manifest_flags = u32::try_from(manifest.payload_flags)
+            .map_err(|_| MissingDiagnostic::InvalidStructure)?;
+        let decoded_hash = Hash::hash_buffer(decoded.as_ref());
+        if manifest.size_payload != i64::from(fragment.size_payload)
+            || manifest.size_content != i64::try_from(fragment.size_content).unwrap_or(i64::MAX)
+            || manifest_flags != persisted_flags
+            || manifest.decoded_hash.as_slice() != decoded_hash.data()
+            || decoded_hash != requested_hash
+        {
+            return Err(MissingDiagnostic::Corrupt);
+        }
+        Ok((stored_durable(fragment), payload))
+    }
+
+    async fn resolve_one(
+        coordinator: &PostgresFragmentCoordinator,
+        repository: Context,
+        address: Address,
+    ) -> Result<crate::domain::fragments::FragmentResolution, StoreError> {
+        coordinator
+            .resolve(
+                repository.data(),
+                address.context.data(),
+                &[address.hash.data().to_vec()],
+            )
+            .await
+            .map_err(domain_store_err)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| StoreError::internal("fragment resolver omitted its requested hash"))
+    }
+
+    async fn mark_coordinated_missing(
+        coordinator: &PostgresFragmentCoordinator,
+        witness: &crate::domain::fragments::EpochWitness,
+        diagnostic: MissingDiagnostic,
+    ) -> Result<(), StoreError> {
+        coordinator
+            .mark_missing(witness, diagnostic)
+            .await
+            .map_err(domain_store_err)?;
+        Ok(())
+    }
+
+    async fn load_coordinated(
+        &self,
+        coordinator: &PostgresFragmentCoordinator,
+        provider: &FragmentProviderEntry,
+        repository: Context,
+        address: Address,
+    ) -> Result<(Fragment, Bytes), StoreError> {
+        let resolution = Self::resolve_one(coordinator, repository, address).await?;
+        let captured_verdict = resolution.verdict.clone();
+        let FragmentVerdict::Readable {
+            witness, manifest, ..
+        } = resolution.verdict
+        else {
+            return Err(Self::not_found(address.hash));
+        };
+
+        let loaded = match manifest.authority {
+            EpochAuthority::Remote => {
+                let logical_request_id = uuid::Uuid::now_v7().hyphenated().to_string();
+                let attempt_id = uuid::Uuid::now_v7().hyphenated().to_string();
+                let execution = provider
+                    .get(
+                        &FragmentGetAttempt {
+                            logical_request_id,
+                            attempt_id,
+                            attempt_ordinal: 1,
+                        },
+                        &FragmentGetOperation {
+                            object_key: manifest.object_key.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(provider_store_err)?;
+                match (execution.outcome, execution.response) {
+                    (
+                        ProviderAttemptOutcome::Decisive,
+                        FragmentGetResponse::Found { bytes, metadata },
+                    ) => {
+                        let metadata = metadata.into_iter().collect::<HashMap<_, _>>();
+                        let fragment = from_object_metadata(Some(&metadata))
+                            .map_err(|_| MissingDiagnostic::InvalidStructure);
+                        match fragment.and_then(|fragment| {
+                            Self::validate_candidate(
+                                address.hash,
+                                &manifest,
+                                fragment,
+                                Bytes::from(bytes),
+                            )
+                        }) {
+                            Ok(loaded) => loaded,
+                            Err(diagnostic) => {
+                                Self::mark_coordinated_missing(coordinator, &witness, diagnostic)
+                                    .await?;
+                                return Err(Self::not_found(address.hash));
+                            }
+                        }
+                    }
+                    (ProviderAttemptOutcome::Decisive, FragmentGetResponse::NotFound) => {
+                        Self::mark_coordinated_missing(
+                            coordinator,
+                            &witness,
+                            MissingDiagnostic::Absent,
+                        )
+                        .await?;
+                        return Err(Self::not_found(address.hash));
+                    }
+                    (ProviderAttemptOutcome::Decisive, FragmentGetResponse::Throttled)
+                    | (ProviderAttemptOutcome::Ambiguous, _) => {
+                        return Err(StoreError::from(SlowDown));
+                    }
+                    (
+                        ProviderAttemptOutcome::Decisive,
+                        FragmentGetResponse::DefiniteFailure
+                        | FragmentGetResponse::AmbiguousFailure,
+                    ) => {
+                        return Err(StoreError::internal(
+                            "fragment provider GET did not return a readable response",
+                        ));
+                    }
+                }
+            }
+            EpochAuthority::Staged => {
+                let deadline = SystemTime::now()
+                    .checked_add(self.io_timeout)
+                    .ok_or_else(|| StoreError::internal("staged lease deadline overflow"))?;
+                let lease_id = *uuid::Uuid::now_v7().as_bytes();
+                coordinator
+                    .acquire_staged_leases(
+                        &lease_id,
+                        &[(witness.hash.clone(), witness.epoch)],
+                        deadline,
+                    )
+                    .await
+                    .map_err(domain_store_err)?;
+                let read =
+                    tokio::time::timeout(self.io_timeout, tokio::fs::read(&manifest.object_key))
+                        .await;
+                let result = match read {
+                    Ok(Ok(bytes)) => Self::fragment_from_manifest(&manifest).and_then(|fragment| {
+                        Self::validate_candidate(
+                            address.hash,
+                            &manifest,
+                            fragment,
+                            Bytes::from(bytes),
+                        )
+                    }),
+                    Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Err(MissingDiagnostic::Absent)
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        coordinator
+                            .release_staged_lease(&lease_id)
+                            .await
+                            .map_err(domain_store_err)?;
+                        return Err(StoreError::from(SlowDown));
+                    }
+                };
+                coordinator
+                    .release_staged_lease(&lease_id)
+                    .await
+                    .map_err(domain_store_err)?;
+                match result {
+                    Ok(loaded) => loaded,
+                    Err(diagnostic) => {
+                        Self::mark_coordinated_missing(coordinator, &witness, diagnostic).await?;
+                        return Err(Self::not_found(address.hash));
+                    }
+                }
+            }
+        };
+
+        let revalidated = Self::resolve_one(coordinator, repository, address).await?;
+        if revalidated.verdict != captured_verdict {
+            return Err(StoreError::from(SlowDown));
+        }
+        Ok(loaded)
+    }
+
+    fn provider_deadline_unix_ms(&self) -> Result<i64, StoreError> {
+        let deadline = SystemTime::now()
+            .checked_add(self.io_timeout)
+            .ok_or_else(|| StoreError::internal("fragment provider deadline overflow"))?;
+        let millis = deadline
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|error| {
+                StoreError::internal_with_context(error, "fragment provider deadline before epoch")
+            })?
+            .as_millis();
+        i64::try_from(millis).map_err(|error| {
+            StoreError::internal_with_context(error, "fragment provider deadline exceeds i64")
+        })
+    }
+
+    fn validate_head_candidate(
+        requested_hash: Hash,
+        manifest: &FragmentManifest,
+        metadata: Vec<(String, String)>,
+        content_length: u64,
+    ) -> Result<Fragment, MissingDiagnostic> {
+        let metadata = metadata.into_iter().collect::<HashMap<_, _>>();
+        let fragment = from_object_metadata(Some(&metadata))
+            .map_err(|_| MissingDiagnostic::InvalidStructure)?;
+        lore_storage::validate_fragment_metadata(&fragment)
+            .map_err(|_| MissingDiagnostic::InvalidStructure)?;
+
+        let manifest_flags = u32::try_from(manifest.payload_flags)
+            .map_err(|_| MissingDiagnostic::InvalidStructure)?;
+        let persisted_flags = fragment.flags & (CONTENT_STRUCTURE_MASK | ENCODING_MASK);
+        if content_length != u64::from(fragment.size_payload)
+            || manifest.size_payload != i64::from(fragment.size_payload)
+            || manifest.size_content != i64::try_from(fragment.size_content).unwrap_or(i64::MAX)
+            || manifest_flags != persisted_flags
+            || manifest.decoded_hash.as_slice() != requested_hash.data()
+        {
+            return Err(MissingDiagnostic::Corrupt);
+        }
+        Ok(stored_durable(fragment))
+    }
+
+    async fn load_metadata_coordinated(
+        &self,
+        coordinator: &PostgresFragmentCoordinator,
+        provider: &FragmentProviderEntry,
+        budget_pin: &BudgetPin,
+        repository: Context,
+        address: Address,
+    ) -> Result<Fragment, StoreError> {
+        let resolution = Self::resolve_one(coordinator, repository, address).await?;
+        let captured_verdict = resolution.verdict.clone();
+        let FragmentVerdict::Readable {
+            witness, manifest, ..
+        } = resolution.verdict
+        else {
+            return Err(Self::not_found(address.hash));
+        };
+        if manifest.authority == EpochAuthority::Staged {
+            return Self::fragment_from_manifest(&manifest)
+                .map(stored_durable)
+                .map_err(|_| Self::not_found(address.hash));
+        }
+
+        let logical_request_id = uuid::Uuid::now_v7().hyphenated().to_string();
+        let attempt_id = uuid::Uuid::now_v7().hyphenated().to_string();
+        let mut ledger = FragmentAttemptLedger::new(
+            provider.boundary().provider_boundary_id(),
+            &logical_request_id,
+        )
+        .map_err(provider_store_err)?;
+        let admitted = provider
+            .admit_operation(
+                FragmentProviderAttempt {
+                    traffic_class: ProviderTrafficClass::Read,
+                    attempt_class: ProviderAttemptClass::HeadObject,
+                    logical_request_id,
+                    attempt_id,
+                    attempt_ordinal: 1,
+                    deadline_unix_ms: self.provider_deadline_unix_ms()?,
+                    budget_pin: budget_pin.clone(),
+                    put_body: None,
+                },
+                FragmentTransportOperation::Head {
+                    object_key: manifest.object_key.clone(),
+                },
+            )
+            .await
+            .map_err(provider_store_err)?;
+        let execution = admitted
+            .execute(&mut ledger)
+            .await
+            .map_err(provider_store_err)?;
+        let fragment = match (execution.outcome, execution.response) {
+            (
+                ProviderAttemptOutcome::Decisive,
+                FragmentTransportResponse::Head {
+                    metadata,
+                    content_length,
+                },
+            ) => match Self::validate_head_candidate(
+                address.hash,
+                &manifest,
+                metadata,
+                content_length,
+            ) {
+                Ok(fragment) => fragment,
+                Err(diagnostic) => {
+                    Self::mark_coordinated_missing(coordinator, &witness, diagnostic).await?;
+                    return Err(Self::not_found(address.hash));
+                }
+            },
+            (ProviderAttemptOutcome::Decisive, FragmentTransportResponse::NotFound) => {
+                Self::mark_coordinated_missing(coordinator, &witness, MissingDiagnostic::Absent)
+                    .await?;
+                return Err(Self::not_found(address.hash));
+            }
+            (ProviderAttemptOutcome::Ambiguous, _) => return Err(StoreError::from(SlowDown)),
+            (ProviderAttemptOutcome::Decisive, FragmentTransportResponse::DefiniteFailure) => {
+                return Err(StoreError::internal(
+                    "fragment provider HEAD returned a definite failure",
+                ));
+            }
+            _ => {
+                return Err(StoreError::internal(
+                    "fragment provider HEAD returned an inconsistent response",
+                ));
+            }
+        };
+
+        let revalidated = Self::resolve_one(coordinator, repository, address).await?;
+        if revalidated.verdict != captured_verdict {
+            return Err(StoreError::from(SlowDown));
+        }
+        Ok(fragment)
+    }
+
+    fn direct_manifest(
+        intent: &crate::domain::fragments::FragmentIntent,
+        address: Address,
+        fragment: Fragment,
+        payload: &Bytes,
+    ) -> Result<FragmentManifest, StoreError> {
+        let mut identity = blake3::Hasher::new();
+        identity.update(b"lore-fragment-manifest-v1\0");
+        identity.update(&(intent.object_key.len() as u64).to_le_bytes());
+        identity.update(intent.object_key.as_bytes());
+        identity.update(&fragment.flags.to_le_bytes());
+        identity.update(&fragment.size_payload.to_le_bytes());
+        identity.update(&fragment.size_content.to_le_bytes());
+        identity.update(address.hash.data());
+        identity.update(blake3::hash(payload).as_bytes());
+        Ok(FragmentManifest {
+            authority: EpochAuthority::Remote,
+            object_key: intent.object_key.clone(),
+            manifest_id: identity.finalize().as_bytes().to_vec(),
+            size_payload: i64::from(fragment.size_payload),
+            size_content: i64::try_from(fragment.size_content).map_err(|error| {
+                StoreError::internal_with_context(
+                    error,
+                    "fragment size_content exceeds manifest range",
+                )
+            })?,
+            decoded_hash: address.hash.data().to_vec(),
+            payload_flags: i64::from(fragment.flags & (CONTENT_STRUCTURE_MASK | ENCODING_MASK)),
+        })
+    }
+
+    async fn verify_conditional_put(
+        &self,
+        provider: &FragmentProviderEntry,
+        manifest: &FragmentManifest,
+        address: Address,
+    ) -> Result<IoObservation, StoreError> {
+        let execution = provider
+            .get(
+                &FragmentGetAttempt {
+                    logical_request_id: uuid::Uuid::now_v7().hyphenated().to_string(),
+                    attempt_id: uuid::Uuid::now_v7().hyphenated().to_string(),
+                    attempt_ordinal: 1,
+                },
+                &FragmentGetOperation {
+                    object_key: manifest.object_key.clone(),
+                },
+            )
+            .await
+            .map_err(provider_store_err)?;
+        match (execution.outcome, execution.response) {
+            (ProviderAttemptOutcome::Decisive, FragmentGetResponse::Found { bytes, metadata }) => {
+                let metadata = metadata.into_iter().collect::<HashMap<_, _>>();
+                let fragment = match from_object_metadata(Some(&metadata)) {
+                    Ok(fragment) => fragment,
+                    Err(_) => {
+                        return Ok(IoObservation::Unusable(MissingDiagnostic::InvalidStructure));
+                    }
+                };
+                match Self::validate_candidate(address.hash, manifest, fragment, Bytes::from(bytes))
+                {
+                    Ok(_) => Ok(IoObservation::Valid(manifest.clone())),
+                    Err(diagnostic) => Ok(IoObservation::Unusable(diagnostic)),
+                }
+            }
+            (ProviderAttemptOutcome::Decisive, FragmentGetResponse::NotFound) => {
+                Ok(IoObservation::Unusable(MissingDiagnostic::Absent))
+            }
+            (ProviderAttemptOutcome::Decisive, FragmentGetResponse::Throttled)
+            | (ProviderAttemptOutcome::Ambiguous, _) => Err(StoreError::from(SlowDown)),
+            _ => Err(StoreError::internal(
+                "conditional fragment object verification failed",
+            )),
+        }
+    }
+
+    async fn issue_direct_put(
+        &self,
+        provider: CoordinatedProvider<'_>,
+        intent: &crate::domain::fragments::FragmentIntent,
+        manifest: &FragmentManifest,
+        address: Address,
+        fragment: Fragment,
+        payload: &Bytes,
+    ) -> Result<IoObservation, StoreError> {
+        let logical_request_id = uuid::Uuid::now_v7().hyphenated().to_string();
+        let attempt_id = uuid::Uuid::now_v7().hyphenated().to_string();
+        let mut ledger = FragmentAttemptLedger::new(
+            provider.entry.boundary().provider_boundary_id(),
+            &logical_request_id,
+        )
+        .map_err(provider_store_err)?;
+        let traffic_class = match intent.direct_write_kind() {
+            Some(DirectWriteKind::Normal) => ProviderTrafficClass::DirectFallback,
+            Some(DirectWriteKind::Repair) => ProviderTrafficClass::Repair,
+            None => {
+                return Err(StoreError::internal(
+                    "fragment direct PUT intent has no direct-write lineage",
+                ));
+            }
+        };
+        let body_blake3 = *blake3::hash(payload).as_bytes();
+        let admitted = provider
+            .entry
+            .admit_put(
+                FragmentProviderAttempt {
+                    traffic_class,
+                    attempt_class: ProviderAttemptClass::PutObject,
+                    logical_request_id,
+                    attempt_id,
+                    attempt_ordinal: 1,
+                    deadline_unix_ms: self.provider_deadline_unix_ms()?,
+                    budget_pin: provider.budget_pin.clone(),
+                    put_body: None,
+                },
+                FragmentDirectPutOperation {
+                    object_key: intent.object_key.clone(),
+                    metadata: to_object_metadata(&fragment).into_iter().collect(),
+                    declared_size: payload.len() as u64,
+                    declared_blake3: body_blake3,
+                },
+            )
+            .await
+            .map_err(provider_store_err)?;
+        let execution = admitted
+            .execute_direct_put(&mut ledger, payload)
+            .await
+            .map_err(provider_store_err)?;
+        match (execution.outcome, execution.response) {
+            (ProviderAttemptOutcome::Decisive, FragmentTransportResponse::PutCreated) => {
+                Ok(IoObservation::Valid(manifest.clone()))
+            }
+            (
+                ProviderAttemptOutcome::Decisive,
+                FragmentTransportResponse::PutPreconditionFailed,
+            )
+            | (ProviderAttemptOutcome::Ambiguous, _) => {
+                self.verify_conditional_put(provider.entry, manifest, address)
+                    .await
+            }
+            (ProviderAttemptOutcome::Decisive, FragmentTransportResponse::DefiniteFailure) => {
+                Err(StoreError::internal("fragment provider PUT failed"))
+            }
+            _ => Err(StoreError::internal(
+                "fragment provider PUT returned an inconsistent response",
+            )),
+        }
+    }
+
+    async fn put_coordinated(
+        &self,
+        coordinator: &PostgresFragmentCoordinator,
+        provider: CoordinatedProvider<'_>,
+        repository: Context,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), StoreError> {
+        let Some(payload) = payload else {
+            return match Self::resolve_one(coordinator, repository, address)
+                .await?
+                .verdict
+            {
+                FragmentVerdict::Readable { .. } => Ok(()),
+                FragmentVerdict::Absent => Err(StoreError::internal(
+                    "fragment direct PUT requires payload bytes",
+                )),
+            };
+        };
+        let preflight_manifest = FragmentManifest {
+            authority: EpochAuthority::Remote,
+            object_key: String::new(),
+            manifest_id: vec![0; 32],
+            size_payload: i64::from(fragment.size_payload),
+            size_content: i64::try_from(fragment.size_content).map_err(|error| {
+                StoreError::internal_with_context(
+                    error,
+                    "fragment size_content exceeds manifest range",
+                )
+            })?,
+            decoded_hash: address.hash.data().to_vec(),
+            payload_flags: i64::from(fragment.flags & (CONTENT_STRUCTURE_MASK | ENCODING_MASK)),
+        };
+        Self::validate_candidate(address.hash, &preflight_manifest, fragment, payload.clone())
+            .map_err(|diagnostic| {
+                StoreError::internal(format!(
+                    "fragment direct PUT semantic validation failed: {diagnostic:?}"
+                ))
+            })?;
+        let legacy_key = Self::hash_key(address.hash);
+        let begin = coordinator
+            .begin_direct_write(address.hash.data(), &legacy_key)
+            .await
+            .map_err(domain_store_err)?;
+        let intent = match begin {
+            BeginOutcome::AlreadyReadable(witness) => {
+                return match coordinator
+                    .create_association_if_current(
+                        &witness,
+                        repository.data(),
+                        address.context.data(),
+                    )
+                    .await
+                    .map_err(domain_store_err)?
+                {
+                    CommitVerdict::Published => Ok(()),
+                    CommitVerdict::Fenced | CommitVerdict::Abandoned => {
+                        Err(StoreError::from(SlowDown))
+                    }
+                };
+            }
+            BeginOutcome::Fenced(_) => return Err(StoreError::from(SlowDown)),
+            BeginOutcome::Admitted(intent) => intent,
+        };
+        let manifest = Self::direct_manifest(&intent, address, fragment, &payload)?;
+
+        let observation = self
+            .issue_direct_put(provider, &intent, &manifest, address, fragment, &payload)
+            .await?;
+        let published_readable = matches!(observation, IoObservation::Valid(_));
+        match coordinator
+            .commit_remote(&intent, observation)
+            .await
+            .map_err(domain_store_err)?
+        {
+            CommitVerdict::Published => {}
+            CommitVerdict::Fenced | CommitVerdict::Abandoned => {
+                return Err(StoreError::from(SlowDown));
+            }
+        }
+        if !published_readable {
+            return Err(StoreError::from(SlowDown));
+        }
+        match coordinator
+            .create_association(
+                address.hash.data(),
+                repository.data(),
+                address.context.data(),
+            )
+            .await
+            .map_err(domain_store_err)?
+        {
+            CommitVerdict::Published => Ok(()),
+            CommitVerdict::Fenced | CommitVerdict::Abandoned => Err(StoreError::from(SlowDown)),
+        }
+    }
+
     /// Fetch the payload and its authoritative fragment from one `GetObject` response.
     async fn load(&self, hash: Hash) -> Result<(Fragment, Bytes), StoreError> {
         let key = Self::hash_key(hash);
@@ -691,6 +1483,26 @@ impl PostgresImmutableStore {
 
 /// Map a query/execute error; transient failures become `SlowDown` so clients
 /// retry rather than treat them as permanent (A2).
+fn domain_store_err(error: crate::domain::errors::DomainError) -> StoreError {
+    if error.is_retryable() {
+        StoreError::from(SlowDown)
+    } else {
+        StoreError::internal_with_context(error, "fragment lifecycle coordinator failed")
+    }
+}
+
+fn provider_store_err(error: FragmentProviderError) -> StoreError {
+    match error.disposition() {
+        FragmentProviderDisposition::Transient => StoreError::from(SlowDown),
+        FragmentProviderDisposition::InvalidInput
+        | FragmentProviderDisposition::NotReady
+        | FragmentProviderDisposition::OutcomeUnknown
+        | FragmentProviderDisposition::Internal => {
+            StoreError::internal_with_context(error, "fragment provider seam failed")
+        }
+    }
+}
+
 fn db_err(e: tokio_postgres::Error) -> StoreError {
     if crate::pool::is_transient_pg(&e) {
         StoreError::from(SlowDown)
@@ -785,6 +1597,56 @@ impl ImmutableStore for PostgresImmutableStore {
         }
         let _t = self.instruments.start("query", self.pool.status());
         let repository: Context = partition.into();
+        if let FragmentLifecycleRoute::Coordinated { coordinator, .. } = &self.fragment_route {
+            let requested = addresses
+                .iter()
+                .map(|address| FragmentQueryRequest {
+                    hash: address.hash.data().to_vec(),
+                    context: address.context.data().to_vec(),
+                })
+                .collect::<Vec<_>>();
+            let matches = coordinator
+                .resolve_query_matches(repository.data(), &requested)
+                .await
+                .map_err(domain_store_err)?;
+            if matches.len() != results.len() {
+                return Err(StoreError::internal(
+                    "fragment query resolver returned the wrong result count",
+                ));
+            }
+            for ((address, resolved), result) in
+                addresses.iter().zip(matches).zip(results.iter_mut())
+            {
+                if resolved.hash.as_slice() != address.hash.data() {
+                    return Err(StoreError::internal(
+                        "fragment query resolver changed request order",
+                    ));
+                }
+                let match_made = if resolved.exact_context_readable {
+                    StoreMatch::MatchFull
+                } else if resolved.partition_readable {
+                    StoreMatch::MatchPartition
+                } else {
+                    StoreMatch::MatchNone
+                };
+                *result = if match_made == StoreMatch::MatchNone {
+                    StoreMatchResult::default()
+                } else {
+                    StoreMatchResult {
+                        match_made,
+                        partition,
+                        context: if match_made == StoreMatch::MatchFull {
+                            address.context
+                        } else {
+                            Context::default()
+                        },
+                        stored_local: false,
+                        stored_durable: true,
+                    }
+                };
+            }
+            return Ok(());
+        }
         let client = self.pool.get().await.map_err(pool_err)?;
 
         // A fragment push resolves thousands of hashes at once. Join lifecycle state to the
@@ -853,6 +1715,25 @@ impl ImmutableStore for PostgresImmutableStore {
     ) -> Result<StoreGetData, StoreError> {
         let _t = self.instruments.start("get_metadata", self.pool.status());
         let repository: Context = partition.into();
+        if let FragmentLifecycleRoute::Coordinated {
+            coordinator,
+            provider,
+            budget_pin,
+        } = &self.fragment_route
+        {
+            return match self
+                .load_metadata_coordinated(coordinator, provider, budget_pin, repository, address)
+                .await
+            {
+                Ok(fragment) => Ok(StoreGetData::metadata(
+                    fragment,
+                    StoreMatch::MatchFull,
+                    partition,
+                )),
+                Err(error) if error.is_address_not_found() => Ok(StoreGetData::default()),
+                Err(error) => Err(error),
+            };
+        }
         let (associated, state) = tokio::join!(
             self.association_exists(repository, address),
             self.load_state(address.hash)
@@ -885,6 +1766,22 @@ impl ImmutableStore for PostgresImmutableStore {
     ) -> Result<StoreGetData, StoreError> {
         let _t = self.instruments.start("get", self.pool.status());
         let repository: Context = partition.into();
+        if let FragmentLifecycleRoute::Coordinated {
+            coordinator,
+            provider,
+            ..
+        } = &self.fragment_route
+        {
+            let (fragment, payload) = self
+                .load_coordinated(coordinator, provider, repository, address)
+                .await?;
+            return Ok(StoreGetData {
+                fragment,
+                match_made: StoreMatch::MatchFull,
+                partition,
+                payload: Some(payload),
+            });
+        }
         let (associated, state) = tokio::join!(
             self.association_exists(repository, address),
             self.load_state(address.hash)
@@ -935,6 +1832,26 @@ impl ImmutableStore for PostgresImmutableStore {
             )
         })?;
         let repository: Context = partition.into();
+        if let FragmentLifecycleRoute::Coordinated {
+            coordinator,
+            provider,
+            budget_pin,
+        } = &self.fragment_route
+        {
+            return self
+                .put_coordinated(
+                    coordinator,
+                    CoordinatedProvider {
+                        entry: provider,
+                        budget_pin,
+                    },
+                    repository,
+                    address,
+                    fragment,
+                    payload,
+                )
+                .await;
+        }
         let mut client = self.pool.get().await.map_err(pool_err)?;
         let tx = client.transaction().await.map_err(db_err)?;
         Self::lock_hash(&tx, address.hash).await?;
@@ -1154,6 +2071,45 @@ impl ImmutableStore for PostgresImmutableStore {
             context: destination_context,
         };
 
+        if let FragmentLifecycleRoute::Coordinated { coordinator, .. } = &self.fragment_route {
+            let hashes = [source_address.hash.data().to_vec()];
+            let resolution = if source_address.context.is_zero() {
+                coordinator
+                    .resolve_partition(source_repository.data(), &hashes)
+                    .await
+            } else {
+                coordinator
+                    .resolve(
+                        source_repository.data(),
+                        source_address.context.data(),
+                        &hashes,
+                    )
+                    .await
+            }
+            .map_err(domain_store_err)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| StoreError::internal("copy resolver omitted its requested hash"))?;
+            let FragmentVerdict::Readable { witness, .. } = resolution.verdict else {
+                return Err(StoreError::from(AddressNotFound::from(source_address)));
+            };
+            return match coordinator
+                .create_association_if_current(
+                    &witness,
+                    destination_repository.data(),
+                    destination_context.data(),
+                )
+                .await
+                .map_err(domain_store_err)?
+            {
+                crate::domain::fragments::CommitVerdict::Published => Ok(()),
+                crate::domain::fragments::CommitVerdict::Fenced
+                | crate::domain::fragments::CommitVerdict::Abandoned => {
+                    Err(StoreError::from(SlowDown))
+                }
+            };
+        }
+
         let mut client = self.pool.get().await.map_err(pool_err)?;
         let tx = client.transaction().await.map_err(db_err)?;
         Self::lock_hash(&tx, source_address.hash).await?;
@@ -1236,6 +2192,17 @@ impl ImmutableStore for PostgresImmutableStore {
             .instruments
             .start("repository_stats", self.pool.status());
         let repository: Context = partition.into();
+        if let FragmentLifecycleRoute::Coordinated { coordinator, .. } = &self.fragment_route {
+            let stats = coordinator
+                .repository_stats(repository.data())
+                .await
+                .map_err(domain_store_err)?;
+            return Ok(StoreRepositoryStats {
+                fragment_count: stats.fragment_count,
+                payload_bytes: stats.payload_bytes,
+                content_bytes: stats.content_bytes,
+            });
+        }
         let mut client = self.pool.get().await.map_err(pool_err)?;
         let tx = client.transaction().await.map_err(db_err)?;
 

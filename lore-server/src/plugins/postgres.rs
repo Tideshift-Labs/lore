@@ -19,13 +19,25 @@
 //! is implemented, its `create()` returns [`PluginInitError`]; `validate_config`
 //! already parses the config so misconfiguration surfaces early.
 
+use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
+use lore_postgres::domain::DatabaseIdentity;
 use lore_postgres::domain::PostgresDomainStore;
+use lore_postgres::domain::fragments::BudgetPin;
+use lore_postgres::domain::fragments::CellProviderBoundary;
+use lore_postgres::domain::fragments::FragmentDatabaseIdentity;
+use lore_postgres::domain::fragments::FragmentDispatchRuntimeConfig;
+use lore_postgres::domain::fragments::FragmentDispatchTls;
+use lore_postgres::domain::fragments::FragmentProcessPoolInventory;
 use lore_postgres::domain::fragments::InFlightPutBound;
+use lore_postgres::domain::fragments::PostgresFragmentCoordinator;
+use lore_postgres::domain::fragments::ProviderCapabilities;
+use lore_postgres::domain::fragments::ValidatedFragmentProcessPoolInventory;
 use lore_postgres::pool::TlsConfig;
 use lore_postgres::store::immutable_store::ObjectStoreSettings;
 use lore_postgres::store::immutable_store::PostgresImmutableStore;
@@ -71,13 +83,15 @@ pub struct PostgresStoreConfig {
     /// Max pooled connections for the CR-029 domain coordinator specifically.
     ///
     /// Deliberately its own knob with a small default rather than inheriting
-    /// `pool_max`. The coordinator is a **fourth** pool on every Postgres cell,
-    /// added whether or not domain enforcement is on, so inheriting a
-    /// `pool_max` of 10 would raise a cell's steady-state connection count by a
-    /// third to serve a subsystem that is idle until cutover. The two things it
-    /// actually does before then - bootstrap DDL and a singleton state read -
-    /// need one connection, and the backfill walks one repository at a time.
-    /// Raise it when a cell enables enforcement.
+    /// `pool_max`. The coordinator is the fourth pool alongside immutable,
+    /// mutable, and lock; an enabled fragment provider adds the separately
+    /// credentialed dispatch pool as the fifth. Composition accounts for all
+    /// five configured maxima against the hard process budget. Inheriting a
+    /// `pool_max` of 10 here would consume half that entire budget for a
+    /// subsystem that is idle until cutover. The two things it actually does
+    /// before then - bootstrap DDL and a singleton state read - need one
+    /// connection, and the backfill walks one repository at a time. Raise it
+    /// only while keeping the five-pool checked sum within budget.
     #[serde(default = "default_domain_pool_max")]
     pub domain_pool_max: u32,
     /// S3-compatible object storage for fragment bytes and authoritative
@@ -86,6 +100,10 @@ pub struct PostgresStoreConfig {
     /// everything in Postgres.
     #[serde(default)]
     pub object_store: Option<ObjectStoreConfig>,
+    /// Optional governed provider route for WP-118 fragment lifecycle I/O.
+    /// Absence and `enabled = false` leave the exact legacy route active.
+    #[serde(default)]
+    pub fragment_provider: Option<FragmentProviderConfig>,
     /// CR-031's bounded concurrent in-flight put count for the WP-118 fragment
     /// lifecycle provider seam.
     ///
@@ -94,14 +112,11 @@ pub struct PostgresStoreConfig {
     /// this count instead, which is why the number is configuration rather than
     /// a constant.
     ///
-    /// **Nothing constructs a gateway from this yet, deliberately.** Phase 4
-    /// builds the seam; Phase 5 routes the coordinator into the immutable store
-    /// and is where a gateway is first built. Wiring construction now would put
-    /// an unused provider boundary on the mandatory boot path, which is the
-    /// false-activation shape this package has already refused once for
-    /// `readiness()`.
+    /// The value is consumed only when the nested `fragment_provider` block is
+    /// enabled. Absent or disabled provider configuration leaves this bound
+    /// inert and constructs no dispatch pool or gateway.
     ///
-    /// What is live today is refusal at construction: an impossible value fails
+    /// An impossible value fails
     /// the store's `create()`, so a cell configured with one does not boot. The
     /// check lives in [`parse_config`], which every `create()` and the
     /// `validate_config` trait method both call. **It is deliberately not in
@@ -150,6 +165,120 @@ pub struct ObjectStoreConfig {
     pub validate_bucket_on_startup: bool,
 }
 
+/// Raw optional WP-118 provider configuration.
+///
+/// Fields stay optional at deserialization so an explicitly disabled block
+/// needs only `enabled = false`. [`enabled_fragment_provider_config`] converts
+/// an enabled block into a fully required typed value before any construction.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FragmentProviderConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub dispatch_postgres_url: Option<String>,
+    pub dispatch_ca_cert_path: Option<String>,
+    pub dispatch_pool_max: Option<u32>,
+    pub dispatch_connect_timeout_millis: Option<u64>,
+    pub dispatch_acquire_timeout_millis: Option<u64>,
+    pub dispatch_statement_timeout_millis: Option<u64>,
+    pub dispatch_lock_timeout_millis: Option<u64>,
+    pub provider_boundary_id: Option<String>,
+    pub endpoint_host: Option<String>,
+    pub region: Option<String>,
+    pub budget_revision: Option<String>,
+    pub budget_fence: Option<u64>,
+}
+
+impl fmt::Debug for FragmentProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FragmentProviderConfig")
+            .field("enabled", &self.enabled)
+            .field(
+                "dispatch_postgres_url",
+                &self.dispatch_postgres_url.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "dispatch_ca_cert_path",
+                &self.dispatch_ca_cert_path.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("dispatch_pool_max", &self.dispatch_pool_max)
+            .field(
+                "dispatch_connect_timeout_millis",
+                &self.dispatch_connect_timeout_millis,
+            )
+            .field(
+                "dispatch_acquire_timeout_millis",
+                &self.dispatch_acquire_timeout_millis,
+            )
+            .field(
+                "dispatch_statement_timeout_millis",
+                &self.dispatch_statement_timeout_millis,
+            )
+            .field(
+                "dispatch_lock_timeout_millis",
+                &self.dispatch_lock_timeout_millis,
+            )
+            .field(
+                "provider_boundary_id",
+                &self.provider_boundary_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "endpoint_host",
+                &self.endpoint_host.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("region", &self.region.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "budget_revision",
+                &self.budget_revision.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("budget_fence", &self.budget_fence)
+            .finish()
+    }
+}
+
+struct EnabledFragmentProviderConfig {
+    dispatch_postgres_url: String,
+    dispatch_ca_cert_path: String,
+    dispatch_pool_max: u32,
+    dispatch_connect_timeout: Duration,
+    dispatch_acquire_timeout: Duration,
+    dispatch_statement_timeout: Duration,
+    dispatch_lock_timeout: Duration,
+    boundary: CellProviderBoundary,
+    budget_pin: BudgetPin,
+}
+
+/// Everything the direct server composition path must supply to activate the
+/// governed fragment route.
+///
+/// Keeping the coordinator and exact process pool inventory in one value makes
+/// partial activation unrepresentable. Generic plugin and maintenance callers
+/// pass `None` and are refused before immutable-store construction when the
+/// route is enabled.
+pub(crate) struct FragmentProviderActivation {
+    coordinator: PostgresFragmentCoordinator,
+    process_pool_inventory: ValidatedFragmentProcessPoolInventory,
+    expected_database_identity: DatabaseIdentity,
+}
+
+impl FragmentProviderActivation {
+    pub(crate) fn new(
+        coordinator: PostgresFragmentCoordinator,
+        process_pool_inventory: ValidatedFragmentProcessPoolInventory,
+        expected_database_identity: DatabaseIdentity,
+    ) -> Self {
+        Self {
+            coordinator,
+            process_pool_inventory,
+            expected_database_identity,
+        }
+    }
+}
+
+const MAX_DISPATCH_POOL_MAX: u32 = 5;
+const MAX_DISPATCH_TIMEOUT_MILLIS: u64 = i32::MAX as u64;
+
 fn default_pool_max() -> u32 {
     10
 }
@@ -164,6 +293,138 @@ fn default_fragment_in_flight_puts() -> u32 {
 
 fn default_fragment_put_admission_wait_millis() -> u64 {
     5_000
+}
+
+fn config_error(name: &str, message: impl Into<String>) -> PluginError {
+    PluginError::from(PluginConfigError {
+        plugin_name: name.to_string(),
+        message: message.into(),
+    })
+}
+
+fn required_string(
+    name: &str,
+    field: &'static str,
+    value: &Option<String>,
+) -> Result<String, PluginError> {
+    value
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            config_error(
+                name,
+                format!("enabled fragment_provider requires non-empty {field}"),
+            )
+        })
+}
+
+fn required_timeout(
+    name: &str,
+    field: &'static str,
+    value: Option<u64>,
+) -> Result<Duration, PluginError> {
+    match value {
+        Some(value) if (1..=MAX_DISPATCH_TIMEOUT_MILLIS).contains(&value) => {
+            Ok(Duration::from_millis(value))
+        }
+        _ => Err(config_error(
+            name,
+            format!(
+                "enabled fragment_provider requires {field} between 1 and \
+                 {MAX_DISPATCH_TIMEOUT_MILLIS} milliseconds"
+            ),
+        )),
+    }
+}
+
+fn enabled_fragment_provider_config(
+    name: &str,
+    cfg: &PostgresStoreConfig,
+) -> Result<Option<EnabledFragmentProviderConfig>, PluginError> {
+    let Some(raw) = cfg
+        .fragment_provider
+        .as_ref()
+        .filter(|fragment_provider| fragment_provider.enabled)
+    else {
+        return Ok(None);
+    };
+    let object_store = cfg.object_store.as_ref().ok_or_else(|| {
+        config_error(
+            name,
+            "enabled fragment_provider requires the immutable object_store configuration",
+        )
+    })?;
+    let dispatch_pool_max = raw.dispatch_pool_max.ok_or_else(|| {
+        config_error(name, "enabled fragment_provider requires dispatch_pool_max")
+    })?;
+    if !(1..=MAX_DISPATCH_POOL_MAX).contains(&dispatch_pool_max) {
+        return Err(config_error(
+            name,
+            format!(
+                "enabled fragment_provider requires dispatch_pool_max between 1 and \
+                 {MAX_DISPATCH_POOL_MAX}"
+            ),
+        ));
+    }
+    let dispatch_postgres_url =
+        required_string(name, "dispatch_postgres_url", &raw.dispatch_postgres_url)?;
+    let dispatch_ca_cert_path =
+        required_string(name, "dispatch_ca_cert_path", &raw.dispatch_ca_cert_path)?;
+    let provider_boundary_id =
+        required_string(name, "provider_boundary_id", &raw.provider_boundary_id)?;
+    let endpoint_host = required_string(name, "endpoint_host", &raw.endpoint_host)?;
+    let region = required_string(name, "region", &raw.region)?;
+    let budget_revision = required_string(name, "budget_revision", &raw.budget_revision)?;
+    let budget_fence = raw
+        .budget_fence
+        .ok_or_else(|| config_error(name, "enabled fragment_provider requires budget_fence"))?;
+    let boundary = CellProviderBoundary::new(
+        &provider_boundary_id,
+        &object_store.bucket,
+        &region,
+        &endpoint_host,
+    )
+    .map_err(|error| {
+        config_error(
+            name,
+            format!("enabled fragment_provider has an invalid provider boundary: {error}"),
+        )
+    })?;
+    let budget_pin = BudgetPin::new(&budget_revision, budget_fence).map_err(|error| {
+        config_error(
+            name,
+            format!("enabled fragment_provider has an invalid budget pin: {error}"),
+        )
+    })?;
+
+    Ok(Some(EnabledFragmentProviderConfig {
+        dispatch_postgres_url,
+        dispatch_ca_cert_path,
+        dispatch_pool_max,
+        dispatch_connect_timeout: required_timeout(
+            name,
+            "dispatch_connect_timeout_millis",
+            raw.dispatch_connect_timeout_millis,
+        )?,
+        dispatch_acquire_timeout: required_timeout(
+            name,
+            "dispatch_acquire_timeout_millis",
+            raw.dispatch_acquire_timeout_millis,
+        )?,
+        dispatch_statement_timeout: required_timeout(
+            name,
+            "dispatch_statement_timeout_millis",
+            raw.dispatch_statement_timeout_millis,
+        )?,
+        dispatch_lock_timeout: required_timeout(
+            name,
+            "dispatch_lock_timeout_millis",
+            raw.dispatch_lock_timeout_millis,
+        )?,
+        boundary,
+        budget_pin,
+    }))
 }
 
 /// Validates CR-031's in-flight put configuration through the same type the
@@ -217,7 +478,51 @@ fn parse_config(name: &str, config: &toml::Value) -> Result<PostgresStoreConfig,
         })
     })?;
     validate_fragment_put_bound(name, &parsed)?;
+    let _ = enabled_fragment_provider_config(name, &parsed)?;
     Ok(parsed)
+}
+
+/// Whether the resolved immutable-store configuration requests the governed
+/// fragment route.
+///
+/// This uses the same typed parse and validation as construction. Server boot
+/// consults it only to preserve the legacy construction order when the block
+/// is absent or disabled; enabled construction still validates the value again
+/// at its real composition door.
+pub(crate) fn fragment_provider_enabled(config: &toml::Value) -> Result<bool, PluginError> {
+    let cfg = parse_config(PLUGIN_NAME, config)?;
+    Ok(cfg
+        .fragment_provider
+        .as_ref()
+        .is_some_and(|fragment_provider| fragment_provider.enabled))
+}
+
+/// Resolve the exact maxima of every Postgres pool an enabled fragment route
+/// will coexist with.
+///
+/// Each input is the same effective store-specific configuration its factory
+/// consumes. Parsing here therefore applies the real defaults independently:
+/// the three store pools use their own `pool_max`, the domain pool uses the
+/// mutable configuration's `domain_pool_max`, and dispatch uses only its
+/// mandatory nested value.
+pub(crate) fn fragment_process_pool_inventory(
+    immutable_config: &toml::Value,
+    mutable_config: &toml::Value,
+    lock_config: &toml::Value,
+) -> Result<Option<FragmentProcessPoolInventory>, PluginError> {
+    let immutable = parse_config(PLUGIN_NAME, immutable_config)?;
+    let Some(fragment_provider) = enabled_fragment_provider_config(PLUGIN_NAME, &immutable)? else {
+        return Ok(None);
+    };
+    let mutable = parse_config(PLUGIN_NAME, mutable_config)?;
+    let lock = parse_config(PLUGIN_NAME, lock_config)?;
+    Ok(Some(FragmentProcessPoolInventory {
+        immutable_pool_max: immutable.pool_max,
+        mutable_pool_max: mutable.pool_max,
+        lock_pool_max: lock.pool_max,
+        domain_pool_max: mutable.domain_pool_max,
+        dispatch_pool_max: fragment_provider.dispatch_pool_max,
+    }))
 }
 
 /// Build the Postgres TLS settings from config: read the optional CA PEM bundle
@@ -245,9 +550,36 @@ fn build_tls(name: &str, cfg: &PostgresStoreConfig) -> Result<TlsConfig, PluginE
 /// cannot drift between them.
 pub(crate) async fn connect_immutable_store(
     config: &toml::Value,
+    fragment_activation: Option<FragmentProviderActivation>,
 ) -> Result<PostgresImmutableStore, PluginError> {
     let plugin_name = PLUGIN_NAME;
     let cfg = parse_config(plugin_name, config)?;
+    let fragment_provider = enabled_fragment_provider_config(plugin_name, &cfg)?;
+    let in_flight_puts = validate_fragment_put_bound(plugin_name, &cfg)?;
+    let fragment_activation = match fragment_provider {
+        None => None,
+        Some(fragment_provider) => {
+            let activation = fragment_activation.ok_or_else(|| {
+                config_error(
+                    plugin_name,
+                    "enabled fragment_provider requires the lifecycle coordinator and exact process pool inventory",
+                )
+            })?;
+            let expected_database_identity = FragmentDatabaseIdentity::new(
+                &activation.expected_database_identity.system_identifier,
+                activation.expected_database_identity.database_oid,
+            )
+            .map_err(|error| {
+                PluginError::from(PluginInitError {
+                    plugin_name: plugin_name.to_string(),
+                    message: format!(
+                        "Failed to bind the attested Postgres database identity for fragment_provider: {error}"
+                    ),
+                })
+            })?;
+            Some((fragment_provider, activation, expected_database_identity))
+        }
+    };
     let tls = build_tls(plugin_name, &cfg)?;
     let object = cfg.object_store.ok_or_else(|| {
         PluginError::from(PluginConfigError {
@@ -267,12 +599,94 @@ pub(crate) async fn connect_immutable_store(
         validate_bucket_on_startup: object.validate_bucket_on_startup,
     };
 
-    PostgresImmutableStore::connect(&cfg.url, cfg.pool_max, &tls, object)
+    let store = PostgresImmutableStore::connect(&cfg.url, cfg.pool_max, &tls, object)
         .await
         .map_err(|e| {
             PluginError::from(PluginInitError {
                 plugin_name: plugin_name.to_string(),
                 message: format!("Failed to create Postgres immutable store: {e}"),
+            })
+        })?;
+    let Some((fragment_provider, activation, expected_database_identity)) = fragment_activation
+    else {
+        return Ok(store);
+    };
+    let FragmentProviderActivation {
+        coordinator,
+        process_pool_inventory,
+        expected_database_identity: _,
+    } = activation;
+    let readiness = coordinator.readiness().await.map_err(|error| {
+        PluginError::from(PluginInitError {
+            plugin_name: plugin_name.to_string(),
+            message: format!("Failed to read fragment lifecycle readiness: {error}"),
+        })
+    })?;
+    if !readiness.lifecycle_enabled {
+        return Err(config_error(
+            plugin_name,
+            "fragment_provider is enabled but fragment lifecycle routing is disabled",
+        ));
+    }
+    if !readiness.ready_for_lifecycle() {
+        return Err(config_error(
+            plugin_name,
+            format!(
+                "fragment_provider is enabled without complete fragment lifecycle readiness \
+                 (provisioned={}, schema_version={}, backfill_state={}, cutover_at_present={}, \
+                  same_database={}, sequence_headroom={}, unresolved_rows={})",
+                readiness.provisioned,
+                readiness.schema_version,
+                readiness.backfill_state,
+                readiness.cutover_at_present,
+                readiness.same_database,
+                readiness.sequence_headroom,
+                readiness.unresolved_rows
+            ),
+        ));
+    }
+
+    // The server configuration never exposes plaintext dispatch mode. The
+    // pinned-CA pool also checks that this URL says `sslmode=require`; a URL
+    // using disable, prefer, or any other mode is refused before a connection.
+    let dispatch_ca =
+        std::fs::read_to_string(&fragment_provider.dispatch_ca_cert_path).map_err(|_| {
+            config_error(
+                plugin_name,
+                "enabled fragment_provider could not read dispatch_ca_cert_path",
+            )
+        })?;
+    if dispatch_ca.trim().is_empty() {
+        return Err(config_error(
+            plugin_name,
+            "enabled fragment_provider dispatch_ca_cert_path contains no CA certificate",
+        ));
+    }
+    let dispatch = FragmentDispatchRuntimeConfig {
+        postgres_url: fragment_provider.dispatch_postgres_url,
+        expected_database_identity,
+        process_pool_inventory,
+        connect_timeout: fragment_provider.dispatch_connect_timeout,
+        acquire_timeout: fragment_provider.dispatch_acquire_timeout,
+        statement_timeout: fragment_provider.dispatch_statement_timeout,
+        lock_timeout: fragment_provider.dispatch_lock_timeout,
+        tls: FragmentDispatchTls::PinnedRootCa(dispatch_ca),
+    };
+
+    store
+        .with_fragment_provider(
+            coordinator,
+            fragment_provider.budget_pin,
+            dispatch,
+            fragment_provider.boundary,
+            ProviderCapabilities::none(),
+            in_flight_puts,
+        )
+        .await
+        .map_err(|error| {
+            PluginError::from(PluginInitError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("Failed to activate fragment_provider: {error}"),
             })
         })
 }
@@ -381,7 +795,7 @@ impl ImmutableStorePluginFactory for PostgresImmutableStorePluginFactory {
         // at most one runtime core is handed off at a time.
         #[allow(clippy::disallowed_methods)]
         let store = tokio::task::block_in_place(|| {
-            runtime().block_on(Box::pin(connect_immutable_store(config)))
+            runtime().block_on(Box::pin(connect_immutable_store(config, None)))
         })?;
 
         Ok(Arc::new(store))
@@ -640,7 +1054,7 @@ bucket = "fragments"
             let immutable = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map(|runtime| runtime.block_on(connect_immutable_store(&config)));
+                .map(|runtime| runtime.block_on(connect_immutable_store(&config, None)));
             match immutable {
                 Ok(Err(error)) => assert!(
                     format!("{error}").contains(ADMISSION_REFUSAL),
@@ -674,6 +1088,64 @@ bucket = "fragments"
         assert_eq!(
             bound.acquire_timeout(),
             std::time::Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn heterogeneous_store_configuration_builds_the_exact_five_pool_inventory() {
+        let immutable: toml::Value = toml::from_str(
+            r#"
+url = "postgresql://immutable@db.example/cell"
+pool_max = 1
+[object_store]
+bucket = "fragments"
+endpoint_url = "https://objects.example.com"
+region = "us-test-1"
+[fragment_provider]
+enabled = true
+dispatch_postgres_url = "postgresql://dispatcher@db-alias.example/cell?sslmode=require"
+dispatch_ca_cert_path = "C:/secrets/dispatch-ca.pem"
+dispatch_pool_max = 5
+dispatch_connect_timeout_millis = 1000
+dispatch_acquire_timeout_millis = 1000
+dispatch_statement_timeout_millis = 2000
+dispatch_lock_timeout_millis = 3000
+provider_boundary_id = "cell.primary"
+endpoint_host = "objects.example.com"
+region = "us-test-1"
+budget_revision = "budget-v1"
+budget_fence = 7
+"#,
+        )
+        .expect("immutable config");
+        let mutable: toml::Value = toml::from_str(
+            r#"
+url = "postgresql://mutable@db.example/cell"
+pool_max = 2
+domain_pool_max = 4
+"#,
+        )
+        .expect("mutable config");
+        let lock: toml::Value = toml::from_str(
+            r#"
+url = "postgresql://lock@db.example/cell"
+pool_max = 3
+"#,
+        )
+        .expect("lock config");
+
+        let inventory = fragment_process_pool_inventory(&immutable, &mutable, &lock)
+            .expect("valid inventory")
+            .expect("enabled provider inventory");
+        assert_eq!(
+            inventory,
+            FragmentProcessPoolInventory {
+                immutable_pool_max: 1,
+                mutable_pool_max: 2,
+                lock_pool_max: 3,
+                domain_pool_max: 4,
+                dispatch_pool_max: 5,
+            }
         );
     }
 

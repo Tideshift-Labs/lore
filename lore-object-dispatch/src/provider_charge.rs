@@ -3,17 +3,19 @@
 
 //! Dark PostgreSQL implementation of the shared cell-local provider limiter.
 //!
-//! The authority accepts a preconnected dispatch-runtime client. It does not install schema,
+//! The authority leases from the same dispatch-runtime pool as the typed authority client. It does
+//! not install schema,
 //! publish a budget, choose a concrete pin, open a provider route, or become the shipped default.
 //! Each call uses one serializable transaction. The database function resolves and validates the
 //! current publication, takes the one grant CAS, and debits the shared bucket plus every applicable
 //! subordinate cap before this client commits.
 
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
-use tokio_postgres::Client;
 use tokio_postgres::IsolationLevel;
 use tokio_postgres::error::SqlState;
 use uuid::Uuid;
@@ -26,6 +28,9 @@ use crate::ProviderChargeError;
 use crate::ProviderChargeGrant;
 use crate::ProviderChargeRequest;
 use crate::ProviderTrafficClass;
+use crate::dispatch_pool::DispatchLease;
+use crate::dispatch_pool::DispatchPoolRole;
+use crate::dispatch_pool::DispatchRuntimePool;
 
 pub const PROVIDER_CHARGE_API_REVISION_V1: &str = "object-store-dispatch-budget-limiter-v1";
 
@@ -53,109 +58,137 @@ const MUTATION_RETRY_SCHEDULE: [Option<Duration>; 3] = [
     None,
 ];
 
-/// Bounded transaction settings for one PostgreSQL charge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PostgresProviderChargeConfig {
-    pub statement_timeout: Duration,
-    pub lock_timeout: Duration,
-}
-
-impl PostgresProviderChargeConfig {
-    pub fn validate(self) -> Result<Self, ProviderChargeError> {
-        let statement = duration_millis(self.statement_timeout)?;
-        let lock = duration_millis(self.lock_timeout)?;
-        statement
-            .checked_add(lock)
-            .ok_or(ProviderChargeError::ConfigurationUnresolved)?;
-        Ok(self)
-    }
-}
-
-/// The CD-4 authority over one cell's dispatch-runtime database connection.
+/// The CD-4 authority over one cell's shared dispatch-runtime pool.
 ///
 /// `UnwiredChargeAuthority` remains the shipped default. Constructing this value is explicit and
 /// still does not publish a budget configuration.
 pub struct PostgresProviderChargeAuthority {
-    client: Mutex<Client>,
-    statement_timeout_ms: u64,
-    lock_timeout_ms: u64,
+    pool: Arc<DispatchRuntimePool>,
 }
 
 impl PostgresProviderChargeAuthority {
-    pub fn new(
-        client: Client,
-        config: PostgresProviderChargeConfig,
-    ) -> Result<Self, ProviderChargeError> {
-        let config = config.validate()?;
-        Ok(Self {
-            client: Mutex::new(client),
-            statement_timeout_ms: duration_millis(config.statement_timeout)?,
-            lock_timeout_ms: duration_millis(config.lock_timeout)?,
-        })
+    /// Share the typed client's runtime pool. A maintenance credential fails closed.
+    pub fn new(pool: Arc<DispatchRuntimePool>) -> Result<Self, ProviderChargeError> {
+        if pool.role() != DispatchPoolRole::Runtime {
+            return Err(ProviderChargeError::ConfigurationUnresolved);
+        }
+        Ok(Self { pool })
     }
 
     async fn charge_once(
         &self,
         request: &ProviderChargeRequest,
     ) -> Result<ChargeAttempt, ChargeExecutionError> {
-        let mut client = self.client.lock().await;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::Serializable)
-            .start()
-            .await
-            .map_err(classify_precommit_error)?;
-        transaction
-            .batch_execute(&format!(
-                "SET LOCAL statement_timeout = '{}ms'; SET LOCAL lock_timeout = '{}ms';",
-                self.statement_timeout_ms, self.lock_timeout_ms
-            ))
-            .await
-            .map_err(classify_precommit_error)?;
-        let logical_request_id =
-            parse_uuid(request.logical_request_id()).map_err(ChargeExecutionError::Public)?;
-        let attempt_id = parse_uuid(request.attempt_id()).map_err(ChargeExecutionError::Public)?;
-        let cap_classes: Vec<i16> = request
-            .cap_classes()
-            .into_iter()
-            .map(cap_class_code)
-            .collect();
-        let row = transaction
-            .query_one(
-                CHARGE_SQL,
-                &[
-                    &PROVIDER_CHARGE_API_REVISION_V1,
-                    &request.provider_boundary_id(),
-                    &traffic_class_code(request.traffic_class()),
-                    &attempt_class_code(request.attempt_class()),
-                    &request.attempt_units().to_string(),
-                    &request.budget_pin().revision,
-                    &request.budget_pin().fence.to_string(),
-                    &logical_request_id,
-                    &attempt_id,
-                    &i32::try_from(request.attempt_ordinal()).map_err(|_| {
-                        ChargeExecutionError::Public(ProviderChargeError::ConfigurationUnresolved)
-                    })?,
-                    &request.deadline_unix_ms(),
-                    &cap_classes,
-                ],
-            )
-            .await
-            .map_err(classify_precommit_error)?;
-        let outcome = decode_charge_row(&row, request).map_err(ChargeExecutionError::Public)?;
+        let mut lease =
+            self.pool.acquire().await.map_err(|_| {
+                ChargeExecutionError::Public(ProviderChargeError::AuthorityUnavailable)
+            })?;
+        // Match the typed dispatch client's commit-phase tracking: a timeout before COMMIT is a
+        // known no-commit authority failure, while a timeout after COMMIT entered the wire path is
+        // ambiguous. In both cases the timed-out transaction leaves the session unsuitable for
+        // reuse, so the lease is retired rather than returned to the shared pool.
+        let commit_started = AtomicBool::new(false);
+        let outcome = match tokio::time::timeout(
+            self.pool.operation_timeout(),
+            charge_on_lease(&self.pool, &mut lease, request, &commit_started),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => Err(classify_charge_timeout(
+                commit_started.load(Ordering::SeqCst),
+            )),
+        };
         match outcome {
-            ChargeAttempt::Granted(grant) => {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|error| classify_commit_sqlstate(error.code()))?;
-                Ok(ChargeAttempt::Granted(grant))
-            }
-            ChargeAttempt::Refused(error) => {
-                // Every refusal result is emitted before this invocation's grant CAS and bucket
-                // updates. No COMMIT is sent. A lost ROLLBACK cannot make the transaction commit.
-                let _ = transaction.rollback().await;
-                Ok(ChargeAttempt::Refused(error))
+            Err(ChargeExecutionError::SessionUnusable(_)) => lease.poison(),
+            _ => lease.release().await,
+        }
+        outcome
+    }
+}
+
+async fn charge_on_lease(
+    pool: &DispatchRuntimePool,
+    lease: &mut DispatchLease<'_>,
+    request: &ProviderChargeRequest,
+    commit_started: &AtomicBool,
+) -> Result<ChargeAttempt, ChargeExecutionError> {
+    let logical_request_id =
+        parse_uuid(request.logical_request_id()).map_err(ChargeExecutionError::Public)?;
+    let attempt_id = parse_uuid(request.attempt_id()).map_err(ChargeExecutionError::Public)?;
+    let attempt_ordinal = i32::try_from(request.attempt_ordinal())
+        .map_err(|_| ChargeExecutionError::Public(ProviderChargeError::ConfigurationUnresolved))?;
+    let cap_classes: Vec<i16> = request
+        .cap_classes()
+        .into_iter()
+        .map(cap_class_code)
+        .collect();
+    let preamble = pool.bounded_execution_preamble();
+    let client = lease.client().map_err(|_| {
+        ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(
+            ProviderChargeError::AuthorityUnavailable,
+        ))
+    })?;
+    let transaction = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::Serializable)
+        .start()
+        .await
+        .map_err(classify_precommit_error)?;
+    if let Err(error) = transaction.batch_execute(&preamble).await {
+        let failure = classify_precommit_error(error);
+        return Err(rollback_after_failure(transaction, failure).await);
+    }
+    let row = match transaction
+        .query_one(
+            CHARGE_SQL,
+            &[
+                &PROVIDER_CHARGE_API_REVISION_V1,
+                &request.provider_boundary_id(),
+                &traffic_class_code(request.traffic_class()),
+                &attempt_class_code(request.attempt_class()),
+                &request.attempt_units().to_string(),
+                &request.budget_pin().revision,
+                &request.budget_pin().fence.to_string(),
+                &logical_request_id,
+                &attempt_id,
+                &attempt_ordinal,
+                &request.deadline_unix_ms(),
+                &cap_classes,
+            ],
+        )
+        .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            let failure = classify_precommit_error(error);
+            return Err(rollback_after_failure(transaction, failure).await);
+        }
+    };
+    let outcome = match decode_charge_row(&row, request) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let failure = ChargeExecutionError::Public(error);
+            return Err(rollback_after_failure(transaction, failure).await);
+        }
+    };
+    match outcome {
+        ChargeAttempt::Granted(grant) => {
+            commit_started.store(true, Ordering::SeqCst);
+            transaction
+                .commit()
+                .await
+                .map_err(|error| classify_commit_sqlstate(error.code()))?;
+            Ok(ChargeAttempt::Granted(grant))
+        }
+        ChargeAttempt::Refused(error) => {
+            // Every refusal result is emitted before this invocation's grant CAS and bucket
+            // updates. No COMMIT is sent. A lost ROLLBACK cannot make the transaction commit.
+            match transaction.rollback().await {
+                Ok(()) => Ok(ChargeAttempt::Refused(error)),
+                Err(_) => Err(ChargeExecutionError::SessionUnusable(
+                    SessionUnusableChargeError::Public(error),
+                )),
             }
         }
     }
@@ -165,8 +198,6 @@ impl fmt::Debug for PostgresProviderChargeAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PostgresProviderChargeAuthority")
-            .field("statement_timeout_ms", &self.statement_timeout_ms)
-            .field("lock_timeout_ms", &self.lock_timeout_ms)
             .finish_non_exhaustive()
     }
 }
@@ -184,6 +215,15 @@ impl ProviderChargeAuthority for PostgresProviderChargeAuthority {
                     Some(delay) => tokio::time::sleep(delay).await,
                     None => return Err(ProviderChargeError::AuthorityUnavailable),
                 },
+                Err(ChargeExecutionError::SessionUnusable(
+                    SessionUnusableChargeError::Retryable,
+                )) => match retry_delay {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => return Err(ProviderChargeError::AuthorityUnavailable),
+                },
+                Err(ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(
+                    error,
+                ))) => return Err(error),
                 Err(ChargeExecutionError::Public(error)) => return Err(error),
             }
         }
@@ -199,7 +239,24 @@ enum ChargeAttempt {
 #[derive(Debug, PartialEq, Eq)]
 enum ChargeExecutionError {
     Retryable,
+    SessionUnusable(SessionUnusableChargeError),
     Public(ProviderChargeError),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SessionUnusableChargeError {
+    Retryable,
+    Public(ProviderChargeError),
+}
+
+impl ChargeExecutionError {
+    fn on_unusable_session(self) -> Self {
+        match self {
+            Self::Retryable => Self::SessionUnusable(SessionUnusableChargeError::Retryable),
+            Self::Public(error) => Self::SessionUnusable(SessionUnusableChargeError::Public(error)),
+            Self::SessionUnusable(error) => Self::SessionUnusable(error),
+        }
+    }
 }
 
 fn decode_charge_row(
@@ -280,6 +337,15 @@ pub fn classify_provider_charge_commit<T, E>(
     result.map_err(|_| ProviderChargeError::AmbiguousCommit)
 }
 
+fn classify_charge_timeout(commit_started: bool) -> ChargeExecutionError {
+    let error = if commit_started {
+        ProviderChargeError::AmbiguousCommit
+    } else {
+        ProviderChargeError::AuthorityUnavailable
+    };
+    ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(error))
+}
+
 /// Classify a SQLSTATE raised by `COMMIT` without discarding the proof that PostgreSQL aborted the
 /// transaction. Every unrecognized or absent SQLSTATE stays ambiguous.
 fn classify_commit_sqlstate(code: Option<&SqlState>) -> ChargeExecutionError {
@@ -290,7 +356,9 @@ fn classify_commit_sqlstate(code: Option<&SqlState>) -> ChargeExecutionError {
         {
             ChargeExecutionError::Retryable
         }
-        _ => ChargeExecutionError::Public(ProviderChargeError::AmbiguousCommit),
+        _ => ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(
+            ProviderChargeError::AmbiguousCommit,
+        )),
     }
 }
 
@@ -306,20 +374,27 @@ fn classify_precommit_error(error: tokio_postgres::Error) -> ChargeExecutionErro
         Some(code) if code == &SqlState::INVALID_PARAMETER_VALUE => {
             ChargeExecutionError::Public(ProviderChargeError::ConfigurationUnresolved)
         }
-        _ => ChargeExecutionError::Public(ProviderChargeError::AuthorityUnavailable),
+        // A SQLSTATE is a server refusal on a functioning protocol session. An unknown one still
+        // fails closed, but the session itself may be reused after the transaction rolls back.
+        Some(_) => ChargeExecutionError::Public(ProviderChargeError::AuthorityUnavailable),
+        // With no SQLSTATE, the failure is at the connection/protocol layer. Returning that session
+        // to the idle pool would let the next charge inherit state this call could not prove sound.
+        None => ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(
+            ProviderChargeError::AuthorityUnavailable,
+        )),
     }
 }
 
-fn duration_millis(duration: Duration) -> Result<u64, ProviderChargeError> {
-    if duration.is_zero()
-        || duration.as_millis() == 0
-        || !duration.subsec_nanos().is_multiple_of(1_000_000)
-    {
-        return Err(ProviderChargeError::ConfigurationUnresolved);
+/// End an open transaction before making its session reusable. A failed rollback preserves the
+/// semantic failure but independently marks the session unusable, so the caller can poison it.
+async fn rollback_after_failure(
+    transaction: tokio_postgres::Transaction<'_>,
+    failure: ChargeExecutionError,
+) -> ChargeExecutionError {
+    match transaction.rollback().await {
+        Ok(()) => failure,
+        Err(_) => failure.on_unusable_session(),
     }
-    let value = u64::try_from(duration.as_millis())
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
-    Ok(value)
 }
 
 fn parse_uuid(value: &str) -> Result<Uuid, ProviderChargeError> {
@@ -389,11 +464,15 @@ mod tests {
         );
         assert_eq!(
             classify_commit_sqlstate(Some(&SqlState::CONNECTION_FAILURE)),
-            ChargeExecutionError::Public(ProviderChargeError::AmbiguousCommit)
+            ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(
+                ProviderChargeError::AmbiguousCommit
+            ))
         );
         assert_eq!(
             classify_commit_sqlstate(None),
-            ChargeExecutionError::Public(ProviderChargeError::AmbiguousCommit)
+            ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(
+                ProviderChargeError::AmbiguousCommit
+            ))
         );
     }
 }

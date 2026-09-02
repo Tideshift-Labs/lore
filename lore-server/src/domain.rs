@@ -8,10 +8,10 @@
 //!
 //! - **Construction** — build the coordinator from the same
 //!   `[plugins.postgres.*]` configuration the three CR-007 stores use, and
-//!   prove positively that they all address one database (R-SHOULD-1). A domain
-//!   transaction that writes domain rows and `lore_mutable` rows together is
-//!   only atomic if those rows live in one database; four independent URLs make
-//!   that a configuration property, so it is checked rather than assumed.
+//!   prove positively that all four conventional pools address one database
+//!   (R-SHOULD-1). When the fragment provider is enabled, this attested identity
+//!   is also the expectation for the separately credentialed fifth, dispatch
+//!   pool. No URL comparison stands in for either proof.
 //! - **Readiness** — a Postgres-mode cell with enforcement requested must refuse
 //!   to come up on an incomplete backfill. The schema `CHECK` is the backstop,
 //!   not the gate.
@@ -32,10 +32,12 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use lore_postgres::domain::DatabaseIdentity;
 use lore_postgres::domain::DomainSchemaState;
 use lore_postgres::domain::bypass::DomainEnforcement;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
+use lore_postgres::domain::fragments::PostgresFragmentCoordinator;
 use lore_postgres::domain::locks::LockFencingReadiness;
 use lore_postgres::domain::locks::PostgresLockCoordinator;
 use lore_postgres::domain::receipts::OperationBinding;
@@ -356,14 +358,27 @@ mod p12_tests;
 /// could not connect cannot tell whether enforcement was requested, and would
 /// silently serve ungoverned traffic on a cell where an operator had turned
 /// enforcement on. Aborting adds no new availability failure mode either: the
-/// three CR-007 stores connect to the same database at boot and already fail
-/// hard, so a cell that cannot reach this database cannot serve anyway.
+/// coordinator and three CR-007 store pools connect to the same database at
+/// boot and already fail hard, while enabled provider composition separately
+/// attests the fifth, dispatch pool. A cell that cannot reach this database
+/// cannot serve anyway.
 pub struct ConfiguredDomainContext {
     /// Coordinator exposed to governed handlers and the private receipt rail.
     pub context: Option<Arc<DomainContext>>,
     /// Handle that must be installed into the concrete Postgres mutable store
     /// before the store is published behind its trait object.
     pub mutable_enforcement: Option<DomainEnforcement>,
+    /// Fragment lifecycle handle on the same CR-029 pool and database.
+    ///
+    /// Server composition passes this only to the Postgres immutable store;
+    /// other immutable-store modes never receive or construct a provider route.
+    pub fragment_coordinator: Option<PostgresFragmentCoordinator>,
+    /// Physical identity positively shared by the domain, immutable, mutable,
+    /// and lock pools: PostgreSQL system identifier plus database OID.
+    ///
+    /// The diagnostic database name travels with the value but is not an
+    /// identity component for dispatch attestation.
+    pub database_identity: Option<DatabaseIdentity>,
 }
 
 pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredDomainContext> {
@@ -371,6 +386,8 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
         return Ok(ConfiguredDomainContext {
             context: None,
             mutable_enforcement: None,
+            fragment_coordinator: None,
+            database_identity: None,
         });
     }
 
@@ -449,6 +466,8 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
         mutable_enforcement.enable();
     }
 
+    let fragment_coordinator = store.fragment_coordinator();
+    let database_identity = store.identity().clone();
     let context = if lock_fencing {
         DomainContext::new_with_lock_coordinator(
             Arc::new(store),
@@ -461,6 +480,8 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
     Ok(ConfiguredDomainContext {
         context: Some(Arc::new(context)),
         mutable_enforcement: Some(mutable_enforcement),
+        fragment_coordinator: Some(fragment_coordinator),
+        database_identity: Some(database_identity),
     })
 }
 

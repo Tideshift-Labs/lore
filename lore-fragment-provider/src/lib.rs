@@ -131,10 +131,11 @@
 //! `GovernedProviderClient` and issue attempts without touching this seam at
 //! all. Nothing done inside this crate prevents that, and nothing could.
 //!
-//! What actually holds today is narrower and checkable: **no caller in the
-//! crates that exist today can**, because `lore-postgres` does not depend on
-//! `lore-object-dispatch` and `lore-server` has no reference to it either.
-//! What enforces it is the manifest pin in
+//! What actually holds today is narrower and checkable: **the existing
+//! composition callers cannot invoke `execute` directly**. `lore-postgres`
+//! does not depend on `lore-object-dispatch`, and `lore-server` activates this
+//! seam without receiving the governed client's ledger, request, or client
+//! value. What enforces the `lore-postgres` boundary is the manifest pin in
 //! `lore-fragment-provider/tests/seam_source_pins.rs` — which fails if the AWS
 //! SDK or `lore-postgres` appears in this crate's shipped dependencies — and
 //! the no-re-export pin beside it. A *new* crate opting in is a manifest edit
@@ -151,48 +152,42 @@
 //! belt and braces** — it covers a seam edit that names the real types in a
 //! signature directly. Its scanner is a regression detector with one known
 //! limit, recorded there rather than fixed.
-//! # Dark and parameterized
+//! # Opt-in activation and fail-closed defaults
 //!
-//! Nothing here is wired. [`UnwiredChargeAuthority`] and
-//! [`UnwiredProviderTransport`] are the shipped defaults and both fail closed
-//! on every call, so compiling or testing this crate authorizes no provider
-//! traffic. The module names no bucket, region, endpoint, credential, or budget
-//! configuration: every one of those is a constructor argument the caller must
-//! supply, and no caller exists. `lore-server` constructs no gateway.
+//! [`FragmentProviderEntry::connect`] is the one composition door for the
+//! shared dispatch pool, database and schema attestation, charge authority,
+//! and provider transport. `lore-server` uses it only for a complete, enabled
+//! Phase 5 `fragment_provider` configuration. Absent or disabled configuration
+//! retains the legacy route and constructs none of these runtime objects.
 //!
-//! # What a Phase 5 PUT still needs from this seam
+//! [`UnwiredChargeAuthority`] and [`UnwiredProviderTransport`] remain the
+//! fail-closed defaults for a gateway built without that composition door.
+//! They refuse every call, so compiling or testing the default gateway
+//! authorizes no provider traffic. Bucket, region, endpoint, credential, and
+//! budget values still enter only as explicit composition inputs.
 //!
-//! CR-031 removed the *pre-admission* body spool (R-BLOCK-3) and bounds memory
-//! with the 256 KiB cap and the in-flight count instead. CD-5's governed client
-//! requires a
-//! [`DurableProviderPutBody`](lore_object_dispatch::DurableProviderPutBody) for
-//! every `PutObject`, mintable only from a spool ledger row the dispatch
-//! authority has moved to `SPOOL_READY`.
+//! # Phase 5 direct PUT contract
 //!
-//! **These two rules are compatible, and an earlier revision of this comment
-//! wrongly called them a contract conflict.** What CR-031 forbids is spooling
-//! *before* admission; a spool taken *after* the in-flight permit is exactly
-//! what the configured count exists to bound. The order that satisfies both is
-//! admit, then spool, then charge, then send.
-//!
-//! What Phase 4 does not yet provide is a way to express that order.
-//! [`FragmentProviderGateway::execute`] takes the permit inside itself, so a
-//! caller that must spool first has nowhere to put the spool step without
-//! taking a second permit for one put. Exposing admission as its own step is
-//! the fix, and it is deliberately not written here: its shape depends on where
-//! Phase 5 mints the spool row, which needs CD-3's `ReservePut` against a real
-//! cell. **Named Phase 5 obligation, not an owner decision.** Bodyless classes
-//! — the reads and the deletes Phases 5 and 6 also need — are unaffected and
-//! work through [`FragmentProviderGateway::execute`] as it stands.
+//! Phase 5 direct fragment PUTs are bounded synchronously rather than durably
+//! spooled. Admission first acquires the one configured in-flight PUT permit;
+//! the direct request then exact-binds its at-most-256-KiB body by size and
+//! BLAKE3 before charge and send. The non-Clone admitted PUT token retains that
+//! sole permit across validation, charge, and transport execution. Durable
+//! spool vocabulary remains reserved for WP-114 dispatcher and drain work and
+//! is not part of this seam's direct-write entry.
 
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 // ---------------------------------------------------------------------------
 // The re-export boundary — read the rule before adding to it
 // ---------------------------------------------------------------------------
+use lore_object_dispatch::AuthorizedProviderAttempt;
+use lore_object_dispatch::AuthorizedProviderGet;
 /// Types a caller needs in order to *describe* an attempt, ask for an
 /// attestation, or read an outcome.
 ///
@@ -235,24 +230,40 @@ use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 /// mutations can be called because every request type is unnameable. The one
 /// reachable method is the argument-free `read_dispatcher_identity_state`,
 /// yielding installed schema revisions, digests and timestamps — the values
-/// [`FragmentProviderError::AttestationMismatch`] already documents as fixed and
+/// [`FragmentSchemaAttestationError::Mismatch`] already documents as fixed and
 /// non-sensitive, and which CD-3's live suite asserts in the clear.
 pub use lore_object_dispatch::BudgetPin;
 pub use lore_object_dispatch::CellProviderBoundary;
+use lore_object_dispatch::DispatchConnectionBudget;
+use lore_object_dispatch::DispatchDatabaseIdentity;
+use lore_object_dispatch::DispatchDatabaseIdentityError;
+use lore_object_dispatch::DispatchPoolConfig;
+use lore_object_dispatch::DispatchPoolError;
+use lore_object_dispatch::DispatchPoolRole;
+use lore_object_dispatch::DispatchRuntimePool;
+use lore_object_dispatch::DispatchTlsMode;
 pub use lore_object_dispatch::DurableProviderPutBody;
 use lore_object_dispatch::GovernedProviderClient;
+use lore_object_dispatch::MeteredProviderAttemptRequest;
 use lore_object_dispatch::PROVIDER_MIN_PART_SIZE_BYTES;
+use lore_object_dispatch::PostgresProviderChargeAuthority;
 pub use lore_object_dispatch::ProviderAttemptClass;
+use lore_object_dispatch::ProviderAttemptExecution;
 use lore_object_dispatch::ProviderAttemptLedger;
 pub use lore_object_dispatch::ProviderAttemptOutcome;
+use lore_object_dispatch::ProviderAttemptReport;
 use lore_object_dispatch::ProviderAttemptRequest;
 pub use lore_object_dispatch::ProviderCapabilities;
 pub use lore_object_dispatch::ProviderChargeAuthority;
 use lore_object_dispatch::ProviderChargeError;
 use lore_object_dispatch::ProviderClientError;
+use lore_object_dispatch::ProviderDirectPutAttemptRequest;
+use lore_object_dispatch::ProviderGetAttemptRequest;
+use lore_object_dispatch::ProviderGetTransport;
 use lore_object_dispatch::ProviderRetryPolicy;
 pub use lore_object_dispatch::ProviderTrafficClass;
 pub use lore_object_dispatch::ProviderTransport;
+use lore_object_dispatch::ProviderTransportRefusal;
 pub use lore_object_dispatch::UnwiredChargeAuthority;
 pub use lore_object_dispatch::UnwiredProviderTransport;
 use lore_object_dispatch::cell_schema_install::CELL_SCHEMA_LAYERS;
@@ -313,10 +324,9 @@ const _: () = assert!(FRAGMENT_PROVIDER_INGRESS_CAP_BYTES < PROVIDER_MIN_PART_SI
 /// the `const` assertion above pins. Leaving those classes reachable would ship
 /// four paths that cannot be exercised and cannot be tested against real
 /// behavior.
-pub const FRAGMENT_PROVIDER_ATTEMPT_CLASSES: [ProviderAttemptClass; 7] = [
+pub const FRAGMENT_PROVIDER_ATTEMPT_CLASSES: [ProviderAttemptClass; 6] = [
     ProviderAttemptClass::Readiness,
     ProviderAttemptClass::HeadObject,
-    ProviderAttemptClass::GetObject,
     ProviderAttemptClass::PutObject,
     ProviderAttemptClass::ListObjectsV2,
     ProviderAttemptClass::ListObjectVersions,
@@ -330,21 +340,6 @@ pub const FRAGMENT_PROVIDER_ATTEMPT_CLASSES: [ProviderAttemptClass; 7] = [
 /// Why this seam refused, or how the governed client below it failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FragmentProviderError {
-    /// The typed authority client could not read 0019's layer identities.
-    ///
-    /// Carries the closed [`DispatchAuthorityError`] discriminant only. That
-    /// type is already redaction-safe by construction; nothing is added here.
-    #[error("cell schema attestation could not be read: {0}")]
-    AttestationUnavailable(#[source] DispatchAuthorityError),
-
-    /// A layer's installed identity is not the one this build expects. Names
-    /// the layer's stable label and nothing else.
-    #[error("cell schema layer '{layer}' is not installed at the expected identity")]
-    AttestationMismatch {
-        /// [`CellSchemaLayerId::label`], a fixed non-sensitive string.
-        layer: &'static str,
-    },
-
     /// The configured in-flight put count is outside the accepted range.
     #[error("configured in-flight put count is outside 1..={MAX_IN_FLIGHT_PUTS}")]
     InvalidInFlightPutBound,
@@ -362,6 +357,15 @@ pub enum FragmentProviderError {
     )]
     IngressCapExceeded,
 
+    #[error("wired fragment provider execution requires an explicit transport operation")]
+    OperationRequired,
+
+    #[error("fragment provider attempt class, operation, and durable body do not agree")]
+    OperationMismatch,
+
+    #[error("fragment provider object key is empty")]
+    InvalidObjectKey,
+
     /// No in-flight put slot became free inside the configured wait.
     #[error("no in-flight put slot became available within the configured admission wait")]
     PutAdmissionTimedOut,
@@ -376,6 +380,33 @@ pub enum FragmentProviderError {
     /// failed. Source-preserving.
     #[error("governed provider client refused the attempt: {0}")]
     Provider(#[source] ProviderClientError),
+}
+
+/// Why the runtime-callable schema readback could not mint an attestation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FragmentSchemaAttestationError {
+    #[error("cell schema attestation could not be read: {0}")]
+    Read(#[source] DispatchAuthorityError),
+    #[error("cell schema layer '{layer:?}' is not installed at the expected identity")]
+    Mismatch { layer: CellSchemaLayerId },
+}
+
+/// Why the one fragment-provider composition door refused activation.
+///
+/// Every underlying error is retained as a typed, redaction-safe source. No variant carries a URL,
+/// credential, PostgreSQL diagnostic, or physical database identity value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FragmentProviderActivationError {
+    #[error("fragment provider dispatch pool configuration is invalid: {0}")]
+    DispatchPool(#[source] DispatchPoolError),
+    #[error("fragment provider dispatch runtime client could not be constructed: {0}")]
+    DispatchClient(#[source] DispatchAuthorityError),
+    #[error("fragment provider dispatch database attestation failed: {0}")]
+    DatabaseIdentity(#[source] DispatchDatabaseIdentityError),
+    #[error("fragment provider cell schema attestation failed: {0}")]
+    Schema(#[source] FragmentSchemaAttestationError),
+    #[error("fragment provider charge authority could not be attached: {0}")]
+    ChargeAuthority(#[source] ProviderChargeError),
 }
 
 /// How a consumer should treat a [`FragmentProviderError`], in terms that name
@@ -419,11 +450,12 @@ impl FragmentProviderError {
     /// silently landing in a catch-all.
     pub fn disposition(&self) -> FragmentProviderDisposition {
         match self {
-            Self::AttestationUnavailable(_) => FragmentProviderDisposition::Transient,
-            Self::AttestationMismatch { .. } => FragmentProviderDisposition::NotReady,
             Self::InvalidInFlightPutBound
             | Self::AttemptClassNotPermitted { .. }
-            | Self::IngressCapExceeded => FragmentProviderDisposition::InvalidInput,
+            | Self::IngressCapExceeded
+            | Self::OperationRequired
+            | Self::OperationMismatch
+            | Self::InvalidObjectKey => FragmentProviderDisposition::InvalidInput,
             Self::PutAdmissionTimedOut | Self::PutAdmissionClosed => {
                 FragmentProviderDisposition::Transient
             }
@@ -558,43 +590,239 @@ trait AttemptSink: Send + Sync {
     fn issue<'a>(
         &'a self,
         ledger: &'a mut ProviderAttemptLedger,
-        request: &'a ProviderAttemptRequest,
+        request: &'a MeteredProviderAttemptRequest,
+        operation: &'a FragmentTransportOperation,
     ) -> Pin<
-        Box<dyn Future<Output = Result<ProviderAttemptOutcome, ProviderClientError>> + Send + 'a>,
+        Box<
+            dyn Future<
+                    Output = Result<
+                        ProviderAttemptExecution<FragmentTransportResponse>,
+                        ProviderClientError,
+                    >,
+                > + Send
+                + 'a,
+        >,
     >;
 
-    fn validate(&self, request: &ProviderAttemptRequest) -> Result<(), ProviderClientError>;
+    fn issue_get<'a>(
+        &'a self,
+        request: &'a ProviderGetAttemptRequest,
+        operation: &'a FragmentGetOperation,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        ProviderAttemptExecution<FragmentGetResponse>,
+                        ProviderClientError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    fn issue_direct_put<'a>(
+        &'a self,
+        ledger: &'a mut ProviderAttemptLedger,
+        request: &'a ProviderDirectPutAttemptRequest,
+        body: &'a [u8],
+        operation: &'a FragmentDirectPutOperation,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        ProviderAttemptExecution<FragmentTransportResponse>,
+                        ProviderClientError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    fn validate(&self, request: &MeteredProviderAttemptRequest) -> Result<(), ProviderClientError>;
 
     fn boundary(&self) -> &CellProviderBoundary;
 
     fn retry_policy(&self) -> ProviderRetryPolicy;
 }
 
-impl<C, T> AttemptSink for GovernedProviderClient<C, T>
+struct UnitAttemptSink<C, T>(GovernedProviderClient<C, T>);
+
+impl<C, T> AttemptSink for UnitAttemptSink<C, T>
 where
     C: ProviderChargeAuthority + Send + Sync,
-    T: ProviderTransport + Send + Sync,
+    T: ProviderTransport<Operation = (), Response = ()> + Send + Sync,
 {
     fn issue<'a>(
         &'a self,
         ledger: &'a mut ProviderAttemptLedger,
-        request: &'a ProviderAttemptRequest,
+        request: &'a MeteredProviderAttemptRequest,
+        _operation: &'a FragmentTransportOperation,
     ) -> Pin<
-        Box<dyn Future<Output = Result<ProviderAttemptOutcome, ProviderClientError>> + Send + 'a>,
+        Box<
+            dyn Future<
+                    Output = Result<
+                        ProviderAttemptExecution<FragmentTransportResponse>,
+                        ProviderClientError,
+                    >,
+                > + Send
+                + 'a,
+        >,
     > {
-        Box::pin(self.execute(ledger, request))
+        Box::pin(async move {
+            let execution = self.0.execute(ledger, request, &()).await?;
+            Ok(ProviderAttemptExecution {
+                outcome: execution.outcome,
+                response: FragmentTransportResponse::Empty,
+            })
+        })
     }
 
-    fn validate(&self, request: &ProviderAttemptRequest) -> Result<(), ProviderClientError> {
-        self.validate_attempt(request)
+    fn issue_get<'a>(
+        &'a self,
+        _request: &'a ProviderGetAttemptRequest,
+        _operation: &'a FragmentGetOperation,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        ProviderAttemptExecution<FragmentGetResponse>,
+                        ProviderClientError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(ProviderClientError::TransportRefused(
+                ProviderTransportRefusal::Unwired,
+            ))
+        })
+    }
+
+    fn issue_direct_put<'a>(
+        &'a self,
+        ledger: &'a mut ProviderAttemptLedger,
+        request: &'a ProviderDirectPutAttemptRequest,
+        body: &'a [u8],
+        _operation: &'a FragmentDirectPutOperation,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        ProviderAttemptExecution<FragmentTransportResponse>,
+                        ProviderClientError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let execution = self
+                .0
+                .execute_direct_put(ledger, request, body, &())
+                .await?;
+            Ok(ProviderAttemptExecution {
+                outcome: execution.outcome,
+                response: FragmentTransportResponse::Empty,
+            })
+        })
+    }
+
+    fn validate(&self, request: &MeteredProviderAttemptRequest) -> Result<(), ProviderClientError> {
+        self.0.validate_attempt(request)
     }
 
     fn boundary(&self) -> &CellProviderBoundary {
-        GovernedProviderClient::boundary(self)
+        self.0.boundary()
     }
 
     fn retry_policy(&self) -> ProviderRetryPolicy {
-        GovernedProviderClient::retry_policy(self)
+        self.0.retry_policy()
+    }
+}
+
+struct PortAttemptSink<C, P>(GovernedProviderClient<C, FragmentTransportAdapter<P>>);
+
+impl<C, P> AttemptSink for PortAttemptSink<C, P>
+where
+    C: ProviderChargeAuthority + Send + Sync,
+    P: FragmentTransportPort + FragmentDirectPutPort + FragmentGetPort,
+{
+    fn issue<'a>(
+        &'a self,
+        ledger: &'a mut ProviderAttemptLedger,
+        request: &'a MeteredProviderAttemptRequest,
+        operation: &'a FragmentTransportOperation,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        ProviderAttemptExecution<FragmentTransportResponse>,
+                        ProviderClientError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let operation = GovernedFragmentOperation::Standard(operation.clone());
+            self.0.execute(ledger, request, &operation).await
+        })
+    }
+
+    fn issue_get<'a>(
+        &'a self,
+        request: &'a ProviderGetAttemptRequest,
+        operation: &'a FragmentGetOperation,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        ProviderAttemptExecution<FragmentGetResponse>,
+                        ProviderClientError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(self.0.execute_get(request, operation))
+    }
+
+    fn issue_direct_put<'a>(
+        &'a self,
+        ledger: &'a mut ProviderAttemptLedger,
+        request: &'a ProviderDirectPutAttemptRequest,
+        body: &'a [u8],
+        operation: &'a FragmentDirectPutOperation,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        ProviderAttemptExecution<FragmentTransportResponse>,
+                        ProviderClientError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let operation = GovernedFragmentOperation::DirectPut(operation.clone());
+            self.0
+                .execute_direct_put(ledger, request, body, &operation)
+                .await
+        })
+    }
+
+    fn validate(&self, request: &MeteredProviderAttemptRequest) -> Result<(), ProviderClientError> {
+        self.0.validate_attempt(request)
+    }
+
+    fn boundary(&self) -> &CellProviderBoundary {
+        self.0.boundary()
+    }
+
+    fn retry_policy(&self) -> ProviderRetryPolicy {
+        self.0.retry_policy()
     }
 }
 
@@ -716,11 +944,11 @@ const ATTESTED_LAYERS: [CellSchemaLayerId; 4] = [
 pub async fn attest_cell_schema(
     client: &DispatchRuntimeClient,
     boundary: CellProviderBoundary,
-) -> Result<CellSchemaAttestation, FragmentProviderError> {
+) -> Result<CellSchemaAttestation, FragmentSchemaAttestationError> {
     let state = client
         .read_dispatcher_identity_state()
         .await
-        .map_err(FragmentProviderError::AttestationUnavailable)?;
+        .map_err(FragmentSchemaAttestationError::Read)?;
     verify_installed_layers(&state, boundary)
 }
 
@@ -740,7 +968,7 @@ pub async fn attest_cell_schema(
 fn verify_installed_layers(
     state: &DispatcherIdentityState,
     boundary: CellProviderBoundary,
-) -> Result<CellSchemaAttestation, FragmentProviderError> {
+) -> Result<CellSchemaAttestation, FragmentSchemaAttestationError> {
     let observed: [&InstalledLayerIdentity; 4] = [
         &state.retention,
         &state.local_authority,
@@ -752,15 +980,15 @@ fn verify_installed_layers(
         let expected = CELL_SCHEMA_LAYERS
             .iter()
             .find(|layer| layer.id == *id)
-            .ok_or(FragmentProviderError::AttestationMismatch { layer: id.label() })?;
+            .ok_or(FragmentSchemaAttestationError::Mismatch { layer: *id })?;
         if identity.schema_revision != expected.schema_revision {
-            return Err(FragmentProviderError::AttestationMismatch { layer: id.label() });
+            return Err(FragmentSchemaAttestationError::Mismatch { layer: *id });
         }
         if hex::encode(identity.migration_blake3) != expected.migration_blake3_hex {
-            return Err(FragmentProviderError::AttestationMismatch { layer: id.label() });
+            return Err(FragmentSchemaAttestationError::Mismatch { layer: *id });
         }
         if identity.install_revision == 0 {
-            return Err(FragmentProviderError::AttestationMismatch { layer: id.label() });
+            return Err(FragmentSchemaAttestationError::Mismatch { layer: *id });
         }
         // Record what the cell reported, not what this build expected. An
         // attestation built from local constants alone would be the same value
@@ -825,6 +1053,331 @@ impl InFlightPutBound {
 // The attempt a caller describes
 // ---------------------------------------------------------------------------
 
+/// Provider operation carried through the policy kernel without teaching it
+/// any S3 vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentTransportOperation {
+    Head {
+        object_key: String,
+    },
+    ListVersions {
+        object_key: String,
+    },
+    DeleteVersion {
+        object_key: String,
+        version_id: String,
+    },
+}
+
+impl FragmentTransportOperation {
+    pub fn object_key(&self) -> &str {
+        match self {
+            Self::Head { object_key }
+            | Self::ListVersions { object_key }
+            | Self::DeleteVersion { object_key, .. } => object_key,
+        }
+    }
+}
+
+/// Body-free description of one conditional direct PUT. The body itself can
+/// enter the transport only through the governed authorization token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentDirectPutOperation {
+    pub object_key: String,
+    pub metadata: Vec<(String, String)>,
+    pub declared_size: u64,
+    pub declared_blake3: [u8; 32],
+}
+
+/// Operation-specific response returned through the governed execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentTransportResponse {
+    Empty,
+    Head {
+        metadata: Vec<(String, String)>,
+        content_length: u64,
+    },
+    PutCreated,
+    PutPreconditionFailed,
+    Versions(Vec<FragmentObjectVersion>),
+    Deleted,
+    NotFound,
+    DefiniteFailure,
+    AmbiguousFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentObjectVersion {
+    pub version_id: String,
+    pub is_latest: bool,
+}
+
+/// One port result. The request count comes from the connector below the SDK,
+/// not from the number of fluent-client calls made by the adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentTransportExchange {
+    pub outcome: ProviderAttemptOutcome,
+    pub provider_requests_issued: u32,
+    pub response: FragmentTransportResponse,
+}
+
+/// Redaction-safe view of the target attested for this cell.
+#[derive(Clone, Copy)]
+pub struct FragmentTransportTarget<'a> {
+    bucket: &'a str,
+    region: &'a str,
+    endpoint_host: &'a str,
+}
+
+impl FragmentTransportTarget<'_> {
+    pub fn bucket(&self) -> &str {
+        self.bucket
+    }
+
+    pub fn region(&self) -> &str {
+        self.region
+    }
+
+    pub fn endpoint_host(&self) -> &str {
+        self.endpoint_host
+    }
+}
+
+impl std::fmt::Debug for FragmentTransportTarget<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FragmentTransportTarget")
+            .field("bucket", &"[REDACTED]")
+            .field("region", &"[REDACTED]")
+            .field("endpoint_host", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Opaque authorized request. It is publicly nameable so an adapter can
+/// receive it, but its sole constructor stays inside this trust boundary.
+pub struct FragmentTransportRequest<'a> {
+    authorized: &'a AuthorizedProviderAttempt<'a>,
+    operation: &'a FragmentTransportOperation,
+}
+
+impl<'a> FragmentTransportRequest<'a> {
+    pub fn target(&self) -> FragmentTransportTarget<'_> {
+        let target = self.authorized.target();
+        FragmentTransportTarget {
+            bucket: &target.bucket,
+            region: &target.region,
+            endpoint_host: &target.endpoint_host,
+        }
+    }
+
+    pub fn operation(&self) -> &FragmentTransportOperation {
+        self.operation
+    }
+
+    pub fn attempt_class(&self) -> ProviderAttemptClass {
+        self.authorized.attempt_class()
+    }
+
+    pub fn put_body(&self) -> Option<&DurableProviderPutBody> {
+        self.authorized.put_body()
+    }
+}
+
+/// The only provider transport port crates outside this seam may implement.
+/// They cannot mint [`FragmentTransportRequest`], so implementing the port does
+/// not grant a direct-call route to a real send.
+pub trait FragmentTransportPort: Send + Sync {
+    fn issue<'a>(
+        &'a self,
+        request: FragmentTransportRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = FragmentTransportExchange> + Send + 'a>>;
+}
+
+/// Opaque authorized direct-PUT request. It is publicly nameable so an adapter
+/// can receive it, but only the governed client can mint the authorization it
+/// contains.
+pub struct FragmentDirectPutRequest<'a> {
+    authorized: &'a AuthorizedProviderAttempt<'a>,
+    operation: &'a FragmentDirectPutOperation,
+}
+
+impl<'a> FragmentDirectPutRequest<'a> {
+    pub fn target(&self) -> FragmentTransportTarget<'_> {
+        let target = self.authorized.target();
+        FragmentTransportTarget {
+            bucket: &target.bucket,
+            region: &target.region,
+            endpoint_host: &target.endpoint_host,
+        }
+    }
+
+    pub fn operation(&self) -> &FragmentDirectPutOperation {
+        self.operation
+    }
+
+    /// Direct PUT bytes, available only after exact size/hash validation and
+    /// a matching shared-budget grant.
+    pub fn body(&self) -> Option<&[u8]> {
+        self.authorized.direct_put_body()
+    }
+
+    pub fn size(&self) -> Option<u64> {
+        self.authorized.direct_put_size()
+    }
+
+    pub fn blake3(&self) -> Option<&[u8; 32]> {
+        self.authorized.direct_put_blake3()
+    }
+}
+
+/// Direct-PUT-only provider port. A caller can implement it but cannot mint a
+/// real request or invoke a send outside the governed seam.
+pub trait FragmentDirectPutPort: Send + Sync {
+    fn issue_direct_put<'a>(
+        &'a self,
+        request: FragmentDirectPutRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = FragmentTransportExchange> + Send + 'a>>;
+}
+
+/// The one unmetered provider operation. Its type carries no charge, budget,
+/// deadline, traffic-class, or durable-ledger vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentGetOperation {
+    pub object_key: String,
+}
+
+/// One unmetered GET attempt. The target is supplied only by the attested
+/// gateway, so callers can identify the attempt but cannot redirect it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentGetAttempt {
+    pub logical_request_id: String,
+    pub attempt_id: String,
+    pub attempt_ordinal: u32,
+}
+
+/// GET-specific response vocabulary. `Throttled` is distinct so the store can
+/// map provider backpressure to `StoreError::SlowDown` without inspecting an
+/// SDK error outside the adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentGetResponse {
+    Found {
+        bytes: Vec<u8>,
+        metadata: Vec<(String, String)>,
+    },
+    NotFound,
+    Throttled,
+    DefiniteFailure,
+    AmbiguousFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentGetExchange {
+    pub outcome: ProviderAttemptOutcome,
+    pub provider_requests_issued: u32,
+    pub response: FragmentGetResponse,
+}
+
+/// Opaque authorized GET request. Only the governed client can mint the
+/// authorization token held here.
+pub struct FragmentGetRequest<'a> {
+    authorized: &'a AuthorizedProviderGet<'a>,
+    operation: &'a FragmentGetOperation,
+}
+
+impl<'a> FragmentGetRequest<'a> {
+    pub fn target(&self) -> FragmentTransportTarget<'_> {
+        let target = self.authorized.target();
+        FragmentTransportTarget {
+            bucket: &target.bucket,
+            region: &target.region,
+            endpoint_host: &target.endpoint_host,
+        }
+    }
+
+    pub fn operation(&self) -> &FragmentGetOperation {
+        self.operation
+    }
+}
+
+/// GET-only provider port. A caller can implement it but cannot construct a
+/// real request, because the authorization token remains private upstream and
+/// this seam exposes no constructor.
+pub trait FragmentGetPort: Send + Sync {
+    fn issue_get<'a>(
+        &'a self,
+        request: FragmentGetRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = FragmentGetExchange> + Send + 'a>>;
+}
+
+enum GovernedFragmentOperation {
+    Standard(FragmentTransportOperation),
+    DirectPut(FragmentDirectPutOperation),
+}
+
+struct FragmentTransportAdapter<P>(P);
+
+impl<P: FragmentTransportPort + FragmentDirectPutPort> ProviderTransport
+    for FragmentTransportAdapter<P>
+{
+    type Operation = GovernedFragmentOperation;
+    type Response = FragmentTransportResponse;
+
+    async fn issue<'a>(
+        &'a self,
+        attempt: &'a AuthorizedProviderAttempt<'a>,
+        operation: &'a Self::Operation,
+    ) -> Result<ProviderAttemptReport<Self::Response>, ProviderTransportRefusal> {
+        let exchange = match operation {
+            GovernedFragmentOperation::Standard(operation) => {
+                self.0
+                    .issue(FragmentTransportRequest {
+                        authorized: attempt,
+                        operation,
+                    })
+                    .await
+            }
+            GovernedFragmentOperation::DirectPut(operation) => {
+                self.0
+                    .issue_direct_put(FragmentDirectPutRequest {
+                        authorized: attempt,
+                        operation,
+                    })
+                    .await
+            }
+        };
+        Ok(ProviderAttemptReport {
+            outcome: exchange.outcome,
+            provider_requests_issued: exchange.provider_requests_issued,
+            response: exchange.response,
+        })
+    }
+}
+
+impl<P: FragmentGetPort> ProviderGetTransport for FragmentTransportAdapter<P> {
+    type Operation = FragmentGetOperation;
+    type Response = FragmentGetResponse;
+
+    async fn issue_get<'a>(
+        &'a self,
+        attempt: &'a AuthorizedProviderGet<'a>,
+        operation: &'a Self::Operation,
+    ) -> Result<ProviderAttemptReport<Self::Response>, ProviderTransportRefusal> {
+        let exchange = self
+            .0
+            .issue_get(FragmentGetRequest {
+                authorized: attempt,
+                operation,
+            })
+            .await;
+        Ok(ProviderAttemptReport {
+            outcome: exchange.outcome,
+            provider_requests_issued: exchange.provider_requests_issued,
+            response: exchange.response,
+        })
+    }
+}
+
 /// One provider attempt a fragment lifecycle operation asks this seam to make.
 ///
 /// **There is deliberately no target field.** The gateway addresses its own
@@ -851,8 +1404,8 @@ pub struct FragmentProviderAttempt {
     ///
     /// Supplied by the caller. This module never mints one and never touches a
     /// filesystem, which is what keeps CR-031's "no pre-admission body spool"
-    /// true of this seam. See the module docs for what a Phase 5 PUT still
-    /// needs before it can supply one.
+    /// true of this seam. The Phase 5 direct-PUT entry supplies this bounded
+    /// body only after synchronous admission and exact body binding.
     pub put_body: Option<DurableProviderPutBody>,
 }
 
@@ -872,6 +1425,321 @@ pub struct FragmentProviderGateway {
     attestation: CellSchemaAttestation,
     bound: InFlightPutBound,
     in_flight_puts: Semaphore,
+    port_wired: bool,
+}
+
+/// TLS configuration for the one dispatch-runtime pool.
+#[derive(Clone)]
+pub enum FragmentDispatchTls {
+    Disabled,
+    PinnedRootCa(String),
+}
+
+impl fmt::Debug for FragmentDispatchTls {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disabled => formatter.write_str("Disabled"),
+            Self::PinnedRootCa(_) => formatter.write_str("PinnedRootCa([REDACTED])"),
+        }
+    }
+}
+
+/// Expected physical database identity supplied by the already-attested domain store.
+///
+/// The system identifier is accepted in the exact canonical decimal form PostgreSQL returns.
+/// Database aliases, credentials, and TLS parameters are deliberately absent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FragmentDatabaseIdentity(DispatchDatabaseIdentity);
+
+impl fmt::Debug for FragmentDatabaseIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FragmentDatabaseIdentity([REDACTED])")
+    }
+}
+
+impl FragmentDatabaseIdentity {
+    pub fn new(
+        system_identifier: &str,
+        database_oid: u32,
+    ) -> Result<Self, FragmentDatabaseIdentityError> {
+        let parsed_system_identifier = system_identifier
+            .parse::<u64>()
+            .map_err(|_| FragmentDatabaseIdentityError::InvalidSystemIdentifier)?;
+        if parsed_system_identifier == 0
+            || parsed_system_identifier.to_string() != system_identifier
+        {
+            return Err(FragmentDatabaseIdentityError::InvalidSystemIdentifier);
+        }
+        if database_oid == 0 {
+            return Err(FragmentDatabaseIdentityError::InvalidDatabaseOid);
+        }
+        let identity = DispatchDatabaseIdentity::new(parsed_system_identifier, database_oid)
+            .map_err(|_| FragmentDatabaseIdentityError::InvalidDatabaseOid)?;
+        Ok(Self(identity))
+    }
+}
+
+/// Why a domain-store identity cannot be used as an activation expectation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FragmentDatabaseIdentityError {
+    #[error("domain database system identifier is not canonical")]
+    InvalidSystemIdentifier,
+    #[error("domain database OID is invalid")]
+    InvalidDatabaseOid,
+}
+
+/// Seam-owned construction input for the shared dispatch pool.
+///
+/// Its exact steady-state inventory names the immutable, mutable, lock, domain, and dispatch
+/// maxima independently. No dispatch pool type crosses this public boundary.
+#[derive(Clone)]
+pub struct FragmentDispatchRuntimeConfig {
+    pub postgres_url: String,
+    pub expected_database_identity: FragmentDatabaseIdentity,
+    pub process_pool_inventory: ValidatedFragmentProcessPoolInventory,
+    pub connect_timeout: Duration,
+    pub acquire_timeout: Duration,
+    pub statement_timeout: Duration,
+    pub lock_timeout: Duration,
+    pub tls: FragmentDispatchTls,
+}
+
+impl fmt::Debug for FragmentDispatchRuntimeConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FragmentDispatchRuntimeConfig")
+            .field("postgres_url", &"[REDACTED]")
+            .field(
+                "expected_database_identity",
+                &self.expected_database_identity,
+            )
+            .field("process_pool_inventory", &self.process_pool_inventory)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("acquire_timeout", &self.acquire_timeout)
+            .field("statement_timeout", &self.statement_timeout)
+            .field("lock_timeout", &self.lock_timeout)
+            .field("tls", &self.tls)
+            .finish()
+    }
+}
+
+/// Exact maxima of every pool the process opens against the cell database.
+///
+/// Composition supplies every value from its owning configuration. The seam neither defaults nor
+/// infers one pool's maximum from another pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FragmentProcessPoolInventory {
+    pub immutable_pool_max: u32,
+    pub mutable_pool_max: u32,
+    pub lock_pool_max: u32,
+    pub domain_pool_max: u32,
+    pub dispatch_pool_max: u32,
+}
+
+impl FragmentProcessPoolInventory {
+    /// Validate the exact five-pool process inventory before composition opens
+    /// any database or object-store connection.
+    pub fn validate(
+        self,
+    ) -> Result<ValidatedFragmentProcessPoolInventory, FragmentProviderActivationError> {
+        let budget = DispatchConnectionBudget::new(
+            self.immutable_pool_max,
+            self.mutable_pool_max,
+            self.lock_pool_max,
+            self.domain_pool_max,
+            self.dispatch_pool_max,
+        )
+        .map_err(FragmentProviderActivationError::DispatchPool)?;
+        Ok(ValidatedFragmentProcessPoolInventory {
+            inventory: self,
+            budget,
+        })
+    }
+}
+
+/// Canonically validated five-pool inventory carried from server preflight to
+/// the dispatch pool without repeating or reimplementing the arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedFragmentProcessPoolInventory {
+    inventory: FragmentProcessPoolInventory,
+    budget: DispatchConnectionBudget,
+}
+
+/// The one composition door for attestation, charge authority, and provider
+/// transport. It retains one Arc-backed pool through the typed client and
+/// charge authority; no second pool or raw connection is opened.
+pub struct FragmentProviderEntry {
+    gateway: FragmentProviderGateway,
+    _dispatch: DispatchRuntimeClient,
+}
+
+impl FragmentProviderEntry {
+    pub async fn connect<P>(
+        config: FragmentDispatchRuntimeConfig,
+        boundary: CellProviderBoundary,
+        capabilities: ProviderCapabilities,
+        bound: InFlightPutBound,
+        transport: P,
+    ) -> Result<Self, FragmentProviderActivationError>
+    where
+        P: FragmentTransportPort + FragmentDirectPutPort + FragmentGetPort + 'static,
+    {
+        let ValidatedFragmentProcessPoolInventory { inventory, budget } =
+            config.process_pool_inventory;
+        let tls = match config.tls {
+            FragmentDispatchTls::Disabled => DispatchTlsMode::Disabled,
+            FragmentDispatchTls::PinnedRootCa(pem) => DispatchTlsMode::PinnedRootCa(pem),
+        };
+        let pool = Arc::new(
+            DispatchRuntimePool::new(DispatchPoolConfig {
+                postgres_url: config.postgres_url,
+                role: DispatchPoolRole::Runtime,
+                expected_database_identity: config.expected_database_identity.0,
+                pool_max: inventory.dispatch_pool_max,
+                connect_timeout: config.connect_timeout,
+                acquire_timeout: config.acquire_timeout,
+                statement_timeout: config.statement_timeout,
+                lock_timeout: config.lock_timeout,
+                tls,
+                budget,
+            })
+            .map_err(FragmentProviderActivationError::DispatchPool)?,
+        );
+        let dispatch = DispatchRuntimeClient::new(pool.clone())
+            .map_err(FragmentProviderActivationError::DispatchClient)?;
+        dispatch
+            .attest_database_identity(config.expected_database_identity.0)
+            .await
+            .map_err(FragmentProviderActivationError::DatabaseIdentity)?;
+        let attestation = attest_cell_schema(&dispatch, boundary)
+            .await
+            .map_err(FragmentProviderActivationError::Schema)?;
+        let charge_authority = PostgresProviderChargeAuthority::new(pool)
+            .map_err(FragmentProviderActivationError::ChargeAuthority)?;
+        let gateway = FragmentProviderGateway::with_transport_port(
+            attestation,
+            capabilities,
+            bound,
+            charge_authority,
+            transport,
+        );
+        Ok(Self {
+            gateway,
+            _dispatch: dispatch,
+        })
+    }
+
+    pub fn boundary(&self) -> &CellProviderBoundary {
+        self.gateway.boundary()
+    }
+
+    pub async fn admit_operation(
+        &self,
+        attempt: FragmentProviderAttempt,
+        operation: FragmentTransportOperation,
+    ) -> Result<AdmittedFragmentAttempt<'_>, FragmentProviderError> {
+        self.gateway.admit_operation(attempt, operation).await
+    }
+
+    pub async fn admit_put(
+        &self,
+        attempt: FragmentProviderAttempt,
+        operation: FragmentDirectPutOperation,
+    ) -> Result<AdmittedFragmentPutAttempt<'_>, FragmentProviderError> {
+        self.gateway.admit_put(attempt, operation).await
+    }
+
+    pub async fn get(
+        &self,
+        attempt: &FragmentGetAttempt,
+        operation: &FragmentGetOperation,
+    ) -> Result<FragmentGetExecution, FragmentProviderError> {
+        self.gateway.get(attempt, operation).await
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentTransportExecution {
+    pub outcome: ProviderAttemptOutcome,
+    pub response: FragmentTransportResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentGetExecution {
+    pub outcome: ProviderAttemptOutcome,
+    pub response: FragmentGetResponse,
+}
+
+/// One admitted body-free operation. The direct-PUT entry uses a distinct token
+/// so this type cannot acquire a PUT body or invoke direct transport.
+pub struct AdmittedFragmentAttempt<'a> {
+    gateway: &'a FragmentProviderGateway,
+    attempt: FragmentProviderAttempt,
+    operation: FragmentTransportOperation,
+}
+
+impl<'a> AdmittedFragmentAttempt<'a> {
+    /// Consume this body-free admission for one governed charge/send.
+    pub async fn execute(
+        self,
+        ledger: &mut FragmentAttemptLedger,
+    ) -> Result<FragmentTransportExecution, FragmentProviderError> {
+        self.gateway.check_ingress_cap(&self.attempt)?;
+        let request =
+            MeteredProviderAttemptRequest::try_from(self.gateway.build_request(&self.attempt))
+                .map_err(FragmentProviderError::Provider)?;
+        let execution = self
+            .gateway
+            .client
+            .issue(&mut ledger.0, &request, &self.operation)
+            .await
+            .map_err(FragmentProviderError::Provider)?;
+        Ok(FragmentTransportExecution {
+            outcome: execution.outcome,
+            response: execution.response,
+        })
+    }
+}
+
+/// One admitted direct PUT. It is non-Clone and retains the sole configured
+/// PUT permit until validation, charge, and transport execution complete.
+pub struct AdmittedFragmentPutAttempt<'a> {
+    gateway: &'a FragmentProviderGateway,
+    attempt: FragmentProviderAttempt,
+    operation: FragmentDirectPutOperation,
+    _put_permit: SemaphorePermit<'a>,
+}
+
+impl AdmittedFragmentPutAttempt<'_> {
+    /// Validate and exact-bind a bounded direct PUT, then consume the sole
+    /// admission permit for its one governed charge/send.
+    pub async fn execute_direct_put(
+        self,
+        ledger: &mut FragmentAttemptLedger,
+        body: &[u8],
+    ) -> Result<FragmentTransportExecution, FragmentProviderError> {
+        let request = ProviderDirectPutAttemptRequest {
+            traffic_class: self.attempt.traffic_class,
+            target: self.gateway.boundary().target().clone(),
+            logical_request_id: self.attempt.logical_request_id,
+            attempt_id: self.attempt.attempt_id,
+            attempt_ordinal: self.attempt.attempt_ordinal,
+            deadline_unix_ms: self.attempt.deadline_unix_ms,
+            budget_pin: self.attempt.budget_pin,
+            declared_size: self.operation.declared_size,
+            declared_blake3: self.operation.declared_blake3,
+        };
+        let execution = self
+            .gateway
+            .client
+            .issue_direct_put(&mut ledger.0, &request, body, &self.operation)
+            .await
+            .map_err(FragmentProviderError::Provider)?;
+        Ok(FragmentTransportExecution {
+            outcome: execution.outcome,
+            response: execution.response,
+        })
+    }
 }
 
 impl FragmentProviderGateway {
@@ -917,19 +1785,49 @@ impl FragmentProviderGateway {
     ) -> Self
     where
         C: ProviderChargeAuthority + Send + Sync + 'static,
-        T: ProviderTransport + Send + Sync + 'static,
+        T: ProviderTransport<Operation = (), Response = ()> + Send + Sync + 'static,
     {
         Self {
-            client: Box::new(GovernedProviderClient::new(
+            client: Box::new(UnitAttemptSink(GovernedProviderClient::new(
                 attestation.boundary().clone(),
                 capabilities,
                 ProviderRetryPolicy::disabled(),
                 charge_authority,
                 transport,
-            )),
+            ))),
             attestation,
             bound,
             in_flight_puts: Semaphore::new(bound.permits()),
+            port_wired: false,
+        }
+    }
+
+    /// Build the wired gateway around the seam-owned opaque transport port.
+    /// The adapter is private, so the authorized dispatch vocabulary remains
+    /// unavailable to the port implementation.
+    pub fn with_transport_port<C, P>(
+        attestation: CellSchemaAttestation,
+        capabilities: ProviderCapabilities,
+        bound: InFlightPutBound,
+        charge_authority: C,
+        transport: P,
+    ) -> Self
+    where
+        C: ProviderChargeAuthority + Send + Sync + 'static,
+        P: FragmentTransportPort + FragmentDirectPutPort + FragmentGetPort + 'static,
+    {
+        Self {
+            client: Box::new(PortAttemptSink(GovernedProviderClient::new(
+                attestation.boundary().clone(),
+                capabilities,
+                ProviderRetryPolicy::disabled(),
+                charge_authority,
+                FragmentTransportAdapter(transport),
+            ))),
+            attestation,
+            bound,
+            in_flight_puts: Semaphore::new(bound.permits()),
+            port_wired: true,
         }
     }
 
@@ -958,6 +1856,71 @@ impl FragmentProviderGateway {
         self.in_flight_puts.available_permits()
     }
 
+    /// Validate and admit one explicit body-free operation.
+    pub async fn admit_operation(
+        &self,
+        attempt: FragmentProviderAttempt,
+        operation: FragmentTransportOperation,
+    ) -> Result<AdmittedFragmentAttempt<'_>, FragmentProviderError> {
+        if !self.port_wired {
+            return Err(FragmentProviderError::OperationRequired);
+        }
+        Self::check_attempt_class(attempt.attempt_class)?;
+        if operation.object_key().is_empty() {
+            return Err(FragmentProviderError::InvalidObjectKey);
+        }
+        let matches = matches!(
+            (attempt.attempt_class, &operation),
+            (
+                ProviderAttemptClass::HeadObject,
+                FragmentTransportOperation::Head { .. }
+            ) | (
+                ProviderAttemptClass::ListObjectVersions,
+                FragmentTransportOperation::ListVersions { .. }
+            ) | (
+                ProviderAttemptClass::DeleteObject,
+                FragmentTransportOperation::DeleteVersion { .. }
+            )
+        );
+        if !matches || attempt.put_body.is_some() {
+            return Err(FragmentProviderError::OperationMismatch);
+        }
+        Ok(AdmittedFragmentAttempt {
+            gateway: self,
+            attempt,
+            operation,
+        })
+    }
+
+    /// Validate and admit one conditional direct PUT. Admission owns the only
+    /// PUT permit before the caller supplies body bytes, and execution never
+    /// reacquires it.
+    pub async fn admit_put(
+        &self,
+        attempt: FragmentProviderAttempt,
+        operation: FragmentDirectPutOperation,
+    ) -> Result<AdmittedFragmentPutAttempt<'_>, FragmentProviderError> {
+        if !self.port_wired {
+            return Err(FragmentProviderError::OperationRequired);
+        }
+        if attempt.attempt_class != ProviderAttemptClass::PutObject || attempt.put_body.is_some() {
+            return Err(FragmentProviderError::OperationMismatch);
+        }
+        if operation.object_key.is_empty() {
+            return Err(FragmentProviderError::InvalidObjectKey);
+        }
+        if operation.declared_size > FRAGMENT_PROVIDER_INGRESS_CAP_BYTES {
+            return Err(FragmentProviderError::IngressCapExceeded);
+        }
+        let put_permit = self.admit_put_permit().await?;
+        Ok(AdmittedFragmentPutAttempt {
+            gateway: self,
+            attempt,
+            operation,
+            _put_permit: put_permit,
+        })
+    }
+
     /// Charges and issues one attempt, subject to every Phase 4 property.
     ///
     /// Order matters and is deliberate. The class allowlist and the ingress cap
@@ -980,14 +1943,57 @@ impl FragmentProviderGateway {
         ledger: &mut FragmentAttemptLedger,
         attempt: &FragmentProviderAttempt,
     ) -> Result<ProviderAttemptOutcome, FragmentProviderError> {
+        if self.port_wired {
+            return Err(FragmentProviderError::OperationRequired);
+        }
         Self::check_attempt_class(attempt.attempt_class)?;
         self.check_ingress_cap(attempt)?;
         let _permit = self.admit(attempt.attempt_class).await?;
-        let request = self.build_request(attempt);
-        self.client
-            .issue(&mut ledger.0, &request)
+        let request = MeteredProviderAttemptRequest::try_from(self.build_request(attempt))
+            .map_err(FragmentProviderError::Provider)?;
+        let execution = self
+            .client
+            .issue(
+                &mut ledger.0,
+                &request,
+                &FragmentTransportOperation::Head {
+                    object_key: String::new(),
+                },
+            )
             .await
-            .map_err(FragmentProviderError::Provider)
+            .map_err(FragmentProviderError::Provider)?;
+        Ok(execution.outcome)
+    }
+
+    /// Issues the one unmetered, read-only provider operation. This path has no
+    /// durable ledger, database charge authority call, budget pin, deadline,
+    /// traffic class, or admission permit.
+    pub async fn get(
+        &self,
+        attempt: &FragmentGetAttempt,
+        operation: &FragmentGetOperation,
+    ) -> Result<FragmentGetExecution, FragmentProviderError> {
+        if !self.port_wired {
+            return Err(FragmentProviderError::OperationRequired);
+        }
+        if operation.object_key.is_empty() {
+            return Err(FragmentProviderError::InvalidObjectKey);
+        }
+        let request = ProviderGetAttemptRequest {
+            target: self.client.boundary().target().clone(),
+            logical_request_id: attempt.logical_request_id.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            attempt_ordinal: attempt.attempt_ordinal,
+        };
+        let execution = self
+            .client
+            .issue_get(&request, operation)
+            .await
+            .map_err(FragmentProviderError::Provider)?;
+        Ok(FragmentGetExecution {
+            outcome: execution.outcome,
+            response: execution.response,
+        })
     }
 
     /// Runs every local Phase 4 check and the governed client's own validation,
@@ -1000,8 +2006,10 @@ impl FragmentProviderGateway {
     ) -> Result<(), FragmentProviderError> {
         Self::check_attempt_class(attempt.attempt_class)?;
         self.check_ingress_cap(attempt)?;
+        let request = MeteredProviderAttemptRequest::try_from(self.build_request(attempt))
+            .map_err(FragmentProviderError::Provider)?;
         self.client
-            .validate(&self.build_request(attempt))
+            .validate(&request)
             .map_err(FragmentProviderError::Provider)
     }
 
@@ -1066,8 +2074,12 @@ impl FragmentProviderGateway {
         if !class.carries_object_body() {
             return Ok(None);
         }
+        self.admit_put_permit().await.map(Some)
+    }
+
+    async fn admit_put_permit(&self) -> Result<SemaphorePermit<'_>, FragmentProviderError> {
         match self.in_flight_puts.try_acquire() {
-            Ok(permit) => return Ok(Some(permit)),
+            Ok(permit) => return Ok(permit),
             Err(TryAcquireError::Closed) => {
                 return Err(FragmentProviderError::PutAdmissionClosed);
             }
@@ -1076,7 +2088,7 @@ impl FragmentProviderGateway {
         match tokio::time::timeout(self.bound.acquire_timeout(), self.in_flight_puts.acquire())
             .await
         {
-            Ok(Ok(permit)) => Ok(Some(permit)),
+            Ok(Ok(permit)) => Ok(permit),
             Ok(Err(_)) => Err(FragmentProviderError::PutAdmissionClosed),
             Err(_) => Err(FragmentProviderError::PutAdmissionTimedOut),
         }
@@ -1103,8 +2115,8 @@ impl std::fmt::Debug for FragmentProviderGateway {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicU32;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -1119,13 +2131,8 @@ mod tests {
     use lore_object_dispatch::ProviderTarget;
     use lore_object_dispatch::ProviderTransportRefusal;
     use lore_object_dispatch::PutObjectPlan;
-    use lore_object_dispatch::bind_durable_put_body;
     use lore_object_dispatch::cell_schema_install::CellSchemaLayer;
     use lore_object_dispatch::plan_put_object;
-    use lore_object_dispatch::spool::LedgerSpoolView;
-    use lore_object_dispatch::spool::SpoolLayout;
-    use lore_object_dispatch::spool::SpoolObjectKey;
-    use lore_object_dispatch::spool::SpoolObjectKind;
 
     use super::*;
 
@@ -1192,44 +2199,12 @@ mod tests {
         }
     }
 
-    /// A durable put body of `size` bytes bound to the fixture boundary and
-    /// request. No filesystem access: `bind_durable_put_body` derives the handle
-    /// and compares it against the ledger's, which is what production does too.
-    fn put_body(size: u64) -> DurableProviderPutBody {
-        let root = if cfg!(windows) {
-            PathBuf::from("C:\\lore-spool")
-        } else {
-            PathBuf::from("/lore-spool")
-        };
-        let layout = match SpoolLayout::new(root) {
-            Ok(layout) => layout,
-            Err(error) => panic!("fixture spool root must be valid: {error}"),
-        };
-        let key = SpoolObjectKey {
-            provider_boundary_id: BOUNDARY_ID.to_string(),
-            logical_request_id: REQUEST_ID.to_string(),
-            attempt_id: ATTEMPT_ID.to_string(),
-            kind: SpoolObjectKind::Put,
-        };
-        let paths = match layout.derive_paths(&key) {
-            Ok(paths) => paths,
-            Err(error) => panic!("fixture spool key must derive: {error}"),
-        };
-        let ledger = LedgerSpoolView::Ready {
-            opaque_handle: paths.opaque_handle().to_string(),
-            size,
-            blake3: [7u8; 32],
-        };
-        match bind_durable_put_body(&layout, &key, &ledger) {
-            Ok(body) => body,
-            Err(error) => panic!("fixture put body must bind: {error}"),
-        }
-    }
-
-    fn put_attempt(size: u64) -> FragmentProviderAttempt {
-        FragmentProviderAttempt {
-            put_body: Some(put_body(size)),
-            ..attempt(ProviderAttemptClass::PutObject)
+    fn put_operation(body: &[u8]) -> FragmentDirectPutOperation {
+        FragmentDirectPutOperation {
+            object_key: "objects/fragment.bin".to_string(),
+            metadata: vec![("codec".to_string(), "raw".to_string())],
+            declared_size: body.len() as u64,
+            declared_blake3: *blake3::hash(body).as_bytes(),
         }
     }
 
@@ -1321,14 +2296,19 @@ mod tests {
     }
 
     impl ProviderTransport for CountingTransport {
-        fn issue(
+        type Operation = ();
+        type Response = ();
+
+        async fn issue(
             &self,
             _attempt: &AuthorizedProviderAttempt<'_>,
-        ) -> Result<ProviderAttemptReport, ProviderTransportRefusal> {
+            _operation: &Self::Operation,
+        ) -> Result<ProviderAttemptReport<Self::Response>, ProviderTransportRefusal> {
             self.issued.fetch_add(1, Ordering::SeqCst);
             Ok(ProviderAttemptReport {
                 outcome: self.outcome,
                 provider_requests_issued: self.requests_per_call,
+                response: (),
             })
         }
     }
@@ -1400,6 +2380,16 @@ mod tests {
 
     struct SharedTransport(Arc<CountingTransport>);
 
+    struct CountingGetPort {
+        get_calls: AtomicUsize,
+        metered_calls: AtomicUsize,
+        requests_per_call: u32,
+        outcome: ProviderAttemptOutcome,
+        direct_body: Mutex<Option<Vec<u8>>>,
+    }
+
+    struct SharedGetPort(Arc<CountingGetPort>);
+
     impl ProviderChargeAuthority for SharedAuthority {
         fn charge(
             &self,
@@ -1411,12 +2401,139 @@ mod tests {
     }
 
     impl ProviderTransport for SharedTransport {
-        fn issue(
+        type Operation = ();
+        type Response = ();
+
+        async fn issue(
             &self,
             attempt: &AuthorizedProviderAttempt<'_>,
-        ) -> Result<ProviderAttemptReport, ProviderTransportRefusal> {
-            CountingTransport::issue(self.0.as_ref(), attempt)
+            operation: &Self::Operation,
+        ) -> Result<ProviderAttemptReport<Self::Response>, ProviderTransportRefusal> {
+            CountingTransport::issue(self.0.as_ref(), attempt, operation).await
         }
+    }
+
+    impl FragmentTransportPort for SharedGetPort {
+        fn issue<'a>(
+            &'a self,
+            request: FragmentTransportRequest<'a>,
+        ) -> Pin<Box<dyn Future<Output = FragmentTransportExchange> + Send + 'a>> {
+            self.0.metered_calls.fetch_add(1, Ordering::SeqCst);
+            let requests_per_call = self.0.requests_per_call;
+            let response = match request.operation() {
+                FragmentTransportOperation::Head { .. } => FragmentTransportResponse::Head {
+                    metadata: Vec::new(),
+                    content_length: 1,
+                },
+                FragmentTransportOperation::ListVersions { .. } => {
+                    FragmentTransportResponse::Versions(Vec::new())
+                }
+                FragmentTransportOperation::DeleteVersion { .. } => {
+                    FragmentTransportResponse::Deleted
+                }
+            };
+            Box::pin(async move {
+                FragmentTransportExchange {
+                    outcome: self.0.outcome,
+                    provider_requests_issued: requests_per_call,
+                    response,
+                }
+            })
+        }
+    }
+
+    impl FragmentDirectPutPort for SharedGetPort {
+        fn issue_direct_put<'a>(
+            &'a self,
+            request: FragmentDirectPutRequest<'a>,
+        ) -> Pin<Box<dyn Future<Output = FragmentTransportExchange> + Send + 'a>> {
+            self.0.metered_calls.fetch_add(1, Ordering::SeqCst);
+            let requests_per_call = self.0.requests_per_call;
+            let body = request.body().expect("direct PUT request carries bytes");
+            assert_eq!(request.size(), Some(body.len() as u64));
+            assert_eq!(request.blake3(), Some(blake3::hash(body).as_bytes()));
+            *self.0.direct_body.lock().expect("direct body lock") = Some(body.to_vec());
+            Box::pin(async move {
+                FragmentTransportExchange {
+                    outcome: self.0.outcome,
+                    provider_requests_issued: requests_per_call,
+                    response: FragmentTransportResponse::PutCreated,
+                }
+            })
+        }
+    }
+
+    impl FragmentGetPort for SharedGetPort {
+        fn issue_get<'a>(
+            &'a self,
+            request: FragmentGetRequest<'a>,
+        ) -> Pin<Box<dyn Future<Output = FragmentGetExchange> + Send + 'a>> {
+            self.0.get_calls.fetch_add(1, Ordering::SeqCst);
+            let requests_per_call = self.0.requests_per_call;
+            Box::pin(async move {
+                assert_eq!(request.target().bucket(), "cell-alpha-fragments");
+                assert_eq!(request.operation().object_key, "objects/fragment.bin");
+                FragmentGetExchange {
+                    outcome: ProviderAttemptOutcome::Decisive,
+                    provider_requests_issued: requests_per_call,
+                    response: FragmentGetResponse::Found {
+                        bytes: vec![1, 2, 3],
+                        metadata: vec![("codec".to_string(), "raw".to_string())],
+                    },
+                }
+            })
+        }
+    }
+
+    fn get_attempt() -> FragmentGetAttempt {
+        FragmentGetAttempt {
+            logical_request_id: REQUEST_ID.to_string(),
+            attempt_id: ATTEMPT_ID.to_string(),
+            attempt_ordinal: 1,
+        }
+    }
+
+    fn get_operation() -> FragmentGetOperation {
+        FragmentGetOperation {
+            object_key: "objects/fragment.bin".to_string(),
+        }
+    }
+
+    fn get_harness(
+        requests_per_call: u32,
+    ) -> (
+        FragmentProviderGateway,
+        Arc<ScriptedChargeAuthority>,
+        Arc<CountingGetPort>,
+    ) {
+        port_harness(ChargeScript::Grant, requests_per_call, bound())
+    }
+
+    fn port_harness(
+        script: ChargeScript,
+        requests_per_call: u32,
+        put_bound: InFlightPutBound,
+    ) -> (
+        FragmentProviderGateway,
+        Arc<ScriptedChargeAuthority>,
+        Arc<CountingGetPort>,
+    ) {
+        let authority = Arc::new(ScriptedChargeAuthority::new(script));
+        let port = Arc::new(CountingGetPort {
+            get_calls: AtomicUsize::new(0),
+            metered_calls: AtomicUsize::new(0),
+            requests_per_call,
+            outcome: ProviderAttemptOutcome::Decisive,
+            direct_body: Mutex::new(None),
+        });
+        let gateway = FragmentProviderGateway::with_transport_port(
+            CellSchemaAttestation::for_tests(boundary()),
+            ProviderCapabilities::none().with_listing(),
+            put_bound,
+            SharedAuthority(Arc::clone(&authority)),
+            SharedGetPort(Arc::clone(&port)),
+        );
+        (gateway, authority, port)
     }
 
     fn harness(script: ChargeScript) -> Harness {
@@ -1564,7 +2681,7 @@ mod tests {
                 }
                 assert_eq!(
                     verify_installed_layers(&state, boundary()),
-                    Err(FragmentProviderError::AttestationMismatch { layer: id.label() }),
+                    Err(FragmentSchemaAttestationError::Mismatch { layer: *id }),
                     "layer {} mutation {mutation} must refuse and name its own layer",
                     id.label(),
                 );
@@ -1631,12 +2748,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_returns_the_typed_response_with_zero_database_authority_calls() {
+        let (gateway, authority, port) = get_harness(1);
+
+        let execution = gateway.get(&get_attempt(), &get_operation()).await;
+
+        assert_eq!(
+            execution,
+            Ok(FragmentGetExecution {
+                outcome: ProviderAttemptOutcome::Decisive,
+                response: FragmentGetResponse::Found {
+                    bytes: vec![1, 2, 3],
+                    metadata: vec![("codec".to_string(), "raw".to_string())],
+                },
+            })
+        );
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(port.get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn get_exposes_a_response_only_for_exactly_one_wire_request() {
+        for (reported, expected) in [
+            (
+                0,
+                Err(FragmentProviderError::Provider(
+                    ProviderClientError::TransportReportInconsistent,
+                )),
+            ),
+            (
+                2,
+                Err(FragmentProviderError::Provider(
+                    ProviderClientError::TransportIssuedUnauthorizedRequests,
+                )),
+            ),
+        ] {
+            let (gateway, authority, port) = get_harness(reported);
+
+            assert_eq!(
+                gateway.get(&get_attempt(), &get_operation()).await,
+                expected
+            );
+            assert_eq!(
+                authority.calls.load(Ordering::SeqCst),
+                0,
+                "reported={reported}"
+            );
+            assert_eq!(
+                port.get_calls.load(Ordering::SeqCst),
+                1,
+                "reported={reported}"
+            );
+            assert_eq!(
+                port.metered_calls.load(Ordering::SeqCst),
+                0,
+                "reported={reported}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn head_list_and_delete_each_charge_and_send_once_while_get_stays_unmetered() {
+        let cases = [
+            (
+                ProviderAttemptClass::HeadObject,
+                FragmentTransportOperation::Head {
+                    object_key: "objects/fragment.bin".to_string(),
+                },
+            ),
+            (
+                ProviderAttemptClass::ListObjectVersions,
+                FragmentTransportOperation::ListVersions {
+                    object_key: "objects/fragment.bin".to_string(),
+                },
+            ),
+            (
+                ProviderAttemptClass::DeleteObject,
+                FragmentTransportOperation::DeleteVersion {
+                    object_key: "objects/fragment.bin".to_string(),
+                    version_id: "version-1".to_string(),
+                },
+            ),
+        ];
+        for (class, operation) in cases {
+            let (gateway, authority, port) = port_harness(ChargeScript::Grant, 1, bound());
+            let admitted = gateway
+                .admit_operation(attempt(class), operation)
+                .await
+                .expect("metered non-GET admission");
+            admitted
+                .execute(&mut ledger())
+                .await
+                .expect("metered non-GET execution");
+            assert_eq!(authority.calls.load(Ordering::SeqCst), 1, "{class:?}");
+            assert_eq!(port.metered_calls.load(Ordering::SeqCst), 1, "{class:?}");
+            assert_eq!(port.get_calls.load(Ordering::SeqCst), 0, "{class:?}");
+        }
+
+        let (gateway, authority, port) = get_harness(1);
+        gateway
+            .get(&get_attempt(), &get_operation())
+            .await
+            .expect("unmetered GET");
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(port.get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn an_ambiguous_commit_stays_charged_and_sends_nothing() {
         let harness = harness(ChargeScript::Refuse(ProviderChargeError::AmbiguousCommit));
         let mut ledger = ledger();
         let outcome = harness
             .gateway
-            .execute(&mut ledger, &attempt(ProviderAttemptClass::GetObject))
+            .execute(&mut ledger, &attempt(ProviderAttemptClass::HeadObject))
             .await;
         assert_eq!(
             outcome,
@@ -1665,7 +2891,7 @@ mod tests {
         let mut ledger = ledger();
         let outcome = harness
             .gateway
-            .execute(&mut ledger, &put_attempt(1_024))
+            .execute(&mut ledger, &attempt(ProviderAttemptClass::HeadObject))
             .await;
         assert_eq!(
             outcome,
@@ -1736,7 +2962,7 @@ mod tests {
         let mut ledger = ledger();
         let outcome = harness
             .gateway
-            .execute(&mut ledger, &attempt(ProviderAttemptClass::GetObject))
+            .execute(&mut ledger, &attempt(ProviderAttemptClass::HeadObject))
             .await;
         assert_eq!(
             outcome,
@@ -1781,58 +3007,147 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_body_over_the_ingress_cap_is_refused_before_the_charge() {
-        let harness = harness(ChargeScript::Grant);
-        let mut ledger = ledger();
-        let outcome = harness
-            .gateway
-            .execute(
-                &mut ledger,
-                &put_attempt(FRAGMENT_PROVIDER_INGRESS_CAP_BYTES + 1),
+    async fn direct_put_bounds_are_zero_one_cap_and_cap_plus_one_before_charge() {
+        for (size, expected) in [
+            (
+                0,
+                Err(FragmentProviderError::Provider(
+                    ProviderClientError::DirectPutBodyOutOfBounds,
+                )),
+            ),
+            (1, Ok(())),
+            (FRAGMENT_PROVIDER_INGRESS_CAP_BYTES as usize, Ok(())),
+            (
+                FRAGMENT_PROVIDER_INGRESS_CAP_BYTES as usize + 1,
+                Err(FragmentProviderError::IngressCapExceeded),
+            ),
+        ] {
+            let body = vec![0x5a; size];
+            let (gateway, authority, port) = port_harness(ChargeScript::Grant, 1, bound());
+            let admitted = gateway
+                .admit_put(
+                    attempt(ProviderAttemptClass::PutObject),
+                    put_operation(&body),
+                )
+                .await;
+            let result = match admitted {
+                Ok(admitted) => admitted
+                    .execute_direct_put(&mut ledger(), &body)
+                    .await
+                    .map(|_| ()),
+                Err(error) => Err(error),
+            };
+            assert_eq!(result, expected, "body size {size}");
+            let expected_calls = u32::from(expected.is_ok());
+            assert_eq!(authority.calls.load(Ordering::SeqCst), expected_calls);
+            assert_eq!(
+                port.metered_calls.load(Ordering::SeqCst),
+                expected_calls as usize
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_put_admission_is_body_free_and_precedes_charge_and_send() {
+        let body = b"body-arrives-only-after-admission";
+        let (gateway, authority, port) = port_harness(ChargeScript::Grant, 1, bound());
+        let admitted = gateway
+            .admit_put(
+                attempt(ProviderAttemptClass::PutObject),
+                put_operation(body),
             )
-            .await;
-        assert_eq!(outcome, Err(FragmentProviderError::IngressCapExceeded));
-        assert_eq!(harness.charge_calls(), 0);
-        assert_eq!(harness.issued(), 0);
-        assert_eq!(ledger.committed_grant_count(), 0);
+            .await
+            .expect("body-free PUT admission");
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
-            harness.gateway.available_put_permits(),
-            harness.gateway.in_flight_put_bound().permits(),
-            "a refused body must not consume an in-flight slot",
+            gateway.available_put_permits(),
+            gateway.in_flight_put_bound().permits() - 1
+        );
+
+        let execution = admitted
+            .execute_direct_put(&mut ledger(), body)
+            .await
+            .expect("admitted direct PUT");
+        assert_eq!(execution.response, FragmentTransportResponse::PutCreated);
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            port.direct_body
+                .lock()
+                .expect("direct body lock")
+                .as_deref(),
+            Some(body.as_slice())
         );
     }
 
     #[tokio::test]
-    async fn a_body_at_exactly_the_ingress_cap_is_admitted() {
-        let harness = harness(ChargeScript::Grant);
-        let mut ledger = ledger();
-        let outcome = harness
-            .gateway
-            .execute(
-                &mut ledger,
-                &put_attempt(FRAGMENT_PROVIDER_INGRESS_CAP_BYTES),
+    async fn direct_put_declared_size_and_hash_mismatch_before_charge() {
+        let body = b"bound-body";
+        for mutation in [0, 1] {
+            let (gateway, authority, port) = port_harness(ChargeScript::Grant, 1, bound());
+            let mut operation = put_operation(body);
+            let FragmentDirectPutOperation {
+                declared_size,
+                declared_blake3,
+                ..
+            } = &mut operation;
+            if mutation == 0 {
+                *declared_size += 1;
+            } else {
+                declared_blake3[0] ^= 0x80;
+            }
+            let admitted = gateway
+                .admit_put(attempt(ProviderAttemptClass::PutObject), operation)
+                .await
+                .expect("declaration shape admits without body");
+            assert_eq!(
+                admitted.execute_direct_put(&mut ledger(), body).await,
+                Err(FragmentProviderError::Provider(
+                    ProviderClientError::DirectPutBodyBindingMismatch
+                )),
+                "mutation {mutation}"
+            );
+            assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_direct_put_charge_sends_zero_wire_requests() {
+        let body = b"refused-direct-put";
+        let (gateway, authority, port) = port_harness(
+            ChargeScript::Refuse(ProviderChargeError::BudgetExhausted),
+            1,
+            bound(),
+        );
+        let admitted = gateway
+            .admit_put(
+                attempt(ProviderAttemptClass::PutObject),
+                put_operation(body),
             )
-            .await;
-        assert_eq!(outcome, Ok(ProviderAttemptOutcome::Decisive));
-        assert_eq!(harness.issued(), 1);
+            .await
+            .expect("body-free PUT admission");
+        let mut ledger = ledger();
+        assert_eq!(
+            admitted.execute_direct_put(&mut ledger, body).await,
+            Err(FragmentProviderError::Provider(
+                ProviderClientError::ChargeRefused(ProviderChargeError::BudgetExhausted)
+            ))
+        );
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ledger.committed_grant_count(), 0);
+        assert_eq!(ledger.attempt_count(), 0);
     }
 
     /// Iterates the closed `ProviderAttemptClass::ALL`, so a variant added
     /// upstream must be classified here rather than defaulting into either set.
     #[test]
     fn every_attempt_class_is_either_permitted_or_refused_by_name() {
-        let harness = harness(ChargeScript::Grant);
         let mut refused = Vec::new();
         for class in ProviderAttemptClass::ALL {
-            let probe = FragmentProviderAttempt {
-                put_body: if class.carries_object_body() {
-                    Some(put_body(1_024))
-                } else {
-                    None
-                },
-                ..attempt(class)
-            };
-            let verdict = harness.gateway.validate_attempt(&probe);
+            let verdict = FragmentProviderGateway::check_attempt_class(class);
             if FRAGMENT_PROVIDER_ATTEMPT_CLASSES.contains(&class) {
                 assert_eq!(
                     verdict,
@@ -1855,12 +3170,13 @@ mod tests {
         assert_eq!(
             refused,
             vec![
+                ProviderAttemptClass::GetObject,
                 ProviderAttemptClass::CreateMultipartUpload,
                 ProviderAttemptClass::UploadPart,
                 ProviderAttemptClass::CompleteMultipartUpload,
                 ProviderAttemptClass::AbortMultipartUpload,
             ],
-            "the refused set is exactly multipart, which the 256 KiB cap makes unreachable",
+            "the refused set is GET, which has its own path, plus unreachable multipart",
         );
     }
 
@@ -1907,29 +3223,40 @@ mod tests {
             Ok(bound) => bound,
             Err(error) => panic!("fixture bound must be valid: {error}"),
         };
-        let harness = Arc::new(Harness::new(ChargeScript::Hang, 1, single));
+        let (gateway, authority, _port) = port_harness(ChargeScript::Hang, 1, single);
+        let gateway = Arc::new(gateway);
 
-        let holder = Arc::clone(&harness);
+        let holder = Arc::clone(&gateway);
         let held = lore_base::lore_spawn!(async move {
+            let body = vec![0x5a; 1_024];
             let mut ledger = ledger();
-            let _ = holder
-                .gateway
-                .execute(&mut ledger, &put_attempt(1_024))
+            let admitted = holder
+                .admit_put(
+                    attempt(ProviderAttemptClass::PutObject),
+                    put_operation(&body),
+                )
                 .await;
+            if let Ok(admitted) = admitted {
+                let _ = admitted.execute_direct_put(&mut ledger, &body).await;
+            }
         });
         // Wait for the first put to actually own the only slot. No sleep: the
         // permit count is the condition, so this cannot pass early.
-        wait_until_puts_are_saturated(&harness.gateway).await;
+        wait_until_puts_are_saturated(&gateway).await;
 
-        let mut ledger = ledger();
-        let outcome = harness
-            .gateway
-            .execute(&mut ledger, &put_attempt(1_024))
+        let body = vec![0x5a; 1_024];
+        let outcome = gateway
+            .admit_put(
+                attempt(ProviderAttemptClass::PutObject),
+                put_operation(&body),
+            )
             .await;
-        assert_eq!(outcome, Err(FragmentProviderError::PutAdmissionTimedOut));
-        assert_eq!(ledger.committed_grant_count(), 0);
+        assert!(matches!(
+            outcome,
+            Err(FragmentProviderError::PutAdmissionTimedOut)
+        ));
         assert_eq!(
-            harness.charge_calls(),
+            authority.calls.load(Ordering::SeqCst),
             1,
             "only the admitted put may reach the limiter",
         );
@@ -1944,34 +3271,47 @@ mod tests {
             Ok(bound) => bound,
             Err(error) => panic!("fixture bound must be valid: {error}"),
         };
-        let harness = Arc::new(Harness::new(ChargeScript::Hang, 1, single));
+        let (gateway, authority, _port) = port_harness(ChargeScript::Hang, 1, single);
+        let gateway = Arc::new(gateway);
 
-        let holder = Arc::clone(&harness);
+        let holder = Arc::clone(&gateway);
         let held = lore_base::lore_spawn!(async move {
+            let body = vec![0x5a; 1_024];
             let mut ledger = ledger();
-            let _ = holder
-                .gateway
-                .execute(&mut ledger, &put_attempt(1_024))
+            let admitted = holder
+                .admit_put(
+                    attempt(ProviderAttemptClass::PutObject),
+                    put_operation(&body),
+                )
                 .await;
+            if let Ok(admitted) = admitted {
+                let _ = admitted.execute_direct_put(&mut ledger, &body).await;
+            }
         });
-        wait_until_puts_are_saturated(&harness.gateway).await;
+        wait_until_puts_are_saturated(&gateway).await;
 
         // The scripted authority hangs, so a HEAD that took a put slot would time
         // out on admission first. Racing it against a bounded timeout separates
         // "queued behind the put bound" from "reached the limiter and is waiting
         // there", which are the two outcomes this test has to tell apart.
         let mut ledger = ledger();
-        let raced = tokio::time::timeout(
-            Duration::from_millis(200),
-            harness
-                .gateway
-                .execute(&mut ledger, &attempt(ProviderAttemptClass::HeadObject)),
-        )
+        let raced = tokio::time::timeout(Duration::from_millis(200), async {
+            gateway
+                .admit_operation(
+                    attempt(ProviderAttemptClass::HeadObject),
+                    FragmentTransportOperation::Head {
+                        object_key: "objects/fragment.bin".to_string(),
+                    },
+                )
+                .await?
+                .execute(&mut ledger)
+                .await
+        })
         .await;
         match raced {
             Err(_elapsed) => {
                 assert_eq!(
-                    harness.charge_calls(),
+                    authority.calls.load(Ordering::SeqCst),
                     2,
                     "the bodyless attempt must have reached the limiter, not the put queue",
                 );
@@ -2139,7 +3479,9 @@ mod tests {
                 FragmentProviderDisposition::Transient,
             ),
             (
-                FragmentProviderError::AttestationMismatch { layer: "retention" },
+                FragmentProviderError::Provider(ProviderClientError::ChargeRefused(
+                    ProviderChargeError::BudgetPinRejected,
+                )),
                 FragmentProviderDisposition::NotReady,
             ),
         ] {

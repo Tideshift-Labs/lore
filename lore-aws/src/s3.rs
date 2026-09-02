@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::ops::Range;
@@ -71,15 +72,21 @@ pub struct S3Impl {
     client: s3::Client,
     instruments: S3Instruments,
     slow_operation_duration: Duration,
+    resolved_endpoint_url: Option<String>,
 }
 
 #[cfg_attr(test, automock)]
 impl S3Impl {
-    pub fn new(client: s3::Client, slow_operation_duration: Duration) -> Self {
+    pub fn new(
+        client: s3::Client,
+        slow_operation_duration: Duration,
+        resolved_endpoint_url: Option<String>,
+    ) -> Self {
         Self {
             client,
             instruments: S3Instruments::new(S3InstrumentProvider {}),
             slow_operation_duration,
+            resolved_endpoint_url,
         }
     }
 
@@ -276,5 +283,14 @@ impl S3Impl {
 
     pub fn sdk_client(&self) -> &s3::Client {
         &self.client
+    }
+
+    /// Endpoint URL exposed by the resolved shared SDK config.
+    ///
+    /// The generated S3 config has no stable endpoint URL getter. Keeping the
+    /// resolved shared value lets security-sensitive callers fail closed when
+    /// no trustworthy endpoint is available.
+    pub fn resolved_endpoint_url(&self) -> Option<String> {
+        self.resolved_endpoint_url.clone()
     }
 }
