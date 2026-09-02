@@ -245,6 +245,7 @@ use lore_object_dispatch::DispatchTlsMode;
 pub use lore_object_dispatch::DurableProviderPutBody;
 use lore_object_dispatch::GovernedProviderClient;
 use lore_object_dispatch::MeteredProviderAttemptRequest;
+use lore_object_dispatch::PROVIDER_ATTEMPT_DEADLINE_HORIZON_MS;
 use lore_object_dispatch::PROVIDER_MIN_PART_SIZE_BYTES;
 use lore_object_dispatch::PostgresProviderChargeAuthority;
 pub use lore_object_dispatch::ProviderAttemptClass;
@@ -301,6 +302,13 @@ pub const MAX_IN_FLIGHT_PUTS: u32 = 1_024;
 /// posture: small enough that a cell that never tunes it cannot flood the
 /// shared cell budget on its own.
 pub const DEFAULT_IN_FLIGHT_PUTS: u32 = 4;
+
+/// Largest configured send window accepted by the fragment route.
+///
+/// This is derived from the governed client's request-deadline horizon rather
+/// than restating five minutes in server configuration code.
+pub const FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS: u64 =
+    PROVIDER_ATTEMPT_DEADLINE_HORIZON_MS as u64;
 
 // The arithmetic behind the multipart exclusion below, checked by the compiler.
 // If a later change raised the fragment ingress cap above the provider's

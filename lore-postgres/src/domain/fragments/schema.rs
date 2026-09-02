@@ -20,7 +20,14 @@
 /// First server-only fragment lifecycle schema revision. Recorded in
 /// `lore_fragment_schema_state.schema_version`; a server whose compiled value is
 /// below the stored value refuses to enable lifecycle routing.
-pub const FRAGMENT_SCHEMA_VERSION: i64 = 1;
+pub const FRAGMENT_SCHEMA_VERSION: i64 = 2;
+
+/// Provider writes are allowed during a rolling upgrade, but destructive
+/// lifecycle work must remain off.
+pub const WRITE_CAPABILITY_OPTIONAL: i16 = 0;
+/// Every writer must use durable `write-claims-v1` before destructive
+/// lifecycle work may start.
+pub const WRITE_CAPABILITY_CLAIMS_REQUIRED: i16 = 1;
 
 /// Backfill has not begun.
 pub const BACKFILL_NOT_STARTED: i16 = 0;
@@ -99,11 +106,12 @@ pub const DIAGNOSTIC_UNREPAIRABLE_ENCODING: i16 = 5;
 /// `lore_fragment_metering`) are deliberately excluded: the immutable store
 /// self-bootstraps them, so they exist on every Postgres-mode cell and their
 /// presence proves nothing about this migration.
-pub const FRAGMENT_SCHEMA_RELATIONS: [&str; 7] = [
+pub const FRAGMENT_SCHEMA_RELATIONS: [&str; 8] = [
     "lore_fragment_lifecycle",
     "lore_fragment_epochs",
     "lore_fragment_associations",
     "lore_fragment_lifecycle_metering",
+    "lore_fragment_write_claims",
     "lore_fragment_staged_leases",
     "lore_fragment_staged_lease_members",
     "lore_fragment_schema_state",
@@ -178,11 +186,22 @@ CREATE TABLE IF NOT EXISTS lore_fragment_epochs (
     decoded_hash  bytea       NOT NULL CHECK (octet_length(decoded_hash) > 0),
     payload_flags bigint      NOT NULL CHECK (payload_flags >= 0
                                               AND payload_flags <= 4294967295),
+    provider_body_blake3 bytea CHECK (provider_body_blake3 IS NULL
+                                      OR octet_length(provider_body_blake3) = 32),
+    provider_body_size bigint CHECK (provider_body_size IS NULL
+                                     OR (provider_body_size >= 0
+                                         AND provider_body_size <= 262144)),
+    provider_claim_fence bigint CHECK (provider_claim_fence IS NULL
+                                       OR provider_claim_fence >= 1),
     fence         bigint      NOT NULL CHECK (fence >= 1),
     validated_at  timestamptz,
     disposition   smallint    NOT NULL DEFAULT 0 CHECK (disposition IN (0, 1, 2)),
     created_at    timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (hash, epoch)
+    PRIMARY KEY (hash, epoch),
+    CONSTRAINT lore_fragment_epoch_provider_body_shape CHECK (
+        (provider_body_blake3 IS NULL) = (provider_body_size IS NULL)
+        AND (provider_body_blake3 IS NULL) = (provider_claim_fence IS NULL)
+    )
 );
 
 -- Association: binds (FragmentId, repository, context). It never binds a
@@ -258,6 +277,50 @@ CREATE INDEX IF NOT EXISTS lore_fragment_staged_leases_deadline
     ON lore_fragment_staged_leases (deadline)
     WHERE terminal = false;
 
+-- Durable per-attempt provider-write claim. The lifecycle head is always
+-- locked before a row in this table (both are LockClass::Fragments). A claim
+-- binds the exact logical request, attempt, head lineage, object key, and body
+-- before any provider I/O. Prepared, Sending, and Ambiguous remain barriers
+-- until hard_not_after; Decisive and NoSend are terminal and nonblocking. A
+-- provider write always targets Remote authority (2).
+CREATE TABLE IF NOT EXISTS lore_fragment_write_claims (
+    logical_request_id bytea       NOT NULL CHECK (octet_length(logical_request_id) = 16),
+    attempt_id         bytea       NOT NULL CHECK (octet_length(attempt_id) = 16),
+    hash               bytea       NOT NULL,
+    epoch              bigint      NOT NULL CHECK (epoch >= 1),
+    fence              bigint      NOT NULL CHECK (fence >= 1),
+    authority          smallint    NOT NULL CHECK (authority = 2),
+    object_key         text        NOT NULL CHECK (length(object_key) > 0),
+    body_blake3        bytea       NOT NULL CHECK (octet_length(body_blake3) = 32),
+    body_size          bigint      NOT NULL CHECK (body_size >= 0 AND body_size <= 262144),
+    state              smallint    NOT NULL CHECK (state BETWEEN 0 AND 4),
+    send_not_after     timestamptz NOT NULL,
+    hard_not_after     timestamptz NOT NULL,
+    prepared_at        timestamptz NOT NULL,
+    authorized_at      timestamptz,
+    settled_at         timestamptz,
+    PRIMARY KEY (logical_request_id, attempt_id),
+    CONSTRAINT lore_fragment_write_claim_deadline_shape CHECK (
+        send_not_after > prepared_at AND hard_not_after > send_not_after
+    ),
+    CONSTRAINT lore_fragment_write_claim_state_shape CHECK (
+        (state = 0 AND authorized_at IS NULL AND settled_at IS NULL)
+     OR (state = 1 AND authorized_at IS NOT NULL AND settled_at IS NULL)
+     OR (state IN (2, 3) AND authorized_at IS NOT NULL AND settled_at IS NOT NULL)
+     OR (state = 4 AND settled_at IS NOT NULL)
+    )
+);
+
+REVOKE ALL ON TABLE lore_fragment_write_claims FROM PUBLIC;
+
+CREATE INDEX IF NOT EXISTS lore_fragment_write_claims_barrier
+    ON lore_fragment_write_claims (hash, epoch, fence, hard_not_after)
+    WHERE state IN (0, 1, 3);
+
+CREATE INDEX IF NOT EXISTS lore_fragment_write_claims_terminal_prune
+    ON lore_fragment_write_claims (settled_at, logical_request_id, attempt_id)
+    WHERE state IN (2, 4);
+
 -- Singleton. Read at boot for readiness, and the cutover marker's home.
 --
 -- The two CHECKs make the unsafe combinations unrepresentable: routing cannot be
@@ -274,6 +337,9 @@ CREATE TABLE IF NOT EXISTS lore_fragment_schema_state (
     residue_classified      boolean     NOT NULL DEFAULT false,
     cutover_at              timestamptz,
     lifecycle_enabled       boolean     NOT NULL DEFAULT false,
+    write_capability        smallint    NOT NULL DEFAULT 0 CHECK (write_capability IN (0, 1)),
+    provider_write_authority_revision text,
+    write_claims_required_at timestamptz,
     database_identity       text        NOT NULL,
     sequence_headroom_fence bigint      CHECK (sequence_headroom_fence >= 1),
     updated_at              timestamptz NOT NULL,
@@ -286,6 +352,13 @@ CREATE TABLE IF NOT EXISTS lore_fragment_schema_state (
         lifecycle_enabled = false
         OR (backfill_state = 3 AND cutover_at IS NOT NULL AND residue_classified
             AND sequence_headroom_fence IS NOT NULL)
+    ),
+    CONSTRAINT lore_fragment_write_capability_shape CHECK (
+        (write_capability = 0 AND provider_write_authority_revision IS NULL
+                              AND write_claims_required_at IS NULL)
+        OR (write_capability = 1
+            AND length(provider_write_authority_revision) BETWEEN 1 AND 64
+            AND write_claims_required_at IS NOT NULL)
     )
 );
 
@@ -297,7 +370,7 @@ INSERT INTO lore_fragment_schema_state (
 -- seed cannot, and parity compares catalog shape rather than row contents -- so without
 -- that test a version bump would diverge silently between the two paths (INV-EF P2-9).
 SELECT 1                                                                       AS id,
-       1                                                                       AS schema_version,
+       2                                                                       AS schema_version,
        0                                                                       AS backfill_version,
        0                                                                       AS backfill_state,
        control.system_identifier::text || ':' || database.oid::text || ':' || current_database()
@@ -392,7 +465,7 @@ mod tests {
         // would find it, but presence of a sequence says nothing about whether
         // the tables installed. Miscounting this is what INV-EF P2-13 caught in
         // the skill's prose.
-        assert_eq!(FRAGMENT_SCHEMA_RELATIONS.len(), 7);
+        assert_eq!(FRAGMENT_SCHEMA_RELATIONS.len(), 8);
         assert!(
             !FRAGMENT_SCHEMA_RELATIONS.contains(&"lore_fragment_fence_seq"),
             "the fence sequence must stay out of the relation-presence probe"

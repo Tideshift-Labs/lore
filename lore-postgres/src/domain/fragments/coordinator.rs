@@ -57,6 +57,8 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 
 use deadpool_postgres::Pool;
@@ -64,9 +66,11 @@ use deadpool_postgres::Transaction;
 
 use crate::domain::PostgresDomainStore;
 use crate::domain::errors::DomainError;
+use crate::domain::fragments::provider::FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS;
 use crate::domain::fragments::schema;
 use crate::domain::fragments::states::EpochAuthority;
 use crate::domain::fragments::states::FragmentLifecycleState;
+use crate::domain::fragments::states::FragmentWriteClaimState;
 use crate::domain::fragments::states::MissingDiagnostic;
 use crate::domain::lock_order::LockClass;
 use crate::domain::lock_order::LockSequence;
@@ -93,6 +97,12 @@ pub const MAX_LIFECYCLE_GENERATION_FANOUT: usize = MAX_PUSH_FRAGMENT_REVALIDATIO
 
 const DIRECT_WRITE_NORMAL_OPERATION: [u8; 16] = *b"wp118-direct-v1N";
 const DIRECT_WRITE_REPAIR_OPERATION: [u8; 16] = *b"wp118-direct-v1R";
+
+/// Maximum body size one durable direct-write claim accepts.
+pub const MAX_FRAGMENT_WRITE_CLAIM_BODY_BYTES: u64 = 256 * 1024;
+/// Largest terminal-claim prune request accepted by one call.
+pub const MAX_FRAGMENT_WRITE_CLAIM_PRUNE_BATCH: u32 = 1_000;
+const MAX_FRAGMENT_WRITE_CLAIM_DURATION_MILLIS: u128 = i32::MAX as u128;
 
 /// How many members one staged reader lease may cover.
 ///
@@ -161,6 +171,80 @@ impl PostgresDomainStore {
 // Readiness
 // ---------------------------------------------------------------------------
 
+/// Cell-wide provider-write capability recorded in SCHEMA-118.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentWriteCapability {
+    /// Rolling-upgrade posture. Lifecycle reads and governed writes may run,
+    /// but Phase 6B destructive work must refuse.
+    Optional,
+    /// Every process with provider write authority has been moved to
+    /// `write-claims-v1` under the named external credential revision.
+    ClaimsRequired {
+        provider_write_authority_revision: String,
+    },
+}
+
+impl FragmentWriteCapability {
+    pub fn claims_required(&self) -> bool {
+        matches!(self, Self::ClaimsRequired { .. })
+    }
+
+    pub fn provider_write_authority_revision(&self) -> Option<&str> {
+        match self {
+            Self::Optional => None,
+            Self::ClaimsRequired {
+                provider_write_authority_revision,
+            } => Some(provider_write_authority_revision),
+        }
+    }
+
+    fn decode(bits: i16, revision: Option<String>) -> Result<Self, DomainError> {
+        match (bits, revision) {
+            (schema::WRITE_CAPABILITY_OPTIONAL, None) => Ok(Self::Optional),
+            (schema::WRITE_CAPABILITY_CLAIMS_REQUIRED, Some(revision))
+                if valid_write_authority_revision(&revision) =>
+            {
+                Ok(Self::ClaimsRequired {
+                    provider_write_authority_revision: revision,
+                })
+            }
+            _ => Err(DomainError::NotReady(
+                "fragment write capability row has an invalid shape".to_owned(),
+            )),
+        }
+    }
+}
+
+/// Explicit operator assertion used to cross the cell-wide write-capability
+/// cutover.
+///
+/// Constructing this value does not prove an external provider action. The
+/// caller must first rotate provider write credentials and revoke the old
+/// revision from every pre-claims replica. Persisting the revision makes that
+/// prerequisite auditable and lets new replicas exact-attest it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentWriteCapabilityCutover {
+    provider_write_authority_revision: String,
+}
+
+impl FragmentWriteCapabilityCutover {
+    pub fn new(provider_write_authority_revision: &str) -> Result<Self, DomainError> {
+        if !valid_write_authority_revision(provider_write_authority_revision) {
+            return Err(DomainError::InvalidInput(
+                "provider write-authority revision must contain 1..=64 ASCII alphanumeric, '.', '-', or '_' characters"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self {
+            provider_write_authority_revision: provider_write_authority_revision.to_owned(),
+        })
+    }
+
+    pub fn provider_write_authority_revision(&self) -> &str {
+        &self.provider_write_authority_revision
+    }
+}
+
 /// Readiness projection used by server construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragmentLifecycleReadiness {
@@ -181,6 +265,8 @@ pub struct FragmentLifecycleReadiness {
     pub cutover_at_present: bool,
     /// Whether lifecycle routing is enabled.
     pub lifecycle_enabled: bool,
+    /// Durable cell-wide provider-write cutover state.
+    pub write_capability: FragmentWriteCapability,
     /// Positive database-identity match against this process's domain store.
     pub same_database: bool,
     /// The fence sequence's next value is above every persisted fence.
@@ -204,6 +290,7 @@ impl FragmentLifecycleReadiness {
             backfill_state: schema::BACKFILL_NOT_STARTED,
             cutover_at_present: false,
             lifecycle_enabled: false,
+            write_capability: FragmentWriteCapability::Optional,
             same_database: false,
             sequence_headroom: false,
             unresolved_rows: 0,
@@ -227,6 +314,60 @@ impl FragmentLifecycleReadiness {
             && self.same_database
             && self.sequence_headroom
             && self.unresolved_rows == 0
+    }
+}
+
+/// Minimal capability projection used by legacy immutable-store construction.
+/// It deliberately reads no lifecycle authority and grants no operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentWriteCapabilityReadiness {
+    pub provisioned: bool,
+    pub schema_version: i64,
+    pub write_capability: FragmentWriteCapability,
+}
+
+/// Read the cell-wide write capability through an already constructed
+/// Postgres store pool.
+pub async fn read_fragment_write_capability(
+    pool: &Pool,
+) -> Result<FragmentWriteCapabilityReadiness, DomainError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|error| DomainError::from_pool("fragment capability pool", error))?;
+    match fragment_schema_presence(&client).await? {
+        FragmentSchemaPresence::Absent => Ok(FragmentWriteCapabilityReadiness {
+            provisioned: false,
+            schema_version: 0,
+            write_capability: FragmentWriteCapability::Optional,
+        }),
+        FragmentSchemaPresence::Partial { present } => Err(DomainError::NotReady(format!(
+            "SCHEMA-118 is partially installed: {present} of {} probed relations exist",
+            schema::FRAGMENT_SCHEMA_RELATIONS.len()
+        ))),
+        FragmentSchemaPresence::Complete => {
+            let row = client
+                .query_opt(
+                    "SELECT schema_version, write_capability, provider_write_authority_revision \
+                       FROM lore_fragment_schema_state WHERE id = 1",
+                    &[],
+                )
+                .await
+                .map_err(|error| {
+                    DomainError::from_pg("fragment write capability readiness", error)
+                })?
+                .ok_or_else(|| {
+                    DomainError::NotReady("SCHEMA-118 capability singleton is absent".to_owned())
+                })?;
+            Ok(FragmentWriteCapabilityReadiness {
+                provisioned: true,
+                schema_version: row.get("schema_version"),
+                write_capability: FragmentWriteCapability::decode(
+                    row.get("write_capability"),
+                    row.get("provider_write_authority_revision"),
+                )?,
+            })
+        }
     }
 }
 
@@ -388,6 +529,9 @@ pub struct FragmentIntent {
     /// Direct-write lineage recovered from the durable active-operation token.
     /// `None` for stage, promotion, and obliteration intents.
     direct_write_kind: Option<DirectWriteKind>,
+    /// Exact durable provider-write claim for a direct remote publication.
+    /// `None` for stage, promotion, and obliteration intents.
+    write_claim: Option<FragmentWriteClaim>,
     /// The head as captured at begin, for post-I/O revalidation. `None` when
     /// this operation created the head.
     pub captured: Option<EpochWitness>,
@@ -399,6 +543,11 @@ impl FragmentIntent {
     pub fn direct_write_kind(&self) -> Option<DirectWriteKind> {
         self.direct_write_kind
     }
+
+    /// Durable claim that must be authorized and settled around provider I/O.
+    pub fn write_claim(&self) -> Option<&FragmentWriteClaim> {
+        self.write_claim.as_ref()
+    }
 }
 
 /// The immutable-key lineage of one direct remote publication.
@@ -408,6 +557,224 @@ pub enum DirectWriteKind {
     Normal,
     /// Successor to a diagnosed `Missing` head at an immutable epoch key.
     Repair,
+}
+
+/// Caller-supplied fields that are known before a direct-write epoch and fence
+/// are allocated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentWriteClaimInput {
+    logical_request_id: [u8; 16],
+    attempt_id: [u8; 16],
+    body_blake3: [u8; 32],
+    body_size: u64,
+    send_timeout_millis: i64,
+    late_effect_bound_millis: i64,
+}
+
+impl FragmentWriteClaimInput {
+    /// Validate one exact provider-write attempt before any database work.
+    pub fn new(
+        logical_request_id: [u8; 16],
+        attempt_id: [u8; 16],
+        body_blake3: [u8; 32],
+        body_size: u64,
+        send_timeout: Duration,
+        late_effect_bound: Duration,
+    ) -> Result<Self, DomainError> {
+        if logical_request_id == [0; 16] || attempt_id == [0; 16] {
+            return Err(DomainError::InvalidInput(
+                "fragment write claim identifiers must be nonzero".to_owned(),
+            ));
+        }
+        if body_size > MAX_FRAGMENT_WRITE_CLAIM_BODY_BYTES {
+            return Err(DomainError::InvalidInput(format!(
+                "fragment write claim body exceeds {MAX_FRAGMENT_WRITE_CLAIM_BODY_BYTES} bytes"
+            )));
+        }
+        let send_timeout_millis = duration_millis("fragment write send timeout", send_timeout)?;
+        if send_timeout_millis
+            > i64::try_from(FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS).map_err(|_| {
+                DomainError::Internal(
+                    "fragment provider send-timeout maximum exceeds i64".to_owned(),
+                )
+            })?
+        {
+            return Err(DomainError::InvalidInput(format!(
+                "fragment write send timeout exceeds {FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS} milliseconds"
+            )));
+        }
+        let late_effect_bound_millis =
+            duration_millis("fragment write late-effect bound", late_effect_bound)?;
+        send_timeout_millis
+            .checked_add(late_effect_bound_millis)
+            .ok_or_else(|| {
+                DomainError::InvalidInput(
+                    "fragment write claim deadline interval overflows".to_owned(),
+                )
+            })?;
+        Ok(Self {
+            logical_request_id,
+            attempt_id,
+            body_blake3,
+            body_size,
+            send_timeout_millis,
+            late_effect_bound_millis,
+        })
+    }
+}
+
+/// Exact durable binding for one provider-write attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentWriteClaim {
+    logical_request_id: [u8; 16],
+    attempt_id: [u8; 16],
+    hash: Vec<u8>,
+    epoch: i64,
+    fence: i64,
+    authority: EpochAuthority,
+    object_key: String,
+    body_blake3: [u8; 32],
+    body_size: u64,
+    send_not_after: SystemTime,
+    hard_not_after: SystemTime,
+}
+
+impl FragmentWriteClaim {
+    pub fn logical_request_id(&self) -> &[u8; 16] {
+        &self.logical_request_id
+    }
+
+    pub fn attempt_id(&self) -> &[u8; 16] {
+        &self.attempt_id
+    }
+
+    pub fn hash(&self) -> &[u8] {
+        &self.hash
+    }
+
+    pub fn epoch(&self) -> i64 {
+        self.epoch
+    }
+
+    pub fn fence(&self) -> i64 {
+        self.fence
+    }
+
+    pub fn authority(&self) -> EpochAuthority {
+        self.authority
+    }
+
+    pub fn object_key(&self) -> &str {
+        &self.object_key
+    }
+
+    pub fn body_blake3(&self) -> &[u8; 32] {
+        &self.body_blake3
+    }
+
+    pub fn body_size(&self) -> u64 {
+        self.body_size
+    }
+
+    pub fn send_not_after(&self) -> SystemTime {
+        self.send_not_after
+    }
+
+    pub fn hard_not_after(&self) -> SystemTime {
+        self.hard_not_after
+    }
+}
+
+/// One authorization minted from the database clock immediately before the
+/// bounded charge/send future is polled.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AuthorizedFragmentWrite {
+    send_budget: Duration,
+}
+
+impl AuthorizedFragmentWrite {
+    pub fn send_budget(&self) -> Duration {
+        self.send_budget
+    }
+}
+
+/// Durable settlement of one provider-write claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragmentWriteSettlement {
+    Decisive,
+    Ambiguous,
+    NoSend,
+}
+
+/// Bounded, DB-clock retention policy for one terminal-claim prune pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentWriteClaimPruneBatch {
+    max_claims: i64,
+    terminal_retention_millis: i64,
+}
+
+impl FragmentWriteClaimPruneBatch {
+    pub fn new(max_claims: u32, terminal_retention: Duration) -> Result<Self, DomainError> {
+        if !(1..=MAX_FRAGMENT_WRITE_CLAIM_PRUNE_BATCH).contains(&max_claims) {
+            return Err(DomainError::InvalidInput(format!(
+                "fragment write-claim prune batch must be between 1 and {MAX_FRAGMENT_WRITE_CLAIM_PRUNE_BATCH}"
+            )));
+        }
+        Ok(Self {
+            max_claims: i64::from(max_claims),
+            terminal_retention_millis: duration_millis(
+                "fragment write-claim terminal retention",
+                terminal_retention,
+            )?,
+        })
+    }
+}
+
+impl FragmentWriteSettlement {
+    fn state(self) -> FragmentWriteClaimState {
+        match self {
+            Self::Decisive => FragmentWriteClaimState::Decisive,
+            Self::Ambiguous => FragmentWriteClaimState::Ambiguous,
+            Self::NoSend => FragmentWriteClaimState::NoSend,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FragmentWriteClaimBarrier {
+    Clear,
+    BlockedUntil(SystemTime),
+}
+
+enum FragmentWriteClaimCreation {
+    Created(FragmentWriteClaim),
+    BlockedUntil(SystemTime),
+}
+
+struct FragmentWriteClaimLineage<'a> {
+    hash: &'a [u8],
+    epoch: i64,
+    fence: i64,
+    authority: EpochAuthority,
+    object_key: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FragmentWriteCleanupTarget {
+    logical_request_id: [u8; 16],
+    attempt_id: [u8; 16],
+    hash: Vec<u8>,
+    epoch: i64,
+    fence: i64,
+    authority: EpochAuthority,
+    object_key: String,
+    body_blake3: [u8; 32],
+    body_size: u64,
+}
+
+struct FragmentWriteClaimInventory {
+    blocked_until: Option<SystemTime>,
+    cleanup_targets: Vec<FragmentWriteCleanupTarget>,
 }
 
 /// Outcome of a `begin_*` call.
@@ -426,6 +793,8 @@ pub enum BeginOutcome {
     /// The head is inside a deletion sequence or tombstoned, so no new
     /// representation may be published against it.
     Fenced(String),
+    /// A prior attempt on the same exact head can still have a late effect.
+    WriteClaimBlocked { hard_not_after: SystemTime },
 }
 
 /// Outcome of a `commit_*` call.
@@ -648,6 +1017,7 @@ impl PostgresFragmentCoordinator {
         let Some(row) = client
             .query_opt(
                 "SELECT schema_version, backfill_state, cutover_at, lifecycle_enabled, \
+                        write_capability, provider_write_authority_revision, \
                         database_identity, sequence_headroom_fence \
                    FROM lore_fragment_schema_state WHERE id = 1",
                 &[],
@@ -731,6 +1101,10 @@ impl PostgresFragmentCoordinator {
             Some(last_value)
         };
         let cutover_at: Option<SystemTime> = row.get("cutover_at");
+        let write_capability = FragmentWriteCapability::decode(
+            row.get("write_capability"),
+            row.get("provider_write_authority_revision"),
+        )?;
 
         Ok(FragmentLifecycleReadiness {
             provisioned: true,
@@ -738,6 +1112,7 @@ impl PostgresFragmentCoordinator {
             backfill_state: row.get("backfill_state"),
             cutover_at_present: cutover_at.is_some(),
             lifecycle_enabled: row.get("lifecycle_enabled"),
+            write_capability,
             same_database: row.get::<_, String>("database_identity") == self.database_identity,
             sequence_headroom: evidence.is_some()
                 && next_value.is_some_and(|value| value > max_fence),
@@ -798,6 +1173,82 @@ impl PostgresFragmentCoordinator {
             )
             .await
             .map_err(|error| DomainError::from_pg("fragment lifecycle enable", error))?;
+        Ok(())
+    }
+
+    /// Persist the cell-wide `write-claims-v1` requirement.
+    ///
+    /// This is intentionally not called by server boot or schema installation.
+    /// The operator-facing caller must first rotate provider write credentials
+    /// so every older replica loses write authority. The database records and
+    /// exact-attests the supplied non-secret revision; it cannot prove the
+    /// external credential revocation itself.
+    pub async fn require_write_claims(
+        &self,
+        cutover: &FragmentWriteCapabilityCutover,
+    ) -> Result<(), DomainError> {
+        let readiness = self.readiness().await?;
+        if readiness.schema_version != schema::FRAGMENT_SCHEMA_VERSION
+            || !readiness.lifecycle_enabled
+            || !readiness.ready_for_lifecycle()
+        {
+            return Err(DomainError::NotReady(
+                "write-claims-v1 cutover requires exact current SCHEMA-118 readiness and enabled lifecycle routing"
+                    .to_owned(),
+            ));
+        }
+        let mut client = self.checkout().await?;
+        let tx = client.transaction().await.map_err(|error| {
+            DomainError::from_pg("fragment write capability cutover begin", error)
+        })?;
+        let row = tx
+            .query_one(
+                "SELECT write_capability, provider_write_authority_revision \
+                   FROM lore_fragment_schema_state WHERE id = 1 FOR UPDATE",
+                &[],
+            )
+            .await
+            .map_err(|error| {
+                DomainError::from_pg("fragment write capability cutover lock", error)
+            })?;
+        let current = FragmentWriteCapability::decode(
+            row.get("write_capability"),
+            row.get("provider_write_authority_revision"),
+        )?;
+        match current {
+            FragmentWriteCapability::Optional => {
+                tx.execute(
+                    "UPDATE lore_fragment_schema_state \
+                        SET write_capability = $1, provider_write_authority_revision = $2, \
+                            write_claims_required_at = clock_timestamp(), \
+                            updated_at = clock_timestamp() \
+                      WHERE id = 1 AND write_capability = $3",
+                    &[
+                        &schema::WRITE_CAPABILITY_CLAIMS_REQUIRED,
+                        &cutover.provider_write_authority_revision,
+                        &schema::WRITE_CAPABILITY_OPTIONAL,
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    DomainError::from_pg("fragment write capability cutover", error)
+                })?;
+            }
+            FragmentWriteCapability::ClaimsRequired {
+                provider_write_authority_revision,
+            } if provider_write_authority_revision == cutover.provider_write_authority_revision => {
+            }
+            FragmentWriteCapability::ClaimsRequired { .. } => {
+                return Err(DomainError::PreconditionRejected {
+                    reason: "fragment_write_authority_revision_mismatch".to_owned(),
+                    reason_version: 1,
+                });
+            }
+        }
+        classify_commit(
+            tx.commit().await,
+            "fragment write capability cutover commit",
+        )?;
         Ok(())
     }
 
@@ -1111,21 +1562,28 @@ impl PostgresFragmentCoordinator {
         &self,
         hash: &[u8],
         legacy_object_key: &str,
+        claim: FragmentWriteClaimInput,
     ) -> Result<BeginOutcome, DomainError> {
         if legacy_object_key != legacy_hash_key(hash) {
             return Err(DomainError::InvalidInput(
                 "direct write legacy object key does not match the fragment hash".to_owned(),
             ));
         }
-        self.begin_publication(hash, EpochAuthority::Remote, Some(legacy_object_key))
-            .await
+        self.begin_publication(
+            hash,
+            EpochAuthority::Remote,
+            Some(legacy_object_key),
+            Some(&claim),
+            false,
+        )
+        .await
     }
 
     /// Publish a `PreparingStage` intent. Allocates an epoch and fence without
     /// publishing any positive association; the file write, validation, flush,
     /// atomic finalize, and directory durability all happen outside Postgres.
     pub async fn begin_stage(&self, hash: &[u8]) -> Result<BeginOutcome, DomainError> {
-        self.begin_publication(hash, EpochAuthority::Staged, None)
+        self.begin_publication(hash, EpochAuthority::Staged, None, None, false)
             .await
     }
 
@@ -1136,48 +1594,278 @@ impl PostgresFragmentCoordinator {
     /// first-class repair, which is what preserves today's cheap self-heal
     /// (`store/immutable_store.rs:955-980`) without ever overwriting the legacy
     /// key. The successor takes a greater epoch and its own immutable key.
-    pub async fn claim_repair(&self, hash: &[u8]) -> Result<BeginOutcome, DomainError> {
+    pub async fn claim_repair(
+        &self,
+        hash: &[u8],
+        claim: FragmentWriteClaimInput,
+    ) -> Result<BeginOutcome, DomainError> {
+        let legacy_object_key = legacy_hash_key(hash);
+        self.begin_publication(
+            hash,
+            EpochAuthority::Remote,
+            Some(&legacy_object_key),
+            Some(&claim),
+            true,
+        )
+        .await
+    }
+
+    /// Authorize one exact prepared claim immediately before its bounded
+    /// charge/send future is polled.
+    pub async fn authorize_write_claim(
+        &self,
+        claim: &FragmentWriteClaim,
+    ) -> Result<AuthorizedFragmentWrite, DomainError> {
+        let local_started = Instant::now();
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
             .await
-            .map_err(|error| DomainError::from_pg("repair claim begin", error))?;
+            .map_err(|error| DomainError::from_pg("fragment write authorization begin", error))?;
         let mut sequence = LockSequence::new();
-        let Some(head) = lock_fragment_head(&tx, &mut sequence, hash).await? else {
+        let head = lock_fragment_head(&tx, &mut sequence, &claim.hash).await?;
+        let lineage_matches = head.as_ref().is_some_and(|head| {
+            head.current_epoch == claim.epoch
+                && head.last_fence == claim.fence
+                && head.state == FragmentLifecycleState::PreparingRemote
+                && head.active_operation.as_deref().is_some_and(|token| {
+                    (token == DIRECT_WRITE_NORMAL_OPERATION
+                        && claim.object_key == legacy_hash_key(&claim.hash))
+                        || (token == DIRECT_WRITE_REPAIR_OPERATION
+                            && claim.object_key == repair_epoch_key(&claim.hash, claim.epoch))
+                })
+        });
+        if !lineage_matches {
+            settle_write_claim_locked(&tx, &mut sequence, claim, FragmentWriteSettlement::NoSend)
+                .await?;
+            classify_commit(tx.commit().await, "fragment write lineage refusal commit")?;
             return Err(DomainError::PreconditionRejected {
-                reason: "fragment_head_absent".to_owned(),
+                reason: "fragment_write_lineage_moved".to_owned(),
+                reason_version: 1,
+            });
+        }
+
+        let Some(locked) = lock_write_claim_identity(
+            &tx,
+            &mut sequence,
+            &claim.logical_request_id,
+            &claim.attempt_id,
+        )
+        .await?
+        else {
+            return Err(DomainError::NotReady(
+                "fragment write claim is absent".to_owned(),
+            ));
+        };
+        if locked.claim != *claim {
+            return Err(DomainError::InvalidInput(
+                "fragment write claim binding does not match durable state".to_owned(),
+            ));
+        }
+        if locked.state != FragmentWriteClaimState::Prepared {
+            return Err(DomainError::PreconditionRejected {
+                reason: "fragment_write_claim_not_prepared".to_owned(),
+                reason_version: 1,
+            });
+        }
+        let database_now: SystemTime = tx
+            .query_one("SELECT clock_timestamp()", &[])
+            .await
+            .map_err(|error| DomainError::from_pg("fragment write authorization clock", error))?
+            .get(0);
+        let Some(database_budget) = claim.send_not_after.duration_since(database_now).ok() else {
+            settle_write_claim_locked(&tx, &mut sequence, claim, FragmentWriteSettlement::NoSend)
+                .await?;
+            classify_commit(tx.commit().await, "fragment write expired refusal commit")?;
+            return Err(DomainError::PreconditionRejected {
+                reason: "fragment_write_send_deadline_expired".to_owned(),
                 reason_version: 1,
             });
         };
-        if head.state != FragmentLifecycleState::Missing {
-            return Ok(BeginOutcome::Fenced(format!(
-                "repair requires a Missing head; this one is {}",
-                head.state.label()
-            )));
+        tx.execute(
+            "UPDATE lore_fragment_write_claims \
+                SET state = $3, authorized_at = clock_timestamp() \
+              WHERE logical_request_id = $1 AND attempt_id = $2 AND state = $4",
+            &[
+                &claim.logical_request_id.as_slice(),
+                &claim.attempt_id.as_slice(),
+                &FragmentWriteClaimState::Sending.bits(),
+                &FragmentWriteClaimState::Prepared.bits(),
+            ],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("fragment write authorize", error))?;
+        classify_commit(tx.commit().await, "fragment write authorization commit")?;
+        Ok(AuthorizedFragmentWrite {
+            send_budget: database_budget.saturating_sub(local_started.elapsed()),
+        })
+    }
+
+    /// Settle a claim in its own short transaction when no lifecycle
+    /// publication transaction is available.
+    pub async fn settle_write_claim(
+        &self,
+        claim: &FragmentWriteClaim,
+        settlement: FragmentWriteSettlement,
+    ) -> Result<(), DomainError> {
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| DomainError::from_pg("fragment write settlement begin", error))?;
+        let mut sequence = LockSequence::new();
+        let _ = lock_fragment_head(&tx, &mut sequence, &claim.hash).await?;
+        settle_write_claim_locked(&tx, &mut sequence, claim, settlement).await?;
+        classify_commit(tx.commit().await, "fragment write settlement commit")?;
+        Ok(())
+    }
+
+    /// Prune a bounded batch of terminal write claims using database time.
+    ///
+    /// No scheduler calls this yet. Phase 6B or an operations package must
+    /// explicitly invoke it. Prepared, Sending, and Ambiguous are never
+    /// selected by age. A Decisive claim is deleted only when its exact target
+    /// digest and size have been copied into durable epoch evidence; NoSend is
+    /// safe after terminal retention because it never names a cleanup target.
+    pub async fn prune_terminal_write_claims(
+        &self,
+        batch: FragmentWriteClaimPruneBatch,
+    ) -> Result<u64, DomainError> {
+        let client = self.checkout().await?;
+        let rows = client
+            .query(
+                "SELECT claim.logical_request_id, claim.attempt_id, claim.hash, claim.state \
+                   FROM lore_fragment_write_claims AS claim \
+                  WHERE claim.settled_at <= clock_timestamp() \
+                                           - ($3::bigint * interval '1 millisecond') \
+                    AND (claim.state = $1 \
+                         OR (claim.state = $2 AND EXISTS ( \
+                             SELECT 1 FROM lore_fragment_epochs AS epoch \
+                              WHERE epoch.hash = claim.hash \
+                                AND epoch.epoch = claim.epoch \
+                                AND epoch.authority = claim.authority \
+                                AND epoch.object_key = claim.object_key \
+                                AND epoch.provider_body_blake3 = claim.body_blake3 \
+                                AND epoch.provider_body_size = claim.body_size \
+                                AND epoch.provider_claim_fence = claim.fence))) \
+                  ORDER BY settled_at, logical_request_id, attempt_id \
+                  LIMIT $4",
+                &[
+                    &FragmentWriteClaimState::NoSend.bits(),
+                    &FragmentWriteClaimState::Decisive.bits(),
+                    &batch.terminal_retention_millis,
+                    &batch.max_claims,
+                ],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("fragment write claim prune plan", error))?;
+        let candidates = rows
+            .into_iter()
+            .map(|row| {
+                Ok(FragmentWriteClaimPruneCandidate {
+                    logical_request_id: fixed_bytes::<16>(
+                        row.get("logical_request_id"),
+                        "fragment write prune logical request id",
+                    )?,
+                    attempt_id: fixed_bytes::<16>(
+                        row.get("attempt_id"),
+                        "fragment write prune attempt id",
+                    )?,
+                    hash: row.get("hash"),
+                    state: FragmentWriteClaimState::from_bits(row.get("state"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, DomainError>>()?;
+        drop(client);
+
+        let mut pruned = 0_u64;
+        for candidate in candidates {
+            let mut client = self.checkout().await?;
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|error| DomainError::from_pg("fragment write claim prune begin", error))?;
+            let mut sequence = LockSequence::new();
+            let _ = lock_fragment_head(&tx, &mut sequence, &candidate.hash).await?;
+            let inventory =
+                write_claim_inventory_locked(&tx, &mut sequence, &candidate.hash).await?;
+            if inventory.blocked_until.is_some() {
+                classify_commit(
+                    tx.commit().await,
+                    "blocked claim inventory normalization commit",
+                )?;
+                continue;
+            }
+            let candidate_target = inventory.cleanup_targets.iter().find(|target| {
+                target.logical_request_id == candidate.logical_request_id
+                    && target.attempt_id == candidate.attempt_id
+            });
+            if candidate.state == FragmentWriteClaimState::Decisive && candidate_target.is_none() {
+                classify_commit(tx.commit().await, "claim inventory normalization commit")?;
+                continue;
+            }
+            let deleted = match (candidate.state, candidate_target) {
+                (FragmentWriteClaimState::NoSend, _) => {
+                    tx.execute(
+                        "DELETE FROM lore_fragment_write_claims \
+                          WHERE logical_request_id = $1 AND attempt_id = $2 AND state = $3 \
+                            AND settled_at <= clock_timestamp() \
+                                - ($4::bigint * interval '1 millisecond')",
+                        &[
+                            &candidate.logical_request_id.as_slice(),
+                            &candidate.attempt_id.as_slice(),
+                            &FragmentWriteClaimState::NoSend.bits(),
+                            &batch.terminal_retention_millis,
+                        ],
+                    )
+                    .await
+                }
+                (FragmentWriteClaimState::Decisive, Some(target)) => {
+                    let body_size = i64::try_from(target.body_size).map_err(|_| {
+                        DomainError::Internal(
+                            "fragment write cleanup target size exceeds i64".to_owned(),
+                        )
+                    })?;
+                    tx.execute(
+                        "DELETE FROM lore_fragment_write_claims AS claim \
+                          WHERE claim.logical_request_id = $1 AND claim.attempt_id = $2 \
+                            AND claim.hash = $3 AND claim.epoch = $4 AND claim.fence = $5 \
+                            AND claim.authority = $6 AND claim.object_key = $7 \
+                            AND claim.body_blake3 = $8 AND claim.body_size = $9 \
+                            AND claim.state = $10 \
+                            AND claim.settled_at <= clock_timestamp() \
+                                - ($11::bigint * interval '1 millisecond') \
+                            AND EXISTS (SELECT 1 FROM lore_fragment_epochs AS epoch \
+                                 WHERE epoch.hash = $3 AND epoch.epoch = $4 \
+                                   AND epoch.authority = $6 AND epoch.object_key = $7 \
+                                   AND epoch.provider_body_blake3 = $8 \
+                                   AND epoch.provider_body_size = $9 \
+                                   AND epoch.provider_claim_fence = $5)",
+                        &[
+                            &candidate.logical_request_id.as_slice(),
+                            &candidate.attempt_id.as_slice(),
+                            &target.hash,
+                            &target.epoch,
+                            &target.fence,
+                            &target.authority.bits(),
+                            &target.object_key,
+                            &target.body_blake3.as_slice(),
+                            &body_size,
+                            &FragmentWriteClaimState::Decisive.bits(),
+                            &batch.terminal_retention_millis,
+                        ],
+                    )
+                    .await
+                }
+                _ => continue,
+            }
+            .map_err(|error| DomainError::from_pg("fragment write claim prune delete", error))?;
+            classify_commit(tx.commit().await, "fragment write claim prune commit")?;
+            pruned = pruned.checked_add(deleted).ok_or_else(|| {
+                DomainError::Internal("fragment write claim prune count overflow".to_owned())
+            })?;
         }
-        let epoch = next_fence(&tx).await?;
-        let fence = next_fence(&tx).await?;
-        // Repair never reuses the legacy bare-hash key. A server-only immutable
-        // epoch key is the whole reason the predecessor's bytes stay
-        // untouched and diagnosable.
-        let object_key = repair_epoch_key(hash, epoch);
-        stamp_operation_fence(&tx, hash, fence).await?;
-        classify_commit(tx.commit().await, "repair claim commit")?;
-        Ok(BeginOutcome::Admitted(Box::new(FragmentIntent {
-            hash: hash.to_vec(),
-            epoch,
-            fence,
-            object_key,
-            authority: EpochAuthority::Remote,
-            direct_write_kind: Some(DirectWriteKind::Repair),
-            captured: Some(EpochWitness {
-                hash: hash.to_vec(),
-                epoch: head.current_epoch,
-                state: head.state,
-                manifest_id: head.manifest_id,
-                fence: head.last_fence,
-            }),
-        })))
+        Ok(pruned)
     }
 
     /// Publish the result of a direct write or a repair.
@@ -1189,9 +1877,20 @@ impl PostgresFragmentCoordinator {
         &self,
         intent: &FragmentIntent,
         observation: IoObservation,
+        settlement: FragmentWriteSettlement,
     ) -> Result<CommitVerdict, DomainError> {
-        self.commit_publication(intent, observation, EpochAuthority::Remote)
-            .await
+        if settlement == FragmentWriteSettlement::NoSend {
+            return Err(DomainError::InvalidInput(
+                "a no-send claim cannot publish a remote observation".to_owned(),
+            ));
+        }
+        self.commit_publication(
+            intent,
+            observation,
+            EpochAuthority::Remote,
+            Some(settlement),
+        )
+        .await
     }
 
     /// Publish `Staged` plus its manifest, metering, and association
@@ -1201,7 +1900,7 @@ impl PostgresFragmentCoordinator {
         intent: &FragmentIntent,
         observation: IoObservation,
     ) -> Result<CommitVerdict, DomainError> {
-        self.commit_publication(intent, observation, EpochAuthority::Staged)
+        self.commit_publication(intent, observation, EpochAuthority::Staged, None)
             .await
     }
 
@@ -1211,9 +1910,20 @@ impl PostgresFragmentCoordinator {
         &self,
         intent: &FragmentIntent,
         observation: IoObservation,
+        settlement: FragmentWriteSettlement,
     ) -> Result<CommitVerdict, DomainError> {
-        self.commit_publication(intent, observation, EpochAuthority::Remote)
-            .await
+        if settlement == FragmentWriteSettlement::NoSend {
+            return Err(DomainError::InvalidInput(
+                "a no-send claim cannot publish a repair observation".to_owned(),
+            ));
+        }
+        self.commit_publication(
+            intent,
+            observation,
+            EpochAuthority::Remote,
+            Some(settlement),
+        )
+        .await
     }
 
     /// Begin a promotion from `Staged` to `Remote`.
@@ -1265,6 +1975,7 @@ impl PostgresFragmentCoordinator {
             object_key: legacy_hash_key(hash),
             authority: EpochAuthority::Remote,
             direct_write_kind: None,
+            write_claim: None,
             captured: Some(EpochWitness {
                 hash: hash.to_vec(),
                 epoch: head.current_epoch,
@@ -1304,6 +2015,7 @@ impl PostgresFragmentCoordinator {
             intent,
             IoObservation::Valid(manifest),
             EpochAuthority::Remote,
+            None,
         )
         .await
     }
@@ -1658,6 +2370,7 @@ impl PostgresFragmentCoordinator {
             object_key,
             authority: EpochAuthority::Remote,
             direct_write_kind: None,
+            write_claim: None,
             captured: Some(EpochWitness {
                 hash: hash.to_vec(),
                 epoch: head.current_epoch,
@@ -2159,7 +2872,22 @@ impl PostgresFragmentCoordinator {
         hash: &[u8],
         authority: EpochAuthority,
         legacy_object_key: Option<&str>,
+        claim_input: Option<&FragmentWriteClaimInput>,
+        require_missing: bool,
     ) -> Result<BeginOutcome, DomainError> {
+        match (authority, claim_input) {
+            (EpochAuthority::Remote, None) => {
+                return Err(DomainError::InvalidInput(
+                    "remote publication requires a durable write claim".to_owned(),
+                ));
+            }
+            (EpochAuthority::Staged, Some(_)) => {
+                return Err(DomainError::InvalidInput(
+                    "staged publication cannot carry a provider write claim".to_owned(),
+                ));
+            }
+            _ => {}
+        }
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
@@ -2167,6 +2895,27 @@ impl PostgresFragmentCoordinator {
             .map_err(|error| DomainError::from_pg("publication begin", error))?;
         let mut sequence = LockSequence::new();
         let existing = lock_fragment_head(&tx, &mut sequence, hash).await?;
+        if require_missing {
+            match &existing {
+                None => {
+                    return Err(DomainError::PreconditionRejected {
+                        reason: "fragment_head_absent".to_owned(),
+                        reason_version: 1,
+                    });
+                }
+                Some(head) if head.state == FragmentLifecycleState::Missing => {}
+                Some(head)
+                    if head.state == FragmentLifecycleState::PreparingRemote
+                        && head.active_operation.as_deref()
+                            == Some(DIRECT_WRITE_REPAIR_OPERATION.as_slice()) => {}
+                Some(head) => {
+                    return Ok(BeginOutcome::Fenced(format!(
+                        "repair requires a Missing lineage; this head is {}",
+                        head.state.label()
+                    )));
+                }
+            }
+        }
         if let Some(head) = &existing {
             if head.state.is_readable() {
                 // The dedup short-circuit. No epoch is consumed, no fence is
@@ -2216,6 +2965,34 @@ impl PostgresFragmentCoordinator {
                         ));
                     }
                 };
+                let captured = Some(EpochWitness {
+                    hash: hash.to_vec(),
+                    epoch: head.current_epoch,
+                    state: head.state,
+                    manifest_id: head.manifest_id.clone(),
+                    fence: head.last_fence,
+                });
+                let claim_input = claim_input.ok_or_else(|| {
+                    DomainError::InvalidInput(
+                        "remote publication requires a durable write claim".to_owned(),
+                    )
+                })?;
+                let lineage = FragmentWriteClaimLineage {
+                    hash,
+                    epoch: head.current_epoch,
+                    fence: head.last_fence,
+                    authority,
+                    object_key: &object_key,
+                };
+                let write_claim =
+                    match create_write_claim_locked(&tx, &mut sequence, lineage, claim_input)
+                        .await?
+                    {
+                        FragmentWriteClaimCreation::Created(claim) => claim,
+                        FragmentWriteClaimCreation::BlockedUntil(hard_not_after) => {
+                            return Ok(BeginOutcome::WriteClaimBlocked { hard_not_after });
+                        }
+                    };
                 let intent = FragmentIntent {
                     hash: hash.to_vec(),
                     epoch: head.current_epoch,
@@ -2223,13 +3000,8 @@ impl PostgresFragmentCoordinator {
                     object_key,
                     authority,
                     direct_write_kind: Some(direct_write_kind),
-                    captured: Some(EpochWitness {
-                        hash: hash.to_vec(),
-                        epoch: head.current_epoch,
-                        state: head.state,
-                        manifest_id: head.manifest_id.clone(),
-                        fence: head.last_fence,
-                    }),
+                    write_claim: Some(write_claim),
+                    captured,
                 };
                 classify_commit(tx.commit().await, "publication resume commit")?;
                 return Ok(BeginOutcome::Admitted(Box::new(intent)));
@@ -2273,6 +3045,23 @@ impl PostgresFragmentCoordinator {
         )
         .await
         .map_err(|error| DomainError::from_pg("publication intent insert", error))?;
+        let write_claim = if let Some(claim_input) = claim_input {
+            let lineage = FragmentWriteClaimLineage {
+                hash,
+                epoch,
+                fence,
+                authority,
+                object_key: &object_key,
+            };
+            match create_write_claim_locked(&tx, &mut sequence, lineage, claim_input).await? {
+                FragmentWriteClaimCreation::Created(claim) => Some(claim),
+                FragmentWriteClaimCreation::BlockedUntil(hard_not_after) => {
+                    return Ok(BeginOutcome::WriteClaimBlocked { hard_not_after });
+                }
+            }
+        } else {
+            None
+        };
         classify_commit(tx.commit().await, "publication begin commit")?;
         Ok(BeginOutcome::Admitted(Box::new(FragmentIntent {
             hash: hash.to_vec(),
@@ -2281,6 +3070,7 @@ impl PostgresFragmentCoordinator {
             object_key,
             authority,
             direct_write_kind,
+            write_claim,
             captured: existing.map(|head| EpochWitness {
                 hash: hash.to_vec(),
                 epoch: head.current_epoch,
@@ -2296,7 +3086,17 @@ impl PostgresFragmentCoordinator {
         intent: &FragmentIntent,
         observation: IoObservation,
         authority: EpochAuthority,
+        settlement: Option<FragmentWriteSettlement>,
     ) -> Result<CommitVerdict, DomainError> {
+        let write_claim = match (intent.write_claim.as_ref(), settlement) {
+            (Some(claim), Some(settlement)) => Some((claim, settlement)),
+            (None, None) => None,
+            _ => {
+                return Err(DomainError::InvalidInput(
+                    "publication claim and settlement must be supplied together".to_owned(),
+                ));
+            }
+        };
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
@@ -2310,15 +3110,27 @@ impl PostgresFragmentCoordinator {
         let fanout = plan_lifecycle_fanout(&tx, &intent.hash).await?;
         lock_lifecycle_fanout(&tx, &mut sequence, &fanout).await?;
         let Some(head) = lock_fragment_head(&tx, &mut sequence, &intent.hash).await? else {
+            if let Some((claim, settlement)) = write_claim {
+                settle_write_claim_locked(&tx, &mut sequence, claim, settlement).await?;
+                classify_commit(tx.commit().await, "fenced publication settlement commit")?;
+            }
             return Ok(CommitVerdict::Fenced);
         };
         // The fence this operation was issued at is the head's own fence only
         // while no other operation has touched it. Anything else means a
         // repair, an obliterate, or a competing write linearized in between.
         if head.last_fence != intent.fence {
+            if let Some((claim, settlement)) = write_claim {
+                settle_write_claim_locked(&tx, &mut sequence, claim, settlement).await?;
+                classify_commit(tx.commit().await, "moved publication settlement commit")?;
+            }
             return Ok(CommitVerdict::Fenced);
         }
         if head.state.is_deleting() || head.state == FragmentLifecycleState::Tombstoned {
+            if let Some((claim, settlement)) = write_claim {
+                settle_write_claim_locked(&tx, &mut sequence, claim, settlement).await?;
+                classify_commit(tx.commit().await, "deleted publication settlement commit")?;
+            }
             return Ok(CommitVerdict::Fenced);
         }
         let was_readable = head.state.is_readable();
@@ -2362,6 +3174,9 @@ impl PostgresFragmentCoordinator {
                 if was_readable {
                     apply_lifecycle_generation(&tx, &confirmed).await?;
                 }
+                if let Some((claim, settlement)) = write_claim {
+                    settle_write_claim_locked(&tx, &mut sequence, claim, settlement).await?;
+                }
                 classify_commit(tx.commit().await, "publication missing commit")?;
                 return Ok(CommitVerdict::Published);
             }
@@ -2369,14 +3184,24 @@ impl PostgresFragmentCoordinator {
         };
 
         let fence = next_fence(&tx).await?;
+        let provider_body_blake3 = write_claim.map(|(claim, _)| claim.body_blake3.as_slice());
+        let provider_body_size = write_claim
+            .map(|(claim, _)| i64::try_from(claim.body_size))
+            .transpose()
+            .map_err(|_| {
+                DomainError::Internal("fragment write claim body size exceeds i64".to_owned())
+            })?;
+        let provider_claim_fence = write_claim.map(|(claim, _)| claim.fence);
         // Immutable: a repair successor is a new row at a greater epoch, never
         // an update of an existing one. `DO NOTHING` covers only the exact
         // replay of one operation's own commit.
         tx.execute(
             "INSERT INTO lore_fragment_epochs ( \
                  hash, epoch, authority, object_key, manifest_id, size_payload, size_content, \
-                 decoded_hash, payload_flags, fence, validated_at, disposition \
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, clock_timestamp(), $11) \
+                 decoded_hash, payload_flags, provider_body_blake3, provider_body_size, \
+                 provider_claim_fence, fence, validated_at, disposition \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
+                       clock_timestamp(), $14) \
              ON CONFLICT (hash, epoch) DO NOTHING",
             &[
                 &intent.hash,
@@ -2388,6 +3213,9 @@ impl PostgresFragmentCoordinator {
                 &manifest.size_content,
                 &manifest.decoded_hash,
                 &manifest.payload_flags,
+                &provider_body_blake3,
+                &provider_body_size,
+                &provider_claim_fence,
                 &fence,
                 &schema::DISPOSITION_CURRENT_ELIGIBLE,
             ],
@@ -2456,6 +3284,9 @@ impl PostgresFragmentCoordinator {
             // Unreadable to readable is a lifecycle transition too.
             apply_lifecycle_generation(&tx, &confirmed).await?;
         }
+        if let Some((claim, settlement)) = write_claim {
+            settle_write_claim_locked(&tx, &mut sequence, claim, settlement).await?;
+        }
         classify_commit(tx.commit().await, "publication commit")?;
         Ok(CommitVerdict::Published)
     }
@@ -2480,6 +3311,19 @@ struct FragmentHeadLock {
     manifest_id: Option<Vec<u8>>,
     last_fence: i64,
     active_operation: Option<Vec<u8>>,
+}
+
+struct LockedFragmentWriteClaim {
+    claim: FragmentWriteClaim,
+    state: FragmentWriteClaimState,
+    unexpired: bool,
+}
+
+struct FragmentWriteClaimPruneCandidate {
+    logical_request_id: [u8; 16],
+    attempt_id: [u8; 16],
+    hash: Vec<u8>,
+    state: FragmentWriteClaimState,
 }
 
 impl FragmentHeadLock {
@@ -2529,6 +3373,380 @@ async fn lock_fragment_head(
         })
     })
     .transpose()
+}
+
+async fn create_write_claim_locked(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    lineage: FragmentWriteClaimLineage<'_>,
+    input: &FragmentWriteClaimInput,
+) -> Result<FragmentWriteClaimCreation, DomainError> {
+    if let Some(existing) = lock_write_claim(tx, sequence, input).await? {
+        let expected = FragmentWriteClaim {
+            logical_request_id: input.logical_request_id,
+            attempt_id: input.attempt_id,
+            hash: lineage.hash.to_vec(),
+            epoch: lineage.epoch,
+            fence: lineage.fence,
+            authority: lineage.authority,
+            object_key: lineage.object_key.to_owned(),
+            body_blake3: input.body_blake3,
+            body_size: input.body_size,
+            send_not_after: existing.claim.send_not_after,
+            hard_not_after: existing.claim.hard_not_after,
+        };
+        if existing.claim != expected {
+            return Err(DomainError::InvalidInput(
+                "fragment write attempt identity was reused with a different binding".to_owned(),
+            ));
+        }
+        return match (existing.state, existing.unexpired) {
+            (FragmentWriteClaimState::Prepared, true) => {
+                Ok(FragmentWriteClaimCreation::Created(existing.claim))
+            }
+            (state, true) if state.blocks_until_hard_expiry() => Ok(
+                FragmentWriteClaimCreation::BlockedUntil(existing.claim.hard_not_after),
+            ),
+            _ => Err(DomainError::PreconditionRejected {
+                reason: "fragment_write_attempt_terminal_or_expired".to_owned(),
+                reason_version: 1,
+            }),
+        };
+    }
+
+    if let FragmentWriteClaimBarrier::BlockedUntil(hard_not_after) =
+        write_claim_barrier_locked(tx, sequence, lineage.hash, lineage.epoch, lineage.fence).await?
+    {
+        return Ok(FragmentWriteClaimCreation::BlockedUntil(hard_not_after));
+    }
+
+    sequence.enter(LockClass::Fragments)?;
+    let body_size = i64::try_from(input.body_size).map_err(|_| {
+        DomainError::InvalidInput("fragment write claim body size exceeds i64".to_owned())
+    })?;
+    let row = tx
+        .query_one(
+            "WITH claim_clock AS (SELECT clock_timestamp() AS now) \
+             INSERT INTO lore_fragment_write_claims ( \
+                 logical_request_id, attempt_id, hash, epoch, fence, authority, object_key, \
+                 body_blake3, body_size, state, send_not_after, hard_not_after, prepared_at \
+             ) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                    claim_clock.now + ($11::bigint * interval '1 millisecond'), \
+                    claim_clock.now + (($11::bigint + $12::bigint) * interval '1 millisecond'), \
+                    claim_clock.now \
+               FROM claim_clock \
+             RETURNING send_not_after, hard_not_after",
+            &[
+                &input.logical_request_id.as_slice(),
+                &input.attempt_id.as_slice(),
+                &lineage.hash,
+                &lineage.epoch,
+                &lineage.fence,
+                &lineage.authority.bits(),
+                &lineage.object_key,
+                &input.body_blake3.as_slice(),
+                &body_size,
+                &FragmentWriteClaimState::Prepared.bits(),
+                &input.send_timeout_millis,
+                &input.late_effect_bound_millis,
+            ],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("fragment write claim insert", error))?;
+    Ok(FragmentWriteClaimCreation::Created(FragmentWriteClaim {
+        logical_request_id: input.logical_request_id,
+        attempt_id: input.attempt_id,
+        hash: lineage.hash.to_vec(),
+        epoch: lineage.epoch,
+        fence: lineage.fence,
+        authority: lineage.authority,
+        object_key: lineage.object_key.to_owned(),
+        body_blake3: input.body_blake3,
+        body_size: input.body_size,
+        send_not_after: row.get("send_not_after"),
+        hard_not_after: row.get("hard_not_after"),
+    }))
+}
+
+/// Inspect existing late-effect barriers while the caller holds the exact
+/// lifecycle head lock. Claim creation uses this lineage-scoped check; a repair
+/// successor may proceed on a new epoch while the hash-wide inventory retains
+/// an older ambiguous target for Phase 6B cleanup.
+async fn write_claim_barrier_locked(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    hash: &[u8],
+    epoch: i64,
+    fence: i64,
+) -> Result<FragmentWriteClaimBarrier, DomainError> {
+    sequence.enter(LockClass::Fragments)?;
+    let blocking_states = [
+        FragmentWriteClaimState::Prepared.bits(),
+        FragmentWriteClaimState::Sending.bits(),
+        FragmentWriteClaimState::Ambiguous.bits(),
+    ];
+    let rows = tx
+        .query(
+            "SELECT hard_not_after FROM lore_fragment_write_claims \
+              WHERE hash = $1 AND epoch = $2 AND fence = $3 \
+                AND state = ANY($4) AND hard_not_after > clock_timestamp() \
+              ORDER BY hard_not_after DESC FOR UPDATE",
+            &[&hash, &epoch, &fence, &blocking_states.as_slice()],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("fragment write claim barrier", error))?;
+    Ok(rows
+        .first()
+        .map(|row| FragmentWriteClaimBarrier::BlockedUntil(row.get("hard_not_after")))
+        .unwrap_or(FragmentWriteClaimBarrier::Clear))
+}
+
+/// Inspect every claim for a hash while the exact lifecycle head is locked.
+///
+/// This is the Phase 6B cleanup inventory. It is deliberately private and
+/// takes a transaction plus lock sequence so it cannot become a race-prone
+/// standalone deletion authority. Current-lineage send authorization continues
+/// to use exact epoch/fence binding elsewhere.
+async fn write_claim_inventory_locked(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    hash: &[u8],
+) -> Result<FragmentWriteClaimInventory, DomainError> {
+    sequence.enter(LockClass::Fragments)?;
+    let database_now: SystemTime = tx
+        .query_one("SELECT clock_timestamp()", &[])
+        .await
+        .map_err(|error| DomainError::from_pg("fragment write inventory clock", error))?
+        .get(0);
+    let rows = tx
+        .query(
+            "SELECT logical_request_id, attempt_id, hash, epoch, fence, authority, object_key, \
+                    body_blake3, body_size, state, send_not_after, hard_not_after, \
+                    hard_not_after > $2 AS unexpired \
+               FROM lore_fragment_write_claims \
+              WHERE hash = $1 \
+              ORDER BY logical_request_id, attempt_id FOR UPDATE",
+            &[&hash, &database_now],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("fragment write claim inventory", error))?;
+    let mut blocked_until: Option<SystemTime> = None;
+    let mut cleanup_targets = Vec::new();
+    for row in rows {
+        let locked = decode_locked_write_claim(row)?;
+        match locked.state {
+            FragmentWriteClaimState::Prepared => {
+                if locked.claim.send_not_after > database_now {
+                    blocked_until = Some(
+                        blocked_until
+                            .map(|current| current.max(locked.claim.send_not_after))
+                            .unwrap_or(locked.claim.send_not_after),
+                    );
+                } else {
+                    let updated = tx
+                        .execute(
+                            "UPDATE lore_fragment_write_claims \
+                                SET state = $3, settled_at = $4 \
+                              WHERE logical_request_id = $1 AND attempt_id = $2 AND state = $5",
+                            &[
+                                &locked.claim.logical_request_id.as_slice(),
+                                &locked.claim.attempt_id.as_slice(),
+                                &FragmentWriteClaimState::NoSend.bits(),
+                                &database_now,
+                                &FragmentWriteClaimState::Prepared.bits(),
+                            ],
+                        )
+                        .await
+                        .map_err(|error| {
+                            DomainError::from_pg(
+                                "expired prepared fragment write claim settle",
+                                error,
+                            )
+                        })?;
+                    if updated != 1 {
+                        return Err(DomainError::PreconditionRejected {
+                            reason: "fragment_write_claim_inventory_race".to_owned(),
+                            reason_version: 1,
+                        });
+                    }
+                }
+            }
+            FragmentWriteClaimState::Sending | FragmentWriteClaimState::Ambiguous
+                if locked.claim.hard_not_after > database_now =>
+            {
+                blocked_until = Some(
+                    blocked_until
+                        .map(|current| current.max(locked.claim.hard_not_after))
+                        .unwrap_or(locked.claim.hard_not_after),
+                );
+            }
+            FragmentWriteClaimState::Sending
+            | FragmentWriteClaimState::Ambiguous
+            | FragmentWriteClaimState::Decisive => {
+                cleanup_targets.push(FragmentWriteCleanupTarget {
+                    logical_request_id: locked.claim.logical_request_id,
+                    attempt_id: locked.claim.attempt_id,
+                    hash: locked.claim.hash,
+                    epoch: locked.claim.epoch,
+                    fence: locked.claim.fence,
+                    authority: locked.claim.authority,
+                    object_key: locked.claim.object_key,
+                    body_blake3: locked.claim.body_blake3,
+                    body_size: locked.claim.body_size,
+                });
+            }
+            FragmentWriteClaimState::NoSend => {}
+        }
+    }
+    Ok(FragmentWriteClaimInventory {
+        blocked_until,
+        cleanup_targets,
+    })
+}
+
+async fn lock_write_claim(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    input: &FragmentWriteClaimInput,
+) -> Result<Option<LockedFragmentWriteClaim>, DomainError> {
+    lock_write_claim_identity(tx, sequence, &input.logical_request_id, &input.attempt_id).await
+}
+
+async fn lock_write_claim_identity(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    logical_request_id: &[u8; 16],
+    attempt_id: &[u8; 16],
+) -> Result<Option<LockedFragmentWriteClaim>, DomainError> {
+    sequence.enter(LockClass::Fragments)?;
+    let row = tx
+        .query_opt(
+            "SELECT logical_request_id, attempt_id, hash, epoch, fence, authority, object_key, \
+                    body_blake3, body_size, state, send_not_after, hard_not_after, \
+                    hard_not_after > clock_timestamp() AS unexpired \
+               FROM lore_fragment_write_claims \
+              WHERE logical_request_id = $1 AND attempt_id = $2 FOR UPDATE",
+            &[&logical_request_id.as_slice(), &attempt_id.as_slice()],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("fragment write claim lock", error))?;
+    row.map(decode_locked_write_claim).transpose()
+}
+
+async fn settle_write_claim_locked(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    claim: &FragmentWriteClaim,
+    settlement: FragmentWriteSettlement,
+) -> Result<(), DomainError> {
+    let Some(locked) =
+        lock_write_claim_identity(tx, sequence, &claim.logical_request_id, &claim.attempt_id)
+            .await?
+    else {
+        return Err(DomainError::NotReady(
+            "fragment write claim is absent".to_owned(),
+        ));
+    };
+    if locked.claim != *claim {
+        return Err(DomainError::InvalidInput(
+            "fragment write claim binding does not match durable state".to_owned(),
+        ));
+    }
+    let target = settlement.state();
+    if locked.state == target {
+        return Ok(());
+    }
+    let valid_transition = matches!(
+        (locked.state, target),
+        (
+            FragmentWriteClaimState::Prepared,
+            FragmentWriteClaimState::NoSend
+        ) | (
+            FragmentWriteClaimState::Sending,
+            FragmentWriteClaimState::Decisive
+        ) | (
+            FragmentWriteClaimState::Sending,
+            FragmentWriteClaimState::Ambiguous
+        ) | (
+            FragmentWriteClaimState::Sending,
+            FragmentWriteClaimState::NoSend
+        )
+    );
+    if !valid_transition {
+        return Err(DomainError::PreconditionRejected {
+            reason: "fragment_write_claim_invalid_settlement".to_owned(),
+            reason_version: 1,
+        });
+    }
+    let updated = tx
+        .execute(
+            "UPDATE lore_fragment_write_claims \
+                SET state = $3, settled_at = clock_timestamp() \
+              WHERE logical_request_id = $1 AND attempt_id = $2 AND state = $4",
+            &[
+                &claim.logical_request_id.as_slice(),
+                &claim.attempt_id.as_slice(),
+                &target.bits(),
+                &locked.state.bits(),
+            ],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("fragment write claim settle", error))?;
+    if updated != 1 {
+        return Err(DomainError::PreconditionRejected {
+            reason: "fragment_write_claim_settlement_race".to_owned(),
+            reason_version: 1,
+        });
+    }
+    Ok(())
+}
+
+fn decode_locked_write_claim(
+    row: tokio_postgres::Row,
+) -> Result<LockedFragmentWriteClaim, DomainError> {
+    let logical_request_id = fixed_bytes::<16>(
+        row.get("logical_request_id"),
+        "fragment write logical request id",
+    )?;
+    let attempt_id = fixed_bytes::<16>(row.get("attempt_id"), "fragment write attempt id")?;
+    let body_blake3 = fixed_bytes::<32>(row.get("body_blake3"), "fragment write body digest")?;
+    let body_size: i64 = row.get("body_size");
+    Ok(LockedFragmentWriteClaim {
+        claim: FragmentWriteClaim {
+            logical_request_id,
+            attempt_id,
+            hash: row.get("hash"),
+            epoch: row.get("epoch"),
+            fence: row.get("fence"),
+            authority: EpochAuthority::from_bits(row.get("authority"))?,
+            object_key: row.get("object_key"),
+            body_blake3,
+            body_size: u64::try_from(body_size).map_err(|_| {
+                DomainError::Internal("fragment write claim has a negative body size".to_owned())
+            })?,
+            send_not_after: row.get("send_not_after"),
+            hard_not_after: row.get("hard_not_after"),
+        },
+        state: FragmentWriteClaimState::from_bits(row.get("state"))?,
+        unexpired: row.get("unexpired"),
+    })
+}
+
+fn fixed_bytes<const N: usize>(value: Vec<u8>, field: &str) -> Result<[u8; N], DomainError> {
+    value.try_into().map_err(|_| {
+        DomainError::Internal(format!(
+            "{field} does not have the schema-required {N}-byte width"
+        ))
+    })
+}
+
+fn valid_write_authority_revision(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
 /// What a push witness comparison decided, as a value rather than a branch
@@ -2985,6 +4203,17 @@ async fn next_fence(tx: &Transaction<'_>) -> Result<i64, DomainError> {
         .await
         .map_err(|error| DomainError::from_pg("fragment fence allocation", error))
         .map(|row| row.get(0))
+}
+
+fn duration_millis(context: &str, duration: Duration) -> Result<i64, DomainError> {
+    let millis = duration.as_millis();
+    if !(1..=MAX_FRAGMENT_WRITE_CLAIM_DURATION_MILLIS).contains(&millis) {
+        return Err(DomainError::InvalidInput(format!(
+            "{context} must be between 1 and {MAX_FRAGMENT_WRITE_CLAIM_DURATION_MILLIS} milliseconds"
+        )));
+    }
+    i64::try_from(millis)
+        .map_err(|_| DomainError::InvalidInput(format!("{context} exceeds i64 milliseconds")))
 }
 
 /// Stamp the head with the fence this operation was issued at, so a delayed
@@ -3461,6 +4690,7 @@ mod tests {
             same_database: true,
             sequence_headroom: true,
             unresolved_rows: 0,
+            write_capability: FragmentWriteCapability::Optional,
         };
         assert!(ready.ready_for_lifecycle());
 

@@ -12,6 +12,7 @@
 //! connection proof, cross-instance racing, stale-witness fencing, generation
 //! fanout atomicity, and readiness against real schema damage.
 
+use std::ops::Deref;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -31,6 +32,12 @@ use lore_postgres::domain::fragments::FragmentManifest;
 use lore_postgres::domain::fragments::FragmentQueryRequest;
 use lore_postgres::domain::fragments::FragmentResolution;
 use lore_postgres::domain::fragments::FragmentVerdict;
+use lore_postgres::domain::fragments::FragmentWriteCapability;
+use lore_postgres::domain::fragments::FragmentWriteCapabilityCutover;
+use lore_postgres::domain::fragments::FragmentWriteClaimInput;
+use lore_postgres::domain::fragments::FragmentWriteClaimPruneBatch;
+use lore_postgres::domain::fragments::FragmentWriteClaimState;
+use lore_postgres::domain::fragments::FragmentWriteSettlement;
 use lore_postgres::domain::fragments::IoObservation;
 use lore_postgres::domain::fragments::MAX_PUSH_FRAGMENT_REVALIDATIONS;
 use lore_postgres::domain::fragments::MissingDiagnostic;
@@ -44,6 +51,8 @@ use lore_postgres::domain::fragments::STAGED_LEASE_MEMBER_NOT_STAGED;
 use lore_postgres::domain::fragments::STAGED_LEASE_MEMBER_SET_MISMATCH;
 use lore_postgres::domain::fragments::StagedReaderLease;
 use lore_postgres::domain::fragments::coordinator::DirectWriteKind;
+use lore_postgres::domain::fragments::coordinator::FragmentIntent;
+use lore_postgres::domain::fragments::read_fragment_write_capability;
 use lore_postgres::domain::fragments::schema;
 use lore_postgres::domain::fragments::states::FragmentLifecycleState;
 use lore_postgres::domain::lock_order::LockClass;
@@ -59,6 +68,89 @@ use uuid::NoContext;
 use uuid::Timestamp;
 use uuid::Uuid;
 
+fn write_claim() -> FragmentWriteClaimInput {
+    FragmentWriteClaimInput::new(
+        *Uuid::now_v7().as_bytes(),
+        *Uuid::now_v7().as_bytes(),
+        [0xA5; 32],
+        1,
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    )
+    .expect("valid test write claim")
+}
+
+struct TestDomainStore(PostgresDomainStore);
+
+impl Deref for TestDomainStore {
+    type Target = PostgresDomainStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl TestDomainStore {
+    fn fragment_coordinator(&self) -> TestFragmentCoordinator {
+        TestFragmentCoordinator(self.0.fragment_coordinator())
+    }
+}
+
+#[derive(Clone)]
+struct TestFragmentCoordinator(PostgresFragmentCoordinator);
+
+impl Deref for TestFragmentCoordinator {
+    type Target = PostgresFragmentCoordinator;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl TestFragmentCoordinator {
+    async fn begin_direct_write(
+        &self,
+        hash: &[u8],
+        legacy_object_key: &str,
+    ) -> Result<BeginOutcome, DomainError> {
+        self.0
+            .begin_direct_write(hash, legacy_object_key, write_claim())
+            .await
+    }
+
+    async fn claim_repair(&self, hash: &[u8]) -> Result<BeginOutcome, DomainError> {
+        self.0.claim_repair(hash, write_claim()).await
+    }
+
+    async fn commit_remote(
+        &self,
+        intent: &FragmentIntent,
+        observation: IoObservation,
+    ) -> Result<CommitVerdict, DomainError> {
+        let claim = intent.write_claim().ok_or_else(|| {
+            DomainError::InvalidInput("test remote intent has no write claim".to_owned())
+        })?;
+        self.0.authorize_write_claim(claim).await?;
+        self.0
+            .commit_remote(intent, observation, FragmentWriteSettlement::Decisive)
+            .await
+    }
+
+    async fn commit_repair(
+        &self,
+        intent: &FragmentIntent,
+        observation: IoObservation,
+    ) -> Result<CommitVerdict, DomainError> {
+        let claim = intent.write_claim().ok_or_else(|| {
+            DomainError::InvalidInput("test repair intent has no write claim".to_owned())
+        })?;
+        self.0.authorize_write_claim(claim).await?;
+        self.0
+            .commit_repair(intent, observation, FragmentWriteSettlement::Decisive)
+            .await
+    }
+}
+
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn normal_direct_write_uses_legacy_key_and_missing_reoffer_uses_repair_epoch_key() {
@@ -73,8 +165,10 @@ async fn normal_direct_write_uses_legacy_key_and_missing_reoffer_uses_repair_epo
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
 
+    let normal_claim = write_claim();
     let BeginOutcome::Admitted(first) = coordinator
-        .begin_direct_write(&hash, &legacy_key)
+        .0
+        .begin_direct_write(&hash, &legacy_key, normal_claim.clone())
         .await
         .expect("begin ordinary direct write")
     else {
@@ -109,7 +203,8 @@ async fn normal_direct_write_uses_legacy_key_and_missing_reoffer_uses_repair_epo
         .await
         .expect("remove persisted lineage token");
     let missing_token = coordinator
-        .begin_direct_write(&hash, &legacy_key)
+        .0
+        .begin_direct_write(&hash, &legacy_key, normal_claim.clone())
         .await
         .expect_err("a PreparingRemote head with no lineage token must fail closed");
     assert_eq!(
@@ -125,7 +220,8 @@ async fn normal_direct_write_uses_legacy_key_and_missing_reoffer_uses_repair_epo
         .await
         .expect("install unknown persisted lineage token");
     let unknown_token = coordinator
-        .begin_direct_write(&hash, &legacy_key)
+        .0
+        .begin_direct_write(&hash, &legacy_key, normal_claim.clone())
         .await
         .expect_err("a PreparingRemote head with an unknown lineage token must fail closed");
     assert_eq!(
@@ -145,7 +241,8 @@ async fn normal_direct_write_uses_legacy_key_and_missing_reoffer_uses_repair_epo
 
     let restarted = store_with_pool(&url, 8).await.fragment_coordinator();
     let BeginOutcome::Admitted(normal_retry) = restarted
-        .begin_direct_write(&hash, &legacy_key)
+        .0
+        .begin_direct_write(&hash, &legacy_key, normal_claim)
         .await
         .expect("resume ordinary direct write after restart")
     else {
@@ -166,8 +263,10 @@ async fn normal_direct_write_uses_legacy_key_and_missing_reoffer_uses_repair_epo
         CommitVerdict::Published
     );
 
+    let repair_claim = write_claim();
     let BeginOutcome::Admitted(repair) = coordinator
-        .begin_direct_write(&hash, &legacy_key)
+        .0
+        .begin_direct_write(&hash, &legacy_key, repair_claim.clone())
         .await
         .expect("re-offer Missing fragment")
     else {
@@ -201,7 +300,8 @@ async fn normal_direct_write_uses_legacy_key_and_missing_reoffer_uses_repair_epo
 
     let repaired_restart = store_with_pool(&url, 8).await.fragment_coordinator();
     let BeginOutcome::Admitted(repair_retry) = repaired_restart
-        .begin_direct_write(&hash, &legacy_key)
+        .0
+        .begin_direct_write(&hash, &legacy_key, repair_claim)
         .await
         .expect("resume repair after restart")
     else {
@@ -278,6 +378,670 @@ async fn payload_free_coordinated_preflight_distinguishes_exact_readable_from_ne
     ));
 }
 
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn durable_write_claims_bind_replay_authorize_settle_and_expiry_to_database_state() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let hash = random_hash();
+    let key = legacy_key(&hash);
+    let logical_request_id = [0x11; 16];
+    let attempt_id = [0x22; 16];
+    let body_blake3 = [0x33; 32];
+    let input = FragmentWriteClaimInput::new(
+        logical_request_id,
+        attempt_id,
+        body_blake3,
+        262_144,
+        Duration::from_millis(500),
+        Duration::from_millis(250),
+    )
+    .expect("valid exact claim binding");
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .0
+        .begin_direct_write(&hash, &key, input.clone())
+        .await
+        .expect("prepare durable write claim")
+    else {
+        panic!("fresh direct write must prepare its claim");
+    };
+    let claim = intent.write_claim().expect("direct intent claim");
+    assert_eq!(claim.logical_request_id(), &logical_request_id);
+    assert_eq!(claim.attempt_id(), &attempt_id);
+    assert_eq!(claim.hash(), hash.as_slice());
+    assert_eq!(claim.epoch(), intent.epoch);
+    assert_eq!(claim.fence(), intent.fence);
+    assert_eq!(claim.authority(), EpochAuthority::Remote);
+    assert_eq!(claim.object_key(), key);
+    assert_eq!(claim.body_blake3(), &body_blake3);
+    assert_eq!(claim.body_size(), 262_144);
+    assert!(claim.send_not_after() < claim.hard_not_after());
+    let no_send_publish = coordinator
+        .0
+        .commit_remote(
+            &intent,
+            IoObservation::Unusable(MissingDiagnostic::Absent),
+            FragmentWriteSettlement::NoSend,
+        )
+        .await
+        .expect_err("NoSend can settle but can never publish an observation");
+    assert_eq!(
+        no_send_publish,
+        DomainError::InvalidInput("a no-send claim cannot publish a remote observation".to_owned())
+    );
+
+    let row = direct
+        .query_one(
+            "SELECT state, prepared_at, send_not_after, hard_not_after, \
+                    prepared_at <= clock_timestamp(), send_not_after > prepared_at, \
+                    hard_not_after > send_not_after \
+               FROM lore_fragment_write_claims \
+              WHERE logical_request_id = $1 AND attempt_id = $2",
+            &[&logical_request_id.as_slice(), &attempt_id.as_slice()],
+        )
+        .await
+        .expect("read prepared claim");
+    assert_eq!(
+        row.get::<_, i16>("state"),
+        FragmentWriteClaimState::Prepared.bits()
+    );
+    assert!(row.get::<_, bool>(4));
+    assert!(row.get::<_, bool>(5));
+    assert!(row.get::<_, bool>(6));
+
+    let BeginOutcome::Admitted(replayed) = coordinator
+        .0
+        .begin_direct_write(&hash, &key, input.clone())
+        .await
+        .expect("replay exact prepared claim")
+    else {
+        panic!("exact prepared replay must remain admitted");
+    };
+    assert_eq!(replayed.write_claim(), intent.write_claim());
+
+    let mismatched = FragmentWriteClaimInput::new(
+        logical_request_id,
+        attempt_id,
+        [0x44; 32],
+        262_144,
+        Duration::from_millis(500),
+        Duration::from_millis(250),
+    )
+    .expect("valid but differently bound claim");
+    let error = coordinator
+        .0
+        .begin_direct_write(&hash, &key, mismatched)
+        .await
+        .expect_err("same attempt identity with a changed body hash must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("reused with a different binding")
+    );
+
+    assert!(matches!(
+        coordinator
+            .0
+            .begin_direct_write(&hash, &key, write_claim())
+            .await
+            .expect("inspect prepared barrier"),
+        BeginOutcome::WriteClaimBlocked { .. }
+    ));
+    let authorized = coordinator
+        .authorize_write_claim(claim)
+        .await
+        .expect("authorize exact prepared claim");
+    assert!(!authorized.send_budget().is_zero());
+    assert!(authorized.send_budget() <= Duration::from_millis(500));
+    assert!(matches!(
+        coordinator
+            .0
+            .begin_direct_write(&hash, &key, write_claim())
+            .await
+            .expect("inspect Sending barrier"),
+        BeginOutcome::WriteClaimBlocked { .. }
+    ));
+    coordinator
+        .settle_write_claim(claim, FragmentWriteSettlement::Ambiguous)
+        .await
+        .expect("settle ambiguous provider outcome");
+    assert_eq!(
+        direct
+            .query_one(
+                "SELECT state FROM lore_fragment_write_claims \
+                  WHERE logical_request_id = $1 AND attempt_id = $2",
+                &[&logical_request_id.as_slice(), &attempt_id.as_slice()],
+            )
+            .await
+            .expect("read settled claim")
+            .get::<_, i16>(0),
+        FragmentWriteClaimState::Ambiguous.bits()
+    );
+    assert!(matches!(
+        coordinator
+            .0
+            .begin_direct_write(&hash, &key, write_claim())
+            .await
+            .expect("inspect Ambiguous barrier"),
+        BeginOutcome::WriteClaimBlocked { .. }
+    ));
+
+    tokio::time::sleep(Duration::from_millis(850)).await;
+    let BeginOutcome::Admitted(after_expiry) = coordinator
+        .0
+        .begin_direct_write(&hash, &key, write_claim())
+        .await
+        .expect("hard-expired ambiguity no longer blocks")
+    else {
+        panic!("a new attempt must be admitted after the database hard expiry");
+    };
+    coordinator
+        .settle_write_claim(
+            after_expiry.write_claim().expect("replacement claim"),
+            FragmentWriteSettlement::NoSend,
+        )
+        .await
+        .expect("NoSend replacement settlement");
+    assert!(matches!(
+        coordinator
+            .0
+            .begin_direct_write(&hash, &key, write_claim())
+            .await
+            .expect("NoSend is nonblocking"),
+        BeginOutcome::Admitted(_)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn write_claim_head_lock_precedes_claim_insert_and_moved_lineage_refuses_send() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let hash = random_hash();
+    let key = legacy_key(&hash);
+    let BeginOutcome::Admitted(seed) = coordinator.begin_direct_write(&hash, &key).await.unwrap()
+    else {
+        panic!("fresh seed must admit");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(&seed, IoObservation::Unusable(MissingDiagnostic::Absent))
+            .await
+            .expect("seed Missing head"),
+        CommitVerdict::Published
+    );
+
+    let mut locker = own_transaction_client(&url).await;
+    let tx = locker.transaction().await.expect("head-lock transaction");
+    tx.query_one(
+        "SELECT hash FROM lore_fragment_lifecycle WHERE hash = $1 FOR UPDATE",
+        &[&hash.as_slice()],
+    )
+    .await
+    .expect("lock exact lifecycle head");
+    let blocked_request = *Uuid::now_v7().as_bytes();
+    let blocked_attempt = *Uuid::now_v7().as_bytes();
+    let blocked_input = FragmentWriteClaimInput::new(
+        blocked_request,
+        blocked_attempt,
+        [0x66; 32],
+        1,
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    )
+    .expect("blocked attempt fixture");
+    let racing = coordinator.clone();
+    let racing_hash = hash.clone();
+    let begin = lore_base::lore_spawn!(async move {
+        racing
+            .0
+            .begin_direct_write(&racing_hash, &legacy_key(&racing_hash), blocked_input)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let observer = client(&url).await;
+    assert_eq!(
+        observer
+            .query_one(
+                "SELECT count(*) FROM lore_fragment_write_claims \
+                  WHERE logical_request_id = $1 AND attempt_id = $2",
+                &[&blocked_request.as_slice(), &blocked_attempt.as_slice()],
+            )
+            .await
+            .expect("claim visibility while head locked")
+            .get::<_, i64>(0),
+        0,
+        "claim insertion must not overtake the lifecycle-head lock"
+    );
+    tx.commit().await.expect("release lifecycle head lock");
+    let BeginOutcome::Admitted(repair) = begin
+        .await
+        .expect("join blocked begin")
+        .expect("begin after head unlock")
+    else {
+        panic!("Missing head must admit a repair after the lock releases");
+    };
+
+    observer
+        .execute(
+            "UPDATE lore_fragment_lifecycle SET state = $2 WHERE hash = $1",
+            &[
+                &hash.as_slice(),
+                &FragmentLifecycleState::DeletingChildren.bits(),
+            ],
+        )
+        .await
+        .expect("simulate the Phase 6B head-first deletion transition");
+    let error = coordinator
+        .authorize_write_claim(repair.write_claim().expect("repair claim"))
+        .await
+        .expect_err("a moved/deleting lineage must refuse authorization");
+    assert!(error.to_string().contains("fragment_write_lineage_moved"));
+    assert_eq!(
+        observer
+            .query_one(
+                "SELECT state FROM lore_fragment_write_claims \
+                  WHERE logical_request_id = $1 AND attempt_id = $2",
+                &[&blocked_request.as_slice(), &blocked_attempt.as_slice()],
+            )
+            .await
+            .expect("read refused claim state")
+            .get::<_, i16>(0),
+        FragmentWriteClaimState::NoSend.bits(),
+        "lineage refusal must durably prevent a later send"
+    );
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn write_claim_acl_denies_public_and_retains_owner_access() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let _store = store(&url).await;
+    let direct = client(&url).await;
+    let public_dml: bool = direct
+        .query_one(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM pg_class AS c, \
+                    LATERAL aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) AS acl \
+                  WHERE c.oid = 'lore_fragment_write_claims'::regclass \
+                    AND acl.grantee = 0 \
+                    AND acl.privilege_type = ANY($1::text[]) \
+             )",
+            &[&["SELECT", "INSERT", "UPDATE", "DELETE"].as_slice()],
+        )
+        .await
+        .expect("inspect PUBLIC table ACL")
+        .get(0);
+    assert!(!public_dml, "PUBLIC must have no write-claim DML privilege");
+    let owner_dml: bool = direct
+        .query_one(
+            "SELECT has_table_privilege( \
+                 current_user, 'lore_fragment_write_claims', 'SELECT,INSERT,UPDATE,DELETE' \
+             )",
+            &[],
+        )
+        .await
+        .expect("inspect owner table ACL")
+        .get(0);
+    assert!(owner_dml, "the schema owner must retain claim-table access");
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn write_capability_cutover_is_exact_idempotent_and_database_attested() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let pool = build_pool(&url, 2, &TlsConfig::default()).expect("build capability pool");
+
+    let initial = read_fragment_write_capability(&pool)
+        .await
+        .expect("read optional capability");
+    assert!(initial.provisioned);
+    assert_eq!(initial.schema_version, schema::FRAGMENT_SCHEMA_VERSION);
+    assert_eq!(initial.write_capability, FragmentWriteCapability::Optional);
+
+    for invalid in [String::new(), "bad revision".to_owned(), "x".repeat(65)] {
+        assert!(FragmentWriteCapabilityCutover::new(&invalid).is_err());
+    }
+    let cutover = FragmentWriteCapabilityCutover::new("write-claims-v1")
+        .expect("canonical write-authority revision");
+    let not_ready = coordinator
+        .require_write_claims(&cutover)
+        .await
+        .expect_err("cutover before lifecycle readiness must fail");
+    assert!(matches!(not_ready, DomainError::NotReady(_)));
+
+    direct
+        .execute(
+            "UPDATE lore_fragment_schema_state \
+                SET backfill_state = $1, cutover_at = clock_timestamp(), \
+                    residue_classified = true, sequence_headroom_fence = 1 \
+              WHERE id = 1",
+            &[&schema::BACKFILL_CUTOVER],
+        )
+        .await
+        .expect("stage lifecycle cutover preconditions");
+    coordinator
+        .enable_lifecycle()
+        .await
+        .expect("enable lifecycle before claims-required cutover");
+    coordinator
+        .require_write_claims(&cutover)
+        .await
+        .expect("persist claims-required capability");
+    coordinator
+        .require_write_claims(&cutover)
+        .await
+        .expect("exact cutover replay must be idempotent");
+
+    let required = read_fragment_write_capability(&pool)
+        .await
+        .expect("read claims-required capability");
+    assert_eq!(required.schema_version, schema::FRAGMENT_SCHEMA_VERSION);
+    assert_eq!(
+        required.write_capability,
+        FragmentWriteCapability::ClaimsRequired {
+            provider_write_authority_revision: "write-claims-v1".to_owned(),
+        }
+    );
+    let mismatch = coordinator
+        .require_write_claims(
+            &FragmentWriteCapabilityCutover::new("write-claims-v2")
+                .expect("second canonical revision"),
+        )
+        .await
+        .expect_err("a different revision must not rewrite the cutover");
+    assert!(matches!(
+        mismatch,
+        DomainError::PreconditionRejected { ref reason, .. }
+            if reason == "fragment_write_authority_revision_mismatch"
+    ));
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn claim_inventory_and_prune_preserve_cleanup_targets_and_bound_terminal_deletion() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+
+    let ambiguous_hash = random_hash();
+    let ambiguous_key = legacy_key(&ambiguous_hash);
+    let ambiguous_input = FragmentWriteClaimInput::new(
+        *Uuid::now_v7().as_bytes(),
+        *Uuid::now_v7().as_bytes(),
+        [0x31; 32],
+        31,
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    )
+    .expect("short ambiguous claim");
+    let BeginOutcome::Admitted(ambiguous_intent) = coordinator
+        .0
+        .begin_direct_write(&ambiguous_hash, &ambiguous_key, ambiguous_input)
+        .await
+        .expect("prepare ambiguous predecessor")
+    else {
+        panic!("fresh ambiguous predecessor must admit");
+    };
+    let ambiguous_claim = ambiguous_intent
+        .write_claim()
+        .expect("ambiguous predecessor claim");
+    coordinator
+        .authorize_write_claim(ambiguous_claim)
+        .await
+        .expect("authorize ambiguous predecessor");
+    coordinator
+        .0
+        .commit_remote(
+            &ambiguous_intent,
+            IoObservation::Unusable(MissingDiagnostic::Absent),
+            FragmentWriteSettlement::Ambiguous,
+        )
+        .await
+        .expect("publish Missing while retaining ambiguous predecessor");
+    tokio::time::sleep(Duration::from_millis(170)).await;
+
+    let BeginOutcome::Admitted(repair_intent) = coordinator
+        .0
+        .begin_direct_write(&ambiguous_hash, &ambiguous_key, write_claim())
+        .await
+        .expect("repair after Missing remains legitimate")
+    else {
+        panic!("repair after Missing must allocate a successor");
+    };
+    assert_ne!(repair_intent.object_key, ambiguous_key);
+    coordinator
+        .settle_write_claim(
+            repair_intent.write_claim().expect("repair claim"),
+            FragmentWriteSettlement::NoSend,
+        )
+        .await
+        .expect("settle unused repair");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let old_row = direct
+        .query_one(
+            "SELECT epoch, fence, object_key, state FROM lore_fragment_write_claims \
+              WHERE logical_request_id = $1 AND attempt_id = $2",
+            &[
+                &ambiguous_claim.logical_request_id().as_slice(),
+                &ambiguous_claim.attempt_id().as_slice(),
+            ],
+        )
+        .await
+        .expect("read old ambiguous cleanup target");
+    assert_eq!(old_row.get::<_, i64>(0), ambiguous_claim.epoch());
+    assert_eq!(old_row.get::<_, i64>(1), ambiguous_claim.fence());
+    assert_eq!(old_row.get::<_, String>(2), ambiguous_key);
+    assert_eq!(
+        old_row.get::<_, i16>(3),
+        FragmentWriteClaimState::Ambiguous.bits()
+    );
+
+    let pruned = coordinator
+        .prune_terminal_write_claims(
+            FragmentWriteClaimPruneBatch::new(1, Duration::from_millis(1))
+                .expect("bounded prune batch"),
+        )
+        .await
+        .expect("prune one terminal claim");
+    assert_eq!(pruned, 1, "the NoSend repair is the sole eligible row");
+    let ambiguous_survives: i64 = direct
+        .query_one(
+            "SELECT count(*) FROM lore_fragment_write_claims \
+              WHERE logical_request_id = $1 AND attempt_id = $2",
+            &[
+                &ambiguous_claim.logical_request_id().as_slice(),
+                &ambiguous_claim.attempt_id().as_slice(),
+            ],
+        )
+        .await
+        .expect("count old ambiguous target after prune")
+        .get(0);
+    assert_eq!(ambiguous_survives, 1);
+
+    let decisive_hash = random_hash();
+    let decisive_key = legacy_key(&decisive_hash);
+    let decisive_input = FragmentWriteClaimInput::new(
+        *Uuid::now_v7().as_bytes(),
+        *Uuid::now_v7().as_bytes(),
+        [0x52; 32],
+        52,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+    .expect("decisive claim");
+    let BeginOutcome::Admitted(decisive_intent) = coordinator
+        .0
+        .begin_direct_write(&decisive_hash, &decisive_key, decisive_input)
+        .await
+        .expect("prepare decisive publication")
+    else {
+        panic!("fresh decisive publication must admit");
+    };
+    let decisive_claim = decisive_intent
+        .write_claim()
+        .expect("decisive publication claim");
+    coordinator
+        .authorize_write_claim(decisive_claim)
+        .await
+        .expect("authorize decisive publication");
+    coordinator
+        .0
+        .commit_remote(
+            &decisive_intent,
+            IoObservation::Valid(manifest(&decisive_key, 0x52, EpochAuthority::Remote)),
+            FragmentWriteSettlement::Decisive,
+        )
+        .await
+        .expect("publish decisive provider evidence");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(
+        coordinator
+            .prune_terminal_write_claims(
+                FragmentWriteClaimPruneBatch::new(1, Duration::from_millis(1))
+                    .expect("single decisive prune"),
+            )
+            .await
+            .expect("prune decisive claim with durable evidence"),
+        1
+    );
+    let epoch_evidence = direct
+        .query_one(
+            "SELECT provider_body_blake3, provider_body_size, provider_claim_fence \
+               FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
+            &[&decisive_hash, &decisive_intent.epoch],
+        )
+        .await
+        .expect("read durable decisive epoch evidence");
+    assert_eq!(epoch_evidence.get::<_, Vec<u8>>(0), vec![0x52; 32]);
+    assert_eq!(epoch_evidence.get::<_, i64>(1), 52);
+    assert_eq!(epoch_evidence.get::<_, i64>(2), decisive_claim.fence());
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn prune_normalizes_expired_prepared_to_targetless_no_send_and_honors_batch_limit() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let hash = random_hash();
+    let key = legacy_key(&hash);
+    let input = FragmentWriteClaimInput::new(
+        *Uuid::now_v7().as_bytes(),
+        *Uuid::now_v7().as_bytes(),
+        [0x71; 32],
+        71,
+        Duration::from_millis(40),
+        Duration::from_millis(200),
+    )
+    .expect("short prepared claim");
+    let BeginOutcome::Admitted(intent) = coordinator
+        .0
+        .begin_direct_write(&hash, &key, input)
+        .await
+        .expect("prepare expiring claim")
+    else {
+        panic!("fresh prepared claim must admit");
+    };
+    let prepared = intent.write_claim().expect("prepared claim");
+
+    let prepared_epoch = prepared.epoch();
+    let prepared_fence = prepared.fence();
+    let remote_authority = EpochAuthority::Remote.bits();
+    let no_send_state = FragmentWriteClaimState::NoSend.bits();
+    for seed in [0x81_u8, 0x82_u8] {
+        let logical_request_id = vec![seed; 16];
+        let attempt_id = vec![seed.wrapping_add(1); 16];
+        let body_blake3 = vec![seed; 32];
+        let body_size = i64::from(seed);
+        direct
+            .execute(
+                "INSERT INTO lore_fragment_write_claims ( \
+                    logical_request_id, attempt_id, hash, epoch, fence, authority, object_key, \
+                    body_blake3, body_size, state, send_not_after, hard_not_after, prepared_at, settled_at \
+                 ) VALUES ( \
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                    clock_timestamp() - interval '2 seconds', \
+                    clock_timestamp() - interval '1 second', \
+                    clock_timestamp() - interval '3 seconds', \
+                    clock_timestamp() - interval '1 second' \
+                 )",
+                &[
+                    &logical_request_id,
+                    &attempt_id,
+                    &hash,
+                    &prepared_epoch,
+                    &prepared_fence,
+                    &remote_authority,
+                    &key,
+                    &body_blake3,
+                    &body_size,
+                    &no_send_state,
+                ],
+            )
+            .await
+            .expect("insert old targetless NoSend candidate");
+    }
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        coordinator
+            .prune_terminal_write_claims(
+                FragmentWriteClaimPruneBatch::new(1, Duration::from_millis(1))
+                    .expect("single-row prune batch"),
+            )
+            .await
+            .expect("bounded prune and inventory normalization"),
+        1,
+        "LIMIT 1 must delete exactly one terminal candidate"
+    );
+    let prepared_state: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_write_claims \
+              WHERE logical_request_id = $1 AND attempt_id = $2",
+            &[
+                &prepared.logical_request_id().as_slice(),
+                &prepared.attempt_id().as_slice(),
+            ],
+        )
+        .await
+        .expect("read normalized prepared claim")
+        .get(0);
+    assert_eq!(prepared_state, FragmentWriteClaimState::NoSend.bits());
+    let first_synthetic_request = vec![0x81_u8; 16];
+    let second_synthetic_request = vec![0x82_u8; 16];
+    let synthetic_remaining: i64 = direct
+        .query_one(
+            "SELECT count(*) FROM lore_fragment_write_claims \
+              WHERE hash = $1 AND logical_request_id IN ($2, $3)",
+            &[&hash, &first_synthetic_request, &second_synthetic_request],
+        )
+        .await
+        .expect("count bounded synthetic survivors")
+        .get(0);
+    assert_eq!(synthetic_remaining, 1);
+}
+
 fn pg_url() -> Option<String> {
     std::env::var("LORE_TEST_PG_URL").ok()
 }
@@ -285,11 +1049,11 @@ fn pg_url() -> Option<String> {
 /// Connect and install SCHEMA-118 through the isolated component fixture.
 /// Production never calls `bootstrap()` (it is migration-owned), so this is a
 /// test-only shortcut, exactly like `PostgresLockCoordinator::bootstrap()`.
-async fn store(url: &str) -> PostgresDomainStore {
+async fn store(url: &str) -> TestDomainStore {
     store_with_pool(url, 8).await
 }
 
-async fn store_with_pool(url: &str, pool_max: u32) -> PostgresDomainStore {
+async fn store_with_pool(url: &str, pool_max: u32) -> TestDomainStore {
     let store = PostgresDomainStore::connect(url, pool_max, &TlsConfig::default())
         .await
         .expect("connect domain store");
@@ -298,7 +1062,7 @@ async fn store_with_pool(url: &str, pool_max: u32) -> PostgresDomainStore {
         .bootstrap()
         .await
         .expect("install isolated SCHEMA-118 fixture");
-    store
+    TestDomainStore(store)
 }
 
 async fn client(url: &str) -> Client {
@@ -872,7 +1636,7 @@ async fn two_independently_constructed_coordinators_race_one_fresh_head_and_exac
     let hash = random_hash();
 
     async fn race_attempt(
-        coordinator: PostgresFragmentCoordinator,
+        coordinator: TestFragmentCoordinator,
         hash: Vec<u8>,
         manifest: FragmentManifest,
     ) -> bool {
@@ -881,14 +1645,22 @@ async fn two_independently_constructed_coordinators_race_one_fresh_head_and_exac
             .await
             .expect("begin must not error")
         {
-            BeginOutcome::AlreadyReadable(_) | BeginOutcome::Fenced(_) => false,
-            BeginOutcome::Admitted(intent) => matches!(
-                coordinator
-                    .commit_remote(&intent, IoObservation::Valid(manifest))
-                    .await
-                    .expect("commit must not error"),
-                CommitVerdict::Published
-            ),
+            BeginOutcome::AlreadyReadable(_)
+            | BeginOutcome::Fenced(_)
+            | BeginOutcome::WriteClaimBlocked { .. } => false,
+            BeginOutcome::Admitted(intent) => match coordinator
+                .commit_remote(&intent, IoObservation::Valid(manifest))
+                .await
+            {
+                Ok(CommitVerdict::Published) => true,
+                Ok(CommitVerdict::Fenced | CommitVerdict::Abandoned) => false,
+                Err(DomainError::PreconditionRejected { ref reason, .. })
+                    if reason == "fragment_write_lineage_moved" =>
+                {
+                    false
+                }
+                result => panic!("race commit had an unrelated outcome: {result:?}"),
+            },
         }
     }
 
@@ -936,7 +1708,7 @@ async fn two_independently_constructed_coordinators_race_one_fresh_head_and_exac
 /// publish a second epoch row.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn a_replayed_direct_write_reuses_the_witness_and_a_late_commit_mutates_nothing() {
+async fn a_replayed_direct_write_reuses_exact_claim_and_terminal_attempt_cannot_publish_twice() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -945,8 +1717,10 @@ async fn a_replayed_direct_write_reuses_the_witness_and_a_late_commit_mutates_no
     let direct = client(&url).await;
     let hash = random_hash();
 
+    let replay_claim = write_claim();
     let BeginOutcome::Admitted(first_intent) = coordinator
-        .begin_direct_write(&hash, &legacy_key(&hash))
+        .0
+        .begin_direct_write(&hash, &legacy_key(&hash), replay_claim.clone())
         .await
         .expect("begin direct write")
     else {
@@ -955,7 +1729,8 @@ async fn a_replayed_direct_write_reuses_the_witness_and_a_late_commit_mutates_no
 
     let restarted = store_with_pool(&url, 8).await.fragment_coordinator();
     let BeginOutcome::Admitted(replayed_intent) = restarted
-        .begin_direct_write(&hash, &legacy_key(&hash))
+        .0
+        .begin_direct_write(&hash, &legacy_key(&hash), replay_claim)
         .await
         .expect("replay persisted direct write")
     else {
@@ -980,14 +1755,15 @@ async fn a_replayed_direct_write_reuses_the_witness_and_a_late_commit_mutates_no
 
     let stale_manifest = manifest("competing-write/stale", 0x20, EpochAuthority::Remote);
     let late = coordinator
-        .commit_remote(&first_intent, IoObservation::Valid(stale_manifest))
+        .0
+        .commit_remote(
+            &first_intent,
+            IoObservation::Valid(stale_manifest),
+            FragmentWriteSettlement::Decisive,
+        )
         .await
-        .expect("late commit must not error");
-    assert_eq!(
-        late,
-        CommitVerdict::Fenced,
-        "the delayed copy of a replayed direct write must be fenced after publication"
-    );
+        .expect("the stale publication is fenced before claim settlement");
+    assert_eq!(late, CommitVerdict::Fenced);
 
     let epoch_rows: i64 = direct
         .query_one(
@@ -999,7 +1775,7 @@ async fn a_replayed_direct_write_reuses_the_witness_and_a_late_commit_mutates_no
         .get(0);
     assert_eq!(
         epoch_rows, 1,
-        "replay and late fencing must leave exactly the one published epoch row"
+        "replay and terminal-attempt refusal must leave exactly one published epoch row"
     );
 }
 
@@ -1023,6 +1799,10 @@ async fn a_stale_witness_from_a_competing_obliterate_fences_a_late_commit_with_z
     else {
         panic!("a fresh hash must admit a direct write");
     };
+    coordinator
+        .authorize_write_claim(stale_intent.write_claim().expect("stale claim"))
+        .await
+        .expect("authorize before the simulated provider I/O gap");
 
     let BeginOutcome::Admitted(_obliterate_intent) = coordinator
         .begin_obliterate(&hash)
@@ -1034,7 +1814,12 @@ async fn a_stale_witness_from_a_competing_obliterate_fences_a_late_commit_with_z
 
     let stale_manifest = manifest("competing-obliterate/stale", 0x30, EpochAuthority::Remote);
     let late = coordinator
-        .commit_remote(&stale_intent, IoObservation::Valid(stale_manifest))
+        .0
+        .commit_remote(
+            &stale_intent,
+            IoObservation::Valid(stale_manifest),
+            FragmentWriteSettlement::Decisive,
+        )
         .await
         .expect("late commit must not error");
     assert_eq!(
@@ -1072,7 +1857,7 @@ async fn a_stale_witness_from_a_competing_obliterate_fences_a_late_commit_with_z
 /// `Fenced` with zero mutation.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn a_stale_witness_from_a_competing_repair_fences_a_late_commit_with_zero_mutation() {
+async fn a_prepared_repair_blocks_a_competitor_and_no_send_attempt_cannot_publish_late() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -1108,15 +1893,29 @@ async fn a_stale_witness_from_a_competing_repair_fences_a_late_commit_with_zero_
         panic!("a Missing head must admit a repair claim");
     };
 
-    // A second, later repair claim on the still-Missing head races ahead and
-    // wins: `claim_repair`'s begin only moves the fence, never the state, so
-    // the head is still Missing and admits again.
+    assert!(matches!(
+        coordinator
+            .claim_repair(&hash)
+            .await
+            .expect("inspect prepared repair barrier"),
+        BeginOutcome::WriteClaimBlocked { .. }
+    ));
+    coordinator
+        .settle_write_claim(
+            stale_repair.write_claim().expect("stale repair claim"),
+            FragmentWriteSettlement::NoSend,
+        )
+        .await
+        .expect("settle the attempt that never sent");
+
+    // NoSend is terminal and nonblocking, so the later repair can now obtain
+    // its own exact claim and publish.
     let BeginOutcome::Admitted(winning_repair) = coordinator
         .claim_repair(&hash)
         .await
         .expect("begin winning repair")
     else {
-        panic!("a second claim on the still-Missing head must also admit");
+        panic!("a second claim must admit after NoSend settlement");
     };
     let winner_manifest = manifest("competing-repair/winner", 0x40, EpochAuthority::Remote);
     assert_eq!(
@@ -1129,14 +1928,19 @@ async fn a_stale_witness_from_a_competing_repair_fences_a_late_commit_with_zero_
 
     let stale_manifest = manifest("competing-repair/stale", 0x50, EpochAuthority::Remote);
     let late = coordinator
-        .commit_repair(&stale_repair, IoObservation::Valid(stale_manifest))
+        .0
+        .commit_repair(
+            &stale_repair,
+            IoObservation::Valid(stale_manifest),
+            FragmentWriteSettlement::Decisive,
+        )
         .await
-        .expect("late repair commit must not error");
-    assert_eq!(
+        .expect_err("a NoSend attempt must not publish late");
+    assert!(matches!(
         late,
-        CommitVerdict::Fenced,
-        "a competing repair must fence the delayed commit"
-    );
+        DomainError::PreconditionRejected { ref reason, .. }
+            if reason == "fragment_write_claim_invalid_settlement"
+    ));
 
     let epoch_rows: i64 = direct
         .query_one(
@@ -1146,7 +1950,10 @@ async fn a_stale_witness_from_a_competing_repair_fences_a_late_commit_with_zero_
         .await
         .expect("count stale epoch rows")
         .get(0);
-    assert_eq!(epoch_rows, 0);
+    assert_eq!(
+        epoch_rows, 1,
+        "the winning attempt publishes the shared repair lineage exactly once"
+    );
 }
 
 /// Item 8: a readable/unreadable transition must bump `fragment_lifecycle_generation`
@@ -1254,7 +2061,7 @@ async fn two_concurrent_transitions_over_an_overlapping_fanout_do_not_deadlock()
     let repo_2 = create_repository(&store).await;
     let repo_3 = create_repository(&store).await;
 
-    async fn publish(coordinator: &PostgresFragmentCoordinator, key: &str, seed: u8) -> Vec<u8> {
+    async fn publish(coordinator: &TestFragmentCoordinator, key: &str, seed: u8) -> Vec<u8> {
         let hash = random_hash();
         let BeginOutcome::Admitted(intent) = coordinator
             .begin_direct_write(&hash, &legacy_key(&hash))

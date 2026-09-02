@@ -7,6 +7,7 @@ use std::pin::Pin;
 
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::BucketVersioningStatus;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use lore_aws::aws_error::is_retryable_sdk_error;
 use lore_aws::net_http_client::HttpRequestAttemptCounter;
@@ -34,8 +35,20 @@ pub(crate) struct PostgresFragmentS3Transport {
     endpoint_host: String,
 }
 
+/// Proof that the exact retry-disabled client observed the exact bucket as
+/// never versioned.
+///
+/// The fields are private and the only constructor is the startup
+/// `GetBucketVersioning` probe below. Production transport construction must
+/// consume this value, so a caller cannot substitute an unprobed client or a
+/// different bucket after attestation.
+struct UnversionedBucketAttestation {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+}
+
 impl PostgresFragmentS3Transport {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         client: aws_sdk_s3::Client,
         bucket: String,
         region: String,
@@ -66,9 +79,10 @@ impl PostgresFragmentS3Transport {
         if resolved_endpoint_host != target_endpoint_host {
             return Err(PostgresFragmentTransportConfigError::EndpointMismatch);
         }
+        let attestation = attest_unversioned_bucket(client, bucket).await?;
         Ok(Self {
-            client,
-            bucket,
+            client: attestation.client,
+            bucket: attestation.bucket,
             region: target_region,
             endpoint_host: target_endpoint_host,
         })
@@ -336,6 +350,37 @@ impl PostgresFragmentS3Transport {
                 }
             }
         }
+    }
+}
+
+/// Perform the sole bucket-level provider read used by runtime activation.
+///
+/// This probe is unmetered and does not enter the dispatch database or charge
+/// authority. The retry-disabled client must reach the connector exactly once.
+/// Source construction exposes no bucket-versioning mutation operation; an
+/// external IAM policy remains responsible for denying that permission.
+async fn attest_unversioned_bucket(
+    client: aws_sdk_s3::Client,
+    bucket: String,
+) -> Result<UnversionedBucketAttestation, PostgresFragmentTransportConfigError> {
+    let counter = HttpRequestAttemptCounter::default();
+    let result = counter
+        .count_connector_attempts(client.get_bucket_versioning().bucket(&bucket).send())
+        .await;
+    if counter.issued() != 1 {
+        return Err(PostgresFragmentTransportConfigError::BucketVersioningAttemptCount);
+    }
+    let output =
+        result.map_err(|_| PostgresFragmentTransportConfigError::BucketVersioningProbeFailed)?;
+    match output.status() {
+        None => Ok(UnversionedBucketAttestation { client, bucket }),
+        Some(BucketVersioningStatus::Enabled) => {
+            Err(PostgresFragmentTransportConfigError::BucketVersioningEnabled)
+        }
+        Some(BucketVersioningStatus::Suspended) => {
+            Err(PostgresFragmentTransportConfigError::BucketVersioningSuspended)
+        }
+        Some(_) => Err(PostgresFragmentTransportConfigError::BucketVersioningUnknown),
     }
 }
 

@@ -157,6 +157,53 @@ impl EpochAuthority {
     }
 }
 
+/// Durable state of one exact provider-write attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragmentWriteClaimState {
+    /// Exact binding persisted; provider send is not authorized yet.
+    Prepared,
+    /// Authorization committed and the bounded send window is open.
+    Sending,
+    /// Provider outcome is decisive. Terminal and nonblocking.
+    Decisive,
+    /// Provider outcome may have a late effect. Blocking until hard expiry.
+    Ambiguous,
+    /// No provider send occurred. Terminal and nonblocking.
+    NoSend,
+}
+
+impl FragmentWriteClaimState {
+    /// Stored encoding.
+    pub const fn bits(self) -> i16 {
+        match self {
+            Self::Prepared => 0,
+            Self::Sending => 1,
+            Self::Decisive => 2,
+            Self::Ambiguous => 3,
+            Self::NoSend => 4,
+        }
+    }
+
+    /// Decode one stored encoding.
+    pub fn from_bits(bits: i16) -> Result<Self, DomainError> {
+        match bits {
+            0 => Ok(Self::Prepared),
+            1 => Ok(Self::Sending),
+            2 => Ok(Self::Decisive),
+            3 => Ok(Self::Ambiguous),
+            4 => Ok(Self::NoSend),
+            other => Err(DomainError::Internal(format!(
+                "unknown fragment write-claim state {other}"
+            ))),
+        }
+    }
+
+    /// Whether this state blocks destructive lifecycle progress before expiry.
+    pub const fn blocks_until_hard_expiry(self) -> bool {
+        matches!(self, Self::Prepared | Self::Sending | Self::Ambiguous)
+    }
+}
+
 /// Why a head is `Missing`. Bounded so the column stays a closed vocabulary
 /// rather than an unbounded free-text field on a hot table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

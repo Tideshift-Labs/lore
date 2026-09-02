@@ -84,6 +84,7 @@ pub use lore_fragment_provider::CellSchemaAttestation;
 pub use lore_fragment_provider::DEFAULT_IN_FLIGHT_PUTS;
 pub use lore_fragment_provider::FRAGMENT_PROVIDER_ATTEMPT_CLASSES;
 pub use lore_fragment_provider::FRAGMENT_PROVIDER_INGRESS_CAP_BYTES;
+pub use lore_fragment_provider::FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS;
 pub use lore_fragment_provider::FragmentAttemptLedger;
 pub use lore_fragment_provider::FragmentDatabaseIdentity;
 pub use lore_fragment_provider::FragmentDatabaseIdentityError;

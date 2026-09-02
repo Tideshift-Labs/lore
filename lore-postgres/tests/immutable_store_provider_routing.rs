@@ -113,10 +113,12 @@ fn ordinary_direct_write_supplies_the_legacy_hash_key_but_missing_uses_a_repair_
     let immutable = source("src/store/immutable_store.rs");
     let coordinated = function(&immutable, "async fn put_coordinated(");
     assert!(coordinated.contains("let legacy_key = Self::hash_key(address.hash);"));
-    assert!(coordinated.contains(".begin_direct_write(address.hash.data(), &legacy_key)"));
+    assert!(
+        coordinated.contains(".begin_direct_write(address.hash.data(), &legacy_key, write_claim)")
+    );
     assert!(
         function(&immutable, "async fn issue_direct_put(")
-            .contains("object_key: intent.object_key.clone()")
+            .contains("object_key: request.intent.object_key.clone()")
     );
 
     let coordinator = source("src/domain/fragments/coordinator.rs");
@@ -137,18 +139,18 @@ fn persisted_direct_write_lineage_drives_retry_traffic_class_and_uncertainty_com
 
     let coordinated = function(&immutable, "async fn put_coordinated(");
     let begin = coordinated
-        .find(".begin_direct_write(address.hash.data(), &legacy_key)")
+        .find(".begin_direct_write(address.hash.data(), &legacy_key, write_claim)")
         .expect("durable begin/resume");
     let provider = coordinated
-        .find(".issue_direct_put(provider, &intent")
+        .find("CoordinatedDirectPut {")
         .expect("provider I/O uses returned intent");
     let uncertainty = coordinated[provider..]
         .find(".await?;")
         .map(|offset| provider + offset)
         .expect("provider uncertainty returns before commit");
     let commit = coordinated
-        .find(".commit_remote(&intent, observation)")
-        .expect("commit only an observation");
+        .find(".commit_remote(&intent, observation, settlement)")
+        .expect("commit the observation and exact claim settlement");
     assert!(begin < provider && provider < uncertainty && uncertainty < commit);
 }
 
@@ -234,7 +236,7 @@ fn direct_put_bytes_reach_only_the_admitted_provider_token() {
     assert!(issue.contains("put_body: None"));
     assert!(issue.contains(".admit_put("));
     assert!(!issue.contains(".admit_operation("));
-    assert!(issue.contains(".execute_direct_put(&mut ledger, payload)"));
+    assert!(issue.contains(".execute_direct_put(&mut ledger, request.payload)"));
     assert!(!issue.contains("payload.to_vec()"));
     assert!(!issue.contains("FragmentTransportOperation::Head"));
 }
@@ -340,7 +342,7 @@ fn governed_transport_attests_region_and_endpoint_from_the_cloned_sdk_config() {
     assert!(governed.contains("&resolved_endpoint_url"));
 
     let transport = source("src/store/fragment_transport.rs");
-    let constructor = function(&transport, "pub(crate) fn new(");
+    let constructor = function(&transport, "pub(crate) async fn new(");
     assert_resolved_client_attestation(constructor);
 
     let label_self_attestation = constructor

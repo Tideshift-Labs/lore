@@ -3,11 +3,12 @@
 
 //! Deployment-config guards for WP-118 Phase 5's opt-in fragment provider.
 
+use lore_postgres::domain::fragments::FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS;
 use lore_server::plugins::ImmutableStorePluginFactory;
 use lore_server::plugins::postgres::FragmentProviderConfig;
 use lore_server::plugins::postgres::PostgresImmutableStorePluginFactory;
 
-const REQUIRED_ENABLED_FIELDS: [&str; 12] = [
+const REQUIRED_ENABLED_FIELDS: [&str; 13] = [
     "dispatch_postgres_url",
     "dispatch_ca_cert_path",
     "dispatch_pool_max",
@@ -15,6 +16,7 @@ const REQUIRED_ENABLED_FIELDS: [&str; 12] = [
     "dispatch_acquire_timeout_millis",
     "dispatch_statement_timeout_millis",
     "dispatch_lock_timeout_millis",
+    "provider_late_effect_bound_millis",
     "provider_boundary_id",
     "endpoint_host",
     "region",
@@ -31,6 +33,7 @@ url = "postgresql://store.example/cell?sslmode=verify-full"
 bucket = "fragment-bucket"
 endpoint_url = "https://objects.example.com"
 region = "us-test-1"
+timeout_millis = 5000
 
 {fragment_provider}
 "#
@@ -48,6 +51,7 @@ dispatch_connect_timeout_millis = 1000
 dispatch_acquire_timeout_millis = 1000
 dispatch_statement_timeout_millis = 2000
 dispatch_lock_timeout_millis = 3000
+provider_late_effect_bound_millis = 4000
 provider_boundary_id = "cell.primary"
 endpoint_host = "objects.example.com"
 region = "us-test-1"
@@ -167,6 +171,16 @@ fn numeric_identity_target_and_budget_values_fail_closed() {
             "dispatch_lock_timeout_millis",
         ),
         (
+            "provider_late_effect_bound_millis = 4000",
+            "provider_late_effect_bound_millis = 0",
+            "provider_late_effect_bound_millis",
+        ),
+        (
+            "provider_late_effect_bound_millis = 4000",
+            "provider_late_effect_bound_millis = 2147483648",
+            "provider_late_effect_bound_millis",
+        ),
+        (
             "provider_boundary_id = \"cell.primary\"",
             "provider_boundary_id = \"bad boundary\"",
             "provider boundary",
@@ -195,6 +209,69 @@ fn numeric_identity_target_and_budget_values_fail_closed() {
         assert!(
             error.contains(expected),
             "{to} must fail as {expected:?}, got {error}"
+        );
+    }
+
+    for invalid_timeout in [0, i32::MAX as u64 + 1] {
+        let mut config = base_config(&complete);
+        config["object_store"]["timeout_millis"] = toml::Value::Integer(
+            i64::try_from(invalid_timeout).expect("test timeout fits TOML integer"),
+        );
+        let error = validate(&config).expect_err("invalid provider send window must be refused");
+        assert!(
+            error.contains("object_store.timeout_millis"),
+            "invalid send window {invalid_timeout} was misclassified: {error}"
+        );
+    }
+}
+
+#[test]
+fn provider_send_uses_the_five_minute_maximum_while_late_effect_is_independent() {
+    let complete = enabled_block();
+    let mut exact = base_config(&complete.replace(
+        "provider_late_effect_bound_millis = 4000",
+        &format!("provider_late_effect_bound_millis = {FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS}"),
+    ));
+    exact["object_store"]["timeout_millis"] = toml::Value::Integer(
+        i64::try_from(FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS)
+            .expect("shared maximum fits TOML integer"),
+    );
+    validate(&exact).expect("the exact shared five-minute maximum must be accepted");
+
+    let over = FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS + 1;
+    let mut invalid_send = exact.clone();
+    invalid_send["object_store"]["timeout_millis"] =
+        toml::Value::Integer(i64::try_from(over).expect("max+1 fits TOML integer"));
+    let error = validate(&invalid_send).expect_err("send max+1 must be refused");
+    assert!(
+        error.contains("object_store.timeout_millis"),
+        "send-window refusal was misclassified: {error}"
+    );
+
+    let mut independent_late_effect = exact;
+    independent_late_effect["fragment_provider"]["provider_late_effect_bound_millis"] =
+        toml::Value::Integer(i64::try_from(over).expect("max+1 fits TOML integer"));
+    validate(&independent_late_effect)
+        .expect("late-effect horizon is not the governed provider send window");
+}
+
+#[test]
+fn write_authority_revision_is_optional_but_canonical_when_present() {
+    let complete = enabled_block();
+    validate(&base_config(&complete)).expect("optional cutover revision may be absent");
+    validate(&base_config(&format!(
+        "{complete}\nprovider_write_authority_revision = \"write-claims-v1\""
+    )))
+    .expect("canonical authority revision must validate");
+
+    for revision in [String::new(), "bad revision".to_owned(), "x".repeat(65)] {
+        let error = validate(&base_config(&format!(
+            "{complete}\nprovider_write_authority_revision = \"{revision}\""
+        )))
+        .expect_err("noncanonical authority revision must fail");
+        assert!(
+            error.contains("provider_write_authority_revision"),
+            "revision {revision:?} was misclassified: {error}"
         );
     }
 }

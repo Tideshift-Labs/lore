@@ -19,12 +19,9 @@ Each case gets a fresh database in one owned disposable container. Cleanup check
 random run label and the owning PowerShell process before removing the container and
 anonymous volume.
 
-No `lore-server` target is in this inventory. As of this runner, `lore-server` has no wiring
-to the fragment lifecycle coordinator at all (`fragment_coordinator()` is unreferenced outside
-`lore-postgres`) -- that wiring is Phase 5, blocked on WP-114. There is therefore no
-lore-server-side "an unmigrated cell boots on the legacy route" counterpart to pin yet; only
-`domain_fragment_lifecycle.rs`'s `an_absent_fragment_schema_routes_legacy_but_a_partial_one_is_refused`
-exercises that contract, at the `lore-postgres` layer.
+No `lore-server` target is in this inventory. Server activation/configuration has its own
+non-live suites; this runner owns only coordinator and migration behavior requiring a real
+PostgreSQL clock, transaction locks, or catalog inspection.
 #>
 
 [CmdletBinding()]
@@ -58,14 +55,20 @@ $inventory = @(
         Cases         = @(
             'normal_direct_write_uses_legacy_key_and_missing_reoffer_uses_repair_epoch_key',
             'payload_free_coordinated_preflight_distinguishes_exact_readable_from_new_publication',
+            'durable_write_claims_bind_replay_authorize_settle_and_expiry_to_database_state',
+            'write_capability_cutover_is_exact_idempotent_and_database_attested',
+            'claim_inventory_and_prune_preserve_cleanup_targets_and_bound_terminal_deletion',
+            'prune_normalizes_expired_prepared_to_targetless_no_send_and_honors_batch_limit',
+            'write_claim_head_lock_precedes_claim_insert_and_moved_lineage_refuses_send',
+            'write_claim_acl_denies_public_and_retains_owner_access',
             'resolver_returns_the_identical_verdict_whether_asked_singly_or_batched',
             'stale_association_rejection_comes_from_repository_tombstone_not_generation_drift',
             'a_positive_read_requires_both_a_live_association_and_a_readable_current_epoch',
             'a_blocked_io_phase_does_not_hold_the_one_connection_pool',
             'two_independently_constructed_coordinators_race_one_fresh_head_and_exactly_one_wins',
-            'a_replayed_direct_write_reuses_the_witness_and_a_late_commit_mutates_nothing',
+            'a_replayed_direct_write_reuses_exact_claim_and_terminal_attempt_cannot_publish_twice',
             'a_stale_witness_from_a_competing_obliterate_fences_a_late_commit_with_zero_mutation',
-            'a_stale_witness_from_a_competing_repair_fences_a_late_commit_with_zero_mutation',
+            'a_prepared_repair_blocks_a_competitor_and_no_send_attempt_cannot_publish_late',
             'a_readable_to_unreadable_transition_bumps_every_live_associated_repository_atomically',
             'two_concurrent_transitions_over_an_overlapping_fanout_do_not_deadlock',
             'an_absent_fragment_schema_routes_legacy_but_a_partial_one_is_refused',

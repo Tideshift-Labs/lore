@@ -49,6 +49,7 @@ fn assert_final_connector_accounting(source: &str) {
 #[derive(Clone, Debug)]
 struct CountingHttpClient {
     connector_calls: Arc<AtomicU32>,
+    response_body: Option<String>,
 }
 
 impl HttpConnector for CountingHttpClient {
@@ -56,7 +57,10 @@ impl HttpConnector for CountingHttpClient {
         self.connector_calls.fetch_add(1, Ordering::SeqCst);
         HttpConnectorFuture::ready(Ok(HttpResponse::new(
             200.try_into().expect("valid HTTP status"),
-            SdkBody::empty(),
+            self.response_body
+                .clone()
+                .map(SdkBody::from)
+                .unwrap_or_else(SdkBody::empty),
         )))
     }
 }
@@ -83,6 +87,7 @@ async fn retry_disabled_operation_still_counts_its_first_final_connector_transmi
             .behavior_version_latest()
             .http_client(NetHttpClient::new(CountingHttpClient {
                 connector_calls: physical_calls.clone(),
+                response_body: None,
             }))
             .credentials_provider(Credentials::new("test", "test", None, None, "test"))
             .region(Region::new("us-east-1"))
@@ -100,6 +105,58 @@ async fn retry_disabled_operation_still_counts_its_first_final_connector_transmi
     assert!(result.is_ok(), "fake connector returned a successful HEAD");
     assert_eq!(physical_calls.load(Ordering::SeqCst), 1);
     assert_eq!(counter.issued(), 1);
+}
+
+#[tokio::test]
+async fn retry_disabled_get_bucket_versioning_parses_every_closed_status_in_one_transmit() {
+    let cases = [
+        (
+            "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>",
+            None,
+        ),
+        (
+            "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status></VersioningConfiguration>",
+            Some("Enabled"),
+        ),
+        (
+            "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Suspended</Status></VersioningConfiguration>",
+            Some("Suspended"),
+        ),
+        (
+            "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>FutureMode</Status></VersioningConfiguration>",
+            Some("FutureMode"),
+        ),
+    ];
+
+    for (body, expected_status) in cases {
+        let physical_calls = Arc::new(AtomicU32::new(0));
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version_latest()
+                .http_client(NetHttpClient::new(CountingHttpClient {
+                    connector_calls: physical_calls.clone(),
+                    response_body: Some(body.to_owned()),
+                }))
+                .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+                .region(Region::new("us-east-1"))
+                .endpoint_url("http://localhost:9000")
+                .retry_config(RetryConfig::disabled())
+                .force_path_style(true)
+                .build(),
+        );
+        let counter = HttpRequestAttemptCounter::default();
+        let output = counter
+            .count_connector_attempts(client.get_bucket_versioning().bucket("cell").send())
+            .await
+            .expect("fake connector returned a successful versioning response");
+
+        assert_eq!(
+            output.status().map(|status| status.as_str()),
+            expected_status
+        );
+        assert_eq!(physical_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(counter.issued(), 1);
+    }
 }
 
 #[test]

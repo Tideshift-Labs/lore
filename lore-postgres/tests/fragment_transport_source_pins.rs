@@ -64,7 +64,7 @@ fn a_direct_operation_without_authorized_direct_bytes_returns_zero_before_sdk_co
 #[test]
 fn retry_is_resolved_disabled_and_get_throttling_remains_transient() {
     let source = source();
-    let constructor = function(&source, "pub(crate) fn new(");
+    let constructor = function(&source, "pub(crate) async fn new(");
     assert!(constructor.contains("retry.has_retry() || retry.max_attempts() != 1"));
     assert!(constructor.contains("PostgresFragmentTransportConfigError::RetryEnabled"));
 
@@ -77,14 +77,15 @@ fn retry_is_resolved_disabled_and_get_throttling_remains_transient() {
 #[test]
 fn every_sdk_send_is_scoped_by_final_connector_attempt_accounting() {
     let source = source();
-    assert_eq!(source.matches(".send(),").count(), 5);
-    assert_eq!(source.matches(".count_connector_attempts(").count(), 5);
-    for marker in [
-        ".head_object()",
-        ".list_object_versions()",
-        ".delete_object()",
-        ".put_object()",
-        ".get_object()",
+    assert_eq!(source.matches(".send()").count(), 6);
+    assert_eq!(source.matches(".count_connector_attempts(").count(), 6);
+    for (marker, send_marker) in [
+        (".get_bucket_versioning()", ".send())"),
+        (".head_object()", ".send(),"),
+        (".list_object_versions()", ".send(),"),
+        (".delete_object()", ".send(),"),
+        (".put_object()", ".send(),"),
+        (".get_object()", ".send(),"),
     ] {
         let operation = source.find(marker).expect("SDK operation");
         let before = &source[..operation];
@@ -92,11 +93,50 @@ fn every_sdk_send_is_scoped_by_final_connector_attempt_accounting() {
             .rfind(".count_connector_attempts(")
             .expect("attempt scope before SDK operation");
         let send = source[operation..]
-            .find(".send(),")
+            .find(send_marker)
             .map(|offset| operation + offset)
             .expect("SDK send");
         assert!(scope < operation && operation < send);
     }
+}
+
+#[test]
+fn startup_attests_versioning_off_with_one_unmetered_read_and_no_head_or_list_oracle() {
+    let source = source();
+    let constructor = function(&source, "pub(crate) async fn new(");
+    assert!(constructor.contains("attest_unversioned_bucket(client, bucket).await?"));
+    assert!(constructor.contains("client: attestation.client"));
+    assert!(constructor.contains("bucket: attestation.bucket"));
+
+    let probe = function(&source, "async fn attest_unversioned_bucket(");
+    assert_eq!(probe.matches(".get_bucket_versioning()").count(), 1);
+    assert_eq!(probe.matches(".count_connector_attempts(").count(), 1);
+    assert!(probe.contains("if counter.issued() != 1"));
+    assert!(probe.contains("BucketVersioningAttemptCount"));
+    assert!(probe.contains("BucketVersioningProbeFailed"));
+    assert!(probe.contains("None => Ok(UnversionedBucketAttestation { client, bucket })"));
+    assert!(probe.contains("Some(BucketVersioningStatus::Enabled)"));
+    assert!(probe.contains("BucketVersioningEnabled"));
+    assert!(probe.contains("Some(BucketVersioningStatus::Suspended)"));
+    assert!(probe.contains("BucketVersioningSuspended"));
+    assert!(
+        probe.contains(
+            "Some(_) => Err(PostgresFragmentTransportConfigError::BucketVersioningUnknown)"
+        )
+    );
+    for forbidden in [
+        ".head_object()",
+        ".list_object_versions()",
+        "ProviderAttemptLedger",
+        "PostgresProviderChargeAuthority",
+        "BudgetPin",
+    ] {
+        assert!(
+            !probe.contains(forbidden),
+            "versioning probe widened through {forbidden}"
+        );
+    }
+    assert!(!source.contains(".put_bucket_versioning()"));
 }
 
 #[test]

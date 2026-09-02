@@ -30,15 +30,19 @@ use lore_postgres::domain::DatabaseIdentity;
 use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::fragments::BudgetPin;
 use lore_postgres::domain::fragments::CellProviderBoundary;
+use lore_postgres::domain::fragments::FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS;
+use lore_postgres::domain::fragments::FRAGMENT_SCHEMA_VERSION;
 use lore_postgres::domain::fragments::FragmentDatabaseIdentity;
 use lore_postgres::domain::fragments::FragmentDispatchRuntimeConfig;
 use lore_postgres::domain::fragments::FragmentDispatchTls;
 use lore_postgres::domain::fragments::FragmentProcessPoolInventory;
+use lore_postgres::domain::fragments::FragmentWriteCapabilityCutover;
 use lore_postgres::domain::fragments::InFlightPutBound;
 use lore_postgres::domain::fragments::PostgresFragmentCoordinator;
 use lore_postgres::domain::fragments::ProviderCapabilities;
 use lore_postgres::domain::fragments::ValidatedFragmentProcessPoolInventory;
 use lore_postgres::pool::TlsConfig;
+use lore_postgres::store::immutable_store::FragmentProviderRuntimeSettings;
 use lore_postgres::store::immutable_store::ObjectStoreSettings;
 use lore_postgres::store::immutable_store::PostgresImmutableStore;
 use lore_postgres::store::lock_store::PostgresLockStore;
@@ -182,11 +186,13 @@ pub struct FragmentProviderConfig {
     pub dispatch_acquire_timeout_millis: Option<u64>,
     pub dispatch_statement_timeout_millis: Option<u64>,
     pub dispatch_lock_timeout_millis: Option<u64>,
+    pub provider_late_effect_bound_millis: Option<u64>,
     pub provider_boundary_id: Option<String>,
     pub endpoint_host: Option<String>,
     pub region: Option<String>,
     pub budget_revision: Option<String>,
     pub budget_fence: Option<u64>,
+    pub provider_write_authority_revision: Option<String>,
 }
 
 impl fmt::Debug for FragmentProviderConfig {
@@ -220,6 +226,10 @@ impl fmt::Debug for FragmentProviderConfig {
                 &self.dispatch_lock_timeout_millis,
             )
             .field(
+                "provider_late_effect_bound_millis",
+                &self.provider_late_effect_bound_millis,
+            )
+            .field(
                 "provider_boundary_id",
                 &self.provider_boundary_id.as_ref().map(|_| "[REDACTED]"),
             )
@@ -233,6 +243,13 @@ impl fmt::Debug for FragmentProviderConfig {
                 &self.budget_revision.as_ref().map(|_| "[REDACTED]"),
             )
             .field("budget_fence", &self.budget_fence)
+            .field(
+                "provider_write_authority_revision",
+                &self
+                    .provider_write_authority_revision
+                    .as_ref()
+                    .map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -245,8 +262,10 @@ struct EnabledFragmentProviderConfig {
     dispatch_acquire_timeout: Duration,
     dispatch_statement_timeout: Duration,
     dispatch_lock_timeout: Duration,
+    provider_late_effect_bound: Duration,
     boundary: CellProviderBoundary,
     budget_pin: BudgetPin,
+    provider_write_authority_revision: Option<String>,
 }
 
 /// Everything the direct server composition path must supply to activate the
@@ -338,6 +357,20 @@ fn required_timeout(
     }
 }
 
+fn required_provider_send_timeout(name: &str, value: u64) -> Result<Duration, PluginError> {
+    if (1..=FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS).contains(&value) {
+        Ok(Duration::from_millis(value))
+    } else {
+        Err(config_error(
+            name,
+            format!(
+                "enabled fragment_provider requires object_store.timeout_millis between 1 and \
+                 {FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS} milliseconds"
+            ),
+        ))
+    }
+}
+
 fn enabled_fragment_provider_config(
     name: &str,
     cfg: &PostgresStoreConfig,
@@ -397,6 +430,23 @@ fn enabled_fragment_provider_config(
             format!("enabled fragment_provider has an invalid budget pin: {error}"),
         )
     })?;
+    let provider_write_authority_revision = raw
+        .provider_write_authority_revision
+        .as_deref()
+        .map(|revision| {
+            FragmentWriteCapabilityCutover::new(revision)
+                .map(|cutover| cutover.provider_write_authority_revision().to_owned())
+                .map_err(|error| {
+                    config_error(
+                        name,
+                        format!(
+                            "enabled fragment_provider has an invalid provider_write_authority_revision: {error}"
+                        ),
+                    )
+                })
+        })
+        .transpose()?;
+    required_provider_send_timeout(name, object_store.timeout_millis)?;
 
     Ok(Some(EnabledFragmentProviderConfig {
         dispatch_postgres_url,
@@ -422,8 +472,14 @@ fn enabled_fragment_provider_config(
             "dispatch_lock_timeout_millis",
             raw.dispatch_lock_timeout_millis,
         )?,
+        provider_late_effect_bound: required_timeout(
+            name,
+            "provider_late_effect_bound_millis",
+            raw.provider_late_effect_bound_millis,
+        )?,
         boundary,
         budget_pin,
+        provider_write_authority_revision,
     }))
 }
 
@@ -609,6 +665,23 @@ pub(crate) async fn connect_immutable_store(
         })?;
     let Some((fragment_provider, activation, expected_database_identity)) = fragment_activation
     else {
+        let capability = store
+            .fragment_write_capability_readiness()
+            .await
+            .map_err(|error| {
+                PluginError::from(PluginInitError {
+                    plugin_name: plugin_name.to_string(),
+                    message: format!(
+                        "Failed to attest the fragment write capability for the legacy route: {error}"
+                    ),
+                })
+            })?;
+        if capability.write_capability.claims_required() {
+            return Err(config_error(
+                plugin_name,
+                "fragment write capability is claims-required; an absent or disabled fragment_provider cannot start",
+            ));
+        }
         return Ok(store);
     };
     let FragmentProviderActivation {
@@ -645,6 +718,28 @@ pub(crate) async fn connect_immutable_store(
             ),
         ));
     }
+    if readiness.schema_version != FRAGMENT_SCHEMA_VERSION {
+        return Err(config_error(
+            plugin_name,
+            format!(
+                "enabled fragment_provider requires exact SCHEMA-118 revision {FRAGMENT_SCHEMA_VERSION}, found {}",
+                readiness.schema_version
+            ),
+        ));
+    }
+    if let Some(required_revision) = readiness
+        .write_capability
+        .provider_write_authority_revision()
+        && fragment_provider
+            .provider_write_authority_revision
+            .as_deref()
+            != Some(required_revision)
+    {
+        return Err(config_error(
+            plugin_name,
+            "fragment_provider provider_write_authority_revision does not match the claims-required database capability",
+        ));
+    }
 
     // The server configuration never exposes plaintext dispatch mode. The
     // pinned-CA pool also checks that this URL says `sslmode=require`; a URL
@@ -679,8 +774,11 @@ pub(crate) async fn connect_immutable_store(
             fragment_provider.budget_pin,
             dispatch,
             fragment_provider.boundary,
-            ProviderCapabilities::none(),
-            in_flight_puts,
+            FragmentProviderRuntimeSettings::new(
+                ProviderCapabilities::none(),
+                in_flight_puts,
+                fragment_provider.provider_late_effect_bound,
+            ),
         )
         .await
         .map_err(|error| {
@@ -1101,6 +1199,7 @@ pool_max = 1
 bucket = "fragments"
 endpoint_url = "https://objects.example.com"
 region = "us-test-1"
+timeout_millis = 5000
 [fragment_provider]
 enabled = true
 dispatch_postgres_url = "postgresql://dispatcher@db-alias.example/cell?sslmode=require"
@@ -1115,6 +1214,7 @@ endpoint_host = "objects.example.com"
 region = "us-test-1"
 budget_revision = "budget-v1"
 budget_fence = 7
+provider_late_effect_bound_millis = 60000
 "#,
         )
         .expect("immutable config");

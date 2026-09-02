@@ -93,6 +93,9 @@ use crate::domain::fragments::FragmentQueryRequest;
 use crate::domain::fragments::FragmentTransportOperation;
 use crate::domain::fragments::FragmentTransportResponse;
 use crate::domain::fragments::FragmentVerdict;
+use crate::domain::fragments::FragmentWriteCapabilityReadiness;
+use crate::domain::fragments::FragmentWriteClaimInput;
+use crate::domain::fragments::FragmentWriteSettlement;
 use crate::domain::fragments::InFlightPutBound;
 use crate::domain::fragments::IoObservation;
 use crate::domain::fragments::MissingDiagnostic;
@@ -103,6 +106,7 @@ use crate::domain::fragments::ProviderCapabilities;
 use crate::domain::fragments::ProviderTrafficClass;
 use crate::domain::fragments::coordinator::DirectWriteKind;
 use crate::domain::fragments::decodable_encoding;
+use crate::domain::fragments::read_fragment_write_capability;
 
 /// Self-bootstrapping schema. The `(hash, repository, context)` primary key is
 /// the association identity; its B-tree also serves the leftmost-prefix
@@ -159,6 +163,27 @@ pub struct ObjectStoreSettings {
     pub validate_bucket_on_startup: bool,
 }
 
+/// Typed runtime inputs that are specific to the governed fragment route.
+pub struct FragmentProviderRuntimeSettings {
+    capabilities: ProviderCapabilities,
+    in_flight_puts: InFlightPutBound,
+    late_effect_bound: Duration,
+}
+
+impl FragmentProviderRuntimeSettings {
+    pub fn new(
+        capabilities: ProviderCapabilities,
+        in_flight_puts: InFlightPutBound,
+        late_effect_bound: Duration,
+    ) -> Self {
+        Self {
+            capabilities,
+            in_flight_puts,
+            late_effect_bound,
+        }
+    }
+}
+
 /// Closed configuration refusals from the retry-disabled physical S3 adapter.
 ///
 /// These are startup classifications, not provider outcomes. No variant
@@ -181,6 +206,16 @@ pub enum PostgresFragmentTransportConfigError {
     InvalidTargetEndpoint,
     #[error("fragment provider target endpoint does not match resolved S3 client")]
     EndpointMismatch,
+    #[error("fragment provider bucket has versioning enabled")]
+    BucketVersioningEnabled,
+    #[error("fragment provider bucket has versioning suspended")]
+    BucketVersioningSuspended,
+    #[error("fragment provider bucket returned an unknown versioning status")]
+    BucketVersioningUnknown,
+    #[error("fragment provider bucket versioning probe failed")]
+    BucketVersioningProbeFailed,
+    #[error("fragment provider bucket versioning probe did not issue exactly one request")]
+    BucketVersioningAttemptCount,
 }
 
 /// Closed startup failures while attaching the governed fragment route.
@@ -226,6 +261,7 @@ enum FragmentLifecycleRoute {
         coordinator: PostgresFragmentCoordinator,
         provider: Arc<FragmentProviderEntry>,
         budget_pin: BudgetPin,
+        late_effect_bound: Duration,
     },
 }
 
@@ -233,6 +269,15 @@ enum FragmentLifecycleRoute {
 struct CoordinatedProvider<'a> {
     entry: &'a FragmentProviderEntry,
     budget_pin: &'a BudgetPin,
+    late_effect_bound: Duration,
+}
+
+struct CoordinatedDirectPut<'a> {
+    intent: &'a crate::domain::fragments::FragmentIntent,
+    manifest: &'a FragmentManifest,
+    address: Address,
+    fragment: Fragment,
+    payload: &'a Bytes,
 }
 
 /// Mutable lifecycle state. Representation flags and sizes never live here.
@@ -335,13 +380,26 @@ impl PostgresImmutableStore {
         coordinator: PostgresFragmentCoordinator,
         provider: Arc<FragmentProviderEntry>,
         budget_pin: BudgetPin,
+        late_effect_bound: Duration,
     ) -> Self {
         self.fragment_route = FragmentLifecycleRoute::Coordinated {
             coordinator,
             provider,
             budget_pin,
+            late_effect_bound,
         };
         self
+    }
+
+    /// Read the durable cell-wide write capability through this store's
+    /// existing pool. This grants no write authority and constructs no
+    /// provider route.
+    pub async fn fragment_write_capability_readiness(
+        &self,
+    ) -> Result<FragmentWriteCapabilityReadiness, StoreError> {
+        read_fragment_write_capability(&self.pool)
+            .await
+            .map_err(domain_store_err)
     }
 
     /// Build the one governed provider entry around a distinct SDK client, then
@@ -355,8 +413,7 @@ impl PostgresImmutableStore {
         budget_pin: BudgetPin,
         dispatch: FragmentDispatchRuntimeConfig,
         boundary: CellProviderBoundary,
-        capabilities: ProviderCapabilities,
-        in_flight_puts: InFlightPutBound,
+        runtime: FragmentProviderRuntimeSettings,
     ) -> Result<Self, PostgresFragmentProviderActivationError> {
         let target = boundary.target().clone();
         if target.bucket != self.bucket {
@@ -379,16 +436,22 @@ impl PostgresImmutableStore {
             target.region,
             target.endpoint_host,
             &resolved_endpoint_url,
-        )?;
+        )
+        .await?;
         let provider = FragmentProviderEntry::connect(
             dispatch,
             boundary,
-            capabilities,
-            in_flight_puts,
+            runtime.capabilities,
+            runtime.in_flight_puts,
             transport,
         )
         .await?;
-        Ok(self.with_fragment_lifecycle(coordinator, Arc::new(provider), budget_pin))
+        Ok(self.with_fragment_lifecycle(
+            coordinator,
+            Arc::new(provider),
+            budget_pin,
+            runtime.late_effect_bound,
+        ))
     }
 
     fn hash_key(hash: Hash) -> String {
@@ -1124,32 +1187,77 @@ impl PostgresImmutableStore {
         }
     }
 
+    async fn settle_direct_put(
+        coordinator: &PostgresFragmentCoordinator,
+        claim: &crate::domain::fragments::FragmentWriteClaim,
+        settlement: FragmentWriteSettlement,
+    ) -> Result<(), StoreError> {
+        coordinator
+            .settle_write_claim(claim, settlement)
+            .await
+            .map_err(domain_store_err)
+    }
+
     async fn issue_direct_put(
         &self,
+        coordinator: &PostgresFragmentCoordinator,
         provider: CoordinatedProvider<'_>,
-        intent: &crate::domain::fragments::FragmentIntent,
-        manifest: &FragmentManifest,
-        address: Address,
-        fragment: Fragment,
-        payload: &Bytes,
-    ) -> Result<IoObservation, StoreError> {
-        let logical_request_id = uuid::Uuid::now_v7().hyphenated().to_string();
-        let attempt_id = uuid::Uuid::now_v7().hyphenated().to_string();
-        let mut ledger = FragmentAttemptLedger::new(
+        request: CoordinatedDirectPut<'_>,
+    ) -> Result<(IoObservation, FragmentWriteSettlement), StoreError> {
+        let claim = request.intent.write_claim().ok_or_else(|| {
+            StoreError::internal("fragment direct PUT intent has no durable write claim")
+        })?;
+        let body_blake3 = *blake3::hash(request.payload).as_bytes();
+        let binding_matches = claim.hash() == request.address.hash.data()
+            && claim.epoch() == request.intent.epoch
+            && claim.fence() == request.intent.fence
+            && claim.authority() == request.intent.authority
+            && claim.object_key() == request.intent.object_key.as_str()
+            && claim.body_blake3() == &body_blake3
+            && claim.body_size() == request.payload.len() as u64;
+        if !binding_matches {
+            Self::settle_direct_put(coordinator, claim, FragmentWriteSettlement::NoSend).await?;
+            return Err(StoreError::internal(
+                "fragment direct PUT does not match its durable write claim",
+            ));
+        }
+        let logical_request_id = uuid::Uuid::from_bytes(*claim.logical_request_id())
+            .hyphenated()
+            .to_string();
+        let attempt_id = uuid::Uuid::from_bytes(*claim.attempt_id())
+            .hyphenated()
+            .to_string();
+        let ledger = FragmentAttemptLedger::new(
             provider.entry.boundary().provider_boundary_id(),
             &logical_request_id,
-        )
-        .map_err(provider_store_err)?;
-        let traffic_class = match intent.direct_write_kind() {
+        );
+        let mut ledger = match ledger {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                Self::settle_direct_put(coordinator, claim, FragmentWriteSettlement::NoSend)
+                    .await?;
+                return Err(provider_store_err(error));
+            }
+        };
+        let traffic_class = match request.intent.direct_write_kind() {
             Some(DirectWriteKind::Normal) => ProviderTrafficClass::DirectFallback,
             Some(DirectWriteKind::Repair) => ProviderTrafficClass::Repair,
             None => {
+                Self::settle_direct_put(coordinator, claim, FragmentWriteSettlement::NoSend)
+                    .await?;
                 return Err(StoreError::internal(
                     "fragment direct PUT intent has no direct-write lineage",
                 ));
             }
         };
-        let body_blake3 = *blake3::hash(payload).as_bytes();
+        let deadline_unix_ms = match system_time_millis(claim.send_not_after()) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                Self::settle_direct_put(coordinator, claim, FragmentWriteSettlement::NoSend)
+                    .await?;
+                return Err(error);
+            }
+        };
         let admitted = provider
             .entry
             .admit_put(
@@ -1159,33 +1267,77 @@ impl PostgresImmutableStore {
                     logical_request_id,
                     attempt_id,
                     attempt_ordinal: 1,
-                    deadline_unix_ms: self.provider_deadline_unix_ms()?,
+                    deadline_unix_ms,
                     budget_pin: provider.budget_pin.clone(),
                     put_body: None,
                 },
                 FragmentDirectPutOperation {
-                    object_key: intent.object_key.clone(),
-                    metadata: to_object_metadata(&fragment).into_iter().collect(),
-                    declared_size: payload.len() as u64,
+                    object_key: request.intent.object_key.clone(),
+                    metadata: to_object_metadata(&request.fragment).into_iter().collect(),
+                    declared_size: request.payload.len() as u64,
                     declared_blake3: body_blake3,
                 },
             )
-            .await
-            .map_err(provider_store_err)?;
-        let execution = admitted
-            .execute_direct_put(&mut ledger, payload)
-            .await
-            .map_err(provider_store_err)?;
-        match (execution.outcome, execution.response) {
+            .await;
+        let admitted = match admitted {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                Self::settle_direct_put(coordinator, claim, FragmentWriteSettlement::NoSend)
+                    .await?;
+                return Err(provider_store_err(error));
+            }
+        };
+        let authorized = match coordinator.authorize_write_claim(claim).await {
+            Ok(authorized) => authorized,
+            Err(error) => {
+                Self::settle_direct_put(coordinator, claim, FragmentWriteSettlement::NoSend)
+                    .await?;
+                return Err(domain_store_err(error));
+            }
+        };
+        if authorized.send_budget().is_zero() {
+            Self::settle_direct_put(coordinator, claim, FragmentWriteSettlement::NoSend).await?;
+            return Err(StoreError::from(SlowDown));
+        }
+        let execution = tokio::time::timeout(
+            authorized.send_budget(),
+            admitted.execute_direct_put(&mut ledger, request.payload),
+        )
+        .await;
+        let execution = match execution {
+            Ok(Ok(execution)) => execution,
+            Ok(Err(error)) => {
+                let settlement = if ledger.attempt_count() == 0
+                    && ledger.committed_grant_count() == 0
+                    && ledger.ambiguous_count() == 0
+                {
+                    FragmentWriteSettlement::NoSend
+                } else {
+                    FragmentWriteSettlement::Ambiguous
+                };
+                Self::settle_direct_put(coordinator, claim, settlement).await?;
+                return Err(provider_store_err(error));
+            }
+            Err(_) => {
+                Self::settle_direct_put(coordinator, claim, FragmentWriteSettlement::Ambiguous)
+                    .await?;
+                return Err(StoreError::from(SlowDown));
+            }
+        };
+        let settlement = match execution.outcome {
+            ProviderAttemptOutcome::Decisive => FragmentWriteSettlement::Decisive,
+            ProviderAttemptOutcome::Ambiguous => FragmentWriteSettlement::Ambiguous,
+        };
+        let observation = match (execution.outcome, execution.response) {
             (ProviderAttemptOutcome::Decisive, FragmentTransportResponse::PutCreated) => {
-                Ok(IoObservation::Valid(manifest.clone()))
+                Ok(IoObservation::Valid(request.manifest.clone()))
             }
             (
                 ProviderAttemptOutcome::Decisive,
                 FragmentTransportResponse::PutPreconditionFailed,
             )
             | (ProviderAttemptOutcome::Ambiguous, _) => {
-                self.verify_conditional_put(provider.entry, manifest, address)
+                self.verify_conditional_put(provider.entry, request.manifest, request.address)
                     .await
             }
             (ProviderAttemptOutcome::Decisive, FragmentTransportResponse::DefiniteFailure) => {
@@ -1194,6 +1346,13 @@ impl PostgresImmutableStore {
             _ => Err(StoreError::internal(
                 "fragment provider PUT returned an inconsistent response",
             )),
+        };
+        match observation {
+            Ok(observation) => Ok((observation, settlement)),
+            Err(error) => {
+                Self::settle_direct_put(coordinator, claim, settlement).await?;
+                Err(error)
+            }
         }
     }
 
@@ -1238,8 +1397,19 @@ impl PostgresImmutableStore {
                 ))
             })?;
         let legacy_key = Self::hash_key(address.hash);
+        let logical_request_id = uuid::Uuid::now_v7();
+        let attempt_id = uuid::Uuid::now_v7();
+        let write_claim = FragmentWriteClaimInput::new(
+            *logical_request_id.as_bytes(),
+            *attempt_id.as_bytes(),
+            *blake3::hash(&payload).as_bytes(),
+            payload.len() as u64,
+            self.io_timeout,
+            provider.late_effect_bound,
+        )
+        .map_err(domain_store_err)?;
         let begin = coordinator
-            .begin_direct_write(address.hash.data(), &legacy_key)
+            .begin_direct_write(address.hash.data(), &legacy_key, write_claim)
             .await
             .map_err(domain_store_err)?;
         let intent = match begin {
@@ -1260,16 +1430,29 @@ impl PostgresImmutableStore {
                 };
             }
             BeginOutcome::Fenced(_) => return Err(StoreError::from(SlowDown)),
+            BeginOutcome::WriteClaimBlocked { .. } => {
+                return Err(StoreError::from(SlowDown));
+            }
             BeginOutcome::Admitted(intent) => intent,
         };
         let manifest = Self::direct_manifest(&intent, address, fragment, &payload)?;
 
-        let observation = self
-            .issue_direct_put(provider, &intent, &manifest, address, fragment, &payload)
+        let (observation, settlement) = self
+            .issue_direct_put(
+                coordinator,
+                provider,
+                CoordinatedDirectPut {
+                    intent: &intent,
+                    manifest: &manifest,
+                    address,
+                    fragment,
+                    payload: &payload,
+                },
+            )
             .await?;
         let published_readable = matches!(observation, IoObservation::Valid(_));
         match coordinator
-            .commit_remote(&intent, observation)
+            .commit_remote(&intent, observation, settlement)
             .await
             .map_err(domain_store_err)?
         {
@@ -1503,6 +1686,18 @@ fn provider_store_err(error: FragmentProviderError) -> StoreError {
     }
 }
 
+fn system_time_millis(value: SystemTime) -> Result<i64, StoreError> {
+    let millis = value
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|error| {
+            StoreError::internal_with_context(error, "fragment write send deadline before epoch")
+        })?
+        .as_millis();
+    i64::try_from(millis).map_err(|error| {
+        StoreError::internal_with_context(error, "fragment write send deadline exceeds i64")
+    })
+}
+
 fn db_err(e: tokio_postgres::Error) -> StoreError {
     if crate::pool::is_transient_pg(&e) {
         StoreError::from(SlowDown)
@@ -1719,6 +1914,7 @@ impl ImmutableStore for PostgresImmutableStore {
             coordinator,
             provider,
             budget_pin,
+            ..
         } = &self.fragment_route
         {
             return match self
@@ -1836,6 +2032,7 @@ impl ImmutableStore for PostgresImmutableStore {
             coordinator,
             provider,
             budget_pin,
+            late_effect_bound,
         } = &self.fragment_route
         {
             return self
@@ -1844,6 +2041,7 @@ impl ImmutableStore for PostgresImmutableStore {
                     CoordinatedProvider {
                         entry: provider,
                         budget_pin,
+                        late_effect_bound: *late_effect_bound,
                     },
                     repository,
                     address,

@@ -62,6 +62,46 @@ fn disabled_or_absent_config_returns_before_dispatch_composition() {
 }
 
 #[test]
+fn write_claim_capability_cutover_is_attested_on_both_legacy_and_enabled_routes() {
+    let connect = between(
+        POSTGRES_PLUGIN,
+        "pub(crate) async fn connect_immutable_store(",
+        "/// Build the CR-029 domain coordinator",
+    );
+    assert_precedes(
+        connect,
+        "PostgresImmutableStore::connect(",
+        ".fragment_write_capability_readiness()",
+    );
+    assert_precedes(
+        connect,
+        ".fragment_write_capability_readiness()",
+        "fragment write capability is claims-required; an absent or disabled fragment_provider cannot start",
+    );
+    assert!(connect.contains(
+        "if capability.write_capability.claims_required() {\n            return Err(config_error(\n                plugin_name,\n                \"fragment write capability is claims-required; an absent or disabled fragment_provider cannot start\""
+    ));
+    assert!(connect.contains("readiness.schema_version != FRAGMENT_SCHEMA_VERSION"));
+    assert!(connect.contains(".provider_write_authority_revision()"));
+    assert!(connect.contains(
+        "provider_write_authority_revision does not match the claims-required database capability"
+    ));
+    assert!(connect.contains(
+        "!= Some(required_revision)\n    {\n        return Err(config_error(\n            plugin_name,\n            \"fragment_provider provider_write_authority_revision does not match the claims-required database capability\""
+    ));
+    assert_precedes(
+        connect,
+        "provider_write_authority_revision does not match the claims-required database capability",
+        "std::fs::read_to_string",
+    );
+
+    assert!(POSTGRES_PLUGIN.contains("provider_write_authority_revision: Option<String>"));
+    for retired in ["credential_rotation_complete", "allow_optional_claims"] {
+        assert!(!POSTGRES_PLUGIN.contains(retired));
+    }
+}
+
+#[test]
 fn lifecycle_is_composed_and_proven_ready_before_provider_activation() {
     let startup = between(
         SERVER,
