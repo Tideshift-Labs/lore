@@ -1075,6 +1075,14 @@ pub enum FragmentTransportOperation {
         object_key: String,
         version_id: String,
     },
+    /// Delete the exact key from an attested unversioned bucket.
+    ///
+    /// There is deliberately no version identifier: the startup typestate on
+    /// the production transport proves that versioning has never been enabled,
+    /// so one decisive `DeleteObject` success is proof that this key is gone.
+    DeleteExact {
+        object_key: String,
+    },
 }
 
 impl FragmentTransportOperation {
@@ -1082,7 +1090,8 @@ impl FragmentTransportOperation {
         match self {
             Self::Head { object_key }
             | Self::ListVersions { object_key }
-            | Self::DeleteVersion { object_key, .. } => object_key,
+            | Self::DeleteVersion { object_key, .. }
+            | Self::DeleteExact { object_key } => object_key,
         }
     }
 }
@@ -1888,6 +1897,9 @@ impl FragmentProviderGateway {
             ) | (
                 ProviderAttemptClass::DeleteObject,
                 FragmentTransportOperation::DeleteVersion { .. }
+            ) | (
+                ProviderAttemptClass::DeleteObject,
+                FragmentTransportOperation::DeleteExact { .. }
             )
         );
         if !matches || attempt.put_body.is_some() {
@@ -2394,6 +2406,7 @@ mod tests {
         requests_per_call: u32,
         outcome: ProviderAttemptOutcome,
         direct_body: Mutex<Option<Vec<u8>>>,
+        metered_operations: Mutex<Vec<FragmentTransportOperation>>,
     }
 
     struct SharedGetPort(Arc<CountingGetPort>);
@@ -2427,6 +2440,11 @@ mod tests {
             request: FragmentTransportRequest<'a>,
         ) -> Pin<Box<dyn Future<Output = FragmentTransportExchange> + Send + 'a>> {
             self.0.metered_calls.fetch_add(1, Ordering::SeqCst);
+            self.0
+                .metered_operations
+                .lock()
+                .expect("metered operation lock")
+                .push(request.operation().clone());
             let requests_per_call = self.0.requests_per_call;
             let response = match request.operation() {
                 FragmentTransportOperation::Head { .. } => FragmentTransportResponse::Head {
@@ -2437,6 +2455,9 @@ mod tests {
                     FragmentTransportResponse::Versions(Vec::new())
                 }
                 FragmentTransportOperation::DeleteVersion { .. } => {
+                    FragmentTransportResponse::Deleted
+                }
+                FragmentTransportOperation::DeleteExact { .. } => {
                     FragmentTransportResponse::Deleted
                 }
             };
@@ -2533,6 +2554,7 @@ mod tests {
             requests_per_call,
             outcome: ProviderAttemptOutcome::Decisive,
             direct_body: Mutex::new(None),
+            metered_operations: Mutex::new(Vec::new()),
         });
         let gateway = FragmentProviderGateway::with_transport_port(
             CellSchemaAttestation::for_tests(boundary()),
@@ -2838,11 +2860,17 @@ mod tests {
                     version_id: "version-1".to_string(),
                 },
             ),
+            (
+                ProviderAttemptClass::DeleteObject,
+                FragmentTransportOperation::DeleteExact {
+                    object_key: "objects/exact-fragment.bin".to_string(),
+                },
+            ),
         ];
         for (class, operation) in cases {
             let (gateway, authority, port) = port_harness(ChargeScript::Grant, 1, bound());
             let admitted = gateway
-                .admit_operation(attempt(class), operation)
+                .admit_operation(attempt(class), operation.clone())
                 .await
                 .expect("metered non-GET admission");
             admitted
@@ -2852,6 +2880,14 @@ mod tests {
             assert_eq!(authority.calls.load(Ordering::SeqCst), 1, "{class:?}");
             assert_eq!(port.metered_calls.load(Ordering::SeqCst), 1, "{class:?}");
             assert_eq!(port.get_calls.load(Ordering::SeqCst), 0, "{class:?}");
+            assert_eq!(
+                port.metered_operations
+                    .lock()
+                    .expect("metered operation lock")
+                    .as_slice(),
+                std::slice::from_ref(&operation),
+                "the gateway must preserve the exact operation and key"
+            );
         }
 
         let (gateway, authority, port) = get_harness(1);

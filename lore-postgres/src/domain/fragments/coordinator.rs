@@ -97,6 +97,13 @@ pub const MAX_LIFECYCLE_GENERATION_FANOUT: usize = MAX_PUSH_FRAGMENT_REVALIDATIO
 
 const DIRECT_WRITE_NORMAL_OPERATION: [u8; 16] = *b"wp118-direct-v1N";
 const DIRECT_WRITE_REPAIR_OPERATION: [u8; 16] = *b"wp118-direct-v1R";
+const OBLITERATE_OPERATION_PREFIX: [u8; 12] = *b"wp118-del-v1";
+const OBLITERATE_ORIGIN_PREPARING_STAGE: u8 = 1;
+const OBLITERATE_ORIGIN_PREPARING_REMOTE_NORMAL: u8 = 2;
+const OBLITERATE_ORIGIN_PREPARING_REMOTE_REPAIR: u8 = 3;
+const OBLITERATE_ORIGIN_STAGED: u8 = 4;
+const OBLITERATE_ORIGIN_REMOTE: u8 = 5;
+const OBLITERATE_ORIGIN_MISSING: u8 = 6;
 
 /// Maximum body size one durable direct-write claim accepts.
 pub const MAX_FRAGMENT_WRITE_CLAIM_BODY_BYTES: u64 = 256 * 1024;
@@ -777,6 +784,174 @@ struct FragmentWriteClaimInventory {
     cleanup_targets: Vec<FragmentWriteCleanupTarget>,
 }
 
+/// Exact association which owns one durable coordinated obliteration.
+///
+/// The association row is tombstoned at begin and its `association_epoch` is
+/// replaced by this globally unique fence. That makes the exact
+/// `(hash, repository, context)` tuple the only caller that can resume the
+/// deletion sequence after a crash; another tombstoned association cannot
+/// steal it merely because it names the same globally deduplicated hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentObliterateOwnership {
+    hash: Vec<u8>,
+    repository_id: Vec<u8>,
+    context: Vec<u8>,
+    fence: i64,
+}
+
+impl FragmentObliterateOwnership {
+    pub fn hash(&self) -> &[u8] {
+        &self.hash
+    }
+
+    pub fn repository_id(&self) -> &[u8] {
+        &self.repository_id
+    }
+
+    pub fn context(&self) -> &[u8] {
+        &self.context
+    }
+
+    pub fn fence(&self) -> i64 {
+        self.fence
+    }
+}
+
+/// One exact physical representation which must be proved gone before the
+/// lifecycle head can become `Tombstoned`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FragmentPurgeTarget {
+    hash: Vec<u8>,
+    epoch: i64,
+    authority: EpochAuthority,
+    object_key: String,
+    provider_body_blake3: Option<[u8; 32]>,
+    provider_body_size: Option<u64>,
+    provider_claim_fence: Option<i64>,
+}
+
+impl FragmentPurgeTarget {
+    pub fn hash(&self) -> &[u8] {
+        &self.hash
+    }
+
+    pub fn epoch(&self) -> i64 {
+        self.epoch
+    }
+
+    pub fn authority(&self) -> EpochAuthority {
+        self.authority
+    }
+
+    pub fn object_key(&self) -> &str {
+        &self.object_key
+    }
+
+    pub fn provider_body_blake3(&self) -> Option<&[u8; 32]> {
+        self.provider_body_blake3.as_ref()
+    }
+
+    pub fn provider_body_size(&self) -> Option<u64> {
+        self.provider_body_size
+    }
+
+    pub fn provider_claim_fence(&self) -> Option<i64> {
+        self.provider_claim_fence
+    }
+}
+
+/// Current-epoch representation retained for exact child discovery while the
+/// head is already unreadable in `DeletingChildren`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentObliterateRepresentation {
+    target: FragmentPurgeTarget,
+    manifest: Option<FragmentManifest>,
+}
+
+impl FragmentObliterateRepresentation {
+    pub fn target(&self) -> &FragmentPurgeTarget {
+        &self.target
+    }
+
+    pub fn manifest(&self) -> Option<&FragmentManifest> {
+        self.manifest.as_ref()
+    }
+}
+
+/// Durable phase represented by a coordinated obliteration intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragmentObliteratePhase {
+    Children,
+    Payload,
+}
+
+/// Owned deletion intent. It borrows no database resource and can therefore
+/// cross waits, recursive child work, and provider/file I/O safely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentObliterateIntent {
+    ownership: FragmentObliterateOwnership,
+    phase: FragmentObliteratePhase,
+    current_epoch: i64,
+    origin: u8,
+    current: Option<FragmentObliterateRepresentation>,
+    purge_targets: Vec<FragmentPurgeTarget>,
+    purge_evidence_epochs: Vec<i64>,
+    metering_present: bool,
+    blocked_until: Option<SystemTime>,
+    provider_write_authority_revision: String,
+}
+
+impl FragmentObliterateIntent {
+    pub fn ownership(&self) -> &FragmentObliterateOwnership {
+        &self.ownership
+    }
+
+    pub fn phase(&self) -> FragmentObliteratePhase {
+        self.phase
+    }
+
+    pub fn current_epoch(&self) -> i64 {
+        self.current_epoch
+    }
+
+    pub fn current(&self) -> Option<&FragmentObliterateRepresentation> {
+        self.current.as_ref()
+    }
+
+    pub fn purge_targets(&self) -> &[FragmentPurgeTarget] {
+        &self.purge_targets
+    }
+
+    pub fn provider_write_authority_revision(&self) -> &str {
+        &self.provider_write_authority_revision
+    }
+}
+
+/// Result of exact-association coordinated obliterate admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentObliterateBegin {
+    NoOp,
+    AssociationOnly,
+    Blocked {
+        intent: Box<FragmentObliterateIntent>,
+        blocked_until: SystemTime,
+    },
+    Ready(Box<FragmentObliterateIntent>),
+}
+
+/// Exact proof minted inside `lore-postgres` only after a staged collaborator
+/// or the governed unversioned transport completed one target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentPurgeProof {
+    target: FragmentPurgeTarget,
+}
+
+impl FragmentPurgeProof {
+    pub(crate) fn new(target: FragmentPurgeTarget) -> Self {
+        Self { target }
+    }
+}
+
 /// Outcome of a `begin_*` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeginOutcome {
@@ -1418,6 +1593,196 @@ impl PostgresFragmentCoordinator {
             payload_bytes: read("payload_bytes")?,
             content_bytes: read("content_bytes")?,
         })
+    }
+
+    /// Rebuild the repairable metering projection from lifecycle authority.
+    ///
+    /// This maintenance transaction takes table locks in the same broad order
+    /// as fragment writers take row classes: lifecycle heads, immutable epoch
+    /// evidence, associations, then the projection. The first lock is
+    /// `EXCLUSIVE`, not `SHARE`: it must conflict with the table-level `ROW
+    /// SHARE` acquired by every lifecycle-head `SELECT FOR UPDATE`/`FOR SHARE`,
+    /// including a lookup that finds no row. That waits out every writer before
+    /// the epoch lock and prevents a writer from crossing the snapshot while
+    /// the remaining locks are acquired. Ordinary `ACCESS SHARE` readers stay
+    /// available. No provider or file I/O occurs in this coordinator.
+    ///
+    /// The returned count is the exact number of authoritative projection
+    /// rows installed. A `Missing` or deleting head retains its current epoch's
+    /// metering evidence until physical purge commits. `Tombstoned` heads and
+    /// `PURGED` epochs cannot enter the canonical projection.
+    pub async fn rebuild_metering_projection(&self) -> Result<u64, DomainError> {
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| DomainError::from_pg("fragment metering rebuild begin", error))?;
+        tx.batch_execute(
+            "LOCK TABLE lore_fragment_lifecycle IN EXCLUSIVE MODE; \
+             LOCK TABLE lore_fragment_epochs IN SHARE MODE; \
+             LOCK TABLE lore_fragment_associations IN SHARE MODE; \
+             LOCK TABLE lore_fragment_lifecycle_metering IN SHARE ROW EXCLUSIVE MODE;",
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("fragment metering rebuild locks", error))?;
+
+        // Materialise the authority predicate once. Every later statement
+        // consumes this exact relation, so upsert and stale-row deletion cannot
+        // drift onto subtly different lifecycle eligibility rules.
+        tx.execute(
+            "CREATE TEMPORARY TABLE lore_fragment_metering_rebuild ON COMMIT DROP AS \
+             SELECT l.hash, l.current_epoch AS epoch, e.payload_flags, \
+                    e.size_payload, e.size_content, e.authority \
+               FROM lore_fragment_lifecycle AS l \
+               JOIN lore_fragment_epochs AS e \
+                 ON e.hash = l.hash AND e.epoch = l.current_epoch \
+              WHERE e.disposition = $1 \
+                AND ( \
+                    (l.state = ANY($2) AND l.manifest_id = e.manifest_id) \
+                    OR l.state = ANY($3) \
+                )",
+            &[
+                &schema::DISPOSITION_CURRENT_ELIGIBLE,
+                &FragmentLifecycleState::readable_bits().as_slice(),
+                &[
+                    FragmentLifecycleState::Missing.bits(),
+                    FragmentLifecycleState::DeletingChildren.bits(),
+                    FragmentLifecycleState::DeletingPayload.bits(),
+                ]
+                .as_slice(),
+            ],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("fragment metering rebuild projection", error))?;
+
+        let authoritative = tx
+            .query_one(
+                "SELECT count(*)::bigint AS count FROM lore_fragment_metering_rebuild",
+                &[],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("fragment metering rebuild count", error))?
+            .try_get::<_, i64>("count")
+            .map_err(|error| {
+                DomainError::Internal(format!(
+                    "fragment metering rebuild count column is invalid: {error}"
+                ))
+            })?;
+        let authoritative = u64::try_from(authoritative).map_err(|_| {
+            DomainError::Internal("fragment metering rebuild count is negative".to_owned())
+        })?;
+
+        let upserted = tx
+            .execute(
+                "INSERT INTO lore_fragment_lifecycle_metering ( \
+                     hash, epoch, payload_flags, size_payload, size_content, authority \
+                 ) \
+                 SELECT hash, epoch, payload_flags, size_payload, size_content, authority \
+                   FROM lore_fragment_metering_rebuild \
+                  ORDER BY hash \
+                 ON CONFLICT (hash) DO UPDATE \
+                    SET epoch = EXCLUDED.epoch, \
+                        payload_flags = EXCLUDED.payload_flags, \
+                        size_payload = EXCLUDED.size_payload, \
+                        size_content = EXCLUDED.size_content, \
+                        authority = EXCLUDED.authority, \
+                        verified_at = clock_timestamp()",
+                &[],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("fragment metering rebuild upsert", error))?;
+        if upserted != authoritative {
+            return Err(DomainError::Internal(format!(
+                "fragment metering rebuild upserted {upserted} rows for {authoritative} authoritative rows"
+            )));
+        }
+
+        let stale = tx
+            .query_one(
+                "SELECT count(*)::bigint AS count \
+                   FROM lore_fragment_lifecycle_metering AS m \
+                  WHERE NOT EXISTS ( \
+                        SELECT 1 FROM lore_fragment_metering_rebuild AS r WHERE r.hash = m.hash \
+                  )",
+                &[],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("fragment metering rebuild stale count", error))?
+            .try_get::<_, i64>("count")
+            .map_err(|error| {
+                DomainError::Internal(format!(
+                    "fragment metering rebuild stale count column is invalid: {error}"
+                ))
+            })?;
+        let stale = u64::try_from(stale).map_err(|_| {
+            DomainError::Internal("fragment metering rebuild stale count is negative".to_owned())
+        })?;
+        let removed = tx
+            .execute(
+                "DELETE FROM lore_fragment_lifecycle_metering AS m \
+                  WHERE NOT EXISTS ( \
+                        SELECT 1 FROM lore_fragment_metering_rebuild AS r WHERE r.hash = m.hash \
+                  )",
+                &[],
+            )
+            .await
+            .map_err(|error| {
+                DomainError::from_pg("fragment metering rebuild stale delete", error)
+            })?;
+        if removed != stale {
+            return Err(DomainError::Internal(format!(
+                "fragment metering rebuild removed {removed} rows for {stale} stale rows"
+            )));
+        }
+
+        let final_count = tx
+            .query_one(
+                "SELECT count(*)::bigint AS count FROM lore_fragment_lifecycle_metering",
+                &[],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("fragment metering rebuild final count", error))?
+            .try_get::<_, i64>("count")
+            .map_err(|error| {
+                DomainError::Internal(format!(
+                    "fragment metering rebuild final count column is invalid: {error}"
+                ))
+            })?;
+        let final_count = u64::try_from(final_count).map_err(|_| {
+            DomainError::Internal("fragment metering rebuild final count is negative".to_owned())
+        })?;
+        if final_count != authoritative {
+            return Err(DomainError::Internal(format!(
+                "fragment metering rebuild retained {final_count} rows for {authoritative} authoritative rows"
+            )));
+        }
+
+        let mismatch = tx
+            .query_opt(
+                "SELECT 1 \
+                   FROM lore_fragment_lifecycle_metering AS m \
+                   FULL JOIN lore_fragment_metering_rebuild AS r USING (hash) \
+                  WHERE m.hash IS NULL OR r.hash IS NULL \
+                     OR m.epoch IS DISTINCT FROM r.epoch \
+                     OR m.payload_flags IS DISTINCT FROM r.payload_flags \
+                     OR m.size_payload IS DISTINCT FROM r.size_payload \
+                     OR m.size_content IS DISTINCT FROM r.size_content \
+                     OR m.authority IS DISTINCT FROM r.authority \
+                  LIMIT 1",
+                &[],
+            )
+            .await
+            .map_err(|error| {
+                DomainError::from_pg("fragment metering rebuild verification", error)
+            })?;
+        if mismatch.is_some() {
+            return Err(DomainError::Internal(
+                "fragment metering rebuild verification found a projection mismatch".to_owned(),
+            ));
+        }
+
+        classify_commit(tx.commit().await, "fragment metering rebuild commit")?;
+        Ok(authoritative)
     }
 
     async fn resolve_scoped(
@@ -2274,174 +2639,428 @@ impl PostgresFragmentCoordinator {
         Ok(CommitVerdict::Published)
     }
 
-    /// Move a head into the deletion sequence and remove its live associations,
-    /// then release everything so the physical purge can run outside Postgres.
+    /// Atomically retire exactly one association and, only for the last live
+    /// association, publish durable ownership of the coordinated deletion.
     ///
-    /// `obliterate` stays the physical takedown primitive. This is the first
-    /// half; [`Self::commit_obliterate`] publishes `Tombstoned` only after the
-    /// caller proves the version-aware purge completed.
-    pub async fn begin_obliterate(&self, hash: &[u8]) -> Result<BeginOutcome, DomainError> {
+    /// The returned value owns every field needed after this transaction. No
+    /// connection, transaction, or lock crosses a wait, recursive child call,
+    /// staged cleanup, or provider request.
+    pub async fn begin_obliterate(
+        &self,
+        hash: &[u8],
+        repository_id: &[u8],
+        context: &[u8],
+        provider_write_authority_revision: &str,
+    ) -> Result<FragmentObliterateBegin, DomainError> {
+        if !valid_write_authority_revision(provider_write_authority_revision) {
+            return Err(DomainError::InvalidInput(
+                "coordinated obliterate requires a valid provider write-authority revision"
+                    .to_owned(),
+            ));
+        }
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
             .await
-            .map_err(|error| DomainError::from_pg("obliterate begin", error))?;
+            .map_err(|error| DomainError::from_pg("coordinated obliterate begin", error))?;
         let mut sequence = LockSequence::new();
-        // Obliterate makes a readable head unreadable and removes every live
-        // association, so both the repository fanout and the association rows
-        // are in play. Repository rows come first (position 1).
-        let fanout = plan_lifecycle_fanout(&tx, hash).await?;
+
+        // Plan the complete live fanout before taking any row, then add the
+        // requesting repository so an absent/foreign request serializes with a
+        // concurrent bind of that exact association. Repository order remains
+        // the first F-032-3 class and is globally sorted.
+        let mut fanout = plan_lifecycle_fanout(&tx, hash).await?;
+        if !fanout.iter().any(|id| id.as_slice() == repository_id) {
+            if fanout.len() == MAX_LIFECYCLE_GENERATION_FANOUT {
+                return Err(DomainError::PreconditionRejected {
+                    reason: "lifecycle_generation_fanout_limit".to_owned(),
+                    reason_version: 1,
+                });
+            }
+            fanout.push(repository_id.to_vec());
+            fanout.sort_unstable();
+        }
         lock_lifecycle_fanout(&tx, &mut sequence, &fanout).await?;
         let Some(head) = lock_fragment_head(&tx, &mut sequence, hash).await? else {
-            return Err(DomainError::PreconditionRejected {
-                reason: "fragment_head_absent".to_owned(),
-                reason_version: 1,
-            });
+            classify_commit(tx.commit().await, "absent coordinated obliterate commit")?;
+            return Ok(FragmentObliterateBegin::NoOp);
         };
+        let confirmed = confirm_lifecycle_fanout(&tx, hash, &fanout).await?;
+
+        let association = tx
+            .query_opt(
+                "SELECT association_epoch, state FROM lore_fragment_associations \
+                  WHERE hash = $1 AND repository_id = $2 AND context = $3",
+                &[&hash, &repository_id, &context],
+            )
+            .await
+            .map_err(|error| {
+                DomainError::from_pg("coordinated obliterate association lock", error)
+            })?;
+
+        if head.state.is_deleting() {
+            let Some(row) = association else {
+                classify_commit(tx.commit().await, "foreign obliterate retry commit")?;
+                return Ok(FragmentObliterateBegin::NoOp);
+            };
+            let owns = row.get::<_, i16>("state") == schema::ASSOCIATION_TOMBSTONED
+                && row.get::<_, i64>("association_epoch") == head.last_fence;
+            if !owns {
+                classify_commit(tx.commit().await, "foreign obliterate retry commit")?;
+                return Ok(FragmentObliterateBegin::NoOp);
+            }
+            require_claims_write_capability(&tx, provider_write_authority_revision).await?;
+            let intent = capture_obliterate_intent_locked(
+                &tx,
+                &mut sequence,
+                hash,
+                repository_id,
+                context,
+                &head,
+                provider_write_authority_revision,
+            )
+            .await?;
+            let blocked_until = obliterate_blocked_until_locked(&tx, &intent).await?;
+            classify_commit(tx.commit().await, "coordinated obliterate retry commit")?;
+            return Ok(match blocked_until {
+                Some(blocked_until) => FragmentObliterateBegin::Blocked {
+                    intent: Box::new(intent),
+                    blocked_until,
+                },
+                None => FragmentObliterateBegin::Ready(Box::new(intent)),
+            });
+        }
         if head.state == FragmentLifecycleState::Tombstoned {
-            return Ok(BeginOutcome::Fenced(
-                "the fragment is already tombstoned".to_owned(),
+            classify_commit(tx.commit().await, "tombstoned obliterate replay commit")?;
+            return Ok(FragmentObliterateBegin::NoOp);
+        }
+
+        let Some(association) = association else {
+            classify_commit(tx.commit().await, "absent association obliterate commit")?;
+            return Ok(FragmentObliterateBegin::NoOp);
+        };
+        if association.get::<_, i16>("state") != schema::ASSOCIATION_LIVE {
+            classify_commit(tx.commit().await, "tombstoned foreign obliterate commit")?;
+            return Ok(FragmentObliterateBegin::NoOp);
+        }
+        let live_association_count: i64 = tx
+            .query_one(
+                "SELECT count(*)::bigint FROM lore_fragment_associations \
+                  WHERE hash = $1 AND state = $2",
+                &[&hash, &schema::ASSOCIATION_LIVE],
+            )
+            .await
+            .map_err(|error| {
+                DomainError::from_pg("coordinated obliterate live association count", error)
+            })?
+            .get(0);
+        if live_association_count > 1 {
+            sequence.enter(LockClass::Associations)?;
+            let association_fence = next_fence(&tx).await?;
+            let updated = tx
+                .execute(
+                    "UPDATE lore_fragment_associations \
+                        SET state = $4, association_epoch = $5, updated_at = clock_timestamp() \
+                      WHERE hash = $1 AND repository_id = $2 AND context = $3 AND state = $6",
+                    &[
+                        &hash,
+                        &repository_id,
+                        &context,
+                        &schema::ASSOCIATION_TOMBSTONED,
+                        &association_fence,
+                        &schema::ASSOCIATION_LIVE,
+                    ],
+                )
+                .await
+                .map_err(|error| DomainError::from_pg("association-only obliterate", error))?;
+            if updated != 1 {
+                return Err(DomainError::Contention(
+                    "the exact fragment association moved while it was locked".to_owned(),
+                ));
+            }
+            bump_association_generation(&tx, repository_id).await?;
+            classify_commit(tx.commit().await, "association-only obliterate commit")?;
+            return Ok(FragmentObliterateBegin::AssociationOnly);
+        }
+        if live_association_count != 1 {
+            return Err(DomainError::Internal(
+                "a locked live association was absent from the live-association count".to_owned(),
             ));
         }
-        let object_key = current_epoch_key(&tx, hash, head.current_epoch)
-            .await?
-            .unwrap_or_else(|| legacy_hash_key(hash));
-        let fence = next_fence(&tx).await?;
-        let was_readable = head.state.is_readable();
-        tx.execute(
-            "UPDATE lore_fragment_lifecycle \
-                SET state = $2, manifest_id = NULL, last_fence = $3, \
-                    active_operation = NULL, diagnostic_class = 0, \
-                    updated_at = clock_timestamp() \
-              WHERE hash = $1",
-            &[
-                &hash,
-                &FragmentLifecycleState::DeletingPayload.bits(),
-                &fence,
-            ],
+
+        require_claims_write_capability(&tx, provider_write_authority_revision).await?;
+        let origin = obliterate_origin_from_head(&head)?;
+        let deletion_fence = next_fence(&tx).await?;
+        let active_operation = encode_obliterate_operation(origin);
+        let deleting_head = FragmentHeadLock {
+            current_epoch: head.current_epoch,
+            state: FragmentLifecycleState::DeletingChildren,
+            manifest_id: None,
+            last_fence: deletion_fence,
+            active_operation: Some(active_operation.to_vec()),
+        };
+        let intent = capture_obliterate_intent_locked(
+            &tx,
+            &mut sequence,
+            hash,
+            repository_id,
+            context,
+            &deleting_head,
+            provider_write_authority_revision,
         )
-        .await
-        .map_err(|error| DomainError::from_pg("obliterate state update", error))?;
-        // Confirmed BEFORE the readability branch and used for everything below.
-        //
-        // This is INV-EF P1-1. The bump used to run over the plan-time list while
-        // the tombstone ran by predicate over the current set, and the only
-        // growth check sat inside `apply_lifecycle_generation` — which obliterate
-        // calls only when the head was readable. On a non-readable head
-        // (`Missing`, `Preparing*`, `Deleting*` are all accepted here; only
-        // `Tombstoned` is refused above) an association created between the plan
-        // read and the head lock was retired by a transaction that had never
-        // locked its repository row and moved no scalar attributable to the
-        // removal.
-        let confirmed = confirm_lifecycle_fanout(&tx, hash, &fanout).await?;
-        if was_readable {
+        .await?;
+        let blocked_until = obliterate_blocked_until_locked(&tx, &intent).await?;
+        sequence.enter(LockClass::Associations)?;
+        let updated_association = tx
+            .execute(
+                "UPDATE lore_fragment_associations \
+                    SET state = $4, association_epoch = $5, updated_at = clock_timestamp() \
+                  WHERE hash = $1 AND repository_id = $2 AND context = $3 AND state = $6",
+                &[
+                    &hash,
+                    &repository_id,
+                    &context,
+                    &schema::ASSOCIATION_TOMBSTONED,
+                    &deletion_fence,
+                    &schema::ASSOCIATION_LIVE,
+                ],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("owned obliterate association", error))?;
+        if updated_association != 1 {
+            return Err(DomainError::Contention(
+                "the exact fragment association moved while it was locked".to_owned(),
+            ));
+        }
+        let updated_head = tx
+            .execute(
+                "UPDATE lore_fragment_lifecycle \
+                    SET state = $2, manifest_id = NULL, last_fence = $3, \
+                        active_operation = $4, diagnostic_class = 0, \
+                        updated_at = clock_timestamp() \
+                  WHERE hash = $1 AND current_epoch = $5 AND state = $6 AND last_fence = $7",
+                &[
+                    &hash,
+                    &FragmentLifecycleState::DeletingChildren.bits(),
+                    &deletion_fence,
+                    &active_operation.as_slice(),
+                    &head.current_epoch,
+                    &head.state.bits(),
+                    &head.last_fence,
+                ],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("owned obliterate head transition", error))?;
+        if updated_head != 1 {
+            return Err(DomainError::Contention(
+                "the fragment head moved while it was locked".to_owned(),
+            ));
+        }
+        bump_association_generation(&tx, repository_id).await?;
+        if head.state.is_readable() {
             apply_lifecycle_generation(&tx, &confirmed).await?;
         }
-        // Retiring associations moves the association scalar too, for every
-        // repository that loses one. Obliterate previously moved only the
-        // lifecycle scalar, so a push whose preflight predated an obliterate of
-        // content it referenced could see an unchanged association generation
-        // and take the fast path. The rows are already locked by the fanout.
-        bump_association_generation_many(&tx, &confirmed).await?;
-        sequence.enter(LockClass::Associations)?;
-        // Scoped to the confirmed repository set rather than every live
-        // association on the hash, so the rows this statement retires are
-        // exactly the rows whose scalars moved above. A bare
-        // `WHERE hash = $1 AND state = LIVE` predicate would silently widen to
-        // anything that appeared in the planning window.
-        tx.execute(
-            "UPDATE lore_fragment_associations \
-                SET state = $2, updated_at = clock_timestamp() \
-              WHERE hash = $1 AND state = $3 AND repository_id = ANY($4)",
-            &[
-                &hash,
-                &schema::ASSOCIATION_TOMBSTONED,
-                &schema::ASSOCIATION_LIVE,
-                &confirmed,
-            ],
-        )
-        .await
-        .map_err(|error| DomainError::from_pg("obliterate association removal", error))?;
-        classify_commit(tx.commit().await, "obliterate begin commit")?;
-        Ok(BeginOutcome::Admitted(Box::new(FragmentIntent {
-            hash: hash.to_vec(),
-            epoch: head.current_epoch,
-            fence,
-            object_key,
-            authority: EpochAuthority::Remote,
-            direct_write_kind: None,
-            write_claim: None,
-            captured: Some(EpochWitness {
-                hash: hash.to_vec(),
-                epoch: head.current_epoch,
-                state: FragmentLifecycleState::DeletingPayload,
-                manifest_id: None,
-                fence,
-            }),
-        })))
+        classify_commit(tx.commit().await, "owned obliterate begin commit")?;
+        Ok(match blocked_until {
+            Some(blocked_until) => FragmentObliterateBegin::Blocked {
+                intent: Box::new(intent),
+                blocked_until,
+            },
+            None => FragmentObliterateBegin::Ready(Box::new(intent)),
+        })
     }
 
-    /// Publish `Tombstoned`, and only after the caller has proved every
-    /// provider version of the exact current-epoch object key is gone.
-    ///
-    /// The epoch row's disposition becomes `PURGED` in the same transaction, so
-    /// a later GC package can tell "proved gone" from "not yet visited" without
-    /// re-deriving it.
-    pub async fn commit_obliterate(
+    /// Revalidate child-work ownership and advance to physical payload purge.
+    pub async fn commit_obliterate_children(
         &self,
-        intent: &FragmentIntent,
+        intent: &FragmentObliterateIntent,
     ) -> Result<CommitVerdict, DomainError> {
-        let Some(captured) = intent.captured.as_ref() else {
-            return Err(DomainError::Internal(
-                "obliterate commit needs the witness captured at begin".to_owned(),
+        if intent.phase != FragmentObliteratePhase::Children {
+            return Err(DomainError::InvalidInput(
+                "obliterate children commit requires a children-phase intent".to_owned(),
             ));
-        };
+        }
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
             .await
-            .map_err(|error| DomainError::from_pg("obliterate commit begin", error))?;
+            .map_err(|error| DomainError::from_pg("obliterate children commit begin", error))?;
         let mut sequence = LockSequence::new();
-        let Some(head) = lock_fragment_head(&tx, &mut sequence, &intent.hash).await? else {
-            return Ok(CommitVerdict::Fenced);
-        };
-        if !head.matches(captured) {
+        if crate::domain::lock_order::lock_repository(
+            &tx,
+            &mut sequence,
+            &intent.ownership.repository_id,
+        )
+        .await?
+        .is_none()
+        {
             return Ok(CommitVerdict::Fenced);
         }
-        let fence = next_fence(&tx).await?;
-        // `diagnostic_class` is zeroed here as well as at begin. The schema's
-        // `lore_fragment_lifecycle_diagnostic_shape` CHECK allows a nonzero
-        // class only on a `Missing` head, so relying on begin having zeroed it
-        // would make this statement take a 23514 on any path that reaches
-        // tombstone from a diagnosed head.
-        tx.execute(
-            "UPDATE lore_fragment_lifecycle \
-                SET state = $2, manifest_id = NULL, last_fence = $3, \
-                    active_operation = NULL, diagnostic_class = 0, \
-                    updated_at = clock_timestamp() \
-              WHERE hash = $1",
-            &[
-                &intent.hash,
-                &FragmentLifecycleState::Tombstoned.bits(),
-                &fence,
-            ],
+        let Some(head) = lock_fragment_head(&tx, &mut sequence, &intent.ownership.hash).await?
+        else {
+            return Ok(CommitVerdict::Fenced);
+        };
+        if head.state != FragmentLifecycleState::DeletingChildren
+            || !owned_obliterate_association_locked(&tx, &intent.ownership).await?
+        {
+            return Ok(CommitVerdict::Fenced);
+        }
+        require_claims_write_capability(&tx, &intent.provider_write_authority_revision).await?;
+        let current = capture_obliterate_intent_locked(
+            &tx,
+            &mut sequence,
+            &intent.ownership.hash,
+            &intent.ownership.repository_id,
+            &intent.ownership.context,
+            &head,
+            &intent.provider_write_authority_revision,
         )
-        .await
-        .map_err(|error| DomainError::from_pg("obliterate tombstone update", error))?;
-        tx.execute(
-            "UPDATE lore_fragment_epochs SET disposition = $3 \
-              WHERE hash = $1 AND epoch = $2",
-            &[&intent.hash, &intent.epoch, &schema::DISPOSITION_PURGED],
+        .await?;
+        if current != *intent
+            || obliterate_blocked_until_locked(&tx, &current)
+                .await?
+                .is_some()
+        {
+            return Ok(CommitVerdict::Fenced);
+        }
+        let updated = tx
+            .execute(
+                "UPDATE lore_fragment_lifecycle SET state = $2, updated_at = clock_timestamp() \
+                  WHERE hash = $1 AND state = $3 AND last_fence = $4 \
+                    AND active_operation = $5",
+                &[
+                    &intent.ownership.hash,
+                    &FragmentLifecycleState::DeletingPayload.bits(),
+                    &FragmentLifecycleState::DeletingChildren.bits(),
+                    &intent.ownership.fence,
+                    &encode_obliterate_operation(intent.origin).as_slice(),
+                ],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("obliterate children transition", error))?;
+        if updated != 1 {
+            return Ok(CommitVerdict::Fenced);
+        }
+        classify_commit(tx.commit().await, "obliterate children commit")?;
+        Ok(CommitVerdict::Published)
+    }
+
+    /// Publish `Tombstoned` only after every captured exact target has a proof.
+    pub async fn commit_obliterate_payload(
+        &self,
+        intent: &FragmentObliterateIntent,
+        proofs: &[FragmentPurgeProof],
+    ) -> Result<CommitVerdict, DomainError> {
+        if intent.phase != FragmentObliteratePhase::Payload {
+            return Err(DomainError::InvalidInput(
+                "obliterate payload commit requires a payload-phase intent".to_owned(),
+            ));
+        }
+        let mut proved = proofs
+            .iter()
+            .map(|proof| proof.target.clone())
+            .collect::<Vec<_>>();
+        proved.sort_unstable();
+        proved.dedup();
+        if proved != intent.purge_targets {
+            return Err(DomainError::PreconditionRejected {
+                reason: "fragment_obliterate_purge_proof_mismatch".to_owned(),
+                reason_version: 1,
+            });
+        }
+
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| DomainError::from_pg("obliterate payload commit begin", error))?;
+        let mut sequence = LockSequence::new();
+        if crate::domain::lock_order::lock_repository(
+            &tx,
+            &mut sequence,
+            &intent.ownership.repository_id,
         )
-        .await
-        .map_err(|error| DomainError::from_pg("obliterate epoch disposition", error))?;
-        tx.execute(
-            "DELETE FROM lore_fragment_lifecycle_metering WHERE hash = $1",
-            &[&intent.hash],
+        .await?
+        .is_none()
+        {
+            return Ok(CommitVerdict::Fenced);
+        }
+        let Some(head) = lock_fragment_head(&tx, &mut sequence, &intent.ownership.hash).await?
+        else {
+            return Ok(CommitVerdict::Fenced);
+        };
+        if head.state != FragmentLifecycleState::DeletingPayload
+            || !owned_obliterate_association_locked(&tx, &intent.ownership).await?
+        {
+            return Ok(CommitVerdict::Fenced);
+        }
+        require_claims_write_capability(&tx, &intent.provider_write_authority_revision).await?;
+        let current = capture_obliterate_intent_locked(
+            &tx,
+            &mut sequence,
+            &intent.ownership.hash,
+            &intent.ownership.repository_id,
+            &intent.ownership.context,
+            &head,
+            &intent.provider_write_authority_revision,
         )
-        .await
-        .map_err(|error| DomainError::from_pg("obliterate metering removal", error))?;
-        classify_commit(tx.commit().await, "obliterate commit")?;
+        .await?;
+        if current != *intent
+            || obliterate_blocked_until_locked(&tx, &current)
+                .await?
+                .is_some()
+        {
+            return Ok(CommitVerdict::Fenced);
+        }
+
+        for epoch in &intent.purge_evidence_epochs {
+            let updated = tx
+                .execute(
+                    "UPDATE lore_fragment_epochs SET disposition = $3 \
+                      WHERE hash = $1 AND epoch = $2 AND disposition <> $3",
+                    &[&intent.ownership.hash, &epoch, &schema::DISPOSITION_PURGED],
+                )
+                .await
+                .map_err(|error| DomainError::from_pg("obliterate epoch disposition", error))?;
+            if updated != 1 {
+                return Ok(CommitVerdict::Fenced);
+            }
+        }
+        let removed_metering = tx
+            .execute(
+                "DELETE FROM lore_fragment_lifecycle_metering WHERE hash = $1",
+                &[&intent.ownership.hash],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("obliterate metering removal", error))?;
+        if removed_metering != u64::from(intent.metering_present) {
+            return Ok(CommitVerdict::Fenced);
+        }
+        let final_fence = next_fence(&tx).await?;
+        let updated = tx
+            .execute(
+                "UPDATE lore_fragment_lifecycle \
+                    SET state = $2, manifest_id = NULL, last_fence = $3, \
+                        active_operation = NULL, diagnostic_class = 0, \
+                        updated_at = clock_timestamp() \
+                  WHERE hash = $1 AND current_epoch = $4 AND state = $5 \
+                    AND last_fence = $6 AND active_operation = $7",
+                &[
+                    &intent.ownership.hash,
+                    &FragmentLifecycleState::Tombstoned.bits(),
+                    &final_fence,
+                    &intent.current_epoch,
+                    &FragmentLifecycleState::DeletingPayload.bits(),
+                    &intent.ownership.fence,
+                    &encode_obliterate_operation(intent.origin).as_slice(),
+                ],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("obliterate tombstone update", error))?;
+        if updated != 1 {
+            return Ok(CommitVerdict::Fenced);
+        }
+        classify_commit(tx.commit().await, "obliterate payload commit")?;
         Ok(CommitVerdict::Published)
     }
 
@@ -3605,6 +4224,407 @@ async fn write_claim_inventory_locked(
     })
 }
 
+fn encode_obliterate_operation(origin: u8) -> [u8; 16] {
+    let mut token = [0_u8; 16];
+    token[..OBLITERATE_OPERATION_PREFIX.len()].copy_from_slice(&OBLITERATE_OPERATION_PREFIX);
+    token[12] = origin;
+    token
+}
+
+fn decode_obliterate_operation(token: Option<&[u8]>) -> Result<u8, DomainError> {
+    let Some(token) = token else {
+        return Err(DomainError::NotReady(
+            "deleting fragment head has no durable obliterate ownership token".to_owned(),
+        ));
+    };
+    if token.len() != 16
+        || token[..OBLITERATE_OPERATION_PREFIX.len()] != OBLITERATE_OPERATION_PREFIX
+        || token[13..] != [0_u8; 3]
+    {
+        return Err(DomainError::NotReady(
+            "deleting fragment head has an unknown obliterate ownership token".to_owned(),
+        ));
+    }
+    match token[12] {
+        OBLITERATE_ORIGIN_PREPARING_STAGE
+        | OBLITERATE_ORIGIN_PREPARING_REMOTE_NORMAL
+        | OBLITERATE_ORIGIN_PREPARING_REMOTE_REPAIR
+        | OBLITERATE_ORIGIN_STAGED
+        | OBLITERATE_ORIGIN_REMOTE
+        | OBLITERATE_ORIGIN_MISSING => Ok(token[12]),
+        _ => Err(DomainError::NotReady(
+            "deleting fragment head has an unknown obliterate origin".to_owned(),
+        )),
+    }
+}
+
+fn obliterate_origin_from_head(head: &FragmentHeadLock) -> Result<u8, DomainError> {
+    match head.state {
+        FragmentLifecycleState::PreparingStage => Ok(OBLITERATE_ORIGIN_PREPARING_STAGE),
+        FragmentLifecycleState::PreparingRemote => match head.active_operation.as_deref() {
+            Some(token) if token == DIRECT_WRITE_NORMAL_OPERATION => {
+                Ok(OBLITERATE_ORIGIN_PREPARING_REMOTE_NORMAL)
+            }
+            Some(token) if token == DIRECT_WRITE_REPAIR_OPERATION => {
+                Ok(OBLITERATE_ORIGIN_PREPARING_REMOTE_REPAIR)
+            }
+            Some(_) => Err(DomainError::NotReady(
+                "PreparingRemote head has an unknown direct-write lineage token".to_owned(),
+            )),
+            None => Err(DomainError::NotReady(
+                "PreparingRemote head has no direct-write lineage token".to_owned(),
+            )),
+        },
+        FragmentLifecycleState::Staged => Ok(OBLITERATE_ORIGIN_STAGED),
+        FragmentLifecycleState::Remote => Ok(OBLITERATE_ORIGIN_REMOTE),
+        FragmentLifecycleState::Missing => Ok(OBLITERATE_ORIGIN_MISSING),
+        FragmentLifecycleState::DeletingChildren | FragmentLifecycleState::DeletingPayload => {
+            decode_obliterate_operation(head.active_operation.as_deref())
+        }
+        FragmentLifecycleState::Tombstoned => Err(DomainError::PreconditionRejected {
+            reason: "fragment_already_tombstoned".to_owned(),
+            reason_version: 1,
+        }),
+    }
+}
+
+fn validate_purge_target_key(target: &FragmentPurgeTarget) -> Result<(), DomainError> {
+    let canonical = match target.authority {
+        EpochAuthority::Staged => target.object_key == staged_epoch_key(&target.hash, target.epoch),
+        // A promoted staged epoch legitimately publishes Remote authority at
+        // the legacy key even though its epoch is greater than the first
+        // publication's. A repair successor is the other canonical Remote
+        // shape. No prefix, neighbouring hash, or arbitrary database text is
+        // ever eligible for DeleteExact.
+        EpochAuthority::Remote => {
+            target.object_key == legacy_hash_key(&target.hash)
+                || target.object_key == repair_epoch_key(&target.hash, target.epoch)
+        }
+    };
+    if canonical {
+        Ok(())
+    } else {
+        Err(DomainError::NotReady(
+            "fragment purge target has a noncanonical object key".to_owned(),
+        ))
+    }
+}
+
+async fn require_claims_write_capability(
+    tx: &Transaction<'_>,
+    expected_revision: &str,
+) -> Result<(), DomainError> {
+    let row = tx
+        .query_opt(
+            "SELECT write_capability, provider_write_authority_revision \
+               FROM lore_fragment_schema_state WHERE id = 1",
+            &[],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("obliterate write capability", error))?
+        .ok_or_else(|| {
+            DomainError::NotReady("SCHEMA-118 capability singleton is absent".to_owned())
+        })?;
+    let capability = FragmentWriteCapability::decode(
+        row.get("write_capability"),
+        row.get("provider_write_authority_revision"),
+    )?;
+    match capability {
+        FragmentWriteCapability::ClaimsRequired {
+            provider_write_authority_revision,
+        } if provider_write_authority_revision == expected_revision => Ok(()),
+        FragmentWriteCapability::ClaimsRequired { .. } => Err(DomainError::NotReady(
+            "fragment write-authority revision does not match coordinated obliterate activation"
+                .to_owned(),
+        )),
+        FragmentWriteCapability::Optional => Err(DomainError::NotReady(
+            "coordinated obliterate requires the write-claims-v1 capability cutover".to_owned(),
+        )),
+    }
+}
+
+async fn owned_obliterate_association_locked(
+    tx: &Transaction<'_>,
+    ownership: &FragmentObliterateOwnership,
+) -> Result<bool, DomainError> {
+    let row = tx
+        .query_opt(
+            "SELECT association_epoch, state FROM lore_fragment_associations \
+              WHERE hash = $1 AND repository_id = $2 AND context = $3",
+            &[
+                &ownership.hash,
+                &ownership.repository_id,
+                &ownership.context,
+            ],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("owned obliterate association", error))?;
+    Ok(row.is_some_and(|row| {
+        row.get::<_, i16>("state") == schema::ASSOCIATION_TOMBSTONED
+            && row.get::<_, i64>("association_epoch") == ownership.fence
+    }))
+}
+
+async fn capture_obliterate_intent_locked(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    hash: &[u8],
+    repository_id: &[u8],
+    context: &[u8],
+    head: &FragmentHeadLock,
+    provider_write_authority_revision: &str,
+) -> Result<FragmentObliterateIntent, DomainError> {
+    let phase = match head.state {
+        FragmentLifecycleState::DeletingChildren => FragmentObliteratePhase::Children,
+        FragmentLifecycleState::DeletingPayload => FragmentObliteratePhase::Payload,
+        _ => {
+            return Err(DomainError::Internal(
+                "obliterate intent capture requires a deleting head".to_owned(),
+            ));
+        }
+    };
+    let origin = decode_obliterate_operation(head.active_operation.as_deref())?;
+    let inventory = write_claim_inventory_locked(tx, sequence, hash).await?;
+    let mut targets = BTreeSet::new();
+    for target in inventory.cleanup_targets {
+        if target.authority != EpochAuthority::Remote {
+            return Err(DomainError::Internal(
+                "a provider write claim named non-remote authority".to_owned(),
+            ));
+        }
+        let target = FragmentPurgeTarget {
+            hash: target.hash,
+            epoch: target.epoch,
+            authority: target.authority,
+            object_key: target.object_key,
+            provider_body_blake3: Some(target.body_blake3),
+            provider_body_size: Some(target.body_size),
+            provider_claim_fence: Some(target.fence),
+        };
+        validate_purge_target_key(&target)?;
+        targets.insert(target);
+    }
+
+    let current = match origin {
+        OBLITERATE_ORIGIN_PREPARING_STAGE => {
+            let target = FragmentPurgeTarget {
+                hash: hash.to_vec(),
+                epoch: head.current_epoch,
+                authority: EpochAuthority::Staged,
+                object_key: staged_epoch_key(hash, head.current_epoch),
+                provider_body_blake3: None,
+                provider_body_size: None,
+                provider_claim_fence: None,
+            };
+            validate_purge_target_key(&target)?;
+            targets.insert(target.clone());
+            Some(FragmentObliterateRepresentation {
+                target,
+                manifest: None,
+            })
+        }
+        OBLITERATE_ORIGIN_PREPARING_REMOTE_NORMAL | OBLITERATE_ORIGIN_PREPARING_REMOTE_REPAIR => {
+            None
+        }
+        OBLITERATE_ORIGIN_STAGED | OBLITERATE_ORIGIN_REMOTE | OBLITERATE_ORIGIN_MISSING => {
+            let row = tx
+                .query_opt(
+                    "SELECT authority, object_key, manifest_id, size_payload, size_content, \
+                            decoded_hash, payload_flags, provider_body_blake3, \
+                            provider_body_size, provider_claim_fence \
+                       FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
+                    &[&hash, &head.current_epoch],
+                )
+                .await
+                .map_err(|error| DomainError::from_pg("obliterate current epoch", error))?;
+            match row {
+                None => {
+                    if origin != OBLITERATE_ORIGIN_MISSING {
+                        return Err(DomainError::NotReady(
+                            "deleting fragment head has no exact current epoch evidence".to_owned(),
+                        ));
+                    }
+                    // An unusable first publication deliberately commits Missing
+                    // without inserting an epoch row. A direct Remote attempt is
+                    // still named exactly by its durable current-epoch claim. With
+                    // no such claim the failed publication was Staged, whose path
+                    // is deterministic. Older claims from predecessor epochs do
+                    // not suppress that staged target.
+                    let current_remote_claim = targets.iter().any(|target| {
+                        target.authority == EpochAuthority::Remote
+                            && target.epoch == head.current_epoch
+                    });
+                    if current_remote_claim {
+                        None
+                    } else {
+                        let target = FragmentPurgeTarget {
+                            hash: hash.to_vec(),
+                            epoch: head.current_epoch,
+                            authority: EpochAuthority::Staged,
+                            object_key: staged_epoch_key(hash, head.current_epoch),
+                            provider_body_blake3: None,
+                            provider_body_size: None,
+                            provider_claim_fence: None,
+                        };
+                        validate_purge_target_key(&target)?;
+                        targets.insert(target.clone());
+                        Some(FragmentObliterateRepresentation {
+                            target,
+                            manifest: None,
+                        })
+                    }
+                }
+                Some(row) => {
+                    let authority = EpochAuthority::from_bits(row.get("authority"))?;
+                    let body_blake3 = row
+                        .get::<_, Option<Vec<u8>>>("provider_body_blake3")
+                        .map(|value| fixed_bytes::<32>(value, "epoch provider body digest"))
+                        .transpose()?;
+                    let body_size = row
+                        .get::<_, Option<i64>>("provider_body_size")
+                        .map(|value| {
+                            u64::try_from(value).map_err(|_| {
+                                DomainError::Internal(
+                                    "epoch provider body size is negative".to_owned(),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    let target = FragmentPurgeTarget {
+                        hash: hash.to_vec(),
+                        epoch: head.current_epoch,
+                        authority,
+                        object_key: row.get("object_key"),
+                        provider_body_blake3: body_blake3,
+                        provider_body_size: body_size,
+                        provider_claim_fence: row.get("provider_claim_fence"),
+                    };
+                    validate_purge_target_key(&target)?;
+                    let manifest = FragmentManifest {
+                        authority,
+                        object_key: target.object_key.clone(),
+                        manifest_id: row.get("manifest_id"),
+                        size_payload: row.get("size_payload"),
+                        size_content: row.get("size_content"),
+                        decoded_hash: row.get("decoded_hash"),
+                        payload_flags: row.get("payload_flags"),
+                    };
+                    targets.insert(target.clone());
+                    Some(FragmentObliterateRepresentation {
+                        target,
+                        manifest: Some(manifest),
+                    })
+                }
+            }
+        }
+        _ => {
+            return Err(DomainError::NotReady(
+                "deleting fragment head has an unknown obliterate origin".to_owned(),
+            ));
+        }
+    };
+    let purge_targets = targets.into_iter().collect::<Vec<_>>();
+
+    // Record which captured targets have immutable epoch evidence. The final
+    // commit updates exactly these rows to PURGED; claim-only targets remain in
+    // the claim table as their evidence and cannot manufacture an affected-row
+    // expectation for an epoch that never published.
+    let mut purge_evidence_epochs = Vec::new();
+    for target in &purge_targets {
+        let body_size = target
+            .provider_body_size
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| DomainError::Internal("purge target size exceeds i64".to_owned()))?;
+        let present = tx
+            .query_opt(
+                "SELECT 1 FROM lore_fragment_epochs \
+                  WHERE hash = $1 AND epoch = $2 AND authority = $3 AND object_key = $4 \
+                    AND provider_body_blake3 IS NOT DISTINCT FROM $5 \
+                    AND provider_body_size IS NOT DISTINCT FROM $6 \
+                    AND provider_claim_fence IS NOT DISTINCT FROM $7",
+                &[
+                    &target.hash,
+                    &target.epoch,
+                    &target.authority.bits(),
+                    &target.object_key,
+                    &target
+                        .provider_body_blake3
+                        .as_ref()
+                        .map(|value| value.as_slice()),
+                    &body_size,
+                    &target.provider_claim_fence,
+                ],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("obliterate epoch evidence", error))?
+            .is_some();
+        if present && !purge_evidence_epochs.contains(&target.epoch) {
+            purge_evidence_epochs.push(target.epoch);
+        }
+    }
+    purge_evidence_epochs.sort_unstable();
+    let metering_present = tx
+        .query_opt(
+            "SELECT 1 FROM lore_fragment_lifecycle_metering WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("obliterate metering evidence", error))?
+        .is_some();
+
+    Ok(FragmentObliterateIntent {
+        ownership: FragmentObliterateOwnership {
+            hash: hash.to_vec(),
+            repository_id: repository_id.to_vec(),
+            context: context.to_vec(),
+            fence: head.last_fence,
+        },
+        phase,
+        current_epoch: head.current_epoch,
+        origin,
+        current,
+        purge_targets,
+        purge_evidence_epochs,
+        metering_present,
+        blocked_until: inventory.blocked_until,
+        provider_write_authority_revision: provider_write_authority_revision.to_owned(),
+    })
+}
+
+async fn obliterate_blocked_until_locked(
+    tx: &Transaction<'_>,
+    intent: &FragmentObliterateIntent,
+) -> Result<Option<SystemTime>, DomainError> {
+    let staged_epochs = intent
+        .purge_targets
+        .iter()
+        .filter(|target| target.authority == EpochAuthority::Staged)
+        .map(|target| target.epoch)
+        .collect::<Vec<_>>();
+    if staged_epochs.is_empty() {
+        return Ok(intent.blocked_until);
+    }
+    let lease_deadline = tx
+        .query_one(
+            "SELECT max(lease.deadline) AS blocked_until \
+               FROM lore_fragment_staged_leases AS lease \
+               JOIN lore_fragment_staged_lease_members AS member \
+                 ON member.lease_id = lease.lease_id \
+              WHERE member.hash = $1 AND member.epoch = ANY($2) \
+                AND NOT lease.terminal AND lease.deadline > clock_timestamp()",
+            &[&intent.ownership.hash, &staged_epochs],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("obliterate staged lease barrier", error))?
+        .get::<_, Option<SystemTime>>("blocked_until");
+    Ok(match (intent.blocked_until, lease_deadline) {
+        (Some(claim), Some(lease)) => Some(claim.max(lease)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    })
+}
+
 async fn lock_write_claim(
     tx: &Transaction<'_>,
     sequence: &mut LockSequence,
@@ -4241,21 +5261,6 @@ async fn stamp_operation_fence(
     Ok(())
 }
 
-async fn current_epoch_key(
-    tx: &Transaction<'_>,
-    hash: &[u8],
-    epoch: i64,
-) -> Result<Option<String>, DomainError> {
-    let row = tx
-        .query_opt(
-            "SELECT object_key FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
-            &[&hash, &epoch],
-        )
-        .await
-        .map_err(|error| DomainError::from_pg("fragment epoch key", error))?;
-    Ok(row.map(|row| row.get("object_key")))
-}
-
 /// Move one repository's association scalar. The row is already locked by the
 /// caller's `lock_repository`, so this takes no new lock class.
 /// **PRECONDITION: the caller already holds this repository row `FOR UPDATE`.**
@@ -4442,48 +5447,6 @@ async fn apply_lifecycle_generation(
     )
     .await
     .map_err(|error| DomainError::from_pg("lifecycle generation bump", error))?;
-    Ok(())
-}
-
-/// Move the association scalar for a whole locked fanout at once.
-///
-/// Used where one operation retires many associations, so every affected
-/// repository's push witness moves with the removal rather than only the
-/// caller's own.
-/// **PRECONDITION: the caller already holds every one of these repository rows
-/// `FOR UPDATE`**, which for its one caller means passing the set returned by
-/// [`confirm_lifecycle_fanout`] and nothing else.
-///
-/// Takes no `LockSequence::enter`, and — as with
-/// [`bump_association_generation`] — registering would be rejected rather than
-/// merely redundant. `begin_obliterate` reaches this *after* `lock_fragment_head`
-/// has advanced the sequence to `LockClass::Fragments` (position 4), so
-/// `enter(Repository)` at position 1 would be a downward move and
-/// `LockSequence` would fail the transaction. The rows were locked earlier, by
-/// `lock_lifecycle_fanout`, before the head.
-///
-/// An earlier revision of this comment said a second entry would be "harmless
-/// because same-class repeats are allowed". That was wrong — by this point the
-/// sequence is no longer on `Repository` — and it is the same
-/// claim-not-checked-against-the-code failure INV-EF raised as P1-3, committed
-/// inside the comment written to close P2-4.
-///
-/// The guard therefore does not cover this write; the precondition does.
-async fn bump_association_generation_many(
-    tx: &Transaction<'_>,
-    repositories: &[Vec<u8>],
-) -> Result<(), DomainError> {
-    if repositories.is_empty() {
-        return Ok(());
-    }
-    tx.execute(
-        "UPDATE lore_domain_repositories \
-            SET content_association_generation = content_association_generation + 1 \
-          WHERE repository_id = ANY($1)",
-        &[&repositories],
-    )
-    .await
-    .map_err(|error| DomainError::from_pg("association generation bump", error))?;
     Ok(())
 }
 

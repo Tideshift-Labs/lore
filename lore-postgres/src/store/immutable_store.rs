@@ -84,11 +84,16 @@ use crate::domain::fragments::FragmentGetAttempt;
 use crate::domain::fragments::FragmentGetOperation;
 use crate::domain::fragments::FragmentGetResponse;
 use crate::domain::fragments::FragmentManifest;
+use crate::domain::fragments::FragmentObliterateBegin;
+use crate::domain::fragments::FragmentObliteratePhase;
+use crate::domain::fragments::FragmentObliterateRepresentation;
 use crate::domain::fragments::FragmentProviderActivationError;
 use crate::domain::fragments::FragmentProviderAttempt;
 use crate::domain::fragments::FragmentProviderDisposition;
 use crate::domain::fragments::FragmentProviderEntry;
 use crate::domain::fragments::FragmentProviderError;
+use crate::domain::fragments::FragmentPurgeProof;
+use crate::domain::fragments::FragmentPurgeTarget;
 use crate::domain::fragments::FragmentQueryRequest;
 use crate::domain::fragments::FragmentTransportOperation;
 use crate::domain::fragments::FragmentTransportResponse;
@@ -168,6 +173,7 @@ pub struct FragmentProviderRuntimeSettings {
     capabilities: ProviderCapabilities,
     in_flight_puts: InFlightPutBound,
     late_effect_bound: Duration,
+    provider_write_authority_revision: Option<String>,
 }
 
 impl FragmentProviderRuntimeSettings {
@@ -175,13 +181,27 @@ impl FragmentProviderRuntimeSettings {
         capabilities: ProviderCapabilities,
         in_flight_puts: InFlightPutBound,
         late_effect_bound: Duration,
+        provider_write_authority_revision: Option<String>,
     ) -> Self {
         Self {
             capabilities,
             in_flight_puts,
             late_effect_bound,
+            provider_write_authority_revision,
         }
     }
+}
+
+/// Provider-independent exact staged-epoch cleanup supplied by WP-114's future
+/// write-behind route. Direct provider mode intentionally leaves this absent.
+#[async_trait]
+pub trait StagedEpochCleanup: Send + Sync {
+    /// Read one exact staged path for child discovery. `None` is decisive
+    /// absence; uncertainty is an error and keeps the head deleting.
+    async fn read_exact(&self, target: &FragmentPurgeTarget) -> Result<Option<Bytes>, StoreError>;
+
+    /// Prove one exact staged path removed.
+    async fn purge_exact(&self, target: &FragmentPurgeTarget) -> Result<(), StoreError>;
 }
 
 /// Closed configuration refusals from the retry-disabled physical S3 adapter.
@@ -252,6 +272,7 @@ pub struct PostgresImmutableStore {
     bucket: String,
     instruments: crate::metrics::Instruments,
     fragment_route: FragmentLifecycleRoute,
+    staged_epoch_cleanup: Option<Arc<dyn StagedEpochCleanup>>,
     io_timeout: Duration,
 }
 
@@ -262,6 +283,7 @@ enum FragmentLifecycleRoute {
         provider: Arc<FragmentProviderEntry>,
         budget_pin: BudgetPin,
         late_effect_bound: Duration,
+        provider_write_authority_revision: Option<String>,
     },
 }
 
@@ -368,6 +390,7 @@ impl PostgresImmutableStore {
             bucket: object.bucket,
             instruments: crate::metrics::Instruments::new("immutable"),
             fragment_route: FragmentLifecycleRoute::Legacy,
+            staged_epoch_cleanup: None,
             io_timeout,
         })
     }
@@ -381,13 +404,22 @@ impl PostgresImmutableStore {
         provider: Arc<FragmentProviderEntry>,
         budget_pin: BudgetPin,
         late_effect_bound: Duration,
+        provider_write_authority_revision: Option<String>,
     ) -> Self {
         self.fragment_route = FragmentLifecycleRoute::Coordinated {
             coordinator,
             provider,
             budget_pin,
             late_effect_bound,
+            provider_write_authority_revision,
         };
+        self
+    }
+
+    /// Attach the staged cleanup collaborator without changing provider or
+    /// lifecycle ownership. Direct mode never calls this.
+    pub fn with_staged_epoch_cleanup(mut self, cleanup: Arc<dyn StagedEpochCleanup>) -> Self {
+        self.staged_epoch_cleanup = Some(cleanup);
         self
     }
 
@@ -451,6 +483,7 @@ impl PostgresImmutableStore {
             Arc::new(provider),
             budget_pin,
             runtime.late_effect_bound,
+            runtime.provider_write_authority_revision,
         ))
     }
 
@@ -1590,13 +1623,303 @@ impl PostgresImmutableStore {
         Ok(())
     }
 
-    /// Rebuild the non-authoritative metering projection from every associated S3 object.
+    fn validate_obliterate_child_candidate(
+        address: Address,
+        manifest: &FragmentManifest,
+        candidate: Option<(Fragment, Bytes)>,
+    ) -> Result<Option<(Fragment, Bytes)>, StoreError> {
+        let Some((fragment, bytes)) = candidate else {
+            return Err(StoreError::internal(
+                "exact fragmented representation is absent during child discovery",
+            ));
+        };
+        Self::validate_candidate(address.hash, manifest, fragment, bytes)
+            .map(Some)
+            .map_err(|diagnostic| {
+                StoreError::internal(format!(
+                    "exact fragment child-discovery payload is invalid: {diagnostic:?}"
+                ))
+            })
+    }
+
+    fn record_owned_obliterate_completion(stats: &StoreObliterateStats) {
+        stats
+            .num_fragments
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .num_payloads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    async fn load_obliterate_representation(
+        &self,
+        provider: &FragmentProviderEntry,
+        cleanup: Option<&Arc<dyn StagedEpochCleanup>>,
+        address: Address,
+        representation: &FragmentObliterateRepresentation,
+    ) -> Result<Option<(Fragment, Bytes)>, StoreError> {
+        let Some(manifest) = representation.manifest() else {
+            return Ok(None);
+        };
+        let payload_flags = u32::try_from(manifest.payload_flags).map_err(|error| {
+            StoreError::internal_with_context(error, "fragment purge payload flags exceed u32")
+        })?;
+        if payload_flags & FragmentFlags::PayloadFragmented.bits() == 0 {
+            return Ok(None);
+        }
+        let candidate = match representation.target().authority() {
+            EpochAuthority::Remote => {
+                let execution = provider
+                    .get(
+                        &FragmentGetAttempt {
+                            logical_request_id: uuid::Uuid::now_v7().hyphenated().to_string(),
+                            attempt_id: uuid::Uuid::now_v7().hyphenated().to_string(),
+                            attempt_ordinal: 1,
+                        },
+                        &FragmentGetOperation {
+                            object_key: representation.target().object_key().to_owned(),
+                        },
+                    )
+                    .await
+                    .map_err(provider_store_err)?;
+                match (execution.outcome, execution.response) {
+                    (
+                        ProviderAttemptOutcome::Decisive,
+                        FragmentGetResponse::Found { bytes, metadata },
+                    ) => {
+                        let metadata = metadata.into_iter().collect::<HashMap<_, _>>();
+                        let fragment = from_object_metadata(Some(&metadata)).map_err(|error| {
+                            StoreError::internal_with_context(
+                                error,
+                                "exact fragment child-discovery metadata is invalid",
+                            )
+                        })?;
+                        Some((fragment, Bytes::from(bytes)))
+                    }
+                    (ProviderAttemptOutcome::Decisive, FragmentGetResponse::NotFound) => None,
+                    (ProviderAttemptOutcome::Decisive, FragmentGetResponse::Throttled)
+                    | (ProviderAttemptOutcome::Ambiguous, _) => {
+                        return Err(StoreError::from(SlowDown));
+                    }
+                    (
+                        ProviderAttemptOutcome::Decisive,
+                        FragmentGetResponse::DefiniteFailure
+                        | FragmentGetResponse::AmbiguousFailure,
+                    ) => {
+                        return Err(StoreError::internal(
+                            "exact fragment child-discovery GET failed",
+                        ));
+                    }
+                }
+            }
+            EpochAuthority::Staged => {
+                let cleanup = cleanup.ok_or_else(|| {
+                    StoreError::internal(
+                        "coordinated obliterate encountered staged authority without cleanup",
+                    )
+                })?;
+                cleanup
+                    .read_exact(representation.target())
+                    .await?
+                    .map(|bytes| {
+                        Self::fragment_from_manifest(manifest)
+                            .map(|fragment| (fragment, bytes))
+                            .map_err(|diagnostic| {
+                                StoreError::internal(format!(
+                                    "exact staged child-discovery manifest is invalid: {diagnostic:?}"
+                                ))
+                            })
+                    })
+                    .transpose()?
+            }
+        };
+        Self::validate_obliterate_child_candidate(address, manifest, candidate)
+    }
+
+    async fn purge_obliterate_target(
+        &self,
+        provider: CoordinatedProvider<'_>,
+        cleanup: Option<&Arc<dyn StagedEpochCleanup>>,
+        target: &FragmentPurgeTarget,
+    ) -> Result<FragmentPurgeProof, StoreError> {
+        match target.authority() {
+            EpochAuthority::Staged => {
+                let cleanup = cleanup.ok_or_else(|| {
+                    StoreError::internal(
+                        "coordinated obliterate encountered staged authority without cleanup",
+                    )
+                })?;
+                cleanup.purge_exact(target).await?;
+            }
+            EpochAuthority::Remote => {
+                let logical_request_id = uuid::Uuid::now_v7().hyphenated().to_string();
+                let attempt_id = uuid::Uuid::now_v7().hyphenated().to_string();
+                let mut ledger = FragmentAttemptLedger::new(
+                    provider.entry.boundary().provider_boundary_id(),
+                    &logical_request_id,
+                )
+                .map_err(provider_store_err)?;
+                let admitted = provider
+                    .entry
+                    .admit_operation(
+                        FragmentProviderAttempt {
+                            traffic_class: ProviderTrafficClass::Operator,
+                            attempt_class: ProviderAttemptClass::DeleteObject,
+                            logical_request_id,
+                            attempt_id,
+                            attempt_ordinal: 1,
+                            deadline_unix_ms: self.provider_deadline_unix_ms()?,
+                            budget_pin: provider.budget_pin.clone(),
+                            put_body: None,
+                        },
+                        FragmentTransportOperation::DeleteExact {
+                            object_key: target.object_key().to_owned(),
+                        },
+                    )
+                    .await
+                    .map_err(provider_store_err)?;
+                let execution =
+                    tokio::time::timeout(self.io_timeout, admitted.execute(&mut ledger))
+                        .await
+                        .map_err(|_| StoreError::from(SlowDown))?
+                        .map_err(provider_store_err)?;
+                match (execution.outcome, execution.response) {
+                    (ProviderAttemptOutcome::Decisive, FragmentTransportResponse::Deleted) => {}
+                    (ProviderAttemptOutcome::Ambiguous, _) => {
+                        return Err(StoreError::from(SlowDown));
+                    }
+                    _ => {
+                        return Err(StoreError::internal(
+                            "exact unversioned fragment delete failed",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(FragmentPurgeProof::new(target.clone()))
+    }
+
+    async fn obliterate_coordinated(
+        self: Arc<Self>,
+        coordinator: &PostgresFragmentCoordinator,
+        provider: CoordinatedProvider<'_>,
+        provider_write_authority_revision: &str,
+        partition: Partition,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        let repository: Context = partition.into();
+        loop {
+            let begin = coordinator
+                .begin_obliterate(
+                    address.hash.data(),
+                    repository.data(),
+                    address.context.data(),
+                    provider_write_authority_revision,
+                )
+                .await
+                .map_err(domain_store_err)?;
+            let intent = match begin {
+                FragmentObliterateBegin::NoOp => return Ok(()),
+                FragmentObliterateBegin::AssociationOnly => {
+                    stats
+                        .num_fragments
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
+                FragmentObliterateBegin::Blocked { blocked_until, .. } => {
+                    if let Ok(delay) = blocked_until.duration_since(SystemTime::now())
+                        && !delay.is_zero()
+                    {
+                        tokio::time::sleep(delay).await;
+                    }
+                    continue;
+                }
+                FragmentObliterateBegin::Ready(intent) => intent,
+            };
+            let cleanup = self.staged_epoch_cleanup.as_ref();
+            if intent
+                .purge_targets()
+                .iter()
+                .any(|target| target.authority() == EpochAuthority::Staged)
+                && cleanup.is_none()
+            {
+                return Err(StoreError::internal(
+                    "coordinated obliterate requires staged epoch cleanup",
+                ));
+            }
+            match intent.phase() {
+                FragmentObliteratePhase::Children => {
+                    if let Some(current) = intent.current()
+                        && let Some((fragment, payload)) = self
+                            .load_obliterate_representation(
+                                provider.entry,
+                                cleanup,
+                                address,
+                                current,
+                            )
+                            .await?
+                    {
+                        self.clone()
+                            .obliterate_sub_fragments(
+                                partition,
+                                address,
+                                fragment,
+                                payload,
+                                stats.clone(),
+                            )
+                            .await?;
+                    }
+                    match coordinator
+                        .commit_obliterate_children(&intent)
+                        .await
+                        .map_err(domain_store_err)?
+                    {
+                        CommitVerdict::Published => continue,
+                        CommitVerdict::Fenced | CommitVerdict::Abandoned => {
+                            return Err(StoreError::from(SlowDown));
+                        }
+                    }
+                }
+                FragmentObliteratePhase::Payload => {
+                    let mut proofs = Vec::with_capacity(intent.purge_targets().len());
+                    for target in intent.purge_targets() {
+                        proofs.push(
+                            self.purge_obliterate_target(provider, cleanup, target)
+                                .await?,
+                        );
+                    }
+                    match coordinator
+                        .commit_obliterate_payload(&intent, &proofs)
+                        .await
+                        .map_err(domain_store_err)?
+                    {
+                        CommitVerdict::Published => {
+                            Self::record_owned_obliterate_completion(&stats);
+                            return Ok(());
+                        }
+                        CommitVerdict::Fenced | CommitVerdict::Abandoned => {
+                            return Err(StoreError::from(SlowDown));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rebuild the non-authoritative metering projection for the active lifecycle route.
     ///
-    /// Both tables are locked for the transaction. Writers may finish their object upload while
-    /// waiting, but cannot publish an association until this complete reconciliation commits. A
-    /// missing or malformed object aborts the whole transaction, so a successful count never
-    /// describes a partially repaired projection.
+    /// The coordinated route delegates to lifecycle authority and performs no provider I/O. The
+    /// legacy route below retains its existing S3 metadata reconstruction: both legacy tables are
+    /// locked for the transaction, and a missing or malformed object aborts the reconciliation.
     pub async fn rebuild_metering_projection(&self) -> Result<u64, StoreError> {
+        if let FragmentLifecycleRoute::Coordinated { coordinator, .. } = &self.fragment_route {
+            return coordinator
+                .rebuild_metering_projection()
+                .await
+                .map_err(domain_store_err);
+        }
+
         let mut client = self.pool.get().await.map_err(pool_err)?;
         let tx = client.transaction().await.map_err(db_err)?;
         tx.batch_execute(
@@ -2033,6 +2356,7 @@ impl ImmutableStore for PostgresImmutableStore {
             provider,
             budget_pin,
             late_effect_bound,
+            ..
         } = &self.fragment_route
         {
             return self
@@ -2125,6 +2449,36 @@ impl ImmutableStore for PostgresImmutableStore {
     ) -> Result<(), StoreError> {
         let _t = self.instruments.start("obliterate", self.pool.status());
         let repository: Context = partition.into();
+
+        if let FragmentLifecycleRoute::Coordinated {
+            coordinator,
+            provider,
+            budget_pin,
+            late_effect_bound,
+            provider_write_authority_revision,
+        } = &self.fragment_route
+        {
+            let revision = provider_write_authority_revision.as_deref().ok_or_else(|| {
+                StoreError::internal(
+                    "coordinated obliterate requires an activated provider write-authority revision",
+                )
+            })?;
+            return self
+                .clone()
+                .obliterate_coordinated(
+                    coordinator,
+                    CoordinatedProvider {
+                        entry: provider,
+                        budget_pin,
+                        late_effect_bound: *late_effect_bound,
+                    },
+                    revision,
+                    partition,
+                    address,
+                    stats,
+                )
+                .await;
+        }
 
         // Phase 1: remove this association and durably publish the child-traversal mark. No object
         // request occurs while a Postgres connection is held. A retry that finds either transient
@@ -2508,14 +2862,30 @@ impl ImmutableStore for PostgresImmutableStore {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use aws_sdk_s3::config::http::HttpResponse;
     use aws_sdk_s3::error::ErrorMetadata;
     use aws_sdk_s3::operation::get_object::GetObjectError;
     use aws_sdk_s3::primitives::SdkBody;
     use aws_sdk_s3::types::error::NoSuchKey;
     use rand::random;
+    use uuid::Uuid;
 
     use super::*;
+    use crate::domain::PostgresDomainStore;
+    use crate::domain::errors::DomainError;
+    use crate::domain::fragments::BeginOutcome;
+    use crate::domain::fragments::CommitVerdict;
+    use crate::domain::fragments::FragmentLifecycleState;
+    use crate::domain::fragments::FragmentObliterateBegin;
+    use crate::domain::fragments::FragmentObliteratePhase;
+    use crate::domain::fragments::FragmentWriteCapabilityCutover;
+    use crate::domain::fragments::FragmentWriteClaimInput;
+    use crate::domain::fragments::FragmentWriteSettlement;
+    use crate::domain::fragments::IoObservation;
+    use crate::domain::fragments::schema;
+    use crate::pool::TlsConfig;
 
     fn service_error(error: GetObjectError, status: u16) -> AwsError<SdkError<GetObjectError>> {
         AwsError::AwsSdkError(Box::new(SdkError::service_error(
@@ -2609,5 +2979,259 @@ mod tests {
                  migrations/0001_init.sql"
             );
         }
+    }
+
+    fn fragmented_obliterate_manifest(authority: EpochAuthority) -> FragmentManifest {
+        FragmentManifest {
+            authority,
+            object_key: "exact-fragment-key".to_owned(),
+            manifest_id: vec![0x41; 32],
+            size_payload: 1,
+            size_content: 1,
+            decoded_hash: vec![0x42; 32],
+            payload_flags: i64::from(FragmentFlags::PayloadFragmented.bits()),
+        }
+    }
+
+    #[test]
+    fn fragmented_remote_not_found_fails_closed_before_children_commit() {
+        let error = PostgresImmutableStore::validate_obliterate_child_candidate(
+            Address::default(),
+            &fragmented_obliterate_manifest(EpochAuthority::Remote),
+            None,
+        )
+        .expect_err("a missing exact remote representation cannot advance child deletion");
+
+        assert!(error.is_internal(), "expected Internal, got {error:?}");
+        assert!(
+            format!("{error:?}")
+                .contains("exact fragmented representation is absent during child discovery")
+        );
+    }
+
+    #[test]
+    fn fragmented_staged_none_fails_closed_before_children_commit() {
+        let error = PostgresImmutableStore::validate_obliterate_child_candidate(
+            Address::default(),
+            &fragmented_obliterate_manifest(EpochAuthority::Staged),
+            None,
+        )
+        .expect_err("a missing exact staged representation cannot advance child deletion");
+
+        assert!(error.is_internal(), "expected Internal, got {error:?}");
+        assert!(
+            format!("{error:?}")
+                .contains("exact fragmented representation is absent during child discovery")
+        );
+    }
+
+    #[test]
+    fn owned_obliterate_completion_counts_fragment_and_payload_once() {
+        let stats = StoreObliterateStats::default();
+
+        PostgresImmutableStore::record_owned_obliterate_completion(&stats);
+
+        assert_eq!(
+            stats
+                .num_fragments
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats
+                .num_payloads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+    async fn exact_purge_proofs_are_required_before_payload_tombstone() {
+        let url = std::env::var("LORE_TEST_PG_URL").expect("runner must provide LORE_TEST_PG_URL");
+        let store = PostgresDomainStore::connect(&url, 4, &TlsConfig::default())
+            .await
+            .expect("connect domain store");
+        let coordinator = store.fragment_coordinator();
+        coordinator
+            .bootstrap()
+            .await
+            .expect("install isolated fragment schema");
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("connect assertion client");
+        lore_base::lore_spawn!(async move {
+            let _ = connection.await;
+        });
+        client
+            .execute(
+                "UPDATE lore_fragment_schema_state \
+                    SET backfill_state = $1, cutover_at = clock_timestamp(), \
+                        residue_classified = true, sequence_headroom_fence = 1 \
+                  WHERE id = 1",
+                &[&schema::BACKFILL_CUTOVER],
+            )
+            .await
+            .expect("stage lifecycle cutover");
+        coordinator
+            .enable_lifecycle()
+            .await
+            .expect("enable lifecycle");
+        let revision = "write-claims-v1";
+        coordinator
+            .require_write_claims(
+                &FragmentWriteCapabilityCutover::new(revision)
+                    .expect("canonical provider authority revision"),
+            )
+            .await
+            .expect("require claims");
+
+        let repository_id = random::<[u8; 16]>();
+        let default_branch_id = random::<[u8; 16]>();
+        client
+            .execute(
+                "INSERT INTO lore_domain_repositories ( \
+                    repository_id, state, generation, name, metadata_hash, \
+                    default_branch_id, creation_fingerprint_version, \
+                    creation_fingerprint, created_at \
+                 ) VALUES ($1, 0, 1, $2, $3, $4, 1, $5, clock_timestamp())",
+                &[
+                    &repository_id.as_slice(),
+                    &format!("purge-proof-{:016x}", random::<u64>()),
+                    &random::<[u8; 32]>().as_slice(),
+                    &default_branch_id.as_slice(),
+                    &random::<[u8; 32]>().as_slice(),
+                ],
+            )
+            .await
+            .expect("insert repository fixture");
+
+        let hash = random::<[u8; 32]>();
+        let object_key = hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let claim = FragmentWriteClaimInput::new(
+            *Uuid::now_v7().as_bytes(),
+            *Uuid::now_v7().as_bytes(),
+            [0x91; 32],
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .expect("valid claim");
+        let BeginOutcome::Admitted(write) = coordinator
+            .begin_direct_write(&hash, &object_key, claim)
+            .await
+            .expect("begin publication")
+        else {
+            panic!("fresh hash must admit");
+        };
+        coordinator
+            .authorize_write_claim(write.write_claim().expect("durable claim"))
+            .await
+            .expect("authorize send");
+        assert_eq!(
+            coordinator
+                .commit_remote(
+                    &write,
+                    IoObservation::Valid(FragmentManifest {
+                        authority: EpochAuthority::Remote,
+                        object_key: object_key.clone(),
+                        manifest_id: vec![0x92; 32],
+                        size_payload: 1,
+                        size_content: 1,
+                        decoded_hash: vec![0x93; 32],
+                        payload_flags: 0,
+                    }),
+                    FragmentWriteSettlement::Decisive,
+                )
+                .await
+                .expect("publish"),
+            CommitVerdict::Published
+        );
+        let context = random::<[u8; 16]>();
+        assert_eq!(
+            coordinator
+                .create_association(&hash, &repository_id, &context)
+                .await
+                .expect("associate"),
+            CommitVerdict::Published
+        );
+
+        let FragmentObliterateBegin::Ready(children) = coordinator
+            .begin_obliterate(&hash, &repository_id, &context, revision)
+            .await
+            .expect("begin obliterate")
+        else {
+            panic!("last association must own deletion");
+        };
+        assert_eq!(children.phase(), FragmentObliteratePhase::Children);
+        assert_eq!(
+            coordinator
+                .commit_obliterate_children(&children)
+                .await
+                .expect("commit children"),
+            CommitVerdict::Published
+        );
+        let FragmentObliterateBegin::Ready(payload) = coordinator
+            .begin_obliterate(&hash, &repository_id, &context, revision)
+            .await
+            .expect("resume payload phase")
+        else {
+            panic!("owning retry must resume payload phase");
+        };
+        assert_eq!(payload.phase(), FragmentObliteratePhase::Payload);
+        let missing = coordinator
+            .commit_obliterate_payload(&payload, &[])
+            .await
+            .expect_err("no proof cannot tombstone a nonempty target set");
+        assert!(matches!(missing, DomainError::PreconditionRejected { .. }));
+        let state_after_missing_proof: i16 = client
+            .query_one(
+                "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+                &[&hash.as_slice()],
+            )
+            .await
+            .expect("read head after missing proof")
+            .get(0);
+        assert_eq!(
+            state_after_missing_proof,
+            FragmentLifecycleState::DeletingPayload.bits(),
+            "a failed or ambiguous physical deletion must not tombstone"
+        );
+        let FragmentObliterateBegin::Ready(retry) = coordinator
+            .begin_obliterate(&hash, &repository_id, &context, revision)
+            .await
+            .expect("resume after physical deletion uncertainty")
+        else {
+            panic!("owning retry must remain recoverable");
+        };
+        assert_eq!(retry.phase(), FragmentObliteratePhase::Payload);
+        assert_eq!(retry.ownership(), payload.ownership());
+        assert_eq!(retry.purge_targets(), payload.purge_targets());
+
+        let proofs = retry
+            .purge_targets()
+            .iter()
+            .cloned()
+            .map(FragmentPurgeProof::new)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            coordinator
+                .commit_obliterate_payload(&retry, &proofs)
+                .await
+                .expect("commit exact proofs"),
+            CommitVerdict::Published
+        );
+        let state: i16 = client
+            .query_one(
+                "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+                &[&hash.as_slice()],
+            )
+            .await
+            .expect("read final head")
+            .get(0);
+        assert_eq!(state, FragmentLifecycleState::Tombstoned.bits());
     }
 }

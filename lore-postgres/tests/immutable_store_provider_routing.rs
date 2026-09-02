@@ -230,6 +230,131 @@ fn coordinated_remote_get_only_a_decisive_not_found_can_mark_missing() {
 }
 
 #[test]
+fn coordinated_obliterate_uses_exact_unversioned_operations_outside_database_resources() {
+    let immutable = source("src/store/immutable_store.rs");
+    let coordinated = function(&immutable, "async fn obliterate_coordinated(");
+    for forbidden in [
+        "self.pool.get()",
+        ".transaction()",
+        ".list_object",
+        "ListVersions",
+        "DeleteVersion",
+        "version_id",
+        "self.s3",
+    ] {
+        assert!(
+            !coordinated.contains(forbidden),
+            "coordinated obliterate must not use {forbidden:?} or retain a DB resource"
+        );
+    }
+    let begin = coordinated
+        .find(".begin_obliterate(")
+        .expect("durable exact-association begin");
+    let children_io = coordinated
+        .find(".load_obliterate_representation(")
+        .expect("exact current-key child discovery");
+    let children_commit = coordinated
+        .find(".commit_obliterate_children(&intent)")
+        .expect("children phase commit");
+    let payload_io = coordinated
+        .find(".purge_obliterate_target(")
+        .expect("exact payload purge");
+    let payload_commit = coordinated
+        .find(".commit_obliterate_payload(&intent, &proofs)")
+        .expect("proof-bound payload commit");
+    assert!(begin < children_io && children_io < children_commit);
+    assert!(children_commit < payload_io && payload_io < payload_commit);
+
+    let purge = function(&immutable, "async fn purge_obliterate_target(");
+    assert!(purge.contains("FragmentTransportOperation::DeleteExact"));
+    assert!(purge.contains("object_key: target.object_key().to_owned()"));
+    assert!(!purge.contains("ListVersions"));
+    assert!(!purge.contains("DeleteVersion"));
+    assert!(!purge.contains("version_id"));
+    assert!(purge.contains("ProviderAttemptOutcome::Ambiguous"));
+    assert!(purge.contains("return Err(StoreError::from(SlowDown))"));
+    assert!(purge.contains("FragmentPurgeProof::new(target.clone())"));
+}
+
+#[test]
+fn coordinator_revalidates_exact_phase_ownership_and_retry_fence_before_each_commit() {
+    let coordinator = source("src/domain/fragments/coordinator.rs");
+    let begin = function(&coordinator, "pub async fn begin_obliterate(");
+    assert!(begin.contains("row.get::<_, i16>(\"state\") == schema::ASSOCIATION_TOMBSTONED"));
+    assert!(begin.contains("row.get::<_, i64>(\"association_epoch\") == head.last_fence"));
+
+    let children = function(&coordinator, "pub async fn commit_obliterate_children(");
+    assert!(children.contains("intent.phase != FragmentObliteratePhase::Children"));
+    assert!(children.contains("head.state != FragmentLifecycleState::DeletingChildren"));
+    assert!(children.contains("owned_obliterate_association_locked(&tx, &intent.ownership)"));
+    assert!(children.contains("if current != *intent"));
+    assert!(children.contains("AND active_operation = $5"));
+
+    let payload = function(&coordinator, "pub async fn commit_obliterate_payload(");
+    assert!(payload.contains("intent.phase != FragmentObliteratePhase::Payload"));
+    assert!(payload.contains("head.state != FragmentLifecycleState::DeletingPayload"));
+    assert!(payload.contains("owned_obliterate_association_locked(&tx, &intent.ownership)"));
+    assert!(payload.contains("if current != *intent"));
+    assert!(payload.contains("AND last_fence = $6 AND active_operation = $7"));
+}
+
+#[test]
+fn child_discovery_absence_fails_closed_before_children_phase_commit() {
+    let immutable = source("src/store/immutable_store.rs");
+    let load = function(&immutable, "async fn load_obliterate_representation(");
+    let compact = load.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        compact
+            .contains("(ProviderAttemptOutcome::Decisive, FragmentGetResponse::NotFound) => None")
+    );
+    assert!(compact.contains("cleanup .read_exact(representation.target()) .await?"));
+    assert!(compact.contains("PayloadFragmented"));
+    assert!(
+        compact.contains("Self::validate_obliterate_child_candidate(address, manifest, candidate)")
+    );
+
+    let validator = function(&immutable, "fn validate_obliterate_child_candidate(");
+    let absence_guard = validator
+        .find("let Some((fragment, bytes)) = candidate else")
+        .expect("remote or staged absence must enter the common fail-closed guard");
+    assert!(validator[absence_guard..].contains("return Err(StoreError::internal("));
+    assert!(
+        validator[absence_guard..]
+            .contains("exact fragmented representation is absent during child discovery")
+    );
+
+    let coordinated = function(&immutable, "async fn obliterate_coordinated(");
+    let load_call = coordinated
+        .find(".load_obliterate_representation(")
+        .expect("child discovery call");
+    let commit = coordinated
+        .find(".commit_obliterate_children(&intent)")
+        .expect("children commit");
+    assert!(load_call < commit);
+    assert!(coordinated[load_call..commit].contains(".await?"));
+}
+
+#[test]
+fn owning_obliterate_completion_preserves_fragment_and_payload_stats() {
+    let immutable = source("src/store/immutable_store.rs");
+    let coordinated = function(&immutable, "async fn obliterate_coordinated(");
+    let association_only = coordinated
+        .find("FragmentObliterateBegin::AssociationOnly")
+        .expect("association-only stats branch");
+    let payload = coordinated
+        .find("CommitVerdict::Published => {")
+        .expect("owning payload completion branch");
+    assert!(coordinated[association_only..payload].contains("num_fragments"));
+    let completion = &coordinated[payload..];
+    assert!(completion.contains("Self::record_owned_obliterate_completion(&stats)"));
+
+    let recorder = function(&immutable, "fn record_owned_obliterate_completion(");
+    assert!(recorder.contains(".num_fragments"));
+    assert!(recorder.contains(".num_payloads"));
+    assert_eq!(recorder.matches(".fetch_add(1").count(), 2);
+}
+
+#[test]
 fn direct_put_bytes_reach_only_the_admitted_provider_token() {
     let immutable = source("src/store/immutable_store.rs");
     let issue = function(&immutable, "async fn issue_direct_put(");

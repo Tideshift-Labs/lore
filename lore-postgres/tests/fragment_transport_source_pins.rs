@@ -77,8 +77,8 @@ fn retry_is_resolved_disabled_and_get_throttling_remains_transient() {
 #[test]
 fn every_sdk_send_is_scoped_by_final_connector_attempt_accounting() {
     let source = source();
-    assert_eq!(source.matches(".send()").count(), 6);
-    assert_eq!(source.matches(".count_connector_attempts(").count(), 6);
+    assert_eq!(source.matches(".send()").count(), 7);
+    assert_eq!(source.matches(".count_connector_attempts(").count(), 7);
     for (marker, send_marker) in [
         (".get_bucket_versioning()", ".send())"),
         (".head_object()", ".send(),"),
@@ -146,6 +146,32 @@ fn direct_put_transport_is_separate_from_standard_and_get_ports() {
     assert_eq!(source.matches("impl FragmentTransportPort").count(), 1);
     assert_eq!(source.matches("impl FragmentGetPort").count(), 1);
     assert!(source.contains("Box::pin(self.issue_direct_put_request(request))"));
+}
+
+#[test]
+fn exact_delete_uses_one_unversioned_delete_without_prefix_head_list_or_version_id() {
+    let source = source();
+    let issue = function(&source, "async fn issue_request(");
+    let start = issue
+        .find("FragmentTransportOperation::DeleteExact { object_key }")
+        .expect("exact delete arm");
+    let arm = &issue[start..];
+    assert_eq!(arm.matches(".delete_object()").count(), 1);
+    assert_eq!(arm.matches(".count_connector_attempts(").count(), 1);
+    assert!(arm.contains(".key(object_key)"));
+    assert!(arm.contains("ProviderAttemptOutcome::Decisive"));
+    assert!(arm.contains("FragmentTransportResponse::Deleted"));
+    for forbidden in [
+        ".prefix(",
+        ".head_object()",
+        ".list_object_versions()",
+        ".version_id(",
+    ] {
+        assert!(
+            !arm.contains(forbidden),
+            "exact unversioned deletion widened through {forbidden}"
+        );
+    }
 }
 
 #[test]

@@ -226,6 +226,30 @@ impl PostgresFragmentS3Transport {
                     ),
                 }
             }
+            FragmentTransportOperation::DeleteExact { object_key } => {
+                let counter = HttpRequestAttemptCounter::default();
+                let result = counter
+                    .count_connector_attempts(
+                        self.client
+                            .delete_object()
+                            .bucket(&self.bucket)
+                            .key(object_key)
+                            .send(),
+                    )
+                    .await;
+                match result {
+                    Ok(_) => Self::exchange(
+                        &counter,
+                        ProviderAttemptOutcome::Decisive,
+                        FragmentTransportResponse::Deleted,
+                    ),
+                    Err(error) => Self::exchange(
+                        &counter,
+                        sdk_outcome(&error),
+                        FragmentTransportResponse::DefiniteFailure,
+                    ),
+                }
+            }
         }
     }
 

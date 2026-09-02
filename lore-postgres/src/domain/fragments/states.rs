@@ -120,7 +120,7 @@ impl FragmentLifecycleState {
 }
 
 /// Which of the two authorities backs one epoch's representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EpochAuthority {
     /// A durable staged file on this cell's filesystem.
     Staged,

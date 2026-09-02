@@ -29,6 +29,8 @@ use lore_postgres::domain::fragments::EpochAuthority;
 use lore_postgres::domain::fragments::EpochWitness;
 use lore_postgres::domain::fragments::FragmentLifecycleReadiness;
 use lore_postgres::domain::fragments::FragmentManifest;
+use lore_postgres::domain::fragments::FragmentObliterateBegin;
+use lore_postgres::domain::fragments::FragmentObliteratePhase;
 use lore_postgres::domain::fragments::FragmentQueryRequest;
 use lore_postgres::domain::fragments::FragmentResolution;
 use lore_postgres::domain::fragments::FragmentVerdict;
@@ -67,6 +69,8 @@ use tokio_postgres::Client;
 use uuid::NoContext;
 use uuid::Timestamp;
 use uuid::Uuid;
+
+const TEST_PROVIDER_WRITE_AUTHORITY_REVISION: &str = "write-claims-v1";
 
 fn write_claim() -> FragmentWriteClaimInput {
     FragmentWriteClaimInput::new(
@@ -149,6 +153,47 @@ impl TestFragmentCoordinator {
             .commit_repair(intent, observation, FragmentWriteSettlement::Decisive)
             .await
     }
+
+    async fn begin_obliterate(
+        &self,
+        hash: &[u8],
+        repository_id: &[u8],
+        context: &[u8],
+    ) -> Result<FragmentObliterateBegin, DomainError> {
+        self.0
+            .begin_obliterate(
+                hash,
+                repository_id,
+                context,
+                TEST_PROVIDER_WRITE_AUTHORITY_REVISION,
+            )
+            .await
+    }
+}
+
+async fn enable_write_claims(url: &str, coordinator: &TestFragmentCoordinator) {
+    let direct = client(url).await;
+    direct
+        .execute(
+            "UPDATE lore_fragment_schema_state \
+                SET backfill_state = $1, cutover_at = clock_timestamp(), \
+                    residue_classified = true, sequence_headroom_fence = 1 \
+              WHERE id = 1",
+            &[&schema::BACKFILL_CUTOVER],
+        )
+        .await
+        .expect("stage lifecycle cutover preconditions");
+    coordinator
+        .enable_lifecycle()
+        .await
+        .expect("enable lifecycle before coordinated obliterate");
+    coordinator
+        .require_write_claims(
+            &FragmentWriteCapabilityCutover::new(TEST_PROVIDER_WRITE_AUTHORITY_REVISION)
+                .expect("valid test provider write-authority revision"),
+        )
+        .await
+        .expect("enable write claims for coordinated obliterate");
 }
 
 #[tokio::test]
@@ -938,6 +983,193 @@ async fn claim_inventory_and_prune_preserve_cleanup_targets_and_bound_terminal_d
 
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn obliterate_retains_an_old_ambiguous_target_across_missing_repair_and_new_epoch() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+    let legacy = legacy_key(&hash);
+
+    let input = FragmentWriteClaimInput::new(
+        *Uuid::now_v7().as_bytes(),
+        *Uuid::now_v7().as_bytes(),
+        [0xB1; 32],
+        17,
+        Duration::from_millis(40),
+        Duration::from_millis(60),
+    )
+    .expect("short ambiguous claim");
+    let BeginOutcome::Admitted(first) = coordinator
+        .0
+        .begin_direct_write(&hash, &legacy, input)
+        .await
+        .expect("begin first publication")
+    else {
+        panic!("fresh hash must admit");
+    };
+    let old_claim = first.write_claim().expect("first claim").clone();
+    coordinator
+        .authorize_write_claim(&old_claim)
+        .await
+        .expect("authorize ambiguous write");
+    assert_eq!(
+        coordinator
+            .0
+            .commit_remote(
+                &first,
+                IoObservation::Unusable(MissingDiagnostic::Absent),
+                FragmentWriteSettlement::Ambiguous,
+            )
+            .await
+            .expect("publish Missing while retaining ambiguous target"),
+        CommitVerdict::Published
+    );
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let BeginOutcome::Admitted(repair) = coordinator
+        .begin_direct_write(&hash, &legacy)
+        .await
+        .expect("begin repair")
+    else {
+        panic!("Missing head must admit repair");
+    };
+    let repair_key = repair.object_key.clone();
+    assert_ne!(repair_key, legacy);
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &repair,
+                IoObservation::Valid(manifest(&repair_key, 0xB2, EpochAuthority::Remote,)),
+            )
+            .await
+            .expect("publish repair"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository, &context)
+            .await
+            .expect("associate repaired fragment"),
+        CommitVerdict::Published
+    );
+    enable_write_claims(&url, &coordinator).await;
+
+    let FragmentObliterateBegin::Ready(deleting) = coordinator
+        .begin_obliterate(&hash, &repository, &context)
+        .await
+        .expect("begin exact deletion after repair")
+    else {
+        panic!("last association must own deletion");
+    };
+    assert_eq!(deleting.phase(), FragmentObliteratePhase::Children);
+    assert!(
+        deleting
+            .purge_targets()
+            .iter()
+            .any(|target| target.object_key() == legacy
+                && target.epoch() == old_claim.epoch()
+                && target.provider_claim_fence() == Some(old_claim.fence())
+                && target.provider_body_blake3() == Some(old_claim.body_blake3())
+                && target.provider_body_size() == Some(old_claim.body_size())),
+        "the old ambiguous legacy-key target must survive into deletion inventory"
+    );
+    assert!(
+        deleting
+            .purge_targets()
+            .iter()
+            .any(|target| target.object_key() == repair_key && target.epoch() == repair.epoch),
+        "the repaired current epoch must remain an independent exact target"
+    );
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn unexpired_ambiguous_claim_blocks_exact_obliterate_before_children_can_advance() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+    let key = legacy_key(&hash);
+    let input = FragmentWriteClaimInput::new(
+        *Uuid::now_v7().as_bytes(),
+        *Uuid::now_v7().as_bytes(),
+        [0xB3; 32],
+        19,
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    )
+    .expect("unexpired ambiguous claim");
+    let BeginOutcome::Admitted(publication) = coordinator
+        .0
+        .begin_direct_write(&hash, &key, input)
+        .await
+        .expect("begin publication")
+    else {
+        panic!("fresh hash must admit");
+    };
+    let claim = publication
+        .write_claim()
+        .expect("durable write claim")
+        .clone();
+    coordinator
+        .authorize_write_claim(&claim)
+        .await
+        .expect("authorize ambiguous send");
+    assert_eq!(
+        coordinator
+            .0
+            .commit_remote(
+                &publication,
+                IoObservation::Unusable(MissingDiagnostic::Absent),
+                FragmentWriteSettlement::Ambiguous,
+            )
+            .await
+            .expect("publish Missing with ambiguous settlement"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository, &context)
+            .await
+            .expect("associate Missing lineage"),
+        CommitVerdict::Published
+    );
+    enable_write_claims(&url, &coordinator).await;
+
+    let FragmentObliterateBegin::Blocked {
+        intent,
+        blocked_until,
+    } = coordinator
+        .begin_obliterate(&hash, &repository, &context)
+        .await
+        .expect("begin exact obliterate")
+    else {
+        panic!("an unexpired ambiguous claim must block exact deletion");
+    };
+    assert_eq!(blocked_until, claim.hard_not_after());
+    assert_eq!(intent.phase(), FragmentObliteratePhase::Children);
+    let state: i16 = client(&url)
+        .await
+        .query_one(
+            "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash.as_slice()],
+        )
+        .await
+        .expect("read blocked obliterate head")
+        .get(0);
+    assert_eq!(state, FragmentLifecycleState::DeletingChildren.bits());
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn prune_normalizes_expired_prepared_to_targetless_no_send_and_honors_batch_limit() {
     let Some(url) = pg_url() else {
         panic!("runner must provide LORE_TEST_PG_URL");
@@ -1044,6 +1276,303 @@ async fn prune_normalizes_expired_prepared_to_targetless_no_send_and_honors_batc
 
 fn pg_url() -> Option<String> {
     std::env::var("LORE_TEST_PG_URL").ok()
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn lifecycle_metering_rebuild_is_exact_removes_stale_rows_and_is_idempotent() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+
+    let remote = random_hash();
+    let missing = random_hash();
+    let deleting_children = random_hash();
+    let deleting_payload = random_hash();
+    let preparing = random_hash();
+    let tombstoned = random_hash();
+    let purged = random_hash();
+    let mismatched_readable = random_hash();
+    let fixtures = [
+        (&remote, FragmentLifecycleState::Remote, 0_i16, true),
+        (&missing, FragmentLifecycleState::Missing, 0_i16, false),
+        (
+            &deleting_children,
+            FragmentLifecycleState::DeletingChildren,
+            0_i16,
+            false,
+        ),
+        (
+            &deleting_payload,
+            FragmentLifecycleState::DeletingPayload,
+            0_i16,
+            false,
+        ),
+        (
+            &preparing,
+            FragmentLifecycleState::PreparingRemote,
+            0_i16,
+            false,
+        ),
+        (
+            &tombstoned,
+            FragmentLifecycleState::Tombstoned,
+            0_i16,
+            false,
+        ),
+        (&purged, FragmentLifecycleState::Missing, 2_i16, false),
+        (
+            &mismatched_readable,
+            FragmentLifecycleState::Remote,
+            0_i16,
+            true,
+        ),
+    ];
+
+    for (ordinal, (hash, state, disposition, readable)) in fixtures.iter().enumerate() {
+        let epoch = i64::try_from(ordinal + 1).expect("small fixture ordinal");
+        let seed = u8::try_from(ordinal + 1).expect("small fixture ordinal");
+        let epoch_manifest = vec![seed; 32];
+        let head_manifest = readable.then(|| {
+            if *hash == &mismatched_readable {
+                vec![0xFE; 32]
+            } else {
+                epoch_manifest.clone()
+            }
+        });
+        direct
+            .execute(
+                "INSERT INTO lore_fragment_epochs (hash, epoch, authority, object_key, \
+                     manifest_id, size_payload, size_content, decoded_hash, payload_flags, \
+                     fence, disposition) \
+                 VALUES ($1, $2, 2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                &[
+                    hash,
+                    &epoch,
+                    &legacy_key(hash),
+                    &epoch_manifest,
+                    &(100_i64 + epoch),
+                    &(200_i64 + epoch),
+                    &vec![seed.wrapping_add(1); 32],
+                    &i64::from(seed),
+                    &epoch,
+                    disposition,
+                ],
+            )
+            .await
+            .expect("insert authoritative epoch fixture");
+        direct
+            .execute(
+                "INSERT INTO lore_fragment_lifecycle \
+                     (hash, current_epoch, state, manifest_id, last_fence) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[hash, &epoch, &state.bits(), &head_manifest, &epoch],
+            )
+            .await
+            .expect("insert lifecycle head fixture");
+        direct
+            .execute(
+                "INSERT INTO lore_fragment_lifecycle_metering \
+                     (hash, epoch, payload_flags, size_payload, size_content, authority) \
+                 VALUES ($1, 99, 0, 1, 1, 1)",
+                &[hash],
+            )
+            .await
+            .expect("insert deliberately stale projection fixture");
+    }
+    let orphan = random_hash();
+    direct
+        .execute(
+            "INSERT INTO lore_fragment_lifecycle_metering \
+                 (hash, epoch, payload_flags, size_payload, size_content, authority) \
+             VALUES ($1, 99, 0, 1, 1, 1)",
+            &[&orphan],
+        )
+        .await
+        .expect("insert orphan projection row");
+
+    let rebuilt = coordinator
+        .rebuild_metering_projection()
+        .await
+        .expect("rebuild exact lifecycle projection");
+    assert_eq!(rebuilt, 4);
+    let rows = direct
+        .query(
+            "SELECT hash, epoch, payload_flags, size_payload, size_content, authority \
+               FROM lore_fragment_lifecycle_metering ORDER BY hash",
+            &[],
+        )
+        .await
+        .expect("read rebuilt projection");
+    assert_eq!(rows.len(), 4);
+    for expected_hash in [&remote, &missing, &deleting_children, &deleting_payload] {
+        let row = rows
+            .iter()
+            .find(|row| row.get::<_, Vec<u8>>("hash") == *expected_hash)
+            .expect("eligible lifecycle row must be projected");
+        let ordinal = fixtures
+            .iter()
+            .position(|(hash, _, _, _)| *hash == expected_hash)
+            .expect("eligible hash fixture ordinal");
+        let epoch = i64::try_from(ordinal + 1).expect("small fixture ordinal");
+        assert_eq!(row.get::<_, i64>("epoch"), epoch);
+        assert_eq!(row.get::<_, i64>("payload_flags"), epoch);
+        assert_eq!(row.get::<_, i64>("size_payload"), 100 + epoch);
+        assert_eq!(row.get::<_, i64>("size_content"), 200 + epoch);
+        assert_eq!(row.get::<_, i16>("authority"), 2);
+    }
+    for excluded in [
+        &preparing,
+        &tombstoned,
+        &purged,
+        &mismatched_readable,
+        &orphan,
+    ] {
+        assert!(
+            rows.iter()
+                .all(|row| row.get::<_, Vec<u8>>("hash") != *excluded),
+            "ineligible or orphan row survived the rebuild"
+        );
+    }
+
+    assert_eq!(
+        coordinator
+            .rebuild_metering_projection()
+            .await
+            .expect("repeat exact lifecycle projection rebuild"),
+        4,
+        "an idempotent rebuild returns the same authoritative count"
+    );
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn lifecycle_metering_rebuild_serializes_behind_an_inflight_epoch_writer_without_deadlock() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let hash = random_hash();
+    let initial_manifest = vec![0x31_u8; 32];
+    let direct = client(&url).await;
+    direct
+        .execute(
+            "INSERT INTO lore_fragment_epochs \
+                 (hash, epoch, authority, object_key, manifest_id, size_payload, \
+                  size_content, decoded_hash, payload_flags, fence, disposition) \
+             VALUES ($1, 1, 2, $2, $3, 10, 11, $4, 0, 1, 0)",
+            &[
+                &hash,
+                &legacy_key(&hash),
+                &initial_manifest,
+                &vec![0x32_u8; 32],
+            ],
+        )
+        .await
+        .expect("insert initial epoch");
+    direct
+        .execute(
+            "INSERT INTO lore_fragment_lifecycle \
+                 (hash, current_epoch, state, manifest_id, last_fence) \
+             VALUES ($1, 1, 7, NULL, 1)",
+            &[&hash],
+        )
+        .await
+        .expect("insert initial Missing head");
+
+    let mut writer = own_transaction_client(&url).await;
+    let writer_tx = writer.transaction().await.expect("writer transaction");
+    writer_tx
+        .query_one(
+            "SELECT hash FROM lore_fragment_lifecycle WHERE hash = $1 FOR UPDATE",
+            &[&hash],
+        )
+        .await
+        .expect("writer locks lifecycle head before epoch mutation");
+    writer_tx
+        .execute(
+            "INSERT INTO lore_fragment_epochs \
+                 (hash, epoch, authority, object_key, manifest_id, size_payload, \
+                  size_content, decoded_hash, payload_flags, fence, disposition) \
+             VALUES ($1, 2, 2, $2, $3, 20, 21, $4, 0, 2, 0)",
+            &[
+                &hash,
+                &format!("{}.r2", legacy_key(&hash)),
+                &vec![0x41_u8; 32],
+                &vec![0x42_u8; 32],
+            ],
+        )
+        .await
+        .expect("writer inserts successor epoch while retaining head lock");
+
+    let rebuilding = coordinator.clone();
+    let rebuild =
+        lore_base::lore_spawn!(async move { rebuilding.rebuild_metering_projection().await });
+    let observer = client(&url).await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = observer
+                .query_one(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM pg_stat_activity \
+                          WHERE datname = current_database() \
+                            AND pid <> pg_backend_pid() \
+                            AND wait_event_type = 'Lock' \
+                            AND query LIKE '%LOCK TABLE lore_fragment_lifecycle IN EXCLUSIVE MODE%' \
+                     )",
+                    &[],
+                )
+                .await
+                .expect("observe blocked rebuild")
+                .get(0);
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("rebuild must block first on the lifecycle EXCLUSIVE lock");
+
+    let (rebuilt, ()) = timeout(Duration::from_secs(5), async {
+        writer_tx
+            .execute(
+                "UPDATE lore_fragment_lifecycle \
+                    SET current_epoch = 2, last_fence = 2, updated_at = clock_timestamp() \
+                  WHERE hash = $1",
+                &[&hash],
+            )
+            .await
+            .expect("writer advances lifecycle head");
+        writer_tx
+            .commit()
+            .await
+            .expect("writer commits successor epoch");
+        let rebuilt = rebuild
+            .await
+            .expect("join rebuilding task")
+            .expect("rebuild after writer commit");
+        (rebuilt, ())
+    })
+    .await
+    .expect("writer and rebuild must serialize without a table-lock deadlock");
+    assert_eq!(rebuilt, 1);
+    assert_eq!(
+        observer
+            .query_one(
+                "SELECT epoch FROM lore_fragment_lifecycle_metering WHERE hash = $1",
+                &[&hash],
+            )
+            .await
+            .expect("read serialized projection")
+            .get::<_, i64>(0),
+        2,
+        "rebuild must project the committed successor, never a partial epoch/head snapshot"
+    );
 }
 
 /// Connect and install SCHEMA-118 through the isolated component fixture.
@@ -1181,6 +1710,10 @@ fn legacy_key(hash: &[u8]) -> String {
     hash.iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>()
+}
+
+fn staged_key(hash: &[u8], epoch: i64) -> String {
+    format!("{}.s{epoch}", legacy_key(hash))
 }
 
 fn random_context() -> Vec<u8> {
@@ -1779,11 +2312,11 @@ async fn a_replayed_direct_write_reuses_exact_claim_and_terminal_attempt_cannot_
     );
 }
 
-/// Item 6b: a competing obliterate independently turns a late commit into
-/// `Fenced` with zero mutation.
+/// An exact-association obliterate cannot capture an unassociated preparing
+/// write, so a foreign request is a no-op and cannot fence its later commit.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn a_stale_witness_from_a_competing_obliterate_fences_a_late_commit_with_zero_mutation() {
+async fn a_foreign_obliterate_cannot_fence_an_unassociated_preparing_write() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -1791,6 +2324,8 @@ async fn a_stale_witness_from_a_competing_obliterate_fences_a_late_commit_with_z
     let coordinator = store.fragment_coordinator();
     let direct = client(&url).await;
     let hash = random_hash();
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
 
     let BeginOutcome::Admitted(stale_intent) = coordinator
         .begin_direct_write(&hash, &legacy_key(&hash))
@@ -1804,13 +2339,13 @@ async fn a_stale_witness_from_a_competing_obliterate_fences_a_late_commit_with_z
         .await
         .expect("authorize before the simulated provider I/O gap");
 
-    let BeginOutcome::Admitted(_obliterate_intent) = coordinator
-        .begin_obliterate(&hash)
-        .await
-        .expect("competing obliterate begin")
-    else {
-        panic!("a non-tombstoned head must admit begin_obliterate");
-    };
+    assert!(matches!(
+        coordinator
+            .begin_obliterate(&hash, &repository_id, &context)
+            .await
+            .expect("foreign obliterate begin"),
+        FragmentObliterateBegin::NoOp
+    ));
 
     let stale_manifest = manifest("competing-obliterate/stale", 0x30, EpochAuthority::Remote);
     let late = coordinator
@@ -1821,11 +2356,11 @@ async fn a_stale_witness_from_a_competing_obliterate_fences_a_late_commit_with_z
             FragmentWriteSettlement::Decisive,
         )
         .await
-        .expect("late commit must not error");
+        .expect("uncontested late commit must not error");
     assert_eq!(
         late,
-        CommitVerdict::Fenced,
-        "a competing obliterate must fence the delayed commit"
+        CommitVerdict::Published,
+        "a foreign obliterate must not capture or fence an unassociated write"
     );
 
     let epoch_rows: i64 = direct
@@ -1836,7 +2371,7 @@ async fn a_stale_witness_from_a_competing_obliterate_fences_a_late_commit_with_z
         .await
         .expect("count stale epoch rows")
         .get(0);
-    assert_eq!(epoch_rows, 0);
+    assert_eq!(epoch_rows, 1);
 
     let state: i16 = direct
         .query_one(
@@ -1848,8 +2383,8 @@ async fn a_stale_witness_from_a_competing_obliterate_fences_a_late_commit_with_z
         .get(0);
     assert_eq!(
         state,
-        FragmentLifecycleState::DeletingPayload.bits(),
-        "the head must remain in the obliteration sequence, not be overwritten by the fenced loser"
+        FragmentLifecycleState::Remote.bits(),
+        "the foreign no-op must leave the preparing write free to publish"
     );
 }
 
@@ -2263,6 +2798,7 @@ async fn an_obliterate_on_a_readable_fragment_with_a_live_association_bumps_its_
     let repository_id = create_repository(&store).await;
     let context = random_context();
     let hash = random_hash();
+    enable_write_claims(&url, &coordinator).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
         .begin_direct_write(&hash, &legacy_key(&hash))
@@ -2275,11 +2811,7 @@ async fn an_obliterate_on_a_readable_fragment_with_a_live_association_bumps_its_
         coordinator
             .commit_remote(
                 &intent,
-                IoObservation::Valid(manifest(
-                    "obliterate-with-association/key",
-                    0x61,
-                    EpochAuthority::Remote
-                ))
+                IoObservation::Valid(manifest(&legacy_key(&hash), 0x61, EpochAuthority::Remote))
             )
             .await
             .expect("commit"),
@@ -2300,13 +2832,14 @@ async fn an_obliterate_on_a_readable_fragment_with_a_live_association_bumps_its_
         .expect("repository must exist");
     assert_eq!(before.fragment_lifecycle_generation, 1);
 
-    let BeginOutcome::Admitted(_obliterate_intent) = coordinator
-        .begin_obliterate(&hash)
+    let FragmentObliterateBegin::Ready(obliterate_intent) = coordinator
+        .begin_obliterate(&hash, &repository_id, &context)
         .await
         .expect("begin obliterate on a readable, associated fragment")
     else {
-        panic!("a non-tombstoned head must admit begin_obliterate");
+        panic!("the sole live association must own coordinated obliterate");
     };
+    assert_eq!(obliterate_intent.phase(), FragmentObliteratePhase::Children);
 
     let after = coordinator
         .capture_push_witness(&repository_id)
@@ -2324,6 +2857,420 @@ async fn an_obliterate_on_a_readable_fragment_with_a_live_association_bumps_its_
         .await
         .expect("resolve during obliteration");
     expect_absent(&resolved[0]);
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn exact_obliterate_is_foreign_safe_and_retires_only_one_shared_association() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository_a = create_repository(&store).await;
+    let repository_b = create_repository(&store).await;
+    let foreign_repository = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+    enable_write_claims(&url, &coordinator).await;
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, &legacy_key(&hash))
+        .await
+        .expect("begin")
+    else {
+        panic!("fresh hash must admit");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(&legacy_key(&hash), 0xA1, EpochAuthority::Remote,)),
+            )
+            .await
+            .expect("publish"),
+        CommitVerdict::Published
+    );
+    for repository in [&repository_a, &repository_b] {
+        assert_eq!(
+            coordinator
+                .create_association(&hash, repository, &context)
+                .await
+                .expect("associate"),
+            CommitVerdict::Published
+        );
+    }
+
+    assert!(matches!(
+        coordinator
+            .begin_obliterate(&hash, &foreign_repository, &context)
+            .await
+            .expect("foreign request"),
+        FragmentObliterateBegin::NoOp
+    ));
+    assert!(matches!(
+        coordinator
+            .begin_obliterate(&hash, &repository_a, &context)
+            .await
+            .expect("retire A"),
+        FragmentObliterateBegin::AssociationOnly
+    ));
+
+    let a = coordinator
+        .resolve(&repository_a, &context, std::slice::from_ref(&hash))
+        .await
+        .expect("resolve retired A");
+    expect_absent(&a[0]);
+    let b = coordinator
+        .resolve(&repository_b, &context, std::slice::from_ref(&hash))
+        .await
+        .expect("resolve surviving B");
+    expect_readable(&b[0]);
+
+    let FragmentObliterateBegin::Ready(last) = coordinator
+        .begin_obliterate(&hash, &repository_b, &context)
+        .await
+        .expect("last association owns physical deletion")
+    else {
+        panic!("the last live association must own physical deletion");
+    };
+    assert_eq!(last.phase(), FragmentObliteratePhase::Children);
+    assert_eq!(last.ownership().repository_id(), repository_b);
+    assert_eq!(last.ownership().context(), context);
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn obliterate_requires_claims_cutover_and_exact_provider_authority_revision() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, &legacy_key(&hash))
+        .await
+        .expect("begin")
+    else {
+        panic!("fresh hash must admit");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(&legacy_key(&hash), 0xA2, EpochAuthority::Remote,)),
+            )
+            .await
+            .expect("publish"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository, &context)
+            .await
+            .expect("associate"),
+        CommitVerdict::Published
+    );
+
+    let optional = coordinator
+        .0
+        .begin_obliterate(
+            &hash,
+            &repository,
+            &context,
+            TEST_PROVIDER_WRITE_AUTHORITY_REVISION,
+        )
+        .await
+        .expect_err("Optional write capability must refuse physical deletion");
+    assert!(matches!(optional, DomainError::NotReady(_)));
+
+    enable_write_claims(&url, &coordinator).await;
+    let wrong_revision = coordinator
+        .0
+        .begin_obliterate(&hash, &repository, &context, "write-claims-v2")
+        .await
+        .expect_err("a mismatched provider authority revision must refuse");
+    assert!(matches!(wrong_revision, DomainError::NotReady(_)));
+
+    let FragmentObliterateBegin::Ready(intent) = coordinator
+        .0
+        .begin_obliterate(
+            &hash,
+            &repository,
+            &context,
+            TEST_PROVIDER_WRITE_AUTHORITY_REVISION,
+        )
+        .await
+        .expect("exact revision")
+    else {
+        panic!("the exact revision must admit the owning deletion");
+    };
+    assert_eq!(
+        intent.provider_write_authority_revision(),
+        TEST_PROVIDER_WRITE_AUTHORITY_REVISION
+    );
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn missing_without_epoch_evidence_still_enters_safe_exact_deletion() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+    enable_write_claims(&url, &coordinator).await;
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, &legacy_key(&hash))
+        .await
+        .expect("begin failed first publication")
+    else {
+        panic!("fresh hash must admit");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(&intent, IoObservation::Unusable(MissingDiagnostic::Absent))
+            .await
+            .expect("publish Missing"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository, &context)
+            .await
+            .expect("associate Missing head"),
+        CommitVerdict::Published
+    );
+
+    let FragmentObliterateBegin::Ready(deleting) = coordinator
+        .begin_obliterate(&hash, &repository, &context)
+        .await
+        .expect("Missing head without epoch evidence must remain deletable")
+    else {
+        panic!("the sole association must own Missing deletion");
+    };
+    assert_eq!(deleting.phase(), FragmentObliteratePhase::Children);
+    assert!(deleting.current().is_none());
+    assert!(
+        deleting
+            .purge_targets()
+            .iter()
+            .any(|target| target.object_key() == legacy_key(&hash))
+    );
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn noncanonical_epoch_object_key_is_refused_before_delete_ownership_is_published() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let repository = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+    enable_write_claims(&url, &coordinator).await;
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, &legacy_key(&hash))
+        .await
+        .expect("begin")
+    else {
+        panic!("fresh hash must admit");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(
+                    "canonical-before-tamper",
+                    0xA3,
+                    EpochAuthority::Remote,
+                )),
+            )
+            .await
+            .expect("publish"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository, &context)
+            .await
+            .expect("associate"),
+        CommitVerdict::Published
+    );
+    direct
+        .execute(
+            "UPDATE lore_fragment_epochs SET object_key = $3 WHERE hash = $1 AND epoch = $2",
+            &[&hash, &intent.epoch, &"prefix-neighbor-not-owned"],
+        )
+        .await
+        .expect("tamper object key fixture");
+
+    let result = coordinator
+        .begin_obliterate(&hash, &repository, &context)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(DomainError::InvalidInput(_) | DomainError::NotReady(_))
+        ),
+        "a noncanonical durable key must be rejected before it can become DeleteExact: {result:?}"
+    );
+    let state: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read head after refusal")
+        .get(0);
+    assert_eq!(state, FragmentLifecycleState::Remote.bits());
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn noncanonical_claim_object_key_is_refused_before_delete_ownership_is_published() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let repository = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+    let legacy = legacy_key(&hash);
+    enable_write_claims(&url, &coordinator).await;
+
+    let short_claim = FragmentWriteClaimInput::new(
+        *Uuid::now_v7().as_bytes(),
+        *Uuid::now_v7().as_bytes(),
+        [0xC1; 32],
+        1,
+        Duration::from_millis(20),
+        Duration::from_millis(30),
+    )
+    .expect("short claim");
+    let BeginOutcome::Admitted(intent) = coordinator
+        .0
+        .begin_direct_write(&hash, &legacy, short_claim)
+        .await
+        .expect("begin failed publication")
+    else {
+        panic!("fresh hash must admit");
+    };
+    let claim = intent.write_claim().expect("durable claim");
+    coordinator
+        .authorize_write_claim(claim)
+        .await
+        .expect("authorize ambiguous publication");
+    assert_eq!(
+        coordinator
+            .0
+            .commit_remote(
+                &intent,
+                IoObservation::Unusable(MissingDiagnostic::Absent),
+                FragmentWriteSettlement::Ambiguous,
+            )
+            .await
+            .expect("publish Missing"),
+        CommitVerdict::Published
+    );
+    direct
+        .execute(
+            "UPDATE lore_fragment_write_claims SET object_key = $3 \
+              WHERE logical_request_id = $1 AND attempt_id = $2",
+            &[
+                &claim.logical_request_id().as_slice(),
+                &claim.attempt_id().as_slice(),
+                &"prefix-neighbor-not-owned",
+            ],
+        )
+        .await
+        .expect("tamper claim key fixture");
+    tokio::time::sleep(Duration::from_millis(70)).await;
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository, &context)
+            .await
+            .expect("associate Missing head"),
+        CommitVerdict::Published
+    );
+
+    let result = coordinator
+        .begin_obliterate(&hash, &repository, &context)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(DomainError::InvalidInput(_) | DomainError::NotReady(_))
+        ),
+        "a noncanonical claim key must be rejected before DeleteExact: {result:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn missing_without_epoch_evidence_reconstructs_the_exact_staged_cleanup_target() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let repository = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+    enable_write_claims(&url, &coordinator).await;
+
+    let BeginOutcome::Admitted(stage) = coordinator
+        .begin_stage(&hash)
+        .await
+        .expect("begin failed staging")
+    else {
+        panic!("fresh hash must admit staging");
+    };
+    assert_eq!(
+        coordinator
+            .commit_staged(&stage, IoObservation::Unusable(MissingDiagnostic::Absent))
+            .await
+            .expect("publish Missing from staging"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository, &context)
+            .await
+            .expect("associate Missing head"),
+        CommitVerdict::Published
+    );
+
+    let FragmentObliterateBegin::Ready(deleting) = coordinator
+        .begin_obliterate(&hash, &repository, &context)
+        .await
+        .expect("resume staged-origin Missing deletion")
+    else {
+        panic!("sole association must own deletion");
+    };
+    let current = deleting
+        .current()
+        .expect("staged fallback remains the exact child-discovery representation");
+    assert!(current.manifest().is_none());
+    assert_eq!(deleting.purge_targets().len(), 1);
+    let target = &deleting.purge_targets()[0];
+    assert_eq!(target.authority(), EpochAuthority::Staged);
+    assert_eq!(target.epoch(), stage.epoch);
+    assert_eq!(target.object_key(), staged_key(&hash, stage.epoch));
 }
 
 /// Reviewer gap: `readiness().unresolved_rows` must stay zero for a live
@@ -3873,11 +4820,12 @@ async fn a_duplicate_staged_lease_id_replays_the_existing_lease_and_refuses_a_di
     }
 }
 
-/// P1-2 item 3: `commit_obliterate` purges the epoch's disposition, deletes
-/// the metering row, and moves the head to `Tombstoned`.
+/// The children-phase commit never claims physical purge: it advances to
+/// `DeletingPayload` while retaining epoch disposition and metering until
+/// exact purge proofs are supplied by the immutable-store route.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tombstones_the_head() {
+async fn commit_obliterate_children_retains_payload_evidence_until_exact_purge_proof() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -3885,6 +4833,9 @@ async fn commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tom
     let coordinator = store.fragment_coordinator();
     let direct = client(&url).await;
     let hash = random_hash();
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+    enable_write_claims(&url, &coordinator).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
         .begin_direct_write(&hash, &legacy_key(&hash))
@@ -3897,14 +4848,17 @@ async fn commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tom
         coordinator
             .commit_remote(
                 &intent,
-                IoObservation::Valid(manifest(
-                    "obliterate-commit/key",
-                    0xF0,
-                    EpochAuthority::Remote
-                ))
+                IoObservation::Valid(manifest(&legacy_key(&hash), 0xF0, EpochAuthority::Remote))
             )
             .await
             .expect("commit"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate"),
         CommitVerdict::Published
     );
     let published_epoch = intent.epoch;
@@ -3922,18 +4876,18 @@ async fn commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tom
         "a published fragment has a metering row"
     );
 
-    let BeginOutcome::Admitted(obliterate_intent) = coordinator
-        .begin_obliterate(&hash)
+    let FragmentObliterateBegin::Ready(obliterate_intent) = coordinator
+        .begin_obliterate(&hash, &repository_id, &context)
         .await
         .expect("begin obliterate")
     else {
-        panic!("a readable head must admit begin_obliterate");
+        panic!("the sole association must own obliterate");
     };
     assert_eq!(
         coordinator
-            .commit_obliterate(&obliterate_intent)
+            .commit_obliterate_children(&obliterate_intent)
             .await
-            .expect("commit obliterate"),
+            .expect("commit child discovery"),
         CommitVerdict::Published
     );
 
@@ -3945,7 +4899,7 @@ async fn commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tom
         .await
         .expect("read head after obliterate");
     let state: i16 = head_row.get(0);
-    assert_eq!(state, FragmentLifecycleState::Tombstoned.bits());
+    assert_eq!(state, FragmentLifecycleState::DeletingPayload.bits());
 
     let disposition: i16 = direct
         .query_one(
@@ -3955,7 +4909,7 @@ async fn commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tom
         .await
         .expect("read published epoch disposition")
         .get(0);
-    assert_eq!(disposition, schema::DISPOSITION_PURGED);
+    assert_eq!(disposition, schema::DISPOSITION_CURRENT_ELIGIBLE);
 
     let metering_after: i64 = direct
         .query_one(
@@ -3965,16 +4919,18 @@ async fn commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tom
         .await
         .expect("count metering after")
         .get(0);
-    assert_eq!(metering_after, 0, "the metering row must be deleted");
+    assert_eq!(
+        metering_after, 1,
+        "metering must remain until exact payload purge proof is committed"
+    );
 }
 
-/// P1-2 item 3 (fencing half): a stale obliterate intent -- one whose fence
-/// was overtaken by a second `begin_obliterate` on the same head before its
-/// own commit ran -- fences `commit_obliterate` and leaves the winner's
-/// mutation exactly as it was.
+/// A retry while `DeletingChildren` recovers the exact durable ownership
+/// fence. Once either copy advances the phase, the other children commit is
+/// fenced and cannot mutate the payload phase.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn commit_obliterate_fences_a_stale_intent_and_mutates_nothing() {
+async fn obliterate_retry_recovers_exact_ownership_and_late_children_commit_is_fenced() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -3982,6 +4938,9 @@ async fn commit_obliterate_fences_a_stale_intent_and_mutates_nothing() {
     let coordinator = store.fragment_coordinator();
     let direct = client(&url).await;
     let hash = random_hash();
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+    enable_write_claims(&url, &coordinator).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
         .begin_direct_write(&hash, &legacy_key(&hash))
@@ -3994,42 +4953,46 @@ async fn commit_obliterate_fences_a_stale_intent_and_mutates_nothing() {
         coordinator
             .commit_remote(
                 &intent,
-                IoObservation::Valid(manifest(
-                    "obliterate-stale/key",
-                    0xF1,
-                    EpochAuthority::Remote
-                ))
+                IoObservation::Valid(manifest(&legacy_key(&hash), 0xF1, EpochAuthority::Remote))
             )
             .await
             .expect("commit"),
         CommitVerdict::Published
     );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate"),
+        CommitVerdict::Published
+    );
 
-    let BeginOutcome::Admitted(stale_intent) = coordinator
-        .begin_obliterate(&hash)
+    let FragmentObliterateBegin::Ready(first_intent) = coordinator
+        .begin_obliterate(&hash, &repository_id, &context)
         .await
-        .expect("begin obliterate (stale)")
+        .expect("begin obliterate")
     else {
-        panic!("a readable head must admit begin_obliterate");
+        panic!("the sole association must own obliterate");
     };
-    // A second begin_obliterate on the same head -- still DeletingPayload, not
-    // yet Tombstoned -- moves the fence again without publishing anything.
-    let BeginOutcome::Admitted(winning_intent) = coordinator
-        .begin_obliterate(&hash)
+    let FragmentObliterateBegin::Ready(replayed_intent) = coordinator
+        .begin_obliterate(&hash, &repository_id, &context)
         .await
-        .expect("begin obliterate (winner)")
+        .expect("retry obliterate")
     else {
-        panic!(
-            "a DeletingPayload head is not yet Tombstoned and must still admit begin_obliterate"
-        );
+        panic!("the owning retry must recover its children-phase intent");
     };
-    assert_ne!(stale_intent.fence, winning_intent.fence);
+    assert_eq!(first_intent.ownership(), replayed_intent.ownership());
+    assert_eq!(first_intent.phase(), FragmentObliteratePhase::Children);
+    assert_eq!(
+        first_intent.purge_targets(),
+        replayed_intent.purge_targets()
+    );
 
     assert_eq!(
         coordinator
-            .commit_obliterate(&winning_intent)
+            .commit_obliterate_children(&replayed_intent)
             .await
-            .expect("commit obliterate (winner)"),
+            .expect("commit replayed children intent"),
         CommitVerdict::Published
     );
 
@@ -4041,28 +5004,20 @@ async fn commit_obliterate_fences_a_stale_intent_and_mutates_nothing() {
         .await
         .expect("read head after winner");
     let state_after_win: i16 = head_after_win.get(0);
-    // `commit_obliterate` stamps a FRESH fence of its own on commit (not
-    // `winning_intent.fence`, which was allocated at begin) -- captured here
-    // only as the known-good baseline the stale attempt must not overwrite.
     let last_fence_after_win: i64 = head_after_win.get(1);
-    assert_eq!(state_after_win, FragmentLifecycleState::Tombstoned.bits());
-    let disposition_after_win: i16 = direct
-        .query_one(
-            "SELECT disposition FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
-            &[&hash, &winning_intent.epoch],
-        )
-        .await
-        .expect("read epoch disposition after winner")
-        .get(0);
+    assert_eq!(
+        state_after_win,
+        FragmentLifecycleState::DeletingPayload.bits()
+    );
 
     let stale_result = coordinator
-        .commit_obliterate(&stale_intent)
+        .commit_obliterate_children(&first_intent)
         .await
-        .expect("stale commit obliterate must not error");
+        .expect("late duplicate children commit must not error");
     assert_eq!(
         stale_result,
         CommitVerdict::Fenced,
-        "a fence moved between the stale begin and its commit"
+        "a children-phase intent cannot commit after payload phase begins"
     );
 
     let head_after_stale = direct
@@ -4076,30 +5031,11 @@ async fn commit_obliterate_fences_a_stale_intent_and_mutates_nothing() {
     let last_fence_after_stale: i64 = head_after_stale.get(1);
     assert_eq!(
         state_after_stale, state_after_win,
-        "a fenced obliterate commit must leave the head exactly as the winner published it"
+        "a fenced duplicate must leave the payload phase unchanged"
     );
-    // The load-bearing check: `state`/`disposition` alone cannot discriminate
-    // a wrongly-proceeding stale commit from the winner's, because a stale
-    // commit that incorrectly proceeded would obliterate the SAME epoch to
-    // the SAME Tombstoned/PURGED values. `last_fence` is the one field a
-    // wrongly-proceeding loser would overwrite with its own freshly allocated
-    // fence -- so an unchanged `last_fence` is what actually proves the stale
-    // commit's UPDATE never ran.
     assert_eq!(
         last_fence_after_stale, last_fence_after_win,
-        "a fenced obliterate commit must not stamp its own fence over the winner's"
-    );
-    let disposition_after_stale: i16 = direct
-        .query_one(
-            "SELECT disposition FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
-            &[&hash, &winning_intent.epoch],
-        )
-        .await
-        .expect("read epoch disposition after stale attempt")
-        .get(0);
-    assert_eq!(
-        disposition_after_stale, disposition_after_win,
-        "a fenced obliterate commit must not mutate the epoch disposition"
+        "a fenced duplicate must not move the durable ownership fence"
     );
 }
 
@@ -4846,6 +5782,7 @@ async fn a_concurrent_create_association_landing_between_the_plan_and_the_head_l
     let repository_r2 = create_repository(&store).await;
     let context = random_context();
     let hash = random_hash();
+    enable_write_claims(&url, &coordinator).await;
 
     // A non-readable head: Missing, from a failed first write.
     let BeginOutcome::Admitted(intent) = coordinator
@@ -4898,7 +5835,11 @@ async fn a_concurrent_create_association_landing_between_the_plan_and_the_head_l
         .await
         .expect("lock repository R externally");
 
-    let obliterate_task = async { coordinator.begin_obliterate(&hash).await };
+    let obliterate_task = async {
+        coordinator
+            .begin_obliterate(&hash, &repository_r, &context)
+            .await
+    };
     let race_task = async {
         // begin_obliterate is blocked on R's external lock regardless of this
         // delay -- it exists only to give it a moment to actually reach and
@@ -4994,16 +5935,11 @@ async fn a_concurrent_create_association_landing_between_the_plan_and_the_head_l
     );
 }
 
-/// P1-1 companion (non-racy): the growth check inside `confirm_lifecycle_fanout`
-/// now runs on every `begin_obliterate`, not only `if was_readable`. A plain,
-/// non-concurrent obliterate of a `Missing` head with two live associations
-/// would have caught the original defect on its own: the association scalar
-/// must move for exactly the associated repositories even though the head was
-/// never readable and no lifecycle-generation scalar moves at all.
+/// With two live associations, exact obliterate retires only the requested
+/// association and leaves the shared non-readable head available to the peer.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn begin_obliterate_on_a_non_readable_head_moves_the_association_scalar_for_every_live_associated_repository()
- {
+async fn exact_obliterate_of_a_shared_non_readable_head_retires_only_the_requested_association() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -5049,13 +5985,13 @@ async fn begin_obliterate_on_a_non_readable_head_moves_the_association_scalar_fo
         .expect("capture B before")
         .expect("repository B must exist");
 
-    let BeginOutcome::Admitted(_obliterate_intent) = coordinator
-        .begin_obliterate(&hash)
-        .await
-        .expect("begin obliterate on a Missing head with live associations")
-    else {
-        panic!("a non-tombstoned head must admit begin_obliterate");
-    };
+    assert!(matches!(
+        coordinator
+            .begin_obliterate(&hash, &repository_a, &context)
+            .await
+            .expect("retire exact association on shared Missing head"),
+        FragmentObliterateBegin::AssociationOnly
+    ));
 
     let after_a = coordinator
         .capture_push_witness(&repository_a)
@@ -5068,18 +6004,28 @@ async fn begin_obliterate_on_a_non_readable_head_moves_the_association_scalar_fo
         .expect("capture B after")
         .expect("repository B must exist");
 
-    for (before, after, label) in [(before_a, after_a, "A"), (before_b, after_b, "B")] {
-        assert_eq!(
-            after.content_association_generation,
-            before.content_association_generation + 1,
-            "repository {label}'s association scalar must move exactly once"
-        );
-        assert_eq!(
-            after.fragment_lifecycle_generation, before.fragment_lifecycle_generation,
-            "a head that was never readable crosses no readability boundary, so repository \
-             {label}'s lifecycle scalar must not move"
-        );
-    }
+    assert_eq!(
+        after_a.content_association_generation,
+        before_a.content_association_generation + 1
+    );
+    assert_eq!(
+        after_b.content_association_generation,
+        before_b.content_association_generation
+    );
+    assert_eq!(
+        after_a.fragment_lifecycle_generation,
+        before_a.fragment_lifecycle_generation
+    );
+    assert_eq!(
+        after_b.fragment_lifecycle_generation,
+        before_b.fragment_lifecycle_generation
+    );
+
+    let remaining = coordinator
+        .resolve(&repository_b, &context, std::slice::from_ref(&hash))
+        .await
+        .expect("resolve surviving association");
+    expect_absent(&remaining[0]);
 }
 
 // ---------------------------------------------------------------------------
@@ -5088,26 +6034,11 @@ async fn begin_obliterate_on_a_non_readable_head_moves_the_association_scalar_fo
 // nothing rule over a real multi-fragment batch.
 // ---------------------------------------------------------------------------
 
-/// Reviewer finding A1: a `Staged` epoch whose bytes have been proved gone
-/// (`DISPOSITION_PURGED`, reached via `begin_obliterate`/`commit_obliterate`
-/// on a `Staged` head) must be refused the same way a `Remote` or fabricated
-/// member is -- a lease over purged bytes would report protection that
-/// cannot exist.
-///
-/// **Post-WP-118-hardening-review note: this case no longer isolates a single
-/// guard.** Obliterating a `Staged` head directly (never promoted) purges
-/// exactly the epoch this lease asks for AND tombstones the head in the same
-/// transaction, so both `lock_lease_member_heads`'s Tombstoned-head check and
-/// the older epoch-disposition `DISPOSITION_PURGED` check refuse
-/// independently here -- removing either guard alone would leave this case
-/// green. `acquire_staged_leases_refuses_a_member_whose_fragment_was_obliterated_after_promotion`
-/// is the case that isolates the head check by leaving the disposition guard
-/// unable to fire (QUARANTINED, never PURGED). The two assertions added below
-/// pin the shape this case actually exercises, so a reader does not have to
-/// re-derive it.
+/// A staged epoch awaiting exact purge remains current-eligible, but its
+/// deleting head must refuse any new reader lease before physical cleanup.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn acquire_staged_leases_refuses_a_purged_staged_member() {
+async fn acquire_staged_leases_refuses_a_staged_member_awaiting_exact_payload_purge() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -5115,8 +6046,11 @@ async fn acquire_staged_leases_refuses_a_purged_staged_member() {
     let coordinator = store.fragment_coordinator();
     let direct = client(&url).await;
     let deadline = microsecond_deadline(Duration::from_secs(60));
+    enable_write_claims(&url, &coordinator).await;
 
     let hash = random_hash();
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
     let BeginOutcome::Admitted(stage_intent) =
         coordinator.begin_stage(&hash).await.expect("begin stage")
     else {
@@ -5127,7 +6061,7 @@ async fn acquire_staged_leases_refuses_a_purged_staged_member() {
             .commit_staged(
                 &stage_intent,
                 IoObservation::Valid(manifest(
-                    "purged-staged-member/staged",
+                    &staged_key(&hash, stage_intent.epoch),
                     0x90,
                     EpochAuthority::Staged
                 ))
@@ -5137,28 +6071,29 @@ async fn acquire_staged_leases_refuses_a_purged_staged_member() {
         CommitVerdict::Published
     );
     let staged_epoch = stage_intent.epoch;
-
-    let BeginOutcome::Admitted(obliterate_intent) = coordinator
-        .begin_obliterate(&hash)
-        .await
-        .expect("begin obliterate")
-    else {
-        panic!("a readable (Staged) head must admit begin_obliterate");
-    };
     assert_eq!(
         coordinator
-            .commit_obliterate(&obliterate_intent)
+            .create_association(&hash, &repository_id, &context)
             .await
-            .expect("commit obliterate"),
+            .expect("associate staged fragment"),
         CommitVerdict::Published
     );
 
-    // Both guards this case exercises, confirmed by direct SQL before the
-    // lease attempt: the epoch-disposition guard fires because this epoch is
-    // PURGED (a never-promoted Staged head has its only epoch purged by
-    // obliterate), and the head-state guard fires because the head is
-    // Tombstoned. Neither assertion is new coverage on its own -- they exist
-    // so the doc comment above is checked rather than asserted.
+    let FragmentObliterateBegin::Ready(obliterate_intent) = coordinator
+        .begin_obliterate(&hash, &repository_id, &context)
+        .await
+        .expect("begin obliterate")
+    else {
+        panic!("the sole association must own staged obliterate");
+    };
+    assert_eq!(
+        coordinator
+            .commit_obliterate_children(&obliterate_intent)
+            .await
+            .expect("commit child discovery"),
+        CommitVerdict::Published
+    );
+
     let staged_disposition: i16 = direct
         .query_one(
             "SELECT disposition FROM lore_fragment_epochs WHERE hash = $1 AND epoch = $2",
@@ -5169,8 +6104,8 @@ async fn acquire_staged_leases_refuses_a_purged_staged_member() {
         .get(0);
     assert_eq!(
         staged_disposition,
-        schema::DISPOSITION_PURGED,
-        "a never-promoted Staged head's only epoch must be purged by obliterate"
+        schema::DISPOSITION_CURRENT_ELIGIBLE,
+        "child discovery cannot claim that staged bytes were purged"
     );
     let head_state: i16 = direct
         .query_one(
@@ -5182,8 +6117,8 @@ async fn acquire_staged_leases_refuses_a_purged_staged_member() {
         .get(0);
     assert_eq!(
         head_state,
-        FragmentLifecycleState::Tombstoned.bits(),
-        "the head must be Tombstoned once obliterate publishes"
+        FragmentLifecycleState::DeletingPayload.bits(),
+        "the head must remain deleting until staged cleanup yields an exact proof"
     );
 
     let lease_id = rand::random::<[u8; 16]>().to_vec();
@@ -5199,7 +6134,7 @@ async fn acquire_staged_leases_refuses_a_purged_staged_member() {
             assert_eq!(reason_version, 1);
         }
         other => panic!(
-            "expected STAGED_LEASE_MEMBER_NOT_STAGED for a purged staged epoch, got {other:?}"
+            "expected STAGED_LEASE_MEMBER_NOT_STAGED while staged payload purge is pending, got {other:?}"
         ),
     }
 }
@@ -5295,7 +6230,7 @@ async fn acquire_staged_leases_admits_a_quarantined_staged_member() {
     let lease = coordinator
         .acquire_staged_leases(&lease_id, &[(hash.clone(), staged_epoch)], deadline)
         .await
-        .expect("a quarantined staged epoch must still admit a lease");
+        .expect("a quarantined staged epoch behind a readable head remains leasable");
     assert_eq!(lease.members, vec![(hash, staged_epoch)]);
 }
 
@@ -5319,8 +6254,11 @@ async fn acquire_staged_leases_refuses_a_member_whose_fragment_was_obliterated_a
     let coordinator = store.fragment_coordinator();
     let direct = client(&url).await;
     let deadline = microsecond_deadline(Duration::from_secs(60));
+    enable_write_claims(&url, &coordinator).await;
 
     let hash = random_hash();
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
     let BeginOutcome::Admitted(stage_intent) =
         coordinator.begin_stage(&hash).await.expect("begin stage")
     else {
@@ -5331,7 +6269,7 @@ async fn acquire_staged_leases_refuses_a_member_whose_fragment_was_obliterated_a
             .commit_staged(
                 &stage_intent,
                 IoObservation::Valid(manifest(
-                    "obliterated-after-promotion/staged",
+                    &staged_key(&hash, stage_intent.epoch),
                     0x93,
                     EpochAuthority::Staged
                 ))
@@ -5353,29 +6291,32 @@ async fn acquire_staged_leases_refuses_a_member_whose_fragment_was_obliterated_a
         coordinator
             .commit_promotion(
                 &promotion_intent,
-                IoObservation::Valid(manifest(
-                    "obliterated-after-promotion/promoted",
-                    0x94,
-                    EpochAuthority::Remote
-                ))
+                IoObservation::Valid(manifest(&legacy_key(&hash), 0x94, EpochAuthority::Remote))
             )
             .await
             .expect("commit promotion"),
         CommitVerdict::Published
     );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate promoted fragment"),
+        CommitVerdict::Published
+    );
 
-    let BeginOutcome::Admitted(obliterate_intent) = coordinator
-        .begin_obliterate(&hash)
+    let FragmentObliterateBegin::Ready(obliterate_intent) = coordinator
+        .begin_obliterate(&hash, &repository_id, &context)
         .await
         .expect("begin obliterate")
     else {
-        panic!("a readable (Remote) head must admit begin_obliterate");
+        panic!("the sole association must own promoted obliterate");
     };
     assert_eq!(
         coordinator
-            .commit_obliterate(&obliterate_intent)
+            .commit_obliterate_children(&obliterate_intent)
             .await
-            .expect("commit obliterate"),
+            .expect("commit child discovery"),
         CommitVerdict::Published
     );
 
@@ -5407,8 +6348,8 @@ async fn acquire_staged_leases_refuses_a_member_whose_fragment_was_obliterated_a
         .get(0);
     assert_eq!(
         head_state,
-        FragmentLifecycleState::Tombstoned.bits(),
-        "the head must be Tombstoned once obliterate publishes"
+        FragmentLifecycleState::DeletingPayload.bits(),
+        "the head must refuse leases while awaiting exact payload purge"
     );
 
     let lease_id = rand::random::<[u8; 16]>().to_vec();
@@ -5449,8 +6390,8 @@ async fn acquire_staged_leases_refuses_a_member_whose_fragment_was_obliterated_a
     assert_eq!(member_rows, 0, "a refused lease must persist no member row");
 }
 
-/// P1-A's mid-flight half: `begin_obliterate` alone (no `commit_obliterate`)
-/// leaves the head `DeletingPayload`, not yet `Tombstoned`. The head check in
+/// P1-A's mid-flight half: `begin_obliterate` alone (no children commit)
+/// leaves the head `DeletingChildren`. The head check in
 /// `lock_lease_member_heads` refuses on `state.is_deleting()`, a separate
 /// branch from the `Tombstoned` equality check the sibling cases exercise --
 /// this is the only case in the file that reaches it.
@@ -5464,8 +6405,11 @@ async fn acquire_staged_leases_refuses_a_member_whose_head_is_mid_deletion() {
     let coordinator = store.fragment_coordinator();
     let direct = client(&url).await;
     let deadline = microsecond_deadline(Duration::from_secs(60));
+    enable_write_claims(&url, &coordinator).await;
 
     let hash = random_hash();
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
     let BeginOutcome::Admitted(stage_intent) =
         coordinator.begin_stage(&hash).await.expect("begin stage")
     else {
@@ -5476,7 +6420,7 @@ async fn acquire_staged_leases_refuses_a_member_whose_head_is_mid_deletion() {
             .commit_staged(
                 &stage_intent,
                 IoObservation::Valid(manifest(
-                    "mid-deletion-member/staged",
+                    &staged_key(&hash, stage_intent.epoch),
                     0x95,
                     EpochAuthority::Staged
                 ))
@@ -5486,13 +6430,20 @@ async fn acquire_staged_leases_refuses_a_member_whose_head_is_mid_deletion() {
         CommitVerdict::Published
     );
     let staged_epoch = stage_intent.epoch;
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate staged fragment"),
+        CommitVerdict::Published
+    );
 
-    let BeginOutcome::Admitted(_obliterate_intent) = coordinator
-        .begin_obliterate(&hash)
+    let FragmentObliterateBegin::Ready(_obliterate_intent) = coordinator
+        .begin_obliterate(&hash, &repository_id, &context)
         .await
         .expect("begin obliterate")
     else {
-        panic!("a readable (Staged) head must admit begin_obliterate");
+        panic!("the sole association must own staged obliterate");
     };
     // Deliberately no commit_obliterate: the head must be DeletingPayload, not
     // yet Tombstoned, so this case reaches `is_deleting()` rather than the
@@ -5507,8 +6458,8 @@ async fn acquire_staged_leases_refuses_a_member_whose_head_is_mid_deletion() {
         .get(0);
     assert_eq!(
         head_state,
-        FragmentLifecycleState::DeletingPayload.bits(),
-        "begin_obliterate alone must leave the head DeletingPayload, not Tombstoned"
+        FragmentLifecycleState::DeletingChildren.bits(),
+        "begin_obliterate alone must leave the head in child discovery"
     );
 
     let lease_id = rand::random::<[u8; 16]>().to_vec();

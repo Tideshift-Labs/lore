@@ -181,6 +181,34 @@ async fn rebuild_postgres_metering(settings: &Settings) -> Result<u64> {
     let plugin_config =
         resolve_plugin_config_with_fallback(&settings.plugins, mode, "immutable_store")
             .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+    let fragment_provider_enabled = plugins::postgres::fragment_provider_enabled(&plugin_config)
+        .map_err(|error| anyhow!("Invalid Postgres immutable store configuration: {error}"))?;
+    if fragment_provider_enabled {
+        // Validate the exact five-pool inventory before opening even the
+        // provider-free domain pool. This is the same activation invariant as
+        // normal server boot, but the validated value is deliberately not used
+        // to construct S3, a provider gateway, or an object-dispatch client.
+        let process_pool_inventory = postgres_fragment_process_pool_inventory(settings)?
+            .ok_or_else(|| anyhow!("enabled fragment_provider has no process pool inventory"))?;
+        let _validated_process_pool_inventory = process_pool_inventory
+            .validate()
+            .map_err(|error| anyhow!("Invalid Postgres process pool inventory: {error}"))?;
+        let configured_domain = crate::domain::configure_domain_context(settings).await?;
+        let coordinator = configured_domain.fragment_coordinator.ok_or_else(|| {
+            anyhow!(
+                "enabled fragment_provider requires the Postgres fragment lifecycle coordinator"
+            )
+        })?;
+        return coordinator
+            .rebuild_metering_projection()
+            .await
+            .map_err(|error| {
+                anyhow!("Failed to rebuild Postgres lifecycle metering projection: {error}")
+            });
+    }
+
+    // The absent/disabled route keeps the legacy construction and provider
+    // metadata rebuild unchanged.
     let store = plugins::postgres::connect_immutable_store(&plugin_config, None)
         .await
         .map_err(|e| anyhow!("Failed to create Postgres immutable store: {e}"))?;

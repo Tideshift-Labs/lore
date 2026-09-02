@@ -778,6 +778,7 @@ pub(crate) async fn connect_immutable_store(
                 ProviderCapabilities::none(),
                 in_flight_puts,
                 fragment_provider.provider_late_effect_bound,
+                fragment_provider.provider_write_authority_revision,
             ),
         )
         .await

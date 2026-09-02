@@ -49,6 +49,7 @@ $setupError = $null
 $inventory = @(
     [pscustomobject]@{
         Package       = 'lore-postgres'
+        Kind          = 'test'
         Target        = 'domain_fragment_lifecycle'
         Exact         = $true
         ExactPrefixes = @()
@@ -58,6 +59,8 @@ $inventory = @(
             'durable_write_claims_bind_replay_authorize_settle_and_expiry_to_database_state',
             'write_capability_cutover_is_exact_idempotent_and_database_attested',
             'claim_inventory_and_prune_preserve_cleanup_targets_and_bound_terminal_deletion',
+            'obliterate_retains_an_old_ambiguous_target_across_missing_repair_and_new_epoch',
+            'unexpired_ambiguous_claim_blocks_exact_obliterate_before_children_can_advance',
             'prune_normalizes_expired_prepared_to_targetless_no_send_and_honors_batch_limit',
             'write_claim_head_lock_precedes_claim_insert_and_moved_lineage_refuses_send',
             'write_claim_acl_denies_public_and_retains_owner_access',
@@ -67,13 +70,19 @@ $inventory = @(
             'a_blocked_io_phase_does_not_hold_the_one_connection_pool',
             'two_independently_constructed_coordinators_race_one_fresh_head_and_exactly_one_wins',
             'a_replayed_direct_write_reuses_exact_claim_and_terminal_attempt_cannot_publish_twice',
-            'a_stale_witness_from_a_competing_obliterate_fences_a_late_commit_with_zero_mutation',
+            'a_foreign_obliterate_cannot_fence_an_unassociated_preparing_write',
             'a_prepared_repair_blocks_a_competitor_and_no_send_attempt_cannot_publish_late',
             'a_readable_to_unreadable_transition_bumps_every_live_associated_repository_atomically',
             'two_concurrent_transitions_over_an_overlapping_fanout_do_not_deadlock',
             'an_absent_fragment_schema_routes_legacy_but_a_partial_one_is_refused',
             'a_repair_on_a_missing_fragment_with_a_live_association_bumps_its_repository_fanout',
             'an_obliterate_on_a_readable_fragment_with_a_live_association_bumps_its_repository_fanout',
+            'exact_obliterate_is_foreign_safe_and_retires_only_one_shared_association',
+            'obliterate_requires_claims_cutover_and_exact_provider_authority_revision',
+            'missing_without_epoch_evidence_still_enters_safe_exact_deletion',
+            'noncanonical_epoch_object_key_is_refused_before_delete_ownership_is_published',
+            'noncanonical_claim_object_key_is_refused_before_delete_ownership_is_published',
+            'missing_without_epoch_evidence_reconstructs_the_exact_staged_cleanup_target',
             'readiness_reports_zero_unresolved_rows_for_a_preparing_head_and_a_missing_head',
             'a_promotion_round_trip_allocates_a_new_epoch_and_publishes_under_remote_authority',
             # INV-EF P1-2/P1-3: the six previously-untested public entry points.
@@ -99,7 +108,7 @@ $inventory = @(
             'a_duplicate_staged_lease_id_replays_the_existing_lease_and_refuses_a_different_batch',
             # Pre-Phase-5 hardening review: the DISPOSITION_PURGED clause (both directions) and
             # validate_lease_members' duplicate-hash/empty-batch refusals.
-            'acquire_staged_leases_refuses_a_purged_staged_member',
+            'acquire_staged_leases_refuses_a_staged_member_awaiting_exact_payload_purge',
             'acquire_staged_leases_admits_a_quarantined_staged_member',
             # WP-118 fix-round hardening review: lock_lease_member_heads's Tombstoned/deleting head
             # check (one epoch deeper than the disposition guard alone) and its FOR SHARE
@@ -108,8 +117,8 @@ $inventory = @(
             'acquire_staged_leases_refuses_a_member_whose_head_is_mid_deletion',
             'acquire_staged_leases_waits_for_a_concurrently_locked_head',
             'acquire_staged_leases_refuses_a_duplicate_hash_batch_and_an_empty_batch',
-            'commit_obliterate_purges_the_epoch_disposition_deletes_metering_and_tombstones_the_head',
-            'commit_obliterate_fences_a_stale_intent_and_mutates_nothing',
+            'commit_obliterate_children_retains_payload_evidence_until_exact_purge_proof',
+            'obliterate_retry_recovers_exact_ownership_and_late_children_commit_is_fenced',
             'enable_lifecycle_refuses_on_a_not_ready_cell_and_succeeds_once_ready',
             'enable_lifecycle_refuses_with_the_roll_forward_diagnostic_when_schema_version_exceeds_the_binary',
             'abandon_promotion_leaves_the_head_staged_and_readable_and_moves_no_repository_lifecycle_generation',
@@ -119,15 +128,26 @@ $inventory = @(
             'guarded_association_cannot_race_mark_missing_into_a_successful_residue',
             # INV-EF P1-1: the begin_obliterate fanout race (fixed at 76033cb).
             'a_concurrent_create_association_landing_between_the_plan_and_the_head_lock_is_refused_with_zero_mutation',
-            'begin_obliterate_on_a_non_readable_head_moves_the_association_scalar_for_every_live_associated_repository'
+            'exact_obliterate_of_a_shared_non_readable_head_retires_only_the_requested_association'
+            'lifecycle_metering_rebuild_is_exact_removes_stale_rows_and_is_idempotent'
+            'lifecycle_metering_rebuild_serializes_behind_an_inflight_epoch_writer_without_deadlock'
         )
     },
     [pscustomobject]@{
         Package       = 'lore-postgres'
+        Kind          = 'test'
         Target        = 'domain_migration_parity'
         Exact         = $true
         ExactPrefixes = @()
         Cases         = @('migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs')
+    },
+    [pscustomobject]@{
+        Package       = 'lore-postgres'
+        Kind          = 'lib'
+        Target        = 'lib'
+        Exact         = $false
+        ExactPrefixes = @('store::immutable_store::tests::exact_purge_proofs_')
+        Cases         = @('store::immutable_store::tests::exact_purge_proofs_are_required_before_payload_tombstone')
     }
 )
 
@@ -136,6 +156,7 @@ $results = @(
         foreach ($testName in $target.Cases) {
             [pscustomobject]@{
                 Package = $target.Package
+                Kind    = $target.Kind
                 Target  = $target.Target
                 Test    = $testName
                 Status  = 'NOT RUN'
@@ -179,7 +200,10 @@ function Get-TestCatalog {
         [Parameter(Mandatory)]
         [string]$Package,
         [Parameter(Mandatory)]
-        [string]$Target
+        [string]$Target,
+        [Parameter(Mandatory)]
+        [ValidateSet('test', 'lib')]
+        [string]$Kind
     )
 
     Push-Location $loreRoot
@@ -189,7 +213,8 @@ function Get-TestCatalog {
         # warnings are evidence output, not runner setup failures; the native exit code remains the
         # authority for success.
         $ErrorActionPreference = 'Continue'
-        $listArgs = @('test', '-p', $Package, '--test', $Target, '--', '--ignored', '--list')
+        $targetArgs = if ($Kind -eq 'lib') { @('--lib') } else { @('--test', $Target) }
+        $listArgs = @('test', '-p', $Package) + $targetArgs + @('--', '--ignored', '--list')
         $output = & cargo @listArgs 2>&1 | Out-String
         $exitCode = $LASTEXITCODE
     }
@@ -213,8 +238,8 @@ function Get-TestCatalog {
 
 function Assert-ExpectedCatalog {
     foreach ($target in $inventory) {
-        $catalog = @(Get-TestCatalog -Package $target.Package -Target $target.Target)
-        $label = "$($target.Package)/$($target.Target)"
+        $catalog = @(Get-TestCatalog -Package $target.Package -Target $target.Target -Kind $target.Kind)
+        $label = "$($target.Package)/$($target.Kind):$($target.Target)"
         $missing = @($target.Cases | Where-Object { $_ -notin $catalog })
         if ($missing.Count -ne 0) {
             throw "$label is missing pinned cases: [$($missing -join ', ')]"
@@ -338,8 +363,13 @@ try {
             $priorErrorAction = $ErrorActionPreference
             try {
                 $ErrorActionPreference = 'Continue'
-                $cargoArgs = @(
-                    'test', '-p', $result.Package, '--test', $result.Target,
+                $targetArgs = if ($result.Kind -eq 'lib') {
+                    @('--lib')
+                }
+                else {
+                    @('--test', $result.Target)
+                }
+                $cargoArgs = @('test', '-p', $result.Package) + $targetArgs + @(
                     '--', '--ignored', '--exact', $result.Test, '--test-threads=1'
                 )
                 $output = & cargo @cargoArgs 2>&1 | Out-String
