@@ -90,6 +90,7 @@ pub mod traits;
 pub mod aws;
 pub mod hashicorp;
 pub mod postgres;
+pub mod remote_notification;
 
 // Re-export commonly used items at the module level
 pub use registry::PluginRegistry;
@@ -129,4 +130,5 @@ pub fn register_all_plugins(registry: &mut PluginRegistry) {
     aws::register(registry);
     hashicorp::register(registry);
     postgres::register(registry);
+    remote_notification::register(registry);
 }

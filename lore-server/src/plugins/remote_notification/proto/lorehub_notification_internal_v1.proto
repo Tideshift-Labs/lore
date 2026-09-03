@@ -1,0 +1,176 @@
+// Copyright 2026 Tideshift Labs
+// SPDX-License-Identifier: MIT
+
+// FORK-LOCAL (Tideshift, CR-027 / WP-111). PRIVATE notification-plane contract
+// between a loreserver cell and its Lorehub notification gateway. This is NOT
+// part of Lore's public wire surface: no CLI, client crate, or desktop consumer
+// links against it, and it must never be added to `lore-proto`'s public proto
+// set. If upstream ever adds a `lorehub.*` or `*.notification.internal.*`
+// package, reconcile the package name, the message and enum tags, and the
+// pinned method path below before regenerating.
+//
+// Pinned method path:
+//   /lorehub.notification.internal.v1.PrivateNotificationService/Publish
+//
+// PIN(WP-111): the notification-plane contract
+// (lorehub/docs/contracts/lore-notification-plane.md) freezes the private
+// envelope's FIELD SEMANTICS and BOUNDS, but its conformance fixtures state
+// that "the private envelope's concrete schema artifact and field numbering are
+// WP-110 Phase 1 work"; only the Phase 0 StreamReset messages carry pinned
+// field numbers today. Everything below is therefore this component's
+// conservative reading, chosen to mirror the frozen StreamReset schema's
+// conventions: package `lorehub.notification.internal.v1`, `V1`-suffixed
+// message names, an explicit `*_UNSPECIFIED = 0` on every enum, and field order
+// following the contract's own field tables. WP-110 Phase 1 supersedes it.
+//
+// This file is a reviewed source-of-record artifact. It is NOT compiled by
+// `build.rs`: `protoc` is optional in this workspace, and `lore-server`'s build
+// script is common WP-119 territory. `wire.rs` is the hand-maintained
+// prost/tonic transcription of exactly this schema, and the tests in that
+// module pin the two together.
+
+syntax = "proto3";
+
+package lorehub.notification.internal.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Delivery class of one private envelope. The class selects the body and the
+// subject suffix (`.live`, `.durable`, `.shadow`).
+enum DeliveryClassV1 {
+  DELIVERY_CLASS_V1_UNSPECIFIED = 0;
+  LIVE_HINT = 1;
+  DURABLE_INVALIDATION = 2;
+  SHADOW_OBSERVATION = 3;
+}
+
+// Monotonic ordinal plus an optional opaque identity component. Two versions
+// are comparable only within one (event_kind, aggregate_kind,
+// aggregate_identity); any other pair is incomparable and forces an
+// authoritative refetch rather than an ordering decision.
+message AggregateVersionV1 {
+  uint64 ordinal = 1;
+  // At most 128 UTF-8 bytes. Empty means absent.
+  string identity = 2;
+}
+
+// The DURABLE_INVALIDATION body. It originates only from a committed CR-032
+// outbox row and carries that row's stable keys.
+message DurableInvalidationBodyV1 {
+  uint32 payload_version = 1;
+  // Exactly 32 raw bytes (BLAKE3 over CR-032's canonical tuple).
+  bytes idempotency_key = 2;
+  // At most 64 UTF-8 bytes. The VALUE SET is deferred by contract amendment
+  // A-13 to producer-package sign-off; only the width is pinned.
+  string event_kind = 3;
+  uint64 repository_generation = 4;
+  // At most 64 UTF-8 bytes. Value set deferred by A-13, width pinned.
+  string aggregate_kind = 5;
+  // At most 256 UTF-8 bytes.
+  string aggregate_identity = 6;
+  AggregateVersionV1 aggregate_version = 7;
+  // Bounded identity/version projection, at most 65536 bytes. Never repository
+  // content, secrets, subjects, unbounded paths, or unbounded resource lists.
+  bytes payload = 8;
+  // Diagnostic commit timestamp. Never ordering authority.
+  google.protobuf.Timestamp committed_at = 9;
+  // At most 256 UTF-8 bytes. Empty means absent; present only when the owning
+  // mutation already resolved a trusted actor.
+  string actor = 10;
+}
+
+// Private envelope, transport version 1.
+message PrivateEnvelopeV1 {
+  // Exactly 1 for this contract version.
+  uint32 transport_version = 1;
+  // Matches ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$, at most 63 bytes.
+  string cell_id = 2;
+  // The publication authority the producer expects to still hold.
+  uint64 placement_epoch = 3;
+  // Stable UUID, exactly 16 raw bytes, reused for every retry of one logical
+  // publication.
+  bytes event_id = 4;
+  // Exactly 16 raw repository bytes (lore_base::types::Partition). The
+  // lowercase hex form appears only in the subject. An all-zero repository is
+  // invalid.
+  bytes repository = 5;
+  DeliveryClassV1 delivery_class = 6;
+  // Bounded opaque diagnostic value, at most 128 UTF-8 bytes. Never authority
+  // and never a metric label.
+  string producer_instance_id = 7;
+  // UTC diagnostic timestamp. Never ordering authority.
+  google.protobuf.Timestamp produced_at = 8;
+
+  // Exactly one body, and it must agree with delivery_class: LIVE_HINT and
+  // SHADOW_OBSERVATION carry lore_event; DURABLE_INVALIDATION carries
+  // durable_invalidation.
+  oneof body {
+    // The serialized public `lore.notification.Event`. Carried as opaque bytes
+    // so this private contract does not import the public schema and cannot
+    // drift it. Its `repository` field must equal every common and subject
+    // repository.
+    bytes lore_event = 9;
+    DurableInvalidationBodyV1 durable_invalidation = 10;
+  }
+}
+
+// Outcome class of one Publish attempt.
+enum PublishOutcomeV1 {
+  PUBLISH_OUTCOME_V1_UNSPECIFIED = 0;
+  // The broker acknowledged. Acceptance evidence fields are required.
+  ACCEPTED = 1;
+  // Retry with the same stable keys and bounded jittered backoff.
+  RETRYABLE = 2;
+  // The publish deadline elapsed with no broker answer. The broker may or may
+  // not have accepted; never fabricate acceptance.
+  TIMEOUT = 3;
+  // Event-specific and not retryable under the current contract version.
+  TERMINAL = 4;
+}
+
+// Failure class, set only when outcome is RETRYABLE or TERMINAL.
+enum PublishFailureClassV1 {
+  PUBLISH_FAILURE_CLASS_V1_UNSPECIFIED = 0;
+  // RETRYABLE classes.
+  BROKER_UNAVAILABLE = 1;
+  PLACEMENT_QUIESCING = 2;
+  STREAM_FULL = 3;
+  // TERMINAL classes.
+  SCOPE_MISMATCH = 4;
+  UNSUPPORTED_SCHEMA = 5;
+}
+
+// Result of one Publish attempt. A result that does not prove broker acceptance
+// under this pinned transport version leaves the caller's intent pending.
+message PublishResultV1 {
+  // Exactly 1. A response carrying 0 or any other value is unversioned and
+  // never proves acceptance.
+  uint32 transport_version = 1;
+  PublishOutcomeV1 outcome = 2;
+  // Echoed from the envelope so a relay can match a late response to its claim.
+  bytes event_id = 3;
+  // Acceptance evidence. Required and non-default when outcome is ACCEPTED.
+  string stream_identity = 4;
+  uint64 stream_epoch = 5;
+  // The JetStream sequence assigned within (stream_identity, stream_epoch).
+  uint64 broker_sequence = 6;
+  // The pinned private contract version the gateway served.
+  uint32 publisher_contract_version = 7;
+  // Diagnostic timestamp. Never ordering authority.
+  google.protobuf.Timestamp broker_accepted_at = 8;
+  PublishFailureClassV1 failure_class = 9;
+}
+
+// The private gateway's publication service. Authenticated by the cell's
+// private mTLS identity; the gateway maps that identity to exactly one cell and
+// role. Never exposed to a desktop client.
+service PrivateNotificationService {
+  // Publishes one private envelope. The gateway waits for JetStream
+  // acknowledgement before returning ACCEPTED.
+  rpc Publish (PrivateEnvelopeV1) returns (PublishResultV1);
+}
+
+// TODO(WP-111 Phase 3): the durable receiver attaches here. WP-110 owns the
+// receiver-side stream (subscription, delivery, acknowledgement) and WP-119
+// owns /lorehub.notification.internal.v1.StreamResetService, which this
+// component consumes but does not host. Neither is vendored this round.

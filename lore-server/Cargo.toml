@@ -28,6 +28,12 @@ opentelemetry = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 parking_lot = { workspace = true }
 pin-project = { workspace = true }
+# CR-027/WP-111 hand-transcribes the PRIVATE notification protobuf under
+# `plugins/remote_notification/` rather than generating it, because `protoc` is
+# optional in this workspace and `build.rs` is common WP-119 wiring. That needs
+# prost's derives directly; `prost-types` alone only supplies the well-known
+# types.
+prost = { workspace = true }
 prost-types = { workspace = true }
 quinn = { workspace = true }
 rand = { workspace = true }
