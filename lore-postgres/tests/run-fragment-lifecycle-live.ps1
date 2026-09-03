@@ -156,6 +156,19 @@ $inventory = @(
             'characterize_same_repo_association_traffic_push_aborts'
             'shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increasing_fanout'
             'create_association_if_current_bumps_the_association_generation_on_every_admitted_copy'
+            # WP-118 backfill cursor. NOT Phase 8, which remains stopped on a real staging cell:
+            # `advance_backfill_cursor` exists so WP-109 Phase 2's schema-backfill race has a site
+            # a deterministic barrier can sit inside. These pin the guarded stop surviving a moved
+            # cursor, the exactly-three-column write set (never `verified_fragments`), the two
+            # pre-scan refusals, and cursor resumability.
+            'backfill_cursor_advance_cannot_reach_cutover_readiness_or_the_enable_gate'
+            'backfill_cursor_advance_writes_only_three_columns_of_the_schema_state_row'
+            'backfill_cursor_refuses_an_out_of_range_batch_and_a_database_with_no_legacy_key_space'
+            'backfill_cursor_resumes_strictly_after_its_stored_position_and_never_regresses_to_null'
+            # The `backfill.advance.locked` anchor's own scenario, driven without the failpoint
+            # mechanism: the singleton's FOR UPDATE orders two contending passes rather than
+            # letting one win and the other no-op.
+            'two_concurrent_cursor_advances_serialise_and_each_resumes_after_the_other'
         )
     },
     [pscustomobject]@{

@@ -48,6 +48,7 @@ use lore_postgres::domain::fragments::FragmentWriteClaimPruneReport;
 use lore_postgres::domain::fragments::FragmentWriteClaimState;
 use lore_postgres::domain::fragments::FragmentWriteSettlement;
 use lore_postgres::domain::fragments::IoObservation;
+use lore_postgres::domain::fragments::MAX_FRAGMENT_BACKFILL_CURSOR_BATCH;
 use lore_postgres::domain::fragments::MAX_LIFECYCLE_GENERATION_FANOUT;
 use lore_postgres::domain::fragments::MAX_PUSH_FRAGMENT_REVALIDATIONS;
 use lore_postgres::domain::fragments::MissingDiagnostic;
@@ -9656,4 +9657,774 @@ async fn characterize_same_repo_association_traffic_push_aborts() {
          or the contract changed",
         samples.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// WP-118 backfill cursor (`advance_backfill_cursor`)
+//
+// **These cases are not Phase 8.** Phase 8 is WP-118's rollout gate and it
+// remains stopped on a real staging cell. `advance_backfill_cursor` exists
+// because WP-109's Phase 2 races include a schema backfill and WP-118's path
+// had no code a deterministic barrier could sit inside; it moves a cursor and a
+// counter on one singleton row and nothing else. A live `backfill_state` of
+// `BACKFILL_RUNNING` means this cursor moved. It does **not** mean a backfill
+// ran, and nothing below should be read as evidence that one did.
+// ---------------------------------------------------------------------------
+
+/// The legacy CR-007 key space the cursor reads. `store/immutable_store.rs`
+/// owns and self-bootstraps these tables in production; a coordinator-only
+/// fixture has never constructed them, which is exactly the absence the
+/// cursor's `to_regclass` probe exists to classify.
+const BACKFILL_LEGACY_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS lore_fragments (
+    hash       bytea NOT NULL,
+    repository bytea NOT NULL,
+    context    bytea NOT NULL,
+    PRIMARY KEY (hash, repository, context)
+);
+CREATE TABLE IF NOT EXISTS lore_fragment_state (
+    hash  bytea  NOT NULL PRIMARY KEY,
+    state bigint NOT NULL CHECK (state IN (0, 1, 256, 512))
+);
+CREATE TABLE IF NOT EXISTS lore_fragment_metering (
+    hash          bytea  NOT NULL PRIMARY KEY,
+    payload_flags bigint NOT NULL CHECK (payload_flags >= 0 AND payload_flags <= 4294967295),
+    size_payload bigint NOT NULL CHECK (size_payload >= 0),
+    size_content bigint NOT NULL CHECK (size_content >= 0)
+);
+";
+
+/// Every relation whose contents must be unchanged by a cursor advance, plus
+/// the one relation that may change.
+///
+/// `lore_domain_schema_state` is here for a specific reason and must not be
+/// dropped as an unrelated table. It is WP-116's singleton, and
+/// `domain/backfill.rs` writes an almost identical statement against it --
+/// `UPDATE ... SET backfill_state = $1 ... WHERE id = 1 AND backfill_state IN
+/// ($3, $1)` -- over columns of the same names. Two near-identical singletons
+/// carrying two near-identical statements is exactly the shape a copy-paste
+/// onto the wrong table takes, and a "nothing else changed" assertion that
+/// omits the nearest miss cannot see the one defect it most needs to.
+///
+/// It is listed ahead of `lore_fragment_schema_state` deliberately: the
+/// comparison loop below reports the first relation that moved, so a
+/// mistargeted write names `lore_domain_schema_state` rather than failing on
+/// the intended row having stayed still.
+const BACKFILL_WATCHED_RELATIONS: [&str; 14] = [
+    "lore_fragment_lifecycle",
+    "lore_fragment_epochs",
+    "lore_fragment_associations",
+    "lore_fragment_lifecycle_metering",
+    "lore_fragment_write_claims",
+    "lore_fragment_staged_leases",
+    "lore_fragment_staged_lease_members",
+    "lore_domain_repositories",
+    "lore_domain_branches",
+    "lore_domain_schema_state",
+    "lore_fragments",
+    "lore_fragment_state",
+    "lore_fragment_metering",
+    "lore_fragment_schema_state",
+];
+
+/// One digest per watched relation, over every row rendered as text.
+///
+/// `t::text` renders every column including timestamps, so any write to any row
+/// of any watched relation moves that relation's digest. `ORDER BY t::text`
+/// makes the digest independent of physical row order.
+async fn backfill_snapshot(direct: &Client) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for relation in BACKFILL_WATCHED_RELATIONS {
+        let digest: String = direct
+            .query_one(
+                &format!(
+                    "SELECT coalesce(md5(string_agg(t::text, '|' ORDER BY t::text)), 'empty') \
+                       FROM {relation} t"
+                ),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|error| panic!("snapshot {relation}: {error}"))
+            .get(0);
+        out.push((relation.to_owned(), digest));
+    }
+    out
+}
+
+/// The singleton schema-state row as `column=value` lines, so a diff names the
+/// exact columns that moved rather than only that the row changed.
+async fn backfill_schema_state_columns(direct: &Client) -> Vec<String> {
+    let rendered: String = direct
+        .query_one(
+            "SELECT string_agg(pair.key || '=' || coalesce(pair.value, '<null>'), \
+                               chr(10) ORDER BY pair.key) \
+               FROM lore_fragment_schema_state t, jsonb_each_text(to_jsonb(t)) AS pair",
+            &[],
+        )
+        .await
+        .expect("render schema state row")
+        .get(0);
+    rendered.lines().map(str::to_owned).collect()
+}
+
+/// The durable cursor position as the row itself holds it.
+async fn stored_backfill_cursor(direct: &Client) -> Option<Vec<u8>> {
+    direct
+        .query_one(
+            "SELECT backfill_cursor FROM lore_fragment_schema_state WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("read stored cursor")
+        .get(0)
+}
+
+/// Fill every watched lifecycle relation with rows a cursor advance must not
+/// touch, so "unchanged" is a real claim rather than a statement about empty
+/// tables.
+async fn seed_backfill_lifecycle_rows(direct: &Client) {
+    let hash: Vec<u8> = vec![0x11; 32];
+    let manifest: Vec<u8> = vec![0x22; 32];
+    let repository: Vec<u8> = vec![0x33; 16];
+    let lease: Vec<u8> = vec![0x44; 16];
+    let request: Vec<u8> = vec![0x55; 16];
+    let attempt: Vec<u8> = vec![0x66; 16];
+
+    direct
+        .execute(
+            "INSERT INTO lore_domain_repositories \
+                 (repository_id, state, generation, name, metadata_hash, \
+                  default_branch_id, creation_fingerprint_version, \
+                  creation_fingerprint, created_at) \
+             VALUES ($1, 0, 1, 'wp118-backfill-cursor', $2, $3, 1, $2, \
+                     clock_timestamp())",
+            &[&repository, &manifest, &lease],
+        )
+        .await
+        .expect("seed repository");
+    direct
+        .execute(
+            "INSERT INTO lore_domain_branches \
+                 (repository_id, branch_id, repository_generation, state, generation, \
+                  name, metadata_hash, latest_hash, creation_fingerprint_version, \
+                  creation_fingerprint, created_at) \
+             VALUES ($1, $2, 1, 0, 1, 'wp118-backfill-cursor-branch', $3, $3, 1, $3, \
+                     clock_timestamp())",
+            &[&repository, &lease, &manifest],
+        )
+        .await
+        .expect("seed branch");
+    direct
+        .execute(
+            "INSERT INTO lore_fragment_lifecycle \
+                 (hash, current_epoch, state, manifest_id, last_fence) \
+             VALUES ($1, 1, 3, $2, 1)",
+            &[&hash, &manifest],
+        )
+        .await
+        .expect("seed lifecycle head");
+    direct
+        .execute(
+            "INSERT INTO lore_fragment_epochs \
+                 (hash, epoch, authority, object_key, manifest_id, size_payload, \
+                  size_content, decoded_hash, payload_flags, fence) \
+             VALUES ($1, 1, 1, 'backfill-cursor-object-key', $2, 10, 10, $2, 0, 1)",
+            &[&hash, &manifest],
+        )
+        .await
+        .expect("seed epoch");
+    direct
+        .execute(
+            "INSERT INTO lore_fragment_associations \
+                 (hash, repository_id, context, association_epoch, state, \
+                  repository_generation) \
+             VALUES ($1, $2, $3, 1, 0, 1)",
+            &[&hash, &repository, &b"backfill-cursor-context".to_vec()],
+        )
+        .await
+        .expect("seed association");
+    direct
+        .execute(
+            "INSERT INTO lore_fragment_lifecycle_metering \
+                 (hash, epoch, payload_flags, size_payload, size_content, authority) \
+             VALUES ($1, 1, 0, 10, 10, 1)",
+            &[&hash],
+        )
+        .await
+        .expect("seed lifecycle metering");
+    direct
+        .execute(
+            "INSERT INTO lore_fragment_write_claims \
+                 (logical_request_id, attempt_id, hash, epoch, fence, authority, \
+                  object_key, body_blake3, body_size, state, send_not_after, \
+                  hard_not_after, prepared_at) \
+             VALUES ($1, $2, $3, 1, 1, 2, 'backfill-cursor-object-key', $4, 10, 0, \
+                     clock_timestamp() + interval '1 hour', \
+                     clock_timestamp() + interval '2 hours', clock_timestamp())",
+            &[&request, &attempt, &hash, &manifest],
+        )
+        .await
+        .expect("seed write claim");
+    direct
+        .execute(
+            "INSERT INTO lore_fragment_staged_leases (lease_id, reader_fence, deadline) \
+             VALUES ($1, 1, clock_timestamp() + interval '1 hour')",
+            &[&lease],
+        )
+        .await
+        .expect("seed staged lease");
+    direct
+        .execute(
+            "INSERT INTO lore_fragment_staged_lease_members (lease_id, hash, epoch) \
+             VALUES ($1, $2, 1)",
+            &[&lease, &hash],
+        )
+        .await
+        .expect("seed staged lease member");
+}
+
+/// Install the legacy key space and seed `count` candidate keys, ascending by
+/// primary key, so the cursor has somewhere to go and a known order to go in.
+async fn seed_legacy_backfill_candidates(direct: &Client, count: u8) -> Vec<Vec<u8>> {
+    direct
+        .batch_execute(BACKFILL_LEGACY_SCHEMA)
+        .await
+        .expect("install legacy fragment schema");
+    let mut hashes = Vec::new();
+    for index in 1..=count {
+        let hash = vec![index; 32];
+        direct
+            .execute(
+                "INSERT INTO lore_fragment_state (hash, state) VALUES ($1, 1)",
+                &[&hash],
+            )
+            .await
+            .expect("seed legacy candidate");
+        direct
+            .execute(
+                "INSERT INTO lore_fragments (hash, repository, context) \
+                 VALUES ($1, $2, $3)",
+                &[&hash, &vec![0x77u8; 16], &b"legacy-context".to_vec()],
+            )
+            .await
+            .expect("seed legacy association");
+        direct
+            .execute(
+                "INSERT INTO lore_fragment_metering \
+                     (hash, payload_flags, size_payload, size_content) \
+                 VALUES ($1, 0, 10, 10)",
+                &[&hash],
+            )
+            .await
+            .expect("seed legacy metering");
+        hashes.push(hash);
+    }
+    hashes
+}
+
+/// The guarded stop survives a moved cursor, and it is held twice over: by the
+/// typed readiness/enable gates and, independently, by the DDL.
+///
+/// A cell whose cursor has moved sits at `BACKFILL_RUNNING`. It must still be
+/// unable to reach `BACKFILL_CUTOVER`, to report itself ready for lifecycle
+/// routing, or to have `lifecycle_enabled` written -- and the refusals must
+/// name the observed state rather than fail generically. This is what keeps a
+/// cursor mechanism from reading as rollout progress it is not.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn backfill_cursor_advance_cannot_reach_cutover_readiness_or_the_enable_gate() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let hashes = seed_legacy_backfill_candidates(&direct, 5).await;
+
+    let before = coordinator.readiness().await.expect("readiness before");
+    assert_eq!(before.backfill_state, schema::BACKFILL_NOT_STARTED);
+    assert!(!before.ready_for_lifecycle());
+
+    let advance = coordinator
+        .advance_backfill_cursor(3)
+        .await
+        .expect("advance cursor");
+    assert_eq!(advance.examined, 3, "batch limit bounds the pass");
+    assert_eq!(advance.cursor.as_deref(), Some(hashes[2].as_slice()));
+    assert!(!advance.exhausted, "a full batch proves nothing either way");
+
+    let row = direct
+        .query_one(
+            "SELECT backfill_state, backfill_cursor, verified_fragments, cutover_at, \
+                    lifecycle_enabled \
+               FROM lore_fragment_schema_state WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("read schema state");
+    let state: i16 = row.get("backfill_state");
+    let cursor: Option<Vec<u8>> = row.get("backfill_cursor");
+    let verified: i64 = row.get("verified_fragments");
+    let cutover: Option<SystemTime> = row.get("cutover_at");
+    let enabled: bool = row.get("lifecycle_enabled");
+    assert_eq!(state, schema::BACKFILL_RUNNING);
+    assert_ne!(state, schema::BACKFILL_CUTOVER);
+    assert_eq!(cursor.as_deref(), Some(hashes[2].as_slice()));
+    assert_eq!(verified, 0, "the cursor claims no verification");
+    assert!(cutover.is_none());
+    assert!(!enabled);
+
+    // The readiness gate refuses, and names the backfill state as the reason.
+    let after = coordinator.readiness().await.expect("readiness after");
+    assert_eq!(after.backfill_state, schema::BACKFILL_RUNNING);
+    assert!(!after.cutover_at_present);
+    assert!(
+        !after.ready_for_lifecycle(),
+        "a moved cursor must not make a cell ready for lifecycle routing"
+    );
+
+    // The enable gate refuses, and for the stated reason rather than any error.
+    match coordinator.enable_lifecycle().await {
+        Err(DomainError::NotReady(message)) => {
+            assert!(
+                message.contains(&format!("backfill_state={}", schema::BACKFILL_RUNNING)),
+                "refusal must name the observed backfill state: {message}"
+            );
+            assert!(
+                message.contains("requires a completed backfill"),
+                "refusal must be the completed-backfill gate: {message}"
+            );
+        }
+        other => panic!("enable_lifecycle must refuse with NotReady, got {other:?}"),
+    }
+
+    // The DDL refuses independently of the typed gate: a cutover marker or an
+    // enabled flag at a non-cutover state is unrepresentable, not merely
+    // unwritten.
+    let marker = direct
+        .execute(
+            "UPDATE lore_fragment_schema_state SET cutover_at = clock_timestamp() WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect_err("a cutover marker at BACKFILL_RUNNING must be rejected");
+    let marker_db = marker.as_db_error().expect("a database error");
+    assert_eq!(
+        marker_db.code().code(),
+        "23514",
+        "must be a CHECK violation"
+    );
+    assert_eq!(
+        marker_db.constraint(),
+        Some("lore_fragment_schema_cutover_shape"),
+        "must be the cutover-shape constraint"
+    );
+
+    let enable = direct
+        .execute(
+            "UPDATE lore_fragment_schema_state SET lifecycle_enabled = true WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect_err("enabling lifecycle at BACKFILL_RUNNING must be rejected");
+    let enable_db = enable.as_db_error().expect("a database error");
+    assert_eq!(
+        enable_db.code().code(),
+        "23514",
+        "must be a CHECK violation"
+    );
+    // `lore_fragment_schema_enable_shape` also forbids this row, but
+    // `lore_fragment_schema_cutover_shape`'s non-cutover arm already pins
+    // `lifecycle_enabled = false`, and PostgreSQL reports the first constraint
+    // that fails. The enable-shape name here is what a source read predicts and
+    // it is wrong against a real PostgreSQL 16: the guarded stop is held twice
+    // over at this state, and the cutover-shape arm is what a caller hits.
+    assert_eq!(
+        enable_db.constraint(),
+        Some("lore_fragment_schema_cutover_shape"),
+        "the cutover-shape arm is what forbids an enabled flag at a non-cutover state"
+    );
+
+    // A cell already past this window refuses rather than silently no-opping.
+    direct
+        .execute(
+            "UPDATE lore_fragment_schema_state SET backfill_state = $1 WHERE id = 1",
+            &[&schema::BACKFILL_VERIFIED],
+        )
+        .await
+        .expect("stage a verified cell");
+    match coordinator.advance_backfill_cursor(3).await {
+        Err(DomainError::NotReady(message)) => assert!(
+            message.contains("NOT_STARTED or RUNNING"),
+            "refusal must name the required window: {message}"
+        ),
+        other => panic!("a verified cell must refuse the cursor, got {other:?}"),
+    }
+}
+
+/// The write set is exactly three columns of one singleton row.
+///
+/// Run against a database holding live rows in every other fragment relation,
+/// so "byte-identical" is a claim about real rows. The non-empty guard below is
+/// not decorative: it fired on the implementation's first run, and without it a
+/// fixture that silently seeded nothing would report a vacuous pass.
+///
+/// `verified_fragments` is deliberately NOT in the write set. Nothing here
+/// verifies a fragment, so the counter named for verification must not move --
+/// this pins three columns, not four.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn backfill_cursor_advance_writes_only_three_columns_of_the_schema_state_row() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    seed_legacy_backfill_candidates(&direct, 4).await;
+    seed_backfill_lifecycle_rows(&direct).await;
+
+    // Every watched relation must actually hold rows, or "unchanged" is vacuous.
+    for relation in BACKFILL_WATCHED_RELATIONS {
+        let count: i64 = direct
+            .query_one(&format!("SELECT count(*)::bigint FROM {relation}"), &[])
+            .await
+            .unwrap_or_else(|error| panic!("count {relation}: {error}"))
+            .get(0);
+        assert!(
+            count > 0,
+            "{relation} must hold at least one row or this case proves nothing"
+        );
+    }
+
+    let before = backfill_snapshot(&direct).await;
+    let before_columns = backfill_schema_state_columns(&direct).await;
+    // A distinguishable clock gap, so `updated_at` genuinely moves.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let advance = coordinator
+        .advance_backfill_cursor(2)
+        .await
+        .expect("advance cursor");
+    assert_eq!(advance.examined, 2);
+
+    let after = backfill_snapshot(&direct).await;
+    let after_columns = backfill_schema_state_columns(&direct).await;
+
+    for ((relation, before_digest), (_, after_digest)) in before.iter().zip(after.iter()) {
+        if relation == "lore_fragment_schema_state" {
+            assert_ne!(
+                before_digest, after_digest,
+                "the schema-state row must have changed, or this case raced nothing"
+            );
+        } else {
+            assert_eq!(
+                before_digest, after_digest,
+                "{relation} must be byte-identical across a cursor advance"
+            );
+        }
+    }
+
+    let moved: Vec<&String> = after_columns
+        .iter()
+        .filter(|line| !before_columns.contains(line))
+        .collect();
+    let mut moved_names: Vec<&str> = moved
+        .iter()
+        .map(|line| line.split('=').next().unwrap_or(line))
+        .collect();
+    moved_names.sort_unstable();
+    assert_eq!(
+        moved_names,
+        vec!["backfill_cursor", "backfill_state", "updated_at"],
+        "exactly three columns of the singleton row may move; got {moved:?}"
+    );
+}
+
+/// Both refusals that precede any candidate read: the batch bound, and a
+/// database with no legacy key space.
+///
+/// The accepted upper boundary is exercised too, so the range guard is pinned
+/// as inclusive rather than only as "large values are rejected" -- `1..=MAX`
+/// and `1..MAX` are indistinguishable without it.
+///
+/// The legacy-absence arm is why `to_regclass` is probed at all: a
+/// coordinator-only fixture never constructed `lore_fragment_state`, and the
+/// caller must see a typed `NotReady` naming the missing key space rather than
+/// a raw `42P01` out of the candidate scan, which would read as damage.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn backfill_cursor_refuses_an_out_of_range_batch_and_a_database_with_no_legacy_key_space() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+
+    for rejected in [0, MAX_FRAGMENT_BACKFILL_CURSOR_BATCH + 1, u32::MAX] {
+        match coordinator.advance_backfill_cursor(rejected).await {
+            Err(DomainError::InvalidInput(message)) => assert!(
+                message.contains(&format!(
+                    "between 1 and {MAX_FRAGMENT_BACKFILL_CURSOR_BATCH}"
+                )),
+                "batch {rejected} must be refused naming the bound: {message}"
+            ),
+            other => panic!("batch {rejected} must be InvalidInput, got {other:?}"),
+        }
+    }
+
+    // Both accepted boundaries clear the range guard and reach the next one.
+    // Without this the case could not tell an inclusive bound from an exclusive
+    // one, since every value it rejects is outside both.
+    for accepted in [1, MAX_FRAGMENT_BACKFILL_CURSOR_BATCH] {
+        match coordinator.advance_backfill_cursor(accepted).await {
+            Err(DomainError::NotReady(message)) => {
+                assert!(
+                    message.contains("lore_fragment_state"),
+                    "an absent legacy key space must be named: {message}"
+                );
+                assert!(
+                    !message.contains("42P01"),
+                    "the absence must be classified, not a raw relation-missing SQLSTATE: \
+                     {message}"
+                );
+            }
+            other => panic!(
+                "batch {accepted} must clear the range guard and refuse on the absent legacy \
+                 key space, got {other:?}"
+            ),
+        }
+    }
+
+    // A refusal leaves the cell where it was. The method's UPDATE is reachable
+    // on the accepting path, so this discriminates against an implementation
+    // that stamped RUNNING before checking its prerequisites.
+    let row = direct
+        .query_one(
+            "SELECT backfill_state, backfill_cursor FROM lore_fragment_schema_state WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("read schema state");
+    let state: i16 = row.get("backfill_state");
+    let cursor: Option<Vec<u8>> = row.get("backfill_cursor");
+    assert_eq!(
+        state,
+        schema::BACKFILL_NOT_STARTED,
+        "a refused pass must not move the backfill state"
+    );
+    assert!(
+        cursor.is_none(),
+        "a refused pass must not stamp a cursor position"
+    );
+
+    // Install the key space and change nothing else about the call: the same
+    // batch that was refused now advances, proving the refusal was the absent
+    // table and not the batch value.
+    seed_legacy_backfill_candidates(&direct, 1).await;
+    let advance = coordinator
+        .advance_backfill_cursor(1)
+        .await
+        .expect("the same batch advances once the legacy key space exists");
+    assert_eq!(advance.examined, 1);
+}
+
+/// The cursor is resumable and monotonic: each pass starts strictly after the
+/// stored position, and an empty pass never regresses it to `NULL`.
+///
+/// The exact per-pass cursor values are what discriminate. A `hash >= $1` scan
+/// instead of `hash > $1` re-reads the previous pass's last key and lands the
+/// cursor a key short on every subsequent pass, while still reporting a full
+/// batch -- indistinguishable from correct behaviour on counts alone.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn backfill_cursor_resumes_strictly_after_its_stored_position_and_never_regresses_to_null() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let hashes = seed_legacy_backfill_candidates(&direct, 5).await;
+
+    let first = coordinator
+        .advance_backfill_cursor(2)
+        .await
+        .expect("first pass");
+    assert_eq!(first.examined, 2);
+    assert_eq!(first.cursor.as_deref(), Some(hashes[1].as_slice()));
+    assert!(!first.exhausted);
+    assert_eq!(
+        stored_backfill_cursor(&direct).await.as_deref(),
+        Some(hashes[1].as_slice()),
+        "the returned position must be the durable one"
+    );
+
+    // Strictly after: a `>=` scan would return hashes[1]..=hashes[2] here and
+    // leave the cursor at hashes[2], one key short.
+    let second = coordinator
+        .advance_backfill_cursor(2)
+        .await
+        .expect("second pass");
+    assert_eq!(second.examined, 2);
+    assert_eq!(
+        second.cursor.as_deref(),
+        Some(hashes[3].as_slice()),
+        "the second pass must start strictly after the stored position"
+    );
+    assert!(!second.exhausted);
+
+    // The short batch is the only evidence the key space ran out.
+    let third = coordinator
+        .advance_backfill_cursor(2)
+        .await
+        .expect("third pass");
+    assert_eq!(third.examined, 1, "one key remains");
+    assert_eq!(third.cursor.as_deref(), Some(hashes[4].as_slice()));
+    assert!(
+        third.exhausted,
+        "a short batch is what reports the key space ran out"
+    );
+
+    // The COALESCE arm: an empty pass reads nothing and must leave the durable
+    // position where it was, both in the returned value and in the row.
+    let empty = coordinator
+        .advance_backfill_cursor(2)
+        .await
+        .expect("empty pass");
+    assert_eq!(empty.examined, 0);
+    assert!(empty.exhausted);
+    assert_eq!(
+        empty.cursor.as_deref(),
+        Some(hashes[4].as_slice()),
+        "an empty pass reports the retained position, not None"
+    );
+    assert_eq!(
+        stored_backfill_cursor(&direct).await.as_deref(),
+        Some(hashes[4].as_slice()),
+        "an empty batch must never move the durable cursor back to NULL"
+    );
+
+    // Every key was read exactly once across the passes: 2 + 2 + 1 + 0 == 5.
+    assert_eq!(
+        first.examined + second.examined + third.examined + empty.examined,
+        u64::try_from(hashes.len()).expect("candidate count fits u64"),
+        "a resumable cursor reads each legacy key exactly once"
+    );
+}
+
+/// Backends in this case's database currently blocked on a lock, excluding the
+/// observing backend itself.
+///
+/// This is what makes the contention deterministic rather than timed: the
+/// blocker is not released until the database itself reports both advances
+/// parked, so neither can have completed before the other started.
+async fn backfill_lock_waiters(observer: &Client) -> i64 {
+    observer
+        .query_one(
+            "SELECT count(*)::bigint FROM pg_stat_activity \
+              WHERE datname = current_database() \
+                AND wait_event_type = 'Lock' \
+                AND pid <> pg_backend_pid()",
+            &[],
+        )
+        .await
+        .expect("count lock waiters")
+        .get(0)
+}
+
+/// Two replicas contending the singleton cursor row serialise on its
+/// `FOR UPDATE` and both advance, each resuming strictly after the other.
+///
+/// This is the `backfill.advance.locked` anchor's own stated scenario, driven
+/// without the failpoint mechanism. The property is the corrected one: the row
+/// lock does not pick a winner and make the loser no-op -- it orders them, so
+/// the second pass reads the position the first committed and continues from
+/// there. Two equal cursors would mean both read the same starting position and
+/// redid the same batch, which is what dropping the `FOR UPDATE` produces.
+///
+/// A third connection holds the row while both calls park, and the release
+/// waits on `pg_stat_activity` reporting two blocked backends rather than on a
+/// sleep, so the contention is established by the database rather than assumed
+/// from timing.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn two_concurrent_cursor_advances_serialise_and_each_resumes_after_the_other() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let observer = client(&url).await;
+    let mut blocker = client(&url).await;
+    let hashes = seed_legacy_backfill_candidates(&direct, 4).await;
+
+    let blocking = blocker
+        .transaction()
+        .await
+        .expect("open the blocking transaction");
+    blocking
+        .query_one(
+            "SELECT id FROM lore_fragment_schema_state WHERE id = 1 FOR UPDATE",
+            &[],
+        )
+        .await
+        .expect("hold the singleton schema-state row");
+
+    let (first, second) = timeout(Duration::from_secs(60), async {
+        let release = async {
+            while backfill_lock_waiters(&observer).await < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            blocking
+                .commit()
+                .await
+                .expect("release the singleton schema-state row");
+        };
+        let (first, second, ()) = tokio::join!(
+            coordinator.advance_backfill_cursor(2),
+            coordinator.advance_backfill_cursor(2),
+            release
+        );
+        (
+            first.expect("first advance"),
+            second.expect("second advance"),
+        )
+    })
+    .await
+    .expect(
+        "both advances must park on the held row and then complete; a timeout here means \
+         either they never contended or they deadlocked",
+    );
+
+    // Neither call no-ops. A serialising lock orders the passes; it does not
+    // discard one of them.
+    assert_eq!(first.examined, 2, "neither contending pass may no-op");
+    assert_eq!(second.examined, 2, "neither contending pass may no-op");
+
+    // The discriminating assertion. Under the `FOR UPDATE` one pass takes
+    // hashes[0..=1] and the other resumes at hashes[2..=3]; without it both
+    // read the same NULL starting cursor and both land on hashes[1].
+    let mut positions = [first.cursor.clone(), second.cursor.clone()];
+    positions.sort();
+    assert_eq!(
+        positions,
+        [Some(hashes[1].clone()), Some(hashes[3].clone())],
+        "serialised passes must take disjoint halves of the key space; two equal positions \
+         mean both read the same starting cursor and duplicated the batch"
+    );
+
+    assert_eq!(
+        stored_backfill_cursor(&direct).await.as_deref(),
+        Some(hashes[3].as_slice()),
+        "the durable position after both passes is the later one"
+    );
+
+    // Both passes were full, so neither may claim the key space ran out even
+    // though it did: `exhausted` is derived from the batch being short, and
+    // 2 + 2 consumed exactly the 4 seeded keys.
+    assert!(!first.exhausted);
+    assert!(!second.exhausted);
 }

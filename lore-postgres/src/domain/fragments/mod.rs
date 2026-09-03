@@ -137,6 +137,7 @@ macro_rules! failpoint {
 pub use coordinator::BeginOutcome;
 pub use coordinator::CommitVerdict;
 pub use coordinator::EpochWitness;
+pub use coordinator::FragmentBackfillCursorAdvance;
 pub use coordinator::FragmentIntent;
 pub use coordinator::FragmentLifecycleReadiness;
 pub use coordinator::FragmentManifest;
@@ -161,6 +162,7 @@ pub use coordinator::FragmentWriteClaimPruneBatch;
 pub use coordinator::FragmentWriteClaimPruneReport;
 pub use coordinator::FragmentWriteSettlement;
 pub use coordinator::IoObservation;
+pub use coordinator::MAX_FRAGMENT_BACKFILL_CURSOR_BATCH;
 pub use coordinator::MAX_FRAGMENT_WRITE_CLAIM_BODY_BYTES;
 pub use coordinator::MAX_FRAGMENT_WRITE_CLAIM_PRUNE_BATCH;
 pub use coordinator::MAX_LIFECYCLE_GENERATION_FANOUT;

@@ -112,6 +112,13 @@ const OBLITERATE_ORIGIN_MISSING: u8 = 6;
 pub const MAX_FRAGMENT_WRITE_CLAIM_BODY_BYTES: u64 = 256 * 1024;
 /// Largest terminal-claim prune request accepted by one call.
 pub const MAX_FRAGMENT_WRITE_CLAIM_PRUNE_BATCH: u32 = 1_000;
+/// Largest candidate batch one [`PostgresFragmentCoordinator::advance_backfill_cursor`]
+/// call reads.
+///
+/// A bound, not a measurement — the same standing caveat
+/// `MAX_LIFECYCLE_GENERATION_FANOUT` carries. Nothing has measured a real
+/// legacy fragment population, and nothing can until a staging cell exists.
+pub const MAX_FRAGMENT_BACKFILL_CURSOR_BATCH: u32 = 1_000;
 const MAX_FRAGMENT_WRITE_CLAIM_DURATION_MILLIS: u128 = i32::MAX as u128;
 
 /// How many members one staged reader lease may cover.
@@ -789,6 +796,28 @@ impl FragmentWriteClaimPruneReport {
     fn record_missing_evidence(&mut self) {
         self.skipped_missing_evidence = self.skipped_missing_evidence.saturating_add(1);
     }
+}
+
+/// Outcome of one [`PostgresFragmentCoordinator::advance_backfill_cursor`] pass.
+///
+/// **This is not Phase 8.** WP-118's Phase 8 is a rollout gate that remains
+/// stopped on a real staging cell; see the method's own documentation for the
+/// full boundary. Nothing here verifies, copies, or publishes a fragment.
+///
+/// `examined` counts the candidate keys the batch read, so
+/// `examined < batch_limit` says the legacy key space ran out inside this pass
+/// and `exhausted` is the same fact stated directly. `cursor` is the durable
+/// position after the pass — `None` only when the pass read nothing and the
+/// stored cursor was already `NULL`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FragmentBackfillCursorAdvance {
+    /// Candidate keys the batch read.
+    pub examined: u64,
+    /// The durable cursor position after this pass.
+    pub cursor: Option<Vec<u8>>,
+    /// The legacy key space ran out inside this pass, so a further pass reads
+    /// nothing until new legacy rows appear.
+    pub exhausted: bool,
 }
 
 impl FragmentWriteSettlement {
@@ -1485,6 +1514,211 @@ impl PostgresFragmentCoordinator {
         )?;
         failpoint!("cutover.require_claims.settled")?;
         Ok(())
+    }
+
+    /// Move the durable fragment-backfill cursor over one bounded batch of
+    /// legacy keys.
+    ///
+    /// # This is not Phase 8, and the distinction is the point
+    ///
+    /// WP-118's Phase 8 is a rollout gate — "Backfill and cutover in
+    /// dark/staging cells" — and it **remains stopped on a real staging cell**.
+    /// This method is not a start on it and must not be read as one. It exists
+    /// for one reason: WP-109's Phase 2 requires "deterministic barriers and
+    /// failpoints, not task scheduling" over a "schema backfill" race, and
+    /// WP-118 Phase 9 found that race had no site here because no
+    /// cursor-advancing code path existed. This is that site and nothing more.
+    ///
+    /// Phase 8's remaining bullets — the 25% subordinate cap, staging rate,
+    /// live-traffic impact, ETA, restart and abort measurement, replacing the
+    /// placeholder with real numbers, and publishing cutover behind five checks
+    /// — are untouched. A live `backfill_state` of
+    /// [`schema::BACKFILL_RUNNING`] means this cursor moved; it does **not**
+    /// mean a backfill ran.
+    ///
+    /// # What it writes, and what that rules out
+    ///
+    /// Exactly three columns of the singleton `lore_fragment_schema_state` row:
+    /// `backfill_state` (only [`schema::BACKFILL_NOT_STARTED`] ->
+    /// [`schema::BACKFILL_RUNNING`]), `backfill_cursor`, and `updated_at`. No
+    /// lifecycle head, epoch row, association, write claim, staged lease, or
+    /// metering row is read for mutation or written. That is what keeps it
+    /// clear of the prune, obliterate, and publication paths, all of which
+    /// serialise on `lore_fragment_lifecycle` heads this never locks.
+    ///
+    /// It deliberately does **not** advance `verified_fragments`. Nothing here
+    /// verifies a fragment — it reads a key and moves a position — and a
+    /// counter named for verification that counts unverified reads is a claim
+    /// outrunning its evidence. That decision has a consequence a later driver
+    /// must handle; see "Forward hazards" below.
+    ///
+    /// It cannot reach [`schema::BACKFILL_CUTOVER`], so
+    /// [`FragmentLifecycleReadiness::ready_for_lifecycle`] still refuses and
+    /// [`Self::enable_lifecycle`] still refuses. The DDL agrees independently:
+    /// `lore_fragment_schema_cutover_shape` makes a cutover marker at any
+    /// non-cutover state unrepresentable.
+    ///
+    /// # Forward hazards for a real Phase 8 driver
+    ///
+    /// Two obligations land on whoever builds the real backfill. Both exist
+    /// **because** of what this method deliberately does not do, so neither is
+    /// visible from its behaviour today.
+    ///
+    /// **The stored position is an unverified one, and nothing marks it as
+    /// such.** A driver that resumes from `backfill_cursor` — the only reason
+    /// the column is durable — starts strictly after the stored key and would
+    /// therefore **silently skip every key this method walked**, having
+    /// verified none of them. `lore-postgres` has no fragment equivalent of the
+    /// lock coordinator's completion path, which nulls
+    /// `lore_domain_lock_schema_state.backfill_cursor` so a lock cell can never
+    /// resume from a stale position. So: **a driver must establish that the
+    /// position was verified before resuming from it, and today it cannot.**
+    /// Two columns could carry that proof and neither can yet — nothing in this
+    /// crate writes `verified_fragments`, and `backfill_version` is seeded 0 by
+    /// `bootstrap()` and never advanced. The cheap remedies are to refuse a
+    /// position stored under `backfill_version = 0`, or to null the cursor
+    /// before the first real pass. Pick one deliberately; do not inherit the
+    /// position by default.
+    ///
+    /// **No [`LockSequence`] registration, and that is conditional on the write
+    /// set above rather than settled for this method forever.**
+    /// `lore_fragment_schema_state` carries no `LockClass` ordinal, and
+    /// [`Self::require_write_claims`] locks the same singleton `FOR UPDATE`
+    /// without a sequence, so this follows an existing precedent rather than
+    /// inventing an exemption.
+    ///
+    /// The moment anyone makes this walk candidates by locking
+    /// `lore_fragment_lifecycle` heads — the obvious next step towards a real
+    /// backfill — it takes a domain row, it needs `LockClass::Fragments`
+    /// registration, and the order must be re-derived by hand. Do not read this
+    /// paragraph as permission to skip that. `acquire_staged_leases` carried a
+    /// documented exemption on exactly this reasoning, and the exemption became
+    /// false the moment a `FOR SHARE` on the member heads was added to it.
+    pub async fn advance_backfill_cursor(
+        &self,
+        batch_limit: u32,
+    ) -> Result<FragmentBackfillCursorAdvance, DomainError> {
+        if !(1..=MAX_FRAGMENT_BACKFILL_CURSOR_BATCH).contains(&batch_limit) {
+            return Err(DomainError::InvalidInput(format!(
+                "fragment backfill cursor batch must be between 1 and \
+                 {MAX_FRAGMENT_BACKFILL_CURSOR_BATCH}"
+            )));
+        }
+        let limit = i64::from(batch_limit);
+        failpoint!("backfill.advance.entry")?;
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| DomainError::from_pg("fragment backfill cursor begin", error))?;
+        let Some(row) = tx
+            .query_opt(
+                "SELECT backfill_state, backfill_cursor \
+                   FROM lore_fragment_schema_state WHERE id = 1 FOR UPDATE",
+                &[],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("fragment backfill cursor lock", error))?
+        else {
+            return Err(DomainError::NotReady(
+                "fragment backfill cursor requires an installed SCHEMA-118 whose singleton \
+                 schema-state row exists"
+                    .to_owned(),
+            ));
+        };
+        failpoint!("backfill.advance.locked")?;
+        let observed_state: i16 = row.get("backfill_state");
+        let cursor: Option<Vec<u8>> = row.get("backfill_cursor");
+
+        // Refused loudly rather than treated as a no-op, mirroring
+        // `domain/backfill.rs`'s own start guard. A cell already at VERIFIED or
+        // CUTOVER has passed this cursor's window, and silently returning zero
+        // there would report "nothing to do" for a cell whose position this
+        // method must never move.
+        if observed_state != schema::BACKFILL_NOT_STARTED
+            && observed_state != schema::BACKFILL_RUNNING
+        {
+            return Err(DomainError::NotReady(format!(
+                "fragment backfill cursor requires backfill_state NOT_STARTED or RUNNING, \
+                 found {observed_state}; this cell has already completed verification or \
+                 cutover and its cursor must not move"
+            )));
+        }
+
+        // The candidate key space is the legacy lifecycle table, which
+        // `store/immutable_store.rs` owns and self-bootstraps. A coordinator
+        // fixture that never constructed a legacy store has no such table, and
+        // a raw 42P01 out of the next statement would read as damage rather
+        // than as an absent prerequisite.
+        let legacy_present: bool = tx
+            .query_one("SELECT to_regclass('lore_fragment_state') IS NOT NULL", &[])
+            .await
+            .map_err(|error| DomainError::from_pg("fragment backfill legacy probe", error))?
+            .get(0);
+        if !legacy_present {
+            return Err(DomainError::NotReady(
+                "fragment backfill cursor reads the legacy lore_fragment_state key space, \
+                 which this database does not have"
+                    .to_owned(),
+            ));
+        }
+
+        // `hash` is that table's primary key, so this is an ordered index scan
+        // from the stored position and the cursor is resumable across a
+        // restart. The `$1 IS NULL` arm is the first pass, where no position
+        // has been stored yet.
+        let candidates = tx
+            .query(
+                "SELECT hash FROM lore_fragment_state \
+                  WHERE $1::bytea IS NULL OR hash > $1::bytea \
+                  ORDER BY hash \
+                  LIMIT $2",
+                &[&cursor, &limit],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("fragment backfill cursor scan", error))?;
+        // `LIMIT $2` bounds this at `MAX_FRAGMENT_BACKFILL_CURSOR_BATCH`, and
+        // `usize` never exceeds `u64` on any supported target, so there is no
+        // failure arm to write here.
+        let examined = candidates.len() as u64;
+        let advanced: Option<Vec<u8>> = candidates.last().map(|row| row.get("hash"));
+        // A short batch is the only evidence the key space ran out. A full
+        // batch proves nothing either way, so it is reported as not exhausted.
+        let exhausted = examined < u64::from(batch_limit);
+
+        // One statement so the state move and the position move cannot land
+        // apart. `COALESCE` keeps the stored position when the batch was empty:
+        // a cursor must never move backwards to NULL. The `backfill_state`
+        // predicate re-states what the `FOR UPDATE` above already guarantees,
+        // so a future caller that drops the lock still cannot skip the guard.
+        let updated = tx
+            .execute(
+                "UPDATE lore_fragment_schema_state \
+                    SET backfill_state = $1, \
+                        backfill_cursor = COALESCE($2, backfill_cursor), \
+                        updated_at = clock_timestamp() \
+                  WHERE id = 1 AND backfill_state IN ($3, $1)",
+                &[
+                    &schema::BACKFILL_RUNNING,
+                    &advanced,
+                    &schema::BACKFILL_NOT_STARTED,
+                ],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("fragment backfill cursor advance", error))?;
+        if updated != 1 {
+            return Err(DomainError::Internal(format!(
+                "fragment backfill cursor advance matched {updated} rows under a held \
+                 FOR UPDATE lock; expected exactly 1"
+            )));
+        }
+        classify_commit(tx.commit().await, "fragment backfill cursor commit")?;
+        failpoint!("backfill.advance.settled")?;
+        Ok(FragmentBackfillCursorAdvance {
+            examined,
+            cursor: advanced.or(cursor),
+            exhausted,
+        })
     }
 
     /// The one batched resolver. `query`, `get_metadata`, `get`, `copy`, push

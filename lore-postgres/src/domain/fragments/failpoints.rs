@@ -253,6 +253,32 @@ const ANCHORS: &[(&str, &str)] = &[
         "lease.acquire.settled",
         "P3 kill after COMMIT with a lease granted and no reader attached",
     ),
+    // ---- backfill cursor -------------------------------------------------
+    //
+    // Read the method's own documentation before reading these three as
+    // progress. They instrument a cursor mechanism built so WP-109's schema
+    // backfill race has a site; this is not Phase 8, which remains stopped on
+    // a real staging cell. Each description repeats that because an anchor
+    // table is read in isolation, which is exactly when the wrong inference
+    // gets made.
+    (
+        "backfill.advance.entry",
+        "P2 schema backfill: line two replicas up on one durable cursor before either locks \
+         the schema-state row. This is not Phase 8, which remains stopped on a staging cell",
+    ),
+    (
+        "backfill.advance.locked",
+        "P2 schema backfill: the FOR UPDATE on the singleton cursor row, which serialises two \
+         replicas rather than excluding one. Both advance, in turn, each resuming from the \
+         position the other committed. This is not Phase 8, which remains stopped on a \
+         staging cell",
+    ),
+    (
+        "backfill.advance.settled",
+        "P3 restart: the cursor advanced and the caller has not seen it, so restart must \
+         resume from the durable position rather than rescan. This is not Phase 8, which \
+         remains stopped on a staging cell",
+    ),
     // ---- cutover ---------------------------------------------------------
     (
         "cutover.require_claims.locked",
