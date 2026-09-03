@@ -40,8 +40,10 @@ use tracing::info;
 use crate::event_relay::admission::OutboxAdmission;
 use crate::event_relay::config::EventRelayConfig;
 use crate::event_relay::envelope_map::EnvelopeSource;
+use crate::event_relay::evaluator_task::ConsumerSafetyTask;
 use crate::event_relay::publisher::DurablePublisher;
 use crate::event_relay::readiness::EventRelayReadiness;
+use crate::event_relay::reset_service::StreamResetHandler;
 use crate::event_relay::startup;
 use crate::event_relay::startup::StartupRefusal;
 use crate::event_relay::worker::EventRelayWorker;
@@ -57,10 +59,13 @@ const REMOTE_NOTIFICATION_MODE: &str = "remote";
 
 /// Connections in the relay's own pool.
 ///
-/// The loop is strictly sequential — one claim transaction, then one
-/// single-statement write per row — so its real concurrency is one, and the
-/// second connection exists only so a readiness probe never queues behind a
-/// claim.
+/// The publish loop is strictly sequential — one claim transaction, then one
+/// single-statement write per row — so its real concurrency is one. Step C adds
+/// two more borrowers on the same pool: the consumer-safety evaluator's own
+/// tick, and the stream-reset service, which takes a connection only when
+/// WP-110 actually reports a reset. Four leaves each of the three a connection
+/// and one spare, so a readiness probe never queues behind a claim and a reset
+/// receipt never queues behind a prune batch.
 ///
 /// It is deliberately **not** the domain coordinator's pool. That pool is sized
 /// for a subsystem that is idle until cutover, and a long-running loop
@@ -72,12 +77,20 @@ const REMOTE_NOTIFICATION_MODE: &str = "remote";
 /// into that accounting the next time the inventory is revised; two
 /// connections is small enough not to move the sum today, which is why it is a
 /// constant rather than a knob.
-const RELAY_POOL_MAX: u32 = 2;
+const RELAY_POOL_MAX: u32 = 4;
 
 /// What server composition keeps after the relay is wired.
 pub struct EventRelayHandles {
     /// Facets for the readiness surface.
     pub readiness: Arc<EventRelayReadiness>,
+    /// The frozen `StreamResetService`, for registration on the internal gRPC
+    /// endpoint.
+    ///
+    /// Handed out rather than registered here because the internal endpoint is
+    /// built later in server composition, from its own builder. Registration is
+    /// therefore gated on this being `Some`, which it is only when the relay is
+    /// enabled and every startup precondition passed.
+    pub reset_service: Arc<StreamResetHandler>,
     /// Required-event mutation admission.
     ///
     /// TODO(WP-119 Phase 8): call `OutboxAdmission::check` before the
@@ -174,12 +187,25 @@ pub async fn configure_event_relay(
         "CR-032 outbox relay enabled"
     );
 
+    let evaluator = ConsumerSafetyTask::new(
+        pool.clone(),
+        remote.cell_id.clone(),
+        config.readiness_probe_interval,
+        readiness.clone(),
+    );
+    let reset_service = Arc::new(StreamResetHandler::new(
+        pool.clone(),
+        remote.cell_id.clone(),
+    ));
+
     let worker = EventRelayWorker::new(pool, publisher, config, readiness.clone(), source);
-    lore_spawn!(endpoints, worker.run(shutdown));
+    lore_spawn!(endpoints, worker.run(shutdown.clone()));
+    lore_spawn!(endpoints, evaluator.run(shutdown));
 
     Ok(Some(EventRelayHandles {
         readiness,
         admission,
+        reset_service,
     }))
 }
 

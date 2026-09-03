@@ -26,6 +26,8 @@ use tracing::info;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
 use crate::domain::DomainContext;
+use crate::event_relay::reset_service::StreamResetHandler;
+use crate::event_relay::reset_wire::StreamResetServiceServer;
 use crate::grpc;
 use crate::grpc::forwarded_repository::v1::service::LoreForwardedRepositoryV1Service;
 use crate::grpc::forwarded_revision::v1::service::LoreForwardedRevisionV1Service;
@@ -93,6 +95,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
         }
 
         Ok(GrpcInternalServerBuilder(WantsTlsConfig {
+            stream_reset_service: None,
             local_immutable_store,
             immutable_store,
             mutable_store,
@@ -105,6 +108,9 @@ impl GrpcInternalServerBuilder<WantsComponents> {
 }
 
 pub struct WantsTlsConfig {
+    /// CR-032's frozen `StreamResetService`, present only when this cell has an
+    /// enabled relay that passed every startup precondition.
+    stream_reset_service: Option<Arc<StreamResetHandler>>,
     local_immutable_store: Arc<dyn ImmutableStore>,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
@@ -115,6 +121,29 @@ pub struct WantsTlsConfig {
 }
 
 impl GrpcInternalServerBuilder<WantsTlsConfig> {
+    /// Register CR-032's `StreamResetService` on this endpoint.
+    ///
+    /// The internal endpoint is the right home for it: it is the only surface
+    /// this server configures with a client CA root, and the notification-plane
+    /// contract requires the reset report to be authenticated by an
+    /// internal-service mTLS identity. `None` on every cell whose relay is
+    /// disabled, which is all of them today, and the service is then simply not
+    /// routed — a caller gets `Unimplemented` rather than an unauthenticated
+    /// path into the fence.
+    ///
+    /// The service does its own authentication rather than relying on the
+    /// endpoint's. `verify_client_certs = false` is a supported configuration
+    /// here, and under it a request carries no peer certificate at all — which
+    /// the handler refuses as `UNAUTHENTICATED_REPORT_V1` rather than treating
+    /// endpoint reachability as identity.
+    pub fn with_stream_reset_service(
+        mut self,
+        stream_reset_service: Option<Arc<StreamResetHandler>>,
+    ) -> Self {
+        self.0.stream_reset_service = stream_reset_service;
+        self
+    }
+
     /// Configure TLS. The gRPC internal endpoint only supports two modes:
     /// either all three of `cert_path`, `key_path`, `cert_chain_path` are
     /// supplied (mTLS) or all three are `None` (untrusted; the caller is
@@ -155,6 +184,7 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
         };
 
         Ok(GrpcInternalServerBuilder(WantsHttp2Config {
+            stream_reset_service: self.0.stream_reset_service,
             local_immutable_store: self.0.local_immutable_store,
             immutable_store: self.0.immutable_store,
             mutable_store: self.0.mutable_store,
@@ -168,6 +198,7 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
 }
 
 pub struct WantsHttp2Config {
+    stream_reset_service: Option<Arc<StreamResetHandler>>,
     local_immutable_store: Arc<dyn ImmutableStore>,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
@@ -231,6 +262,10 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
                 self.0.domain_context,
             ),
         ));
+
+        if let Some(stream_reset_service) = self.0.stream_reset_service {
+            router = router.add_service(StreamResetServiceServer::from_arc(stream_reset_service));
+        }
 
         Ok(GrpcInternalServerBuilder(WantsAddress { router }))
     }

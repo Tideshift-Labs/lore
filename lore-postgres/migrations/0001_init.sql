@@ -1279,6 +1279,281 @@ CREATE INDEX IF NOT EXISTS lore_outbox_dead_letters_operations
     ON lore_outbox_dead_letters (disposition, last_failed_at);
 
 -- ---------------------------------------------------------------------------
+-- SCHEMA-119 Step C: receiver membership, checkpoints, and reset generations
+--
+-- CR-032's "Receiver membership projection" row, split into the four durable
+-- facts it actually is: the per-cell counters every compare-and-set anchors on,
+-- one row per receiver generation, one checkpoint row per
+-- (stream, epoch, receiver, generation), and the reset evidence that fences
+-- the whole cell.
+--
+-- These four tables are created here for the FIRST time, so their
+-- `CREATE TABLE` bodies are the whole declaration. Every LATER change to one of
+-- them is an `ALTER`, never an edit inside the parentheses: a
+-- `CREATE TABLE IF NOT EXISTS` body is silently skipped on a database that
+-- already has the table, so an edited body would reach a fresh cell and no
+-- existing one. The `lore_outbox_dead_letters` block above is the worked
+-- example of both the trap and the repair.
+-- ---------------------------------------------------------------------------
+
+-- Per-cell counters. One row per cell, and the compare-and-set anchor for
+-- every membership change: `membership_version` is what the evaluator, the
+-- reaper, and every checkpoint report compare against, so a concurrent join,
+-- retirement, or reset makes their write fail and retry rather than mix two
+-- membership snapshots in one safety decision.
+--
+-- `current_stream_identity`/`current_stream_epoch` are the cell's AUTHORITATIVE
+-- current placement, not a receiver's captured view. The readiness CAS rereads
+-- them and succeeds only when they still equal what that generation captured,
+-- and the reset service validates a report's old tuple against them. They are
+-- nullable only before the cell's first placement is recorded; a cell in that
+-- state has no receiver that can be ready.
+CREATE TABLE IF NOT EXISTS lore_outbox_membership_state (
+    cell_id                    text        NOT NULL PRIMARY KEY,
+    membership_version         bigint      NOT NULL CHECK (membership_version >= 1),
+    next_membership_generation bigint      NOT NULL CHECK (next_membership_generation >= 1),
+    reset_generation           bigint      NOT NULL CHECK (reset_generation >= 0),
+    current_stream_identity    text
+                                           CHECK (octet_length(current_stream_identity) BETWEEN 1 AND 128),
+    current_stream_epoch       bigint      CHECK (current_stream_epoch >= 1),
+    current_placement_revision bigint      NOT NULL CHECK (current_placement_revision >= 0),
+    updated_at                 timestamptz NOT NULL,
+
+    -- Same subject-token grammar as `lore_outbox_events.cell_id`; a cell whose
+    -- membership row and event rows disagreed on the identity would evaluate
+    -- one cell's safety against another cell's membership.
+    CONSTRAINT lore_outbox_membership_state_cell_id_shape CHECK (
+        cell_id ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+        AND octet_length(cell_id) <= 63
+    ),
+    -- A placement is an identity and an epoch together or neither. Half a
+    -- placement makes the readiness CAS and the reset service's old-tuple
+    -- validation unstateable.
+    CONSTRAINT lore_outbox_membership_state_stream_shape CHECK (
+        (current_stream_identity IS NULL) = (current_stream_epoch IS NULL)
+    )
+);
+
+-- One row per receiver GENERATION, never per receiver. Name reuse never
+-- inherits a checkpoint, which is exactly why `membership_generation` is in the
+-- primary key: a replacement at a greater generation is a different row with no
+-- frontier of its own until it captures, baselines, and drains.
+--
+-- Generation 0 is reserved for the reset fence's `required_placeholder`, a row
+-- that exists to make the required set non-empty while no real replacement has
+-- joined yet. It can never be ready, so it blocks every safety evaluation for
+-- as long as it stands.
+CREATE TABLE IF NOT EXISTS lore_outbox_receiver_membership (
+    cell_id                  text        NOT NULL,
+    receiver_identity        text        NOT NULL
+                                         CHECK (octet_length(receiver_identity) BETWEEN 1 AND 128),
+    membership_generation    bigint      NOT NULL CHECK (membership_generation >= 0),
+    membership_version       bigint      NOT NULL CHECK (membership_version >= 1),
+    state                    text        NOT NULL
+                                         CHECK (state IN ('joining', 'ready', 'draining',
+                                                          'retired', 'required_placeholder')),
+    captured_stream_identity text
+                                         CHECK (octet_length(captured_stream_identity) BETWEEN 1 AND 128),
+    captured_stream_epoch    bigint      CHECK (captured_stream_epoch >= 1),
+    captured_start_sequence  bigint      CHECK (captured_start_sequence >= 0),
+    baseline_at              timestamptz,
+    ready_at                 timestamptz,
+    created_at               timestamptz NOT NULL,
+    updated_at               timestamptz NOT NULL,
+
+    PRIMARY KEY (cell_id, receiver_identity, membership_generation),
+
+    -- The captured position is one fact in three columns. A half-captured row
+    -- would let a baseline be taken against an epoch nothing recorded.
+    CONSTRAINT lore_outbox_receiver_membership_capture_shape CHECK (
+        (captured_stream_identity IS NULL) = (captured_stream_epoch IS NULL)
+        AND (captured_stream_identity IS NULL) = (captured_start_sequence IS NULL)
+    ),
+    -- The contract's ordered bootstrap, expressed as a shape rather than a
+    -- procedure: capture, then baseline, then ready. A CASE rather than a chain
+    -- of equalities, for the reason the publication-shape constraint above
+    -- records: an equality form is satisfied by a row that is wrong on both
+    -- sides at once.
+    CONSTRAINT lore_outbox_receiver_membership_lifecycle_shape CHECK (
+        CASE WHEN state = 'required_placeholder'
+             THEN (membership_generation = 0
+                   AND captured_stream_identity IS NULL
+                   AND baseline_at IS NULL
+                   AND ready_at IS NULL)
+             WHEN state IN ('ready', 'draining')
+             THEN (membership_generation >= 1
+                   AND captured_stream_identity IS NOT NULL
+                   AND baseline_at IS NOT NULL
+                   AND ready_at IS NOT NULL)
+             WHEN state = 'joining'
+             THEN (membership_generation >= 1 AND ready_at IS NULL)
+             ELSE membership_generation >= 1
+        END
+    )
+);
+-- The current generation for one receiver: the greatest generation it has.
+CREATE INDEX IF NOT EXISTS lore_outbox_receiver_membership_current
+    ON lore_outbox_receiver_membership (cell_id, receiver_identity, membership_generation DESC);
+-- The required set and the fence probe read only rows that are not retired.
+-- Literal predicate, and every statement meaning to use it spells
+-- `state <> 'retired'` literally too: the planner uses a partial index only
+-- when it can prove the query predicate implies the index predicate, and under
+-- a generic plan it cannot prove that from a bound parameter.
+CREATE INDEX IF NOT EXISTS lore_outbox_receiver_membership_live
+    ON lore_outbox_receiver_membership (cell_id, membership_generation)
+    WHERE state <> 'retired';
+
+-- The checkpoint vector, keyed exactly as the notification-plane contract pins
+-- it: stream identity, stream epoch, receiver identity, membership generation.
+-- A frontier from a prior epoch says nothing about the current one, which is
+-- why the epoch is in the key rather than a column beside it.
+--
+-- `contiguous_frontier` is the highest broker sequence at or below which every
+-- event is applied or refetched. It never advances across an unresolved gap:
+-- `gaps` and `poison` are the explicit blockers, and `report_checkpoint`
+-- refuses a frontier that has passed the lowest of them.
+CREATE TABLE IF NOT EXISTS lore_outbox_checkpoints (
+    stream_identity       text        NOT NULL
+                                      CHECK (octet_length(stream_identity) BETWEEN 1 AND 128),
+    stream_epoch          bigint      NOT NULL CHECK (stream_epoch >= 1),
+    receiver_identity     text        NOT NULL
+                                      CHECK (octet_length(receiver_identity) BETWEEN 1 AND 128),
+    membership_generation bigint      NOT NULL CHECK (membership_generation >= 1),
+    cell_id               text        NOT NULL,
+    membership_version    bigint      NOT NULL CHECK (membership_version >= 1),
+    contiguous_frontier   bigint      NOT NULL CHECK (contiguous_frontier >= 0),
+    -- Unresolved gaps and poison dispositions, as PARALLEL typed arrays rather
+    -- than one jsonb document. Two reasons, both practical: this crate has no
+    -- JSON dependency and adding one to carry four integers per blocker is not
+    -- a trade worth making, and a `bigint[]` reads back through the driver as a
+    -- `Vec<i64>` with the database enforcing the element type, where a jsonb
+    -- document would be re-parsed by hand on every read.
+    --
+    -- `gap_starts[i]`/`gap_ends[i]` are one inclusive unresolved range;
+    -- `poison_sequences[i]`/`poison_classes[i]` are one parked disposition.
+    gap_starts            bigint[]    NOT NULL,
+    gap_ends              bigint[]    NOT NULL,
+    poison_sequences      bigint[]    NOT NULL,
+    poison_classes        text[]      NOT NULL,
+    reported_at           timestamptz NOT NULL,
+    projection_at         timestamptz NOT NULL,
+
+    PRIMARY KEY (stream_identity, stream_epoch, receiver_identity, membership_generation),
+
+    -- Bounded on the element count, on the pairing between the two halves of
+    -- each blocker, on element nullability, and on the serialized size of the
+    -- one variable-width column.
+    --
+    -- The element count alone bounds nothing: one poison class may carry an
+    -- arbitrarily long string, and this projection is read on every safety
+    -- evaluation. `coalesce(array_length(...), 0)` because an empty array's
+    -- length is NULL, not 0, and a CHECK passes on NULL -- the unbounded case
+    -- would be the one that quietly did not apply.
+    CONSTRAINT lore_outbox_checkpoints_blocker_bounds CHECK (
+        coalesce(array_length(gap_starts, 1), 0) = coalesce(array_length(gap_ends, 1), 0)
+        AND coalesce(array_length(gap_starts, 1), 0) <= 256
+        AND coalesce(array_length(poison_sequences, 1), 0)
+            = coalesce(array_length(poison_classes, 1), 0)
+        AND coalesce(array_length(poison_sequences, 1), 0) <= 256
+        AND array_position(gap_starts, NULL::bigint) IS NULL
+        AND array_position(gap_ends, NULL::bigint) IS NULL
+        AND array_position(poison_sequences, NULL::bigint) IS NULL
+        AND array_position(poison_classes, NULL::text) IS NULL
+        AND octet_length(poison_classes::text) <= 16384
+    )
+);
+CREATE INDEX IF NOT EXISTS lore_outbox_checkpoints_cell
+    ON lore_outbox_checkpoints (cell_id, stream_identity, stream_epoch);
+
+-- Reset evidence, the stored acknowledgement, and the cell fence.
+--
+-- `ack_bytes` holds the SERIALIZED `StreamResetAckV1` produced in the receipt
+-- transaction, and an equivalent retry replays exactly those bytes. That is a
+-- storage rule, not a re-serialization rule: protobuf serialization is not
+-- canonical, so re-encoding the same fields across library versions can differ
+-- and the contract requires byte-identity.
+--
+-- The two unique constraints are the concurrency mechanism, not merely
+-- integrity: equivalent detectors race on them, the winner commits, and every
+-- loser rereads the stored ack and returns it verbatim with the winner's
+-- assigned generation.
+CREATE TABLE IF NOT EXISTS lore_outbox_reset_generations (
+    cell_id               text        NOT NULL,
+    reset_generation      bigint      NOT NULL CHECK (reset_generation >= 1),
+    detection_id          text        NOT NULL
+                                      CHECK (octet_length(detection_id) BETWEEN 1 AND 64),
+    reset_fingerprint     bytea       NOT NULL CHECK (octet_length(reset_fingerprint) = 32),
+    broker_reset_identity text        NOT NULL
+                                      CHECK (octet_length(broker_reset_identity) BETWEEN 1 AND 256),
+    old_stream_identity   text        NOT NULL
+                                      CHECK (octet_length(old_stream_identity) BETWEEN 1 AND 128),
+    old_stream_epoch      bigint      NOT NULL CHECK (old_stream_epoch >= 1),
+    new_stream_identity   text        NOT NULL
+                                      CHECK (octet_length(new_stream_identity) BETWEEN 1 AND 128),
+    new_stream_epoch      bigint      NOT NULL CHECK (new_stream_epoch >= 1),
+    -- `ResetReasonV1`, 1..=5. The proto3 zero value exists only because proto3
+    -- requires one and never appears in a valid report, so it is excluded here
+    -- rather than stored and re-rejected later.
+    reason_code           integer     NOT NULL CHECK (reason_code BETWEEN 1 AND 5),
+    placement_revision    bigint      NOT NULL CHECK (placement_revision >= 0),
+    -- Retained as evidence, and deliberately NOT part of duplicate equality:
+    -- two reports of one physical reset differ here and are the same detection.
+    detected_at_unix_ms   bigint      NOT NULL,
+    -- The stable emitter principal derived from the caller's SPIFFE ID / SAN,
+    -- not the leaf certificate: certificates rotate and the authorization this
+    -- record replays an ack to must outlive a rotation.
+    emitter_identity      text        NOT NULL
+                                      CHECK (octet_length(emitter_identity) BETWEEN 1 AND 256),
+    evidence_id           text        NOT NULL
+                                      CHECK (octet_length(evidence_id) BETWEEN 1 AND 64),
+    ack_bytes             bytea       NOT NULL
+                                      CHECK (octet_length(ack_bytes) BETWEEN 1 AND 4096),
+    state                 text        NOT NULL
+                                      CHECK (state IN ('reset_in_progress', 'cleared')),
+    persisted_at          timestamptz NOT NULL,
+    cleared_at            timestamptz,
+
+    PRIMARY KEY (cell_id, reset_generation),
+    CONSTRAINT lore_outbox_reset_generations_detection UNIQUE (cell_id, detection_id),
+    CONSTRAINT lore_outbox_reset_generations_fingerprint UNIQUE (cell_id, reset_fingerprint),
+    CONSTRAINT lore_outbox_reset_generations_clear_shape CHECK (
+        (state = 'cleared') = (cleared_at IS NOT NULL)
+    ),
+    -- A successor that equals its predecessor is not a reset. The contract is
+    -- explicit that an in-place rollback is not expressible in this transport
+    -- and must not be forced into one.
+    CONSTRAINT lore_outbox_reset_generations_successor_shape CHECK (
+        (new_stream_identity, new_stream_epoch)
+            IS DISTINCT FROM (old_stream_identity, old_stream_epoch)
+    )
+);
+-- At most one reset in progress per cell, enforced by the database rather than
+-- by the service's own read: the fence is what makes `consumer_safe` evaluation
+-- and pruning fail, and two concurrent fences would each believe they own it.
+CREATE UNIQUE INDEX IF NOT EXISTS lore_outbox_reset_generations_fence
+    ON lore_outbox_reset_generations (cell_id)
+    WHERE state = 'reset_in_progress';
+-- Successor validation reads every transition already accepted FROM one old
+-- tuple, and every tuple already retired as a predecessor.
+CREATE INDEX IF NOT EXISTS lore_outbox_reset_generations_old_stream
+    ON lore_outbox_reset_generations (cell_id, old_stream_identity, old_stream_epoch);
+CREATE INDEX IF NOT EXISTS lore_outbox_reset_generations_new_stream
+    ON lore_outbox_reset_generations (cell_id, new_stream_identity, new_stream_epoch);
+
+-- The evaluator's scan: accepted rows on one stream and epoch at or below a
+-- safe sequence. `lore_outbox_events_accepted_stream` leads with `event_id`
+-- after the stream pair, so it answers the epoch-reset sweep but cannot bound
+-- this one by sequence. Literal predicate, same reason as every other partial
+-- index in this schema.
+CREATE INDEX IF NOT EXISTS lore_outbox_events_accepted_sequence
+    ON lore_outbox_events (stream_identity, stream_epoch, broker_sequence)
+    WHERE state = 'broker_accepted';
+-- Retention: the oldest consumer-safe rows first, bounded by the prune batch.
+CREATE INDEX IF NOT EXISTS lore_outbox_events_safe_retention
+    ON lore_outbox_events (created_at, event_id)
+    WHERE state = 'consumer_safe';
+
+-- ---------------------------------------------------------------------------
 -- CR-031 fragment lifecycle authority (SCHEMA-118)
 --
 -- Byte-equivalent copy of the runtime DDL declared in:

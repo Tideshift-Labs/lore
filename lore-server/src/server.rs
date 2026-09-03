@@ -707,6 +707,7 @@ async fn launch_grpc_internal_server(
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     domain_context: Option<Arc<crate::domain::DomainContext>>,
+    stream_reset_service: Option<Arc<crate::event_relay::reset_service::StreamResetHandler>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let grpc_settings = settings
@@ -744,6 +745,7 @@ async fn launch_grpc_internal_server(
             settings.environment.clone().unwrap_or_default(),
             domain_context,
         )?
+        .with_stream_reset_service(stream_reset_service)
         .with_tls_config(cert_path, key_path, cert_chain_path)?
         .with_http2_config(
             grpc_settings
@@ -2289,6 +2291,12 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 let notification_sender = notification.clone();
                 let hook_dispatcher = hook_dispatcher.clone();
                 let shutdown_rx = _shutdown_rx.clone();
+                // CR-032 / WP-119 Step C. `None` on every cell whose relay is
+                // disabled, which is all of them today; the service is then not
+                // routed at all rather than routed and refusing.
+                let stream_reset_service = event_relay_handles
+                    .as_ref()
+                    .map(|handles| handles.reset_service.clone());
                 launch_grpc_internal_server(
                     settings,
                     user_agent_filter,
@@ -2297,6 +2305,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     notification_sender,
                     hook_dispatcher,
                     internal_domain_context,
+                    stream_reset_service,
                     shutdown_rx,
                 )
             });

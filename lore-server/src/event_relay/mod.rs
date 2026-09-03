@@ -16,7 +16,10 @@
 //! | [`publisher`] | the `DurablePublisher` seam over WP-111's gateway client |
 //! | [`envelope_map`] | committed row to private `DURABLE_INVALIDATION` envelope |
 //! | [`worker`] | the bounded claim/publish/settle loop |
-//! | [`readiness`] | the relay and event facets, separate from storage readiness |
+//! | [`evaluator_task`] | the bounded `consumer_safe` and retention loop |
+//! | [`reset_wire`] | the frozen `StreamResetService` schema and derivation |
+//! | [`reset_service`] | that service's authentication and receipt orchestration |
+//! | [`readiness`] | the relay, event, and receiver facets, separate from storage readiness |
 //! | [`admission`] | required-event mutation admission and its `RetryInfo` |
 //! | [`startup`] | the fail-closed boot gate |
 //! | [`retry_info`] | `google.rpc.RetryInfo`, hand-transcribed |
@@ -41,23 +44,34 @@
 //! round, which is why the handle is built, tested, and handed over rather
 //! than wired here.
 //!
-//! # What is deliberately absent
+//! # `consumer_safe` is never inferred from an acknowledgement
 //!
-//! The receiver membership and checkpoint projection, the `consumer_safe`
-//! evaluator, the stream-reset service, retention pruning, and the operator
-//! commands are WP-119 Step C. Nothing here advances `consumer_safe` or infers
-//! consumer safety from a broker acknowledgement; CR-032 keeps those two facts
-//! separate precisely so a relay cannot conflate them.
+//! The relay worker advances a row to `broker_accepted` and stops there.
+//! [`evaluator_task`] is the only thing in this process that advances
+//! `consumer_safe`, and it does so only from the Postgres checkpoint vector
+//! under one membership snapshot. CR-032 keeps the two facts separate precisely
+//! so a relay cannot conflate them, and the split between these two modules is
+//! that separation made structural.
 //!
-//! TODO(WP-119 Step C): the checkpoint projection, the `consumer_safe`
-//! evaluator, the reset service, pruning, and the operator command surface.
+//! # What is still absent
+//!
+//! The operator command surface (status, inspection, replay, dead-letter
+//! disposition) is Phase 8's, and a real pruning schedule beyond
+//! [`evaluator_task`]'s own tick is too. WP-111 Phase 3 owns the durable
+//! receiver itself: this package projects its membership and checkpoints, and
+//! never consumes on its behalf.
+//!
+//! TODO(WP-119 Phase 8): the operator command surface and a pruning schedule.
 
 pub mod admission;
 pub mod config;
 pub mod envelope_map;
+pub mod evaluator_task;
 pub mod metrics;
 pub mod publisher;
 pub mod readiness;
+pub mod reset_service;
+pub mod reset_wire;
 pub mod retry_info;
 pub mod startup;
 pub mod wiring;
@@ -70,9 +84,12 @@ pub use config::RelayBackoff;
 pub use envelope_map::EnvelopeSource;
 pub use envelope_map::MapFailure;
 pub use envelope_map::map_event;
+pub use evaluator_task::ConsumerSafetyTask;
 pub use publisher::DurablePublisher;
 pub use readiness::EventRelayReadiness;
 pub use readiness::ReadinessSnapshot;
+pub use reset_service::StreamResetHandler;
+pub use reset_wire::StreamResetServiceServer;
 pub use startup::StartupRefusal;
 pub use startup::enforce_startup_preconditions;
 pub use worker::EventRelayWorker;

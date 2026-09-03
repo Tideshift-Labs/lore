@@ -8,13 +8,19 @@
 //! facets are reported on their own endpoint and read by whatever decides
 //! whether the cell may accept **required-event** mutations.
 //!
-//! Two facets, from CR-032's "Lag, readiness, and backpressure":
+//! Three facets, from CR-032's "Lag, readiness, and backpressure":
 //!
 //! * **relay** — false when the loop is not running, or the oldest unpublished
 //!   row is older than the configured threshold (30 seconds initially).
 //! * **event** — false while any unresolved terminal row sits in the dead-letter
 //!   table. That is a correctness incident an operator has to dispose of; it is
 //!   not self-healing and must not silently clear.
+//! * **receiver** — false while the `consumer_safe` evaluator cannot prove a
+//!   verdict: a reset fence, an empty or unready required membership, a missing
+//!   checkpoint, or no observation at all. Separate from the relay facet
+//!   because a cell can be publishing perfectly while no consumer is safe, and
+//!   from storage readiness because broker loss must never make reads
+//!   unavailable.
 //!
 //! # Fail closed on silence
 //!
@@ -36,13 +42,22 @@ use lore_postgres::domain::outbox::OutboxBacklog;
 
 use crate::event_relay::metrics;
 
-/// A point-in-time view of both facets and the evidence behind them.
+/// A point-in-time view of all three facets and the evidence behind them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadinessSnapshot {
     /// Relay facet.
     pub relay_ready: bool,
     /// Event facet.
     pub event_ready: bool,
+    /// Receiver facet.
+    pub receiver_ready: bool,
+    /// Required receiver generations the last proven evaluation covered.
+    pub required_receivers: usize,
+    /// Age of the last receiver observation, if any.
+    pub receiver_observation_age: Option<Duration>,
+    /// Why the receiver facet is false, or `None` when it is true. A fixed,
+    /// low-cardinality string.
+    pub receiver_reason: Option<&'static str>,
     /// Whether the worker loop reports itself alive.
     pub loop_running: bool,
     /// Oldest unpublished row age at the last observation, if any.
@@ -66,6 +81,11 @@ pub const REASON_LOOP_NOT_RUNNING: &str = "loop_not_running";
 pub const REASON_NO_OBSERVATION: &str = "no_backlog_observation";
 pub const REASON_STALE_OBSERVATION: &str = "stale_backlog_observation";
 pub const REASON_OLDEST_UNPUBLISHED: &str = "oldest_unpublished_over_threshold";
+/// The receiver facet has no evaluation to report on yet.
+pub const REASON_NO_EVALUATION: &str = "no_consumer_safety_evaluation";
+/// The last evaluation is older than the staleness bound, so the facet cannot
+/// tell healthy from not-looked-at-recently.
+pub const REASON_STALE_EVALUATION: &str = "stale_consumer_safety_evaluation";
 
 #[derive(Debug, Clone)]
 struct Observation {
@@ -75,12 +95,27 @@ struct Observation {
     dead_letter_count: i64,
 }
 
+/// The last thing the `consumer_safe` evaluator proved, or the reason it could
+/// not.
+#[derive(Debug, Clone)]
+struct ReceiverObservation {
+    at: Instant,
+    /// The evaluator's own block label, or `None` when it proved a verdict.
+    ///
+    /// Carried as the label rather than the typed block so this module does not
+    /// depend on the evaluator's variant set: the mapping already exists in one
+    /// place, and duplicating it here would be a second place to forget.
+    block: Option<&'static str>,
+    required_receivers: usize,
+}
+
 /// The shared readiness handle. Written by the worker loop, read by the health
 /// surface.
 #[derive(Debug)]
 pub struct EventRelayReadiness {
     loop_running: AtomicBool,
     last: Mutex<Option<Observation>>,
+    last_receiver: Mutex<Option<ReceiverObservation>>,
     max_oldest_unpublished: Duration,
     /// Twice the probe interval plus one publish deadline. Precomputed so the
     /// read path does no arithmetic on configuration it does not own.
@@ -106,6 +141,7 @@ impl EventRelayReadiness {
         Self {
             loop_running: AtomicBool::new(false),
             last: Mutex::new(None),
+            last_receiver: Mutex::new(None),
             max_oldest_unpublished,
             // Doubling the interval gives one whole missed probe of tolerance,
             // so an ordinary scheduling hiccup is not an incident; the deadline
@@ -140,7 +176,30 @@ impl EventRelayReadiness {
         *self.lock() = Some(observation);
     }
 
-    /// Both facets plus the evidence behind them.
+    /// Record an evaluation that proved a verdict over `required_receivers`
+    /// generations.
+    pub fn record_receiver_proof(&self, required_receivers: usize) {
+        metrics::record_receiver_lag_rows(0);
+        *self.lock_receiver() = Some(ReceiverObservation {
+            at: Instant::now(),
+            block: None,
+            required_receivers,
+        });
+    }
+
+    /// Record an evaluation that proved nothing, and why.
+    ///
+    /// `reason` must come from the evaluator's closed label set; it is reported
+    /// verbatim as the facet's reason and as a metric label.
+    pub fn record_receiver_block(&self, reason: &'static str) {
+        *self.lock_receiver() = Some(ReceiverObservation {
+            at: Instant::now(),
+            block: Some(reason),
+            required_receivers: 0,
+        });
+    }
+
+    /// All three facets plus the evidence behind them.
     pub fn snapshot(&self) -> ReadinessSnapshot {
         let loop_running = self.loop_running.load(Ordering::Relaxed);
         let observation = self.lock().clone();
@@ -168,9 +227,27 @@ impl EventRelayReadiness {
         let dead_letter_count = observation.as_ref().map_or(0, |o| o.dead_letter_count);
         let event_ready = observation.is_some() && !stale && dead_letter_count == 0;
 
+        // The receiver facet, on the same fail-closed-on-silence rule. Its
+        // staleness bound is the shared one: the evaluator runs on the same
+        // probe interval as the backlog observation, so an evaluator that
+        // wedged or whose database went away stops refreshing this and the
+        // facet goes false rather than staying green on an old verdict.
+        let receiver = self.lock_receiver().clone();
+        let receiver_observation_age = receiver.as_ref().map(|o| o.at.elapsed());
+        let receiver_stale = receiver_observation_age.is_some_and(|age| age > self.staleness_bound);
+        let receiver_reason = match receiver.as_ref() {
+            None => Some(REASON_NO_EVALUATION),
+            Some(_) if receiver_stale => Some(REASON_STALE_EVALUATION),
+            Some(observation) => observation.block,
+        };
+
         ReadinessSnapshot {
             relay_ready: relay_reason.is_none(),
             event_ready,
+            receiver_ready: receiver_reason.is_none(),
+            required_receivers: receiver.as_ref().map_or(0, |o| o.required_receivers),
+            receiver_observation_age,
+            receiver_reason,
             loop_running,
             oldest_unpublished_age: observation.as_ref().and_then(|o| o.oldest_pending_age),
             pending_count: observation.as_ref().map_or(0, |o| o.pending_count),
@@ -191,12 +268,25 @@ impl EventRelayReadiness {
         self.snapshot().event_ready
     }
 
+    /// The receiver facet alone.
+    pub fn receiver_ready(&self) -> bool {
+        self.snapshot().receiver_ready
+    }
+
     /// See `drain::ConnectionRegistry` for the same poisoning rationale: a
     /// panic while holding this lock must not take readiness reporting down
     /// with it, and the guarded value is a plain snapshot with no invariant a
     /// panic could have broken halfway.
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Observation>> {
         match self.last.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Same poisoning rationale as [`Self::lock`].
+    fn lock_receiver(&self) -> std::sync::MutexGuard<'_, Option<ReceiverObservation>> {
+        match self.last_receiver.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
@@ -335,6 +425,68 @@ mod tests {
         );
     }
 
+    /// A fresh handle has no evaluation, so the receiver facet is false. Zero
+    /// evidence is never readiness.
+    #[test]
+    fn a_fresh_handle_is_not_receiver_ready() {
+        let snapshot = readiness().snapshot();
+        assert!(!snapshot.receiver_ready);
+        assert_eq!(snapshot.receiver_reason, Some(REASON_NO_EVALUATION));
+        assert_eq!(snapshot.required_receivers, 0);
+    }
+
+    #[test]
+    fn a_proven_evaluation_makes_the_receiver_facet_ready() {
+        let readiness = readiness();
+        readiness.record_receiver_proof(2);
+        let snapshot = readiness.snapshot();
+        assert!(snapshot.receiver_ready);
+        assert_eq!(snapshot.receiver_reason, None);
+        assert_eq!(snapshot.required_receivers, 2);
+    }
+
+    /// A reset fence fails the receiver facet and nothing else. The relay is
+    /// still publishing and storage is untouched.
+    #[test]
+    fn a_reset_fence_fails_the_receiver_facet_only() {
+        let readiness = readiness();
+        readiness.set_loop_running(true);
+        readiness.record_backlog(&backlog(Some(Duration::from_secs(1)), 0));
+        readiness.record_receiver_block("reset_in_progress");
+        let snapshot = readiness.snapshot();
+        assert!(!snapshot.receiver_ready);
+        assert_eq!(snapshot.receiver_reason, Some("reset_in_progress"));
+        assert!(snapshot.relay_ready);
+        assert!(snapshot.event_ready);
+    }
+
+    /// The wedged-evaluator case: a verdict was proven once and then stopped
+    /// being refreshed. Staleness is not readiness.
+    #[test]
+    fn a_stale_evaluation_fails_the_receiver_facet() {
+        let readiness =
+            EventRelayReadiness::new(Duration::from_secs(30), Duration::ZERO, Duration::ZERO);
+        readiness.record_receiver_proof(2);
+        while readiness.snapshot().receiver_observation_age == Some(Duration::ZERO) {
+            std::hint::spin_loop();
+        }
+        let snapshot = readiness.snapshot();
+        assert!(!snapshot.receiver_ready);
+        assert_eq!(snapshot.receiver_reason, Some(REASON_STALE_EVALUATION));
+    }
+
+    /// A later proof clears an earlier block; the facet is the last evaluation,
+    /// not a latch. A dead letter is a latch and this deliberately is not: the
+    /// blocks it reports are all self-healing conditions.
+    #[test]
+    fn a_later_proof_clears_an_earlier_block() {
+        let readiness = readiness();
+        readiness.record_receiver_block("empty_required_membership");
+        assert!(!readiness.receiver_ready());
+        readiness.record_receiver_proof(1);
+        assert!(readiness.receiver_ready());
+    }
+
     #[test]
     fn every_reason_is_a_bounded_label() {
         for reason in [
@@ -342,6 +494,8 @@ mod tests {
             REASON_NO_OBSERVATION,
             REASON_STALE_OBSERVATION,
             REASON_OLDEST_UNPUBLISHED,
+            REASON_NO_EVALUATION,
+            REASON_STALE_EVALUATION,
         ] {
             assert!(!reason.is_empty());
             assert!(reason.is_ascii());

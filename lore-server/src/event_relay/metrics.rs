@@ -55,6 +55,16 @@ pub(crate) struct Instruments {
     backlog_dead_letters: Gauge<u64>,
     /// Required-event mutation admissions refused, by the limit that tripped.
     admission_rejections: Counter<u64>,
+    /// Rows advanced to `consumer_safe`, summed over evaluator ticks.
+    consumer_safe_rows: Counter<u64>,
+    /// Evaluator ticks that proved nothing, by the reason that blocked them.
+    evaluation_blocks: Counter<u64>,
+    /// Rows reaped by retention pruning, by table.
+    pruned_rows: Counter<u64>,
+    /// Stream reset reports, by outcome.
+    reset_reports: Counter<u64>,
+    /// The slowest required receiver's frontier lag, in rows, as last observed.
+    receiver_lag_rows: Gauge<u64>,
 }
 
 impl Instruments {
@@ -115,6 +125,28 @@ impl Instruments {
                     "Required-event mutations refused before their transaction, by limit",
                 )
                 .build(),
+            consumer_safe_rows: meter
+                .u64_counter(provider.scope_name("consumer_safe.rows"))
+                .with_description("Outbox rows advanced to consumer_safe by the bounded evaluator")
+                .build(),
+            evaluation_blocks: meter
+                .u64_counter(provider.scope_name("consumer_safe.blocks"))
+                .with_description(
+                    "Evaluator ticks that proved nothing, by the reason that blocked them",
+                )
+                .build(),
+            pruned_rows: meter
+                .u64_counter(provider.scope_name("prune.rows"))
+                .with_description("Outbox rows reaped by retention pruning, by table")
+                .build(),
+            reset_reports: meter
+                .u64_counter(provider.scope_name("reset.reports"))
+                .with_description("Stream reset reports served, by outcome")
+                .build(),
+            receiver_lag_rows: meter
+                .u64_gauge(provider.scope_name("receiver.lag_rows"))
+                .with_description("Accepted rows above the proven safe sequence, last observed")
+                .build(),
         }
     }
 
@@ -159,6 +191,34 @@ pub(crate) const DEFERRED_DEAD_LETTER_WRITE: &str = "dead_letter_write";
 pub(crate) const ADMISSION_AGE: &str = "oldest_pending_age";
 pub(crate) const ADMISSION_ROWS: &str = "pending_rows";
 pub(crate) const ADMISSION_BYTES: &str = "pending_bytes";
+
+/// The bounded evaluation-block label set. These mirror
+/// `lore_postgres::domain::outbox::EvaluationBlock` and the `SafetyBlock` it
+/// wraps; `super::evaluator_task::block_label` is the only place the two are
+/// related, so a new variant is a compile error there rather than a silently
+/// unlabelled increment.
+pub(crate) const BLOCK_CELL_UNKNOWN: &str = "cell_unknown";
+pub(crate) const BLOCK_RESET_IN_PROGRESS: &str = "reset_in_progress";
+pub(crate) const BLOCK_NO_PLACEMENT: &str = "no_current_placement";
+pub(crate) const BLOCK_EMPTY_MEMBERSHIP: &str = "empty_required_membership";
+pub(crate) const BLOCK_MEMBER_NOT_READY: &str = "member_not_ready";
+pub(crate) const BLOCK_MISSING_CHECKPOINT: &str = "missing_checkpoint";
+
+/// The bounded prune-table label set.
+pub(crate) const PRUNED_EVENTS: &str = "events";
+pub(crate) const PRUNED_DEAD_LETTERS: &str = "dead_letters";
+
+/// The bounded stream-reset outcome label set. Every value the reset service
+/// records, and nothing derived from a report's own fields: a detection ID or a
+/// broker identity as a label would be exactly the unbounded cardinality the
+/// contract prohibits.
+pub(crate) const RESET_ACCEPTED: &str = "accepted";
+pub(crate) const RESET_REPLAYED: &str = "replayed";
+pub(crate) const RESET_DETECTION_MISMATCH: &str = "detection_mismatch";
+pub(crate) const RESET_PLACEMENT_MISMATCH: &str = "placement_mismatch";
+pub(crate) const RESET_STALE_OLD_STREAM: &str = "stale_old_stream";
+pub(crate) const RESET_INVALID_SUCCESSOR: &str = "invalid_successor";
+pub(crate) const RESET_CELL_UNKNOWN: &str = "cell_unknown";
 
 pub(crate) fn record_claimed_rows(rows: u64) {
     Instruments::instance().claimed_rows.add(rows, &[]);
@@ -227,6 +287,32 @@ pub(crate) fn record_admission_rejection(limit: &'static str) {
         .add(1, &[KeyValue::new("limit", limit)]);
 }
 
+pub(crate) fn record_consumer_safe_rows(rows: u64) {
+    Instruments::instance().consumer_safe_rows.add(rows, &[]);
+}
+
+pub(crate) fn record_evaluation_block(reason: &'static str) {
+    Instruments::instance()
+        .evaluation_blocks
+        .add(1, &[KeyValue::new("reason", reason)]);
+}
+
+pub(crate) fn record_pruned_rows(table: &'static str, rows: u64) {
+    Instruments::instance()
+        .pruned_rows
+        .add(rows, &[KeyValue::new("table", table)]);
+}
+
+pub(crate) fn record_reset_report(outcome: &'static str) {
+    Instruments::instance()
+        .reset_reports
+        .add(1, &[KeyValue::new("outcome", outcome)]);
+}
+
+pub(crate) fn record_receiver_lag_rows(rows: u64) {
+    Instruments::instance().receiver_lag_rows.record(rows, &[]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +342,21 @@ mod tests {
             DEFERRED_RETRY_WRITE,
             DEFERRED_DEAD_LETTER_POOL,
             DEFERRED_DEAD_LETTER_WRITE,
+            BLOCK_CELL_UNKNOWN,
+            BLOCK_RESET_IN_PROGRESS,
+            BLOCK_NO_PLACEMENT,
+            BLOCK_EMPTY_MEMBERSHIP,
+            BLOCK_MEMBER_NOT_READY,
+            BLOCK_MISSING_CHECKPOINT,
+            PRUNED_EVENTS,
+            PRUNED_DEAD_LETTERS,
+            RESET_ACCEPTED,
+            RESET_REPLAYED,
+            RESET_DETECTION_MISMATCH,
+            RESET_PLACEMENT_MISMATCH,
+            RESET_STALE_OLD_STREAM,
+            RESET_INVALID_SUCCESSOR,
+            RESET_CELL_UNKNOWN,
         ] {
             assert!(!label.is_empty());
             assert!(label.is_ascii());
@@ -275,6 +376,47 @@ mod tests {
         record_deferred(DEFERRED_RETRY_POOL);
         record_backlog(1.0, 2, 0);
         record_admission_rejection(ADMISSION_AGE);
+        record_consumer_safe_rows(4);
+        record_evaluation_block(BLOCK_RESET_IN_PROGRESS);
+        record_pruned_rows(PRUNED_EVENTS, 7);
+        record_reset_report(RESET_ACCEPTED);
+        record_receiver_lag_rows(3);
+    }
+
+    /// The reset-outcome labels are a closed set that must stay distinct: two
+    /// outcomes sharing a label would silently merge two different operator
+    /// signals into one series.
+    #[test]
+    fn the_reset_outcome_labels_are_distinct() {
+        let mut labels = vec![
+            RESET_ACCEPTED,
+            RESET_REPLAYED,
+            RESET_DETECTION_MISMATCH,
+            RESET_PLACEMENT_MISMATCH,
+            RESET_STALE_OLD_STREAM,
+            RESET_INVALID_SUCCESSOR,
+            RESET_CELL_UNKNOWN,
+        ];
+        let total = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), total);
+    }
+
+    #[test]
+    fn the_evaluation_block_labels_are_distinct() {
+        let mut labels = vec![
+            BLOCK_CELL_UNKNOWN,
+            BLOCK_RESET_IN_PROGRESS,
+            BLOCK_NO_PLACEMENT,
+            BLOCK_EMPTY_MEMBERSHIP,
+            BLOCK_MEMBER_NOT_READY,
+            BLOCK_MISSING_CHECKPOINT,
+        ];
+        let total = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), total);
     }
 
     /// The publish-outcome family label set spans four values, and only three
