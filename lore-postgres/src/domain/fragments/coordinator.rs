@@ -2431,14 +2431,31 @@ impl PostgresFragmentCoordinator {
         batch: FragmentWriteClaimPruneBatch,
     ) -> Result<FragmentWriteClaimPruneReport, DomainError> {
         let client = self.checkout().await?;
-        // The anti-join's state list is written as SQL literals, and must stay
-        // that way. `0, 1, 3` are Prepared, Sending and Ambiguous, and the text
-        // matches `lore_fragment_write_claims_barrier`'s partial predicate
-        // exactly. Bound as a `$n` array instead, the planner cannot prove
-        // partial-index implication, and a forced generic plan degrades the
-        // subquery to a sequential scan of the whole claims table for every
-        // candidate row. Measured on PostgreSQL 16.15: literals keep the index
-        // scan, a bound array does not.
+        // Every state test in this statement is written as SQL literals, and
+        // must stay that way.
+        //
+        // The anti-join's `0, 1, 3` are Prepared, Sending and Ambiguous, and
+        // the text matches `lore_fragment_write_claims_barrier`'s partial
+        // predicate exactly. Bound as a `$n` array instead, the planner cannot
+        // prove partial-index implication, and a forced generic plan degrades
+        // the subquery to a sequential scan of the whole claims table for every
+        // candidate row. Measured on PostgreSQL 16.14: literals keep the index
+        // scan, a bound array does not. The mechanism is the planner's
+        // partial-index implication proof, so read the version as the one that
+        // was measured, not as a bound on where this applies.
+        //
+        // The outer arms' `4` (NoSend) and `2` (Decisive) are the same
+        // mechanism against the other partial index,
+        // `lore_fragment_write_claims_terminal_prune`
+        // (`WHERE state IN (2, 4)`). Written as `claim.state = $1 OR
+        // claim.state = $2` the generic plan loses that index and so loses the
+        // `settled_at, logical_request_id, attempt_id` ordering it supplies for
+        // free, adding a top-N sort over the whole table on top of the
+        // sequential scan. Measured on the same PostgreSQL 16.14: the bound
+        // form took 317,352 buffers, the literal form 1,199. Again the version
+        // records what was measured, not a bound on where this applies. The
+        // literal form looks like something to tidy back into bindings; it is
+        // not.
         //
         // The barrier arms mirror `write_claim_barrier_for_prune` exactly:
         // Prepared blocks on `send_not_after`, Sending and Ambiguous block on
@@ -2450,9 +2467,9 @@ impl PostgresFragmentCoordinator {
                 "SELECT claim.logical_request_id, claim.attempt_id, claim.hash, claim.state \
                    FROM lore_fragment_write_claims AS claim \
                   WHERE claim.settled_at <= clock_timestamp() \
-                                           - ($3::bigint * interval '1 millisecond') \
-                    AND (claim.state = $1 \
-                         OR (claim.state = $2 AND EXISTS ( \
+                                           - ($1::bigint * interval '1 millisecond') \
+                    AND (claim.state = 4 \
+                         OR (claim.state = 2 AND EXISTS ( \
                              SELECT 1 FROM lore_fragment_epochs AS epoch \
                               WHERE epoch.hash = claim.hash \
                                 AND epoch.epoch = claim.epoch \
@@ -2470,13 +2487,8 @@ impl PostgresFragmentCoordinator {
                                               ELSE active.hard_not_after END) \
                                         > clock_timestamp()))) \
                   ORDER BY settled_at, logical_request_id, attempt_id \
-                  LIMIT $4",
-                &[
-                    &FragmentWriteClaimState::NoSend.bits(),
-                    &FragmentWriteClaimState::Decisive.bits(),
-                    &batch.terminal_retention_millis,
-                    &batch.max_claims,
-                ],
+                  LIMIT $2",
+                &[&batch.terminal_retention_millis, &batch.max_claims],
             )
             .await
             .map_err(|error| DomainError::from_pg("fragment write claim prune plan", error))?;
@@ -4546,6 +4558,18 @@ async fn create_write_claim_locked(
 /// lifecycle head lock. Claim creation uses this lineage-scoped check; a repair
 /// successor may proceed on a new epoch while the hash-wide inventory retains
 /// an older ambiguous target for Phase 6B cleanup.
+///
+/// # Why the state list is a SQL literal
+///
+/// `0, 1, 3` are Prepared, Sending and Ambiguous, and the text matches
+/// `lore_fragment_write_claims_barrier`'s partial predicate exactly. Bound as
+/// `state = ANY($n)` instead, the statement returns the same rows and passes
+/// every gate, but the planner can no longer prove partial-index implication,
+/// so a generic plan degrades this to a sequential scan of the whole claims
+/// table. There is no other index on that table with `hash` leading, so there
+/// is no fallback. This one sits on the live publication path.
+/// `write_claim_barrier_for_prune` carries the same literal for the same
+/// reason.
 async fn write_claim_barrier_locked(
     tx: &Transaction<'_>,
     sequence: &mut LockSequence,
@@ -4554,18 +4578,13 @@ async fn write_claim_barrier_locked(
     fence: i64,
 ) -> Result<FragmentWriteClaimBarrier, DomainError> {
     sequence.enter(LockClass::Fragments)?;
-    let blocking_states = [
-        FragmentWriteClaimState::Prepared.bits(),
-        FragmentWriteClaimState::Sending.bits(),
-        FragmentWriteClaimState::Ambiguous.bits(),
-    ];
     let rows = tx
         .query(
             "SELECT hard_not_after FROM lore_fragment_write_claims \
               WHERE hash = $1 AND epoch = $2 AND fence = $3 \
-                AND state = ANY($4) AND hard_not_after > clock_timestamp() \
+                AND state IN (0, 1, 3) AND hard_not_after > clock_timestamp() \
               ORDER BY hard_not_after DESC FOR UPDATE",
-            &[&hash, &epoch, &fence, &blocking_states.as_slice()],
+            &[&hash, &epoch, &fence],
         )
         .await
         .map_err(|error| DomainError::from_pg("fragment write claim barrier", error))?;

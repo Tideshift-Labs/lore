@@ -204,8 +204,8 @@ fn hash_wide_inventory_preserves_exact_cleanup_targets_and_uses_database_time() 
 fn prune_is_bounded_db_clocked_and_requires_exact_decisive_epoch_evidence() {
     let source = coordinator_source();
     let prune = function(&source, "pub async fn prune_terminal_write_claims(");
-    assert!(prune.contains("claim.state = $1"));
-    assert!(prune.contains("claim.state = $2 AND EXISTS"));
+    assert!(prune.contains("claim.state = 4"));
+    assert!(prune.contains("claim.state = 2 AND EXISTS"));
     assert!(prune.contains("FragmentWriteClaimState::Decisive.bits()"));
     assert!(prune.contains("FragmentWriteClaimState::NoSend.bits()"));
     for forbidden in [
@@ -220,16 +220,16 @@ fn prune_is_bounded_db_clocked_and_requires_exact_decisive_epoch_evidence() {
         );
     }
     assert!(prune.contains("settled_at <= clock_timestamp()"));
-    assert!(prune.contains("LIMIT $4"));
+    assert!(prune.contains("LIMIT $2"));
     assert_order(
         prune,
         &[
-            "claim.state = $1",
-            "claim.state = $2 AND EXISTS",
+            "claim.state = 4",
+            "claim.state = 2 AND EXISTS",
             "epoch.provider_body_blake3 = claim.body_blake3",
             "epoch.provider_body_size = claim.body_size",
             "epoch.provider_claim_fence = claim.fence",
-            "LIMIT $4",
+            "LIMIT $2",
         ],
     );
     // The head lock comes first and its absence stops the loop: it is the
@@ -264,20 +264,25 @@ fn prune_is_bounded_db_clocked_and_requires_exact_decisive_epoch_evidence() {
     }
 }
 
-/// The prune path's two state tests are written as SQL literals on purpose, and
-/// no gate other than this one can tell the difference.
+/// Every state test on the prune path is written as SQL literals on purpose,
+/// and no gate other than this one can tell the difference.
 ///
-/// Bound as `state = ANY($n)` the statements still return the same rows, still
-/// pass every live case, and still pass Clippy and `fmt`. What changes is the
-/// plan: the planner can no longer prove that the predicate implies
-/// `lore_fragment_write_claims_barrier`'s partial predicate
-/// (`WHERE state IN (0, 1, 3)`), so under a generic plan the anti-join degrades
-/// to a sequential scan of the whole claims table for every candidate row. That
-/// is a silent, unbounded cost regression, so the literal text is pinned here.
+/// Bound as `$n` the statements still return the same rows, still pass every
+/// live case, and still pass Clippy and `fmt`. What changes is the plan: the
+/// planner can no longer prove that the predicate implies a partial index's
+/// predicate, so a generic plan loses the index. The anti-join and the prune
+/// barrier lose `lore_fragment_write_claims_barrier`
+/// (`WHERE state IN (0, 1, 3)`) and degrade to a sequential scan of the whole
+/// claims table; the plan query's outer arms lose
+/// `lore_fragment_write_claims_terminal_prune` (`WHERE state IN (2, 4)`) and
+/// with it the `settled_at, logical_request_id, attempt_id` ordering that index
+/// supplies for free, adding a top-N sort over the whole table on top of the
+/// scan. That is a silent, unbounded cost regression, so the literal text is
+/// pinned here.
 ///
-/// The literal-to-variant linkage (`Prepared` is 0, `Sending` 1, `Ambiguous` 3,
-/// `NoSend` 4) is **not** re-asserted here. It is already pinned exactly once,
-/// against both the enum and the schema's own partial indexes, by
+/// The literal-to-variant linkage (`Prepared` is 0, `Sending` 1, `Decisive` 2,
+/// `Ambiguous` 3, `NoSend` 4) is **not** re-asserted here. It is already pinned
+/// exactly once, against both the enum and the schema's own partial indexes, by
 /// `fragment_write_claim_schema.rs`'s
 /// `stored_state_shape_and_barrier_index_match_the_closed_typed_vocabulary`;
 /// renumbering a variant fails there.
@@ -291,6 +296,34 @@ fn prune_selection_and_barrier_pin_sql_state_literals_and_take_no_claim_row_lock
     // being pinned (the anti-join's placement, and the direction of the time
     // comparison) straddle a line break in the current formatting.
     let prune_sql = normalized_sql(prune);
+
+    // The negatives run first, deliberately. They are what actually holds the
+    // literals in place and they name the regression; every positive below is
+    // also violated by a re-binding revert and would otherwise mask them by
+    // failing first.
+    //
+    // Scoped to the plan statement, because the loop's two DELETEs bind
+    // `claim.state = $10` legitimately. Those are row-exact CAS deletes reached
+    // through the primary key, with no partial index to prove implication
+    // against, so the argument for literals does not apply to them and a
+    // whole-function negative would be false today.
+    let plan_start = prune
+        .find("let rows = client")
+        .expect("prune plan statement");
+    let plan_end = prune[plan_start..]
+        .find("fragment write claim prune plan")
+        .expect("prune plan diagnostic")
+        + plan_start;
+    let plan_sql = normalized_sql(&prune[plan_start..plan_end]);
+    assert!(
+        !plan_sql.contains("claim.state = $"),
+        "the prune plan's state tests must stay SQL literals, not bound parameters"
+    );
+    assert!(
+        !plan_sql.contains("ANY($"),
+        "the prune plan's anti-join must stay an IN list, not a bound array"
+    );
+
     // Selection, not ordering, is what stops one blocked hash owning every
     // batch slot: without this anti-join the oldest terminal rows on a hash
     // carrying a live barrier win the `LIMIT` on every pass, are skipped in the
@@ -330,6 +363,15 @@ fn prune_selection_and_barrier_pin_sql_state_literals_and_take_no_claim_row_lock
         prune_sql.contains("ELSE active.hard_not_after END) > clock_timestamp()"),
         "the anti-join must exclude a hash whose barrier horizon is still ahead of the clock"
     );
+    // The outer arms' own literals and the shape they sit in, bound together in
+    // one assertion: `4` (NoSend) is the bare disjunct the loop prunes with no
+    // barrier, `2` (Decisive) is the arm gated by the epoch-evidence `EXISTS`.
+    // The negatives above cannot see the two arms swapping, since both spellings
+    // are literals; this can.
+    assert!(
+        prune_sql.contains("AND (claim.state = 4 OR (claim.state = 2 AND EXISTS ("),
+        "the outer arms must test SQL literals, NoSend bare and Decisive gated by epoch evidence"
+    );
 
     let barrier = function(&source, "async fn write_claim_barrier_for_prune(");
     assert!(barrier.contains("SET state = 4"));
@@ -346,6 +388,72 @@ fn prune_selection_and_barrier_pin_sql_state_literals_and_take_no_claim_row_lock
         !barrier.contains("FOR UPDATE"),
         "the prune barrier must read under the head lock, not lock claim rows"
     );
+}
+
+/// `write_claim_barrier_locked` carries the same SQL literal for the same
+/// reason as the prune barrier above, but on the live publication path:
+/// `create_write_claim_locked` calls it, so every coordinated direct put pays
+/// its plan. Nothing pinned this statement before the literal landed.
+///
+/// The two barriers differ in exactly one way and are easy to conflate: this
+/// one locks the claim rows it reads, its prune sibling deliberately does not.
+/// That absence is pinned in
+/// `prune_selection_and_barrier_pin_sql_state_literals_and_take_no_claim_row_lock`;
+/// the presence is pinned here so the pair reads as a deliberate difference
+/// rather than an oversight in one of them.
+///
+/// As there, the literal-to-variant linkage is **not** re-asserted. It is
+/// pinned exactly once, against both the enum and the schema's own partial
+/// indexes, by `fragment_write_claim_schema.rs`'s
+/// `stored_state_shape_and_barrier_index_match_the_closed_typed_vocabulary`.
+#[test]
+fn publication_path_barrier_pins_its_sql_state_literal_and_keeps_its_claim_row_lock() {
+    let source = coordinator_source();
+    let barrier = function(&source, "async fn write_claim_barrier_locked(");
+    // The function's own doc comment discusses the bound form it replaced, and
+    // `function` starts at the signature, so none of the negatives below can
+    // match prose.
+    let barrier_sql = normalized_sql(barrier);
+
+    // The negatives run first, as in the prune test above: the predicate
+    // positive further down is violated by the same revert and would otherwise
+    // fail first and hide which shape came back.
+    //
+    // `blocking_states` was the Rust-side local the bound array was built from,
+    // and `state = ANY($4)` was the SQL it fed. A revert usually restores both,
+    // but an inline array restores only the second, so neither assertion covers
+    // the other.
+    assert!(
+        !barrier.contains("blocking_states"),
+        "the publication-path barrier must not rebuild a bound state-list local"
+    );
+    assert!(
+        !barrier_sql.contains("ANY($"),
+        "the publication-path barrier must not bind its state list as an array"
+    );
+    // The parameter list as a whole, not element by element: a fourth entry is
+    // exactly how the bound state list got here, and only the closed list
+    // refuses one.
+    assert!(
+        barrier_sql.contains("&[&hash, &epoch, &fence],"),
+        "the barrier's parameters must be exactly the lineage keys, with no fourth"
+    );
+    // The whole predicate in one, so the literal list stays bound to the
+    // lineage keys it filters with and to the `hard_not_after` comparison that
+    // decides whether a barrier is still live. `>` and not `<`: a horizon in
+    // the past is an expired claim and no barrier at all.
+    assert!(
+        barrier_sql.contains(
+            "WHERE hash = $1 AND epoch = $2 AND fence = $3 \
+             AND state IN (0, 1, 3) AND hard_not_after > clock_timestamp()"
+        ),
+        "the publication-path barrier must test its state list as SQL literals"
+    );
+    assert!(
+        barrier_sql.contains("ORDER BY hard_not_after DESC FOR UPDATE"),
+        "the publication-path barrier must lock the claim rows it reads"
+    );
+    assert!(!barrier.contains("SystemTime::now"));
 }
 
 #[test]
