@@ -32,6 +32,7 @@ use crate::domain::lock_order::LockSequence;
 use crate::domain::lock_order::lock_branch;
 use crate::domain::lock_order::lock_repository;
 use crate::domain::outbox;
+use crate::domain::outbox::version::AggregateVersion;
 use crate::domain::receipts;
 use crate::domain::receipts::ConsumeResult;
 use crate::domain::retry::classify_commit;
@@ -81,25 +82,38 @@ async fn apply_projection(
 }
 
 /// Append the classified event, always as the transaction's last write.
+///
+/// `committed` is what **this** transaction wrote, and it is the only source of
+/// the event's `aggregate_version` ordinal. CR-032 F-032-4 requires the
+/// committed version, and for `metadata_compare_and_swap`, `begin_obliterate`,
+/// and an unconstrained `repository_delete` the caller cannot know it: the
+/// value is read under the row lock this transaction holds. Resolving it here
+/// is what stops a plausible, wrong, permanently-keyed ordinal from being
+/// published.
 async fn append_event(
     tx: &Transaction<'_>,
     sequence: &mut LockSequence,
     repository_id: &[u8],
-    repository_generation: i64,
+    committed: CommittedVersions,
     event: Option<&PendingEvent>,
 ) -> Result<(), DomainError> {
     let Some(event) = event else { return Ok(()) };
+    let version = AggregateVersion::new(
+        event.aggregate_ordinal.resolve(committed)?,
+        event.aggregate_identity.clone(),
+    )?
+    .encode();
     sequence.enter(LockClass::OutboxInsert)?;
     outbox::append(
         tx,
         &outbox::OutboxEvent {
             cell_id: &event.cell_id,
             repository_id,
-            repository_generation,
+            repository_generation: committed.repository_generation,
             event_kind: &event.event_kind,
             aggregate_kind: &event.aggregate_kind,
             aggregate_id: &event.aggregate_id,
-            aggregate_version: &event.aggregate_version,
+            aggregate_version: &version,
             payload_schema_version: event.payload_schema_version,
             payload: &event.payload,
         },
@@ -517,7 +531,10 @@ impl DomainTransactionStore for PostgresDomainStore {
             &tx,
             &mut sequence,
             &input.repository_id,
-            1,
+            CommittedVersions {
+                repository_generation: 1,
+                branch_generation: Some(1),
+            },
             input.event.as_ref(),
         )
         .await?;
@@ -642,7 +659,10 @@ impl DomainTransactionStore for PostgresDomainStore {
             &tx,
             &mut sequence,
             &input.repository_id,
-            generation,
+            CommittedVersions {
+                repository_generation: generation,
+                branch_generation: None,
+            },
             input.event.as_ref(),
         )
         .await?;
@@ -766,7 +786,10 @@ impl DomainTransactionStore for PostgresDomainStore {
             &tx,
             &mut sequence,
             &input.repository_id,
-            repository_generation,
+            CommittedVersions {
+                repository_generation,
+                branch_generation,
+            },
             input.event.as_ref(),
         )
         .await?;
@@ -870,6 +893,20 @@ impl DomainTransactionStore for PostgresDomainStore {
         )
         .await?;
 
+        // **The current-head no-op suppression point** (CR-032's "Current-head
+        // push and exact create/delete retry: no new event"; WP-119 inventory
+        // disagreement C1).
+        //
+        // This arm returns before `append_event`, so a push of the current head
+        // appends no outbox row even though the handler still calls the
+        // governed publish and this transaction still commits its receipt and
+        // its generation/tombstone/fence checks. Suppression lives here, not in
+        // the handler, because the handler cannot see the locked row: it
+        // decides "is this the current head" against a preflight read, and a
+        // concurrent push between preflight and commit would make that decision
+        // wrong in both directions. Moving this check earlier, or letting it
+        // fall through to the append, is what turns a retry storm on an
+        // unchanged head into a stream of duplicate durable events.
         if branch.latest_hash == input.new_latest_hash {
             let outcome = DomainOutcome::Applied;
             receipts::commit_terminal(&tx, &operation.key, &outcome, None, clock).await?;
@@ -901,7 +938,10 @@ impl DomainTransactionStore for PostgresDomainStore {
             &tx,
             &mut sequence,
             &input.repository_id,
-            repository.generation,
+            CommittedVersions {
+                repository_generation: repository.generation,
+                branch_generation: Some(branch_generation),
+            },
             input.event.as_ref(),
         )
         .await?;
@@ -921,6 +961,7 @@ impl DomainTransactionStore for PostgresDomainStore {
         &self,
         operation: &GovernedOperation,
         repository_id: &[u8],
+        event: Option<&PendingEvent>,
     ) -> Result<MutationResult, DomainError> {
         let _t = self
             .instruments()
@@ -966,6 +1007,22 @@ impl DomainTransactionStore for PostgresDomainStore {
         )
         .await
         .map_err(|e| DomainError::from_pg("obliteration fence", e))?;
+
+        // CR-032 PIN-3's `repository.obliterated` row, appended last like every
+        // other classified event. There is no projection write on this path —
+        // the payload delete happens outside this transaction — so the append
+        // follows the fence directly.
+        append_event(
+            &tx,
+            &mut sequence,
+            repository_id,
+            CommittedVersions {
+                repository_generation: generation,
+                branch_generation: None,
+            },
+            event,
+        )
+        .await?;
 
         let outcome = DomainOutcome::Applied;
         receipts::commit_terminal(&tx, &operation.key, &outcome, None, clock).await?;

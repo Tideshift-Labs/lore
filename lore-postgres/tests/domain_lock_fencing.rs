@@ -854,7 +854,7 @@ async fn obsolete_repository_and_branch_generations_make_rows_logically_absent()
     )
     .await;
     let obliterate = store
-        .begin_obliterate(&obliterate_operation, &repository_id)
+        .begin_obliterate(&obliterate_operation, &repository_id, None)
         .await
         .expect("begin real repository obliteration");
     assert_eq!(obliterate.outcome, DomainOutcome::Applied);

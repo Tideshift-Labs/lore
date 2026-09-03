@@ -12,6 +12,7 @@ use subtle::ConstantTimeEq;
 use tokio_postgres::Transaction;
 
 use super::schema;
+use crate::domain::coordinator::CommittedVersions;
 use crate::domain::coordinator::GovernedOperation;
 use crate::domain::coordinator::PendingEvent;
 use crate::domain::errors::DomainError;
@@ -21,6 +22,7 @@ use crate::domain::lock_order::LockSequence;
 use crate::domain::lock_order::lock_branch;
 use crate::domain::lock_order::lock_repository;
 use crate::domain::outbox;
+use crate::domain::outbox::version::AggregateVersion;
 use crate::domain::receipts;
 use crate::domain::receipts::ConsumeResult;
 use crate::domain::receipts::OperationBinding;
@@ -1774,6 +1776,14 @@ async fn update_namespace_fence(
     Ok(())
 }
 
+/// Append the classified lock event, always as the transaction's last write.
+///
+/// A lock mutation commits no repository or branch generation of its own, so
+/// `committed.branch_generation` is always `None` here and a lock event's
+/// ordinal is the `Exact` committed namespace fence its builder was handed.
+/// The fence comes from a sequence inside this transaction and the owner token
+/// from a CSPRNG inside it, so neither is knowable to a caller; see
+/// [`crate::domain::coordinator::CommittedOrdinal`].
 async fn append_event(
     tx: &Transaction<'_>,
     sequence: &mut LockSequence,
@@ -1782,6 +1792,15 @@ async fn append_event(
     event: Option<&PendingEvent>,
 ) -> Result<(), DomainError> {
     let Some(event) = event else { return Ok(()) };
+    let committed = CommittedVersions {
+        repository_generation,
+        branch_generation: None,
+    };
+    let version = AggregateVersion::new(
+        event.aggregate_ordinal.resolve(committed)?,
+        event.aggregate_identity.clone(),
+    )?
+    .encode();
     sequence.enter(LockClass::OutboxInsert)?;
     outbox::append(
         tx,
@@ -1792,7 +1811,7 @@ async fn append_event(
             event_kind: &event.event_kind,
             aggregate_kind: &event.aggregate_kind,
             aggregate_id: &event.aggregate_id,
-            aggregate_version: &event.aggregate_version,
+            aggregate_version: &version,
             payload_schema_version: event.payload_schema_version,
             payload: &event.payload,
         },

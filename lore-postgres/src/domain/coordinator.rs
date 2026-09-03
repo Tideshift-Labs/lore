@@ -145,6 +145,25 @@ pub struct RepositoryCreateInput {
     /// `lore_mutable` projection rows this transaction must write in step.
     pub projection: Vec<ProjectionWrite>,
     /// Classified event to append last, if any.
+    ///
+    /// BLOCKED(WP-116): one `Option` cannot carry the two events this
+    /// transition owes. CR-032's classification table requires a row for
+    /// "Repository live publication" **and** a row for "Branch create", and
+    /// this method commits both in one transaction: the repository row at
+    /// generation 1 and its default branch at generation 1. A single slot can
+    /// express `repository.published` or `branch.created`, never both.
+    ///
+    /// Not resolved in Part 1 because this method has no production caller:
+    /// `RepositoryCreateInput` is constructed only in tests, and the two
+    /// repository-create handler sites are still fenced by
+    /// `reject_unwired_governed_operation`. It must be resolved before those
+    /// sites are wired.
+    ///
+    /// Missing artefact: an owner decision between widening this field to a
+    /// bounded `Vec<PendingEvent>` and a CR-032 amendment saying a repository
+    /// publication's default branch is covered by `repository.published`
+    /// alone. The `Vec` is the safer default, but it changes the shape
+    /// WP-117 and WP-118 consume, so it is not an implementation-time call.
     pub event: Option<PendingEvent>,
 }
 
@@ -166,7 +185,77 @@ pub struct ProjectionWrite {
     pub value: Option<Vec<u8>>,
 }
 
+/// Where the ordinal half of an event's `aggregate_version` comes from.
+///
+/// CR-032 F-032-4 (PIN-2) requires the ordinal to be the version the
+/// transaction **committed**. Four of the six append-capable coordinator
+/// methods compute that value inside their own transaction and never take it as
+/// an input — `metadata_compare_and_swap` reads the repository/branch
+/// generation under the row lock, `repository_delete` may be called with no
+/// expected generation, `begin_obliterate` derives its fence from the locked
+/// row, and every lock mutation draws its fence from a sequence — so a caller
+/// that pre-computed the ordinal would be guessing. A wrong ordinal is not a
+/// cosmetic defect: it travels inside the frozen `idempotency_key` preimage, so
+/// it would silently mis-key the event and break exact-retry dedupe.
+///
+/// The builder therefore names *which* committed value it wants, and the
+/// coordinator's own append step resolves it from the transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommittedOrdinal {
+    /// The repository generation this transaction committed.
+    RepositoryGeneration,
+    /// The branch generation this transaction committed. Only valid on a method
+    /// that commits one; anywhere else it is a programming error, not a
+    /// fallback.
+    BranchGeneration,
+    /// A value the caller already knows exactly, such as a lock namespace fence
+    /// the coordinator hands back in the same transaction.
+    Exact(u64),
+}
+
+/// The committed versions one transaction can resolve a [`CommittedOrdinal`]
+/// against. `branch_generation` is `None` on a method that commits none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedVersions {
+    /// Repository generation as committed by this transaction.
+    pub repository_generation: i64,
+    /// Branch generation as committed by this transaction, where there is one.
+    pub branch_generation: Option<i64>,
+}
+
+impl CommittedOrdinal {
+    /// Resolve to the exact committed ordinal, or fail.
+    ///
+    /// Deliberately has no fallback arm. An event that asked for a branch
+    /// generation on a method that commits none is a builder/caller mismatch,
+    /// and substituting the repository generation would publish a plausible,
+    /// wrong, permanently-keyed version.
+    pub fn resolve(self, committed: CommittedVersions) -> Result<u64, DomainError> {
+        let signed = match self {
+            Self::RepositoryGeneration => committed.repository_generation,
+            Self::BranchGeneration => committed.branch_generation.ok_or_else(|| {
+                DomainError::Internal(
+                    "outbox event asked for the committed branch generation, but this \
+                     transaction commits none"
+                        .to_owned(),
+                )
+            })?,
+            Self::Exact(value) => return Ok(value),
+        };
+        u64::try_from(signed).map_err(|_| {
+            DomainError::Internal(format!(
+                "outbox aggregate_version ordinal must be non-negative, got {signed}"
+            ))
+        })
+    }
+}
+
 /// A classified event to append to the outbox as the transaction's last write.
+///
+/// The `aggregate_version` bytes are **not** carried here. See
+/// [`CommittedOrdinal`]: the ordinal is resolved by the coordinator from the
+/// values its own transaction committed, and only the bounded identity half is
+/// caller-supplied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingEvent {
     /// Cell identity, from trusted server configuration.
@@ -177,8 +266,12 @@ pub struct PendingEvent {
     pub aggregate_kind: String,
     /// Aggregate identity.
     pub aggregate_id: Vec<u8>,
-    /// Committed aggregate version, opaque bounded bytes.
-    pub aggregate_version: Vec<u8>,
+    /// Which committed version the ordinal half of `aggregate_version` takes.
+    pub aggregate_ordinal: CommittedOrdinal,
+    /// The bounded identity half of `aggregate_version`: an exact revision
+    /// hash, a lock owner token, an association epoch, or empty where the event
+    /// kind has none.
+    pub aggregate_identity: Vec<u8>,
     /// Payload schema version.
     pub payload_schema_version: i32,
     /// Bounded identity/version payload. Never repository content.
@@ -197,6 +290,25 @@ pub struct RepositoryDeleteInput {
     /// Projection rows to remove in step.
     pub projection: Vec<ProjectionWrite>,
     /// Classified event to append last, if any.
+    ///
+    /// BLOCKED(WP-116): same one-slot ceiling as
+    /// [`RepositoryCreateInput::event`], and worse here because the count is
+    /// unbounded. This transaction tombstones every live branch of the
+    /// repository in one `UPDATE`, and CR-032 classifies a branch tombstone as
+    /// "Yes, once per real committed transition". N branches owe N
+    /// `branch.deleted` rows; one slot expresses one.
+    ///
+    /// CR-032 does give the shape of an answer for the adjacent case — a
+    /// repository tombstone hiding all associations emits "One
+    /// repository-generation event, not one row per hidden association" — but
+    /// it says that about associations, not branches, and WP-119's inventory
+    /// (disagreement C3) already records that the summary has no single writer
+    /// to hang off. Reading the association rule across to branches is a
+    /// contract decision, not an implementation one.
+    ///
+    /// Unresolved for the same reason as create: no production caller, both
+    /// delete sites still fenced. Also still blocked on `delete_proof`, which
+    /// CR-029 names but derives nowhere.
     pub event: Option<PendingEvent>,
 }
 
@@ -406,9 +518,15 @@ pub trait DomainTransactionStore: Send + Sync {
     ///
     /// Called by the immutable-lifecycle package's obliteration-begin
     /// transition. WP-116 owns only this fence, not fragment state.
+    ///
+    /// `event` carries CR-032 PIN-3's `repository.obliterated` row. This method
+    /// takes it as a bare parameter rather than inside an input struct because
+    /// its only other argument is the repository id; the five struct-carrying
+    /// methods each already had several.
     async fn begin_obliterate(
         &self,
         operation: &GovernedOperation,
         repository_id: &[u8],
+        event: Option<&PendingEvent>,
     ) -> Result<MutationResult, DomainError>;
 }

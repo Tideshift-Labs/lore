@@ -197,7 +197,7 @@ async fn begin_obliterate_advances_live_generation_and_refuses_a_tombstoned_repo
     // A live repository advances by exactly one.
     let obliterate_op = admitted_operation(&url, "lore.domain.v1.test/ObliterateFenceLive").await;
     let obliterated = store
-        .begin_obliterate(&obliterate_op, &repository_id)
+        .begin_obliterate(&obliterate_op, &repository_id, None)
         .await
         .expect("begin_obliterate on a live repository must not error");
     assert_eq!(obliterated.outcome, DomainOutcome::Applied);
@@ -237,7 +237,7 @@ async fn begin_obliterate_advances_live_generation_and_refuses_a_tombstoned_repo
     let obliterate_after_delete =
         admitted_operation(&url, "lore.domain.v1.test/ObliterateFenceTombstoned").await;
     let refused = store
-        .begin_obliterate(&obliterate_after_delete, &repository_id)
+        .begin_obliterate(&obliterate_after_delete, &repository_id, None)
         .await
         .expect("begin_obliterate on a tombstoned repository must not error");
     assert_eq!(refused.outcome, not_applied(TOMBSTONED_V1));
@@ -288,7 +288,7 @@ async fn begin_obliterate_and_branch_push_commit_agree_on_the_repository_generat
 
     let obliterate_op = admitted_operation(&url, "lore.domain.v1.test/ObliteratePushFence").await;
     let obliterated = store
-        .begin_obliterate(&obliterate_op, &repository_id)
+        .begin_obliterate(&obliterate_op, &repository_id, None)
         .await
         .expect("begin_obliterate must not error");
     assert_eq!(obliterated.repository_generation, Some(2));

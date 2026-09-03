@@ -19,6 +19,7 @@ use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
 use lore_postgres::domain::coordinator::MetadataCasInput;
 use lore_postgres::domain::coordinator::MutationResult;
+use lore_postgres::domain::coordinator::PendingEvent;
 use lore_postgres::domain::coordinator::RepositoryCreateInput;
 use lore_postgres::domain::coordinator::RepositoryDeleteInput;
 use lore_postgres::domain::coordinator::RepositorySnapshot;
@@ -292,6 +293,7 @@ impl DomainTransactionStore for RecordingStore {
         &self,
         _operation: &GovernedOperation,
         _repository_id: &[u8],
+        _event: Option<&PendingEvent>,
     ) -> Result<MutationResult, DomainError> {
         unreachable!("receipt-rail tests do not call begin_obliterate")
     }

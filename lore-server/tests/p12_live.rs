@@ -222,7 +222,7 @@ async fn exact_mediated_obliterate_consumes_while_tuple_tamper_preserves_prepare
             .expect("enforced carriage must govern");
         let operation = admitted.into_governed("begin_obliterate", digest);
         let result = store
-            .begin_obliterate(&operation, &repository_id)
+            .begin_obliterate(&operation, &repository_id, None)
             .await
             .expect("obliterate coordinator call must return decisively");
 

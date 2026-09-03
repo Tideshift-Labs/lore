@@ -14,6 +14,7 @@ use lore_postgres::domain::errors::DomainOutcome;
 use lore_postgres::domain::locks::PostgresLockCoordinator;
 use lore_postgres::domain::locks::PushLockWitness;
 use lore_postgres::domain::locks::VerifiedLockOwner;
+use lore_postgres::domain::outbox::builders as outbox_builders;
 use lore_proto::BranchPushRequest;
 use lore_proto::BranchPushResponse;
 use lore_revision::branch;
@@ -365,6 +366,15 @@ pub(crate) struct GovernedPushCommit {
     expected_latest_hash: Vec<u8>,
     lock_witness: PushLockWitness,
     pub(crate) owner: VerifiedLockOwner,
+    /// The branch's authored name, carried for the event's bounded payload.
+    ///
+    /// Not an identity: CR-032's 2026-09-03 branch amendment makes the branch
+    /// aggregate's `aggregate_id` the 16-byte branch id, precisely because a
+    /// name can run to 1,000 bytes. It is read from the same preflight snapshot
+    /// as the generation it is published alongside, so the payload names the
+    /// branch the CAS was asserted against rather than whatever it is called by
+    /// the time a consumer reads the row.
+    branch_name: String,
 }
 
 /// Capture SCHEMA-117's witness independently of CR-019 and prepare the
@@ -444,6 +454,7 @@ pub(crate) async fn prepare_governed_push(
         expected_latest_hash: branch.latest_hash,
         lock_witness,
         owner,
+        branch_name: branch.name,
     }))
 }
 
@@ -517,6 +528,39 @@ impl GovernedPushCommit {
             return Err(Status::aborted("Branch preflight changed; rerun preflight"));
         }
         let (key, key_type) = branch::mutable_key(repository.salt(), LATEST, repository.id, branch);
+        // The classified `branch.pushed` row.
+        //
+        // `branch_push_commit` remains the **only** suppression authority for a
+        // current-head push: it compares the locked row and returns before its
+        // append, which is the point WP-119's inventory (disagreement C1)
+        // requires be pinned. Skipping the build here is not a second
+        // suppression decision, it is a build skip on the one case where the
+        // coordinator's answer is already determined. `publish` has just
+        // asserted `expected_latest_hash == current_head`, so
+        // `current_head == new_head` means `expected == new` and the
+        // coordinator's no-op arm is forced. CR-032 classifies that push as
+        // "No new event", so building one would be work whose only possible
+        // outcomes are discarded or a spurious error. The reverse direction
+        // stays safe: if the handler thinks the head advances and the
+        // coordinator finds it did not, the coordinator suppresses and the
+        // built event is simply unused.
+        //
+        // `None` also when this cell has no configured identity; see
+        // `DomainContext::cell_id`.
+        let event = match (self.domain.cell_id(), current_head == new_head) {
+            (Some(cell_id), false) => Some(
+                outbox_builders::branch_pushed(
+                    cell_id,
+                    repository.id.as_ref(),
+                    branch.as_ref(),
+                    &self.branch_name,
+                    current_head.as_ref(),
+                    new_head.as_ref(),
+                )
+                .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?,
+            ),
+            (Some(_), true) | (None, _) => None,
+        };
         let input = BranchPushCommitInput {
             repository_id: repository.id.as_ref().to_vec(),
             branch_id: branch.as_ref().to_vec(),
@@ -535,7 +579,7 @@ impl GovernedPushCommit {
                 key: key.as_ref().to_vec(),
                 value: Some(new_head.as_ref().to_vec()),
             }],
-            event: None,
+            event,
         };
         let result = self
             .domain

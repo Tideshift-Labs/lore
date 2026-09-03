@@ -59,10 +59,50 @@ fn every_authenticated_site_uses_the_one_canonical_intent_definition() {
             .source
             .contains(".branch_push_commit(&self.operation")
     );
-    assert!(
-        WIRED_SITES[1]
+    // WP-116 Part 1: the push must hand its classified event to the
+    // coordinator.
+    //
+    // Scoped to the `BranchPushCommitInput` literal, not to the whole file.
+    // `include_str!` pulls in `#[cfg(test)] mod tests` too, so a file-wide
+    // `contains`/`!contains` pair is both unsound (a test fixture writing
+    // `event: None` fails it spuriously) and too weak (a regression to
+    // `let event = None;` above the literal satisfies it). The literal is the
+    // one place where feeding versus not feeding the coordinator is decided.
+    let literal = {
+        let start = WIRED_SITES[0]
             .source
-            .contains(".begin_obliterate(operation, repository.data())")
+            .find("let input = BranchPushCommitInput {")
+            .expect("branch push must build its coordinator input as a struct literal");
+        let rest = &WIRED_SITES[0].source[start..];
+        let end = rest
+            .find("\n        };")
+            .expect("the BranchPushCommitInput literal must terminate");
+        &rest[..end]
+    };
+    // No trailing newline in the needle: `event,` is the literal's last field,
+    // so the slice ends immediately after it.
+    assert!(
+        literal.contains("\n            event,"),
+        "branch push must pass its built event to the coordinator; a literal \
+         that sets `event: None`, or omits the field, has regressed to the \
+         pre-WP-116 unfed outbox"
+    );
+    assert!(
+        !literal.contains("event: None"),
+        "branch push must not regress to an unfed outbox event"
+    );
+    // The event has to come from the shared pinned builder rather than a
+    // second, file-local definition of the same classification. This is the
+    // same rule `the_removed_inline_branch_push_definition_cannot_return`
+    // enforces for the canonical intent digest.
+    assert_eq!(
+        WIRED_SITES[0]
+            .source
+            .matches("outbox_builders::branch_pushed(")
+            .count(),
+        1,
+        "branch push must build its event through exactly one call to the \
+         shared pinned builder"
     );
 }
 

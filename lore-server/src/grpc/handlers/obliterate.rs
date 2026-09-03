@@ -6,6 +6,7 @@ use std::sync::Arc;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_postgres::domain::errors::DomainOutcome;
+use lore_postgres::domain::outbox::builders as outbox_builders;
 use lore_proto::ObliterateRequest;
 use lore_proto::ObliterateResponse;
 use lore_revision::notification::NotificationSender;
@@ -99,9 +100,28 @@ pub async fn handler(
                 address_context: address.context.as_ref(),
             })
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            // CR-032 PIN-3: the obliteration fence commits exactly one
+            // `repository.obliterated` row, in the same transaction as the
+            // fence. Built here, before the transaction opens, so an over-wide
+            // or malformed identity is a request rejection rather than a
+            // rollback. `None` when this cell has no configured identity; see
+            // `DomainContext::cell_id`.
+            let event = match domain.cell_id() {
+                Some(cell_id) => Some(
+                    outbox_builders::repository_obliterated(
+                        cell_id,
+                        repository.data(),
+                        address.hash.as_ref(),
+                        address.context.as_ref(),
+                    )
+                    .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?,
+                ),
+                None => None,
+            };
             Some((
                 domain.clone(),
                 admitted.into_governed("begin_obliterate", digest),
+                event,
             ))
         }
         None => None,
@@ -134,10 +154,10 @@ pub async fn handler(
 
             info!("Handling obliterate request for address {address}");
 
-            if let Some((domain, operation)) = governed.as_ref() {
+            if let Some((domain, operation, event)) = governed.as_ref() {
                 let result = domain
                     .store()
-                    .begin_obliterate(operation, repository.data())
+                    .begin_obliterate(operation, repository.data(), event.as_ref())
                     .await
                     .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?;
                 if let DomainOutcome::NotApplied { reason, .. } = result.outcome {

@@ -19,6 +19,7 @@ use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::coordinator::CAS_MISMATCH_V1;
+use lore_postgres::domain::coordinator::CommittedOrdinal;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GENERATION_MISMATCH_V1;
 use lore_postgres::domain::coordinator::GovernedOperation;
@@ -702,6 +703,7 @@ fn build_governed(
         expected_latest_hash,
         lock_witness,
         owner,
+        branch_name: "main".to_owned(),
     }
 }
 
@@ -801,6 +803,111 @@ async fn publish_carries_the_witness_generations_and_hashes_into_the_commit_inpu
     assert_eq!(call.expected_branch_lock_namespace_last_applied_fence, 17);
     assert_eq!(call.expected_latest_hash, current_head.as_ref().to_vec());
     assert_eq!(call.new_latest_hash, new_head.as_ref().to_vec());
+}
+
+/// WP-116 review finding (blocking): every test above builds its `DomainContext`
+/// via the two-argument `DomainContext::new`, which leaves `cell_id: None` --
+/// so `publish`'s `event` match always took the `(None, _) => None` arm and the
+/// entire outbox-producer wiring in this handler went unexecuted by any test,
+/// including every test above this one. This is the first test in the tree
+/// that configures a cell id and actually reaches the `(Some(cell_id), false)`
+/// arm.
+#[tokio::test]
+async fn publish_with_a_configured_cell_id_and_an_advancing_head_builds_the_branch_pushed_event() {
+    let script = Arc::new(ScriptedDomainStore::new(MutationResult {
+        outcome: DomainOutcome::Applied,
+        repository_generation: Some(4),
+        branch_generation: Some(6),
+    }));
+    let domain =
+        Arc::new(DomainContext::new(script.clone(), false).with_cell_id(Some("cell-a".to_owned())));
+    let current_head = Hash::hash_buffer(b"cell-id-configured-current-head");
+    let new_head = Hash::hash_buffer(b"cell-id-configured-new-head");
+    let governed = build_governed(
+        domain,
+        current_head.as_ref().to_vec(),
+        scripted_witness(),
+        scripted_owner(),
+        4,
+        6,
+    );
+
+    let repository = local_repository_context().await;
+    let branch = random::<BranchId>();
+
+    let applied = governed
+        .publish(&repository, branch, current_head, new_head)
+        .await
+        .expect("an Applied outcome must succeed");
+    assert_eq!(applied, new_head);
+
+    let calls = script.recorded_branch_push_commit_calls();
+    assert_eq!(calls.len(), 1);
+    let event = calls[0]
+        .event
+        .as_ref()
+        .expect("a configured cell_id and an advancing head must build Some(event)");
+    assert_eq!(event.cell_id, "cell-a");
+    assert_eq!(event.event_kind, outbox_builders::BRANCH_PUSHED);
+    assert_eq!(event.aggregate_kind, outbox_builders::AGGREGATE_BRANCH);
+    assert_eq!(
+        event.aggregate_id,
+        branch.as_ref().to_vec(),
+        "aggregate_id is the 16 raw branch-id bytes, per CR-032's second PIN-4 amendment \
+         (2026-09-03) -- the branch name travels in the payload instead"
+    );
+    assert_eq!(event.aggregate_ordinal, CommittedOrdinal::BranchGeneration);
+    assert_eq!(event.aggregate_identity, new_head.as_ref().to_vec());
+    // The branch name (build_governed hardcodes "main") still travels, just
+    // in the payload rather than aggregate_id.
+    let payload_text = String::from_utf8(event.payload.clone()).expect("payload is UTF-8 JSON-ish");
+    assert!(payload_text.contains("main"));
+}
+
+/// The second half of the C1 rule: a configured cell_id does not by itself
+/// build an event on a current-head no-op. `publish`'s own match skips the
+/// build in this case (`(Some(_), true) => None`) rather than building one and
+/// relying on the coordinator to drop it -- the coordinator's
+/// `branch.latest_hash == input.new_latest_hash` arm remains the only
+/// suppression *authority* (proven at the coordinator level in
+/// `lore-postgres/tests/domain_outbox_producers.rs`), but this proves the
+/// handler-level build skip specifically, which that coordinator-level test
+/// cannot: a `ScriptedDomainStore` never runs real coordinator logic, so this
+/// is the only place `publish`'s own match arm is exercised.
+#[tokio::test]
+async fn publish_with_a_configured_cell_id_and_the_current_head_builds_no_event() {
+    let script = Arc::new(ScriptedDomainStore::new(MutationResult {
+        outcome: DomainOutcome::Applied,
+        repository_generation: Some(4),
+        branch_generation: Some(6),
+    }));
+    let domain =
+        Arc::new(DomainContext::new(script.clone(), false).with_cell_id(Some("cell-a".to_owned())));
+    let current_head = Hash::hash_buffer(b"cell-id-configured-noop-head");
+    let governed = build_governed(
+        domain,
+        current_head.as_ref().to_vec(),
+        scripted_witness(),
+        scripted_owner(),
+        4,
+        6,
+    );
+
+    let repository = local_repository_context().await;
+    let branch = random::<BranchId>();
+
+    let applied = governed
+        .publish(&repository, branch, current_head, current_head)
+        .await
+        .expect("a current-head push must still succeed");
+    assert_eq!(applied, current_head);
+
+    let calls = script.recorded_branch_push_commit_calls();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].event.is_none(),
+        "a current-head push must build no event even with a configured cell_id"
+    );
 }
 
 /// Runs `publish` once against a fresh scripted store that always returns

@@ -2720,7 +2720,7 @@ async fn stale_association_rejection_comes_from_repository_tombstone_not_generat
 
     let bump_op = prepare_operation(&store, "lore.domain.v1.test/FragmentGenerationDrift").await;
     let bumped = store
-        .begin_obliterate(&bump_op, &repository_id)
+        .begin_obliterate(&bump_op, &repository_id, None)
         .await
         .expect("begin_obliterate must not error");
     assert_eq!(bumped.outcome, DomainOutcome::Applied);

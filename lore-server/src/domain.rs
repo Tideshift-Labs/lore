@@ -125,6 +125,7 @@ pub struct DomainContext {
     store: Arc<dyn DomainTransactionStore>,
     enforcement: bool,
     lock_coordinator: Option<Arc<PostgresLockCoordinator>>,
+    cell_id: Option<String>,
 }
 
 impl DomainContext {
@@ -134,6 +135,7 @@ impl DomainContext {
             store,
             enforcement,
             lock_coordinator: None,
+            cell_id: None,
         }
     }
 
@@ -149,7 +151,35 @@ impl DomainContext {
             store,
             enforcement,
             lock_coordinator: Some(lock_coordinator),
+            cell_id: None,
         }
+    }
+
+    /// Attach the configured cell identity, so producers can build CR-032
+    /// outbox events.
+    ///
+    /// Separate from the constructors on purpose: the cell identity is
+    /// **optional** at this layer. A cell that has not configured one is the
+    /// pre-CR-032 cell, and it keeps working with no outbox rows rather than
+    /// refusing every mutation. Closing that gap fail-closed is WP-119's
+    /// required-event admission gate, which knows whether the cell is supposed
+    /// to be producing events; this constructor cannot tell the difference
+    /// between "not configured yet" and "misconfigured".
+    #[must_use]
+    pub fn with_cell_id(mut self, cell_id: Option<String>) -> Self {
+        self.cell_id = cell_id;
+        self
+    }
+
+    /// The configured cell identity, or `None` on a cell that has none.
+    ///
+    /// A producer with `None` here emits no event. It must not substitute a
+    /// hostname, a database name, or any other plausible-looking string: the
+    /// `cell_id` is field one of CR-032's frozen `idempotency_key` preimage and
+    /// becomes a broker subject token, so an invented value silently re-keys
+    /// every event this cell will ever emit and can restructure the subject.
+    pub fn cell_id(&self) -> Option<&str> {
+        self.cell_id.as_deref()
     }
 
     /// The coordinator itself.
@@ -468,6 +498,7 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
 
     let fragment_coordinator = store.fragment_coordinator();
     let database_identity = store.identity().clone();
+    let cell_id = resolve_cell_id(settings)?;
     let context = if lock_fencing {
         DomainContext::new_with_lock_coordinator(
             Arc::new(store),
@@ -476,13 +507,80 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
         )
     } else {
         DomainContext::new(Arc::new(store), enforcement)
-    };
+    }
+    .with_cell_id(cell_id);
     Ok(ConfiguredDomainContext {
         context: Some(Arc::new(context)),
         mutable_enforcement: Some(mutable_enforcement),
         fragment_coordinator: Some(fragment_coordinator),
         database_identity: Some(database_identity),
     })
+}
+
+/// Resolve the cell identity CR-032 producers stamp on every outbox event.
+///
+/// The value lives in `[plugins.remote] cell_id`, which is where the
+/// notification plane already reads it from, so a cell cannot end up publishing
+/// events under one identity and relaying them under another.
+///
+/// Three outcomes, and the asymmetry is deliberate:
+///
+/// * **No plugin table at all** is `Ok(None)`. A cell with no notification
+///   plugin configured is the pre-CR-032 cell; it keeps mutating and simply
+///   produces no outbox rows. Refusing to boot here would take down every
+///   existing Postgres-mode cell for a feature none of them has turned on.
+/// * **A plugin table with no `cell_id`** is also `Ok(None)`, and deliberately
+///   not a boot failure here. The table is the notification plugin's, not the
+///   outbox's; when `[notification] mode = "remote"` is actually set, that
+///   plugin's own factory validation refuses the missing key at boot, and
+///   duplicating the refusal in this function would make an unrelated,
+///   unenabled stanza fatal to a cell that never asked for either feature.
+/// * **Present but malformed** is a boot failure. `cell_id` is field one of the
+///   frozen `idempotency_key` preimage and becomes a broker subject token, so a
+///   typo is not a value to fall back from: accepting it would key every event
+///   this cell emits under a name no consumer subscribes to, and treating it as
+///   absent would silently disable the outbox on a cell an operator believed
+///   was configured.
+///
+/// Known gap, deliberately not closed here: a well-formed `cell_id` in a stale
+/// `[plugins.remote]` table on a cell whose `[notification] mode` is not
+/// `remote` yields a producing outbox with no relay configured. That is the
+/// correct failure shape — rows accumulate durably and the relay's own startup
+/// gate is what reports it — but it is worth knowing that this function does
+/// not couple the two.
+// PIN(WP-116): cell identity source is [plugins.remote_notification].cell_id
+// until a top-level cell setting exists. The table is named `remote` on the
+// wire (`PLUGIN_NAME`); it is the notification plugin's, and the outbox
+// borrows it so producer and relay cannot disagree about which cell this is.
+fn resolve_cell_id(settings: &Settings) -> Result<Option<String>> {
+    let Some(table) = settings
+        .plugins
+        .get(crate::plugins::remote_notification::PLUGIN_NAME)
+    else {
+        return Ok(None);
+    };
+    let Some(value) = table.get("cell_id") else {
+        return Ok(None);
+    };
+    let cell_id = value.as_str().ok_or_else(|| {
+        anyhow!(
+            "[plugins.{}] cell_id must be a string",
+            crate::plugins::remote_notification::PLUGIN_NAME
+        )
+    })?;
+    // Validated against the outbox's own grammar, not the notification
+    // plugin's identical copy: this value is going into `lore_outbox_events`,
+    // and the append API is the thing that will reject it. Both come from the
+    // same contract clause, so they agree today; keying the check to the
+    // consumer means they cannot silently stop agreeing.
+    if !lore_postgres::domain::outbox::schema::is_valid_cell_id(cell_id) {
+        return Err(anyhow!(
+            "[plugins.{}] cell_id is not a valid cell identity: it must match the contract grammar and fit {} bytes",
+            crate::plugins::remote_notification::PLUGIN_NAME,
+            lore_postgres::domain::outbox::schema::MAX_CELL_ID_BYTES,
+        ));
+    }
+    Ok(Some(cell_id.to_owned()))
 }
 
 fn resolve_lock_fencing(readiness: &LockFencingReadiness, settings: &Settings) -> Result<bool> {
@@ -602,6 +700,7 @@ pub(crate) mod test_support {
     use lore_postgres::domain::coordinator::BranchSnapshot;
     use lore_postgres::domain::coordinator::MetadataCasInput;
     use lore_postgres::domain::coordinator::MutationResult;
+    use lore_postgres::domain::coordinator::PendingEvent;
     use lore_postgres::domain::coordinator::RepositoryCreateInput;
     use lore_postgres::domain::coordinator::RepositoryDeleteInput;
     use lore_postgres::domain::coordinator::RepositorySnapshot;
@@ -827,6 +926,7 @@ pub(crate) mod test_support {
             &self,
             _operation: &GovernedOperation,
             _repository_id: &[u8],
+            _event: Option<&PendingEvent>,
         ) -> Result<MutationResult, DomainError> {
             unreachable!("DomainContext::admit tests never call the coordinator")
         }
@@ -973,6 +1073,7 @@ pub(crate) mod test_support {
             &self,
             _operation: &GovernedOperation,
             _repository_id: &[u8],
+            _event: Option<&PendingEvent>,
         ) -> Result<MutationResult, DomainError> {
             unreachable!("ScriptedDomainStore only scripts branch_push_commit")
         }
