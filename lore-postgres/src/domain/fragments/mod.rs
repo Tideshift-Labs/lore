@@ -81,10 +81,58 @@
 //! which is a WP-116 seam.
 
 pub mod coordinator;
+#[cfg(feature = "failure_generator")]
+pub mod failpoints;
 pub mod masks;
 pub mod provider;
 pub mod schema;
 pub mod states;
+
+/// Whether this build carries WP-118 Phase 9's fragment failpoints.
+///
+/// Present in **both** configurations on purpose. Cargo cannot express that
+/// `lore-server/failure_generator` and `lore-postgres/failure_generator` must
+/// move together, and a forwarded feature chain in this fork has already been
+/// shown to drift silently (see the `oodle` chain and the learning
+/// `cargo-cannot-express-that-two-features-must-move-together-pin-it-with-a-cross-crate-guard-test.md`).
+/// This is what the cross-crate guard compares against, in
+/// `lore-server/src/plugins/postgres.rs`.
+pub const fn failpoints_compiled() -> bool {
+    cfg!(feature = "failure_generator")
+}
+
+/// Reach a WP-118 Phase 9 failpoint. Expands to nothing in a default build.
+///
+/// The two arms are the whole enforcement. Under `failure_generator` this calls
+/// [`failpoints::hit`]; without it, that function does not exist and cannot be
+/// named, so a call site that tried to reach a failpoint in a default build is
+/// `E0433` rather than something a reviewer has to catch.
+///
+/// **That is the only property either arm holds.** The default arm binds the
+/// anchor literal so it is type-checked, but it type-checks the *expression*,
+/// not the *name* — every string literal passes, in both configurations. A
+/// mistyped anchor is caught by nothing the compiler does; only the call-site
+/// scan against [`failpoints`]'s `ANCHORS` table catches it.
+///
+/// Call sites write `failpoint!("anchor.name")?;` — the `?` is deliberately
+/// left visible rather than hidden inside the expansion, because a `.settled`
+/// anchor configured with the `unknown` action really does return an error from
+/// a commit that succeeded.
+#[cfg(feature = "failure_generator")]
+macro_rules! failpoint {
+    ($anchor:expr) => {
+        $crate::domain::fragments::failpoints::hit($anchor).await
+    };
+}
+
+#[cfg(not(feature = "failure_generator"))]
+macro_rules! failpoint {
+    ($anchor:expr) => {
+        ::core::result::Result::<(), $crate::domain::errors::DomainError>::Ok({
+            let _anchor: &'static str = $anchor;
+        })
+    };
+}
 
 pub use coordinator::BeginOutcome;
 pub use coordinator::CommitVerdict;
@@ -128,6 +176,7 @@ pub use coordinator::STAGED_LEASE_MEMBER_SET_MISMATCH;
 pub use coordinator::STAGED_LEASE_VANISHED;
 pub use coordinator::StagedReaderLease;
 pub use coordinator::read_fragment_write_capability;
+pub(crate) use failpoint;
 pub use masks::CONTENT_STRUCTURE_MASK;
 pub use masks::DERIVED_TIER_MASK;
 pub use masks::DecodeSupport;

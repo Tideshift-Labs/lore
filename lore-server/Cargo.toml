@@ -110,9 +110,19 @@ oodle = ["lore-revision/oodle", "lore-postgres/oodle"]
 integration_tests = []
 test_random = []
 seeding = ["lore-revision/seeding"]
-# Enables fault-injection in the storage layer (e.g. LORE_MISS_FRAGMENT_WRITES).
-# Used by smoke tests that exercise missing-fragment recovery paths.
-failure_generator = ["lore-storage/failure_generator"]
+# Enables fault-injection in the storage layer (e.g. LORE_MISS_FRAGMENT_WRITES)
+# and WP-118 Phase 9's deterministic failpoints in `lore-postgres`'s fragment
+# lifecycle coordinator (LORE_FRAGMENT_FAILPOINTS). Used by smoke tests that
+# exercise missing-fragment recovery, and by WP-109's two-process shared-backend
+# proof.
+#
+# `lore-postgres/failure_generator` must stay forwarded. Without it the
+# coordinator's failpoint module is not compiled, every anchor is inert, and a
+# harness that sets LORE_FRAGMENT_FAILPOINTS gets a silent no-op rather than a
+# barrier — a proof that reports green having raced nothing. Cargo cannot
+# express that the two features move together, so this is pinned by
+# `plugins::postgres::tests::the_failpoint_feature_chain_reaches_lore_postgres`.
+failure_generator = ["lore-storage/failure_generator", "lore-postgres/failure_generator"]
 
 [[bin]]
 name = "loreserver"

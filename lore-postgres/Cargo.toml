@@ -69,6 +69,39 @@ lore-telemetry = { workspace = true }
 # it needs OODLE_LIB_DIR. Off by default, matching every other crate here.
 oodle = ["lore-storage/oodle"]
 
+# WP-118 Phase 9: deterministic failpoints in the fragment lifecycle
+# coordinator, for WP-109's two-process shared-backend proof.
+#
+# TEST-ONLY, and the gate is the whole design: `domain/fragments/failpoints.rs`
+# is declared under this cfg, so in a default build `failpoints::hit` does not
+# exist and cannot be named. A call site that tried to reach a failpoint without
+# the feature is E0433, not something review has to catch. The `failpoint!`
+# macro's default arm expands to a typed `Ok`, so a default binary contains no
+# failpoint code and reads no environment variable — verified: the string
+# `LORE_FRAGMENT_FAILPOINTS` appears 0 times in a default `liblore_postgres`
+# rlib and 5 times in a `--features failure_generator` one.
+#
+# Stated exactly, because the weaker fact is easy to overclaim: the anchor
+# STRING LITERALS do survive into a default build's string table, since the
+# default macro arm still binds the literal to type-check it. Nothing reads them
+# and no anchor is reachable.
+#
+# That binding type-checks the EXPRESSION, not the NAME. Any string literal
+# passes it, so no build in any configuration catches a mistyped anchor. The
+# only enforcement is a scan comparing the `failpoint!` call sites against the
+# ANCHORS table — `the_anchor_table_and_the_call_sites_name_the_same_set` here,
+# which compiles only under this feature, plus the default-tier scan in
+# `lore-postgres/tests/`. CI builds with `--features failure_generator` but does
+# not `cargo test` with it, so the default-tier scan is the one that actually
+# runs on a pull request.
+#
+# Deliberately the SAME NAME as `lore-storage/failure_generator` and forwarded
+# from the same `lore-server/failure_generator` entry, so there is one chain to
+# keep aligned rather than two. Cargo cannot express that they must move
+# together; `the_failpoint_feature_chain_reaches_lore_postgres` in
+# `lore-server/src/plugins/postgres.rs` is what catches the drift.
+failure_generator = []
+
 [dev-dependencies]
 serial_test = { workspace = true }
 tokio-util = { workspace = true }

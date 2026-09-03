@@ -12,6 +12,9 @@
 //! connection proof, cross-instance racing, stale-witness fencing, generation
 //! fanout atomicity, and readiness against real schema damage.
 
+#[path = "common/case_namespace.rs"]
+mod case_namespace;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ops::Deref;
@@ -3421,9 +3424,19 @@ async fn a_promotion_round_trip_allocates_a_new_epoch_and_publishes_under_remote
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn an_absent_fragment_schema_routes_legacy_but_a_partial_one_is_refused() {
-    let Some(url) = pg_url() else {
+    let Some(base_url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
+    // WP-118 Phase 9 proof-of-use for `CaseNamespace`. This case is the one in
+    // this file that discriminates on the namespace actually taking effect: it
+    // damages the schema through a plain `tokio_postgres` client and observes
+    // the damage through the store's own pool, so the two connection paths must
+    // resolve the same schema or every "must be refused" assertion below fails.
+    // The rest of the case is unchanged.
+    let namespace =
+        case_namespace::CaseNamespace::acquire(&base_url, "absent-fragment-schema").await;
+    let url = namespace.pg_url().to_owned();
+
     // Deliberately not the bootstrapping `store()` helper: this case needs the
     // state a booting cell actually finds before any migration has run.
     let bare = PostgresDomainStore::connect(&url, 4, &TlsConfig::default())
@@ -3435,6 +3448,21 @@ async fn an_absent_fragment_schema_routes_legacy_but_a_partial_one_is_refused() 
         .await
         .expect("an unmigrated database must answer, not error");
     assert_eq!(readiness, FragmentLifecycleReadiness::not_provisioned());
+
+    // `connect` has now run `ensure_schema`, so the CR-029 domain relations
+    // exist. Prove they landed in the case namespace rather than in `public`:
+    // without the `search_path` override they would be in `public`, so the
+    // first assertion fails if the namespace is not in effect. The second is
+    // the isolation claim; under the live runner it is near-vacuous because the
+    // containing database is fresh, and it is load-bearing only for a harness
+    // (WP-109's) that shares one database across cases.
+    assert_eq!(
+        namespace
+            .schemas_containing("lore_domain_repositories")
+            .await,
+        vec![namespace.schema_name().to_owned()],
+        "the domain schema must be installed in the case namespace alone"
+    );
 
     bare.fragment_coordinator()
         .bootstrap()
@@ -3499,6 +3527,12 @@ async fn an_absent_fragment_schema_routes_legacy_but_a_partial_one_is_refused() 
         "a provisioned schema missing its repository generation columns must be refused, \
          never reported as ready"
     );
+
+    // Drop the pooled and direct connections before the namespace so nothing is
+    // still holding a relation in the schema being dropped.
+    drop(direct);
+    drop(bare);
+    namespace.release().await;
 }
 
 // ---------------------------------------------------------------------------

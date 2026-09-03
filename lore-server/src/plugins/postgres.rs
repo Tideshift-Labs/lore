@@ -993,9 +993,49 @@ impl LockStorePluginFactory for PostgresLockStorePluginFactory {
 /// Auto-discovered by `build.rs` and called from the generated
 /// `plugins/mod.rs::register_all_plugins`.
 pub fn register(registry: &mut PluginRegistry) {
+    warn_if_fragment_failpoints_are_compiled();
     registry.register_immutable_store_plugin(Box::new(PostgresImmutableStorePluginFactory));
     registry.register_mutable_store_plugin(Box::new(PostgresMutableStorePluginFactory));
     registry.register_lock_store_plugin(Box::new(PostgresLockStorePluginFactory));
+}
+
+/// The boot banner emitted when this binary carries WP-118 Phase 9's fragment
+/// failpoints. Named so a test can assert on the exact bytes.
+pub(crate) const FRAGMENT_FAILPOINTS_COMPILED_BANNER: &str = "WARNING: this loreserver was built with `failure_generator`. The fragment lifecycle \
+     coordinator carries WP-118 Phase 9 failpoints, which can pause, abort, or withhold a commit \
+     acknowledgement when LORE_FRAGMENT_FAILPOINTS names an anchor. This is a TEST binary and \
+     must not serve production traffic.";
+
+/// Announce at boot that this binary carries WP-118 Phase 9's fragment
+/// failpoints.
+///
+/// Every other guard on this feature is compile-time: the module does not exist
+/// in a default build, so no failpoint can fire in one. This covers the case
+/// those guards cannot — a binary that really was built with the feature and
+/// then deployed. `ServerInfo` already reports `failure_generator`, but only to
+/// a client that asks; and `failpoints.rs` warns only once at least one anchor
+/// parses, so a feature-carrying binary with no environment set is otherwise
+/// silent.
+///
+/// **Written to stderr rather than through `tracing`, and that is not a style
+/// choice.** [`register`] is reached from `server.rs`'s `register_all_plugins`
+/// call, which runs *before* `TelemetryInitializer::init` installs a subscriber
+/// — deliberately, so every compiled-in plugin can contribute OpenTelemetry
+/// resource detectors first (see the comment above that call). A
+/// `tracing::warn!` here is therefore emitted with no subscriber attached and is
+/// dropped on the floor: it would look like coverage of the one case the
+/// compile-time guards cannot reach, while covering nothing. Moving the
+/// emission later would mean reordering a boot sequence whose order is
+/// load-bearing for a different reason. `eprintln!` needs no subscriber, so the
+/// banner survives the ordering instead of depending on it.
+///
+/// Keyed off the compiled-in constant rather than a local `cfg!`, so it reports
+/// what `lore-postgres` actually built — the thing that matters, and the thing a
+/// broken feature chain gets wrong.
+fn warn_if_fragment_failpoints_are_compiled() {
+    if lore_postgres::domain::fragments::failpoints_compiled() {
+        eprintln!("{FRAGMENT_FAILPOINTS_COMPILED_BANNER}");
+    }
 }
 
 #[cfg(test)]
@@ -1041,6 +1081,91 @@ mod tests {
             verdict, expected,
             "lore-server's `oodle` feature must forward to lore-postgres/oodle; \
              without it the coordinator misreports a decodable Oodle2 object as unrepairable"
+        );
+    }
+
+    /// The `failure_generator` Cargo feature must reach `lore-postgres`, not
+    /// only `lore-storage`.
+    ///
+    /// WP-118 Phase 9's failpoints live in `lore-postgres`'s fragment lifecycle
+    /// coordinator, and WP-109's two-process proof drives its races through
+    /// them. If `lore-server/failure_generator` forwarded only to
+    /// `lore-storage`, the coordinator's failpoint module would not be
+    /// compiled: every `LORE_FRAGMENT_FAILPOINTS` anchor would be a silent
+    /// no-op, and the proof would report green having raced nothing. That is a
+    /// worse failure than a build error, because it looks like evidence.
+    ///
+    /// Env marker that turns a re-executed copy of this test binary into the
+    /// child half of [`the_failpoint_boot_banner_actually_reaches_stderr`].
+    const BANNER_CHILD_MARKER: &str = "LORE_TEST_FRAGMENT_FAILPOINT_BANNER_CHILD";
+
+    /// The boot banner must actually be emitted, not merely be present in
+    /// source.
+    ///
+    /// This is an executed proof on purpose. The previous version of this
+    /// warning used `tracing::warn!` and was correct-looking, unreachable, and
+    /// shipped: `register_all_plugins` runs before the telemetry subscriber is
+    /// installed, so the event went nowhere. A source-ordering argument is what
+    /// produced that defect, so it cannot be what closes it.
+    ///
+    /// The child re-executes this same test binary with a marker in its
+    /// environment, runs the real [`register_all_plugins`] path against a fresh
+    /// registry, and exits. The parent asserts on its stderr — which needs no
+    /// subscriber, no configuration file, and no server boot.
+    ///
+    /// It asserts in **both** directions: the banner is present in a
+    /// `failure_generator` build and absent in a default one. The second half
+    /// is what pins that an ordinary production binary stays silent.
+    #[test]
+    fn the_failpoint_boot_banner_actually_reaches_stderr() {
+        if std::env::var(BANNER_CHILD_MARKER).is_ok() {
+            // Child: exercise the real registration path and let the banner (if
+            // this build has one) go to the inherited stderr.
+            let mut registry = crate::plugins::PluginRegistry::new();
+            crate::plugins::register_all_plugins(&mut registry);
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("the test binary must know its own path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "plugins::postgres::tests::the_failpoint_boot_banner_actually_reaches_stderr",
+                "--nocapture",
+            ])
+            .env(BANNER_CHILD_MARKER, "1")
+            .output()
+            .expect("the child test process must run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if cfg!(feature = "failure_generator") {
+            assert!(
+                stderr.contains(FRAGMENT_FAILPOINTS_COMPILED_BANNER),
+                "a failure_generator build must announce its failpoints on stderr at plugin \
+                 registration, because that runs before any tracing subscriber exists. \
+                 stderr was:\n{stderr}"
+            );
+        } else {
+            assert!(
+                !stderr.contains("failure_generator"),
+                "a default build must not announce failpoints it does not carry. \
+                 stderr was:\n{stderr}"
+            );
+        }
+    }
+
+    /// Second instance of the same guard shape as the `oodle` chain above, for
+    /// the same reason: Cargo cannot express "these two features move
+    /// together", so a hand-edited feature list is the drift and a test
+    /// compiled in both configurations is the only thing that sees it.
+    #[test]
+    fn the_failpoint_feature_chain_reaches_lore_postgres() {
+        assert_eq!(
+            lore_postgres::domain::fragments::failpoints_compiled(),
+            cfg!(feature = "failure_generator"),
+            "lore-server's `failure_generator` feature must forward to \
+             lore-postgres/failure_generator; without it WP-109's failpoints are inert and its \
+             barriers race nothing"
         );
     }
 

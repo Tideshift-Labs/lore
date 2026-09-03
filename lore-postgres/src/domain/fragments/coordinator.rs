@@ -66,6 +66,9 @@ use deadpool_postgres::Transaction;
 
 use crate::domain::PostgresDomainStore;
 use crate::domain::errors::DomainError;
+// WP-118 Phase 9. Expands to nothing in a default build; `failpoints::hit` is
+// not nameable there. See `super::failpoint`.
+use crate::domain::fragments::failpoint;
 use crate::domain::fragments::provider::FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS;
 use crate::domain::fragments::schema;
 use crate::domain::fragments::states::EpochAuthority;
@@ -1339,6 +1342,9 @@ impl PostgresFragmentCoordinator {
             )));
         }
         let client = self.checkout().await?;
+        // This is a single autocommit UPDATE rather than a transaction, so its
+        // two anchors are pre/post write rather than locked/settled.
+        failpoint!("cutover.enable_lifecycle.pre_write")?;
         client
             .execute(
                 "UPDATE lore_fragment_schema_state \
@@ -1348,6 +1354,7 @@ impl PostgresFragmentCoordinator {
             )
             .await
             .map_err(|error| DomainError::from_pg("fragment lifecycle enable", error))?;
+        failpoint!("cutover.enable_lifecycle.post_write")?;
         Ok(())
     }
 
@@ -1386,6 +1393,7 @@ impl PostgresFragmentCoordinator {
             .map_err(|error| {
                 DomainError::from_pg("fragment write capability cutover lock", error)
             })?;
+        failpoint!("cutover.require_claims.locked")?;
         let current = FragmentWriteCapability::decode(
             row.get("write_capability"),
             row.get("provider_write_authority_revision"),
@@ -1424,6 +1432,7 @@ impl PostgresFragmentCoordinator {
             tx.commit().await,
             "fragment write capability cutover commit",
         )?;
+        failpoint!("cutover.require_claims.settled")?;
         Ok(())
     }
 
@@ -1625,6 +1634,7 @@ impl PostgresFragmentCoordinator {
         )
         .await
         .map_err(|error| DomainError::from_pg("fragment metering rebuild locks", error))?;
+        failpoint!("metering.rebuild.locked")?;
 
         // Materialise the authority predicate once. Every later statement
         // consumes this exact relation, so upsert and stale-row deletion cannot
@@ -1782,6 +1792,7 @@ impl PostgresFragmentCoordinator {
         }
 
         classify_commit(tx.commit().await, "fragment metering rebuild commit")?;
+        failpoint!("metering.rebuild.settled")?;
         Ok(authoritative)
     }
 
@@ -1989,6 +2000,7 @@ impl PostgresFragmentCoordinator {
             .map_err(|error| DomainError::from_pg("fragment write authorization begin", error))?;
         let mut sequence = LockSequence::new();
         let head = lock_fragment_head(&tx, &mut sequence, &claim.hash).await?;
+        failpoint!("claim.authorize.locked")?;
         let lineage_matches = head.as_ref().is_some_and(|head| {
             head.current_epoch == claim.epoch
                 && head.last_fence == claim.fence
@@ -2061,6 +2073,7 @@ impl PostgresFragmentCoordinator {
         .await
         .map_err(|error| DomainError::from_pg("fragment write authorize", error))?;
         classify_commit(tx.commit().await, "fragment write authorization commit")?;
+        failpoint!("claim.authorize.settled")?;
         Ok(AuthorizedFragmentWrite {
             send_budget: database_budget.saturating_sub(local_started.elapsed()),
         })
@@ -2080,8 +2093,10 @@ impl PostgresFragmentCoordinator {
             .map_err(|error| DomainError::from_pg("fragment write settlement begin", error))?;
         let mut sequence = LockSequence::new();
         let _ = lock_fragment_head(&tx, &mut sequence, &claim.hash).await?;
+        failpoint!("claim.settle.locked")?;
         settle_write_claim_locked(&tx, &mut sequence, claim, settlement).await?;
         classify_commit(tx.commit().await, "fragment write settlement commit")?;
+        failpoint!("claim.settle.settled")?;
         Ok(())
     }
 
@@ -2310,6 +2325,7 @@ impl PostgresFragmentCoordinator {
                 reason_version: 1,
             });
         };
+        failpoint!("promotion.begin.locked")?;
         if head.state != FragmentLifecycleState::Staged {
             return Ok(BeginOutcome::Fenced(format!(
                 "promotion requires a Staged head; this one is {}",
@@ -2333,6 +2349,7 @@ impl PostgresFragmentCoordinator {
         let fence = next_fence(&tx).await?;
         stamp_operation_fence(&tx, hash, fence).await?;
         classify_commit(tx.commit().await, "promotion begin commit")?;
+        failpoint!("promotion.begin.settled")?;
         Ok(BeginOutcome::Admitted(Box::new(FragmentIntent {
             hash: hash.to_vec(),
             epoch,
@@ -2437,6 +2454,7 @@ impl PostgresFragmentCoordinator {
         let Some(head) = lock_fragment_head(&tx, &mut sequence, &witness.hash).await? else {
             return Ok(CommitVerdict::Fenced);
         };
+        failpoint!("lifecycle.mark_missing.locked")?;
         if !head.matches(witness) {
             return Ok(CommitVerdict::Fenced);
         }
@@ -2474,6 +2492,7 @@ impl PostgresFragmentCoordinator {
             apply_lifecycle_generation(&tx, &confirmed).await?;
         }
         classify_commit(tx.commit().await, "mark missing commit")?;
+        failpoint!("lifecycle.mark_missing.settled")?;
         Ok(CommitVerdict::Published)
     }
 
@@ -2490,6 +2509,7 @@ impl PostgresFragmentCoordinator {
         repository_id: &[u8],
         context: &[u8],
     ) -> Result<CommitVerdict, DomainError> {
+        failpoint!("association.create.entry")?;
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
@@ -2504,6 +2524,7 @@ impl PostgresFragmentCoordinator {
                 reason_version: 1,
             });
         };
+        failpoint!("association.create.locked")?;
         if repository.state != STATE_LIVE {
             return Ok(CommitVerdict::Fenced);
         }
@@ -2536,6 +2557,7 @@ impl PostgresFragmentCoordinator {
         .map_err(|error| DomainError::from_pg("association create insert", error))?;
         bump_association_generation(&tx, repository_id).await?;
         classify_commit(tx.commit().await, "association create commit")?;
+        failpoint!("association.create.settled")?;
         Ok(CommitVerdict::Published)
     }
 
@@ -2566,6 +2588,7 @@ impl PostgresFragmentCoordinator {
         let Some(head) = lock_fragment_head(&tx, &mut sequence, &witness.hash).await? else {
             return Ok(CommitVerdict::Fenced);
         };
+        failpoint!("association.create_guarded.locked")?;
         if !head.matches(witness) || !head.state.is_readable() {
             return Ok(CommitVerdict::Fenced);
         }
@@ -2593,6 +2616,7 @@ impl PostgresFragmentCoordinator {
         .map_err(|error| DomainError::from_pg("guarded association insert", error))?;
         bump_association_generation(&tx, repository_id).await?;
         classify_commit(tx.commit().await, "guarded association commit")?;
+        failpoint!("association.create_guarded.settled")?;
         Ok(CommitVerdict::Published)
     }
 
@@ -2603,6 +2627,7 @@ impl PostgresFragmentCoordinator {
         repository_id: &[u8],
         context: &[u8],
     ) -> Result<CommitVerdict, DomainError> {
+        failpoint!("association.tombstone.entry")?;
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
@@ -2615,6 +2640,7 @@ impl PostgresFragmentCoordinator {
         {
             return Ok(CommitVerdict::Fenced);
         }
+        failpoint!("association.tombstone.locked")?;
         sequence.enter(LockClass::Associations)?;
         let updated = tx
             .execute(
@@ -2636,6 +2662,7 @@ impl PostgresFragmentCoordinator {
         }
         bump_association_generation(&tx, repository_id).await?;
         classify_commit(tx.commit().await, "association tombstone commit")?;
+        failpoint!("association.tombstone.settled")?;
         Ok(CommitVerdict::Published)
     }
 
@@ -2658,6 +2685,7 @@ impl PostgresFragmentCoordinator {
                     .to_owned(),
             ));
         }
+        failpoint!("obliterate.begin.entry")?;
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
@@ -2686,6 +2714,10 @@ impl PostgresFragmentCoordinator {
             return Ok(FragmentObliterateBegin::NoOp);
         };
         let confirmed = confirm_lifecycle_fanout(&tx, hash, &fanout).await?;
+        // Placed once, here, rather than beside each of this method's eight
+        // commit sites: past this point the fanout and the head are both held,
+        // so one anchor covers every exit.
+        failpoint!("obliterate.begin.locked")?;
 
         let association = tx
             .query_opt(
@@ -2861,6 +2893,11 @@ impl PostgresFragmentCoordinator {
             apply_lifecycle_generation(&tx, &confirmed).await?;
         }
         classify_commit(tx.commit().await, "owned obliterate begin commit")?;
+        // The ownership-publishing exit only. This method's other successful
+        // exits (NoOp, foreign/coordinated retry, tombstoned replay) are
+        // decisive answers about a deletion someone else owns, so they are not
+        // anchored; WP-109's push/obliterate races all run through this one.
+        failpoint!("obliterate.begin.settled")?;
         Ok(match blocked_until {
             Some(blocked_until) => FragmentObliterateBegin::Blocked {
                 intent: Box::new(intent),
@@ -2900,6 +2937,7 @@ impl PostgresFragmentCoordinator {
         else {
             return Ok(CommitVerdict::Fenced);
         };
+        failpoint!("obliterate.children.locked")?;
         if head.state != FragmentLifecycleState::DeletingChildren
             || !owned_obliterate_association_locked(&tx, &intent.ownership).await?
         {
@@ -2942,6 +2980,7 @@ impl PostgresFragmentCoordinator {
             return Ok(CommitVerdict::Fenced);
         }
         classify_commit(tx.commit().await, "obliterate children commit")?;
+        failpoint!("obliterate.children.settled")?;
         Ok(CommitVerdict::Published)
     }
 
@@ -2989,6 +3028,7 @@ impl PostgresFragmentCoordinator {
         else {
             return Ok(CommitVerdict::Fenced);
         };
+        failpoint!("obliterate.payload.locked")?;
         if head.state != FragmentLifecycleState::DeletingPayload
             || !owned_obliterate_association_locked(&tx, &intent.ownership).await?
         {
@@ -3061,6 +3101,7 @@ impl PostgresFragmentCoordinator {
             return Ok(CommitVerdict::Fenced);
         }
         classify_commit(tx.commit().await, "obliterate payload commit")?;
+        failpoint!("obliterate.payload.settled")?;
         Ok(CommitVerdict::Published)
     }
 
@@ -3372,6 +3413,7 @@ impl PostgresFragmentCoordinator {
         // check below against the only two writers that can move it.
         let mut sequence = LockSequence::new();
         lock_lease_member_heads(&tx, &mut sequence, &member_hashes).await?;
+        failpoint!("lease.acquire.locked")?;
         // Scope check second, so a refusal happens before anything is written
         // and the transaction has nothing to undo.
         if tx
@@ -3452,6 +3494,7 @@ impl PostgresFragmentCoordinator {
         .await
         .map_err(|error| DomainError::from_pg("staged lease member insert", error))?;
         classify_commit(tx.commit().await, "staged lease commit")?;
+        failpoint!("lease.acquire.settled")?;
         Ok(StagedReaderLease {
             lease_id: lease_id.to_vec(),
             reader_fence,
@@ -3507,6 +3550,7 @@ impl PostgresFragmentCoordinator {
             }
             _ => {}
         }
+        failpoint!("publication.begin.entry")?;
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
@@ -3514,6 +3558,7 @@ impl PostgresFragmentCoordinator {
             .map_err(|error| DomainError::from_pg("publication begin", error))?;
         let mut sequence = LockSequence::new();
         let existing = lock_fragment_head(&tx, &mut sequence, hash).await?;
+        failpoint!("publication.begin.locked")?;
         if require_missing {
             match &existing {
                 None => {
@@ -3682,6 +3727,10 @@ impl PostgresFragmentCoordinator {
             None
         };
         classify_commit(tx.commit().await, "publication begin commit")?;
+        // The admission exit only. The resume commit above republishes an
+        // intent this coordinator already owns and is not a new admission, so
+        // it is deliberately not anchored.
+        failpoint!("publication.begin.settled")?;
         Ok(BeginOutcome::Admitted(Box::new(FragmentIntent {
             hash: hash.to_vec(),
             epoch,
@@ -3728,6 +3777,10 @@ impl PostgresFragmentCoordinator {
         // head lock is an F-032-3 inversion.
         let fanout = plan_lifecycle_fanout(&tx, &intent.hash).await?;
         lock_lifecycle_fanout(&tx, &mut sequence, &fanout).await?;
+        // Before the head lock, because the fanout locks are already held here
+        // and this method's five commit sites all lie past this point. A pause
+        // here is what makes a second process contend on the repository rows.
+        failpoint!("publication.commit.locked")?;
         let Some(head) = lock_fragment_head(&tx, &mut sequence, &intent.hash).await? else {
             if let Some((claim, settlement)) = write_claim {
                 settle_write_claim_locked(&tx, &mut sequence, claim, settlement).await?;
@@ -3907,6 +3960,7 @@ impl PostgresFragmentCoordinator {
             settle_write_claim_locked(&tx, &mut sequence, claim, settlement).await?;
         }
         classify_commit(tx.commit().await, "publication commit")?;
+        failpoint!("publication.commit.settled")?;
         Ok(CommitVerdict::Published)
     }
 
