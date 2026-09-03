@@ -14,11 +14,21 @@
 use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::outbox::OutboxEvent;
 use lore_postgres::domain::outbox::append;
+use lore_postgres::domain::outbox::version::AggregateVersion;
 use lore_postgres::pool::TlsConfig;
 use tokio_postgres::error::SqlState;
 
 fn pg_url() -> Option<String> {
     std::env::var("LORE_TEST_PG_URL").ok()
+}
+
+/// WP-119 Step A narrowed `aggregate_version` from opaque bytes to a
+/// checked v1 encoding (8-byte big-endian ordinal, optional identity). Every
+/// fixture in this file that predates that change needs a value that
+/// satisfies it -- an arbitrary 2-byte literal like the old `b"v1"` is no
+/// longer accepted by `append`'s `validate()`.
+fn agg_version(ordinal: u64) -> Vec<u8> {
+    AggregateVersion::ordinal_only(ordinal).encode()
 }
 
 async fn connect_domain_store(url: &str) -> PostgresDomainStore {
@@ -77,8 +87,15 @@ async fn payload_over_64_kib_is_rejected_by_append_and_by_the_schema_check() {
     let aggregate_id: [u8; 16] = rand::random();
 
     let oversized = vec![0u8; 64 * 1024 + 1];
+    let version = agg_version(1);
     let tx = client.transaction().await.expect("begin tx");
-    let event = fresh_event(&cell_id, &repository_id, &aggregate_id, b"v1", &oversized);
+    let event = fresh_event(
+        &cell_id,
+        &repository_id,
+        &aggregate_id,
+        &version,
+        &oversized,
+    );
     let err = append(&tx, &event)
         .await
         .expect_err("append must reject a payload over the frozen 64 KiB cap");
@@ -133,8 +150,9 @@ async fn exact_key_retry_after_commit_returns_the_original_event_id() {
     let cell_id = format!("cell-{:016x}", rand::random::<u64>());
     let aggregate_id: [u8; 16] = rand::random();
 
+    let version = agg_version(1);
     let tx = client.transaction().await.expect("begin first tx");
-    let first_event = fresh_event(&cell_id, &repository_id, &aggregate_id, b"v1", b"{}");
+    let first_event = fresh_event(&cell_id, &repository_id, &aggregate_id, &version, b"{}");
     let first = append(&tx, &first_event)
         .await
         .expect("first append must succeed");
@@ -147,7 +165,7 @@ async fn exact_key_retry_after_commit_returns_the_original_event_id() {
         &cell_id,
         &repository_id,
         &aggregate_id,
-        b"v1",
+        &version,
         b"{\"different\":true}",
     );
     let retry = append(&tx, &retry_event)
@@ -188,13 +206,15 @@ async fn different_aggregate_version_creates_a_new_row() {
     let cell_id = format!("cell-{:016x}", rand::random::<u64>());
     let aggregate_id: [u8; 16] = rand::random();
 
+    let version1 = agg_version(1);
     let tx = client.transaction().await.expect("begin tx v1");
-    let v1 = fresh_event(&cell_id, &repository_id, &aggregate_id, b"v1", b"{}");
+    let v1 = fresh_event(&cell_id, &repository_id, &aggregate_id, &version1, b"{}");
     let first = append(&tx, &v1).await.expect("append v1");
     tx.commit().await.expect("commit v1");
 
+    let version2 = agg_version(2);
     let tx = client.transaction().await.expect("begin tx v2");
-    let v2 = fresh_event(&cell_id, &repository_id, &aggregate_id, b"v2", b"{}");
+    let v2 = fresh_event(&cell_id, &repository_id, &aggregate_id, &version2, b"{}");
     let second = append(&tx, &v2).await.expect("append v2");
     tx.commit().await.expect("commit v2");
 
@@ -222,14 +242,31 @@ async fn state_enum_admits_exactly_the_three_frozen_values() {
     for state in ["pending", "broker_accepted", "consumer_safe"] {
         let cell_id = format!("cell-{:016x}", rand::random::<u64>());
         let aggregate_id: [u8; 16] = rand::random();
+        // SCHEMA-119's `lore_outbox_events_publication_shape` CHECK is a
+        // biconditional: `broker_accepted`/`consumer_safe` require every
+        // publication column set, and `pending` requires them all NULL. The
+        // three-value state enum this test pins is orthogonal to that CHECK,
+        // but a raw insert still has to satisfy both to prove the state
+        // value itself is accepted.
+        let past_pending = state != "pending";
+        let stream_identity: Option<&str> = past_pending.then_some("DURABLE-state-enum-test");
+        let stream_epoch: Option<i64> = past_pending.then_some(1);
+        let broker_sequence: Option<i64> = past_pending.then_some(0);
+        let gateway_response_id: Option<&str> = past_pending.then_some("resp-state-enum-test");
+        let publisher_contract_version: Option<i32> = past_pending.then_some(1);
+        let broker_accepted_at: Option<std::time::SystemTime> =
+            past_pending.then(std::time::SystemTime::now);
         client
             .execute(
                 "INSERT INTO lore_outbox_events (
                     event_id, cell_id, idempotency_key, repository_id, repository_generation,
                     event_kind, aggregate_kind, aggregate_id, aggregate_version,
-                    payload_schema_version, payload, state, created_at, available_at
+                    payload_schema_version, payload, state, created_at, available_at,
+                    stream_identity, stream_epoch, broker_sequence, gateway_response_id,
+                    publisher_contract_version, broker_accepted_at
                 ) VALUES ($1, $2, $3, $4, 1, 'branch.pushed', 'branch', $5, 'v1', 1, '{}',
-                          $6, clock_timestamp(), clock_timestamp())",
+                          $6, clock_timestamp(), clock_timestamp(),
+                          $7, $8, $9, $10, $11, $12)",
                 &[
                     &uuid::Uuid::new_v4(),
                     &cell_id,
@@ -237,6 +274,12 @@ async fn state_enum_admits_exactly_the_three_frozen_values() {
                     &repository_id.as_slice(),
                     &aggregate_id.as_slice(),
                     &state,
+                    &stream_identity,
+                    &stream_epoch,
+                    &broker_sequence,
+                    &gateway_response_id,
+                    &publisher_contract_version,
+                    &broker_accepted_at,
                 ],
             )
             .await
@@ -285,8 +328,9 @@ async fn append_inside_a_rolled_back_transaction_leaves_no_row() {
     let cell_id = format!("cell-{:016x}", rand::random::<u64>());
     let aggregate_id: [u8; 16] = rand::random();
 
+    let version = agg_version(1);
     let tx = client.transaction().await.expect("begin tx");
-    let event = fresh_event(&cell_id, &repository_id, &aggregate_id, b"v1", b"{}");
+    let event = fresh_event(&cell_id, &repository_id, &aggregate_id, &version, b"{}");
     let appended = append(&tx, &event).await.expect("append must succeed");
     tx.rollback()
         .await

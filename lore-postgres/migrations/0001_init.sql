@@ -978,6 +978,307 @@ CREATE TABLE IF NOT EXISTS lore_outbox_schema_state (
 );
 
 -- ---------------------------------------------------------------------------
+-- SCHEMA-119 relay extension (CR-032; WP-119 Step A)
+--
+-- Extends the WP-116 base **in place**. There is no parallel intent store: the
+-- relay claim, publication result, and dead letter rows of CR-032's persistent
+-- model attach to the same `lore_outbox_events` row the mutation transaction
+-- wrote, so an event has exactly one durable identity for its whole life.
+--
+-- Every column is added with `ADD COLUMN IF NOT EXISTS` so an existing empty
+-- cell upgrades in place. Cells are empty everywhere today (no outbox row has
+-- ever been written in production), so this DDL runs inside the boot-time
+-- `ensure_schema` transaction and no index here needs `CONCURRENTLY`.
+ALTER TABLE lore_outbox_events
+    -- Relay claim. `claim_generation` starts at 0 and increases on every claim,
+    -- so a stale worker comparing against an older generation can never
+    -- acknowledge, reschedule, or dead-letter a newer claim.
+    ADD COLUMN IF NOT EXISTS claim_generation bigint NOT NULL DEFAULT 0
+        CHECK (claim_generation >= 0),
+    ADD COLUMN IF NOT EXISTS claim_owner text
+        CHECK (octet_length(claim_owner) BETWEEN 1 AND 128),
+    ADD COLUMN IF NOT EXISTS claim_expires_at timestamptz,
+    ADD COLUMN IF NOT EXISTS attempt_count integer NOT NULL DEFAULT 0
+        CHECK (attempt_count >= 0),
+    ADD COLUMN IF NOT EXISTS last_error_class text
+        CHECK (octet_length(last_error_class) BETWEEN 1 AND 64),
+    -- Publication result. CR-032's "next attempt time" is the base row's
+    -- existing `available_at`; it is not duplicated here.
+    ADD COLUMN IF NOT EXISTS stream_identity text
+        CHECK (octet_length(stream_identity) BETWEEN 1 AND 128),
+    ADD COLUMN IF NOT EXISTS stream_epoch bigint
+        CHECK (stream_epoch >= 1),
+    ADD COLUMN IF NOT EXISTS broker_sequence bigint
+        CHECK (broker_sequence >= 0),
+    ADD COLUMN IF NOT EXISTS gateway_response_id text
+        CHECK (octet_length(gateway_response_id) BETWEEN 1 AND 128),
+    ADD COLUMN IF NOT EXISTS publisher_contract_version integer
+        CHECK (publisher_contract_version >= 1),
+    ADD COLUMN IF NOT EXISTS broker_accepted_at timestamptz;
+
+DO $outbox_relay_constraints$
+BEGIN
+    -- Both directions, and both TOTALLY. `broker_accepted`/`consumer_safe`
+    -- must carry the FULL publication result, and a `pending` row must carry
+    -- NONE of it: `release_for_retry` and the epoch-reset requeue both return a
+    -- row to `pending`, and a leftover stream identity or broker sequence there
+    -- reads to a later reader as proof of an acceptance that was withdrawn.
+    --
+    -- Written as a CASE rather than the shorter
+    -- `(state IN (...)) = (every column IS NOT NULL)`. That equality looks
+    -- like it says the same thing and does not: a pending row carrying ONE
+    -- leftover column makes both sides false and satisfies it. Measured on
+    -- PostgreSQL 16.15 -- `UPDATE ... SET stream_identity = 's'` on a pending
+    -- row was accepted under the equality form and is rejected under this one.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_events_publication_shape'
+          AND conrelid = 'lore_outbox_events'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_events
+            ADD CONSTRAINT lore_outbox_events_publication_shape CHECK (
+                CASE WHEN state = 'pending'
+                     THEN (stream_identity IS NULL
+                           AND stream_epoch IS NULL
+                           AND broker_sequence IS NULL
+                           AND gateway_response_id IS NULL
+                           AND publisher_contract_version IS NULL
+                           AND broker_accepted_at IS NULL)
+                     ELSE (stream_identity IS NOT NULL
+                           AND stream_epoch IS NOT NULL
+                           AND broker_sequence IS NOT NULL
+                           AND gateway_response_id IS NOT NULL
+                           AND publisher_contract_version IS NOT NULL
+                           AND broker_accepted_at IS NOT NULL)
+                END
+            );
+    END IF;
+    -- A lease is an owner and an expiry together or neither. A half-set lease
+    -- is either un-expirable (owner, no expiry) or ownerless but reserved
+    -- (expiry, no owner); both make the reclaim rule unstateable.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_events_claim_shape'
+          AND conrelid = 'lore_outbox_events'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_events
+            ADD CONSTRAINT lore_outbox_events_claim_shape CHECK (
+                (claim_owner IS NULL) = (claim_expires_at IS NULL)
+            );
+    END IF;
+    -- The cell identity is a SUBJECT TOKEN, not just a column: every subject is
+    -- `lore.v1.cell.<cell_id>.repo.<repository_hex>.<class>`. A value carrying a
+    -- dot, a space, or a wildcard would restructure the subject rather than be
+    -- rejected by it, so the notification-plane contract pins the charset
+    -- alongside the width and this is the backstop behind `append`'s own check.
+    -- The base CREATE TABLE declares `cell_id text` with no bound at all.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_events_cell_id_shape'
+          AND conrelid = 'lore_outbox_events'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_events
+            ADD CONSTRAINT lore_outbox_events_cell_id_shape CHECK (
+                cell_id ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+                AND octet_length(cell_id) <= 63
+            );
+    END IF;
+END
+$outbox_relay_constraints$;
+
+-- Eligible unpublished work, for the relay scan.
+--
+-- The predicate is a SQL **literal**, and every statement meaning to use it
+-- spells `state = 'pending'` literally too. A bound parameter (`state = $1`,
+-- `state = ANY($1)`) returns the same rows and passes every test, but the
+-- planner uses a partial index only when it can prove the query predicate
+-- implies the index predicate, and under a generic plan it cannot prove that
+-- from a parameter. No non-partial index leads with `available_at`, so the
+-- fallback is a sequential scan of the whole table.
+CREATE INDEX IF NOT EXISTS lore_outbox_events_pending_available
+    ON lore_outbox_events (available_at, event_id)
+    WHERE state = 'pending';
+-- Oldest-unpublished age for readiness and admission, answered index-only from
+-- the leading column rather than by scanning the pending set.
+CREATE INDEX IF NOT EXISTS lore_outbox_events_pending_created
+    ON lore_outbox_events (created_at)
+    WHERE state = 'pending';
+-- There is deliberately NO partial expression index on octet_length(payload)
+-- for the admission byte budget, though it is the obvious thing to add.
+-- Measured on PostgreSQL 16.15 over 18,000 pending rows with 8 KiB payloads:
+-- with such an index the byte probe reads 600 shared buffers in 4.9 ms, and
+-- without it 602 in 4.7 ms. PostgreSQL does not satisfy octet_length(payload)
+-- from the expression index (the plan is an Index Scan, never Index Only), and
+-- it does not need to -- octet_length reads the length out of the TOAST pointer
+-- in the main tuple without detoasting, so the cost already scales with the
+-- pending ROW count rather than with payload bytes. The index would add write
+-- amplification on every append and every state transition and buy nothing.
+-- Do not add it back without a measurement that contradicts this one.
+-- Expired claims. Partial on `IS NOT NULL`, so it holds only rows a relay
+-- currently owns -- bounded by the claim batch size times the number of live
+-- workers rather than by the table.
+CREATE INDEX IF NOT EXISTS lore_outbox_events_claim_expiry
+    ON lore_outbox_events (claim_expires_at)
+    WHERE claim_expires_at IS NOT NULL;
+-- Broker-epoch reset: every retained not-yet-safe row published to one stream
+-- identity and epoch. Literal predicate, same reason as above.
+CREATE INDEX IF NOT EXISTS lore_outbox_events_accepted_stream
+    ON lore_outbox_events (stream_identity, stream_epoch, event_id)
+    WHERE state = 'broker_accepted';
+
+-- Terminal rows, moved out of `lore_outbox_events` so the relay scan never
+-- walks past them and no poison row blocks a later one. The copy is immutable
+-- evidence: every identity and payload column is carried verbatim, and an
+-- operator disposition never deletes it.
+--
+-- **Any later column or constraint on this table is an `ALTER`, never an edit
+-- to the body below.** `CREATE TABLE IF NOT EXISTS` silently skips a changed
+-- body on a database that already has the table, so a column added inside the
+-- parentheses reaches a fresh cell and no existing one -- and the first
+-- statement that references it fails with `column ... does not exist` rather
+-- than returning a typed outcome. That is not hypothetical: the six columns
+-- and two constraints now applied by the `ALTER`/`DO` blocks below were first
+-- written inside this body, and an independent reviewer demonstrated exactly
+-- that failure by dropping them and re-running this DDL. The migration-parity
+-- test cannot catch it, because both of its sides are fresh installs.
+--
+-- **The `ALTER`/`DO` blocks are only safe for ADDING, and carry the same trap
+-- for CHANGING.** `ADD COLUMN IF NOT EXISTS` skips a column that exists,
+-- whatever its type or CHECK now says, and the `IF NOT EXISTS (SELECT 1 FROM
+-- pg_constraint WHERE conname = ...)` guards skip a constraint whose body has
+-- since been edited. Both leave the OLD definition in place on every existing
+-- cell while a fresh one gets the new -- the same silent divergence, one level
+-- down. Editing an existing column or constraint here therefore needs its own
+-- explicitly-named migration step, not an edit in place. This applies to the
+-- `lore_outbox_events` blocks above just as much as to the ones below.
+CREATE TABLE IF NOT EXISTS lore_outbox_dead_letters (
+    event_id               uuid        NOT NULL PRIMARY KEY,
+    cell_id                text        NOT NULL,
+    idempotency_key        bytea       NOT NULL CHECK (octet_length(idempotency_key) = 32),
+
+    repository_id          bytea       NOT NULL CHECK (octet_length(repository_id) = 16),
+    repository_generation  bigint      NOT NULL CHECK (repository_generation >= 1),
+
+    event_kind             text        NOT NULL,
+    aggregate_kind         text        NOT NULL,
+    aggregate_id           bytea       NOT NULL CHECK (octet_length(aggregate_id) <= 64),
+    aggregate_version      bytea       NOT NULL CHECK (octet_length(aggregate_version) <= 256),
+
+    payload_schema_version integer     NOT NULL CHECK (payload_schema_version >= 1),
+    payload                bytea       NOT NULL CHECK (octet_length(payload) <= 65536),
+
+    created_at             timestamptz NOT NULL,
+    attempt_count          integer     NOT NULL CHECK (attempt_count >= 0),
+
+    terminal_class         text        NOT NULL
+                                       CHECK (octet_length(terminal_class) BETWEEN 1 AND 64),
+    first_failed_at        timestamptz NOT NULL,
+    last_failed_at         timestamptz NOT NULL,
+
+    disposition            text        NOT NULL
+                                       CHECK (disposition IN ('parked', 'requeued', 'obsolete')),
+    disposition_reason     text        CHECK (octet_length(disposition_reason) <= 1024),
+    disposition_at         timestamptz,
+    disposition_actor      text        CHECK (octet_length(disposition_actor) BETWEEN 1 AND 256),
+
+    -- `parked` is the un-dispositioned state, so it is exactly the state with
+    -- no disposition timestamp, and a disposition always names who made it.
+    CONSTRAINT lore_outbox_dead_letters_disposition_shape CHECK (
+        (disposition = 'parked') = (disposition_at IS NULL)
+        AND (disposition_at IS NULL) = (disposition_actor IS NULL)
+    )
+);
+
+ALTER TABLE lore_outbox_dead_letters
+    -- The claim generation the row carried when it was dead-lettered.
+    --
+    -- Load-bearing, not diagnostic. `claim_generation` is the ONLY relay fence,
+    -- and it lives on `lore_outbox_events` -- a row that leaves that table and
+    -- comes back would restart the counter, so a worker still holding the old
+    -- generation would compare equal against the reinstated row and act on a
+    -- claim it lost. Requeue therefore reinstates at this value PLUS ONE.
+    --
+    -- The DEFAULT is a formality: `dead_letter` copies the event row's own
+    -- generation under the same `FOR UPDATE` that read it, so every row this
+    -- crate writes carries a real value. The default can only be reached by a
+    -- row that predates this column, and no such row exists anywhere -- this
+    -- table is created for the first time by `SCHEMA-119`.
+    ADD COLUMN IF NOT EXISTS claim_generation bigint NOT NULL DEFAULT 0
+        CHECK (claim_generation >= 0),
+    -- How many terminal-failure cycles this dead letter has recorded: 1 on the
+    -- first, incremented when a requeued row fails terminally again.
+    --
+    -- Keyed by `event_id`, which is what makes it a cycle count for THIS
+    -- durable row rather than for the logical event. A producer that re-appends
+    -- after a dead-letter mints a fresh `event_id`, so the same
+    -- `(cell_id, idempotency_key)` can end up with two dead-letter rows each
+    -- counting 1.
+    ADD COLUMN IF NOT EXISTS dead_letter_count integer NOT NULL DEFAULT 1
+        CHECK (dead_letter_count >= 1),
+    -- The disposition this row carried before its most recent re-dead-letter.
+    --
+    -- A requeued event that fails terminally again has to return to `parked`,
+    -- or it would never appear in the operator queue again. Overwriting the
+    -- disposition in place would delete the record of the decision that put it
+    -- back in flight, which is the audit trail an operator needs in order not
+    -- to make the same call twice. One level is retained; `dead_letter_count`
+    -- says how many were not.
+    ADD COLUMN IF NOT EXISTS previous_disposition text
+        CHECK (previous_disposition IN ('parked', 'requeued', 'obsolete')),
+    ADD COLUMN IF NOT EXISTS previous_disposition_reason text
+        CHECK (octet_length(previous_disposition_reason) <= 1024),
+    ADD COLUMN IF NOT EXISTS previous_disposition_at timestamptz,
+    ADD COLUMN IF NOT EXISTS previous_disposition_actor text
+        CHECK (octet_length(previous_disposition_actor) BETWEEN 1 AND 256);
+
+DO $outbox_dead_letter_constraints$
+BEGIN
+    -- The retained prior decision is whole or absent, never half, and it obeys
+    -- the same "parked carries no timestamp" rule as the live one. A CASE, not
+    -- a chain of equalities: `previous_disposition IS NULL` makes an `IN` test
+    -- yield NULL, a CHECK passes on NULL, and the clause meant to force the
+    -- other three columns empty would quietly not apply.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_dead_letters_previous_disposition_shape'
+          AND conrelid = 'lore_outbox_dead_letters'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_dead_letters
+            ADD CONSTRAINT lore_outbox_dead_letters_previous_disposition_shape CHECK (
+                CASE WHEN previous_disposition IS NULL
+                     THEN (previous_disposition_reason IS NULL
+                           AND previous_disposition_at IS NULL
+                           AND previous_disposition_actor IS NULL)
+                     WHEN previous_disposition = 'parked'
+                     THEN (previous_disposition_at IS NULL
+                           AND previous_disposition_actor IS NULL)
+                     ELSE (previous_disposition_at IS NOT NULL
+                           AND previous_disposition_actor IS NOT NULL)
+                END
+            );
+    END IF;
+    -- A row that has never been re-dead-lettered has no prior decision to
+    -- retain, and one that has must have had a disposition to supersede --
+    -- `dead_letter` only ever runs against an event row, which only requeue
+    -- can put back, and requeue always writes a disposition.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_dead_letters_redelivery_shape'
+          AND conrelid = 'lore_outbox_dead_letters'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_dead_letters
+            ADD CONSTRAINT lore_outbox_dead_letters_redelivery_shape CHECK (
+                (dead_letter_count = 1) = (previous_disposition IS NULL)
+            );
+    END IF;
+END
+$outbox_dead_letter_constraints$;
+
+-- Operator queue: parked rows awaiting a disposition, oldest failure first.
+CREATE INDEX IF NOT EXISTS lore_outbox_dead_letters_operations
+    ON lore_outbox_dead_letters (disposition, last_failed_at);
+
+-- ---------------------------------------------------------------------------
 -- CR-031 fragment lifecycle authority (SCHEMA-118)
 --
 -- Byte-equivalent copy of the runtime DDL declared in:

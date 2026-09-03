@@ -21,12 +21,30 @@ use uuid::Uuid;
 
 use crate::domain::errors::DomainError;
 use crate::domain::outbox::schema::IDEMPOTENCY_KEY_DOMAIN_V1;
+use crate::domain::outbox::schema::MAX_AGGREGATE_KIND_BYTES;
+use crate::domain::outbox::schema::MAX_CELL_ID_BYTES;
+use crate::domain::outbox::schema::MAX_EVENT_KIND_BYTES;
 use crate::domain::outbox::schema::MAX_PAYLOAD_BYTES;
 use crate::domain::outbox::schema::OUTBOX_STATE_PENDING;
+use crate::domain::outbox::schema::is_valid_cell_id;
+use crate::domain::outbox::version::validate_encoded;
 
 /// Frozen bound on `aggregate_id`, matching the schema CHECK.
+///
+/// PIN(WP-119): the notification-plane contract bounds the wire envelope's
+/// `aggregate_identity` at 256 UTF-8 bytes, which is wider than this. The base
+/// schema's CHECK is 64 and every landed producer fits it, so the narrower
+/// bound is kept: it is inside the contract's envelope accounting, and
+/// widening later is compatible with every row already written while narrowing
+/// would not be. Raise it with the CR owner before a producer needs more.
 pub const MAX_AGGREGATE_ID_BYTES: usize = 64;
-/// Frozen bound on `aggregate_version`, matching the schema CHECK.
+/// The `aggregate_version` **column** CHECK.
+///
+/// A deliberate superset of the encoded bound: SCHEMA-119 narrowed the accepted
+/// values to the v1 encoding (8..=128 bytes, see
+/// [`crate::domain::outbox::version`]) and `validate` enforces that, but the
+/// column keeps the wider CHECK so the narrowing is a Rust-side contract rather
+/// than a type change on a table.
 pub const MAX_AGGREGATE_VERSION_BYTES: usize = 256;
 
 /// One classified domain event, ready to append.
@@ -105,8 +123,20 @@ pub fn idempotency_key(event: &OutboxEvent<'_>) -> [u8; 32] {
 /// Validate every frozen bound before touching the database, so a rejected
 /// event costs no transaction work and cannot leave a partial write.
 fn validate(event: &OutboxEvent<'_>) -> Result<(), DomainError> {
-    if event.cell_id.is_empty() {
-        return Err(DomainError::InvalidInput("outbox cell_id is empty".into()));
+    // The `cell_id` becomes a subject token
+    // (`lore.v1.cell.<cell_id>.repo.<repository_hex>.<class>`), so its charset
+    // is a safety property and not only a width: a `.`, a space, or a wildcard
+    // would restructure the subject rather than fail it. Pinned by the
+    // notification-plane contract's subject grammar and amendment A-8. It comes
+    // from trusted server configuration, so this is defence in depth — but a
+    // misconfigured cell must fail closed at append, not at the gateway after
+    // the row is already durable.
+    if !is_valid_cell_id(event.cell_id) {
+        return Err(DomainError::InvalidInput(format!(
+            "outbox cell_id must match the contract's ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ and fit \
+             {MAX_CELL_ID_BYTES} bytes, got {}",
+            event.cell_id.len()
+        )));
     }
     if event.repository_id.len() != 16 {
         return Err(DomainError::InvalidInput(format!(
@@ -125,18 +155,34 @@ fn validate(event: &OutboxEvent<'_>) -> Result<(), DomainError> {
             "outbox event_kind and aggregate_kind must be non-empty".into(),
         ));
     }
+    // The notification-plane contract's pinned widths. The base `CREATE TABLE`
+    // declares both columns as bare `text`, so nothing but this rejects an
+    // over-wide kind before it becomes a row the gateway will refuse.
+    if event.event_kind.len() > MAX_EVENT_KIND_BYTES {
+        return Err(DomainError::InvalidInput(format!(
+            "outbox event_kind exceeds the contract's {MAX_EVENT_KIND_BYTES}-byte width: {}",
+            event.event_kind.len()
+        )));
+    }
+    if event.aggregate_kind.len() > MAX_AGGREGATE_KIND_BYTES {
+        return Err(DomainError::InvalidInput(format!(
+            "outbox aggregate_kind exceeds the contract's \
+             {MAX_AGGREGATE_KIND_BYTES}-byte width: {}",
+            event.aggregate_kind.len()
+        )));
+    }
     if event.aggregate_id.len() > MAX_AGGREGATE_ID_BYTES {
         return Err(DomainError::InvalidInput(format!(
             "outbox aggregate_id exceeds {MAX_AGGREGATE_ID_BYTES} bytes: {}",
             event.aggregate_id.len()
         )));
     }
-    if event.aggregate_version.len() > MAX_AGGREGATE_VERSION_BYTES {
-        return Err(DomainError::InvalidInput(format!(
-            "outbox aggregate_version exceeds {MAX_AGGREGATE_VERSION_BYTES} bytes: {}",
-            event.aggregate_version.len()
-        )));
-    }
+    // SCHEMA-119: `aggregate_version` is no longer opaque at the API boundary.
+    // It must be a v1 encoding (8-byte big-endian ordinal plus 0..=120 identity
+    // bytes), because a consumer that cannot decode an ordinal cannot answer
+    // "older, newer, or incomparable" and must refetch instead. The column's
+    // own 256-byte CHECK stays a superset of this.
+    validate_encoded(event.aggregate_version)?;
     if event.payload_schema_version < 1 {
         return Err(DomainError::InvalidInput(format!(
             "outbox payload_schema_version must be >= 1, got {}",
@@ -230,6 +276,15 @@ pub async fn append(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::outbox::version::AggregateVersion;
+    use crate::domain::outbox::version::MAX_ENCODED_AGGREGATE_VERSION_BYTES;
+
+    /// A minimal well-formed `aggregate_version`: SCHEMA-119's `validate`
+    /// rejects anything that is not a v1 encoding, so the `validate_*` cases
+    /// below need a real one or they would all pass for the wrong reason.
+    fn version_bytes(ordinal: u64) -> Vec<u8> {
+        AggregateVersion::ordinal_only(ordinal).encode()
+    }
 
     fn event<'a>(kind: &'a str, version: &'a [u8]) -> OutboxEvent<'a> {
         OutboxEvent {
@@ -271,24 +326,66 @@ mod tests {
 
     #[test]
     fn validate_rejects_oversized_payload() {
+        let version = version_bytes(1);
         let big = vec![0u8; MAX_PAYLOAD_BYTES + 1];
-        let mut e = event("branch.pushed", b"v1");
+        let mut e = event("branch.pushed", &version);
         e.payload = &big;
         assert!(matches!(validate(&e), Err(DomainError::InvalidInput(_))));
     }
 
     #[test]
     fn validate_accepts_payload_at_the_cap() {
+        let version = version_bytes(1);
         let exact = vec![0u8; MAX_PAYLOAD_BYTES];
-        let mut e = event("branch.pushed", b"v1");
+        let mut e = event("branch.pushed", &version);
         e.payload = &exact;
         assert!(validate(&e).is_ok());
     }
 
     #[test]
     fn validate_rejects_wrong_repository_id_length() {
-        let mut e = event("branch.pushed", b"v1");
+        let version = version_bytes(1);
+        let mut e = event("branch.pushed", &version);
         e.repository_id = &[1u8; 15];
         assert!(matches!(validate(&e), Err(DomainError::InvalidInput(_))));
+    }
+
+    /// SCHEMA-119's narrowing. The column CHECK still admits 256 bytes and the
+    /// old API admitted anything under it, so only this rejects a version a
+    /// consumer could not decode an ordinal from.
+    #[test]
+    fn validate_rejects_an_aggregate_version_that_is_not_a_v1_encoding() {
+        let e = event("branch.pushed", b"v1");
+        assert!(matches!(validate(&e), Err(DomainError::InvalidInput(_))));
+
+        let too_wide = vec![0u8; MAX_ENCODED_AGGREGATE_VERSION_BYTES + 1];
+        let e = event("branch.pushed", &too_wide);
+        assert!(matches!(validate(&e), Err(DomainError::InvalidInput(_))));
+
+        let widest = vec![0u8; MAX_ENCODED_AGGREGATE_VERSION_BYTES];
+        let e = event("branch.pushed", &widest);
+        assert!(validate(&e).is_ok());
+    }
+
+    /// The contract's pinned kind widths. Both columns are bare `text`, so
+    /// `validate` is the only thing that can reject an over-wide kind.
+    #[test]
+    fn validate_rejects_kinds_wider_than_the_contract() {
+        let version = version_bytes(1);
+        let wide = "k".repeat(MAX_EVENT_KIND_BYTES + 1);
+
+        let mut e = event("branch.pushed", &version);
+        e.event_kind = &wide;
+        assert!(matches!(validate(&e), Err(DomainError::InvalidInput(_))));
+
+        let mut e = event("branch.pushed", &version);
+        e.aggregate_kind = &wide;
+        assert!(matches!(validate(&e), Err(DomainError::InvalidInput(_))));
+
+        let at_cap = "k".repeat(MAX_EVENT_KIND_BYTES);
+        let mut e = event("branch.pushed", &version);
+        e.event_kind = &at_cap;
+        e.aggregate_kind = &at_cap;
+        assert!(validate(&e).is_ok());
     }
 }

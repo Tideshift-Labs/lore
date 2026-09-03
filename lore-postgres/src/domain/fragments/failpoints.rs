@@ -298,6 +298,41 @@ const ANCHORS: &[(&str, &str)] = &[
         "cutover.enable_lifecycle.post_write",
         "P3 restart: lifecycle routing enabled, against a concurrent boot readiness check",
     ),
+    // ---- CR-032 outbox relay (WP-119 Step A) ---------------------------
+    //
+    // These anchor `domain/outbox/relay.rs`, not this coordinator. They live in
+    // this table because the `failpoint!` macro is `pub(crate)` and the two
+    // scans that enforce anchor names -- this module's own
+    // `the_anchor_table_and_the_call_sites_name_the_same_set` and the
+    // default-tier one in `tests/fragment_provider_source_pins.rs` -- both walk
+    // the WHOLE crate and assert set equality against this one table. A second
+    // table would make every outbox anchor an undeclared call site and fail
+    // both scans. Keep them here until someone generalises the roster.
+    (
+        "outbox.claim.after_select",
+        "P3 relay claim: rows are locked by FOR UPDATE SKIP LOCKED and no lease is stamped \
+         yet, so a second worker must skip them rather than block",
+    ),
+    (
+        "outbox.claim.before_commit",
+        "P3 kill before COMMIT: leases were stamped and rolled back, so the rows must still \
+         be claimable with their original claim generation",
+    ),
+    (
+        "outbox.accept.before_update",
+        "P3 kill after the gateway acknowledged and before Postgres recorded it: the event \
+         must be publishable again under the same stable keys",
+    ),
+    (
+        "outbox.accept.after_update",
+        "P3 lost commit acknowledgement on an accepted row: a duplicate publish must be a \
+         no-op rather than a second acceptance",
+    ),
+    (
+        "outbox.dead_letter.between_copy_and_delete",
+        "P3 kill inside the dead-letter transaction: the row must be in exactly one of the \
+         two tables after restart, never both and never neither",
+    ),
 ];
 
 /// What a configured anchor does when reached.
@@ -328,10 +363,55 @@ impl Action {
     }
 }
 
+/// Every window suffix an anchor may name.
+///
+/// Test-only, because it is a *vocabulary*, not a decision the runtime makes:
+/// nothing at run time consults it, since the configuration parser already
+/// drops any anchor with no `ANCHORS` entry. Its whole job is to stop the
+/// window names drifting into ad-hoc suffixes, which it does through the two
+/// tests below.
+///
+/// The first three are the fragment coordinator's uniform
+/// `entry`/`locked`/`settled` shape, and `pre_write`/`post_write` are
+/// `enable_lifecycle`'s, which is a single autocommit `UPDATE` rather than a
+/// transaction.
+///
+/// The last five are CR-032's outbox relay store, which needed its own names
+/// rather than being forced into the coordinator's three. That store has no
+/// single transaction shape to name windows against: `claim_batch` and
+/// `dead_letter` open their own short transactions, while
+/// `record_broker_accepted` is one statement on a caller-supplied client. Its
+/// windows are therefore statement-relative, and calling the point between a
+/// dead letter's copy and its delete `.locked` would have been a name that
+/// told a harness author nothing about what is on either side of it.
+#[cfg(test)]
+const WINDOW_SUFFIXES: &[&str] = &[
+    ".entry",
+    ".locked",
+    ".settled",
+    ".pre_write",
+    ".post_write",
+    ".after_select",
+    ".before_commit",
+    ".before_update",
+    ".after_update",
+    ".between_copy_and_delete",
+];
+
 /// Whether an anchor names a window that is past its commit, and so can carry
 /// [`Action::Unknown`].
+///
+/// `outbox.accept.after_update` qualifies because `record_broker_accepted`
+/// issues one statement on a caller-supplied client and CR-032 requires the
+/// relay to hold no transaction across a publish, so for its only permitted
+/// caller that statement has committed by the time the anchor is reached. The
+/// signature cannot enforce that — a caller passing a `Transaction` would make
+/// the anchor pre-commit — so this classification is a property of the relay
+/// worker's contract, not of the type.
 fn is_post_commit(anchor: &str) -> bool {
-    anchor.ends_with(".settled") || anchor.ends_with(".post_write")
+    anchor.ends_with(".settled")
+        || anchor.ends_with(".post_write")
+        || anchor.ends_with(".after_update")
 }
 
 struct Config {
@@ -554,16 +634,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_anchor_names_one_of_the_four_windows() {
+    fn every_anchor_names_one_of_the_documented_windows() {
         for (anchor, _) in ANCHORS {
             assert!(
-                anchor.ends_with(".entry")
-                    || anchor.ends_with(".locked")
-                    || anchor.ends_with(".settled")
-                    || anchor.ends_with(".pre_write")
-                    || anchor.ends_with(".post_write"),
-                "{anchor} does not name one of the documented windows"
+                WINDOW_SUFFIXES
+                    .iter()
+                    .any(|suffix| anchor.ends_with(suffix)),
+                "{anchor} does not name one of the documented windows: {WINDOW_SUFFIXES:?}"
             );
+        }
+    }
+
+    /// The vocabulary is a closed list, not a suggestion: `is_post_commit` is
+    /// suffix-matched, so a window nobody declared would be silently
+    /// pre-commit and quietly refuse the `unknown` action a harness configured
+    /// for it. Every suffix must therefore be reachable from a real anchor.
+    #[test]
+    fn every_documented_window_is_used_by_an_anchor() {
+        for suffix in WINDOW_SUFFIXES {
+            assert!(
+                ANCHORS.iter().any(|(anchor, _)| anchor.ends_with(suffix)),
+                "the window {suffix} is documented but no anchor names it; a vocabulary entry \
+                 nothing uses is how a typo in a real anchor gets accepted"
+            );
+        }
+    }
+
+    /// Which windows may carry `unknown`, pinned per suffix rather than left to
+    /// the reader. A window wrongly classified post-commit lets a harness
+    /// inject a lost-acknowledgement error before the write it is meant to
+    /// follow.
+    #[test]
+    fn only_the_post_commit_windows_admit_the_unknown_action() {
+        for suffix in [".settled", ".post_write", ".after_update"] {
+            assert!(is_post_commit(&format!("some.anchor{suffix}")));
+        }
+        for suffix in [
+            ".entry",
+            ".locked",
+            ".pre_write",
+            ".after_select",
+            ".before_commit",
+            ".before_update",
+            ".between_copy_and_delete",
+        ] {
+            assert!(!is_post_commit(&format!("some.anchor{suffix}")));
         }
     }
 

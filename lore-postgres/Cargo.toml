@@ -105,3 +105,6 @@ failure_generator = []
 [dev-dependencies]
 serial_test = { workspace = true }
 tokio-util = { workspace = true }
+# WP-119 Step A tests only (domain_outbox_encoding.rs): parses the
+# idempotency-key.json conformance fixture once the docs lane lands it.
+serde_json = { workspace = true }
