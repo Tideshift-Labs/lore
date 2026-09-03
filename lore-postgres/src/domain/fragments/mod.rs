@@ -158,6 +158,7 @@ pub use coordinator::FragmentWriteCapabilityReadiness;
 pub use coordinator::FragmentWriteClaim;
 pub use coordinator::FragmentWriteClaimInput;
 pub use coordinator::FragmentWriteClaimPruneBatch;
+pub use coordinator::FragmentWriteClaimPruneReport;
 pub use coordinator::FragmentWriteSettlement;
 pub use coordinator::IoObservation;
 pub use coordinator::MAX_FRAGMENT_WRITE_CLAIM_BODY_BYTES;

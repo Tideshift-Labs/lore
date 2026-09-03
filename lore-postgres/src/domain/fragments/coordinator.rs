@@ -740,6 +740,57 @@ impl FragmentWriteClaimPruneBatch {
     }
 }
 
+/// Outcome of one terminal-claim prune pass.
+///
+/// `pruned` alone cannot tell a caller whether there was nothing to do or
+/// whether the whole batch was consumed by skips: both report zero. `examined`
+/// accounts for every candidate the plan returned, so
+/// `examined == pruned + skipped_blocked + skipped_missing_evidence` always
+/// holds: `examined == 0` is a genuinely empty batch, and
+/// `examined == batch.max_claims` says the batch was full and another pass is
+/// worthwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FragmentWriteClaimPruneReport {
+    /// Candidates the plan query returned.
+    pub examined: u64,
+    /// Claim rows deleted.
+    pub pruned: u64,
+    /// Candidates skipped because the hash carried a live send barrier when
+    /// the head lock was taken.
+    pub skipped_blocked: u64,
+    /// Candidates whose own claim row was gone, no longer in the state the
+    /// plan saw, or outside the retention window by the time the head lock was
+    /// taken, so no row was deleted.
+    pub skipped_missing_evidence: u64,
+}
+
+impl FragmentWriteClaimPruneReport {
+    fn new(examined: usize) -> Result<Self, DomainError> {
+        Ok(Self {
+            examined: u64::try_from(examined).map_err(|_| {
+                DomainError::Internal("fragment write claim prune batch exceeds u64".to_owned())
+            })?,
+            ..Self::default()
+        })
+    }
+
+    // One accumulation policy for all three counters. Every candidate advances
+    // exactly one of them by one, and the candidate count is bounded by
+    // `MAX_FRAGMENT_WRITE_CLAIM_PRUNE_BATCH`, so none can reach the saturation
+    // point. `deleted` is 0 or 1 because both deletes key on the primary key.
+    fn record_pruned(&mut self, deleted: u64) {
+        self.pruned = self.pruned.saturating_add(deleted);
+    }
+
+    fn record_blocked(&mut self) {
+        self.skipped_blocked = self.skipped_blocked.saturating_add(1);
+    }
+
+    fn record_missing_evidence(&mut self) {
+        self.skipped_missing_evidence = self.skipped_missing_evidence.saturating_add(1);
+    }
+}
+
 impl FragmentWriteSettlement {
     fn state(self) -> FragmentWriteClaimState {
         match self {
@@ -2107,11 +2158,59 @@ impl PostgresFragmentCoordinator {
     /// selected by age. A Decisive claim is deleted only when its exact target
     /// digest and size have been copied into durable epoch evidence; NoSend is
     /// safe after terminal retention because it never names a cleanup target.
+    ///
+    /// # Forward progress
+    ///
+    /// The plan query anti-joins against active claims, so a hash carrying a
+    /// live barrier contributes its NoSend claims and withholds only its
+    /// Decisive ones — exactly the rows the loop would skip. Selection, not
+    /// ordering, is what fixes this: the order is by `settled_at`, so without
+    /// the anti-join the oldest Decisive rows on one blocked hash win every
+    /// slot on every pass, get skipped in the loop, and starve younger prunable
+    /// rows on every other hash. A hash under continuous write traffic
+    /// regenerates those claims indefinitely, so the batch never self-clears.
+    ///
+    /// The anti-join is a selection filter, not the safety property. It runs
+    /// unlocked on a pooled connection, so a hash can gain an active claim
+    /// between the plan and the head lock. `write_claim_barrier_for_prune` is
+    /// the locked check that actually gates the delete.
+    ///
+    /// It sits inside the Decisive arm, not over the whole predicate, because
+    /// the loop exempts NoSend from the barrier. A hash-wide anti-join over
+    /// both arms would be stricter than the loop it feeds: it would stop
+    /// selecting NoSend rows on a barriered hash that the loop would happily
+    /// prune, so a hash under continuous write traffic would accumulate them
+    /// forever. The plan and the loop must agree on strictness in both
+    /// directions.
+    ///
+    /// **One skip the plan does not model.** The loop also skips a candidate
+    /// whose hash has no lifecycle head, and nothing excludes that candidate
+    /// from selection, so such a row would re-occupy a slot on every pass
+    /// forever — the same head-of-line shape the anti-join removes. It is
+    /// unreachable today: no statement deletes from `lore_fragment_lifecycle`
+    /// (the two that look like it delete from `lore_fragment_lifecycle_metering`,
+    /// a different table), and no foreign key ties the two tables, so a claim
+    /// cannot outlive its head. Anyone adding a lifecycle delete path owes this
+    /// plan query a matching head-existence term.
     pub async fn prune_terminal_write_claims(
         &self,
         batch: FragmentWriteClaimPruneBatch,
-    ) -> Result<u64, DomainError> {
+    ) -> Result<FragmentWriteClaimPruneReport, DomainError> {
         let client = self.checkout().await?;
+        // The anti-join's state list is written as SQL literals, and must stay
+        // that way. `0, 1, 3` are Prepared, Sending and Ambiguous, and the text
+        // matches `lore_fragment_write_claims_barrier`'s partial predicate
+        // exactly. Bound as a `$n` array instead, the planner cannot prove
+        // partial-index implication, and a forced generic plan degrades the
+        // subquery to a sequential scan of the whole claims table for every
+        // candidate row. Measured on PostgreSQL 16.15: literals keep the index
+        // scan, a bound array does not.
+        //
+        // The barrier arms mirror `write_claim_barrier_for_prune` exactly:
+        // Prepared blocks on `send_not_after`, Sending and Ambiguous block on
+        // `hard_not_after`. A uniform `hard_not_after` test would be stricter
+        // than the loop and would newly starve any hash holding a Prepared row
+        // whose send window has closed but whose hard window has not.
         let rows = client
             .query(
                 "SELECT claim.logical_request_id, claim.attempt_id, claim.hash, claim.state \
@@ -2127,7 +2226,15 @@ impl PostgresFragmentCoordinator {
                                 AND epoch.object_key = claim.object_key \
                                 AND epoch.provider_body_blake3 = claim.body_blake3 \
                                 AND epoch.provider_body_size = claim.body_size \
-                                AND epoch.provider_claim_fence = claim.fence))) \
+                                AND epoch.provider_claim_fence = claim.fence) \
+                             AND NOT EXISTS ( \
+                                 SELECT 1 FROM lore_fragment_write_claims AS active \
+                                  WHERE active.hash = claim.hash \
+                                    AND active.state IN (0, 1, 3) \
+                                    AND (CASE WHEN active.state = 0 \
+                                              THEN active.send_not_after \
+                                              ELSE active.hard_not_after END) \
+                                        > clock_timestamp()))) \
                   ORDER BY settled_at, logical_request_id, attempt_id \
                   LIMIT $4",
                 &[
@@ -2158,7 +2265,7 @@ impl PostgresFragmentCoordinator {
             .collect::<Result<Vec<_>, DomainError>>()?;
         drop(client);
 
-        let mut pruned = 0_u64;
+        let mut report = FragmentWriteClaimPruneReport::new(candidates.len())?;
         for candidate in candidates {
             let mut client = self.checkout().await?;
             let tx = client
@@ -2166,26 +2273,50 @@ impl PostgresFragmentCoordinator {
                 .await
                 .map_err(|error| DomainError::from_pg("fragment write claim prune begin", error))?;
             let mut sequence = LockSequence::new();
-            let _ = lock_fragment_head(&tx, &mut sequence, &candidate.hash).await?;
-            let inventory =
-                write_claim_inventory_locked(&tx, &mut sequence, &candidate.hash).await?;
-            if inventory.blocked_until.is_some() {
+            let head = lock_fragment_head(&tx, &mut sequence, &candidate.hash).await?;
+            // The head row lock is the serialisation point that both the
+            // barrier probe and the deletes rest on: every writer of
+            // `lore_fragment_write_claims` takes it first, which is what lets
+            // the probe read without `FOR UPDATE`. A hash with no head row
+            // offers no such lock, so that premise would be false and this loop
+            // must not proceed. `lock_fragment_head`'s own doc requires any
+            // caller that proceeds on `None` to re-derive its argument; this
+            // one cannot, so it stops instead of inheriting one.
+            if head.is_none() {
+                classify_commit(tx.commit().await, "headless claim prune release commit")?;
+                report.record_missing_evidence();
+                continue;
+            }
+            let blocked_until =
+                write_claim_barrier_for_prune(&tx, &mut sequence, &candidate.hash).await?;
+            // The barrier gates the Decisive arm only. A NoSend claim records
+            // that no provider send occurred, so it names no cleanup target:
+            // `write_claim_inventory_locked` contributes nothing for a NoSend
+            // row, and obliterate therefore derives no purge target from one.
+            // Another claim being in flight on this hash has no bearing on it,
+            // and its delete is already an exact CAS on its own row.
+            if candidate.state == FragmentWriteClaimState::Decisive && blocked_until.is_some() {
                 classify_commit(
                     tx.commit().await,
                     "blocked claim inventory normalization commit",
                 )?;
+                report.record_blocked();
                 continue;
             }
-            let candidate_target = inventory.cleanup_targets.iter().find(|target| {
-                target.logical_request_id == candidate.logical_request_id
-                    && target.attempt_id == candidate.attempt_id
-            });
-            if candidate.state == FragmentWriteClaimState::Decisive && candidate_target.is_none() {
-                classify_commit(tx.commit().await, "claim inventory normalization commit")?;
-                continue;
-            }
-            let deleted = match (candidate.state, candidate_target) {
-                (FragmentWriteClaimState::NoSend, _) => {
+            // The candidate's own row, not a hash-wide scan: the exact target
+            // this delete must bind is the candidate's own claim, and the
+            // hash-wide inventory was only ever searched for it by identity.
+            // Taken on both arms, not just the Decisive one that reads it, so
+            // every prune delete locks its row before its own CAS.
+            let locked = lock_write_claim_identity(
+                &tx,
+                &mut sequence,
+                &candidate.logical_request_id,
+                &candidate.attempt_id,
+            )
+            .await?;
+            let deleted = match candidate.state {
+                FragmentWriteClaimState::NoSend => {
                     tx.execute(
                         "DELETE FROM lore_fragment_write_claims \
                           WHERE logical_request_id = $1 AND attempt_id = $2 AND state = $3 \
@@ -2200,7 +2331,27 @@ impl PostgresFragmentCoordinator {
                     )
                     .await
                 }
-                (FragmentWriteClaimState::Decisive, Some(target)) => {
+                FragmentWriteClaimState::Decisive => {
+                    let Some(target) = locked
+                        .filter(|locked| locked.state == FragmentWriteClaimState::Decisive)
+                        .map(|locked| locked.claim)
+                    else {
+                        classify_commit(tx.commit().await, "claim inventory normalization commit")?;
+                        report.record_missing_evidence();
+                        continue;
+                    };
+                    // Pruning a Decisive claim on a predecessor epoch removes
+                    // obliterate's only handle on that older provider object,
+                    // because `capture_obliterate_intent_locked` reads exactly
+                    // one epoch row (the head's current epoch) and takes every
+                    // other target from this table. That is deliberate, not a
+                    // leak: CR-031 scopes obliterate to the current epoch's
+                    // exact object key, and assigns quarantined and orphaned
+                    // predecessor epochs to a later GC package. Their epoch rows
+                    // survive quarantine (`commit_publication` updates
+                    // `disposition`, it does not delete), so GC keeps a durable
+                    // source that never depended on a claim row. What is removed
+                    // here is an incidental handle. No GC package exists yet.
                     let body_size = i64::try_from(target.body_size).map_err(|_| {
                         DomainError::Internal(
                             "fragment write cleanup target size exceeds i64".to_owned(),
@@ -2224,7 +2375,10 @@ impl PostgresFragmentCoordinator {
                         &[
                             &candidate.logical_request_id.as_slice(),
                             &candidate.attempt_id.as_slice(),
-                            &target.hash,
+                            // The hash whose head this loop locked, not the
+                            // locked row's own copy, so the delete's scope and
+                            // the lock's scope agree by construction.
+                            &candidate.hash,
                             &target.epoch,
                             &target.fence,
                             &target.authority.bits(),
@@ -2237,15 +2391,27 @@ impl PostgresFragmentCoordinator {
                     )
                     .await
                 }
-                _ => continue,
+                // The plan query selects only NoSend and Decisive, so this arm
+                // is unreachable. Count it rather than dropping it silently, so
+                // the report's counters keep summing to `examined`.
+                _ => {
+                    classify_commit(tx.commit().await, "claim inventory normalization commit")?;
+                    report.record_missing_evidence();
+                    continue;
+                }
             }
             .map_err(|error| DomainError::from_pg("fragment write claim prune delete", error))?;
             classify_commit(tx.commit().await, "fragment write claim prune commit")?;
-            pruned = pruned.checked_add(deleted).ok_or_else(|| {
-                DomainError::Internal("fragment write claim prune count overflow".to_owned())
-            })?;
+            // A zero-row delete means the row moved out from under the plan
+            // between the batch read and the head lock. Counting it keeps the
+            // counters summing to `examined` instead of losing the candidate.
+            if deleted == 0 {
+                report.record_missing_evidence();
+            } else {
+                report.record_pruned(deleted);
+            }
         }
-        Ok(pruned)
+        Ok(report)
     }
 
     /// Publish the result of a direct write or a repair.
@@ -4173,6 +4339,104 @@ async fn write_claim_barrier_locked(
         .first()
         .map(|row| FragmentWriteClaimBarrier::BlockedUntil(row.get("hard_not_after")))
         .unwrap_or(FragmentWriteClaimBarrier::Clear))
+}
+
+/// Compute one hash's send barrier for the prune loop, and settle any
+/// `Prepared` claim whose send window has closed.
+///
+/// This is the prune path's replacement for [`write_claim_inventory_locked`].
+/// That function stays as it is, because obliterate
+/// (`capture_obliterate_intent_locked`) needs its hash-wide exact cleanup
+/// targets; the prune loop only ever needed the barrier plus its own
+/// candidate's row, which it now takes through
+/// [`lock_write_claim_identity`].
+///
+/// # Why this can read without `FOR UPDATE`
+///
+/// The caller holds this hash's `lore_fragment_lifecycle` row `FOR UPDATE`, and
+/// every writer of `lore_fragment_write_claims` takes that head lock first:
+/// claim insert, authorization, settlement, this normalization, and the prune
+/// deletes. Holding the head is therefore sufficient to serialise this read,
+/// the same argument `lock_lease_member_heads` documents for reading epoch
+/// dispositions without locking epoch rows. Locking every claim row on the hash
+/// adds nothing and lets a prune pass queue behind unrelated traffic.
+///
+/// This probe is **not** redundant with the plan query's anti-join. The
+/// anti-join runs unlocked on a separate pooled connection and is advisory: a
+/// hash can gain an active claim between the plan and the head lock. This is
+/// the locked check, and it is what makes the delete safe.
+///
+/// # Why the state list is a SQL literal
+///
+/// `0, 1, 3` are Prepared, Sending and Ambiguous, and `4` is NoSend. Written as
+/// literals, both statements match `lore_fragment_write_claims_barrier`'s
+/// partial predicate and use it with `hash` as the index condition. Bound as
+/// `$n` parameters, the planner cannot prove partial-index implication, and a
+/// generic plan degrades both to a sequential scan of the whole claims table.
+/// There is no other index on this table with `hash` leading.
+async fn write_claim_barrier_for_prune(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    hash: &[u8],
+) -> Result<Option<SystemTime>, DomainError> {
+    sequence.enter(LockClass::Fragments)?;
+    let database_now: SystemTime = tx
+        .query_one("SELECT clock_timestamp()", &[])
+        .await
+        .map_err(|error| DomainError::from_pg("fragment write prune barrier clock", error))?
+        .get(0);
+    // Settle every Prepared claim whose send window has closed, exactly as
+    // `write_claim_inventory_locked` does row by row. The head lock already
+    // serialises this, so one set-based statement is equivalent and takes row
+    // locks only on the rows it changes. Prepared (0) becomes NoSend (4).
+    //
+    // The inventory's `updated != 1` guard (its
+    // `fragment_write_claim_inventory_race` rejection) has no counterpart here,
+    // and needs none. That guard covers a read-then-CAS pair: the inventory
+    // reads a row as Prepared, then updates it by identity, and the guard
+    // catches a change in between. This statement reads and writes in one
+    // operation, so there is no window for that check to describe. The rejection
+    // remains reachable from the inventory itself, which obliterate still calls.
+    tx.execute(
+        "UPDATE lore_fragment_write_claims SET state = 4, settled_at = $2 \
+          WHERE hash = $1 AND state = 0 AND send_not_after <= $2",
+        &[&hash, &database_now],
+    )
+    .await
+    .map_err(|error| DomainError::from_pg("expired prepared fragment write claim settle", error))?;
+    let rows = tx
+        .query(
+            "SELECT state, send_not_after, hard_not_after \
+               FROM lore_fragment_write_claims \
+              WHERE hash = $1 AND state IN (0, 1, 3) \
+              ORDER BY logical_request_id, attempt_id",
+            &[&hash],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("fragment write prune barrier", error))?;
+    let mut blocked_until: Option<SystemTime> = None;
+    for row in rows {
+        let state = FragmentWriteClaimState::from_bits(row.get("state"))?;
+        // Prepared blocks on its send horizon, Sending and Ambiguous on their
+        // hard late-effect horizon. The plan query's anti-join mirrors this
+        // split; a uniform `hard_not_after` test would be stricter than the
+        // loop and would starve hashes holding a settled-out Prepared row.
+        let horizon: Option<SystemTime> = match state {
+            FragmentWriteClaimState::Prepared => Some(row.get("send_not_after")),
+            FragmentWriteClaimState::Sending | FragmentWriteClaimState::Ambiguous => {
+                Some(row.get("hard_not_after"))
+            }
+            FragmentWriteClaimState::Decisive | FragmentWriteClaimState::NoSend => None,
+        };
+        if let Some(horizon) = horizon.filter(|horizon| *horizon > database_now) {
+            blocked_until = Some(
+                blocked_until
+                    .map(|current| current.max(horizon))
+                    .unwrap_or(horizon),
+            );
+        }
+    }
+    Ok(blocked_until)
 }
 
 /// Inspect every claim for a hash while the exact lifecycle head is locked.

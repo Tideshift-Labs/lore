@@ -44,6 +44,7 @@ use lore_postgres::domain::fragments::FragmentWriteCapability;
 use lore_postgres::domain::fragments::FragmentWriteCapabilityCutover;
 use lore_postgres::domain::fragments::FragmentWriteClaimInput;
 use lore_postgres::domain::fragments::FragmentWriteClaimPruneBatch;
+use lore_postgres::domain::fragments::FragmentWriteClaimPruneReport;
 use lore_postgres::domain::fragments::FragmentWriteClaimState;
 use lore_postgres::domain::fragments::FragmentWriteSettlement;
 use lore_postgres::domain::fragments::IoObservation;
@@ -914,7 +915,20 @@ async fn claim_inventory_and_prune_preserve_cleanup_targets_and_bound_terminal_d
         )
         .await
         .expect("prune one terminal claim");
-    assert_eq!(pruned, 1, "the NoSend repair is the sole eligible row");
+    // The ambiguous predecessor's hard horizon has already passed (its windows
+    // were 50/150 ms and the sleep above is 170 ms), so it is neither an
+    // eligible candidate nor an active barrier: the batch is one candidate and
+    // it is pruned, with nothing skipped on either counter.
+    assert_eq!(
+        pruned,
+        FragmentWriteClaimPruneReport {
+            examined: 1,
+            pruned: 1,
+            skipped_blocked: 0,
+            skipped_missing_evidence: 0,
+        },
+        "the NoSend repair is the sole eligible row"
+    );
     let ambiguous_survives: i64 = direct
         .query_one(
             "SELECT count(*) FROM lore_fragment_write_claims \
@@ -973,7 +987,12 @@ async fn claim_inventory_and_prune_preserve_cleanup_targets_and_bound_terminal_d
             )
             .await
             .expect("prune decisive claim with durable evidence"),
-        1
+        FragmentWriteClaimPruneReport {
+            examined: 1,
+            pruned: 1,
+            skipped_blocked: 0,
+            skipped_missing_evidence: 0,
+        }
     );
     let epoch_evidence = direct
         .query_one(
@@ -1251,8 +1270,13 @@ async fn prune_normalizes_expired_prepared_to_targetless_no_send_and_honors_batc
             )
             .await
             .expect("bounded prune and inventory normalization"),
-        1,
-        "LIMIT 1 must delete exactly one terminal candidate"
+        FragmentWriteClaimPruneReport {
+            examined: 1,
+            pruned: 1,
+            skipped_blocked: 0,
+            skipped_missing_evidence: 0,
+        },
+        "LIMIT 1 must examine and delete exactly one terminal candidate"
     );
     let prepared_state: i16 = direct
         .query_one(
@@ -1279,6 +1303,805 @@ async fn prune_normalizes_expired_prepared_to_targetless_no_send_and_honors_batc
         .expect("count bounded synthetic survivors")
         .get(0);
     assert_eq!(synthetic_remaining, 1);
+}
+
+// ---------------------------------------------------------------------------
+// WP-118 prune-fix shared fixtures.
+//
+// Every prune case below needs the same two ingredients: a hash whose terminal
+// claim carries real durable epoch evidence (so it is eligible on the plan
+// query's own decisive terms, and only the barrier or the batch can keep it
+// out), and synthetic sibling rows on that same hash. Building the second by
+// hand from the first's stored evidence keeps the synthetic rows honest — they
+// satisfy the same EXISTS clause a real row does, rather than being waved
+// through.
+// ---------------------------------------------------------------------------
+
+/// One hash's durable claim evidence, copied so a synthetic sibling row can
+/// satisfy the plan query's decisive EXISTS clause against the same epoch.
+struct ClaimEvidence {
+    epoch: i64,
+    fence: i64,
+    authority: i16,
+    object_key: String,
+    body_blake3: Vec<u8>,
+    body_size: i64,
+}
+
+/// Publish one decisive provider write on a fresh hash, then age its terminal
+/// claim well past any short prune retention so it is an eligible candidate.
+async fn aged_decisive_publication(
+    coordinator: &TestFragmentCoordinator,
+    direct: &Client,
+    seed: u8,
+) -> Vec<u8> {
+    let hash = random_hash();
+    let key = legacy_key(&hash);
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, &key)
+        .await
+        .expect("begin a decisive publication")
+    else {
+        panic!("a fresh hash must admit its direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(&key, seed, EpochAuthority::Remote)),
+            )
+            .await
+            .expect("publish decisive provider evidence"),
+        CommitVerdict::Published
+    );
+    direct
+        .execute(
+            "UPDATE lore_fragment_write_claims \
+                SET settled_at = clock_timestamp() - interval '10 seconds' \
+              WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("age the decisive claim past retention");
+    hash
+}
+
+async fn claim_evidence(direct: &Client, hash: &[u8]) -> ClaimEvidence {
+    let row = direct
+        .query_one(
+            "SELECT epoch, fence, authority, object_key, body_blake3, body_size \
+               FROM lore_fragment_write_claims WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read the hash's durable claim evidence");
+    ClaimEvidence {
+        epoch: row.get("epoch"),
+        fence: row.get("fence"),
+        authority: row.get("authority"),
+        object_key: row.get("object_key"),
+        body_blake3: row.get("body_blake3"),
+        body_size: row.get("body_size"),
+    }
+}
+
+/// Insert one aged terminal claim sharing `hash`'s durable epoch evidence.
+///
+/// `authorized_at` is set on both arms: the state CHECK requires it for
+/// Decisive and permits it for NoSend, so one statement serves both.
+async fn insert_aged_terminal_claim(
+    direct: &Client,
+    hash: &[u8],
+    evidence: &ClaimEvidence,
+    seed: u8,
+    state: FragmentWriteClaimState,
+) -> (Vec<u8>, Vec<u8>) {
+    let logical_request_id = vec![seed; 16];
+    let attempt_id = vec![seed.wrapping_add(1); 16];
+    direct
+        .execute(
+            "INSERT INTO lore_fragment_write_claims ( \
+                logical_request_id, attempt_id, hash, epoch, fence, authority, object_key, \
+                body_blake3, body_size, state, send_not_after, hard_not_after, prepared_at, \
+                authorized_at, settled_at \
+             ) VALUES ( \
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                clock_timestamp() - interval '11 seconds', \
+                clock_timestamp() - interval '10 seconds', \
+                clock_timestamp() - interval '12 seconds', \
+                clock_timestamp() - interval '11 seconds', \
+                clock_timestamp() - interval '9 seconds' \
+             )",
+            &[
+                &logical_request_id,
+                &attempt_id,
+                &hash,
+                &evidence.epoch,
+                &evidence.fence,
+                &evidence.authority,
+                &evidence.object_key,
+                &evidence.body_blake3,
+                &evidence.body_size,
+                &state.bits(),
+            ],
+        )
+        .await
+        .expect("insert an aged terminal claim");
+    (logical_request_id, attempt_id)
+}
+
+/// Insert one unexpired `Prepared` claim: a live send barrier on `hash` whose
+/// send horizon is an hour out, so it blocks for the whole case and cannot be
+/// settled out by `write_claim_barrier_for_prune`'s own normalization.
+async fn insert_live_send_barrier(
+    direct: &Client,
+    hash: &[u8],
+    evidence: &ClaimEvidence,
+    seed: u8,
+) -> (Vec<u8>, Vec<u8>) {
+    let logical_request_id = vec![seed; 16];
+    let attempt_id = vec![seed.wrapping_add(1); 16];
+    direct
+        .execute(
+            "INSERT INTO lore_fragment_write_claims ( \
+                logical_request_id, attempt_id, hash, epoch, fence, authority, object_key, \
+                body_blake3, body_size, state, send_not_after, hard_not_after, prepared_at \
+             ) VALUES ( \
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                clock_timestamp() + interval '1 hour', \
+                clock_timestamp() + interval '2 hours', \
+                clock_timestamp() \
+             )",
+            &[
+                &logical_request_id,
+                &attempt_id,
+                &hash,
+                &evidence.epoch,
+                &evidence.fence,
+                &evidence.authority,
+                &evidence.object_key,
+                &vec![seed; 32],
+                &7_i64,
+                &FragmentWriteClaimState::Prepared.bits(),
+            ],
+        )
+        .await
+        .expect("insert a live send barrier");
+    (logical_request_id, attempt_id)
+}
+
+async fn claim_row_count(direct: &Client, logical_request_id: &[u8], attempt_id: &[u8]) -> i64 {
+    direct
+        .query_one(
+            "SELECT count(*) FROM lore_fragment_write_claims \
+              WHERE logical_request_id = $1 AND attempt_id = $2",
+            &[&logical_request_id, &attempt_id],
+        )
+        .await
+        .expect("count one claim row")
+        .get(0)
+}
+
+/// WP-118: one blocked hash must not own the whole prune batch.
+///
+/// Before the plan query gained its anti-join against active claims, the batch
+/// was selected by `settled_at` order alone. The oldest terminal rows therefore
+/// won every slot of the `LIMIT` on every pass; the loop then skipped each of
+/// them because the hash still carried a live send barrier, and younger
+/// prunable rows on every other hash were never reached. Measured before the
+/// fix: 256 of 256 slots to a single blocked hash, and 196 consecutive passes
+/// in which nothing at all was deleted. A hash under continuous write traffic
+/// regenerates those claims indefinitely, so the batch never self-clears.
+///
+/// This is the smallest live reproduction: two aged Decisive rows on a blocked
+/// hash, a younger Decisive row on a prunable one, and a batch limit exactly
+/// the size of the blocked pair. Against the pre-fix plan query the pass
+/// reports `examined: 2, pruned: 0, skipped_blocked: 2` and the prunable row
+/// survives; with the anti-join the blocked hash is not planned at all.
+///
+/// The ordering is deliberately left as-is and is not what fixes this —
+/// selection is. Ordering by `settled_at` is still correct: oldest-first is the
+/// retention order a prune wants, once the rows it cannot delete are out of the
+/// candidate set.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn a_blocked_hash_does_not_occupy_the_prune_batch_and_starve_a_younger_prunable_hash() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+
+    // The blocked hash: one real decisive publication, so its claim carries
+    // durable epoch evidence and is genuinely eligible on the plan query's own
+    // terms. Only the barrier stops it being deleted.
+    let blocked_hash = aged_decisive_publication(&coordinator, &direct, 0x91).await;
+    let evidence = claim_evidence(&direct, &blocked_hash).await;
+
+    // A second aged terminal row on the same hash, sharing the first's exact
+    // epoch evidence so it satisfies the plan query's decisive EXISTS clause
+    // too. Two rows is what makes this head-of-line occupancy rather than a
+    // single unlucky candidate: they fill the whole batch between them.
+    insert_aged_terminal_claim(
+        &direct,
+        &blocked_hash,
+        &evidence,
+        0x93,
+        FragmentWriteClaimState::Decisive,
+    )
+    .await;
+    insert_live_send_barrier(&direct, &blocked_hash, &evidence, 0x95).await;
+
+    // The prunable hash: a younger terminal row on a hash with no barrier at
+    // all. It sorts last, so it is exactly what the pre-fix batch never reached.
+    let prunable_hash = random_hash();
+    let prunable_key = legacy_key(&prunable_hash);
+    let BeginOutcome::Admitted(prunable_intent) = coordinator
+        .begin_direct_write(&prunable_hash, &prunable_key)
+        .await
+        .expect("prepare the prunable hash's publication")
+    else {
+        panic!("a fresh hash must admit its direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &prunable_intent,
+                IoObservation::Valid(manifest(&prunable_key, 0x98, EpochAuthority::Remote)),
+            )
+            .await
+            .expect("publish the prunable hash's decisive evidence"),
+        CommitVerdict::Published
+    );
+    let prunable_claim = prunable_intent
+        .write_claim()
+        .expect("prunable publication claim");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    // A batch exactly the size of the blocked pair. Pre-fix the two blocked
+    // rows sort first and take both slots.
+    let report = coordinator
+        .prune_terminal_write_claims(
+            FragmentWriteClaimPruneBatch::new(2, Duration::from_millis(1))
+                .expect("two-slot prune batch"),
+        )
+        .await
+        .expect("prune past a blocked hash in one pass");
+    assert_eq!(
+        report,
+        FragmentWriteClaimPruneReport {
+            examined: 1,
+            pruned: 1,
+            skipped_blocked: 0,
+            skipped_missing_evidence: 0,
+        },
+        "the blocked hash must be excluded by the plan, not skipped inside the batch"
+    );
+
+    let prunable_remaining = claim_row_count(
+        &direct,
+        prunable_claim.logical_request_id().as_slice(),
+        prunable_claim.attempt_id().as_slice(),
+    )
+    .await;
+    assert_eq!(
+        prunable_remaining, 0,
+        "the younger prunable row must be reached in this single pass"
+    );
+
+    // The blocked hash keeps all three rows: the anti-join is a selection
+    // filter, not a licence to delete past a live barrier.
+    let blocked_remaining: i64 = direct
+        .query_one(
+            "SELECT count(*) FROM lore_fragment_write_claims WHERE hash = $1",
+            &[&blocked_hash],
+        )
+        .await
+        .expect("count the blocked hash's survivors")
+        .get(0);
+    assert_eq!(blocked_remaining, 3);
+    // No assertion here that the barrier row is still `Prepared`. Once the hash
+    // is excluded from the plan, `write_claim_barrier_for_prune` never runs
+    // against it, so such an assertion could not discriminate any
+    // implementation. The Prepared normalization contract is exercised where it
+    // is reachable, by
+    // `prune_normalizes_expired_prepared_to_targetless_no_send_and_honors_batch_limit`
+    // and, under a live barrier, by
+    // `a_barriered_hash_still_yields_its_no_send_claims_while_its_decisive_claims_stay_excluded`.
+}
+
+/// WP-118: the head-locked barrier re-check, not the anti-join, is the safety
+/// gate — and this is the only case that executes it.
+///
+/// The plan query's anti-join runs unlocked on a pooled connection, so it is
+/// advisory: a hash can gain an active claim between the plan and the head
+/// lock. `write_claim_barrier_for_prune` is what actually refuses the delete,
+/// and it is the reason `prune_terminal_write_claims` may read claim rows
+/// without `FOR UPDATE` at all. Nothing exercised it before this case.
+///
+/// Deterministic interleaving, not timing, and no failpoint — the same method
+/// as `a_concurrent_create_association_landing_between_the_plan_and_the_head_lock_is_refused_with_zero_mutation`.
+/// An external transaction takes the hash's lifecycle row `FOR UPDATE` and
+/// inserts the barrier claim **in that same uncommitted transaction**. The
+/// prune's plan query runs on a different, pooled connection and cannot see an
+/// uncommitted row, so the hash *is* planned; the loop then parks at
+/// `lock_fragment_head`. Releasing the external transaction lets the loop
+/// through, and by then the barrier claim is durably committed.
+///
+/// `examined: 1` is load-bearing alongside `skipped_blocked: 1`: together they
+/// prove the plan admitted the candidate and the locked re-check alone refused
+/// it. Were the interleaving to collapse — the insert committing before the
+/// plan ran — the anti-join would exclude the hash and `examined` would be 0,
+/// so this case cannot pass by accidentally proving the advisory filter instead.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn the_head_locked_barrier_recheck_refuses_a_claim_the_unlocked_plan_query_admitted() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+
+    let hash = aged_decisive_publication(&coordinator, &direct, 0xb1).await;
+    let evidence = claim_evidence(&direct, &hash).await;
+    let target = direct
+        .query_one(
+            "SELECT logical_request_id, attempt_id FROM lore_fragment_write_claims \
+              WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read the candidate's identity");
+    let target_request: Vec<u8> = target.get("logical_request_id");
+    let target_attempt: Vec<u8> = target.get("attempt_id");
+
+    let mut lock_client = own_transaction_client(&url).await;
+    let lock_tx = lock_client
+        .transaction()
+        .await
+        .expect("open the external head-lock transaction");
+    lock_tx
+        .execute(
+            "SELECT 1 FROM lore_fragment_lifecycle WHERE hash = $1 FOR UPDATE",
+            &[&hash],
+        )
+        .await
+        .expect("lock the lifecycle head externally");
+    lock_tx
+        .execute(
+            "INSERT INTO lore_fragment_write_claims ( \
+                logical_request_id, attempt_id, hash, epoch, fence, authority, object_key, \
+                body_blake3, body_size, state, send_not_after, hard_not_after, prepared_at \
+             ) VALUES ( \
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                clock_timestamp() + interval '1 hour', \
+                clock_timestamp() + interval '2 hours', \
+                clock_timestamp() \
+             )",
+            &[
+                &vec![0xb3_u8; 16],
+                &vec![0xb4_u8; 16],
+                &hash,
+                &evidence.epoch,
+                &evidence.fence,
+                &evidence.authority,
+                &evidence.object_key,
+                &vec![0xb5_u8; 32],
+                &7_i64,
+                &FragmentWriteClaimState::Prepared.bits(),
+            ],
+        )
+        .await
+        .expect("insert the racing barrier inside the uncommitted transaction");
+
+    let prune = coordinator.prune_terminal_write_claims(
+        FragmentWriteClaimPruneBatch::new(4, Duration::from_millis(1))
+            .expect("bounded racing prune batch"),
+    );
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        lock_tx
+            .commit()
+            .await
+            .expect("release the external head lock");
+    };
+    let (report, ()) = tokio::join!(prune, release);
+
+    assert_eq!(
+        report.expect("racing prune pass"),
+        FragmentWriteClaimPruneReport {
+            examined: 1,
+            pruned: 0,
+            skipped_blocked: 1,
+            skipped_missing_evidence: 0,
+        },
+        "the unlocked plan admitted this candidate; only the head-locked \
+         barrier re-check may refuse it"
+    );
+    assert_eq!(
+        claim_row_count(&direct, &target_request, &target_attempt).await,
+        1,
+        "a barrier observed under the head lock must leave the claim in place"
+    );
+}
+
+/// WP-118: both ways a prune candidate can lose its evidence between the
+/// unlocked plan and the head lock, and neither may delete anything.
+///
+/// No case asserted `skipped_missing_evidence` non-zero before this one, so
+/// both arms that feed it were unexecuted.
+///
+/// Phase A is the natural race: the candidate's own claim row is deleted by a
+/// competitor holding the head lock. Same two-connection interleaving as the
+/// barrier case, with a `DELETE` in place of the insert — `examined: 1` again
+/// proves the plan admitted the row before it vanished.
+///
+/// Phase B is the headless candidate, and it needs no concurrency at all. A
+/// claim whose hash has no `lore_fragment_lifecycle` row offers no head lock to
+/// take, so the premise that lets the barrier probe read without `FOR UPDATE`
+/// is simply false there. The loop must stop rather than inherit a lock it
+/// never acquired. This arm is discriminating on its own: proceeding on
+/// `lock_fragment_head`'s `None` deletes the row and reports `pruned: 1`.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn a_candidate_that_loses_its_row_or_its_head_between_plan_and_lock_deletes_nothing() {
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+
+    // Phase A: the claim row is deleted under the head lock while the prune is
+    // parked on that same lock.
+    let raced_hash = aged_decisive_publication(&coordinator, &direct, 0xc1).await;
+    let mut lock_client = own_transaction_client(&url).await;
+    let lock_tx = lock_client
+        .transaction()
+        .await
+        .expect("open the external head-lock transaction");
+    lock_tx
+        .execute(
+            "SELECT 1 FROM lore_fragment_lifecycle WHERE hash = $1 FOR UPDATE",
+            &[&raced_hash],
+        )
+        .await
+        .expect("lock the lifecycle head externally");
+    lock_tx
+        .execute(
+            "DELETE FROM lore_fragment_write_claims WHERE hash = $1",
+            &[&raced_hash],
+        )
+        .await
+        .expect("delete the candidate inside the uncommitted transaction");
+
+    let prune = coordinator.prune_terminal_write_claims(
+        FragmentWriteClaimPruneBatch::new(4, Duration::from_millis(1))
+            .expect("bounded racing prune batch"),
+    );
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        lock_tx
+            .commit()
+            .await
+            .expect("release the external head lock");
+    };
+    let (raced_report, ()) = tokio::join!(prune, release);
+    assert_eq!(
+        raced_report.expect("racing prune pass"),
+        FragmentWriteClaimPruneReport {
+            examined: 1,
+            pruned: 0,
+            skipped_blocked: 0,
+            skipped_missing_evidence: 1,
+        },
+        "a candidate whose row moved under the head lock is missing evidence, \
+         not a silent loss"
+    );
+
+    // Phase B: a terminal claim on a hash that has no lifecycle head at all.
+    //
+    // Phase B's `examined: 1` only means what it says while phase A's row is
+    // really gone, so assert that rather than inheriting it. Without this pin a
+    // phase A that stopped deleting would silently make phase B's expectation
+    // wrong instead of failing.
+    let claims_before_phase_b: i64 = direct
+        .query_one("SELECT count(*) FROM lore_fragment_write_claims", &[])
+        .await
+        .expect("count claims left by phase A")
+        .get(0);
+    assert_eq!(
+        claims_before_phase_b, 0,
+        "phase A must leave no claim row, or phase B's batch is not what it claims"
+    );
+
+    let headless_hash = random_hash();
+    let headless_request = vec![0xc5_u8; 16];
+    let headless_attempt = vec![0xc6_u8; 16];
+    direct
+        .execute(
+            "INSERT INTO lore_fragment_write_claims ( \
+                logical_request_id, attempt_id, hash, epoch, fence, authority, object_key, \
+                body_blake3, body_size, state, send_not_after, hard_not_after, prepared_at, \
+                settled_at \
+             ) VALUES ( \
+                $1, $2, $3, 1, 1, $4, $5, $6, 7, $7, \
+                clock_timestamp() - interval '11 seconds', \
+                clock_timestamp() - interval '10 seconds', \
+                clock_timestamp() - interval '12 seconds', \
+                clock_timestamp() - interval '9 seconds' \
+             )",
+            &[
+                &headless_request,
+                &headless_attempt,
+                &headless_hash,
+                &EpochAuthority::Remote.bits(),
+                &legacy_key(&headless_hash),
+                &vec![0xc7_u8; 32],
+                &FragmentWriteClaimState::NoSend.bits(),
+            ],
+        )
+        .await
+        .expect("insert a terminal claim on a headless hash");
+    let headless_head: i64 = direct
+        .query_one(
+            "SELECT count(*) FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&headless_hash],
+        )
+        .await
+        .expect("confirm the headless hash has no lifecycle row")
+        .get(0);
+    assert_eq!(headless_head, 0);
+
+    let headless_report = coordinator
+        .prune_terminal_write_claims(
+            FragmentWriteClaimPruneBatch::new(4, Duration::from_millis(1))
+                .expect("bounded headless prune batch"),
+        )
+        .await
+        .expect("headless prune pass");
+    assert_eq!(
+        headless_report,
+        FragmentWriteClaimPruneReport {
+            examined: 1,
+            pruned: 0,
+            skipped_blocked: 0,
+            skipped_missing_evidence: 1,
+        },
+        "with no head row there is no lock to serialise on, so the loop must stop"
+    );
+    assert_eq!(
+        claim_row_count(&direct, &headless_request, &headless_attempt).await,
+        1,
+        "a headless candidate must survive, not be deleted without a head lock"
+    );
+}
+
+/// WP-118: the third `skipped_missing_evidence` feeder — the delete's own CAS
+/// refusing a plan that went stale under the lock.
+///
+/// The plan query reads unlocked on a pooled connection, so every candidate it
+/// hands the loop is a *claim* about eligibility, not a fact. Each delete
+/// re-states the full eligibility predicate — identity, state, and the
+/// retention window — and a zero-row result means the plan was stale. That
+/// feeder had no executed coverage: the sibling case above reaches
+/// `skipped_missing_evidence` through the Decisive arm's `locked` guard, which
+/// returns before any delete runs.
+///
+/// The lever here is the retention window, because it is the only clause a
+/// surviving NoSend row can fall foul of — NoSend is terminal, so no transition
+/// moves its state, and identity is immutable. It is also the clause worth
+/// pinning: a delete that trusted the plan's retention check instead of
+/// re-stating its own would delete a row that is no longer eligible, and the
+/// row surviving is what proves it did not. The row moving out of the window
+/// under the head lock stands in for any way the plan's premise can lapse; the
+/// property under test is that the delete re-checks rather than trusts.
+///
+/// Deterministic: the retention window is five seconds and the external
+/// transaction resets `settled_at` to the database clock, so the row is outside
+/// the window by seconds, not milliseconds, when the delete re-evaluates.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn a_candidate_that_leaves_the_retention_window_under_the_head_lock_is_refused_by_its_delete()
+{
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+
+    // A real publication supplies the lifecycle head the loop requires; its own
+    // claim is then cleared so the synthetic NoSend row is the only candidate.
+    let hash = aged_decisive_publication(&coordinator, &direct, 0xe1).await;
+    let evidence = claim_evidence(&direct, &hash).await;
+    direct
+        .execute(
+            "DELETE FROM lore_fragment_write_claims WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("clear the publication's own claim");
+    let (candidate_request, candidate_attempt) = insert_aged_terminal_claim(
+        &direct,
+        &hash,
+        &evidence,
+        0xe3,
+        FragmentWriteClaimState::NoSend,
+    )
+    .await;
+    let claims_before: i64 = direct
+        .query_one("SELECT count(*) FROM lore_fragment_write_claims", &[])
+        .await
+        .expect("count claims before the pass")
+        .get(0);
+    assert_eq!(
+        claims_before, 1,
+        "the synthetic NoSend row must be the only candidate in this batch"
+    );
+
+    let mut lock_client = own_transaction_client(&url).await;
+    let lock_tx = lock_client
+        .transaction()
+        .await
+        .expect("open the external head-lock transaction");
+    lock_tx
+        .execute(
+            "SELECT 1 FROM lore_fragment_lifecycle WHERE hash = $1 FOR UPDATE",
+            &[&hash],
+        )
+        .await
+        .expect("lock the lifecycle head externally");
+    lock_tx
+        .execute(
+            "UPDATE lore_fragment_write_claims SET settled_at = clock_timestamp() \
+              WHERE logical_request_id = $1 AND attempt_id = $2",
+            &[&candidate_request, &candidate_attempt],
+        )
+        .await
+        .expect("move the candidate back inside retention while holding the head");
+
+    let prune = coordinator.prune_terminal_write_claims(
+        FragmentWriteClaimPruneBatch::new(4, Duration::from_secs(5))
+            .expect("five-second retention prune batch"),
+    );
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        lock_tx
+            .commit()
+            .await
+            .expect("release the external head lock");
+    };
+    let (report, ()) = tokio::join!(prune, release);
+
+    assert_eq!(
+        report.expect("stale-plan prune pass"),
+        FragmentWriteClaimPruneReport {
+            examined: 1,
+            pruned: 0,
+            skipped_blocked: 0,
+            skipped_missing_evidence: 1,
+        },
+        "a delete whose own retention re-check fails is missing evidence, not a prune"
+    );
+    assert_eq!(
+        claim_row_count(&direct, &candidate_request, &candidate_attempt).await,
+        1,
+        "a row back inside the retention window must survive its own delete"
+    );
+}
+
+/// WP-118: the anti-join must be exactly as strict as the loop it feeds, and no
+/// stricter.
+///
+/// The loop exempts `NoSend` from the barrier: a NoSend claim records that no
+/// provider send occurred, so it names no cleanup target and another claim
+/// being in flight on the hash has no bearing on it. A hash-wide anti-join
+/// spanning both arms therefore contradicted the loop — it stopped *selecting*
+/// NoSend rows on a barriered hash that the loop would happily have pruned,
+/// making the exemption near-dead code and letting a hot hash accumulate NoSend
+/// claims forever. Measured on the shipped form: 256 hot NoSend rows selected;
+/// on the hash-wide form, 0.
+///
+/// So the anti-join sits inside the Decisive arm. `NoSend` needs only age;
+/// `Decisive` needs age, exact epoch evidence, and no barrier. This case
+/// asserts both halves against one barriered hash in a single pass, which is
+/// what makes it fail against the hash-wide placement rather than merely
+/// looking different.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn a_barriered_hash_still_yields_its_no_send_claims_while_its_decisive_claims_stay_excluded()
+{
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+
+    // One hot hash: a real aged Decisive claim, a live send barrier, and three
+    // aged NoSend rows of the kind continuous write traffic leaves behind.
+    let hash = aged_decisive_publication(&coordinator, &direct, 0xd1).await;
+    let evidence = claim_evidence(&direct, &hash).await;
+    let decisive = direct
+        .query_one(
+            "SELECT logical_request_id, attempt_id FROM lore_fragment_write_claims \
+              WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read the decisive claim's identity");
+    let decisive_request: Vec<u8> = decisive.get("logical_request_id");
+    let decisive_attempt: Vec<u8> = decisive.get("attempt_id");
+    let (barrier_request, barrier_attempt) =
+        insert_live_send_barrier(&direct, &hash, &evidence, 0xd3).await;
+
+    let mut no_send_rows = Vec::new();
+    for seed in [0xd5_u8, 0xd7_u8, 0xd9_u8] {
+        no_send_rows.push(
+            insert_aged_terminal_claim(
+                &direct,
+                &hash,
+                &evidence,
+                seed,
+                FragmentWriteClaimState::NoSend,
+            )
+            .await,
+        );
+    }
+
+    // A batch with room for every terminal row on the hash, so what is left
+    // behind is a selection decision rather than a `LIMIT`.
+    let report = coordinator
+        .prune_terminal_write_claims(
+            FragmentWriteClaimPruneBatch::new(4, Duration::from_millis(1))
+                .expect("four-slot prune batch"),
+        )
+        .await
+        .expect("prune a barriered hash's NoSend claims");
+    assert_eq!(
+        report,
+        FragmentWriteClaimPruneReport {
+            examined: 3,
+            pruned: 3,
+            skipped_blocked: 0,
+            skipped_missing_evidence: 0,
+        },
+        "a live barrier must not withhold NoSend claims from the plan"
+    );
+
+    for (request, attempt) in &no_send_rows {
+        assert_eq!(
+            claim_row_count(&direct, request, attempt).await,
+            0,
+            "every aged NoSend row on the barriered hash must be pruned"
+        );
+    }
+    assert_eq!(
+        claim_row_count(&direct, &decisive_request, &decisive_attempt).await,
+        1,
+        "the barriered Decisive claim must stay excluded in the same pass"
+    );
+    // Reachable here, unlike in the plan-excluded case above: the loop really
+    // does run the barrier probe against this hash for each NoSend candidate,
+    // so an unexpired Prepared row surviving as Prepared is a discriminating
+    // observation rather than a vacuous one.
+    let barrier_state: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_write_claims \
+              WHERE logical_request_id = $1 AND attempt_id = $2",
+            &[&barrier_request, &barrier_attempt],
+        )
+        .await
+        .expect("read the live send barrier after the pass")
+        .get(0);
+    assert_eq!(
+        barrier_state,
+        FragmentWriteClaimState::Prepared.bits(),
+        "an unexpired Prepared claim must not be normalized to NoSend"
+    );
 }
 
 fn pg_url() -> Option<String> {

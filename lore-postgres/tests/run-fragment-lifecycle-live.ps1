@@ -62,6 +62,20 @@ $inventory = @(
             'obliterate_retains_an_old_ambiguous_target_across_missing_repair_and_new_epoch',
             'unexpired_ambiguous_claim_blocks_exact_obliterate_before_children_can_advance',
             'prune_normalizes_expired_prepared_to_targetless_no_send_and_honors_batch_limit',
+            # WP-118 prune fix: the plan query's anti-join against active claims. Before it, a
+            # blocked hash's oldest terminal rows re-occupied every batch slot on every pass
+            # (measured 256/256) and starved younger prunable rows on every other hash.
+            'a_blocked_hash_does_not_occupy_the_prune_batch_and_starve_a_younger_prunable_hash',
+            # WP-118 prune fix round: the head-locked barrier re-check (the actual safety gate;
+            # the anti-join is advisory), both skipped_missing_evidence arms, and the anti-join's
+            # placement inside the Decisive arm so a barriered hash still yields its NoSend rows.
+            'the_head_locked_barrier_recheck_refuses_a_claim_the_unlocked_plan_query_admitted',
+            'a_candidate_that_loses_its_row_or_its_head_between_plan_and_lock_deletes_nothing',
+            # The third skipped_missing_evidence feeder: the delete's own retention CAS refusing
+            # a plan that went stale under the head lock. The fourth feeder (the `_` match arm)
+            # is structurally unreachable and is deliberately left that way.
+            'a_candidate_that_leaves_the_retention_window_under_the_head_lock_is_refused_by_its_delete',
+            'a_barriered_hash_still_yields_its_no_send_claims_while_its_decisive_claims_stay_excluded',
             'write_claim_head_lock_precedes_claim_insert_and_moved_lineage_refuses_send',
             'write_claim_acl_denies_public_and_retains_owner_access',
             'resolver_returns_the_identical_verdict_whether_asked_singly_or_batched',
