@@ -131,6 +131,17 @@ $inventory = @(
             'exact_obliterate_of_a_shared_non_readable_head_retires_only_the_requested_association'
             'lifecycle_metering_rebuild_is_exact_removes_stale_rows_and_is_idempotent'
             'lifecycle_metering_rebuild_serializes_behind_an_inflight_epoch_writer_without_deadlock'
+            # WP-118 Phase 7: CR-031's two sustained-upload-traffic push cases, the shared-hash
+            # fanout cost characterization (INV-EF P2-7), and the copy path's association-
+            # generation bump. The fanout case is a measurement: its numbers are printed, not
+            # asserted, so it is listed in $printOutputCases below.
+            'same_repo_lifecycle_traffic_does_not_starve_branch_push'
+            'cross_repo_bulk_upload_does_not_abort_unrelated_push'
+            # Item 1b: the literal association-traffic scenario as a CHARACTERIZATION. It asserts
+            # only that the starvation is observable; its rate numbers are printed, not gated.
+            'characterize_same_repo_association_traffic_push_aborts'
+            'shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increasing_fanout'
+            'create_association_if_current_bumps_the_association_generation_on_every_admitted_copy'
         )
     },
     [pscustomobject]@{
@@ -149,6 +160,17 @@ $inventory = @(
         ExactPrefixes = @('store::immutable_store::tests::exact_purge_proofs_')
         Cases         = @('store::immutable_store::tests::exact_purge_proofs_are_required_before_payload_tombstone')
     }
+)
+
+# Cases whose captured stdout is evidence in its own right, not just failure
+# context. Every case runs with `--nocapture`, but the runner only echoes the
+# captured output on FAIL/NOT RUN; a measurement that PASSES would otherwise
+# have its numbers swallowed, which is the one thing it exists to produce.
+$printOutputCases = @(
+    'shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increasing_fanout',
+    'same_repo_lifecycle_traffic_does_not_starve_branch_push',
+    'cross_repo_bulk_upload_does_not_abort_unrelated_push',
+    'characterize_same_repo_association_traffic_push_aborts'
 )
 
 $results = @(
@@ -370,7 +392,7 @@ try {
                     @('--test', $result.Target)
                 }
                 $cargoArgs = @('test', '-p', $result.Package) + $targetArgs + @(
-                    '--', '--ignored', '--exact', $result.Test, '--test-threads=1'
+                    '--', '--ignored', '--exact', $result.Test, '--test-threads=1', '--nocapture'
                 )
                 $output = & cargo @cargoArgs 2>&1 | Out-String
                 $exitCode = $LASTEXITCODE
@@ -402,6 +424,10 @@ try {
                 $result.Failed -eq 0 -and $exitCode -eq 0) {
                 $result.Status = 'PASS'
                 Write-Host '  PASS'
+                if ($result.Test -in $printOutputCases) {
+                    Write-Host "  --- captured output for $($result.Test) ---"
+                    Write-Host $output
+                }
             }
             elseif ($result.Ran -eq 1) {
                 $result.Status = 'FAIL'

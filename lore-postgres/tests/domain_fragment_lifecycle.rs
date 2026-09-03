@@ -12,8 +12,11 @@
 //! connection proof, cross-instance racing, stale-witness fencing, generation
 //! fanout atomicity, and readiness against real schema damage.
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ops::Deref;
 use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 
 use lore_postgres::domain::PostgresDomainStore;
@@ -41,6 +44,7 @@ use lore_postgres::domain::fragments::FragmentWriteClaimPruneBatch;
 use lore_postgres::domain::fragments::FragmentWriteClaimState;
 use lore_postgres::domain::fragments::FragmentWriteSettlement;
 use lore_postgres::domain::fragments::IoObservation;
+use lore_postgres::domain::fragments::MAX_LIFECYCLE_GENERATION_FANOUT;
 use lore_postgres::domain::fragments::MAX_PUSH_FRAGMENT_REVALIDATIONS;
 use lore_postgres::domain::fragments::MissingDiagnostic;
 use lore_postgres::domain::fragments::PostgresFragmentCoordinator;
@@ -7268,5 +7272,1531 @@ async fn revalidate_push_witness_aborts_when_the_association_set_moved_even_thou
         "an association move must abort even though the required fragment is readable at a \
          content-equivalent epoch -- association precedence must outrank the equivalence \
          allowance"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WP-118 Phase 7: CR-031's two sustained-upload-traffic push cases, the
+// shared-hash fanout cost characterization (INV-EF P2-7), and the copy path's
+// association-generation bump.
+// ---------------------------------------------------------------------------
+
+/// CR-031's normative window: the uploaders stay busy for at least this long.
+const SUSTAINED_UPLOAD_WINDOW: Duration = Duration::from_secs(10);
+
+/// CR-031's suite watchdog for both sustained-traffic cases.
+const SUSTAINED_SUITE_WATCHDOG: Duration = Duration::from_secs(30);
+
+/// CR-031 fixes the push count for both sustained-traffic cases.
+const SUSTAINED_PUSH_COUNT: usize = 100;
+
+/// CR-031 fixes three disjoint uploaders for both sustained-traffic cases.
+const SUSTAINED_UPLOADER_COUNT: usize = 3;
+
+/// Hashes each uploader cycles through. Small enough that every hash is
+/// revisited many times inside the window, so the traffic is genuinely
+/// sustained rather than one burst.
+const UPLOADER_HASHES_EACH: usize = 4;
+
+/// Fragments each simulated push requires. Well under
+/// [`MAX_PUSH_FRAGMENT_REVALIDATIONS`], which is what CR-031's shape specifies.
+const PUSH_REQUIRED_FRAGMENTS: usize = 16;
+
+/// Spacing between pushes, so the 100 pushes spread across the sustained
+/// window instead of finishing in a burst before the uploaders warm up.
+const PUSH_INTERVAL: Duration = Duration::from_millis(60);
+
+/// Publish one fresh readable `Remote` fragment and return its hash.
+///
+/// The published manifest carries the **intent's own** `object_key`, not a
+/// caller-supplied label. Several older fixtures in this file publish a
+/// descriptive string instead, which leaves the epoch row holding a key that
+/// does not match the one the intent was admitted at. That is harmless for a
+/// case that never deletes -- nothing on the publication path compares them --
+/// but `begin_obliterate` does reject a noncanonical epoch key
+/// (`noncanonical_epoch_object_key_is_refused_before_delete_ownership_is_published`),
+/// so a fixture built that way silently cannot be obliterated later. Taking the
+/// key from the intent keeps every fragment these Phase 7 cases publish
+/// canonical and reusable; `seed` still varies the manifest identity bytes.
+async fn publish_remote_fragment(coordinator: &TestFragmentCoordinator, seed: u8) -> Vec<u8> {
+    let hash = random_hash();
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, &legacy_key(&hash))
+        .await
+        .expect("begin publication")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(&intent.object_key, seed, EpochAuthority::Remote)),
+            )
+            .await
+            .expect("commit publication"),
+        CommitVerdict::Published
+    );
+    hash
+}
+
+/// What kind of traffic one uploader generates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploaderTraffic {
+    /// Fresh publications that associate nothing, plus readable/unreadable
+    /// cycling of the uploader's own already-associated hashes. Moves only
+    /// `fragment_lifecycle_generation` on the repository.
+    LifecycleOnly,
+    /// What a real bulk upload through `store/immutable_store.rs` does: every
+    /// fresh publication is also associated into the repository, so
+    /// `content_association_generation` moves and
+    /// `fragment_lifecycle_generation` does not.
+    PublishAndAssociate,
+}
+
+/// What one uploader actually achieved inside the window.
+///
+/// Counted rather than assumed, so a run where the traffic never got going is
+/// visible in the printed regime block instead of hiding behind a green tick.
+#[derive(Debug, Clone)]
+struct UploaderTally {
+    label: &'static str,
+    publications: usize,
+    associations: usize,
+    transitions: usize,
+    elapsed: Duration,
+}
+
+impl UploaderTally {
+    fn publications_per_second(&self) -> f64 {
+        self.publications as f64 / self.elapsed.as_secs_f64()
+    }
+}
+
+/// One push attempt's verdict plus the wall-clock window over which a
+/// concurrent scalar move could have invalidated it.
+///
+/// `window` spans from the moment preflight's `capture_push_witness` returns to
+/// the moment `revalidate_push_witness` returns, so it includes the final
+/// transaction's own repository and branch lock acquisition. That is the
+/// interval a competing uploader has to move a scalar in.
+#[derive(Debug, Clone)]
+struct PushSample {
+    verdict: PushWitnessVerdict,
+    window: Duration,
+}
+
+/// Summarise a run of push samples for the printed regime block.
+fn summarize_pushes(samples: &[PushSample]) -> String {
+    let unchanged = samples
+        .iter()
+        .filter(|sample| sample.verdict == PushWitnessVerdict::Unchanged)
+        .count();
+    let mut fallback = 0usize;
+    let mut revalidated_counts: BTreeSet<usize> = BTreeSet::new();
+    let mut aborted: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for sample in samples {
+        match &sample.verdict {
+            PushWitnessVerdict::Unchanged => {}
+            PushWitnessVerdict::FallbackSatisfied { revalidated } => {
+                fallback += 1;
+                revalidated_counts.insert(*revalidated);
+            }
+            PushWitnessVerdict::Aborted { reason } => {
+                *aborted.entry(reason).or_default() += 1;
+            }
+        }
+    }
+    let mut windows: Vec<u128> = samples
+        .iter()
+        .map(|sample| sample.window.as_micros())
+        .collect();
+    windows.sort_unstable();
+    let median = windows[windows.len() / 2];
+    let aborted_total: usize = aborted.values().sum();
+    format!(
+        "pushes={} unchanged={unchanged} fallback_satisfied={fallback} aborted={aborted_total} \
+         aborted_reasons={aborted:?} revalidated_counts={revalidated_counts:?} \
+         window_us_min={} window_us_median={median} window_us_max={}",
+        samples.len(),
+        windows[0],
+        windows[windows.len() - 1]
+    )
+}
+
+/// One uploader's sustained traffic against `repository_id`, over its own
+/// disjoint hash set, until `deadline`.
+///
+/// Under [`UploaderTraffic::LifecycleOnly`] each iteration does three real
+/// things: publishes a brand-new fragment (pure upload volume, associated with
+/// nothing), drives one of its own already-associated fragments readable to
+/// unreadable, and re-uploads it unreadable to readable through the repair
+/// path. Those two transitions move `fragment_lifecycle_generation`, the
+/// scalar the bounded push fallback exists to survive.
+///
+/// Under [`UploaderTraffic::PublishAndAssociate`] each iteration publishes a
+/// fresh fragment and associates it into the repository, which is what a real
+/// bulk upload does, and moves `content_association_generation` instead.
+///
+/// Returns a counted [`UploaderTally`] rather than a bare number, so a caller
+/// can report the achieved rate instead of assuming the traffic was real.
+async fn run_sustained_uploader(
+    coordinator: &TestFragmentCoordinator,
+    repository_id: &[u8],
+    context: &[u8],
+    hashes: &[Vec<u8>],
+    label: &'static str,
+    traffic: UploaderTraffic,
+    deadline: Instant,
+) -> UploaderTally {
+    let started = Instant::now();
+    let mut tally = UploaderTally {
+        label,
+        publications: 0,
+        associations: 0,
+        transitions: 0,
+        elapsed: Duration::ZERO,
+    };
+    let mut seed = 0x10u8;
+    while Instant::now() < deadline {
+        for hash in hashes {
+            if Instant::now() >= deadline {
+                break;
+            }
+            seed = seed.wrapping_add(1);
+            let fresh = publish_remote_fragment(coordinator, seed).await;
+            tally.publications += 1;
+
+            if traffic == UploaderTraffic::PublishAndAssociate {
+                assert_eq!(
+                    coordinator
+                        .create_association(&fresh, repository_id, context)
+                        .await
+                        .expect("uploader create_association must not error"),
+                    CommitVerdict::Published
+                );
+                tally.associations += 1;
+                continue;
+            }
+
+            let resolved = coordinator
+                .resolve(repository_id, context, std::slice::from_ref(hash))
+                .await
+                .expect("uploader resolves its own fragment");
+            let (witness, ..) = expect_readable(&resolved[0]);
+            let witness = witness.clone();
+            assert_eq!(
+                coordinator
+                    .mark_missing(&witness, MissingDiagnostic::Absent)
+                    .await
+                    .expect("uploader mark_missing must not error"),
+                CommitVerdict::Published,
+                "an uploader owns its own disjoint hashes, so nothing can fence it"
+            );
+            tally.transitions += 1;
+
+            let BeginOutcome::Admitted(repair) = coordinator
+                .claim_repair(hash)
+                .await
+                .expect("uploader claims a repair")
+            else {
+                panic!("a Missing head the uploader owns must admit a repair claim");
+            };
+            seed = seed.wrapping_add(1);
+            assert_eq!(
+                coordinator
+                    .commit_repair(
+                        &repair,
+                        IoObservation::Valid(manifest(
+                            &repair.object_key,
+                            seed,
+                            EpochAuthority::Remote
+                        )),
+                    )
+                    .await
+                    .expect("uploader commit_repair must not error"),
+                CommitVerdict::Published
+            );
+            tally.transitions += 1;
+        }
+    }
+    tally.elapsed = started.elapsed();
+    tally
+}
+
+/// Run one coordinator-level final push transaction and return its verdict
+/// together with the window a concurrent scalar move had to invalidate it.
+///
+/// `FINAL-PUSH-118` is owned by WP-116 and is not built, so this is the
+/// coordinator-level equivalent of the real handler: capture the witness
+/// outside any transaction (preflight), then open the final transaction and
+/// take its locks in F-032-3 order (repository, branch, then the fragment rows
+/// `revalidate_push_witness` takes for itself) and revalidate inside it. The
+/// verdict is taken from that single call: nothing here retries, so a returned
+/// `Aborted` is a push that did not commit on its first final-transaction
+/// attempt.
+async fn run_final_push_transaction(
+    coordinator: &TestFragmentCoordinator,
+    pool: &deadpool_postgres::Pool,
+    repository_id: &[u8],
+    required: &[RequiredFragment],
+) -> PushSample {
+    let captured = coordinator
+        .capture_push_witness(repository_id)
+        .await
+        .expect("preflight witness capture must not error")
+        .expect("the pushing repository must exist");
+    let window_start = Instant::now();
+
+    let mut push_client = pool.get().await.expect("checkout final-push connection");
+    let tx = push_client
+        .transaction()
+        .await
+        .expect("open final-push transaction");
+    let mut sequence = LockSequence::new();
+    sequence
+        .enter(LockClass::Repository)
+        .expect("repository is the final push's first class");
+    tx.execute(
+        "SELECT 1 FROM lore_domain_repositories WHERE repository_id = $1 FOR UPDATE",
+        &[&repository_id],
+    )
+    .await
+    .expect("final push locks its repository row");
+    sequence
+        .enter(LockClass::Branch)
+        .expect("branch follows repository");
+    tx.execute(
+        "SELECT 1 FROM lore_domain_branches WHERE repository_id = $1 ORDER BY branch_id FOR UPDATE",
+        &[&repository_id],
+    )
+    .await
+    .expect("final push locks its branch rows");
+
+    let verdict = coordinator
+        .revalidate_push_witness(&tx, &mut sequence, repository_id, captured, required)
+        .await
+        .expect("revalidate_push_witness must not error");
+    let window = window_start.elapsed();
+    tx.commit()
+        .await
+        .expect("commit the final-push transaction");
+    PushSample { verdict, window }
+}
+
+/// After an aborted push, how long until one commits on a first attempt again.
+///
+/// CR-031's remedy for a known-no-commit abort is "wait for a quiet scalar and
+/// take a fresh fast-path preflight". This measures exactly that: repeat the
+/// whole preflight-plus-final-transaction cycle until one returns something
+/// other than `Aborted`, and report how long it took and how many attempts it
+/// cost. Returns `None` if `budget` expires first, which is itself the answer.
+async fn wait_for_a_first_attempt_commit(
+    coordinator: &TestFragmentCoordinator,
+    pool: &deadpool_postgres::Pool,
+    repository_id: &[u8],
+    required: &[RequiredFragment],
+    budget: Duration,
+) -> Option<(Duration, usize)> {
+    let started = Instant::now();
+    let mut attempts = 0usize;
+    while started.elapsed() < budget {
+        attempts += 1;
+        let sample = run_final_push_transaction(coordinator, pool, repository_id, required).await;
+        if !matches!(sample.verdict, PushWitnessVerdict::Aborted { .. }) {
+            return Some((started.elapsed(), attempts));
+        }
+    }
+    None
+}
+
+/// Publish `count` readable fragments, associate each with `repository_id`
+/// under `context`, and return the exact required set a preflight would.
+async fn required_set(
+    coordinator: &TestFragmentCoordinator,
+    repository_id: &[u8],
+    context: &[u8],
+    count: usize,
+) -> Vec<RequiredFragment> {
+    let mut hashes = Vec::with_capacity(count);
+    for index in 0..count {
+        let seed = u8::try_from(index % 200).expect("required-set seed fits in u8");
+        let hash = publish_remote_fragment(coordinator, seed).await;
+        assert_eq!(
+            coordinator
+                .create_association(&hash, repository_id, context)
+                .await
+                .expect("associate a required fragment"),
+            CommitVerdict::Published
+        );
+        hashes.push(hash);
+    }
+    let resolved = coordinator
+        .resolve(repository_id, context, &hashes)
+        .await
+        .expect("resolve the required set");
+    resolved
+        .iter()
+        .map(|resolution| {
+            let (witness, ..) = expect_readable(resolution);
+            RequiredFragment {
+                hash: resolution.hash.clone(),
+                epoch: witness.epoch,
+            }
+        })
+        .collect()
+}
+
+/// Publish and associate one uploader's own disjoint hash set.
+async fn uploader_hash_set(
+    coordinator: &TestFragmentCoordinator,
+    repository_id: &[u8],
+    context: &[u8],
+) -> Vec<Vec<u8>> {
+    let mut hashes = Vec::with_capacity(UPLOADER_HASHES_EACH);
+    for index in 0..UPLOADER_HASHES_EACH {
+        let seed = u8::try_from(index).expect("uploader seed fits in u8");
+        let hash = publish_remote_fragment(coordinator, seed).await;
+        assert_eq!(
+            coordinator
+                .create_association(&hash, repository_id, context)
+                .await
+                .expect("associate an uploader fragment"),
+            CommitVerdict::Published
+        );
+        hashes.push(hash);
+    }
+    hashes
+}
+
+/// Three disjoint same-repository uploaders active for at least ten seconds,
+/// 100 pushes whose required sets are at most
+/// `MAX_PUSH_FRAGMENT_REVALIDATIONS` fragments, each committing on its
+/// **first** final-transaction attempt with no fallback-induced `ABORTED`,
+/// under a 30-second suite watchdog.
+///
+/// # This is NOT CR-031's `same_repo_bulk_upload_does_not_starve_branch_push`
+///
+/// That name is the CR's normative acceptance test, and it is deliberately
+/// **not implemented**, because it is unsatisfiable against the frozen
+/// contract: a real bulk upload creates associations, and the association arm
+/// admits no fallback. Nothing in this file may wear that name while testing
+/// something narrower. What stands in its place is
+/// [`characterize_same_repo_association_traffic_push_aborts`], which runs the
+/// literal scenario as a measurement of what the push path actually returns.
+///
+/// This case covers the neighbouring property that *is* satisfiable and that
+/// nothing else pins: the bounded fallback carrying a push through sustained
+/// same-repository **lifecycle** churn.
+///
+/// # What the uploader traffic deliberately is, and is not
+///
+/// The uploaders move the pushing repository's **lifecycle** scalar: they
+/// publish fresh fragments and drive their own disjoint, already-associated
+/// hashes readable to unreadable to readable. That is the exact contention the
+/// bounded fallback was added for, and every push here must therefore reach
+/// `Unchanged` or `FallbackSatisfied`.
+///
+/// They deliberately do **not** create new associations in the pushing
+/// repository, and this case does not cover that traffic. `create_association`
+/// and `create_association_if_current` both move
+/// `content_association_generation`, and `classify_push_witness` gives
+/// `AssociationMoved` precedence over `LifecycleOnly` and admits no fallback
+/// for it (CR-031:258-267 grants the bounded fallback only for a changed
+/// lifecycle scalar). A same-repository uploader that creates associations
+/// therefore aborts a push whose preflight predates it, by contract rather than
+/// by defect. Read this green as covering lifecycle-scalar contention only;
+/// association-creating same-repository traffic is measured separately by
+/// [`characterize_same_repo_association_traffic_push_aborts`], which is a
+/// characterization rather than an acceptance case.
+///
+/// # Timing regime
+///
+/// This runs against a local disposable PostgreSQL with no object store, so it
+/// is a different timing regime from production, not a scaled model of one.
+/// Both sides move: with no provider I/O the uploader cycle is faster (more
+/// scalar movement per second, harsher for the push), and the push's own
+/// capture-to-revalidate window is also shorter (fewer chances to be
+/// invalidated). Which effect dominates depends on the ratio between the two,
+/// and **nobody has measured it** -- so do not read this tier as either
+/// conservative or optimistic relative to a deployed cell. The case prints the
+/// achieved uploader rate, both scalars' movement, the verdict distribution,
+/// and the observed push window precisely so the regime a given run was
+/// produced in is on the record instead of being described.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn same_repo_lifecycle_traffic_does_not_starve_branch_push() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store_with_pool(&url, 16).await;
+    let coordinator = store.fragment_coordinator();
+    let repository_id = create_repository(&store).await;
+
+    let push_context = random_context();
+    let required = required_set(
+        &coordinator,
+        &repository_id,
+        &push_context,
+        PUSH_REQUIRED_FRAGMENTS,
+    )
+    .await;
+    assert_eq!(required.len(), PUSH_REQUIRED_FRAGMENTS);
+    assert!(
+        required.len() <= MAX_PUSH_FRAGMENT_REVALIDATIONS,
+        "CR-031's shape requires the push's required set to sit under the bound"
+    );
+
+    let labels = [
+        "same-repo/uploader-a",
+        "same-repo/uploader-b",
+        "same-repo/uploader-c",
+    ];
+    let mut uploader_contexts = Vec::with_capacity(SUSTAINED_UPLOADER_COUNT);
+    let mut uploader_hashes = Vec::with_capacity(SUSTAINED_UPLOADER_COUNT);
+    for _ in 0..SUSTAINED_UPLOADER_COUNT {
+        let context = random_context();
+        let hashes = uploader_hash_set(&coordinator, &repository_id, &context).await;
+        uploader_contexts.push(context);
+        uploader_hashes.push(hashes);
+    }
+
+    let push_pool = build_pool(&url, 4, &TlsConfig::default()).expect("build final-push pool");
+    let before = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness before the window")
+        .expect("the pushing repository must exist");
+
+    let deadline = Instant::now() + SUSTAINED_UPLOAD_WINDOW;
+    let pushes = async {
+        let mut verdicts = Vec::with_capacity(SUSTAINED_PUSH_COUNT);
+        for _ in 0..SUSTAINED_PUSH_COUNT {
+            verdicts.push(
+                run_final_push_transaction(&coordinator, &push_pool, &repository_id, &required)
+                    .await,
+            );
+            tokio::time::sleep(PUSH_INTERVAL).await;
+        }
+        verdicts
+    };
+
+    let (samples, tally_a, tally_b, tally_c) = timeout(SUSTAINED_SUITE_WATCHDOG, async {
+        tokio::join!(
+            pushes,
+            run_sustained_uploader(
+                &coordinator,
+                &repository_id,
+                &uploader_contexts[0],
+                &uploader_hashes[0],
+                labels[0],
+                UploaderTraffic::LifecycleOnly,
+                deadline,
+            ),
+            run_sustained_uploader(
+                &coordinator,
+                &repository_id,
+                &uploader_contexts[1],
+                &uploader_hashes[1],
+                labels[1],
+                UploaderTraffic::LifecycleOnly,
+                deadline,
+            ),
+            run_sustained_uploader(
+                &coordinator,
+                &repository_id,
+                &uploader_contexts[2],
+                &uploader_hashes[2],
+                labels[2],
+                UploaderTraffic::LifecycleOnly,
+                deadline,
+            ),
+        )
+    })
+    .await
+    .expect("the sustained same-repository suite must finish inside its 30s watchdog");
+
+    let after = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness after the window")
+        .expect("the pushing repository must exist");
+    let tallies = [tally_a, tally_b, tally_c];
+    let association_moves =
+        after.content_association_generation - before.content_association_generation;
+    let lifecycle_moves =
+        after.fragment_lifecycle_generation - before.fragment_lifecycle_generation;
+
+    // The regime this evidence was produced in, printed before any assertion
+    // can abort the run. A run where the scalars barely moved never exercised
+    // the contention this case claims to, and that must be visible in the
+    // numbers rather than inferred from a green tick.
+    println!(
+        "WP118-P7-SAME-REPO regime uploader_traffic=LifecycleOnly window_s={} \
+         association_moves={association_moves} lifecycle_moves={lifecycle_moves}",
+        SUSTAINED_UPLOAD_WINDOW.as_secs()
+    );
+    let mut total_publications = 0usize;
+    for tally in &tallies {
+        total_publications += tally.publications;
+        println!(
+            "WP118-P7-SAME-REPO uploader label={} publications={} publications_per_s={:.1} \
+             transitions={} associations={} elapsed_ms={}",
+            tally.label,
+            tally.publications,
+            tally.publications_per_second(),
+            tally.transitions,
+            tally.associations,
+            tally.elapsed.as_millis()
+        );
+    }
+    println!(
+        "WP118-P7-SAME-REPO uploaders_total publications={total_publications} \
+         publications_per_s={:.1}",
+        total_publications as f64 / SUSTAINED_UPLOAD_WINDOW.as_secs_f64()
+    );
+    println!("WP118-P7-SAME-REPO {}", summarize_pushes(&samples));
+
+    // The traffic must have been real. Without these the whole case could pass
+    // vacuously on an all-`Unchanged` run against idle uploaders.
+    for tally in &tallies {
+        assert!(
+            tally.transitions >= 2,
+            "{} must have completed real readability transitions inside the window, got {}",
+            tally.label,
+            tally.transitions
+        );
+    }
+    assert!(
+        lifecycle_moves > 0,
+        "the pushing repository's lifecycle scalar must actually have moved during the window; \
+         at zero movement this case proves nothing about the bounded fallback however green it is"
+    );
+    assert_eq!(
+        association_moves, 0,
+        "no uploader creates or retires an association under LifecycleOnly traffic, so the \
+         association scalar must be exactly where it started -- if this moves, the case is \
+         measuring different traffic than its doc comment claims"
+    );
+    assert_eq!(
+        lifecycle_moves,
+        i64::try_from(tallies.iter().map(|tally| tally.transitions).sum::<usize>())
+            .expect("transition count fits in i64"),
+        "every uploader transition is a readability crossing on a fragment associated with the \
+         pushing repository, so each must move its lifecycle scalar exactly once"
+    );
+
+    assert_eq!(samples.len(), SUSTAINED_PUSH_COUNT);
+    let aborted: Vec<&PushWitnessVerdict> = samples
+        .iter()
+        .map(|sample| &sample.verdict)
+        .filter(|verdict| matches!(verdict, PushWitnessVerdict::Aborted { .. }))
+        .collect();
+    assert!(
+        aborted.is_empty(),
+        "CR-031 requires all {SUSTAINED_PUSH_COUNT} pushes to commit on the first \
+         final-transaction attempt with no fallback-induced ABORTED; {} aborted: {aborted:?}",
+        aborted.len()
+    );
+    let fallbacks = samples
+        .iter()
+        .filter(|sample| matches!(sample.verdict, PushWitnessVerdict::FallbackSatisfied { .. }))
+        .count();
+    assert!(
+        fallbacks >= 1,
+        "at least one push must have raced a lifecycle bump into its own preflight window and \
+         been carried by the bounded fallback; {SUSTAINED_PUSH_COUNT} `Unchanged` verdicts would \
+         mean this case never exercised the fallback at all"
+    );
+    for sample in &samples {
+        if let PushWitnessVerdict::FallbackSatisfied { revalidated } = &sample.verdict {
+            assert_eq!(
+                *revalidated, PUSH_REQUIRED_FRAGMENTS,
+                "the fallback must revalidate the exact required set, no subset"
+            );
+        }
+    }
+}
+
+/// CR-031's `cross_repo_bulk_upload_does_not_abort_unrelated_push`: the same
+/// sustained shape with the three uploaders in *different* repositories from
+/// the pushing one.
+///
+/// Every push must reach the **unchanged fast path** (`Unchanged`, meaning no
+/// fragment row is read at all). This is the case the 2026-08-29 probe measured
+/// at the uncontended floor; this pins that it stays there rather than
+/// re-measuring latency.
+///
+/// The timing-regime caveat on
+/// [`same_repo_lifecycle_traffic_does_not_starve_branch_push`] applies here too: this
+/// is a different regime from production in both directions at once, and which
+/// dominates is unmeasured. The printed rate, scalar movement, verdict
+/// distribution, and push window record the regime this run was produced in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn cross_repo_bulk_upload_does_not_abort_unrelated_push() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store_with_pool(&url, 16).await;
+    let coordinator = store.fragment_coordinator();
+    let pushing_repository = create_repository(&store).await;
+
+    let push_context = random_context();
+    let required = required_set(
+        &coordinator,
+        &pushing_repository,
+        &push_context,
+        PUSH_REQUIRED_FRAGMENTS,
+    )
+    .await;
+
+    let labels = [
+        "cross-repo/uploader-a",
+        "cross-repo/uploader-b",
+        "cross-repo/uploader-c",
+    ];
+    let mut uploader_repositories = Vec::with_capacity(SUSTAINED_UPLOADER_COUNT);
+    let mut uploader_contexts = Vec::with_capacity(SUSTAINED_UPLOADER_COUNT);
+    let mut uploader_hashes = Vec::with_capacity(SUSTAINED_UPLOADER_COUNT);
+    for _ in 0..SUSTAINED_UPLOADER_COUNT {
+        let repository = create_repository(&store).await;
+        let context = random_context();
+        let hashes = uploader_hash_set(&coordinator, &repository, &context).await;
+        uploader_repositories.push(repository);
+        uploader_contexts.push(context);
+        uploader_hashes.push(hashes);
+    }
+
+    let push_pool = build_pool(&url, 4, &TlsConfig::default()).expect("build final-push pool");
+    let before = coordinator
+        .capture_push_witness(&pushing_repository)
+        .await
+        .expect("capture witness before the window")
+        .expect("the pushing repository must exist");
+    let mut uploader_before = Vec::with_capacity(SUSTAINED_UPLOADER_COUNT);
+    for repository in &uploader_repositories {
+        uploader_before.push(
+            coordinator
+                .capture_push_witness(repository)
+                .await
+                .expect("capture uploader witness before")
+                .expect("an uploader repository must exist"),
+        );
+    }
+
+    let deadline = Instant::now() + SUSTAINED_UPLOAD_WINDOW;
+    let pushes = async {
+        let mut verdicts = Vec::with_capacity(SUSTAINED_PUSH_COUNT);
+        for _ in 0..SUSTAINED_PUSH_COUNT {
+            verdicts.push(
+                run_final_push_transaction(
+                    &coordinator,
+                    &push_pool,
+                    &pushing_repository,
+                    &required,
+                )
+                .await,
+            );
+            tokio::time::sleep(PUSH_INTERVAL).await;
+        }
+        verdicts
+    };
+
+    let (samples, tally_a, tally_b, tally_c) = timeout(SUSTAINED_SUITE_WATCHDOG, async {
+        tokio::join!(
+            pushes,
+            run_sustained_uploader(
+                &coordinator,
+                &uploader_repositories[0],
+                &uploader_contexts[0],
+                &uploader_hashes[0],
+                labels[0],
+                UploaderTraffic::LifecycleOnly,
+                deadline,
+            ),
+            run_sustained_uploader(
+                &coordinator,
+                &uploader_repositories[1],
+                &uploader_contexts[1],
+                &uploader_hashes[1],
+                labels[1],
+                UploaderTraffic::LifecycleOnly,
+                deadline,
+            ),
+            run_sustained_uploader(
+                &coordinator,
+                &uploader_repositories[2],
+                &uploader_contexts[2],
+                &uploader_hashes[2],
+                labels[2],
+                UploaderTraffic::LifecycleOnly,
+                deadline,
+            ),
+        )
+    })
+    .await
+    .expect("the sustained cross-repository suite must finish inside its 30s watchdog");
+
+    let after = coordinator
+        .capture_push_witness(&pushing_repository)
+        .await
+        .expect("capture witness after the window")
+        .expect("the pushing repository must exist");
+    let tallies = [tally_a, tally_b, tally_c];
+
+    // The regime, printed before any assertion can abort the run.
+    println!(
+        "WP118-P7-CROSS-REPO regime uploader_traffic=LifecycleOnly window_s={} \
+         pushing_repo_association_moves={} pushing_repo_lifecycle_moves={}",
+        SUSTAINED_UPLOAD_WINDOW.as_secs(),
+        after.content_association_generation - before.content_association_generation,
+        after.fragment_lifecycle_generation - before.fragment_lifecycle_generation
+    );
+    let mut total_publications = 0usize;
+    let mut uploader_after = Vec::with_capacity(SUSTAINED_UPLOADER_COUNT);
+    for (index, tally) in tallies.iter().enumerate() {
+        total_publications += tally.publications;
+        let observed = coordinator
+            .capture_push_witness(&uploader_repositories[index])
+            .await
+            .expect("capture uploader witness after")
+            .expect("an uploader repository must exist");
+        println!(
+            "WP118-P7-CROSS-REPO uploader label={} publications={} publications_per_s={:.1} \
+             transitions={} own_association_moves={} own_lifecycle_moves={} elapsed_ms={}",
+            tally.label,
+            tally.publications,
+            tally.publications_per_second(),
+            tally.transitions,
+            observed.content_association_generation
+                - uploader_before[index].content_association_generation,
+            observed.fragment_lifecycle_generation
+                - uploader_before[index].fragment_lifecycle_generation,
+            tally.elapsed.as_millis()
+        );
+        uploader_after.push(observed);
+    }
+    println!(
+        "WP118-P7-CROSS-REPO uploaders_total publications={total_publications} \
+         publications_per_s={:.1}",
+        total_publications as f64 / SUSTAINED_UPLOAD_WINDOW.as_secs_f64()
+    );
+    println!("WP118-P7-CROSS-REPO {}", summarize_pushes(&samples));
+
+    // The named property first, so a break to per-repository isolation fails
+    // on the claim this case exists to make rather than on a support check.
+    assert_eq!(
+        after, before,
+        "cross-repository upload traffic must move neither of the pushing repository's scalars"
+    );
+
+    assert_eq!(samples.len(), SUSTAINED_PUSH_COUNT);
+    for sample in &samples {
+        assert_eq!(
+            sample.verdict,
+            PushWitnessVerdict::Unchanged,
+            "every cross-repository push must reach the unchanged fast path, reading no fragment \
+             row at all"
+        );
+    }
+
+    // Support: the uploaders were real, and each one's own repository absorbed
+    // exactly its own transitions. Without this the stillness above could be
+    // the stillness of an idle cell.
+    for (index, tally) in tallies.iter().enumerate() {
+        assert!(
+            tally.transitions >= 2,
+            "{} must have completed real readability transitions inside the window, got {}",
+            tally.label,
+            tally.transitions
+        );
+        assert_eq!(
+            uploader_after[index].fragment_lifecycle_generation
+                - uploader_before[index].fragment_lifecycle_generation,
+            i64::try_from(tally.transitions).expect("transition count fits in i64"),
+            "{}'s own repository must absorb every one of its transitions",
+            tally.label
+        );
+    }
+}
+
+/// Fanout sizes the cost characterization measures. The largest is the
+/// admission bound itself, so the table covers the whole admissible range.
+const FANOUT_MEASUREMENT_SIZES: [usize; 4] = [1, 64, 512, MAX_LIFECYCLE_GENERATION_FANOUT];
+
+/// A deliberately generous liveness bound, not a performance gate.
+///
+/// The only failure this can express is "the operation did not finish", which
+/// is the no-deadlock claim the measurement makes. It sits far above any
+/// plausible honest duration for one bounded transaction against a local
+/// disposable PostgreSQL, so a slow rig, a cold cache, or a busy Docker host
+/// cannot turn a measurement into a flake. Do not tighten it into a threshold:
+/// the numbers this case prints are the output, and no assertion here claims
+/// any particular one of them.
+const FANOUT_LIVENESS_BOUND: Duration = Duration::from_secs(120);
+
+/// Count the live association rows for one exact `(hash, repository, context)`,
+/// read directly rather than inferred from a `CommitVerdict`.
+///
+/// A `Published` verdict is the coordinator's own account of what it did. A
+/// generation bump that was not atomic with the row it is supposed to accompany
+/// would still satisfy every scalar assertion, so the row itself has to be
+/// looked at.
+async fn live_association_rows(
+    direct: &Client,
+    hash: &[u8],
+    repository_id: &[u8],
+    context: &[u8],
+) -> i64 {
+    direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_associations \
+              WHERE hash = $1 AND repository_id = $2 AND context = $3 AND state = $4",
+            &[&hash, &repository_id, &context, &schema::ASSOCIATION_LIVE],
+        )
+        .await
+        .expect("count live association rows")
+        .get(0)
+}
+
+/// Count the live associations a lifecycle transition on `hash` fans out to,
+/// read independently of the coordinator's own planning query.
+async fn live_fanout_rows(direct: &Client, hash: &[u8]) -> i64 {
+    direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_fragment_associations \
+              WHERE hash = $1 AND state = $2",
+            &[&hash, &schema::ASSOCIATION_LIVE],
+        )
+        .await
+        .expect("count the live fanout")
+        .get(0)
+}
+
+/// CR-031's shared-hash fanout **cost characterization**. This is a
+/// measurement, not a pass/fail threshold.
+///
+/// For increasing fanout sizes N it reports, for a hash live-associated with N
+/// repositories:
+///
+/// * a readable-to-unreadable transition (`mark_missing`), which plans, locks,
+///   and *writes* all N repository rows;
+/// * a `Staged`-to-`Remote` promotion (`commit_promotion`), which crosses no
+///   readability boundary and therefore writes none of them, yet still plans
+///   and locks the full fanout unconditionally in `commit_publication`. That is
+///   WP-118's deferred **P2-7**: N row locks it never uses. This case exists to
+///   measure what those locks cost.
+///
+/// The only assertions are a generous liveness bound (see
+/// [`FANOUT_LIVENESS_BOUND`]), the expected verdict, the fanout width read
+/// independently of the coordinator, and the generation movement that proves
+/// each measured call did the work its timing is attributed to. No timing
+/// threshold is asserted, because none has been derived from anything.
+///
+/// # Explicitly out of scope
+///
+/// This measures **the cost at a given N**. It does **not** measure real
+/// shared-hash *distribution* -- how large N actually gets in production. That
+/// needs a real staging cell and is guarded-stopped. `coordinator.rs`'s
+/// `MAX_LIFECYCLE_GENERATION_FANOUT` already records that its value "is a
+/// bound, not a measurement" and that staging measurement should replace it.
+/// Nothing here replaces it, and a green run of this case must not be read as
+/// having done so.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increasing_fanout() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store_with_pool(&url, 8).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let context = random_context();
+
+    let largest = FANOUT_MEASUREMENT_SIZES
+        .iter()
+        .copied()
+        .max()
+        .expect("the measurement table is non-empty");
+
+    let repository_setup_start = Instant::now();
+    let mut repositories = Vec::with_capacity(largest);
+    for _ in 0..largest {
+        repositories.push(create_repository(&store).await);
+    }
+    let repository_setup_ms = repository_setup_start.elapsed().as_millis();
+
+    println!("WP118-P7-FANOUT setup repositories={largest} elapsed_ms={repository_setup_ms}");
+    println!(
+        "WP118-P7-FANOUT | n | transition_ms | promotion_ms | association_setup_ms | \
+         transition_scalar_delta | promotion_scalar_delta"
+    );
+
+    for size in FANOUT_MEASUREMENT_SIZES {
+        let sampled = [0usize, size - 1];
+        let association_start = Instant::now();
+
+        let transition_hash = publish_remote_fragment(&coordinator, 0x30).await;
+        let promotion_hash = random_hash();
+        let BeginOutcome::Admitted(stage_intent) = coordinator
+            .begin_stage(&promotion_hash)
+            .await
+            .expect("begin the promotion fixture's stage")
+        else {
+            panic!("a fresh hash must admit a stage begin");
+        };
+        assert_eq!(
+            coordinator
+                .commit_staged(
+                    &stage_intent,
+                    IoObservation::Valid(manifest(
+                        &staged_key(&promotion_hash, stage_intent.epoch),
+                        0x31,
+                        EpochAuthority::Staged,
+                    )),
+                )
+                .await
+                .expect("commit the promotion fixture's staged epoch"),
+            CommitVerdict::Published
+        );
+
+        for repository_id in &repositories[..size] {
+            for hash in [&transition_hash, &promotion_hash] {
+                assert_eq!(
+                    coordinator
+                        .create_association(hash, repository_id, &context)
+                        .await
+                        .expect("associate a fanout fixture"),
+                    CommitVerdict::Published
+                );
+            }
+        }
+        let association_setup_ms = association_start.elapsed().as_millis();
+
+        for hash in [&transition_hash, &promotion_hash] {
+            assert_eq!(
+                live_fanout_rows(&direct, hash).await,
+                i64::try_from(size).expect("fanout size fits in i64"),
+                "the measured fanout must actually be N rows wide"
+            );
+        }
+
+        // --- readable -> unreadable, which writes all N repository rows ---
+        let resolved = coordinator
+            .resolve(
+                &repositories[0],
+                &context,
+                std::slice::from_ref(&transition_hash),
+            )
+            .await
+            .expect("resolve the transition fixture");
+        let (witness, ..) = expect_readable(&resolved[0]);
+        let witness = witness.clone();
+
+        let mut transition_before = Vec::with_capacity(sampled.len());
+        for index in sampled {
+            transition_before.push(
+                coordinator
+                    .capture_push_witness(&repositories[index])
+                    .await
+                    .expect("capture a sampled witness")
+                    .expect("a fanout repository must exist"),
+            );
+        }
+        let transition_start = Instant::now();
+        let transition_verdict = timeout(
+            FANOUT_LIVENESS_BOUND,
+            coordinator.mark_missing(&witness, MissingDiagnostic::Absent),
+        )
+        .await
+        .expect("a readable-to-unreadable transition must not deadlock")
+        .expect("mark_missing must not error");
+        let transition_ms = transition_start.elapsed().as_millis();
+        assert_eq!(transition_verdict, CommitVerdict::Published);
+
+        let mut transition_delta = 0i64;
+        for (offset, index) in sampled.iter().copied().enumerate() {
+            let after = coordinator
+                .capture_push_witness(&repositories[index])
+                .await
+                .expect("capture a sampled witness")
+                .expect("a fanout repository must exist");
+            transition_delta = after.fragment_lifecycle_generation
+                - transition_before[offset].fragment_lifecycle_generation;
+            assert_eq!(
+                transition_delta, 1,
+                "a readability crossing must move every repository in the fanout exactly once, \
+                 so the timing above is the cost of real work"
+            );
+        }
+
+        // --- Staged -> Remote, which crosses nothing and writes none of them ---
+        let BeginOutcome::Admitted(promotion_intent) = coordinator
+            .begin_promotion(&promotion_hash)
+            .await
+            .expect("begin the promotion")
+        else {
+            panic!("a Staged head must admit begin_promotion");
+        };
+        let mut promotion_before = Vec::with_capacity(sampled.len());
+        for index in sampled {
+            promotion_before.push(
+                coordinator
+                    .capture_push_witness(&repositories[index])
+                    .await
+                    .expect("capture a sampled witness")
+                    .expect("a fanout repository must exist"),
+            );
+        }
+        let promotion_start = Instant::now();
+        let promotion_verdict = timeout(
+            FANOUT_LIVENESS_BOUND,
+            coordinator.commit_promotion(
+                &promotion_intent,
+                IoObservation::Valid(manifest(
+                    &legacy_key(&promotion_hash),
+                    0x32,
+                    EpochAuthority::Remote,
+                )),
+            ),
+        )
+        .await
+        .expect("a non-crossing promotion must not deadlock")
+        .expect("commit_promotion must not error");
+        let promotion_ms = promotion_start.elapsed().as_millis();
+        assert_eq!(promotion_verdict, CommitVerdict::Published);
+
+        let mut promotion_delta = 0i64;
+        for (offset, index) in sampled.iter().copied().enumerate() {
+            let after = coordinator
+                .capture_push_witness(&repositories[index])
+                .await
+                .expect("capture a sampled witness")
+                .expect("a fanout repository must exist");
+            promotion_delta = after.fragment_lifecycle_generation
+                - promotion_before[offset].fragment_lifecycle_generation;
+            assert_eq!(
+                promotion_delta, 0,
+                "a Staged-to-Remote promotion crosses no readability boundary, so it must write \
+                 no lifecycle scalar -- the whole point of P2-7 is that it locks the fanout it \
+                 does not write"
+            );
+        }
+
+        println!(
+            "WP118-P7-FANOUT | {size} | {transition_ms} | {promotion_ms} | \
+             {association_setup_ms} | {transition_delta} | {promotion_delta}"
+        );
+    }
+}
+
+/// CR-031 requires create, **copy**, and tombstone to increment
+/// `content_association_generation`. Create and tombstone are each already
+/// pinned by a case that reads the scalar; the copy path
+/// (`create_association_if_current`, reached from the immutable store's
+/// already-readable publication and copy-on-write paths) had cases asserting
+/// only its verdicts, so its `bump_association_generation` call was unpinned.
+///
+/// This closes that gap in both directions: an admitted copy moves the
+/// association scalar exactly once and the lifecycle scalar not at all, and a
+/// fenced copy moves neither.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn create_association_if_current_bumps_the_association_generation_on_every_admitted_copy() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let repository_id = create_repository(&store).await;
+    let source_context = random_context();
+    let copy_context = random_context();
+    let fenced_context = random_context();
+
+    let hash = publish_remote_fragment(&coordinator, 0x70).await;
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &source_context)
+            .await
+            .expect("associate the source context"),
+        CommitVerdict::Published
+    );
+
+    let resolved = coordinator
+        .resolve(&repository_id, &source_context, std::slice::from_ref(&hash))
+        .await
+        .expect("resolve the readable witness");
+    let (witness, ..) = expect_readable(&resolved[0]);
+    let witness = witness.clone();
+
+    let before = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture before the copy")
+        .expect("the repository must exist");
+
+    assert_eq!(
+        coordinator
+            .create_association_if_current(&witness, &repository_id, &copy_context)
+            .await
+            .expect("guarded copy association"),
+        CommitVerdict::Published
+    );
+
+    let after_copy = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture after the copy")
+        .expect("the repository must exist");
+    assert_eq!(
+        after_copy.content_association_generation,
+        before.content_association_generation + 1,
+        "the copy path must move the association scalar exactly once, atomically with its insert \
+         -- CR-031 requires create, copy, and tombstone to increment it alike"
+    );
+    assert_eq!(
+        after_copy.fragment_lifecycle_generation, before.fragment_lifecycle_generation,
+        "a copy crosses no readability boundary and must move no lifecycle scalar"
+    );
+    assert_eq!(
+        live_association_rows(&direct, &hash, &repository_id, &copy_context).await,
+        1,
+        "the scalar bump must be accompanied by the association row it is atomic with"
+    );
+
+    // A replayed copy into the *same* context still moves the scalar. The
+    // insert is `ON CONFLICT ... DO UPDATE`, and the bump is unconditional, so
+    // a retried copy-on-write publication re-arms every concurrent push's
+    // witness. That direction is the safe one -- a spurious bump costs a
+    // conservative abort, a missed one would let a push commit against a
+    // membership change it never revalidated -- so pin it, or a later
+    // "optimisation" that skips the bump when the row already existed would
+    // land silently.
+    assert_eq!(
+        coordinator
+            .create_association_if_current(&witness, &repository_id, &copy_context)
+            .await
+            .expect("replayed guarded copy association"),
+        CommitVerdict::Published
+    );
+    let after_replay = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture after the replayed copy")
+        .expect("the repository must exist");
+    assert_eq!(
+        after_replay.content_association_generation,
+        after_copy.content_association_generation + 1,
+        "a replayed copy is still an association write and must move the scalar again"
+    );
+    assert_eq!(
+        live_association_rows(&direct, &hash, &repository_id, &copy_context).await,
+        1,
+        "the replay upserts the existing row rather than adding a second one"
+    );
+
+    // A stale witness is refused. Deliberately NOT paired with a
+    // scalar-unchanged assertion: the fenced arm returns before `tx.commit()`,
+    // so the transaction rolls back and *no* implementation of this shape could
+    // move the scalar here. Such an assertion would pass against every possible
+    // body and prove nothing (INV-EF P2-11). The residue proof that does
+    // discriminate already lives in
+    // `guarded_association_requires_the_exact_readable_witness`.
+    let mut stale = witness.clone();
+    stale.fence += 1;
+    assert_eq!(
+        coordinator
+            .create_association_if_current(&stale, &repository_id, &fenced_context)
+            .await
+            .expect("stale guarded copy association"),
+        CommitVerdict::Fenced
+    );
+}
+
+/// Budget for the post-abort recovery measurement. Generous: the number it
+/// produces is the output, and running out is itself a reportable answer.
+const QUIET_SCALAR_WAIT_BUDGET: Duration = Duration::from_secs(20);
+
+/// **Characterization, not acceptance.** CR-031's literal
+/// `same_repo_bulk_upload_does_not_starve_branch_push` shape -- three
+/// same-repository uploaders doing what a real bulk upload does, which includes
+/// creating associations -- and a measurement of what the push path actually
+/// returns under it.
+///
+/// This case exists because that literal shape is unsatisfiable against the
+/// frozen contract, and an owner deciding between amending the test spec and
+/// narrowing the association check needs measured evidence rather than an
+/// argument. The chain, all verified in source:
+///
+/// * a real upload ends in `create_association` (`store/immutable_store.rs`) or
+///   `create_association_if_current`, and both call
+///   `bump_association_generation` unconditionally;
+/// * that moves `content_association_generation` on the uploaded-into
+///   repository;
+/// * `classify_push_witness` returns `AssociationMoved`, which outranks
+///   `LifecycleOnly` and returns `Aborted { required_fragment_changed }` with no
+///   fallback -- CR-031's F-031-3 grants the bounded fallback only for a changed
+///   *lifecycle* scalar.
+///
+/// So a same-repository push racing genuine upload traffic aborts, while
+/// CR-031's own acceptance text requires zero fallback-induced `ABORTED` under
+/// exactly that traffic. The over-strictness *is* the starvation the CR says
+/// must not happen.
+///
+/// **The precedence is deliberate and is not a defect to fix from here.**
+/// `revalidate_push_witness`'s own comment records that association precedence
+/// is what keeps obliterate-then-recreate out of reach of the
+/// semantically-equivalent-epoch allowance. Loosening it is a frozen-contract
+/// decision with a real safety rationale behind it, and it belongs to the CR's
+/// owner.
+///
+/// # What is asserted, and what is only reported
+///
+/// The only assertion is that **at least one** push aborted with exactly
+/// `REQUIRED_FRAGMENT_CHANGED`. That cannot flake upward: the mechanism is
+/// deterministic given any association bump inside any push's window, and the
+/// case fails loudly if the traffic never got going. Everything else -- the
+/// abort rate, how many pushes commit first-attempt, and how long a push must
+/// wait for a quiet association scalar -- is printed, not asserted, because a
+/// rate measured on this rig is a property of this rig's timing regime.
+///
+/// The timing-regime caveat on
+/// [`same_repo_lifecycle_traffic_does_not_starve_branch_push`] applies in full: with
+/// no object-store latency the uploaders cycle faster *and* the push window is
+/// shorter, the two push the abort rate in opposite directions, and which one
+/// dominates has not been measured. Do not read the printed rate as a
+/// production estimate in either direction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn characterize_same_repo_association_traffic_push_aborts() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store_with_pool(&url, 16).await;
+    let coordinator = store.fragment_coordinator();
+    let repository_id = create_repository(&store).await;
+
+    let push_context = random_context();
+    let required = required_set(
+        &coordinator,
+        &repository_id,
+        &push_context,
+        PUSH_REQUIRED_FRAGMENTS,
+    )
+    .await;
+
+    let labels = [
+        "assoc-characterization/uploader-a",
+        "assoc-characterization/uploader-b",
+        "assoc-characterization/uploader-c",
+    ];
+    let mut uploader_contexts = Vec::with_capacity(SUSTAINED_UPLOADER_COUNT);
+    for _ in 0..SUSTAINED_UPLOADER_COUNT {
+        uploader_contexts.push(random_context());
+    }
+    // PublishAndAssociate needs no pre-seeded hash set: every iteration mints a
+    // fresh hash and associates it, which is exactly a bulk upload of new
+    // content. One placeholder entry drives the loop.
+    let placeholder = vec![random_hash()];
+
+    let push_pool = build_pool(&url, 4, &TlsConfig::default()).expect("build final-push pool");
+    let before = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness before the window")
+        .expect("the pushing repository must exist");
+
+    let deadline = Instant::now() + SUSTAINED_UPLOAD_WINDOW;
+    let pushes = async {
+        let mut samples = Vec::with_capacity(SUSTAINED_PUSH_COUNT);
+        for _ in 0..SUSTAINED_PUSH_COUNT {
+            samples.push(
+                run_final_push_transaction(&coordinator, &push_pool, &repository_id, &required)
+                    .await,
+            );
+            tokio::time::sleep(PUSH_INTERVAL).await;
+        }
+        samples
+    };
+
+    let (samples, tally_a, tally_b, tally_c) = timeout(SUSTAINED_SUITE_WATCHDOG, async {
+        tokio::join!(
+            pushes,
+            run_sustained_uploader(
+                &coordinator,
+                &repository_id,
+                &uploader_contexts[0],
+                &placeholder,
+                labels[0],
+                UploaderTraffic::PublishAndAssociate,
+                deadline,
+            ),
+            run_sustained_uploader(
+                &coordinator,
+                &repository_id,
+                &uploader_contexts[1],
+                &placeholder,
+                labels[1],
+                UploaderTraffic::PublishAndAssociate,
+                deadline,
+            ),
+            run_sustained_uploader(
+                &coordinator,
+                &repository_id,
+                &uploader_contexts[2],
+                &placeholder,
+                labels[2],
+                UploaderTraffic::PublishAndAssociate,
+                deadline,
+            ),
+        )
+    })
+    .await
+    .expect("the association-traffic characterization must finish inside its 30s watchdog");
+
+    let after = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness after the window")
+        .expect("the pushing repository must exist");
+    let tallies = [tally_a, tally_b, tally_c];
+    let association_moves =
+        after.content_association_generation - before.content_association_generation;
+    let lifecycle_moves =
+        after.fragment_lifecycle_generation - before.fragment_lifecycle_generation;
+
+    println!(
+        "WP118-P7-ASSOC-CHAR regime uploader_traffic=PublishAndAssociate window_s={} \
+         association_moves={association_moves} lifecycle_moves={lifecycle_moves}",
+        SUSTAINED_UPLOAD_WINDOW.as_secs()
+    );
+    let mut total_publications = 0usize;
+    for tally in &tallies {
+        total_publications += tally.publications;
+        println!(
+            "WP118-P7-ASSOC-CHAR uploader label={} publications={} publications_per_s={:.1} \
+             associations={} elapsed_ms={}",
+            tally.label,
+            tally.publications,
+            tally.publications_per_second(),
+            tally.associations,
+            tally.elapsed.as_millis()
+        );
+    }
+    println!(
+        "WP118-P7-ASSOC-CHAR uploaders_total publications={total_publications} \
+         publications_per_s={:.1}",
+        total_publications as f64 / SUSTAINED_UPLOAD_WINDOW.as_secs_f64()
+    );
+    println!("WP118-P7-ASSOC-CHAR {}", summarize_pushes(&samples));
+
+    // Attribution note, because this filter does NOT by itself prove which arm
+    // fired. `REQUIRED_FRAGMENT_CHANGED` is emitted by five arms of
+    // `revalidate_push_witness` (`coordinator.rs:3129`, `:3148`, `:3211`,
+    // `:3217`, `:3230`) -- an absent repository row, the association-moved
+    // precedence, a required fragment whose row vanished, one that is no longer
+    // readable, and a non-equivalent epoch. The attribution to the
+    // association arm is INDIRECT and rests on the two assertions below:
+    // `lifecycle_moves == 0` rules out every readability-driven arm (no
+    // fragment this repository is associated with crossed the boundary, and
+    // the required set is never touched by the uploaders), and the repository
+    // demonstrably exists. Do not read this filter as direct proof of the arm.
+    let aborted = samples
+        .iter()
+        .filter(|sample| {
+            matches!(
+                &sample.verdict,
+                PushWitnessVerdict::Aborted { reason } if *reason == REQUIRED_FRAGMENT_CHANGED
+            )
+        })
+        .count();
+    let committed = samples.len() - aborted;
+    println!(
+        "WP118-P7-ASSOC-CHAR outcome aborted={aborted}/{} first_attempt_commits={committed}",
+        samples.len()
+    );
+
+    // With the uploaders now stopped the association scalar is quiet, so this
+    // measures CR-031's own stated remedy for a known-no-commit abort: wait for
+    // a quiet scalar and take a fresh preflight.
+    match wait_for_a_first_attempt_commit(
+        &coordinator,
+        &push_pool,
+        &repository_id,
+        &required,
+        QUIET_SCALAR_WAIT_BUDGET,
+    )
+    .await
+    {
+        Some((waited, attempts)) => println!(
+            "WP118-P7-ASSOC-CHAR quiet_scalar_recovery attempts={attempts} waited_us={} \
+             (uploaders stopped)",
+            waited.as_micros()
+        ),
+        None => println!(
+            "WP118-P7-ASSOC-CHAR quiet_scalar_recovery NONE within budget_s={} (uploaders stopped)",
+            QUIET_SCALAR_WAIT_BUDGET.as_secs()
+        ),
+    }
+
+    // The traffic must have been real, or the measurement above is of nothing.
+    for tally in &tallies {
+        assert!(
+            tally.associations >= 2,
+            "{} must have completed real associating publications inside the window, got {}",
+            tally.label,
+            tally.associations
+        );
+    }
+    assert_eq!(
+        association_moves,
+        i64::try_from(
+            tallies
+                .iter()
+                .map(|tally| tally.associations)
+                .sum::<usize>()
+        )
+        .expect("association count fits in i64"),
+        "each associating publication moves the repository's association scalar exactly once"
+    );
+    assert_eq!(
+        lifecycle_moves, 0,
+        "PublishAndAssociate traffic publishes fresh hashes that are readable before they are \
+         associated, so it crosses no readability boundary for this repository -- a nonzero \
+         lifecycle movement would mean this case is measuring mixed traffic and its attribution \
+         of the aborts to the association scalar would not hold"
+    );
+
+    // Non-vacuity pin, and it is load-bearing rather than decorative. Under
+    // the current contract an association-moved witness NEVER reaches the
+    // bounded fallback, so the fallback count must be zero. Without this,
+    // loosening the association precedence -- the exact change this case exists
+    // to inform -- would turn most of these aborts into `FallbackSatisfied`
+    // while leaving a handful of aborts from other causes, and the case would
+    // survive the very change it was written to characterize.
+    assert_eq!(
+        samples
+            .iter()
+            .filter(|sample| matches!(sample.verdict, PushWitnessVerdict::FallbackSatisfied { .. }))
+            .count(),
+        0,
+        "an association-moved witness must never reach the bounded fallback under the current \
+         contract; a nonzero count here means the precedence changed and this characterization \
+         is stale, not passing"
+    );
+
+    // The finding itself. Given any association bump landing inside any of 100
+    // push windows this is deterministic; if it ever fails, either the traffic
+    // stopped or the association precedence changed, and both are things the
+    // owner needs to know.
+    assert!(
+        aborted >= 1,
+        "the association-precedence starvation must be observable: with {association_moves} \
+         association bumps against {} pushes, at least one push must have aborted with \
+         `{REQUIRED_FRAGMENT_CHANGED}`. Zero aborts means either the uploaders never contended \
+         or the contract changed",
+        samples.len()
     );
 }
