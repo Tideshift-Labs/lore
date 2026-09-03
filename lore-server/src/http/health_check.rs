@@ -76,6 +76,7 @@ mod tests {
             interval_timeout: None,
             store_health_check: true,
             drain: None,
+            event_relay: None,
         };
         let test_shared_state = ServerState {
             immutable_store,
@@ -105,6 +106,7 @@ mod tests {
             interval_timeout: None,
             store_health_check: false,
             drain: None,
+            event_relay: None,
         });
 
         let app = axum::Router::new().route(
@@ -131,6 +133,7 @@ mod tests {
             interval_timeout: None,
             store_health_check: false,
             drain: Some(drain),
+            event_relay: None,
         });
 
         let app = axum::Router::new().route(
@@ -157,6 +160,7 @@ mod tests {
             interval_timeout: None,
             store_health_check: false,
             drain: Some(drain),
+            event_relay: None,
         });
 
         let app = axum::Router::new().route(
@@ -186,6 +190,7 @@ mod tests {
             interval_timeout: None,
             store_health_check: true,
             drain: Some(drain),
+            event_relay: None,
         };
         let test_shared_state = ServerState {
             immutable_store,

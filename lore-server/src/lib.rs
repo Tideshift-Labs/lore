@@ -6,6 +6,7 @@ pub mod cache;
 pub mod domain;
 pub mod domain_intent;
 pub mod drain;
+pub mod event_relay;
 pub mod execution_state;
 pub mod grpc;
 pub mod hooks;

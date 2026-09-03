@@ -40,6 +40,10 @@ pub struct Settings {
     pub feature: Option<FeatureSettings>,
     pub tokio: Option<TokioSettings>,
     pub notification: Option<NotificationSettings>,
+    /// CR-032 / WP-119 Step B. Absent means the relay does not run, which is
+    /// also what `enabled = false` means; the section exists only to turn it on
+    /// and to move a value inside its reviewed bounds.
+    pub outbox_relay: Option<OutboxRelaySettings>,
     pub topology: Option<TopologySettings>,
     #[serde(default)]
     pub plugins: HashMap<String, toml::Value>,
@@ -62,6 +66,7 @@ impl std::fmt::Debug for Settings {
             .field("feature", &self.feature)
             .field("tokio", &self.tokio)
             .field("notification", &self.notification)
+            .field("outbox_relay", &self.outbox_relay)
             .field("topology", &self.topology)
             .field(
                 "plugins",
@@ -538,6 +543,133 @@ pub struct NotificationSettings {
 
 fn default_notification_mode() -> String {
     "local".to_string()
+}
+
+/// `[outbox_relay]` — CR-032's bounded relay worker (WP-119 Step B).
+///
+/// Every knob here is a **raw** value. Nothing in this struct is validated:
+/// `crate::event_relay::EventRelayConfig::from_settings` owns the reviewed
+/// bounds, so a value outside them fails startup with a named reason rather
+/// than being clamped silently on the way in. CR-032 calls these limits
+/// "configurable only within reviewed bounds", and a clamp would let an
+/// operator believe a value took effect when it did not.
+///
+/// The section is inert unless `enabled` is true, and enabling it additionally
+/// requires `[notification] mode = "remote"` (the relay publishes through the
+/// private gateway client that mode configures) and a cell whose outbox schema
+/// state is present, compatible, and cut over.
+#[derive(Clone, Debug, Deserialize)]
+//#[serde(deny_unknown_fields)]
+pub struct OutboxRelaySettings {
+    /// Whether this loreserver runs a relay worker. Default false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Lease owner recorded on every claim. Defaults to the hostname plus the
+    /// process id, so two workers on one host are still distinguishable.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Rows claimed per transaction. CR-032 caps this at 100.
+    #[serde(default = "default_relay_batch_size")]
+    pub batch_size: usize,
+    /// Claim lease. CR-032 pins 30 seconds.
+    #[serde(default = "default_relay_claim_lease_seconds")]
+    pub claim_lease_seconds: u64,
+    /// Per-publish deadline. CR-032 caps this at 10 seconds.
+    #[serde(default = "default_relay_publish_deadline_seconds")]
+    pub publish_deadline_seconds: u64,
+    /// How long to wait after a claim returns nothing.
+    #[serde(default = "default_relay_idle_interval_millis")]
+    pub idle_interval_millis: u64,
+    /// First retry delay before jitter; doubles per prior attempt.
+    #[serde(default = "default_relay_backoff_base_millis")]
+    pub backoff_base_millis: u64,
+    /// Ceiling on that doubling.
+    #[serde(default = "default_relay_backoff_cap_seconds")]
+    pub backoff_cap_seconds: u64,
+    /// How often the loop refreshes the backlog facts readiness reports.
+    #[serde(default = "default_relay_readiness_probe_interval_seconds")]
+    pub readiness_probe_interval_seconds: u64,
+    /// Oldest-unpublished age above which relay readiness is false. CR-032
+    /// pins 30 seconds.
+    #[serde(default = "default_relay_max_oldest_unpublished_seconds")]
+    pub max_oldest_unpublished_seconds: u64,
+    /// Oldest-unpublished age above which required-event mutation admission
+    /// closes. CR-032 pins five minutes.
+    #[serde(default = "default_admission_max_oldest_pending_age_seconds")]
+    pub admission_max_oldest_pending_age_seconds: u64,
+    /// Unpublished row count above which admission closes. CR-032 pins one
+    /// million.
+    #[serde(default = "default_admission_max_pending_rows")]
+    pub admission_max_pending_rows: i64,
+    /// Unpublished payload byte budget above which admission closes. CR-032
+    /// pins 5 GiB.
+    #[serde(default = "default_admission_max_pending_bytes")]
+    pub admission_max_pending_bytes: i64,
+}
+
+impl Default for OutboxRelaySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            owner: None,
+            batch_size: default_relay_batch_size(),
+            claim_lease_seconds: default_relay_claim_lease_seconds(),
+            publish_deadline_seconds: default_relay_publish_deadline_seconds(),
+            idle_interval_millis: default_relay_idle_interval_millis(),
+            backoff_base_millis: default_relay_backoff_base_millis(),
+            backoff_cap_seconds: default_relay_backoff_cap_seconds(),
+            readiness_probe_interval_seconds: default_relay_readiness_probe_interval_seconds(),
+            max_oldest_unpublished_seconds: default_relay_max_oldest_unpublished_seconds(),
+            admission_max_oldest_pending_age_seconds:
+                default_admission_max_oldest_pending_age_seconds(),
+            admission_max_pending_rows: default_admission_max_pending_rows(),
+            admission_max_pending_bytes: default_admission_max_pending_bytes(),
+        }
+    }
+}
+
+fn default_relay_batch_size() -> usize {
+    100
+}
+
+fn default_relay_claim_lease_seconds() -> u64 {
+    30
+}
+
+fn default_relay_publish_deadline_seconds() -> u64 {
+    10
+}
+
+fn default_relay_idle_interval_millis() -> u64 {
+    500
+}
+
+fn default_relay_backoff_base_millis() -> u64 {
+    250
+}
+
+fn default_relay_backoff_cap_seconds() -> u64 {
+    30
+}
+
+fn default_relay_readiness_probe_interval_seconds() -> u64 {
+    5
+}
+
+fn default_relay_max_oldest_unpublished_seconds() -> u64 {
+    30
+}
+
+fn default_admission_max_oldest_pending_age_seconds() -> u64 {
+    5 * 60
+}
+
+fn default_admission_max_pending_rows() -> i64 {
+    1_000_000
+}
+
+fn default_admission_max_pending_bytes() -> i64 {
+    5 * 1024 * 1024 * 1024
 }
 
 #[cfg(test)]

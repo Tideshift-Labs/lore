@@ -816,6 +816,30 @@ pub(crate) async fn connect_domain_store(
         })
 }
 
+/// Build a small dedicated pool on the cell database for CR-032's relay worker
+/// (WP-119 Step B).
+///
+/// It reuses the `[plugins.postgres]` connection shape and TLS material rather
+/// than adding a second URL, for the same reason the domain coordinator does:
+/// the outbox rows the relay reads are written by mutation transactions in that
+/// exact database, and a second URL would make co-location a configuration
+/// property again. The caller still proves co-location positively before
+/// running anything; this function only builds the pool.
+pub(crate) fn connect_relay_pool(
+    config: &toml::Value,
+    pool_max: u32,
+) -> Result<lore_postgres::pool::Pool, PluginError> {
+    let plugin_name = PLUGIN_NAME;
+    let cfg = parse_config(plugin_name, config)?;
+    let tls = build_tls(plugin_name, &cfg)?;
+    lore_postgres::pool::build_pool(&cfg.url, pool_max, &tls).map_err(|e| {
+        PluginError::from(PluginInitError {
+            plugin_name: plugin_name.to_string(),
+            message: format!("Failed to build the outbox relay pool: {e}"),
+        })
+    })
+}
+
 /// R-SHOULD-1: prove positively that another configured CR-007 pool addresses
 /// the same physical database as the domain coordinator.
 ///

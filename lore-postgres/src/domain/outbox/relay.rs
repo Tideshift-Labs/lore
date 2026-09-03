@@ -148,6 +148,16 @@ pub struct ClaimedEvent {
     pub claim_expires_at: SystemTime,
     /// Attempts made before this one.
     pub attempt_count: i32,
+    /// How the **immediately preceding** attempt on this row failed, or `None`
+    /// when this is the first attempt or the row has only ever been claimed.
+    ///
+    /// Carried so a worker can tell a first failure of some kind from a
+    /// repeated one without a second query. CR-032 makes a *repeated*
+    /// event-specific 4xx terminal while a single one is not, and
+    /// `attempt_count` cannot answer that: it counts every release, including
+    /// timeouts and 5xx, so a row that survived a broker outage would arrive at
+    /// its first genuine rejection already looking like a repeat offender.
+    pub last_error_class: Option<String>,
 }
 
 /// A versioned gateway acknowledgement, as recorded on the row.
@@ -529,7 +539,8 @@ pub async fn claim_batch(
                      claim_expires_at = clock_timestamp() + ($2::double precision \
                                         * interval '1 second') \
                  WHERE event_id = ANY($3) \
-                 RETURNING {EVENT_COLUMNS}, claim_generation, claim_expires_at, attempt_count"
+                 RETURNING {EVENT_COLUMNS}, claim_generation, claim_expires_at, \
+                           attempt_count, last_error_class"
             ),
             &[&owner, &lease_secs, &ids],
         )
@@ -548,6 +559,7 @@ pub async fn claim_batch(
                 claim_generation: row.get("claim_generation"),
                 claim_expires_at: row.get("claim_expires_at"),
                 attempt_count: row.get("attempt_count"),
+                last_error_class: row.get("last_error_class"),
             })
         })
         .collect()
@@ -1418,6 +1430,89 @@ pub async fn admission_check(
     }
 
     Ok(AdmissionVerdict::Admit)
+}
+
+// ---------------------------------------------------------------------------
+// Startup enforcement
+// ---------------------------------------------------------------------------
+
+/// The `lore_outbox_schema_state` singleton, as the relay's startup gate reads
+/// it (WP-119 Step B).
+///
+/// CR-032 requires a loreserver in required-event mode to refuse to boot
+/// against a cell whose outbox is absent, whose relay compatibility floor is
+/// above what the binary speaks, or whose cutover marker is incomplete. Those
+/// are three facts on this one row, so the gate needs one read rather than
+/// three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxSchemaState {
+    /// Version of the DDL the row was last written by.
+    pub migration_version: i64,
+    /// Backfill algorithm version.
+    pub backfill_version: i64,
+    /// Lowest producer contract version this cell accepts.
+    pub producer_compat_floor: i32,
+    /// Lowest relay contract version this cell accepts. Compare with
+    /// [`relay_is_compatible`].
+    pub relay_compat_floor: i32,
+    /// Lowest consumer contract version this cell accepts.
+    pub consumer_compat_floor: i32,
+    /// Set exactly when the cell's outbox cutover completed. `None` means the
+    /// marker is incomplete and required-event mode must not run.
+    pub cutover_at: Option<SystemTime>,
+    /// Inert until Step C defines retention.
+    pub retention_policy_version: Option<i32>,
+    /// Last write to this row.
+    pub updated_at: SystemTime,
+}
+
+/// Read the singleton outbox schema state, or `None` when this database has no
+/// outbox at all.
+///
+/// The two ways the state can be absent are deliberately collapsed into one
+/// `None`: the table may not exist (the connection addresses a database that
+/// never ran `OUTBOX_SCHEMA`), or the table may exist with no singleton row
+/// (bootstrap did not finish). The startup gate's answer is the same refusal
+/// for both, and distinguishing them would put a SQLSTATE comparison in every
+/// caller for no decision it can act on differently. The refusal message names
+/// which one it was.
+pub async fn schema_state(
+    client: &impl GenericClient,
+) -> Result<Option<OutboxSchemaState>, DomainError> {
+    let row = match client
+        .query_opt(
+            "SELECT migration_version, backfill_version, \
+                    producer_compat_floor, relay_compat_floor, consumer_compat_floor, \
+                    cutover_at, retention_policy_version, updated_at \
+             FROM lore_outbox_schema_state WHERE id = 1",
+            &[],
+        )
+        .await
+    {
+        Ok(row) => row,
+        Err(e) if is_undefined_table(&e) => return Ok(None),
+        Err(e) => return Err(DomainError::from_pg("outbox schema state select", e)),
+    };
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(OutboxSchemaState {
+        migration_version: row.get("migration_version"),
+        backfill_version: row.get("backfill_version"),
+        producer_compat_floor: row.get("producer_compat_floor"),
+        relay_compat_floor: row.get("relay_compat_floor"),
+        consumer_compat_floor: row.get("consumer_compat_floor"),
+        cutover_at: row.get("cutover_at"),
+        retention_policy_version: row.get("retention_policy_version"),
+        updated_at: row.get("updated_at"),
+    }))
+}
+
+/// Whether a query failed because the relation does not exist (SQLSTATE 42P01).
+fn is_undefined_table(error: &tokio_postgres::Error) -> bool {
+    error
+        .code()
+        .is_some_and(|code| *code == tokio_postgres::error::SqlState::UNDEFINED_TABLE)
 }
 
 // TODO(WP-119 Step C): the receiver membership/checkpoint projection, the

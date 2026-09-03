@@ -71,6 +71,7 @@ mod tests {
             interval_timeout: None,
             store_health_check: false,
             drain,
+            event_relay: None,
         })
     }
 

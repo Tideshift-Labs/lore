@@ -81,51 +81,50 @@ use crate::plugins::PluginRegistry;
 
 /// Plugin registration hook, auto-discovered by `build.rs`.
 ///
-/// **Deliberately a no-op.** WP-111 publishes this component with a clean
-/// owned-file diff; WP-119 alone integrates common `lore-server` settings,
-/// server construction, readiness, and drain during its serialized
-/// `SCHEMA-119` window, and registration is part of that integration rather
-/// than of this component.
-///
-/// The one line that window adds, in place of this comment:
-///
-/// ```ignore
-/// registry.register_notification_plugin(Box::new(
-///     crate::plugins::remote_notification::RemoteNotificationPluginFactory,
-/// ));
-/// ```
+/// Wired by WP-119's `SCHEMA-119` window, which owns the common `lore-server`
+/// settings, server-construction, readiness, and drain files this plugin
+/// threads through. WP-111 shipped it unregistered so its own diff stayed
+/// clean; this is the one line that handoff reserved.
 ///
 /// Nothing else is needed to select the plugin: `configure_notification` in
-/// `server.rs` already routes any `[notification] mode` that is not `"local"`
-/// to a registry lookup by that name, hands the factory the `[plugins.<mode>]`
+/// `server.rs` routes any `[notification] mode` that is not `"local"` to a
+/// registry lookup by that name, hands the factory the `[plugins.<mode>]`
 /// table, and spawns each returned receiver into the server's `JoinSet`. So
-/// `mode = "remote"` plus `[plugins.remote]` works the moment the line above
-/// exists.
-pub fn register(_registry: &mut PluginRegistry) {
-    // TODO(WP-119 SCHEMA-119): register `RemoteNotificationPluginFactory` here.
+/// `mode = "remote"` plus `[plugins.remote]` now works.
+///
+/// Registration alone starts no relay. CR-032's durable path additionally
+/// requires `[outbox_relay] enabled = true`, and that gate is separate on
+/// purpose: a cell may publish best-effort `LIVE_HINT` traffic through this
+/// plugin long before it is cut over to required-event mode.
+pub fn register(registry: &mut PluginRegistry) {
+    registry.register_notification_plugin(Box::new(
+        crate::plugins::remote_notification::RemoteNotificationPluginFactory,
+    ));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A handoff tripwire, not a behavioural assertion.
+    /// The other side of WP-111's handoff tripwire.
     ///
-    /// It pins that this component ships **unregistered**, which is the
-    /// `PLUGIN-COMPONENT-READY` contract with WP-119. When `SCHEMA-119` adds
-    /// the registration line, this test fails and is meant to: flipping it to
-    /// assert the factory IS registered is part of that wiring step.
+    /// It previously pinned that this component shipped **unregistered**, which
+    /// was the `PLUGIN-COMPONENT-READY` contract with WP-119. `SCHEMA-119`
+    /// added the registration line, so the assertion is inverted rather than
+    /// deleted: the tripwire's job now is to catch a later refactor that drops
+    /// the registration and leaves `mode = "remote"` failing at boot with an
+    /// unknown-plugin error that reads like a configuration typo.
     #[test]
-    fn the_factory_is_not_registered_until_wp_119_wires_it() {
+    fn schema_119_registered_the_factory_under_its_plugin_name() {
         let mut registry = PluginRegistry::new();
         register(&mut registry);
         assert!(
-            !registry
+            registry
                 .list_notification_plugins()
                 .iter()
                 .any(|name| name == PLUGIN_NAME),
-            "registration is WP-119's SCHEMA-119 step; if this now fails, update the assertion \
-             rather than removing the registration"
+            "`[notification] mode = \"remote\"` resolves through this registration; without it \
+             a correctly configured cell fails at boot with an unknown-plugin error"
         );
     }
 

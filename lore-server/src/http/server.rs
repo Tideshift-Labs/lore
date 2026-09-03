@@ -26,6 +26,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use super::drain_status;
+use super::event_readiness;
 use super::health_check;
 use super::presigned;
 use super::security_headers::ContentTypeAllowlist;
@@ -77,6 +78,13 @@ pub struct ServerHealth {
     /// reports 503 so load balancers pull the node, and `/drain_status`
     /// reports the remaining active connections.
     pub drain: Option<Arc<DrainState>>,
+    /// CR-032's event-plane facets, when this cell runs a relay.
+    ///
+    /// Read only by `/event_readiness`. It is deliberately **not** consulted by
+    /// `/health_check`: CR-032 requires storage readiness to be separate, so
+    /// broker loss cannot pull a node that is serving reads perfectly well out
+    /// of the load balancer.
+    pub event_relay: Option<Arc<crate::event_relay::readiness::EventRelayReadiness>>,
 }
 
 impl ServerHealth {
@@ -89,6 +97,7 @@ impl ServerHealth {
             interval_timeout: None,
             store_health_check: false,
             drain: None,
+            event_relay: None,
         }
     }
 }
@@ -164,6 +173,10 @@ pub fn create_router(
         .route(
             "/drain_status",
             routing::get(drain_status::handler).with_state(server_health.clone()),
+        )
+        .route(
+            "/event_readiness",
+            routing::get(event_readiness::handler).with_state(server_health.clone()),
         );
 
     crate::store::spawn_immutable_store_availability_monitor(server_health);
@@ -258,6 +271,7 @@ impl LoreHttpServer {
             interval_timeout: None,
             store_health_check: false,
             drain: None,
+            event_relay: None,
         });
 
         let app = Router::new()
@@ -287,6 +301,7 @@ impl LoreHttpServer {
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
         drain: Option<Arc<DrainState>>,
+        event_relay: Option<Arc<crate::event_relay::readiness::EventRelayReadiness>>,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let addr = SocketAddr::from_str(format!("{}:{}", settings.host, settings.port).as_str())
@@ -312,6 +327,7 @@ impl LoreHttpServer {
             },
             store_health_check: settings.store_health_check,
             drain,
+            event_relay,
         };
 
         let presign_config = build_presign_config(&settings.presign)?;

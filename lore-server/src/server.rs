@@ -788,21 +788,42 @@ fn build_lore_http_settings(
     }
 }
 
+/// The facet handles the HTTP surface reports on, grouped so the launcher keeps
+/// a readable signature as facets are added.
+///
+/// They are deliberately separate facets rather than one aggregate health flag:
+/// CR-032 requires broker or relay trouble to be reportable without pulling a
+/// node that is serving reads perfectly well out of the load balancer.
+struct HttpSurfaceFacets {
+    /// Aggregate drain view, behind `/health_check` and `/drain_status`.
+    drain_state: Arc<DrainState>,
+    /// Whether graceful drain is enabled, which decides how long this surface
+    /// outlives the shutdown signal.
+    graceful_drain: bool,
+    /// CR-032's event-plane facets, behind `/event_readiness`.
+    event_relay: Option<Arc<crate::event_relay::readiness::EventRelayReadiness>>,
+}
+
 async fn launch_http_server(
     settings: LoreHttpServerSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     jwt_verifier: Option<JwtVerifier>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    drain_state: Arc<DrainState>,
-    graceful_drain: bool,
+    facets: HttpSurfaceFacets,
 ) -> Result<()> {
+    let HttpSurfaceFacets {
+        drain_state,
+        graceful_drain,
+        event_relay,
+    } = facets;
     LoreHttpServer::serve(
         settings,
         immutable_store,
         mutable_store,
         jwt_verifier,
         Some(drain_state.clone()),
+        event_relay,
         async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
             // Under graceful drain, keep the health/status surface up until
@@ -2052,6 +2073,11 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     .await?;
 
     let lock_store = configure_lock_store_via_plugin(&plugin_registry, &settings)?;
+    // Kept before the partial move below. This is the identity every CR-007
+    // pool was positively proven to share, and it is what the CR-032 relay pool
+    // is checked against: a relay reading a different database would report an
+    // empty backlog that means nothing.
+    let configured_domain_identity = configured_domain.database_identity.clone();
     let domain_context = configured_domain.context;
     // The internal forwarding endpoint reaches the same repository handlers, so
     // it gets the same coordinator handle rather than an ungoverned bypass.
@@ -2156,6 +2182,12 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         });
     }
 
+    // Declared outside the maintenance branch so the HTTP surface below can
+    // report the facets whether or not a relay was built. A maintenance-mode
+    // node runs no relay and reports `configured: false`, which is the honest
+    // answer rather than a green one.
+    let mut event_relay_handles: Option<crate::event_relay::wiring::EventRelayHandles> = None;
+
     if !is_maintenance {
         let (notification, notification_service) = configure_notification(
             &mut endpoints,
@@ -2164,6 +2196,21 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             &settings.notification,
             local_store().as_ref(),
             &settings.plugins,
+        )
+        .await?;
+
+        // CR-032 / WP-119 Step B. Built after the notification plugin so a
+        // misconfigured notification mode is reported by the mode check rather
+        // than by a confusing gateway-connect failure, and before the gRPC
+        // surface so a cell that cannot relay never accepts a mutation that
+        // would append a row nothing will publish. Returns `None` on every cell
+        // that has not set `[outbox_relay] enabled = true`, which is all of
+        // them today.
+        event_relay_handles = crate::event_relay::wiring::configure_event_relay(
+            &settings,
+            configured_domain_identity.as_ref(),
+            &mut endpoints,
+            _shutdown_rx.clone(),
         )
         .await?;
 
@@ -2430,6 +2477,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let mutable_store = mutable_store.clone();
             let shutdown_rx = _shutdown_rx.clone();
             let drain_state = drain_state.clone();
+            let event_relay_readiness = event_relay_handles
+                .as_ref()
+                .map(|handles| handles.readiness.clone());
 
             lore_spawn!(
                 endpoints,
@@ -2439,8 +2489,11 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     mutable_store,
                     jwt_verifier,
                     shutdown_rx,
-                    drain_state,
-                    graceful_drain,
+                    HttpSurfaceFacets {
+                        drain_state,
+                        graceful_drain,
+                        event_relay: event_relay_readiness,
+                    },
                 )
             );
         }

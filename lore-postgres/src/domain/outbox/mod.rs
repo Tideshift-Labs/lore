@@ -16,7 +16,8 @@
 //!   `aggregate_version` is now a checked encoding rather than opaque bytes.
 //! * [`version`] — that encoding.
 //! * [`relay`] — the relay-side store: claim, acknowledge, retry, dead letter,
-//!   epoch-reset requeue, lookup, backlog, admission.
+//!   epoch-reset requeue, lookup, backlog, admission, and the schema-state read
+//!   Step B's startup gate refuses on.
 //!
 //! **The relay worker loop is not here.** It is WP-119 Step B, in `lore-server`.
 //! Nothing in this module publishes, waits, or decides a backoff. The receiver
@@ -24,6 +25,9 @@
 //! retention pruning are Step C and are likewise absent.
 
 pub mod append;
+/// WP-116's transaction-local event builders for the pinned CR-032 event set.
+/// Producer-side only; nothing here appends, publishes, or decides anything.
+pub mod builders;
 pub mod relay;
 pub mod schema;
 pub mod version;
@@ -42,6 +46,7 @@ pub use relay::DeadLetterOutcome;
 pub use relay::OutboxBacklog;
 pub use relay::OutboxEventRecord;
 pub use relay::OutboxRow;
+pub use relay::OutboxSchemaState;
 pub use schema::OUTBOX_BASE_API_VERSION;
 pub use schema::OUTBOX_RELAY_SCHEMA_VERSION;
 pub use schema::OUTBOX_SCHEMA;
