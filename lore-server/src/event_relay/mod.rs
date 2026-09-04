@@ -16,7 +16,9 @@
 //! | [`publisher`] | the `DurablePublisher` seam over WP-111's gateway client |
 //! | [`envelope_map`] | committed row to private `DURABLE_INVALIDATION` envelope |
 //! | [`worker`] | the bounded claim/publish/settle loop |
-//! | [`evaluator_task`] | the bounded `consumer_safe` and retention loop |
+//! | [`evaluator_task`] | the bounded `consumer_safe` loop |
+//! | [`prune_task`] | the bounded, drain-aware retention schedule |
+//! | [`operator`] | `loreserver outbox`, the bounded operator recovery surface |
 //! | [`reset_wire`] | the frozen `StreamResetService` schema and derivation |
 //! | [`reset_service`] | that service's authentication and receipt orchestration |
 //! | [`readiness`] | the relay, event, and receiver facets, separate from storage readiness |
@@ -53,23 +55,31 @@
 //! so a relay cannot conflate them, and the split between these two modules is
 //! that separation made structural.
 //!
+//! # The operator surface is out-of-process and read-mostly
+//!
+//! [`operator`] is `loreserver outbox`, a set of subcommands that load the same
+//! settings a serving process would, run exactly one bounded operation, and
+//! exit. It binds no endpoint and starts no worker, so it can be run against a
+//! cell whose relay is disabled or wedged — which is when an operator needs it.
+//! Its two writes (dead-letter requeue and obsolete-with-proof) go through the
+//! same fenced compare-and-set the relay itself uses; it has no privileged
+//! path.
+//!
 //! # What is still absent
 //!
-//! The operator command surface (status, inspection, replay, dead-letter
-//! disposition) is Phase 8's, and a real pruning schedule beyond
-//! [`evaluator_task`]'s own tick is too. WP-111 Phase 3 owns the durable
-//! receiver itself: this package projects its membership and checkpoints, and
-//! never consumes on its behalf.
-//!
-//! TODO(WP-119 Phase 8): the operator command surface and a pruning schedule.
+//! WP-111 Phase 3 owns the durable receiver itself: this package projects its
+//! membership and checkpoints, and never consumes on its behalf.
 
 pub mod admission;
 pub mod config;
 pub mod envelope_map;
 pub mod evaluator_task;
 pub mod metrics;
+pub mod operator;
+pub mod prune_task;
 pub mod publisher;
 pub mod readiness;
+pub mod reset_budget;
 pub mod reset_service;
 pub mod reset_wire;
 pub mod retry_info;
@@ -81,10 +91,12 @@ pub use admission::OutboxAdmission;
 pub use config::EventRelayConfig;
 pub use config::EventRelayConfigError;
 pub use config::RelayBackoff;
+pub use config::RetentionConfig;
 pub use envelope_map::EnvelopeSource;
 pub use envelope_map::MapFailure;
 pub use envelope_map::map_event;
 pub use evaluator_task::ConsumerSafetyTask;
+pub use prune_task::RetentionTask;
 pub use publisher::DurablePublisher;
 pub use readiness::EventRelayReadiness;
 pub use readiness::ReadinessSnapshot;

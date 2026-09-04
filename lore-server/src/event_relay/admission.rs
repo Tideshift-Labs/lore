@@ -85,14 +85,59 @@ use crate::event_relay::retry_info;
 /// The bounded retry hint attached to a rejection.
 ///
 /// CR-032 requires the `RetryInfo` to be bounded and to fit one measured
-/// end-to-end elapsed and attempt budget with the real Lore client policy. A
-/// fixed small delay is the conservative choice while that budget is still
-/// unmeasured: it cannot exceed a client's patience on its own, and the backlog
-/// that caused the rejection drains on the relay's timescale, not the client's.
+/// end-to-end elapsed and attempt budget with the real Lore client policy.
+/// WP-119 Phase 8 measured the drain rate this is derived from; it is no longer
+/// a placeholder.
 ///
-/// PIN(WP-119): the value is a placeholder until Phase 8's load test measures
-/// the real drain rate. Raising it is a reviewed change, not a tuning knob.
-pub const ADMISSION_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// # Two independent floors, and the larger one wins
+///
+/// **The cache refresh.** This gate does not probe the database per mutation:
+/// it reads a verdict the worker's readiness tick refreshes every
+/// `readiness_probe_interval`. A client retrying sooner than one whole interval
+/// is therefore *guaranteed* to read the identical cached verdict and be
+/// refused again for a reason that has not been re-examined. The delay must
+/// clear one interval with margin, and
+/// [`super::config::EventRelayConfig::from_settings`] enforces the other half
+/// of that: a `readiness_probe_interval` at or above this value is a named
+/// startup refusal, not a silent inversion.
+///
+/// **Relay progress.** The retry should also arrive after the relay has had
+/// time to change the answer rather than merely to re-report it. Measured
+/// (`cargo test -p lore-server --test outbox_drain_rate -- --ignored
+/// --nocapture`, PostgreSQL 16 on the local dataplane container, 10,000 seeded
+/// pending rows of 512-byte payload, publishing through WP-111's in-process
+/// `FakeGateway`, debug build):
+///
+/// | | |
+/// | --- | --- |
+/// | drain elapsed | 49.2 s |
+/// | rows/second | 203 |
+/// | claim batches | 100 at 100 rows |
+/// | slowest batch | 4.11 s |
+///
+/// Ten seconds is more than two of that run's slowest claim-publish-settle
+/// batches, so a retry always lands after at least one whole settle cycle. It
+/// is also two full readiness intervals *at the shipped five-second default* —
+/// though the configuration bound is only `<`, so a cell that widened the probe
+/// to nine seconds gets one refresh rather than two. One is the load-bearing
+/// claim: it is what makes the retry read a verdict that was re-examined.
+///
+/// **The measurement's two opposing biases, stated rather than netted.** The
+/// fake gateway publishes in-process with no network, which makes 203 rows/s an
+/// over-estimate of a production drain; the debug build makes it an
+/// under-estimate. Neither is corrected for, because the derivation above does
+/// not rest on the rate being accurate — it rests on ten seconds covering
+/// several batches at any rate in this neighbourhood, which both biases leave
+/// true.
+///
+/// # The ceiling
+///
+/// CR-032 caps the delay by the documented client retry budget: activation is
+/// blocked if a generic client's `RESOURCE_EXHAUSTED` retry can exceed it. Ten
+/// seconds leaves a six-attempt client inside one minute of elapsed time, which
+/// is well inside any budget the real Lore client policy could document.
+/// Raising it further is a reviewed change, not a tuning knob.
+pub const ADMISSION_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 /// Consecutive failed refreshes after which a standing `Reject` is dropped.
 ///

@@ -163,6 +163,15 @@ pub struct Cli {
     /// immutable-store mode is `postgres`.
     #[arg(long)]
     pub rebuild_postgres_metering: bool,
+
+    /// A maintenance operation to run instead of serving.
+    ///
+    /// Optional, so `loreserver` with no arguments still starts a server
+    /// exactly as before. See `event_relay::operator` for why CR-032's operator
+    /// recovery surface is a subcommand rather than another flag beside
+    /// `--rebuild-postgres-metering`.
+    #[command(subcommand)]
+    pub command: Option<crate::event_relay::operator::MaintenanceCommand>,
 }
 
 fn ensure_postgres_rebuild_mode(mode: &str) -> Result<()> {
@@ -248,6 +257,10 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
     let (settings, settings_hash) = Settings::load(cli.config.as_deref(), cli.env.as_deref())?;
     let runtime_shutdown_timeout = settings.server.runtime_shutdown_timeout_seconds;
     let rebuild_metering = cli.rebuild_postgres_metering;
+    let maintenance = cli.command;
+    // Both maintenance routes exit without binding an endpoint, so neither
+    // waits on the endpoint-drain timeout below.
+    let serving = !rebuild_metering && maintenance.is_none();
 
     lore_base::log::set_log_callback(Some(server_log_dispatch));
 
@@ -272,13 +285,18 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
                 // deployment scripts can parse it without depending on the tracing format.
                 println!("{associated_hash_count}");
                 Ok(())
+            } else if let Some(command) = maintenance.as_ref() {
+                // CR-032's operator recovery surface (WP-119 Phase 8). One
+                // bounded operation against the configured cell, then exit; no
+                // endpoint is bound and no relay worker starts.
+                crate::event_relay::operator::run(command, &settings).await
             } else {
                 async_main((settings, settings_hash), config).await
             }
         })
     });
 
-    if !rebuild_metering {
+    if serving {
         info!("Wait up to {runtime_shutdown_timeout} seconds for runtime shutdown");
     }
     lore_base::runtime::runtime_shutdown_timeout(Duration::from_secs(

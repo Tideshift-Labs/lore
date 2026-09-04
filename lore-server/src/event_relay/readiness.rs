@@ -103,6 +103,22 @@ pub struct ReadinessSnapshot {
     pub durable_receiver_lag: u64,
     /// The membership generation the receiver is running, once it has one.
     pub durable_receiver_generation: Option<i64>,
+    /// Age of the last retention sweep, if one has run (WP-119 Phase 8).
+    ///
+    /// **Diagnostic only. It gates no facet, deliberately.** Retention falling
+    /// behind costs disk; it never makes an event undelivered, unreplayable, or
+    /// a consumer unsafe. Wiring it into a readiness facet would let a full
+    /// disk's early warning take a healthy cell out of rotation, and would
+    /// couple a background sweep to the RPC-serving gate the way CR-032
+    /// separates storage readiness from event readiness precisely to avoid.
+    pub retention_sweep_age: Option<Duration>,
+    /// Rows the last sweep reaped, across both tables.
+    pub retention_last_reaped: u64,
+    /// Why the last sweep proved nothing reapable, from the evaluator's own
+    /// closed label set. `None` when it completed or has not run.
+    pub retention_block: Option<&'static str>,
+    /// Whether the last sweep failed outright, as opposed to being blocked.
+    pub retention_failed: bool,
 }
 
 /// Reasons the relay facet reports false. Fixed strings; never interpolated.
@@ -138,6 +154,19 @@ struct ReceiverObservation {
     required_receivers: usize,
 }
 
+/// The last retention sweep's outcome (WP-119 Phase 8).
+///
+/// Diagnostic, not a facet. See [`ReadinessSnapshot::retention_sweep_age`].
+#[derive(Debug, Clone)]
+struct RetentionObservation {
+    at: Instant,
+    reaped: u64,
+    /// The evaluator's own block label when the sweep proved nothing reapable.
+    block: Option<&'static str>,
+    /// Whether the sweep failed rather than being blocked.
+    failed: bool,
+}
+
 /// The shared readiness handle. Written by the worker loop, read by the health
 /// surface.
 #[derive(Debug)]
@@ -145,6 +174,7 @@ pub struct EventRelayReadiness {
     loop_running: AtomicBool,
     last: Mutex<Option<Observation>>,
     last_receiver: Mutex<Option<ReceiverObservation>>,
+    last_retention: Mutex<Option<RetentionObservation>>,
     /// This process's own durable receiver, attached once by server
     /// construction when the cell declares one.
     ///
@@ -178,6 +208,7 @@ impl EventRelayReadiness {
             loop_running: AtomicBool::new(false),
             last: Mutex::new(None),
             last_receiver: Mutex::new(None),
+            last_retention: Mutex::new(None),
             durable_receiver: OnceLock::new(),
             max_oldest_unpublished,
             // Doubling the interval gives one whole missed probe of tolerance,
@@ -251,6 +282,40 @@ impl EventRelayReadiness {
         });
     }
 
+    /// Record one completed retention sweep (WP-119 Phase 8).
+    ///
+    /// `block` is the evaluator's own closed label when the sweep proved
+    /// nothing reapable — the same label set the receiver facet reports, so the
+    /// two never disagree about why a cell is holding rows.
+    pub fn record_retention_sweep(
+        &self,
+        reaped: u64,
+        dead_letters: u64,
+        block: Option<&'static str>,
+    ) {
+        *self.lock_retention() = Some(RetentionObservation {
+            at: Instant::now(),
+            reaped: reaped.saturating_add(dead_letters),
+            block,
+            failed: false,
+        });
+    }
+
+    /// Record a sweep that could not run or could not finish.
+    ///
+    /// Kept distinct from a blocked sweep for the reason
+    /// `metrics::SWEEP_BLOCKED` records: a cell holding rows because a receiver
+    /// is behind is retention working, and a cell holding rows because the
+    /// sweep is erroring is not.
+    pub fn record_retention_failure(&self) {
+        *self.lock_retention() = Some(RetentionObservation {
+            at: Instant::now(),
+            reaped: 0,
+            block: None,
+            failed: true,
+        });
+    }
+
     /// All three facets plus the evidence behind them.
     pub fn snapshot(&self) -> ReadinessSnapshot {
         let loop_running = self.loop_running.load(Ordering::Relaxed);
@@ -298,6 +363,10 @@ impl EventRelayReadiness {
         // and on every blocked boundary, so there is no observation to age.
         let durable = self.durable_receiver.get().map(|handle| handle.snapshot());
 
+        // Diagnostic only: read here so one snapshot carries every fact, and
+        // deliberately not folded into any of the three facets above.
+        let retention = self.lock_retention().clone();
+
         ReadinessSnapshot {
             relay_ready: relay_reason.is_none(),
             event_ready,
@@ -316,6 +385,10 @@ impl EventRelayReadiness {
             durable_receiver_reason: durable.as_ref().and_then(|snapshot| snapshot.reason),
             durable_receiver_lag: durable.as_ref().map_or(0, |snapshot| snapshot.lag),
             durable_receiver_generation: durable.as_ref().and_then(|snapshot| snapshot.generation),
+            retention_sweep_age: retention.as_ref().map(|o| o.at.elapsed()),
+            retention_last_reaped: retention.as_ref().map_or(0, |o| o.reaped),
+            retention_block: retention.as_ref().and_then(|o| o.block),
+            retention_failed: retention.as_ref().is_some_and(|o| o.failed),
         }
     }
 
@@ -348,6 +421,14 @@ impl EventRelayReadiness {
     /// Same poisoning rationale as [`Self::lock`].
     fn lock_receiver(&self) -> std::sync::MutexGuard<'_, Option<ReceiverObservation>> {
         match self.last_receiver.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Same poisoning rationale as [`Self::lock`].
+    fn lock_retention(&self) -> std::sync::MutexGuard<'_, Option<RetentionObservation>> {
+        match self.last_retention.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }

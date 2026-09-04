@@ -867,4 +867,164 @@ CREATE INDEX IF NOT EXISTS lore_outbox_events_accepted_sequence
 CREATE INDEX IF NOT EXISTS lore_outbox_events_safe_retention
     ON lore_outbox_events (created_at, event_id)
     WHERE state = 'consumer_safe';
+
+-- ---------------------------------------------------------------------------
+-- Phase 8 operator replay audit (CR-032; WP-119 Phase 8)
+--
+-- CR-032: "Replay reuses the original event and idempotency keys and records an
+-- operator/reason audit field." The audit lives ON the row rather than in a
+-- side table, because what an operator needs when they find a pending row that
+-- should have published days ago is why it is pending again, and a join they
+-- have to remember to write is a fact they will read without.
+--
+-- `ADD COLUMN IF NOT EXISTS`, never an edit to a `CREATE TABLE IF NOT EXISTS`
+-- body: that body is silently skipped on a database that already has the table.
+ALTER TABLE lore_outbox_events
+    ADD COLUMN IF NOT EXISTS replay_count integer NOT NULL DEFAULT 0
+        CHECK (replay_count >= 0),
+    ADD COLUMN IF NOT EXISTS replayed_at timestamptz,
+    ADD COLUMN IF NOT EXISTS replay_actor text
+        CHECK (octet_length(replay_actor) BETWEEN 1 AND 256),
+    ADD COLUMN IF NOT EXISTS replay_reason text
+        CHECK (octet_length(replay_reason) BETWEEN 1 AND 1024);
+
+DO $outbox_replay_constraints$
+BEGIN
+    -- The three audit facts are one fact. A row carrying an actor with no
+    -- reason, or a replay count with no actor, records that a replay happened
+    -- while withholding the half CR-032 actually requires -- and the operator
+    -- procedure ends at "clear the event-readiness incident", which needs the
+    -- reason to clear it against.
+    --
+    -- Three pairwise equalities rather than one grouped predicate, for the same
+    -- reason `lore_outbox_events_publication_shape` is a CASE: an equality
+    -- between two disjunctions is satisfied by a row that sets exactly one
+    -- column on each side.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_events_replay_shape'
+          AND conrelid = 'lore_outbox_events'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_events
+            ADD CONSTRAINT lore_outbox_events_replay_shape CHECK (
+                (replayed_at IS NULL) = (replay_actor IS NULL)
+                AND (replayed_at IS NULL) = (replay_reason IS NULL)
+                AND (replayed_at IS NULL) = (replay_count = 0)
+            );
+    END IF;
+END
+$outbox_replay_constraints$;
+
+-- The replay window scan: broker-accepted rows for one cell inside CR-032's
+-- 24-hour window. Literal predicate, same reason as every other partial index
+-- in this schema -- and no non-partial index leads with `broker_accepted_at`,
+-- so a bound-parameter spelling of the state falls back to a sequential scan of
+-- the whole table.
+--
+-- `cell_id` leads because every operator command is scoped to the configured
+-- cell before it is scoped to anything else, so the equality that can never be
+-- absent is the one that should cut the scan first.
+CREATE INDEX IF NOT EXISTS lore_outbox_events_replay_window
+    ON lore_outbox_events (cell_id, broker_accepted_at, event_id)
+    WHERE state = 'broker_accepted';
+-- Operator inspection of one repository, scoped to the cell. The base
+-- `lore_outbox_events_repository` index leads with `repository_id` and carries
+-- no cell, so it answers a producer's own lookup but cannot bound an operator
+-- listing to the configured cell without a filter step.
+CREATE INDEX IF NOT EXISTS lore_outbox_events_operator_repository
+    ON lore_outbox_events (cell_id, repository_id, created_at, event_id);
+
+-- ---------------------------------------------------------------------------
+-- Unpublished-since, and the replay audit's survival through a dead letter
+-- (CR-032; WP-119 Phase 8, reviewer findings 1 and 2)
+--
+-- `unpublished_since` is the instant a row entered its CURRENT publication
+-- cycle. It is what CR-032's "oldest-unpublished age" actually means, and it is
+-- not `created_at`.
+--
+-- The distinction had no observable effect until Phase 8 gave an operator a way
+-- to return a published row to `pending`. A row created seven days ago and
+-- replayed one second ago is one second behind, not seven days; measuring from
+-- `created_at` made the replay itself report a week-old backlog, which is above
+-- both the 30-second readiness threshold and the five-minute admission limit —
+-- so the recovery command closed the cell's own write admission the moment it
+-- succeeded. Measured on PostgreSQL 16: one replayed row, sole pending row,
+-- `oldest_pending_age = 604831s`.
+--
+-- `available_at` was the tempting existing column and is wrong for this: the
+-- retry backoff moves it forward on every failed attempt, so a row that has
+-- been failing for hours would report an age near zero and hide exactly the
+-- stuck backlog the probe exists to find.
+--
+-- The `DEFAULT clock_timestamp()` is load-bearing rather than cosmetic. It is
+-- evaluated per row on any INSERT that does not name the column, so the
+-- producer-side `append()` path and `requeue_dead_letter`'s reinstating
+-- `INSERT ... SELECT` both get the correct value without either statement
+-- having to know this column exists.
+--
+-- **This ALTER rewrites the table on a populated cell, and the boot-time
+-- `ensure_schema` transaction is where it would run.** `clock_timestamp()` is
+-- VOLATILE, and PostgreSQL's add-a-column-with-a-default fast path applies only
+-- to a non-volatile default; a volatile one is a full rewrite holding ACCESS
+-- EXCLUSIVE. So is the index below, which is built non-CONCURRENTLY because
+-- `ensure_schema` runs inside a transaction and cannot do otherwise.
+--
+-- Both are safe today for the reason the SCHEMA-119 block above records: no
+-- outbox row has ever been written in production, so every cell applies this to
+-- an empty table. That is a fact about today, not a property of this DDL. If a
+-- populated cell ever has to take this migration, do the column and the index
+-- out of band first -- the index with CONCURRENTLY, checking
+-- `pg_index.indisvalid` afterwards -- and only then roll the binary, exactly as
+-- the schema-bootstrap rules for this crate require.
+ALTER TABLE lore_outbox_events
+    ADD COLUMN IF NOT EXISTS unpublished_since timestamptz NOT NULL
+        DEFAULT clock_timestamp();
+
+-- The age probe reads this column, not `created_at`. Partial on the literal
+-- `state = 'pending'`, same rule as every other partial index here.
+--
+-- `lore_outbox_events_pending_created` is deliberately KEPT rather than
+-- replaced: it still answers the `created_at, event_id` scan order, and
+-- dropping an index inside the boot-time `ensure_schema` transaction is a
+-- different and riskier operation than adding one.
+CREATE INDEX IF NOT EXISTS lore_outbox_events_pending_unpublished
+    ON lore_outbox_events (unpublished_since)
+    WHERE state = 'pending';
+
+-- The replay audit follows the event onto the dead-letter table.
+--
+-- Without these, the audit CR-032 requires is lost on precisely the path an
+-- incident review would ask about: a replayed row that then failed terminally
+-- copies to `lore_outbox_dead_letters`, and a later requeue reinstates it with
+-- `replay_count = 0` and a null actor. Reproduced before the fix.
+--
+-- The evidence copy is immutable, so these are carried verbatim by
+-- `dead_letter` and carried back verbatim by `requeue_dead_letter`; nothing
+-- recomputes them.
+ALTER TABLE lore_outbox_dead_letters
+    ADD COLUMN IF NOT EXISTS replay_count integer NOT NULL DEFAULT 0
+        CHECK (replay_count >= 0),
+    ADD COLUMN IF NOT EXISTS replayed_at timestamptz,
+    ADD COLUMN IF NOT EXISTS replay_actor text
+        CHECK (octet_length(replay_actor) BETWEEN 1 AND 256),
+    ADD COLUMN IF NOT EXISTS replay_reason text
+        CHECK (octet_length(replay_reason) <= 1024);
+
+DO $outbox_dead_letter_replay_constraints$
+BEGIN
+    -- The same three-way shape the live table carries, for the same reason.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_dead_letters_replay_shape'
+          AND conrelid = 'lore_outbox_dead_letters'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_dead_letters
+            ADD CONSTRAINT lore_outbox_dead_letters_replay_shape CHECK (
+                (replayed_at IS NULL) = (replay_actor IS NULL)
+                AND (replayed_at IS NULL) = (replay_reason IS NULL)
+                AND (replayed_at IS NULL) = (replay_count = 0)
+            );
+    END IF;
+END
+$outbox_dead_letter_replay_constraints$;
 "#;

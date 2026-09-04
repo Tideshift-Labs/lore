@@ -225,6 +225,32 @@ pub struct OutboxRow {
     pub acceptance: Option<BrokerAcceptanceRecord>,
     /// When the broker accepted, present exactly when `acceptance` is.
     pub broker_accepted_at: Option<SystemTime>,
+    /// How many operator replays this row has been through (WP-119 Phase 8).
+    ///
+    /// Zero on a row no operator has ever replayed, which is every row the
+    /// relay produced on its own.
+    pub replay_count: i32,
+    /// The audit trail CR-032 requires on a replay, present exactly when
+    /// `replay_count` is non-zero. `lore_outbox_events_replay_shape` makes the
+    /// three all-set or all-null together.
+    pub replay: Option<ReplayAudit>,
+}
+
+/// The operator/reason audit CR-032 requires a replay to write to the row.
+///
+/// Only the **most recent** replay is retained. A row replayed twice records
+/// the second decision and a count of two; the first decision's own record is
+/// the operator's incident reference, which CR-032 already requires to be
+/// exported. Keeping a full history here would put an unbounded array on the
+/// hottest table in the relay's scan path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayAudit {
+    /// Who ordered the replay.
+    pub actor: String,
+    /// Why.
+    pub reason: String,
+    /// When, by the database clock.
+    pub at: SystemTime,
 }
 
 /// Bounded backlog facts, from one query.
@@ -246,8 +272,16 @@ pub struct OutboxBacklog {
     pub pending_count: i64,
     /// Sum of payload lengths over the same unpublished set and bounded window.
     pub pending_bytes: i64,
-    /// Age of the oldest pending row by the database clock. `None` when there
+    /// How long the oldest unpublished row has been unpublished **in its
+    /// current publication cycle**, by the database clock. `None` when there
     /// are no pending rows.
+    ///
+    /// Measured from `unpublished_since`, not `created_at`. The two are the
+    /// same for every row the producer wrote and never differ until something
+    /// returns a published row to `pending` — a replay or a broker epoch reset.
+    /// A row created a week ago and replayed a second ago is one second behind,
+    /// and measuring it as a week would close the cell's admission gate on the
+    /// strength of the recovery that fixed it.
     pub oldest_pending_age: Option<Duration>,
     /// The leased subset of `pending_count`: rows carrying a claim owner and
     /// expiry, expired or not. Capped at the ceiling.
@@ -356,7 +390,7 @@ pub enum DeadLetterOutcome {
 
 /// The identity/payload columns, in one place so every `SELECT` that decodes an
 /// [`OutboxEventRecord`] lists exactly these and cannot drift from the decoder.
-const EVENT_COLUMNS: &str = "event_id, cell_id, idempotency_key, \
+pub(super) const EVENT_COLUMNS: &str = "event_id, cell_id, idempotency_key, \
      repository_id, repository_generation, \
      event_kind, aggregate_kind, aggregate_id, aggregate_version, \
      payload_schema_version, payload, created_at";
@@ -377,7 +411,7 @@ fn idempotency_key_from(row: &Row) -> Result<[u8; 32], DomainError> {
     })
 }
 
-fn event_from(row: &Row) -> Result<OutboxEventRecord, DomainError> {
+pub(super) fn event_from(row: &Row) -> Result<OutboxEventRecord, DomainError> {
     Ok(OutboxEventRecord {
         event_id: row.get("event_id"),
         cell_id: row.get("cell_id"),
@@ -398,7 +432,7 @@ fn event_from(row: &Row) -> Result<OutboxEventRecord, DomainError> {
 // Bounded input validation
 // ---------------------------------------------------------------------------
 
-fn bounded(label: &str, value: &str, max: usize) -> Result<(), DomainError> {
+pub(super) fn bounded(label: &str, value: &str, max: usize) -> Result<(), DomainError> {
     if value.is_empty() {
         return Err(DomainError::InvalidInput(format!(
             "outbox {label} is empty"
@@ -796,6 +830,14 @@ pub async fn dead_letter(
         return Ok(CasOutcome::AlreadyAccepted);
     }
 
+    // The replay audit rides along, both on the insert and on the conflict
+    // update (WP-119 Phase 8). Without it, the one path an incident review
+    // actually asks about — a row an operator replayed, which then failed
+    // terminally — reached the operator queue with no record that it had ever
+    // been replayed, and a later requeue reinstated it at `replay_count = 0`
+    // with a null actor. The evidence copy is immutable, so these are carried
+    // verbatim rather than recomputed.
+    //
     // A repeat dead-letter (requeued, then terminally failed again) must return
     // the row to `parked` or it would never reach the operator queue a second
     // time -- but overwriting the disposition in place would delete the record
@@ -810,6 +852,7 @@ pub async fn dead_letter(
              event_kind, aggregate_kind, aggregate_id, aggregate_version, \
              payload_schema_version, payload, created_at, attempt_count, \
              claim_generation, \
+             replay_count, replayed_at, replay_actor, replay_reason, \
              terminal_class, first_failed_at, last_failed_at, disposition \
          ) \
          SELECT event_id, cell_id, idempotency_key, \
@@ -817,11 +860,16 @@ pub async fn dead_letter(
                 event_kind, aggregate_kind, aggregate_id, aggregate_version, \
                 payload_schema_version, payload, created_at, attempt_count, \
                 claim_generation, \
+                replay_count, replayed_at, replay_actor, replay_reason, \
                 $2, clock_timestamp(), clock_timestamp(), $3 \
          FROM lore_outbox_events WHERE event_id = $1 \
          ON CONFLICT (event_id) DO UPDATE SET \
              terminal_class = EXCLUDED.terminal_class, \
              attempt_count = EXCLUDED.attempt_count, \
+             replay_count = EXCLUDED.replay_count, \
+             replayed_at = EXCLUDED.replayed_at, \
+             replay_actor = EXCLUDED.replay_actor, \
+             replay_reason = EXCLUDED.replay_reason, \
              claim_generation = GREATEST(lore_outbox_dead_letters.claim_generation, \
                                          EXCLUDED.claim_generation), \
              last_failed_at = EXCLUDED.last_failed_at, \
@@ -859,9 +907,15 @@ pub async fn dead_letter(
 /// that performs the reinstatement.
 ///
 /// The reinstated row keeps its `event_id`, `idempotency_key`, and every
-/// identity field. `attempt_count` resets to 0, the lease is empty, and there
-/// is no publication result. The evidence row is kept and marked `requeued`
-/// rather than deleted.
+/// identity field, **including any replay audit** the row carried when it went
+/// terminal. `attempt_count` resets to 0, the lease is empty, and there is no
+/// publication result. The evidence row is kept and marked `requeued` rather
+/// than deleted.
+///
+/// `unpublished_since` is set to now rather than carried: the row is entering a
+/// fresh publication cycle, and dating it from the original append would make a
+/// requeued dead letter report its whole terminal lifetime as relay lag and
+/// close the cell's admission gate.
 ///
 /// **`claim_generation` does NOT reset.** It is reinstated at the dead letter's
 /// stored generation **plus one**, which is strictly above every generation any
@@ -932,13 +986,17 @@ pub async fn requeue_dead_letter(
                  repository_id, repository_generation, \
                  event_kind, aggregate_kind, aggregate_id, aggregate_version, \
                  payload_schema_version, payload, \
-                 state, created_at, available_at, claim_generation, attempt_count \
+                 state, created_at, available_at, unpublished_since, \
+                 claim_generation, attempt_count, \
+                 replay_count, replayed_at, replay_actor, replay_reason \
              ) \
              SELECT event_id, cell_id, idempotency_key, \
                     repository_id, repository_generation, \
                     event_kind, aggregate_kind, aggregate_id, aggregate_version, \
                     payload_schema_version, payload, \
-                    $2, created_at, clock_timestamp(), claim_generation + 1, 0 \
+                    $2, created_at, clock_timestamp(), clock_timestamp(), \
+                    claim_generation + 1, 0, \
+                    replay_count, replayed_at, replay_actor, replay_reason \
              FROM lore_outbox_dead_letters WHERE event_id = $1",
             &[&event_id, &OUTBOX_STATE_PENDING],
         )
@@ -1161,9 +1219,18 @@ pub async fn requeue_unsafe_for_epoch_reset(
 
         let requeued = tx
             .execute(
+                // `unpublished_since` restarts here for the same reason the
+                // operator replay restarts it (WP-119 Phase 8): these rows were
+                // published and are being returned to `pending` by a broker
+                // epoch reset, so their unpublished clock begins now. Leaving
+                // it at `created_at` would make an epoch reset on a
+                // week-old-but-published backlog report a week-old backlog and
+                // close the cell's admission gate, on rows the relay is not
+                // actually behind on.
                 "UPDATE lore_outbox_events SET \
                      state = 'pending', \
                      available_at = clock_timestamp(), \
+                     unpublished_since = clock_timestamp(), \
                      claim_generation = claim_generation + 1, \
                      stream_identity = NULL, \
                      stream_epoch = NULL, \
@@ -1219,11 +1286,7 @@ pub async fn lookup_by_idempotency_key(
     let row = client
         .query_opt(
             &format!(
-                "SELECT {EVENT_COLUMNS}, state, available_at, \
-                        claim_generation, claim_owner, claim_expires_at, \
-                        attempt_count, last_error_class, \
-                        stream_identity, stream_epoch, broker_sequence, \
-                        gateway_response_id, publisher_contract_version, broker_accepted_at \
+                "SELECT {EVENT_COLUMNS}, {ROW_STATE_COLUMNS} \
                  FROM lore_outbox_events WHERE cell_id = $1 AND idempotency_key = $2"
             ),
             &[&cell_id, &key],
@@ -1234,7 +1297,25 @@ pub async fn lookup_by_idempotency_key(
     let Some(row) = row else {
         return Ok(None);
     };
+    Ok(Some(row_from(&row)?))
+}
 
+/// The columns every `SELECT` decoding a full [`OutboxRow`] must list, beyond
+/// [`EVENT_COLUMNS`].
+///
+/// Same reason as `EVENT_COLUMNS`: the list and the decoder are one fact, and
+/// an operator listing that spelled its own subset would decode a row the
+/// lookup path could not, or silently drop a column added to one and not the
+/// other.
+pub(super) const ROW_STATE_COLUMNS: &str = "state, available_at, \
+     claim_generation, claim_owner, claim_expires_at, \
+     attempt_count, last_error_class, \
+     stream_identity, stream_epoch, broker_sequence, \
+     gateway_response_id, publisher_contract_version, broker_accepted_at, \
+     replay_count, replayed_at, replay_actor, replay_reason";
+
+/// Decode one row selected with `{EVENT_COLUMNS}, {ROW_STATE_COLUMNS}`.
+pub(super) fn row_from(row: &Row) -> Result<OutboxRow, DomainError> {
     // The `lore_outbox_events_publication_shape` CHECK makes these six columns
     // all-set or all-null together, so reading one of them decides whether the
     // record is present; the others are read unconditionally and would be
@@ -1248,8 +1329,16 @@ pub async fn lookup_by_idempotency_key(
         publisher_contract_version: row.get("publisher_contract_version"),
     });
 
-    Ok(Some(OutboxRow {
-        event: event_from(&row)?,
+    // Same shape argument, against `lore_outbox_events_replay_shape`.
+    let replayed_at: Option<SystemTime> = row.get("replayed_at");
+    let replay = replayed_at.map(|at| ReplayAudit {
+        actor: row.get("replay_actor"),
+        reason: row.get("replay_reason"),
+        at,
+    });
+
+    Ok(OutboxRow {
+        event: event_from(row)?,
         state: row.get("state"),
         available_at: row.get("available_at"),
         claim_generation: row.get("claim_generation"),
@@ -1259,7 +1348,9 @@ pub async fn lookup_by_idempotency_key(
         last_error_class: row.get("last_error_class"),
         acceptance,
         broker_accepted_at: row.get("broker_accepted_at"),
-    }))
+        replay_count: row.get("replay_count"),
+        replay,
+    })
 }
 
 /// Read the bounded backlog facts in one query.
@@ -1285,7 +1376,7 @@ pub async fn lookup_by_idempotency_key(
 ///   `octet_length` reads the length from the TOAST pointer without detoasting.
 ///   All figures PostgreSQL 16.15.
 /// * `oldest_pending_age` is a `min()` over the leading column of
-///   `lore_outbox_events_pending_created`, answered from the first live index
+///   `lore_outbox_events_pending_unpublished`, answered from the first live index
 ///   entry rather than by scanning — an `Index Only Scan` under a `Limit`.
 /// * `claimed_count` counts over `lore_outbox_events_claim_expiry`, partial on
 ///   `claim_expires_at IS NOT NULL`, so it holds only rows a worker currently
@@ -1311,7 +1402,7 @@ pub async fn backlog(client: &impl GenericClient) -> Result<OutboxBacklog, Domai
                (SELECT coalesce(sum(len), 0) FROM ( \
                     SELECT octet_length(payload) AS len FROM lore_outbox_events \
                     WHERE state = 'pending' LIMIT $1) AS b)::bigint AS pending_bytes, \
-               (SELECT extract(epoch FROM (clock_timestamp() - min(created_at))) \
+               (SELECT extract(epoch FROM (clock_timestamp() - min(unpublished_since))) \
                   FROM lore_outbox_events \
                  WHERE state = 'pending')::double precision AS oldest_pending_age_secs, \
                (SELECT count(*) FROM ( \
@@ -1369,7 +1460,8 @@ pub async fn admission_check(
 ) -> Result<AdmissionVerdict, DomainError> {
     let age_secs: Option<f64> = client
         .query_one(
-            "SELECT extract(epoch FROM (clock_timestamp() - min(created_at)))::double precision \
+            "SELECT extract(epoch FROM (clock_timestamp() - min(unpublished_since)))::double \
+               precision \
                AS oldest_pending_age_secs \
                FROM lore_outbox_events WHERE state = 'pending'",
             &[],

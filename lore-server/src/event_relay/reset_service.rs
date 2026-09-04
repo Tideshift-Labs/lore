@@ -47,11 +47,16 @@ use lore_postgres::domain::outbox::reset::ResetAcceptance;
 use lore_postgres::domain::outbox::reset::ResetReport;
 use lore_postgres::pool::Pool;
 use tonic::async_trait;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
 
 use crate::event_relay::metrics;
+use crate::event_relay::reset_budget;
+use crate::event_relay::reset_budget::Charge;
+use crate::event_relay::reset_budget::ReportBudget;
+use crate::event_relay::reset_budget::UNAUTHENTICATED_KEY;
 use crate::event_relay::reset_wire::RESET_SCHEMA_VERSION;
 use crate::event_relay::reset_wire::ResetReasonV1;
 use crate::event_relay::reset_wire::ResetReportErrorV1;
@@ -91,6 +96,12 @@ const RESET_REQUEUE_LOG_THRESHOLD: u64 = 100_000;
 pub struct StreamResetHandler {
     pool: Pool,
     cell_id: String,
+    /// Per-emitter diagnostic budget (WP-119 Phase 8).
+    ///
+    /// Rate-limits the **logging** of rejected reports, never a verdict. See
+    /// [`super::reset_budget`] for why the stronger design — refusing an
+    /// over-budget caller outright — is deliberately not taken.
+    budget: ReportBudget,
 }
 
 impl std::fmt::Debug for StreamResetHandler {
@@ -107,25 +118,103 @@ impl std::fmt::Debug for StreamResetHandler {
 impl StreamResetHandler {
     /// Build the service for one cell.
     pub fn new(pool: Pool, cell_id: String) -> Self {
-        Self { pool, cell_id }
+        Self {
+            pool,
+            cell_id,
+            budget: ReportBudget::default(),
+        }
     }
 
     /// Accept, replay, or reject one report. See the module documentation for
     /// the fixed order and why it is the security property.
+    ///
+    /// The budget charged on the failure paths below observes the outcome and
+    /// changes nothing about it. Every `?` here returns the same status it
+    /// always did, in the same order, whether or not the emitter is
+    /// quarantined.
     async fn serve(
         &self,
         request: tonic::Request<StreamResetReportV1>,
     ) -> Result<tonic::Response<StoredAck>, tonic::Status> {
-        // 1. Authentication, before anything reads the body.
-        let principal = authenticate(&request)?;
+        // 1. Authentication, before anything reads the body. A failure here has
+        //    no principal to key a budget on, so it charges the shared
+        //    unauthenticated bucket.
+        let principal = match authenticate(&request) {
+            Ok(principal) => principal,
+            Err(status) => {
+                self.note_rejection(UNAUTHENTICATED_KEY, metrics::RESET_UNAUTHENTICATED, || {
+                    "a stream reset report failed authentication".to_owned()
+                });
+                return Err(status);
+            }
+        };
         let report = request.into_inner();
         // 2. Authorization, before the stored-record comparison, so a
         //    key-probing caller cannot tell an existing detection from an
         //    absent one.
-        authorize(&self.cell_id, &principal, &report.cell_id)?;
+        if let Err(status) = authorize(&self.cell_id, &principal, &report.cell_id) {
+            self.note_rejection(&principal, metrics::RESET_UNAUTHORIZED, || {
+                "a stream reset report was refused by the cell authorization check".to_owned()
+            });
+            return Err(status);
+        }
         // 3. Derivation, exactly once, before any durable lookup.
-        let report = validate_and_convert(&report)?;
+        let report = match validate_and_convert(&report) {
+            Ok(report) => report,
+            Err(status) => {
+                self.note_rejection(&principal, metrics::RESET_MALFORMED, || {
+                    "a stream reset report failed its canonical derivation check".to_owned()
+                });
+                return Err(status);
+            }
+        };
         self.receipt(report, principal).await
+    }
+
+    /// Charge one rejection against its emitter's diagnostic budget, and log it
+    /// at the volume that budget allows.
+    ///
+    /// `detail` is a closure so an over-budget rejection does not pay to format
+    /// a message nothing will print — which is the cost this exists to bound.
+    ///
+    /// Returns nothing on purpose. There is no verdict here for a caller to
+    /// branch on: every call site has already decided its status, and a return
+    /// value would invite a future edit to gate that status on the budget.
+    fn note_rejection<F>(&self, principal: &str, outcome: &'static str, detail: F)
+    where
+        F: FnOnce() -> String,
+    {
+        metrics::record_reset_report(outcome);
+        match self.budget.charge(principal, std::time::Instant::now()) {
+            Charge::Report => {
+                warn!(cell_id = %self.cell_id, %principal, outcome, "{}", detail());
+            }
+            Charge::Quarantining => {
+                // The protected line. It is emitted even though the emitter has
+                // just crossed its budget, because it is the record that
+                // explains every rejection that follows it — an operator
+                // reading a suddenly quiet log needs to find this.
+                warn!(
+                    cell_id = %self.cell_id,
+                    %principal,
+                    outcome,
+                    budget = reset_budget::REJECTION_BUDGET,
+                    refill_seconds = reset_budget::REJECTION_REFILL_INTERVAL.as_secs(),
+                    "{}; this emitter has exhausted its diagnostic budget and further rejections \
+                     will be counted rather than logged. Its reports are still served unchanged.",
+                    detail()
+                );
+            }
+            Charge::Quarantined => {
+                metrics::record_quarantined_reset_report(outcome);
+                debug!(cell_id = %self.cell_id, %principal, outcome, "quarantined reset rejection");
+            }
+        }
+    }
+
+    /// Clear an emitter's budget after it succeeds.
+    fn note_success(&self, principal: &str) {
+        self.budget.forgive(principal);
     }
 }
 
@@ -149,7 +238,11 @@ fn authenticate<T>(request: &tonic::Request<T>) -> Result<String, tonic::Status>
         return Err(ResetReportErrorV1::UnauthenticatedReport.status());
     };
     let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref()).map_err(|error| {
-        warn!(%error, "a stream reset caller presented an unparseable leaf certificate");
+        // `debug!`, not `warn!`: the caller-facing refusal below is what the
+        // per-emitter diagnostic budget rate-limits, and a `warn!` here would
+        // route around it — an unauthenticated flood would fill the log through
+        // this line while every budgeted line stayed silent.
+        debug!(%error, "a stream reset caller presented an unparseable leaf certificate");
         ResetReportErrorV1::UnauthenticatedReport.status()
     })?;
     // The SAN's URI entry, not the subject DN and not the certificate itself.
@@ -181,11 +274,11 @@ fn authenticate<T>(request: &tonic::Request<T>) -> Result<String, tonic::Status>
 /// to.
 fn authorize(cell_id: &str, principal: &str, request_cell: &str) -> Result<(), tonic::Status> {
     let Some(principal_cell) = spiffe_cell(principal) else {
-        warn!(%cell_id, "a stream reset caller's principal names no cell segment");
+        debug!(%cell_id, "a stream reset caller's principal names no cell segment");
         return Err(ResetReportErrorV1::UnauthorizedReport.status());
     };
     if principal_cell != cell_id || request_cell != cell_id {
-        warn!(%cell_id, "a stream reset report named another cell");
+        debug!(%cell_id, "a stream reset report named another cell");
         return Err(ResetReportErrorV1::CrossCellReport.status());
     }
     Ok(())
@@ -387,6 +480,7 @@ impl StreamResetHandler {
                         );
                     }
                 }
+                self.note_success(&principal);
                 metrics::record_reset_report(metrics::RESET_REPLAYED);
                 info!(
                     cell_id = %self.cell_id,
@@ -442,6 +536,7 @@ impl StreamResetHandler {
                         "an epoch reset requeued an unusually large retained backlog"
                     );
                 }
+                self.note_success(&principal);
                 metrics::record_reset_report(metrics::RESET_ACCEPTED);
                 info!(
                     cell_id = %self.cell_id,
@@ -452,28 +547,38 @@ impl StreamResetHandler {
                 Ok(tonic::Response::new(StoredAck(stored.ack_bytes)))
             }
             ResetAcceptance::DetectionMismatch => {
-                metrics::record_reset_report(metrics::RESET_DETECTION_MISMATCH);
+                self.note_rejection(&principal, metrics::RESET_DETECTION_MISMATCH, || {
+                    "rejected a stream reset report whose detection did not match its stored \
+                     record"
+                        .to_owned()
+                });
                 Err(ResetReportErrorV1::ResetDetectionMismatch.status())
             }
             ResetAcceptance::PlacementMismatch { .. } => {
-                metrics::record_reset_report(metrics::RESET_PLACEMENT_MISMATCH);
+                self.note_rejection(&principal, metrics::RESET_PLACEMENT_MISMATCH, || {
+                    "rejected a stream reset report against a placement this cell does not hold"
+                        .to_owned()
+                });
                 Err(ResetReportErrorV1::PlacementMismatch.status())
             }
             ResetAcceptance::StaleOldStream { .. } => {
-                metrics::record_reset_report(metrics::RESET_STALE_OLD_STREAM);
+                self.note_rejection(&principal, metrics::RESET_STALE_OLD_STREAM, || {
+                    "rejected a stream reset report naming an old stream this cell has moved past"
+                        .to_owned()
+                });
                 Err(ResetReportErrorV1::StaleOldStream.status())
             }
             ResetAcceptance::InvalidSuccessor { rule } => {
-                metrics::record_reset_report(metrics::RESET_INVALID_SUCCESSOR);
-                warn!(
-                    cell_id = %self.cell_id,
-                    rule,
-                    "rejected a stream reset report with an invalid successor"
-                );
+                self.note_rejection(&principal, metrics::RESET_INVALID_SUCCESSOR, || {
+                    format!("rejected a stream reset report with an invalid successor: {rule}")
+                });
                 Err(ResetReportErrorV1::InvalidSuccessorStream.status())
             }
             ResetAcceptance::CellUnknown => {
-                metrics::record_reset_report(metrics::RESET_CELL_UNKNOWN);
+                self.note_rejection(&principal, metrics::RESET_CELL_UNKNOWN, || {
+                    "rejected a stream reset report on a cell with no outbox membership state"
+                        .to_owned()
+                });
                 // The cell has no membership state, so it has never been through
                 // cutover and holds no outbox rows a reset could void. Reported
                 // as a precondition rather than as a mismatch: nothing about the

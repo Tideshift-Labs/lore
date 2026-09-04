@@ -61,6 +61,11 @@ pub(crate) struct Instruments {
     evaluation_blocks: Counter<u64>,
     /// Rows reaped by retention pruning, by table.
     pruned_rows: Counter<u64>,
+    /// Retention sweeps, by outcome.
+    prune_sweeps: Counter<u64>,
+    /// Reset reports rejected while their emitter is diagnostically
+    /// quarantined, by rejection class.
+    quarantined_reset_reports: Counter<u64>,
     /// Stream reset reports, by outcome.
     reset_reports: Counter<u64>,
     /// The slowest required receiver's frontier lag, in rows, as last observed.
@@ -139,6 +144,16 @@ impl Instruments {
                 .u64_counter(provider.scope_name("prune.rows"))
                 .with_description("Outbox rows reaped by retention pruning, by table")
                 .build(),
+            prune_sweeps: meter
+                .u64_counter(provider.scope_name("prune.sweeps"))
+                .with_description("Outbox retention sweeps, by outcome")
+                .build(),
+            quarantined_reset_reports: meter
+                .u64_counter(provider.scope_name("reset.quarantined"))
+                .with_description(
+                    "Rejected stream reset reports from an emitter over its diagnostic budget",
+                )
+                .build(),
             reset_reports: meter
                 .u64_counter(provider.scope_name("reset.reports"))
                 .with_description("Stream reset reports served, by outcome")
@@ -204,6 +219,22 @@ pub(crate) const BLOCK_EMPTY_MEMBERSHIP: &str = "empty_required_membership";
 pub(crate) const BLOCK_MEMBER_NOT_READY: &str = "member_not_ready";
 pub(crate) const BLOCK_MISSING_CHECKPOINT: &str = "missing_checkpoint";
 
+/// The bounded retention-sweep outcome label set (WP-119 Phase 8).
+///
+/// `blocked` and `failed` are deliberately distinct. A blocked sweep is the
+/// retention rule working — some required receiver is behind, so nothing is
+/// reapable — while a failed one is a database or pool fault. Collapsing them
+/// would make a wedged cell and a healthy lagging one look the same on the one
+/// signal that could tell them apart.
+pub(crate) const SWEEP_COMPLETED: &str = "completed";
+pub(crate) const SWEEP_BLOCKED: &str = "blocked";
+/// A sweep that stopped early because the process is draining. Distinct from
+/// `completed` so a rolling restart does not read as a run of full sweeps that
+/// happened to reap nothing.
+pub(crate) const SWEEP_DRAINED: &str = "drained";
+pub(crate) const SWEEP_FAILED: &str = "failed";
+pub(crate) const SWEEP_UNAVAILABLE: &str = "pool_unavailable";
+
 /// The bounded prune-table label set.
 pub(crate) const PRUNED_EVENTS: &str = "events";
 pub(crate) const PRUNED_DEAD_LETTERS: &str = "dead_letters";
@@ -219,6 +250,13 @@ pub(crate) const RESET_PLACEMENT_MISMATCH: &str = "placement_mismatch";
 pub(crate) const RESET_STALE_OLD_STREAM: &str = "stale_old_stream";
 pub(crate) const RESET_INVALID_SUCCESSOR: &str = "invalid_successor";
 pub(crate) const RESET_CELL_UNKNOWN: &str = "cell_unknown";
+/// The three pre-receipt rejections (WP-119 Phase 8). Previously uncounted:
+/// they return before `receipt` runs, so a cell whose reports were all failing
+/// authentication or derivation recorded no reset outcome at all and looked
+/// identical to a cell nobody was reporting to.
+pub(crate) const RESET_UNAUTHENTICATED: &str = "unauthenticated";
+pub(crate) const RESET_UNAUTHORIZED: &str = "unauthorized";
+pub(crate) const RESET_MALFORMED: &str = "malformed";
 
 pub(crate) fn record_claimed_rows(rows: u64) {
     Instruments::instance().claimed_rows.add(rows, &[]);
@@ -301,6 +339,25 @@ pub(crate) fn record_pruned_rows(table: &'static str, rows: u64) {
     Instruments::instance()
         .pruned_rows
         .add(rows, &[KeyValue::new("table", table)]);
+}
+
+pub(crate) fn record_prune_sweep(outcome: &'static str) {
+    Instruments::instance()
+        .prune_sweeps
+        .add(1, &[KeyValue::new("outcome", outcome)]);
+}
+
+/// One rejected reset report from an emitter that is over its diagnostic
+/// budget.
+///
+/// The label is the **rejection class**, never the emitter principal: an
+/// emitter identity as a label is exactly the unbounded cardinality CR-032
+/// prohibits, and this counter exists because a misbehaving emitter is
+/// generating that cardinality in the first place.
+pub(crate) fn record_quarantined_reset_report(outcome: &'static str) {
+    Instruments::instance()
+        .quarantined_reset_reports
+        .add(1, &[KeyValue::new("outcome", outcome)]);
 }
 
 pub(crate) fn record_reset_report(outcome: &'static str) {

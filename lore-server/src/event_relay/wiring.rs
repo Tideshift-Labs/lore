@@ -70,6 +70,7 @@ use crate::event_relay::admission::OutboxAdmission;
 use crate::event_relay::config::EventRelayConfig;
 use crate::event_relay::envelope_map::EnvelopeSource;
 use crate::event_relay::evaluator_task::ConsumerSafetyTask;
+use crate::event_relay::prune_task::RetentionTask;
 use crate::event_relay::publisher::DurablePublisher;
 use crate::event_relay::readiness::EventRelayReadiness;
 use crate::event_relay::reset_service::StreamResetHandler;
@@ -97,12 +98,17 @@ const REMOTE_NOTIFICATION_MODE: &str = "remote";
 /// Connections in the relay's own pool.
 ///
 /// The publish loop is strictly sequential — one claim transaction, then one
-/// single-statement write per row — so its real concurrency is one. Step C adds
-/// two more borrowers on the same pool: the consumer-safety evaluator's own
-/// tick, and the stream-reset service, which takes a connection only when
-/// WP-110 actually reports a reset. Four leaves each of the three a connection
-/// and one spare, so a readiness probe never queues behind a claim and a reset
-/// receipt never queues behind a prune batch.
+/// single-statement write per row — so its real concurrency is one. Step C
+/// added two more borrowers on the same pool: the consumer-safety evaluator's
+/// own tick, and the stream-reset service, which takes a connection only when
+/// WP-110 actually reports a reset. Phase 8 added a fourth, the retention
+/// sweep, when it split retention out of the evaluator's tick — where it had
+/// been sharing the evaluator's single connection.
+///
+/// Five, so each of the four has a connection and one is spare: a readiness
+/// probe never queues behind a claim, and a reset receipt never queues behind a
+/// prune batch. Sizing it at exactly four would make every reset report wait on
+/// whichever loop happened to be mid-transaction.
 ///
 /// It is deliberately **not** the domain coordinator's pool. That pool is sized
 /// for a subsystem that is idle until cutover, and a long-running loop
@@ -114,7 +120,7 @@ const REMOTE_NOTIFICATION_MODE: &str = "remote";
 /// into that accounting the next time the inventory is revised; two
 /// connections is small enough not to move the sum today, which is why it is a
 /// constant rather than a knob.
-const RELAY_POOL_MAX: u32 = 4;
+const RELAY_POOL_MAX: u32 = 5;
 
 /// What server composition keeps after the relay is wired.
 pub struct EventRelayHandles {
@@ -404,6 +410,12 @@ pub fn spawn_event_relay(
         config.readiness_probe_interval,
         readiness.clone(),
     );
+    let retention = RetentionTask::new(
+        pool.clone(),
+        cell_id.clone(),
+        config.retention,
+        readiness.clone(),
+    );
     let reset_service = Arc::new(StreamResetHandler::new(pool.clone(), cell_id));
 
     // The gate is attached before the worker starts, so no window exists in
@@ -418,7 +430,8 @@ pub fn spawn_event_relay(
     let worker = EventRelayWorker::new(pool, publisher, config, readiness.clone(), source)
         .with_admission(admission.clone());
     lore_spawn!(endpoints, worker.run(shutdown.clone()));
-    lore_spawn!(endpoints, evaluator.run(shutdown));
+    lore_spawn!(endpoints, evaluator.run(shutdown.clone()));
+    lore_spawn!(endpoints, retention.run(shutdown));
 
     Ok(EventRelayHandles {
         readiness,
@@ -456,6 +469,21 @@ fn refuse_receiver_without_relay(settings: &Settings) -> Result<()> {
 /// Build the relay's own small pool from the same `[plugins.postgres]`
 /// connection shape the CR-007 stores use.
 fn build_relay_pool(settings: &Settings) -> Result<Pool> {
+    build_cell_pool(settings, RELAY_POOL_MAX)
+}
+
+/// The same pool, sized for a one-shot operator command (WP-119 Phase 8).
+///
+/// Shares [`build_cell_pool`] with the relay rather than resolving the
+/// connection shape a second time: an operator command that reached a different
+/// database than the relay would report on a cell nobody is publishing from,
+/// which is the one failure this surface exists to rule out.
+pub(crate) fn build_operator_pool(settings: &Settings, max_size: u32) -> Result<Pool> {
+    build_cell_pool(settings, max_size)
+}
+
+/// Resolve the cell database's connection shape and open a pool of `max_size`.
+fn build_cell_pool(settings: &Settings, max_size: u32) -> Result<Pool> {
     if settings.mutable_store.mode != POSTGRES_MODE {
         return Err(anyhow!(StartupRefusal::NotPostgresMode));
     }
@@ -467,6 +495,6 @@ fn build_relay_pool(settings: &Settings) -> Result<Pool> {
                      database"
                 )
             })?;
-    crate::plugins::postgres::connect_relay_pool(&config, RELAY_POOL_MAX)
+    crate::plugins::postgres::connect_relay_pool(&config, max_size)
         .map_err(|error| anyhow!("Failed to build the outbox relay pool: {error}"))
 }

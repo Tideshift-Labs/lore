@@ -1,12 +1,15 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! The bounded `consumer_safe` evaluator loop and its retention sweep
-//! (WP-119 Step C).
+//! The bounded `consumer_safe` evaluator loop (WP-119 Step C).
 //!
 //! One task per Postgres-mode loreserver, running beside the relay worker on the
-//! same readiness probe interval. Each tick does at most two bounded
-//! transactions: advance accepted rows the checkpoint vector proves safe, then
-//! reap rows that are both past the retention floor and still proven safe.
+//! same readiness probe interval. Each tick is one bounded transaction that
+//! advances accepted rows the checkpoint vector proves safe.
+//!
+//! Retention used to run here too, on a fixed divisor of this tick. WP-119
+//! Phase 8 moved it to [`super::prune_task`] so the two cadences are
+//! independent and so a drain is not made to wait on a sweep — see that
+//! module's own documentation for both reasons.
 //!
 //! # Why it is a separate task from the worker
 //!
@@ -29,11 +32,6 @@ use lore_postgres::domain::outbox::EvaluationBlock;
 use lore_postgres::domain::outbox::SafetyBlock;
 use lore_postgres::domain::outbox::evaluate_consumer_safe;
 use lore_postgres::domain::outbox::evaluator::MAX_EVALUATION_BATCH;
-use lore_postgres::domain::outbox::prune::MAX_PRUNE_BATCH;
-use lore_postgres::domain::outbox::prune::MIN_DEAD_LETTER_RETENTION;
-use lore_postgres::domain::outbox::prune::MIN_RETENTION_AGE;
-use lore_postgres::domain::outbox::prune_consumer_safe;
-use lore_postgres::domain::outbox::prune_dead_letters;
 use lore_postgres::pool::Pool;
 use tokio::sync::watch;
 use tracing::debug;
@@ -43,22 +41,7 @@ use tracing::warn;
 use crate::event_relay::metrics;
 use crate::event_relay::readiness::EventRelayReadiness;
 
-/// How many prune transactions one tick may run.
-///
-/// Retention is a background sweep, not a deadline: a cell with a large reapable
-/// backlog drains over several ticks rather than holding one long transaction.
-/// Four batches is 4,000 rows a tick, which clears a day of a busy cell's
-/// backlog well inside an hour at the shipped probe interval.
-const PRUNE_BATCHES_PER_TICK: usize = 4;
-
-/// How often the retention sweep runs relative to the evaluation.
-///
-/// Retention has a seven-day floor, so running it on every five-second tick
-/// would be four orders of magnitude more often than it can possibly matter.
-/// Once a minute at the shipped interval.
-const PRUNE_EVERY_N_TICKS: u64 = 12;
-
-/// The evaluator and retention loop.
+/// The evaluator loop.
 pub struct ConsumerSafetyTask {
     pool: Pool,
     cell_id: String,
@@ -104,20 +87,18 @@ impl ConsumerSafetyTask {
             interval_ms = self.interval.as_millis(),
             "CR-032 consumer-safety evaluator started"
         );
-        let mut ticks: u64 = 0;
         loop {
             tokio::select! {
                 _ = shutdown.wait_for(|stop| *stop) => break,
                 () = tokio::time::sleep(self.interval) => {}
             }
-            ticks = ticks.wrapping_add(1);
-            self.tick(ticks).await;
+            self.tick().await;
         }
         info!(cell_id = %self.cell_id, "CR-032 consumer-safety evaluator stopped");
         Ok(())
     }
 
-    async fn tick(&self, ticks: u64) {
+    async fn tick(&self) {
         let mut client = match self.pool.get().await {
             Ok(client) => client,
             Err(error) => {
@@ -156,90 +137,15 @@ impl ConsumerSafetyTask {
                 }
             }
             Err(error) => {
+                // Nothing follows: the retention sweep this used to fall
+                // through to is `super::prune_task`'s since Phase 8. The facet
+                // is deliberately left unrefreshed, so a run of failed ticks
+                // ages it past the staleness bound and the receiver facet goes
+                // false on its own.
                 warn!(
                     %error,
                     cell_id = %self.cell_id,
                     "the consumer-safety evaluation failed this tick"
-                );
-                return;
-            }
-        }
-
-        if !ticks.is_multiple_of(PRUNE_EVERY_N_TICKS) {
-            return;
-        }
-        // TODO(WP-119 Phase 8): this is the whole scheduler. An operator command
-        // calls the same `prune_consumer_safe` directly, and a cell needing a
-        // faster drain than four batches a minute needs a real schedule rather
-        // than a larger constant here.
-        let mut reaped = 0_u64;
-        for _ in 0..PRUNE_BATCHES_PER_TICK {
-            match prune_consumer_safe(
-                &mut client,
-                &self.cell_id,
-                MIN_RETENTION_AGE,
-                MAX_PRUNE_BATCH,
-            )
-            .await
-            {
-                Ok(outcome) => {
-                    reaped = reaped.saturating_add(outcome.deleted);
-                    // A blocked or empty batch means there is nothing more to do
-                    // this tick, and continuing would re-prove the same vector
-                    // three more times for nothing.
-                    if outcome.deleted == 0 {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        %error,
-                        cell_id = %self.cell_id,
-                        "retention pruning failed this tick"
-                    );
-                    break;
-                }
-            }
-        }
-        if reaped > 0 {
-            metrics::record_pruned_rows(metrics::PRUNED_EVENTS, reaped);
-            info!(
-                cell_id = %self.cell_id,
-                reaped,
-                "reaped consumer-safe outbox rows past the retention floor"
-            );
-        }
-
-        // Dead letters are swept on the same cadence but under their own rule:
-        // only rows an operator has already disposed of, and only past the
-        // thirty-day floor. A parked row is never matched, so this can never
-        // clear an incident nobody decided on.
-        //
-        // One batch a sweep rather than four. The disposed set is bounded by how
-        // often an operator acts, which is orders of magnitude below the event
-        // volume the consumer-safe sweep drains.
-        match prune_dead_letters(
-            &mut client,
-            &self.cell_id,
-            MIN_DEAD_LETTER_RETENTION,
-            MAX_PRUNE_BATCH,
-        )
-        .await
-        {
-            Ok(0) => {}
-            Ok(deleted) => {
-                metrics::record_pruned_rows(metrics::PRUNED_DEAD_LETTERS, deleted);
-                info!(
-                    cell_id = %self.cell_id,
-                    deleted,
-                    "reaped dispositioned dead letters past the thirty-day floor"
-                );
-            }
-            Err(error) => {
-                warn!(
-                    %error,
-                    cell_id = %self.cell_id,
-                    "dead-letter pruning failed this tick"
                 );
             }
         }
@@ -308,16 +214,5 @@ mod tests {
         assert!(!label.contains("loreserver"));
         assert!(!label.contains('4'));
         assert_eq!(label, metrics::BLOCK_MISSING_CHECKPOINT);
-    }
-
-    #[test]
-    fn the_prune_cadence_is_far_below_the_retention_floor() {
-        // Sanity on the two constants together: pruning once every twelve
-        // five-second ticks is a minute, against a seven-day floor.
-        let cadence = Duration::from_secs(5) * PRUNE_EVERY_N_TICKS as u32;
-        assert!(cadence < MIN_RETENTION_AGE);
-        assert!(cadence < MIN_DEAD_LETTER_RETENTION);
-        assert_eq!(cadence, Duration::from_secs(60));
-        assert_eq!(PRUNE_BATCHES_PER_TICK * MAX_PRUNE_BATCH as usize, 4_000);
     }
 }

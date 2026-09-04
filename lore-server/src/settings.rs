@@ -613,6 +613,25 @@ pub struct OutboxRelaySettings {
     /// pins 5 GiB.
     #[serde(default = "default_admission_max_pending_bytes")]
     pub admission_max_pending_bytes: i64,
+    /// How often the retention sweep runs. Its own cadence since WP-119 Phase 8
+    /// rather than a divisor of the readiness probe interval, so a cell can
+    /// change one without changing the other.
+    #[serde(default = "default_prune_interval_seconds")]
+    pub prune_interval_seconds: u64,
+    /// How long a consumer-safe row is retained before it may be reaped.
+    /// CR-032 fixes a seven-day floor; a shorter value is refused at startup.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
+    /// How long a **dispositioned** dead letter is retained. CR-032 fixes a
+    /// thirty-day floor. A parked dead letter is never reaped at any age.
+    #[serde(default = "default_dead_letter_retention_days")]
+    pub dead_letter_retention_days: u64,
+    /// Rows per prune transaction. CR-032 caps this at 1,000.
+    #[serde(default = "default_prune_batch_rows")]
+    pub prune_batch_rows: i64,
+    /// Consumer-safe prune transactions per sweep.
+    #[serde(default = "default_prune_batches_per_sweep")]
+    pub prune_batches_per_sweep: usize,
 }
 
 impl Default for OutboxRelaySettings {
@@ -632,8 +651,33 @@ impl Default for OutboxRelaySettings {
                 default_admission_max_oldest_pending_age_seconds(),
             admission_max_pending_rows: default_admission_max_pending_rows(),
             admission_max_pending_bytes: default_admission_max_pending_bytes(),
+            prune_interval_seconds: default_prune_interval_seconds(),
+            retention_days: default_retention_days(),
+            dead_letter_retention_days: default_dead_letter_retention_days(),
+            prune_batch_rows: default_prune_batch_rows(),
+            prune_batches_per_sweep: default_prune_batches_per_sweep(),
         }
     }
+}
+
+fn default_prune_interval_seconds() -> u64 {
+    60
+}
+
+fn default_retention_days() -> u64 {
+    7
+}
+
+fn default_dead_letter_retention_days() -> u64 {
+    30
+}
+
+fn default_prune_batch_rows() -> i64 {
+    1_000
+}
+
+fn default_prune_batches_per_sweep() -> usize {
+    4
 }
 
 fn default_relay_batch_size() -> usize {

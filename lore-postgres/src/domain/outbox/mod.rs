@@ -32,6 +32,10 @@
 //!   fence, retirement.
 //! * [`cutover`] — Step C's cutover marker, the key to Step B's fail-closed
 //!   startup gate.
+//! * [`operator`] — Phase 8's bounded, cell-scoped operator recovery surface:
+//!   status, inspection, replay, and the two dead-letter dispositions. It
+//!   decides no policy and holds no thresholds; `lore-server`'s
+//!   `event_relay::operator` is the command surface over it.
 //!
 //! **The relay worker loop is not here.** It is WP-119 Step B, in `lore-server`.
 //! Nothing in this module publishes, waits, or decides a backoff. Neither is the
@@ -47,6 +51,7 @@ pub mod checkpoint;
 pub mod cutover;
 pub mod evaluator;
 pub mod membership;
+pub mod operator;
 pub mod prune;
 pub mod relay;
 pub mod reset;
@@ -76,6 +81,12 @@ pub use membership::MembershipSnapshot;
 pub use membership::MembershipState;
 pub use membership::SafetyBlock;
 pub use membership::read_membership_snapshot;
+pub use operator::DeadLetterRecord;
+pub use operator::InspectedEvent;
+pub use operator::MembershipSummary;
+pub use operator::OperatorStatus;
+pub use operator::ReplayOutcome;
+pub use operator::RequiredMember;
 pub use prune::PruneOutcome;
 pub use prune::prune_consumer_safe;
 pub use prune::prune_dead_letters;
@@ -90,6 +101,7 @@ pub use relay::OutboxBacklog;
 pub use relay::OutboxEventRecord;
 pub use relay::OutboxRow;
 pub use relay::OutboxSchemaState;
+pub use relay::ReplayAudit;
 pub use reset::AckInputs;
 pub use reset::ResetAcceptance;
 pub use reset::ResetReport;

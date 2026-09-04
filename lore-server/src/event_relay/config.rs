@@ -12,8 +12,12 @@
 use std::time::Duration;
 
 use lore_postgres::domain::outbox::AdmissionLimits;
+use lore_postgres::domain::outbox::prune::MAX_PRUNE_BATCH;
+use lore_postgres::domain::outbox::prune::MIN_DEAD_LETTER_RETENTION;
+use lore_postgres::domain::outbox::prune::MIN_RETENTION_AGE;
 use lore_postgres::domain::outbox::relay::MAX_CLAIM_BATCH;
 
+use crate::event_relay::admission::ADMISSION_RETRY_DELAY;
 use crate::settings::OutboxRelaySettings;
 
 /// CR-032's publish deadline ceiling.
@@ -92,6 +96,52 @@ impl RelayBackoff {
     }
 }
 
+/// Reviewed bounds on the retention sweep cadence (WP-119 Phase 8).
+///
+/// The lower bound is not a busy-loop guard. A sweep is up to five bounded
+/// transactions against the hottest table in the relay's scan path, and CR-032's
+/// shortest retention floor is seven days — so a cadence measured in seconds
+/// buys nothing and contends with the publish loop for the same rows.
+pub const MIN_PRUNE_INTERVAL: Duration = Duration::from_secs(10);
+/// Upper bound. A sweep an hour apart already reaps far faster than a seven-day
+/// floor accrues; beyond that the schedule stops being one.
+pub const MAX_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Upper bound on transactions per sweep. At CR-032's thousand-row transaction
+/// bound this is 32,000 rows a sweep, which drains a very large backlog inside
+/// an hour at the default cadence without any single sweep holding a connection
+/// for long.
+pub const MAX_PRUNE_BATCHES_PER_SWEEP: usize = 32;
+
+/// The validated retention schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// How often a sweep runs.
+    pub sweep_interval: Duration,
+    /// Consumer-safe rows must be at least this old. Refused below CR-032's
+    /// seven-day floor by the store itself, and again here so the refusal
+    /// happens at startup rather than on the first sweep.
+    pub consumer_safe_age: Duration,
+    /// Dispositioned dead letters must be at least this old. Thirty-day floor,
+    /// same rule.
+    pub dead_letter_age: Duration,
+    /// Rows per prune transaction, capped by CR-032's own thousand.
+    pub batch_rows: i64,
+    /// Consumer-safe prune transactions per sweep.
+    pub batches_per_sweep: usize,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            sweep_interval: Duration::from_secs(60),
+            consumer_safe_age: MIN_RETENTION_AGE,
+            dead_letter_age: MIN_DEAD_LETTER_RETENTION,
+            batch_rows: MAX_PRUNE_BATCH,
+            batches_per_sweep: 4,
+        }
+    }
+}
+
 /// Everything the relay worker needs, already checked.
 #[derive(Debug, Clone)]
 pub struct EventRelayConfig {
@@ -115,6 +165,8 @@ pub struct EventRelayConfig {
     pub max_oldest_unpublished: Duration,
     /// Required-event mutation admission limits.
     pub admission: AdmissionLimits,
+    /// The retention sweep's own schedule and floors.
+    pub retention: RetentionConfig,
 }
 
 impl EventRelayConfig {
@@ -211,6 +263,25 @@ impl EventRelayConfig {
                 detail: "must be at least 1".to_string(),
             });
         }
+        // The second cross-field bound, and the reason it exists is in
+        // `ADMISSION_RETRY_DELAY`'s own documentation: the admission gate reads
+        // a verdict this interval refreshes, so a client told to retry sooner
+        // than one whole interval is guaranteed to read the identical cached
+        // verdict. Refused rather than clamped — an operator who widened the
+        // probe interval to reduce database load needs to know it would have
+        // silently made every admission retry a no-op.
+        let probe_interval = Duration::from_secs(raw.readiness_probe_interval_seconds);
+        if probe_interval >= ADMISSION_RETRY_DELAY {
+            return Err(EventRelayConfigError::OutOfBounds {
+                field: "readiness_probe_interval_seconds",
+                detail: format!(
+                    "must be below the admission retry delay ({}s), or a rejected client's retry \
+                     reads the same cached verdict it was already refused on; got {}",
+                    ADMISSION_RETRY_DELAY.as_secs(),
+                    raw.readiness_probe_interval_seconds
+                ),
+            });
+        }
         if raw.max_oldest_unpublished_seconds == 0 {
             return Err(EventRelayConfigError::OutOfBounds {
                 field: "max_oldest_unpublished_seconds",
@@ -236,6 +307,8 @@ impl EventRelayConfig {
             });
         }
 
+        let retention = Self::retention_from(raw)?;
+
         Ok(Self {
             enabled: raw.enabled,
             owner,
@@ -253,8 +326,106 @@ impl EventRelayConfig {
                 max_pending_rows: raw.admission_max_pending_rows,
                 max_pending_bytes: raw.admission_max_pending_bytes,
             },
+            retention,
         })
     }
+
+    /// Validate the retention half of a raw section.
+    ///
+    /// Split out because it is the one group of knobs with no interaction with
+    /// the publish loop's own bounds, and because the retention *floors* are
+    /// owned by `lore_postgres` rather than by this module — the checks here
+    /// exist so a cell that configured a shorter window is refused at startup
+    /// instead of on its first sweep, days later, in a `warn!` nobody reads.
+    fn retention_from(raw: &OutboxRelaySettings) -> Result<RetentionConfig, EventRelayConfigError> {
+        let sweep_interval = Duration::from_secs(raw.prune_interval_seconds);
+        if sweep_interval < MIN_PRUNE_INTERVAL || sweep_interval > MAX_PRUNE_INTERVAL {
+            return Err(EventRelayConfigError::OutOfBounds {
+                field: "prune_interval_seconds",
+                detail: format!(
+                    "must be {}..={} seconds, got {}",
+                    MIN_PRUNE_INTERVAL.as_secs(),
+                    MAX_PRUNE_INTERVAL.as_secs(),
+                    raw.prune_interval_seconds
+                ),
+            });
+        }
+
+        // `checked_mul` rather than `days * 86_400`: an operator typing a very
+        // large day count would otherwise wrap to a *short* window, which is
+        // the one direction CR-032 forbids — and it would then pass the floor
+        // check below for the wrong reason.
+        let consumer_safe_age =
+            days(raw.retention_days).ok_or_else(|| EventRelayConfigError::OutOfBounds {
+                field: "retention_days",
+                detail: format!("{} days is not a representable window", raw.retention_days),
+            })?;
+        if consumer_safe_age < MIN_RETENTION_AGE {
+            return Err(EventRelayConfigError::OutOfBounds {
+                field: "retention_days",
+                detail: format!(
+                    "must be at least {} days (CR-032's replay window), got {}",
+                    MIN_RETENTION_AGE.as_secs() / 86_400,
+                    raw.retention_days
+                ),
+            });
+        }
+
+        let dead_letter_age = days(raw.dead_letter_retention_days).ok_or_else(|| {
+            EventRelayConfigError::OutOfBounds {
+                field: "dead_letter_retention_days",
+                detail: format!(
+                    "{} days is not a representable window",
+                    raw.dead_letter_retention_days
+                ),
+            }
+        })?;
+        if dead_letter_age < MIN_DEAD_LETTER_RETENTION {
+            return Err(EventRelayConfigError::OutOfBounds {
+                field: "dead_letter_retention_days",
+                detail: format!(
+                    "must be at least {} days (CR-032's dead-letter floor), got {}",
+                    MIN_DEAD_LETTER_RETENTION.as_secs() / 86_400,
+                    raw.dead_letter_retention_days
+                ),
+            });
+        }
+
+        if raw.prune_batch_rows < 1 || raw.prune_batch_rows > MAX_PRUNE_BATCH {
+            return Err(EventRelayConfigError::OutOfBounds {
+                field: "prune_batch_rows",
+                detail: format!(
+                    "must be 1..={MAX_PRUNE_BATCH} (CR-032's transaction bound), got {}",
+                    raw.prune_batch_rows
+                ),
+            });
+        }
+        if raw.prune_batches_per_sweep < 1
+            || raw.prune_batches_per_sweep > MAX_PRUNE_BATCHES_PER_SWEEP
+        {
+            return Err(EventRelayConfigError::OutOfBounds {
+                field: "prune_batches_per_sweep",
+                detail: format!(
+                    "must be 1..={MAX_PRUNE_BATCHES_PER_SWEEP}, got {}",
+                    raw.prune_batches_per_sweep
+                ),
+            });
+        }
+
+        Ok(RetentionConfig {
+            sweep_interval,
+            consumer_safe_age,
+            dead_letter_age,
+            batch_rows: raw.prune_batch_rows,
+            batches_per_sweep: raw.prune_batches_per_sweep,
+        })
+    }
+}
+
+/// A whole number of days as a `Duration`, or `None` when it cannot be
+/// represented.
+fn days(count: u64) -> Option<Duration> {
+    count.checked_mul(24 * 60 * 60).map(Duration::from_secs)
 }
 
 /// The `claim_owner` column's bound, mirrored here so the config refuses a

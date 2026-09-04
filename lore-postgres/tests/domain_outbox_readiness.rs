@@ -58,6 +58,12 @@ async fn pg_client(url: &str) -> Client {
 /// Insert one pending row with an explicit `created_at`/`available_at` and
 /// payload size, bypassing `append()` so the age/byte assertions below are
 /// exact rather than approximate.
+///
+/// `unpublished_since` is back-dated alongside the other two, and it is the one
+/// the age probe actually reads (WP-119 Phase 8). Back-dating only `created_at`
+/// now seeds a row that is old but *not behind*, which is a real and different
+/// state — it is what a just-replayed week-old row looks like — and the probe
+/// correctly reports it as ~0s.
 async fn seed_pending(
     client: &Client,
     cell_id: &str,
@@ -75,9 +81,11 @@ async fn seed_pending(
             "INSERT INTO lore_outbox_events ( \
                  event_id, cell_id, idempotency_key, repository_id, repository_generation, \
                  event_kind, aggregate_kind, aggregate_id, aggregate_version, \
-                 payload_schema_version, payload, state, created_at, available_at \
+                 payload_schema_version, payload, state, created_at, available_at, \
+                 unpublished_since \
              ) VALUES ( \
                  $1, $2, $3, $4, 1, 'branch.pushed', 'branch', $5, $6, 1, $7, 'pending', \
+                 clock_timestamp() - ($8::double precision * interval '1 second'), \
                  clock_timestamp() - ($8::double precision * interval '1 second'), \
                  clock_timestamp() - ($8::double precision * interval '1 second') \
              )",

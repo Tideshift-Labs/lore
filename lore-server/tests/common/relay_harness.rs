@@ -34,6 +34,7 @@ use lore_server::event_relay::EnvelopeSource;
 use lore_server::event_relay::EventRelayConfig;
 use lore_server::event_relay::EventRelayReadiness;
 use lore_server::event_relay::RelayBackoff;
+use lore_server::event_relay::RetentionConfig;
 use lore_server::plugins::remote_notification::client::PrivateGatewayClient;
 use lore_server::plugins::remote_notification::config::RemoteNotificationConfig;
 use lore_server::plugins::remote_notification::fake_gateway::FakeGateway;
@@ -106,6 +107,11 @@ pub fn fast_test_config(owner: &str) -> EventRelayConfig {
         readiness_probe_interval: Duration::from_millis(50),
         max_oldest_unpublished: Duration::from_secs(30),
         admission: AdmissionLimits::default(),
+        // WP-119 Phase 8 added the retention schedule to this struct. The
+        // reviewed defaults are right for every case here: nothing in this
+        // harness runs the retention sweep, and the store refuses a window
+        // below CR-032's floor regardless of what this said.
+        retention: RetentionConfig::default(),
     }
 }
 
