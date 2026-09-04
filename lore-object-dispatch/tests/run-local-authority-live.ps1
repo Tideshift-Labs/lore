@@ -216,7 +216,7 @@ $databaseNames = @($tests | ForEach-Object { $_.Database }) + @($installChainPro
 
 # CR-033 D5's cell install set, shared with the classification check below so the two cannot
 # drift apart.
-$cd1InstallSetNumbers = @(2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
+$cd1InstallSetNumbers = @(2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
 $cd1KnownDeferredNumbers = @(4, 5, 6)
 
 $environmentNames = @($tests | ForEach-Object { $_.EnvVar })

@@ -146,27 +146,34 @@ async fn live_postgres_cell_schema_installs_clean_and_attests() {
     // the first half of WP-114 CD-1's caveat N2.
     assert_eq!(report.attestation.retention_read_state_result, "READ");
 
-    // All three dispatch-layer readbacks are retired to the out-of-band migrator at full chain
+    // All four dispatch-layer readbacks are retired to the out-of-band migrator at full chain
     // depth, for two different reasons:
     // 0011 revokes the authority entrypoint (42501), and 0011's whole-schema catalog manifest no
-    // longer matches once 0012-0017 add functions (55000). This is the executed proof of that
-    // consequence; the offline suite can only observe the SQL that causes it. The exact code per
-    // layer is asserted, not merely "both are retired": four records claim the two modes apart, so
-    // accepting either code for either layer would leave that distinction unproven.
+    // longer matches once 0012-0017 add functions (55000). Cell retention (WP-114 CD-8) joins the
+    // 42501 group: 0024 creates its readback already granted to the runtime role alone, so it is
+    // unreachable from the migrator's own attester seat from the moment it exists, not after a
+    // later migration revokes it. This is the executed proof of that consequence; the offline
+    // suite can only observe the SQL that causes it. The exact code per layer is asserted, not
+    // merely "all are retired": five records claim the two modes apart, so accepting either code
+    // for either layer would leave that distinction unproven.
     assert_eq!(
         report.attestation.retired_readbacks,
         vec![
             ("authority", "42501"),
             ("put_reservation", "55000"),
-            ("dispatcher_identity", "42501")
+            ("dispatcher_identity", "42501"),
+            ("cell_retention", "42501")
         ]
     );
     assert_eq!(report.attestation.replaced_functions_revoked, 4);
     assert_eq!(report.attestation.inert_tables_present, 4);
 
-    // The install set is 18 artifacts; nothing outside it may have been applied. WP-114 CD-4 added
-    // 0021 and 0022 for the dark shared provider-budget limiter.
-    assert_eq!(CELL_INSTALL_SET.len(), 18);
+    // The install set is 20 artifacts; nothing outside it may have been applied. WP-114 CD-4 added
+    // 0021 and 0022 for the dark shared provider-budget limiter, and CD-8 added 0023 and 0024 for
+    // cell-scale retention. This literal is a deliberate manual tripwire (like
+    // `tests/cell_schema_install.rs`'s `CELL_INSTALLED_MIGRATION_NUMBERS`): a future migration must
+    // update it, not silently pass by comparing the constant to itself.
+    assert_eq!(CELL_INSTALL_SET.len(), 20);
 
     // An installed cell holds ZERO `pg_default_acl` rows, cluster-wide. Measured, not assumed, and
     // it is not what reading 0002 suggests: 0002:12-17 issues three `ALTER DEFAULT PRIVILEGES ...
@@ -268,10 +275,12 @@ async fn live_postgres_cell_schema_install_is_idempotent() {
         .expect("second install must replay, never re-migrate");
     assert_eq!(second.disposition, CellInstallDisposition::Replayed);
 
-    // Three of the five layer install entrypoints survive to full chain depth. Retention's is never
-    // retired. Dispatcher identity's survives because 0019 asserts only the objects it names, and
-    // the budget limiter's exact-pin replay survives its own provisioning migration. Authority and
-    // put reservation are attested rather than re-executed, and say so.
+    // Four of the six layer install entrypoints survive to full chain depth. Retention's is never
+    // retired. Dispatcher identity's survives because 0019 asserts only the objects it names, the
+    // budget limiter's exact-pin replay survives its own provisioning migration, and cell
+    // retention's (WP-114 CD-8) is likewise never retired -- `install_retired_after: None`, unlike
+    // its `read_state_retired_after: Some(24)`. Authority and put reservation are attested rather
+    // than re-executed, and say so.
     assert_eq!(
         second.layer_outcomes,
         [
@@ -290,6 +299,10 @@ async fn live_postgres_cell_schema_install_is_idempotent() {
             ),
             (
                 CellSchemaLayerId::BudgetLimiter,
+                LayerInstallOutcome::Replayed
+            ),
+            (
+                CellSchemaLayerId::CellRetention,
                 LayerInstallOutcome::Replayed
             ),
         ]

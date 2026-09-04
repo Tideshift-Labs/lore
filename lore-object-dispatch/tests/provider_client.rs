@@ -2174,8 +2174,8 @@ async fn execute_reports_transport_refusal_while_keeping_the_grant_charged() {
     let audit = ledger
         .audit_for(&logical_request_id())
         .expect("non-poisoned ledger must audit its own bound request");
-    assert_eq!(audit.committed_grant_count, 1);
-    assert_eq!(audit.attempt_count, 0);
+    assert_eq!(audit.audit().committed_grant_count, 1);
+    assert_eq!(audit.audit().attempt_count, 0);
 }
 
 #[tokio::test]
@@ -2611,10 +2611,13 @@ async fn a_ledger_that_completed_one_request_refuses_to_accumulate_a_second_requ
     let audit = ledger
         .audit_for(&request_a.logical_request_id)
         .expect("ledger must still audit request A only");
-    assert_eq!(audit.attempt_count, 1);
-    assert_eq!(audit.decisive_terminal_count, 1);
-    validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
-        .expect("request A's audit must still be accepted by the frozen encoder");
+    assert_eq!(audit.audit().attempt_count, 1);
+    assert_eq!(audit.audit().decisive_terminal_count, 1);
+    validate_and_encode_object_store_provider_attempt_audit(
+        audit.audit(),
+        &compact_receipt_limits(),
+    )
+    .expect("request A's audit must still be accepted by the frozen encoder");
 
     // The audit binding (not only execute's) refuses request B's id too: naming B never gets a
     // receipt attached to A's counters.
@@ -2659,8 +2662,11 @@ async fn execute_refuses_an_attempt_naming_a_different_logical_request_than_the_
     let audit = ledger
         .audit_for(&logical_request_id())
         .expect("unpoisoned ledger must still audit its own bound request");
-    validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
-        .expect("audit must be accepted by the frozen encoder");
+    validate_and_encode_object_store_provider_attempt_audit(
+        audit.audit(),
+        &compact_receipt_limits(),
+    )
+    .expect("audit must be accepted by the frozen encoder");
 }
 
 #[tokio::test]
@@ -2696,8 +2702,11 @@ async fn execute_refuses_an_attempt_when_the_ledger_is_bound_to_a_different_boun
     let audit = ledger
         .audit_for(&logical_request_id())
         .expect("unpoisoned ledger must still audit its own bound request");
-    validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
-        .expect("audit must be accepted by the frozen encoder");
+    validate_and_encode_object_store_provider_attempt_audit(
+        audit.audit(),
+        &compact_receipt_limits(),
+    )
+    .expect("audit must be accepted by the frozen encoder");
 }
 
 /// Regression guard that the binding check is not over-tight: a ledger bound to exactly the
@@ -2998,8 +3007,11 @@ async fn record_no_dispatch_is_still_allowed_after_a_committed_grant_that_never_
     let audit = ledger
         .audit_for(&logical_request_id())
         .expect("non-poisoned ledger must audit its own bound request");
-    validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
-        .expect("audit must be accepted by the frozen encoder");
+    validate_and_encode_object_store_provider_attempt_audit(
+        audit.audit(),
+        &compact_receipt_limits(),
+    )
+    .expect("audit must be accepted by the frozen encoder");
 }
 
 /// A recorded no-dispatch asserts the request resolved without reaching the provider. The refusal
@@ -3055,10 +3067,13 @@ async fn execute_refuses_after_a_recorded_no_dispatch_without_poisoning_the_ledg
     let audit = ledger.audit_for(&logical_request_id()).expect(
         "the refused-but-unpoisoned ledger must still produce an audit for its own bound request",
     );
-    assert_eq!(audit.no_dispatch_count, 1);
-    assert_eq!(audit.attempt_count, 0);
-    validate_and_encode_object_store_provider_attempt_audit(&audit, &compact_receipt_limits())
-        .expect("the truthful no-dispatch audit must still be accepted by the frozen encoder");
+    assert_eq!(audit.audit().no_dispatch_count, 1);
+    assert_eq!(audit.audit().attempt_count, 0);
+    validate_and_encode_object_store_provider_attempt_audit(
+        audit.audit(),
+        &compact_receipt_limits(),
+    )
+    .expect("the truthful no-dispatch audit must still be accepted by the frozen encoder");
 }
 
 #[tokio::test]
@@ -3184,11 +3199,11 @@ async fn audit_for_the_bound_request_id_returns_ok_with_the_expected_counters() 
     let audit = ledger
         .audit_for(&logical_request_id())
         .expect("the ledger's own bound request id must audit");
-    assert_eq!(audit.attempt_count, 1);
-    assert_eq!(audit.committed_grant_count, 1);
-    assert_eq!(audit.decisive_terminal_count, 1);
-    assert_eq!(audit.ambiguous_count, 0);
-    assert_eq!(audit.no_dispatch_count, 0);
+    assert_eq!(audit.audit().attempt_count, 1);
+    assert_eq!(audit.audit().committed_grant_count, 1);
+    assert_eq!(audit.audit().decisive_terminal_count, 1);
+    assert_eq!(audit.audit().ambiguous_count, 0);
+    assert_eq!(audit.audit().no_dispatch_count, 0);
 }
 
 #[tokio::test]
@@ -3369,9 +3384,9 @@ fn assert_mirrors_audit_algebra(ledger: &ProviderAttemptLedger, label: &str) {
                 panic!("case {label}: non-poisoned ledger must audit: {error}")
             });
             // ProviderAttemptLedger has no refund method at all, so this must always be false.
-            assert!(!audit.provider_authority_refunded, "case: {label}");
+            assert!(!audit.audit().provider_authority_refunded, "case: {label}");
             validate_and_encode_object_store_provider_attempt_audit(
-                &audit,
+                audit.audit(),
                 &compact_receipt_limits(),
             )
             .unwrap_or_else(|error| {

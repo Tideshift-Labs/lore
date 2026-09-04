@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
+#[path = "common/committed_audit.rs"]
+mod committed_audit;
+
+use lore_object_dispatch::BoundProviderAttemptAudit;
 use lore_object_dispatch::CompactReceiptError;
 use lore_object_dispatch::NoDispatchProofFields;
 use lore_object_dispatch::NoDispatchReason;
@@ -31,6 +35,9 @@ use lore_proto::lore::object_dispatch::v1::*;
 const NOW: i64 = 0x018f_3e12_a456;
 const REQUEST_ID: &str = "018f3e12-a450-7abc-8def-0123456789ab";
 const ATTEMPT_ID: &str = "018f3e12-a451-7abc-8def-0123456789ab";
+const OTHER_ATTEMPT_ID: &str = "018f3e12-a4bb-7abc-8def-0123456789ab";
+const OTHER_REQUEST_ID: &str = "018f3e12-a4aa-7abc-8def-0123456789ab";
+const BOUNDARY_ID: &str = "boundary-1";
 const DIGEST: [u8; 32] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
     26, 27, 28, 29, 30, 31,
@@ -563,16 +570,30 @@ fn terminal_audit() -> ObjectStoreProviderAttemptAudit {
     }
 }
 
-fn no_dispatch_audit() -> ObjectStoreProviderAttemptAudit {
-    ObjectStoreProviderAttemptAudit {
-        attempt_count: 0,
-        committed_grant_count: 0,
-        no_dispatch_count: 1,
-        decisive_terminal_count: 0,
-        ambiguous_count: 0,
-        provider_authority_refunded: false,
-        audit_blake3: None,
-    }
+/// A real bound audit matching [`terminal_audit`]'s shape (WP-114 CD-8), driven through
+/// [`committed_audit::committed_decisive_audit_sync`] rather than fabricated.
+fn bound_terminal_audit() -> BoundProviderAttemptAudit {
+    committed_audit::committed_decisive_audit_sync(BOUNDARY_ID, REQUEST_ID, ATTEMPT_ID, NOW)
+}
+
+/// A real bound audit with `attempt_count = 0`, `committed_grant_count = 0`, `no_dispatch_count =
+/// 1`, driven through [`lore_object_dispatch::ProviderAttemptLedger::record_no_dispatch`] (WP-114
+/// CD-8) rather than fabricated. The unbound literal this used to wrap was removed once every
+/// caller moved to the bound shape (CD-8's `ObjectStoreCompactReceiptInput`/`PlannerInput` no
+/// longer accept the unbound type at all).
+fn bound_no_dispatch_audit() -> BoundProviderAttemptAudit {
+    let proof = build_no_dispatch_proof(
+        NoDispatchProofFields {
+            reason: NoDispatchReason::PreparedTtlExpired,
+            proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
+            proof_fence: 1,
+            committed_at_unix_ms: NOW,
+            authority_epoch: 1,
+        },
+        16_384,
+    )
+    .expect("no-dispatch proof fixture for the bound audit");
+    committed_audit::no_dispatch_bound_audit(BOUNDARY_ID, REQUEST_ID, &proof)
 }
 
 struct Fixture {
@@ -580,7 +601,7 @@ struct Fixture {
     receipt: lore_object_dispatch::CanonicalObjectStoreRequestReceipt,
     outcome: lore_object_dispatch::CanonicalObjectStoreRequestOutcome,
     reserve_put_ack: Option<lore_object_dispatch::CanonicalObjectStoreReservePutAck>,
-    audit: ObjectStoreProviderAttemptAudit,
+    audit: BoundProviderAttemptAudit,
 }
 
 fn reserve_put_ack() -> lore_object_dispatch::CanonicalObjectStoreReservePutAck {
@@ -648,10 +669,7 @@ fn reserve_put_ack() -> lore_object_dispatch::CanonicalObjectStoreReservePutAck 
     .expect("ReservePut ACK fixture")
 }
 
-fn fixture(
-    authority: ObjectStoreCompactAuthority,
-    audit: ObjectStoreProviderAttemptAudit,
-) -> Fixture {
+fn fixture(authority: ObjectStoreCompactAuthority, audit: BoundProviderAttemptAudit) -> Fixture {
     let is_put = match &authority {
         ObjectStoreCompactAuthority::RequestState(value) => {
             value.value().put_reservation_fingerprint.is_some()
@@ -692,7 +710,7 @@ fn fixture(
 fn get_fixture() -> Fixture {
     fixture(
         ObjectStoreCompactAuthority::RequestState(Box::new(terminal_state(StateKind::GetAcked))),
-        terminal_audit(),
+        bound_terminal_audit(),
     )
 }
 
@@ -767,11 +785,11 @@ fn disposed_put_and_prepared_expired_no_payload_compact() {
             ObjectStoreCompactAuthority::RequestState(Box::new(terminal_state(
                 StateKind::PutRetryable,
             ))),
-            terminal_audit(),
+            bound_terminal_audit(),
         ),
         fixture(
             ObjectStoreCompactAuthority::RequestState(Box::new(expired_state())),
-            no_dispatch_audit(),
+            bound_no_dispatch_audit(),
         ),
     ];
     for fixture in cases {
@@ -788,7 +806,7 @@ fn disposed_put_compact_pins_reserve_ack_and_replay_projection() {
         ObjectStoreCompactAuthority::RequestState(Box::new(terminal_state(
             StateKind::PutRetryable,
         ))),
-        terminal_audit(),
+        bound_terminal_audit(),
     );
     let ObjectStoreCompactReceiptDecision::ApplyCompaction { compact, .. } =
         decide_object_store_compact_receipt(&planner(&fixture), &limits()).expect("PUT compaction")
@@ -988,7 +1006,7 @@ fn prune_deadline_takes_maximum_of_all_contributors_and_utf8_sorts_ids() {
 fn live_retained_payload_authority_does_not_compact() {
     let live = fixture(
         ObjectStoreCompactAuthority::RequestState(Box::new(terminal_state(StateKind::Available))),
-        terminal_audit(),
+        bound_terminal_audit(),
     );
     assert_eq!(
         decide_object_store_compact_receipt(&planner(&live), &limits()),
@@ -996,45 +1014,50 @@ fn live_retained_payload_authority_does_not_compact() {
     );
 }
 
+/// Four real, recording-API-derived audit shapes for the phase matrix below (WP-114 CD-8): a
+/// fresh ledger for a phase with no attempt yet, one real decisive commit, and one real ambiguous
+/// commit. `open_state` always projects `REQUEST_ID` regardless of phase (the bound audit's
+/// request identity must agree with it, or the new mismatch check below would reject these
+/// fixtures), and each call below opens its own fresh `ProviderAttemptLedger`, so reusing
+/// `REQUEST_ID` across cases shares no mutable state between them.
+///
+/// There is no real-API way to reach "attempt recorded, grant committed, no terminal resolution
+/// at all" (`execute` only returns once the transport has resolved one way or the other), so
+/// `Dispatching` now uses the decisive shape rather than the previous synthetic
+/// `decisive_terminal_count: 0` literal -- the assertion below is audit-content-independent (an
+/// open phase retains regardless of what the audit says), so this does not weaken the test.
+fn open_phase_audit(phase: ObjectStoreRequestPhaseV1) -> BoundProviderAttemptAudit {
+    match phase {
+        ObjectStoreRequestPhaseV1::ObjectStoreRequestPhasePrepared
+        | ObjectStoreRequestPhaseV1::ObjectStoreRequestPhaseAdmitted => {
+            committed_audit::fresh_bound_audit(BOUNDARY_ID, REQUEST_ID)
+        }
+        ObjectStoreRequestPhaseV1::ObjectStoreRequestPhaseDispatching => {
+            committed_audit::committed_decisive_audit_sync(BOUNDARY_ID, REQUEST_ID, ATTEMPT_ID, NOW)
+        }
+        ObjectStoreRequestPhaseV1::ObjectStoreRequestPhasePossiblyDispatched => {
+            committed_audit::committed_ambiguous_audit_sync(
+                BOUNDARY_ID,
+                REQUEST_ID,
+                ATTEMPT_ID,
+                NOW,
+            )
+        }
+        other => panic!("open_phase_audit fixture does not cover phase {other:?}"),
+    }
+}
+
 #[test]
 fn every_open_request_phase_retains_full_without_no_dispatch_audit() {
-    for (phase, attempt_count, committed_grant_count, ambiguous_count) in [
-        (
-            ObjectStoreRequestPhaseV1::ObjectStoreRequestPhasePrepared,
-            0,
-            0,
-            0,
-        ),
-        (
-            ObjectStoreRequestPhaseV1::ObjectStoreRequestPhaseAdmitted,
-            0,
-            0,
-            0,
-        ),
-        (
-            ObjectStoreRequestPhaseV1::ObjectStoreRequestPhaseDispatching,
-            1,
-            1,
-            0,
-        ),
-        (
-            ObjectStoreRequestPhaseV1::ObjectStoreRequestPhasePossiblyDispatched,
-            1,
-            1,
-            1,
-        ),
+    for phase in [
+        ObjectStoreRequestPhaseV1::ObjectStoreRequestPhasePrepared,
+        ObjectStoreRequestPhaseV1::ObjectStoreRequestPhaseAdmitted,
+        ObjectStoreRequestPhaseV1::ObjectStoreRequestPhaseDispatching,
+        ObjectStoreRequestPhaseV1::ObjectStoreRequestPhasePossiblyDispatched,
     ] {
         let selected = fixture(
             ObjectStoreCompactAuthority::RequestState(Box::new(open_state(phase))),
-            ObjectStoreProviderAttemptAudit {
-                attempt_count,
-                committed_grant_count,
-                no_dispatch_count: 0,
-                decisive_terminal_count: 0,
-                ambiguous_count,
-                provider_authority_refunded: false,
-                audit_blake3: None,
-            },
+            open_phase_audit(phase),
         );
         assert_eq!(
             decide_object_store_compact_receipt(&planner(&selected), &limits()),
@@ -1125,6 +1148,25 @@ fn exact_replay_wins_before_clock_drift_and_changed_intent_conflicts() {
     );
 }
 
+// WP-114 CD-8 note on this test's two audit shapes.
+//
+// The first (terminal ambiguity, below) IS reachable through the real recording API, just not
+// through one `execute()` call: `ProviderAttemptOutcome` is `Decisive` xor `Ambiguous` per
+// attempt, so `decisive_terminal_count = 1` and `ambiguous_count = 1` simultaneously needs two
+// attempts on one ledger -- an ambiguous delivery followed by a decisive one, exactly the retry
+// sequence the "historical ambiguity" framing describes. See
+// `committed_audit::committed_ambiguous_then_decisive_audit_sync`.
+//
+// The second (no-dispatch-with-a-committed-grant, further below) is NOT reachable: it needs
+// `committed_grant_count = 1` with `attempt_count = 0`, and every path that commits a grant without
+// a following attempt (a `TransportRefused`-shaped failure) also poisons the ledger, which
+// `record_no_dispatch` checks and refuses before its own attempt-count precondition. Since
+// `BoundProviderAttemptAudit` (CD-8) has no public constructor other than `audit_for`, no external
+// caller -- including this test -- can construct that shape anymore. OPEN QUESTION for the
+// implementer: is `provider_attempt_audit_is_valid`'s tolerance for a grant exceeding the attempt
+// count still deliberate now that nothing can reach it that way, or should this become a negative
+// case proving the shape is unreachable? Not resolved here; the closest reachable substitute is
+// used below with the assertion scoped to what it actually proves.
 #[test]
 fn historical_terminal_ambiguity_and_no_dispatch_grant_are_audited_exactly() {
     let terminal = terminal_state(StateKind::GetAcked);
@@ -1139,15 +1181,13 @@ fn historical_terminal_ambiguity_and_no_dispatch_grant_are_audited_exactly() {
         .expect("historically ambiguous terminal state");
     let terminal_fixture = fixture(
         ObjectStoreCompactAuthority::RequestState(Box::new(terminal)),
-        ObjectStoreProviderAttemptAudit {
-            attempt_count: 1,
-            committed_grant_count: 1,
-            no_dispatch_count: 0,
-            decisive_terminal_count: 1,
-            ambiguous_count: 1,
-            provider_authority_refunded: false,
-            audit_blake3: None,
-        },
+        committed_audit::committed_ambiguous_then_decisive_audit_sync(
+            BOUNDARY_ID,
+            REQUEST_ID,
+            ATTEMPT_ID,
+            OTHER_ATTEMPT_ID,
+            NOW,
+        ),
     );
     assert!(matches!(
         decide_object_store_compact_receipt(&planner(&terminal_fixture), &limits()),
@@ -1198,15 +1238,12 @@ fn historical_terminal_ambiguity_and_no_dispatch_grant_are_audited_exactly() {
         .expect("no-dispatch authority with historical grant");
     let expired_fixture = fixture(
         ObjectStoreCompactAuthority::RequestState(Box::new(expired)),
-        ObjectStoreProviderAttemptAudit {
-            attempt_count: 0,
-            committed_grant_count: 1,
-            no_dispatch_count: 1,
-            decisive_terminal_count: 0,
-            ambiguous_count: 0,
-            provider_authority_refunded: false,
-            audit_blake3: None,
-        },
+        // Closest reachable approximation: a plain real no-dispatch audit (attempt=0,
+        // committed_grant=0, no_dispatch=1), not the original's simultaneous committed_grant=1 --
+        // see the FINDING comment above. This no longer proves the encoder accepts a no-dispatch
+        // audit alongside a historically committed grant; it only re-proves plain no-dispatch
+        // compacts, which `disposed_put_and_prepared_expired_no_payload_compact` already covers.
+        bound_no_dispatch_audit(),
     );
     assert!(matches!(
         decide_object_store_compact_receipt(&planner(&expired_fixture), &limits()),
@@ -1324,7 +1361,7 @@ fn reserve_put_ack_validation_rejects_digest_mutation_and_detaches_values() {
 fn compact_rejects_foreign_or_nonterminal_reserve_put_ack_authority() {
     let fixture = fixture(
         ObjectStoreCompactAuthority::RequestState(Box::new(expired_state())),
-        no_dispatch_audit(),
+        bound_no_dispatch_audit(),
     );
     let source = fixture.reserve_put_ack.as_ref().expect("PUT ACK fixture");
     let ack_limits = ReservePutAckLimits {
@@ -1410,6 +1447,66 @@ fn direct_input<'a>(
     }
 }
 
+/// WP-114 CD-8 (INV-EJ B1's unclosed half): a `BoundProviderAttemptAudit` minted for one logical
+/// request must be refused when the projected authority names a different one, even though
+/// `audit_for` already checked the audit against the *ledger's own* request identity at mint time
+/// -- that earlier check cannot see which receipt the caller later attaches the audit to.
+#[test]
+fn provider_attempt_audit_naming_a_different_request_is_refused_by_the_planner() {
+    let fixture = get_fixture();
+    let mismatched_audit = committed_audit::committed_decisive_audit_sync(
+        BOUNDARY_ID,
+        OTHER_REQUEST_ID,
+        ATTEMPT_ID,
+        NOW,
+    );
+    let mut input = planner(&fixture);
+    input.provider_attempt_audit = &mismatched_audit;
+    assert_eq!(
+        decide_object_store_compact_receipt(&input, &limits()),
+        Err(CompactReceiptError::ProviderAttemptAuditRequestMismatch)
+    );
+}
+
+/// Same mismatch, proven against the direct encoder (`ObjectStoreCompactReceiptInput`) rather than
+/// the planner (`ObjectStoreCompactReceiptPlannerInput`) -- CD-8 binds both input structs
+/// independently, so one passing does not prove the other does.
+#[test]
+fn provider_attempt_audit_naming_a_different_request_is_refused_by_the_direct_encoder() {
+    let fixture = get_fixture();
+    let applied = decide_object_store_compact_receipt(&planner(&fixture), &limits())
+        .expect("baseline compaction");
+    let ObjectStoreCompactReceiptDecision::ApplyCompaction { compact, .. } = applied else {
+        panic!("baseline must compact");
+    };
+    let mismatched_audit = committed_audit::committed_decisive_audit_sync(
+        BOUNDARY_ID,
+        OTHER_REQUEST_ID,
+        ATTEMPT_ID,
+        NOW,
+    );
+    let mut input = direct_input(&fixture, &compact);
+    input.provider_attempt_audit = &mismatched_audit;
+    assert_eq!(
+        validate_and_encode_object_store_compact_receipt(&input, &limits()),
+        Err(CompactReceiptError::ProviderAttemptAuditRequestMismatch)
+    );
+}
+
+/// The producer-side binding (CD-5's `audit_for`) and the consumer-side binding (CD-8's check
+/// above) are independent: a caller who correctly names its own request at mint time still gets a
+/// valid audit, and that audit is exactly what the matching, non-mismatched fixtures throughout
+/// this file already prove is accepted. This test is the negative control's positive counterpart:
+/// the SAME `logical_request_id` the authority already projects is accepted.
+#[test]
+fn provider_attempt_audit_naming_the_matching_request_is_accepted() {
+    let fixture = get_fixture();
+    assert!(matches!(
+        decide_object_store_compact_receipt(&planner(&fixture), &limits()),
+        Ok(ObjectStoreCompactReceiptDecision::ApplyCompaction { .. })
+    ));
+}
+
 #[test]
 fn direct_codec_rejects_missing_derived_floor_digests_wrappers_and_time_projection() {
     let primary = get_fixture();
@@ -1457,7 +1554,7 @@ fn direct_codec_rejects_missing_derived_floor_digests_wrappers_and_time_projecti
         ObjectStoreCompactAuthority::RequestState(Box::new(terminal_state(
             StateKind::PutRetryable,
         ))),
-        terminal_audit(),
+        bound_terminal_audit(),
     );
     let wrapper_mismatch = ObjectStoreCompactReceiptInput {
         authority: &primary.authority,

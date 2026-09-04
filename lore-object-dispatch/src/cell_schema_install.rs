@@ -123,7 +123,7 @@ macro_rules! cell_migration {
 }
 
 /// CR-033 D5's cell install set, in install order.
-pub const CELL_INSTALL_SET: [CellMigration; 18] = [
+pub const CELL_INSTALL_SET: [CellMigration; 20] = [
     cell_migration!(
         2,
         "0002_object_store_retention_authority.sql",
@@ -214,9 +214,24 @@ pub const CELL_INSTALL_SET: [CellMigration; 18] = [
         "0022_object_store_dispatch_budget_limiter_provisioning.sql",
         "7d471d4524dec97f0108b57d586f99676e48721860bb78b1710b6d6a7e979c34"
     ),
+    cell_migration!(
+        23,
+        "0023_object_store_dispatch_cell_retention_schema.sql",
+        "cef47bfe8afd932b66f0c7c6856aa10b27532841e6da90208f8ee753a700542a"
+    ),
+    cell_migration!(
+        24,
+        "0024_object_store_dispatch_cell_retention_provisioning.sql",
+        "1c4da52ea7d7ae362038e1c1258d73195934022876a49eadbf8c2844ff48cb52"
+    ),
 ];
 
 /// Retention migrations retained, compiled, and deliberately not installed (CR-033 D5).
+///
+/// WP-114 CD-8 kept this membership. Its decision was that these three are **replaced** for a cell,
+/// not installed as-is and not resized, so they stay exactly where CR-033 D5 left them: source
+/// retained, compiled, tested, uncalled, unedited. The replacement is migrations 0023 and 0024, and
+/// the argument for it is in [`crate::cell_retention`].
 pub const CELL_DEFERRED_MIGRATIONS: [u16; 3] = [4, 5, 6];
 
 /// Fail closed if packaging or merge changed any embedded artifact's bytes.
@@ -271,6 +286,8 @@ pub enum CellSchemaLayerId {
     DispatcherIdentity,
     /// Migrations 0021 and 0022.
     BudgetLimiter,
+    /// Migrations 0023 and 0024 (WP-114 CD-8).
+    CellRetention,
 }
 
 impl CellSchemaLayerId {
@@ -283,6 +300,7 @@ impl CellSchemaLayerId {
             Self::PutReservation => "put_reservation",
             Self::DispatcherIdentity => "dispatcher_identity",
             Self::BudgetLimiter => "budget_limiter",
+            Self::CellRetention => "cell_retention",
         }
     }
 }
@@ -327,7 +345,7 @@ pub struct CellSchemaLayer {
 }
 
 /// The layer contracts, in install order.
-pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 5] = [
+pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 6] = [
     CellSchemaLayer {
         id: CellSchemaLayerId::Retention,
         api_revision: "object-store-retention-provisioning-v1",
@@ -431,6 +449,32 @@ pub const CELL_SCHEMA_LAYERS: [CellSchemaLayer; 5] = [
             "budget_limiter_installed_at_unix_ms",
         ],
         installed_after_migration: 22,
+    },
+    CellSchemaLayer {
+        id: CellSchemaLayerId::CellRetention,
+        api_revision: "object-store-dispatch-cell-retention-v1",
+        schema_revision: "object-store-dispatch-cell-retention-schema-v1",
+        migration_blake3_hex: "cef47bfe8afd932b66f0c7c6856aa10b27532841e6da90208f8ee753a700542a",
+        contract_migration: 23,
+        install_function: "object_store_dispatch_cell_retention_install_v1",
+        read_state_function: "object_store_dispatch_cell_retention_read_state_v1",
+        // Not a retirement in the sense the two dispatch layers are: 0024 creates this readback
+        // already granted to the runtime role alone, so it is unreachable from the attester's
+        // migrator seat from the moment it exists. It is recorded here rather than left as `None`
+        // so the attester runs a real expected-failure probe against it. A `None` here would mean
+        // the readback is never exercised by attestation at all, which is what the budget limiter's
+        // equally runtime-only readback currently gets. Runtime calls remain its intended live use:
+        // this is the signal `CellRetentionClient` reads before it prunes anything.
+        read_state_retired_after: Some(24),
+        read_state_retired_sqlstate: Some("42501"),
+        install_retired_after: None,
+        identity_columns: [
+            "cell_retention_schema_revision",
+            "cell_retention_migration_blake3",
+            "cell_retention_install_revision",
+            "cell_retention_installed_at_unix_ms",
+        ],
+        installed_after_migration: 24,
     },
 ];
 
@@ -850,16 +894,35 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
 /// while resolving to nothing, and every digest here would still match. That gap is closed in the
 /// database instead, by 0019's fourth object assertion, which requires that constraint to be
 /// present and to carry the replica identity.
+///
+/// Re-measured by WP-114 CD-8 after migrations 0023 and 0024 added the cell-scale retention layer.
+/// Eight sections moved and the same four stayed still, which is the check rather than the
+/// bookkeeping. `columns`, `constraints` and `types` move with 0024's four identity columns, its
+/// all-or-none check, and its three composite result types; `functions` and `function_acls` with
+/// its seven procedures and their grants; and `indexes` with 0023's four. `relations` and
+/// `relation_acls` move for a reason worth naming because it is not obvious from the migrations:
+/// both sections enumerate `pg_class` with no `relkind` filter, so an added *index* contributes a
+/// relation row and a default-ACL row even though neither migration creates a table. `schema`,
+/// `default_acls`, `triggers` and `rules_and_policies` are unchanged, as both migrations require --
+/// a move in any of those four would mean they did something they do not claim to do.
+///
+/// Measured a second time after CD-8's review fix round, which dropped one redundant index and
+/// added a field to one composite result type. Five sections moved and the split is again the
+/// check: `relations`, `indexes` and `relation_acls` with the dropped index, `functions` with the
+/// rewritten procedure bodies, and `columns` because a composite type carries `pg_attribute` rows
+/// like any other relation. `constraints` and `function_acls` correctly stayed still -- the round
+/// added no constraint, created no function and revoked none -- and so did the same four that
+/// stayed still the first time.
 pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
     hex32("f468de7d148f5335b52a10c4298d609be546801754da1d991ff0ac7e7c0da0ca"),
-    hex32("7ccaae88f56265bff668406b874a46dcdba51bff338d94e0f6d85d70b424f86f"),
-    hex32("309dff5388bd8a3c0fa571235ef6f880ca4431df576227528abd5aa714a93203"),
-    hex32("2eb72daf008fa334914dca61258d936491d32150dbf138876b81875f93f17b20"),
-    hex32("102799932cdff39b85a73d5af5221afd7b4be6f7b3566dfabdfd514a65fba986"),
-    hex32("8ff35a1d0cc3db05335e97ee64a02a65dfcb0d7883a389d1b129cb853d123fd5"),
-    hex32("f6b6eb9729b97f9250ba787425423dedc567094b1268aeb1c944519b83f7bcc0"),
-    hex32("3223198b12b114d8850baf20208043c7b2e5588c598e3c63d6c805a31cf876d8"),
-    hex32("a6aa8b4525ea4c04fc987c52943a1376200dcf2b58ee76f55333b6b4500c4b0e"),
+    hex32("316036b2379716cfa8f437588afff7b0e51f5158c04146525589e9bfc00e07a4"),
+    hex32("a034c938af4fe80ed2e47aae05b84de1d2164c71a1f4ba7c17598f834fa4a496"),
+    hex32("5c0279033f49f711b0ef2a70144a314a670b789fe27afd57129a4122f6ca294c"),
+    hex32("e73d69307f2270734c4acb7b0e35e6fae8348abdbf88bec1b78d15ba7cfaec72"),
+    hex32("f7f3af85ac11837251f1814f7e721f9f2df634bfcacb49782cd34f51c5879687"),
+    hex32("11bdc5927ce99423041176c5687b03e878ccd5a28a5e0f2d841975af25e5d929"),
+    hex32("8b0520688bb7ccd78c8ba7260e46331ddb50d04d7784fd69fffc5d14006ecaf6"),
+    hex32("ceb77a757063fe3514a25f80be242a241943cab76539cf201550a1fc976443d4"),
     hex32("971ec53fc27466c873c783701757e1434c20b383d23f081d918a2d6e4c797971"),
     hex32("b5f633ebe7a54a9d43e75d043387b67cc659395fa8f0880a5c0d869a2b90fe81"),
     hex32("444e1ca598f3a2dbe3601fdb803e2479f21b3b22fe4713d50f9a0e47fd7b73b2"),
@@ -871,7 +934,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
 /// whose exact rendering is a server-version property. A different major version is expected to
 /// fail closed here and needs a re-measured pin, not a relaxed check.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_V1: [u8; 32] =
-    hex32("34f32d3fa8f7ee21ccf3abc51c5d1b613da2afbf1fd6bcf7c4e03c74cce61915");
+    hex32("0451b224cb7e8470fa27bd4c2673822dc515203565ec91ed51bcd92287939d1c");
 
 /// Const hex decoder for the pinned digests above.
 const fn hex32(text: &str) -> [u8; 32] {
@@ -1030,7 +1093,7 @@ pub enum LayerInstallOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellAttestation {
     /// Each layer's identity tuple, in [`CELL_SCHEMA_LAYERS`] order.
-    pub layers: [(CellSchemaLayerId, LayerIdentity); 5],
+    pub layers: [(CellSchemaLayerId, LayerIdentity); 6],
     /// Per-section live catalog digests, in [`CELL_CATALOG_MANIFEST_SECTIONS`] order.
     pub catalog_sections: [[u8; 32]; 12],
     /// BLAKE3-256 over the whole manifest.
@@ -1060,7 +1123,7 @@ pub struct CellInstallReport {
     /// Whether this run created or replayed.
     pub disposition: CellInstallDisposition,
     /// Each layer's install-procedure outcome, in [`CELL_SCHEMA_LAYERS`] order.
-    pub layer_outcomes: [(CellSchemaLayerId, LayerInstallOutcome); 5],
+    pub layer_outcomes: [(CellSchemaLayerId, LayerInstallOutcome); 6],
     /// The attestation taken after the run.
     pub attestation: CellAttestation,
 }
@@ -1115,7 +1178,11 @@ const SCHEMA_STATE_SQL: &str = "SELECT
     budget_limiter_schema_revision,
     pg_catalog.encode(budget_limiter_migration_blake3, 'hex'),
     budget_limiter_install_revision::text,
-    budget_limiter_installed_at_unix_ms
+    budget_limiter_installed_at_unix_ms,
+    cell_retention_schema_revision,
+    pg_catalog.encode(cell_retention_migration_blake3, 'hex'),
+    cell_retention_install_revision::text,
+    cell_retention_installed_at_unix_ms
   FROM object_store_retention.object_dispatch_retention_schema_state
  WHERE singleton";
 
@@ -1233,7 +1300,7 @@ pub async fn apply_cell_install_plan(
 ) -> Result<
     (
         CellInstallDisposition,
-        [(CellSchemaLayerId, LayerInstallOutcome); 5],
+        [(CellSchemaLayerId, LayerInstallOutcome); 6],
     ),
     CellSchemaError,
 > {
@@ -1255,6 +1322,10 @@ pub async fn apply_cell_install_plan(
         ),
         (
             CellSchemaLayerId::BudgetLimiter,
+            LayerInstallOutcome::Created,
+        ),
+        (
+            CellSchemaLayerId::CellRetention,
             LayerInstallOutcome::Created,
         ),
     ];
@@ -1546,7 +1617,7 @@ async fn call_layer_install(
 
 async fn read_layer_identities(
     client: &Client,
-) -> Result<[(CellSchemaLayerId, LayerIdentity); 5], CellSchemaError> {
+) -> Result<[(CellSchemaLayerId, LayerIdentity); 6], CellSchemaError> {
     // 0011 revokes every privilege on the schema-state table from all three service roles, so the
     // tuples are readable only as the schema owner. The migrator is a member of the owner role by
     // the install precondition above, which is what makes this legitimate rather than a widening.
@@ -1590,6 +1661,7 @@ async fn read_layer_identities(
         (CellSchemaLayerId::PutReservation, LayerIdentity::Absent),
         (CellSchemaLayerId::DispatcherIdentity, LayerIdentity::Absent),
         (CellSchemaLayerId::BudgetLimiter, LayerIdentity::Absent),
+        (CellSchemaLayerId::CellRetention, LayerIdentity::Absent),
     ];
     for (index, layer) in CELL_SCHEMA_LAYERS.iter().enumerate() {
         identities[index] = (layer.id, read_layer_identity(row, index * 4, layer)?);

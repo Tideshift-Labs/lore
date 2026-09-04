@@ -917,7 +917,7 @@ impl DispatchMaintenanceClient {
 // ---------------------------------------------------------------------------------------------
 
 /// A mutation with its parameters already converted to what `tokio-postgres` can bind.
-trait PreparedMutation {
+pub(crate) trait PreparedMutation {
     type Outcome;
 
     fn statement(&self) -> &'static str;
@@ -937,7 +937,7 @@ enum AttemptOutcome<T> {
     AmbiguousCommit,
 }
 
-async fn run_mutation<M: PreparedMutation>(
+pub(crate) async fn run_mutation<M: PreparedMutation>(
     pool: &DispatchRuntimePool,
     prepared: &M,
 ) -> Result<DispatchAccepted<M::Outcome>, DispatchAuthorityError> {
@@ -1094,7 +1094,7 @@ async fn mutate_on_lease<M: PreparedMutation>(
 /// Acquisition sits outside the bounded-execution envelope, as it does on the mutation path: the
 /// envelope bounds the transaction, while the pool carries its own `acquire_timeout` and
 /// `connect_timeout`. Folding acquisition in would report provable pool exhaustion as a timeout.
-async fn read_once(
+pub(crate) async fn read_once(
     pool: &DispatchRuntimePool,
     statement: &str,
     params: &[&(dyn ToSql + Sync)],
@@ -1369,7 +1369,7 @@ fn disposition_of(
     }
 }
 
-fn text(row: &Row, index: usize) -> Result<String, DispatchAuthorityError> {
+pub(crate) fn text(row: &Row, index: usize) -> Result<String, DispatchAuthorityError> {
     row.try_get::<_, String>(index)
         .map_err(|_| DispatchAuthorityError::InvalidAuthorityResponse("expected a text column"))
 }
@@ -1379,7 +1379,7 @@ fn uuid(row: &Row, index: usize) -> Result<Uuid, DispatchAuthorityError> {
         .map_err(|_| DispatchAuthorityError::InvalidAuthorityResponse("expected a uuid column"))
 }
 
-fn int8(row: &Row, index: usize) -> Result<i64, DispatchAuthorityError> {
+pub(crate) fn int8(row: &Row, index: usize) -> Result<i64, DispatchAuthorityError> {
     row.try_get::<_, i64>(index)
         .map_err(|_| DispatchAuthorityError::InvalidAuthorityResponse("expected a bigint column"))
 }
@@ -1408,7 +1408,7 @@ fn uint64(row: &Row, index: usize) -> Result<u64, DispatchAuthorityError> {
     })
 }
 
-fn require(condition: bool, what: &'static str) -> Result<(), DispatchAuthorityError> {
+pub(crate) fn require(condition: bool, what: &'static str) -> Result<(), DispatchAuthorityError> {
     if condition {
         Ok(())
     } else {

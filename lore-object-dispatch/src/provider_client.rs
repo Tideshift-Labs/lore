@@ -1536,6 +1536,44 @@ impl ProviderGetTransport for UnwiredProviderTransport {
     }
 }
 
+/// A provider-attempt audit bound to the logical request whose attempts produced it (WP-114 CD-8).
+///
+/// This closes the half of INV-EJ B1 that [`ProviderAttemptLedger::audit_for`] could not.
+/// `audit_for` checking its caller's argument catches the mistake at the point it is made, but a
+/// check at the producer cannot bind a value the consumer accepts unconditionally:
+/// [`ObjectStoreProviderAttemptAudit`] is a public struct of public counters, so a correct audit
+/// still attached to the wrong receipt and one could be written as a struct literal without calling
+/// `audit_for` at all.
+///
+/// The binding is structural rather than checked. Both fields are private and this module declares
+/// no constructor for them, so the only value of this type that can exist anywhere is the one
+/// `audit_for` returns, and [`crate::compaction::ObjectStoreCompactReceiptInput`] requires it. A
+/// caller can still route an audit to the wrong receipt, but the receipt encoder now compares the
+/// carried request identity against the authority's own and refuses.
+///
+/// **It changes no canonical encoding.** The encoder still reads the same five counters in the same
+/// order; the request identity travels beside them and is never written into the audit preimage. No
+/// golden literal moves, in either language.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundProviderAttemptAudit {
+    audit: ObjectStoreProviderAttemptAudit,
+    logical_request_id: String,
+}
+
+impl BoundProviderAttemptAudit {
+    /// The counters, in the shape the frozen encoder takes.
+    #[must_use]
+    pub fn audit(&self) -> &ObjectStoreProviderAttemptAudit {
+        &self.audit
+    }
+
+    /// The logical request these counters describe.
+    #[must_use]
+    pub fn logical_request_id(&self) -> &str {
+        &self.logical_request_id
+    }
+}
+
 /// The attempt accounting one logical request accumulates, and the source of its retained
 /// provider-attempt audit.
 ///
@@ -1657,24 +1695,26 @@ impl ProviderAttemptLedger {
 
     /// The retained provider-attempt audit, for the logical request the caller is attaching it to.
     ///
-    /// The caller must name that request and it must be this ledger's, so a caller reaching for
-    /// the wrong ledger is told so at the point of the mistake. **This is not a binding, and the
-    /// difference matters.** [`ObjectStoreProviderAttemptAudit`] is a public struct of public
-    /// counters, and `ObjectStoreCompactReceiptInput` takes it beside a `logical_request_id` it
-    /// never checks it against, so an audit obtained here for request A still attaches to request
-    /// B's receipt, and one can be written as a struct literal without calling this at all.
-    /// Binding `execute`'s input closed the half that could be closed from inside this module:
-    /// one ledger can no longer accumulate two requests' attempts. Closing the other half means a
-    /// bound audit type the receipt input requires, which is a contract change to the retained
-    /// compact-receipt family and is recorded as an obligation in WP-114 rather than improvised
-    /// here.
+    /// The caller must name that request and it must be this ledger's, so a caller reaching for the
+    /// wrong ledger is told so at the point of the mistake. Since WP-114 CD-8 this is also the only
+    /// place a [`BoundProviderAttemptAudit`] can come from, and
+    /// [`crate::compaction::ObjectStoreCompactReceiptInput`] requires one, so the check here is now
+    /// backed by a binding the consumer cannot be talked out of: an audit minted for request A is
+    /// refused by request B's receipt encoder rather than silently accepted by it.
     ///
     /// Identity is checked before poison, matching [`GovernedProviderClient::execute`]: whether
     /// this is the caller's ledger at all precedes any question about the state it is in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderClientError::LedgerRequestMismatch`] when the named request is not this
+    /// ledger's, the error that closed the ledger when it is poisoned, and
+    /// [`ProviderClientError::LedgerAlgebraViolation`] when the accumulated counters would not
+    /// satisfy the frozen encoder.
     pub fn audit_for(
         &self,
         logical_request_id: &str,
-    ) -> Result<ObjectStoreProviderAttemptAudit, ProviderClientError> {
+    ) -> Result<BoundProviderAttemptAudit, ProviderClientError> {
         if logical_request_id != self.logical_request_id {
             return Err(ProviderClientError::LedgerRequestMismatch);
         }
@@ -1697,7 +1737,14 @@ impl ProviderAttemptLedger {
         if !provider_attempt_audit_is_valid(&audit) {
             return Err(ProviderClientError::LedgerAlgebraViolation);
         }
-        Ok(audit)
+        Ok(BoundProviderAttemptAudit {
+            audit,
+            // This ledger's own binding, not the caller's argument. They are equal here because the
+            // mismatch check above already refused every case in which they are not, but taking it
+            // from `self` is what makes that true by construction rather than by the ordering of
+            // two statements in this function.
+            logical_request_id: self.logical_request_id.clone(),
+        })
     }
 
     fn poison(&mut self, error: ProviderClientError) -> ProviderClientError {

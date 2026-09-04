@@ -21,3 +21,11 @@ path = "src/fragment_put_before_admission.rs"
 [[bin]]
 name = "fragment-general-token-cannot-put"
 path = "src/fragment_general_token_cannot_put.rs"
+
+[[bin]]
+name = "bound-provider-attempt-audit-cannot-be-constructed"
+path = "src/bound_provider_attempt_audit_cannot_be_constructed.rs"
+
+[[bin]]
+name = "compact-receipt-input-rejects-unbound-audit"
+path = "src/compact_receipt_input_rejects_unbound_audit.rs"

@@ -21,6 +21,7 @@ use thiserror::Error;
 use crate::contract::BoundedCanonicalWriter;
 use crate::contract::canonical_uuid_v7_timestamp;
 use crate::contract::validate_canonical_text;
+use crate::provider_client::BoundProviderAttemptAudit;
 use crate::request_state_wire::CanonicalObjectStoreRequestOutcome;
 use crate::request_state_wire::CanonicalObjectStoreRequestReceipt;
 use crate::request_state_wire::CanonicalObjectStoreRequestState;
@@ -186,7 +187,15 @@ pub struct ObjectStoreCompactReceiptInput<'a> {
     pub get_outcome: &'a CanonicalObjectStoreRequestOutcome,
     pub admission_created_at_unix_ms: i64,
     pub reserve_put_ack: Option<&'a CanonicalObjectStoreReservePutAck>,
-    pub provider_attempt_audit: &'a ObjectStoreProviderAttemptAudit,
+    /// The audit, bound to the request whose attempts produced it (WP-114 CD-8).
+    ///
+    /// A bare [`ObjectStoreProviderAttemptAudit`] is deliberately not accepted here. It is a public
+    /// struct of public counters, so accepting one meant any audit attached to any receipt and one
+    /// could be written as a struct literal that no ledger ever saw. A
+    /// [`BoundProviderAttemptAudit`] exists only where
+    /// [`crate::provider_client::ProviderAttemptLedger::audit_for`] made it, and the encoder below
+    /// compares the request it names against the authority's own.
+    pub provider_attempt_audit: &'a BoundProviderAttemptAudit,
     pub dependency_floors: &'a [ObjectStoreCompactDependencyFloor],
     pub closure_committed_at_unix_ms: i64,
     pub compacted_at_unix_ms: i64,
@@ -307,7 +316,8 @@ pub struct ObjectStoreCompactReceiptPlannerInput<'a> {
     pub get_outcome: &'a CanonicalObjectStoreRequestOutcome,
     pub admission_created_at_unix_ms: i64,
     pub reserve_put_ack: Option<&'a CanonicalObjectStoreReservePutAck>,
-    pub provider_attempt_audit: &'a ObjectStoreProviderAttemptAudit,
+    /// The audit, bound to its request. See [`ObjectStoreCompactReceiptInput`].
+    pub provider_attempt_audit: &'a BoundProviderAttemptAudit,
     pub trusted_dependency_floors: Option<&'a [ObjectStoreCompactDependencyFloor]>,
     pub database_now_unix_ms: i64,
     pub existing_compact: Option<&'a CanonicalObjectStoreCompactReceipt>,
@@ -370,6 +380,10 @@ pub enum CompactReceiptError {
     InvalidRetentionProjection,
     #[error("encoded compact receipt does not match its value")]
     EncodedValueMismatch,
+    /// The audit was minted by a ledger bound to a different logical request than the authority
+    /// this receipt projects (WP-114 CD-8, closing INV-EJ B1's consumer half).
+    #[error("compact provider-attempt audit names a different logical request")]
+    ProviderAttemptAuditRequestMismatch,
 }
 
 fn validate_limits(limits: &ObjectStoreCompactReceiptLimits) -> Result<(), CompactReceiptError> {
@@ -793,6 +807,30 @@ fn compact_fingerprint(
     Ok(*blake3::hash(&output.finish()).as_bytes())
 }
 
+/// Refuse an audit minted against a different logical request than this receipt's authority
+/// (WP-114 CD-8).
+///
+/// The producer side of this was already closed: a ledger is opened against one boundary and one
+/// logical request, `execute` refuses an attempt naming anything else, and `audit_for` refuses to
+/// hand an audit to a caller naming the wrong request. What was missing is exactly this -- the
+/// consumer comparing the audit it was handed against the authority it is compacting. Both halves
+/// are needed: a check at the producer cannot bind a value the consumer accepts unconditionally,
+/// and a check here cannot know whose counters they are unless the producer said so.
+///
+/// The comparison is byte equality on the canonical identity text. Both sides are produced by the
+/// same canonicalisation -- the ledger validated its request id as a canonical UUIDv7 at
+/// construction, and the projection reads the authority's own canonical field -- so a difference
+/// here is a different request, never a different spelling of one.
+fn checked_audit_binding(
+    audit: &BoundProviderAttemptAudit,
+    projection: &AuthorityProjection<'_>,
+) -> Result<(), CompactReceiptError> {
+    if audit.logical_request_id() != projection.logical_request_id {
+        return Err(CompactReceiptError::ProviderAttemptAuditRequestMismatch);
+    }
+    Ok(())
+}
+
 fn audit_matches_authority(
     actual: &ObjectStoreProviderAttemptAudit,
     projection: &AuthorityProjection<'_>,
@@ -860,8 +898,9 @@ pub fn validate_and_encode_object_store_compact_receipt(
         input.get_outcome,
         limits,
     )?;
+    checked_audit_binding(input.provider_attempt_audit, &projection)?;
     let audit = validate_and_encode_object_store_provider_attempt_audit(
-        input.provider_attempt_audit,
+        input.provider_attempt_audit.audit(),
         limits,
     )?;
     let floors = checked_floors(input.dependency_floors, limits)?;
@@ -1072,8 +1111,9 @@ pub fn decide_object_store_compact_receipt(
         input.get_outcome,
         &validation_limits,
     )?;
+    checked_audit_binding(input.provider_attempt_audit, &projection)?;
     let audit = validate_and_encode_object_store_provider_attempt_audit(
-        input.provider_attempt_audit,
+        input.provider_attempt_audit.audit(),
         &validation_limits,
     )?;
     if !audit_matches_authority(audit.value(), &projection)? {
@@ -1170,7 +1210,12 @@ pub fn decide_object_store_compact_receipt(
             get_outcome: &outcome,
             admission_created_at_unix_ms: input.admission_created_at_unix_ms,
             reserve_put_ack,
-            provider_attempt_audit: audit.value(),
+            // The bound value this planner was given, not `audit.value()`. The two encode to
+            // identical bytes -- `validate_and_encode_object_store_provider_attempt_audit` returns
+            // its input with only `audit_blake3` filled in -- and any digest the caller supplied
+            // was already verified against those bytes above, so passing the bound value loses no
+            // check and keeps the binding intact all the way into the receipt.
+            provider_attempt_audit: input.provider_attempt_audit,
             dependency_floors: &floor_values,
             closure_committed_at_unix_ms,
             compacted_at_unix_ms: input.database_now_unix_ms,

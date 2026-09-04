@@ -1,12 +1,16 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
+#[path = "committed_audit.rs"]
+mod committed_audit;
+
 use lore_object_dispatch::*;
 use lore_proto::lore::object_dispatch::v1::*;
 
 pub const NOW: i64 = 0x018f_3e12_a456;
 pub const REQUEST_ID: &str = "018f3e12-a450-7abc-8def-0123456789ab";
 pub const ATTEMPT_ID: &str = "018f3e12-a451-7abc-8def-0123456789ab";
+const PROVIDER_BOUNDARY_ID: &str = "boundary-1";
 
 const DIGEST: [u8; 32] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
@@ -203,7 +207,14 @@ fn closed_state() -> lore_object_dispatch::CanonicalObjectStoreRequestState {
     .expect("closed state fixture")
 }
 
-pub fn compact_plan() -> ObjectStoreCompactReceiptDecision {
+pub async fn compact_plan() -> ObjectStoreCompactReceiptDecision {
+    let audit = committed_audit::committed_decisive_audit(
+        PROVIDER_BOUNDARY_ID,
+        REQUEST_ID,
+        ATTEMPT_ID,
+        NOW,
+    )
+    .await;
     let authority = ObjectStoreCompactAuthority::RequestState(Box::new(closed_state()));
     let ObjectStoreCompactAuthority::RequestState(state) = &authority;
     let receipt = validate_and_encode_object_store_request_receipt(
@@ -234,15 +245,7 @@ pub fn compact_plan() -> ObjectStoreCompactReceiptDecision {
             get_outcome: &outcome,
             admission_created_at_unix_ms: NOW - 50,
             reserve_put_ack: None,
-            provider_attempt_audit: &ObjectStoreProviderAttemptAudit {
-                attempt_count: 1,
-                committed_grant_count: 1,
-                no_dispatch_count: 0,
-                decisive_terminal_count: 1,
-                ambiguous_count: 0,
-                provider_authority_refunded: false,
-                audit_blake3: None,
-            },
+            provider_attempt_audit: &audit,
             trusted_dependency_floors: None,
             database_now_unix_ms: NOW + 50,
             existing_compact: None,

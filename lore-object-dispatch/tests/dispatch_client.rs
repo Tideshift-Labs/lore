@@ -1781,8 +1781,11 @@ fn test_budget(dispatch_pool_max: u32) -> DispatchConnectionBudget {
 
 #[test]
 fn no_other_crate_source_file_calls_the_typed_clients_or_builds_another_pool() {
-    // Phase 5 composes CD-4 charging over CD-3's one shared runtime pool. No sibling may call a
-    // typed client, and provider_charge.rs is the only sibling allowed to retain that pool.
+    // Phase 5 composes CD-4 charging over CD-3's one shared runtime pool. WP-114 CD-8's
+    // cell-scale retention joined it as a second legitimate consumer, on the same rule: it also
+    // takes the process's already-built pool rather than constructing its own (checked below by
+    // the same `DispatchRuntimePool::new(` scan). No OTHER sibling may call a typed client or
+    // retain the pool.
     let mut sources = Vec::new();
     collect_rust_sources(&crate_root().join("src"), &mut sources);
     assert!(sources.len() > 20, "source walk found too few files");
@@ -1814,8 +1817,9 @@ fn no_other_crate_source_file_calls_the_typed_clients_or_builds_another_pool() {
     }
     assert_eq!(
         pool_consumers,
-        vec!["provider_charge.rs"],
-        "only the charge authority may consume the shared runtime pool"
+        vec!["cell_retention.rs", "provider_charge.rs"],
+        "only the charge authority and cell-scale retention (WP-114 CD-8) may consume the shared \
+         runtime pool"
     );
 }
 

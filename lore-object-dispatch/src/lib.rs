@@ -9,6 +9,7 @@
 //! and migration artifacts remain source-dark until their later activation work supplies an
 //! explicit composition path.
 
+pub mod cell_retention;
 pub mod cell_schema_install;
 pub mod compact_prune;
 pub mod compaction;
@@ -200,6 +201,7 @@ pub use provider_charge::PostgresProviderChargeAuthority;
 pub use provider_charge::classify_provider_charge_commit;
 pub use provider_client::AuthorizedProviderAttempt;
 pub use provider_client::AuthorizedProviderGet;
+pub use provider_client::BoundProviderAttemptAudit;
 pub use provider_client::BudgetPin;
 pub use provider_client::CellProviderBoundary;
 pub use provider_client::DurableProviderPutBody;

@@ -40,8 +40,8 @@ use lore_object_dispatch::cell_schema_install::validate_cell_install_set_digests
 // guard, and a source-dark check).
 // ---------------------------------------------------------------------------------------------
 
-const CELL_INSTALLED_MIGRATION_NUMBERS: [u16; 18] = [
-    2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+const CELL_INSTALLED_MIGRATION_NUMBERS: [u16; 20] = [
+    2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
 ];
 
 fn migrations_dir() -> PathBuf {
@@ -202,7 +202,13 @@ fn embedded_bytes_are_the_frozen_bytes() {
 #[test]
 fn plan_interleaves_layer_installs_immediately_after_their_ddl_step() {
     let plan = cell_install_plan();
-    assert_eq!(plan.len(), 23);
+    // One step per migration DDL, plus one `InstallLayer` step per schema layer. Derived rather
+    // than a written-down count, which drifts every time a wave adds a migration or a layer (WP-114
+    // CD-8 added both at once).
+    assert_eq!(
+        plan.len(),
+        CELL_INSTALL_SET.len() + CELL_SCHEMA_LAYERS.len()
+    );
 
     let ddl_indices: Vec<usize> = plan
         .iter()
@@ -257,6 +263,7 @@ fn plan_interleaves_layer_installs_immediately_after_their_ddl_step() {
         CellSchemaLayerId::DispatcherIdentity
     );
     assert_eq!(CELL_SCHEMA_LAYERS[4].id, CellSchemaLayerId::BudgetLimiter);
+    assert_eq!(CELL_SCHEMA_LAYERS[5].id, CellSchemaLayerId::CellRetention);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -328,6 +335,20 @@ fn layer_contract_matches_the_frozen_sql() {
             read_state_retired_after: None,
             installed_after_migration: 22,
             migration_blake3_hex: "3387f71079d81552e97226144e3f8526706f197d6eedb23af9af5a41ac43fb31",
+        },
+        Expected {
+            id: CellSchemaLayerId::CellRetention,
+            api_revision: "object-store-dispatch-cell-retention-v1",
+            schema_revision: "object-store-dispatch-cell-retention-schema-v1",
+            install_function: "object_store_dispatch_cell_retention_install_v1",
+            read_state_function: "object_store_dispatch_cell_retention_read_state_v1",
+            // Unlike the two dispatch layers above, this is not a retirement in the same sense:
+            // 0024 creates the readback already granted to the runtime role alone, so it is
+            // unreachable from the migrator's own attester seat from the moment it exists rather
+            // than after some later migration revokes it.
+            read_state_retired_after: Some(24),
+            installed_after_migration: 24,
+            migration_blake3_hex: "cef47bfe8afd932b66f0c7c6856aa10b27532841e6da90208f8ee753a700542a",
         },
     ];
 
@@ -937,9 +958,22 @@ fn no_service_shell_and_runtime_source_never_calls_the_install_procedures() {
             continue;
         }
         let source = std::fs::read_to_string(path).expect("read production Rust source");
+        // Exclude doc-comment lines before the substring check: a rustdoc intra-doc link such as
+        // `[crate::cell_schema_install::CELL_DEFERRED_MIGRATIONS]` in a `//!`/`///` comment is prose
+        // citing a constant, not runtime code referencing the installer module, and must not trip
+        // this guard (WP-114 CD-8's `cell_retention.rs` module doc does exactly this).
+        let code_only: String = source
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !(trimmed.starts_with("//!") || trimmed.starts_with("///"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            !source.contains("cell_schema_install::"),
-            "{} references cell_schema_install::, but runtime source must never install this artifact",
+            !code_only.contains("cell_schema_install::"),
+            "{} references cell_schema_install:: outside a doc comment, but runtime source must \
+             never install this artifact",
             path.display()
         );
         for entrypoint in install_procedure_names {

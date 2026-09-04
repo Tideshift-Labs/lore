@@ -344,7 +344,7 @@ async fn assert_and_remove_transfer_fault(admin: &tokio_postgres::Client, fault:
 async fn prove_transfer_retry(fault: RetryFault) {
     let environment = LiveEnvironment::load();
     let admin = connect_admin(&environment).await;
-    let compact_plan = retention_fixture::compact_plan();
+    let compact_plan = retention_fixture::compact_plan().await;
     let (_, source_authority_blake3) = applied_compact(&compact_plan);
     reset_and_seed_full_record(&admin.client, &source_authority_blake3).await;
     install_transfer_fault(&admin.client, fault).await;
@@ -429,7 +429,7 @@ async fn transfer_retries_one_deadlock_abort_then_applies_once() {
 async fn prune_lost_commit_response_adopts_exact_immutable_receipt_without_duplicate_mutation() {
     let environment = LiveEnvironment::load();
     let admin = connect_admin(&environment).await;
-    let compact_plan = retention_fixture::compact_plan();
+    let compact_plan = retention_fixture::compact_plan().await;
     let (compact, source_authority_blake3) = applied_compact(&compact_plan);
     reset_and_seed_full_record(&admin.client, &source_authority_blake3).await;
     let (upstream_host, upstream_port) = upstream_address(&environment.maintenance_url);

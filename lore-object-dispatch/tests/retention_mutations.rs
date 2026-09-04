@@ -612,6 +612,18 @@ fn mutation_artifact_is_embedded_only_and_all_production_rust_remains_dark() {
                 // which also proves itself against planted calls.
                 continue;
             }
+            if source_path
+                == Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src")
+                    .join("cell_retention.rs")
+            {
+                // WP-114 CD-8's module doc names both deferred procedures in prose, explaining
+                // exactly why they cannot run in a cell (the argument for replacing them with
+                // 0023/0024 rather than installing or resizing them). This is a citation, not a
+                // call: cell_retention.rs never imports or invokes `retention_mutations`, and its
+                // own runtime calls go through `dispatch_client`/0024's procedures only.
+                continue;
+            }
             assert!(
                 !source.contains(sql_identifier),
                 "retention mutation SQL identifier {sql_identifier} escaped the dedicated client into {}",
