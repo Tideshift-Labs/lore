@@ -1,0 +1,135 @@
+# Copyright 2026 Tideshift Labs
+# SPDX-License-Identifier: MIT
+#
+# WP-109 Phase 3 two-process config template.
+#
+# One of these is rendered per loreserver process into that process's own
+# config directory as `local.toml`, which `Settings::load` layers last over the
+# binary's compiled-in `lore-server/config/default.toml`. Every name wrapped in
+# doubled braces below is substituted by
+# `active_active_two_process_support::cell::render`, which then REFUSES to
+# return a document still containing a doubled brace — an unsubstituted
+# placeholder would boot a server against a bucket or a database that does not
+# exist and report it as a case failure. That refusal is also why this comment
+# describes the syntax in words instead of showing it: a literal example here
+# would trip the very guard it is describing.
+#
+# The two processes differ ONLY in their ports, their state directory, their
+# relay owner, and their producer instance id. Same database, same bucket, same
+# cell id: that identity is the whole point of the proof.
+
+# QUIC shares 41337 with gRPC in the compiled-in defaults, and this harness
+# drives gRPC only. Leaving QUIC on would bind the same port twice per process
+# and collide across the two processes as well.
+[server.quic]
+enabled = false
+
+[server.quic_internal]
+enabled = false
+
+[server.grpc]
+enabled = true
+host = "127.0.0.1"
+port = {{GRPC_PORT}}
+
+[server.http]
+enabled = true
+host = "127.0.0.1"
+port = {{HTTP_PORT}}
+
+# Auth is ON. CR-029 carriage is refused without a verified principal
+# (`DomainContext::admit`), so a governed mutation is unreachable on an
+# auth-off cell and WP-109 Phase 3's final proof is auth-on regardless.
+[server.auth]
+jwt_issuer = "{{JWT_ISSUER}}"
+jwt_audience = ["{{JWT_AUDIENCE}}"]
+enforce_write_permission = true
+
+[server.auth.jwk]
+endpoint = "{{JWKS_URL}}"
+
+# All three coordination stores in the ONE shared cell database; fragment bytes
+# in the ONE shared MinIO bucket.
+[immutable_store]
+mode = "postgres"
+
+[mutable_store]
+mode = "postgres"
+
+[lock_store]
+mode = "postgres"
+
+[plugins.postgres.immutable_store]
+url = "{{PG_URL}}"
+
+[plugins.postgres.immutable_store.object_store]
+bucket = "{{S3_BUCKET}}"
+endpoint_url = "{{S3_ENDPOINT}}"
+region = "{{S3_REGION}}"
+force_path_style = true
+
+[plugins.postgres.mutable_store]
+url = "{{PG_URL}}"
+
+[plugins.postgres.lock_store]
+url = "{{PG_URL}}"
+
+# Every store above is in postgres mode, so the local-store settings the
+# compiled-in defaults carry should never be reached. They are pinned to this
+# process's own state directory anyway: an unset `path` derives one under the
+# system temp directory, which BOTH processes would then share, and a proof
+# about two independent processes must not have an unexamined shared directory
+# in it. If either of these paths ever grows content, that is a finding.
+[immutable_store.local]
+path = "{{STATE_DIR}}/immutable"
+
+[mutable_store.local]
+path = "{{STATE_DIR}}/mutable"
+
+# `mode = "remote"` is what unmounts the local public NotificationService and
+# selects the CR-027 plugin. `[outbox_relay]`'s startup gate refuses any other
+# mode, because the relay publishes through this plugin's gateway client.
+[notification]
+mode = "remote"
+
+[plugins.remote]
+gateway_uri = "{{GATEWAY_URI}}"
+cell_id = "{{CELL_ID}}"
+placement_epoch = {{PLACEMENT_EPOCH}}
+producer_instance_id = "{{PRODUCER_INSTANCE_ID}}"
+client_cert_path = "{{CLIENT_CERT}}"
+client_key_path = "{{CLIENT_KEY}}"
+trust_roots_path = "{{TRUST_ROOTS}}"
+queue_capacity = 256
+request_timeout_ms = 2000
+drain_timeout_ms = 2000
+
+[plugins.remote.retry]
+initial_backoff_ms = 25
+max_backoff_ms = 250
+max_attempts = 2
+
+[plugins.remote.contract]
+private_transport_version = 1
+durable_payload_version_min = 1
+durable_payload_version_max = 1
+
+# NOTE(WP-109 Phase 3): `[plugins.remote.receiver]` is deliberately ABSENT.
+# `RemoteNotificationPluginFactory::create` builds the plugin with no
+# `ReceiverRuntime` (`factory.rs:69`), and the only entry point that starts a
+# durable receiver, `factory::create_with_receiver`, has no non-test caller.
+# Declaring the table here would produce a boot-time warning and a cell that
+# still runs no receiver, which is a worse artefact than its documented
+# absence. See the harness report's BLOCKED entry.
+
+[outbox_relay]
+enabled = {{RELAY_ENABLED}}
+owner = "{{RELAY_OWNER}}"
+batch_size = 8
+claim_lease_seconds = {{CLAIM_LEASE_SECONDS}}
+publish_deadline_seconds = 2
+idle_interval_millis = {{IDLE_INTERVAL_MILLIS}}
+backoff_base_millis = 50
+backoff_cap_seconds = 5
+readiness_probe_interval_seconds = 1
+max_oldest_unpublished_seconds = 30

@@ -48,12 +48,25 @@ lore-proto = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-# Test-only token minting for the auth-ON QUIC harness (WP-108 case B4). Verification stays
-# `lore-server`'s: this only signs the tokens its `JwtVerifier` is then asked to accept or refuse.
+# Test-only token minting for the auth-ON QUIC harness (WP-108 case B4) and for
+# WP-109 Phase 3's two-process harness, which mints the bearer tokens both live
+# loreserver processes verify against a JWKS endpoint the harness serves.
+# Verification stays `lore-server`'s: this only signs the tokens its
+# `JwtVerifier` is then asked to accept or refuse.
 jsonwebtoken = { workspace = true }
 lore-server = { workspace = true }
 lore-transport = { workspace = true, features = ["test_seams"] }
 rcgen = { workspace = true }
+serde = { workspace = true }
+# WP-109 Phase 3 only. The two-process harness reads authoritative state over a
+# THIRD connection that belongs to neither server process (`lore-postgres`,
+# `tokio-postgres`), mints CR-029 governed carriage against the same coordinator
+# a control plane would (`lore-postgres`, `uuid`), and drives both processes
+# over real gRPC (`tonic`). None of these reach a non-test build: this crate's
+# only target is the `integration_tests`-gated suite.
+lore-postgres = { workspace = true }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+tonic = { workspace = true, features = ["channel"] }
 
 [features]
 integration_tests = ["lore-server/integration_tests"]

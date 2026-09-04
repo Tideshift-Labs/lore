@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+mod active_active_two_process_support;
+mod active_active_two_process_test;
 mod aws_store_test;
 mod common;
 mod dynamodb_test;
