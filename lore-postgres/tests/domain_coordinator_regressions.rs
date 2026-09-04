@@ -243,6 +243,7 @@ async fn repository_create_exact_replay_returns_the_committed_outcome() {
             outcome: DomainOutcome::Applied,
             repository_generation: None,
             branch_generation: None,
+            observed_pointer: None,
         },
         "a consumed operation replays its committed outcome, never {ADMISSION_REJECTED_V1}"
     );

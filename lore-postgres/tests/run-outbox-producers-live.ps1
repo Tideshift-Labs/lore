@@ -50,6 +50,7 @@ $cases = @(
     'admission_rejection_leaves_no_row',
     'begin_obliterate_commits_exactly_one_repository_obliterated_row',
     'begin_obliterate_on_a_tombstoned_repository_leaves_no_row',
+    'branch_metadata_cas_mismatch_reports_the_branch_metadata_hash_as_observed_pointer',
     'branch_push_cas_mismatch_leaves_no_row',
     'branch_push_current_head_noop_leaves_no_row_even_with_event_supplied',
     'branch_push_tip_advance_commits_exactly_one_row_with_branch_generation_and_revision_identity',

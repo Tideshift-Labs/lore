@@ -6,6 +6,8 @@ use std::sync::Arc;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Hash;
+use lore_postgres::domain::coordinator::ProjectionWrite;
+use lore_postgres::domain::outbox::builders as outbox_builders;
 use lore_proto::BranchMetadataSetRequest;
 use lore_proto::BranchMetadataSetResponse;
 use lore_revision::branch;
@@ -20,9 +22,12 @@ use tonic::Response;
 use tonic::Status;
 
 use crate::domain::DomainContext;
+use crate::domain::GovernedMetadataCas;
 use crate::domain::GovernedScope;
+use crate::domain::MetadataCasOutcome;
 use crate::domain::admit_at_entry;
-use crate::domain::reject_unwired_governed_operation;
+use crate::domain_intent::CanonicalIntent;
+use crate::domain_intent::canonical_intent_digest;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -112,24 +117,46 @@ pub async fn handler(
     let extensions = request.extensions().clone();
     let req = request.into_inner();
 
-    if let Some(admitted) = admit_at_entry(
+    // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
+    // at handler entry, before any handler logic or authorization side effect.
+    let admitted = admit_at_entry(
         domain_context,
         &request_metadata,
         request_authorization.as_ref(),
         GovernedScope::TargetRepository {
             repository_id: repository_id.data(),
         },
-    )? {
-        return Err(reject_unwired_governed_operation(
-            &admitted,
-            "lore.RevisionService/BranchMetadataSet",
-        ));
-    }
+    )?;
 
     let branch_id = BranchId::from(req.branch_id);
     if branch_id == BranchId::default() {
         return Err(Status::invalid_argument("Missing branch ID"));
     }
+
+    // Recomputed from the exact validated wire values, never taken from the
+    // body. v0 and v1 of this CAS share one frozen intent family, so identical
+    // values must produce identical bytes on both entry points.
+    //
+    // After the empty/default check, per INTENT-02-LORE; see the v0 repository
+    // handler for the full reasoning.
+    let governed = match admitted {
+        Some(admitted) => {
+            let digest = canonical_intent_digest(&CanonicalIntent::BranchMetadataCas {
+                repository_id: repository_id.data(),
+                branch_id: branch_id.as_ref(),
+                expected_hash: &req.expected_hash,
+                new_hash: &req.new_hash,
+            })
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            GovernedMetadataCas::prepare(
+                domain_context,
+                Some(admitted),
+                "lore.RevisionService/BranchMetadataSet",
+                digest,
+            )?
+        }
+        None => None,
+    };
 
     let expected_hash: Hash = req.expected_hash.into();
     let new_hash: Hash = req.new_hash.into();
@@ -200,22 +227,105 @@ pub async fn handler(
                 repository_id,
                 branch_id,
             );
-            let write_token = get_write_token();
-            let previous = repository
-                .write_mutable_store(&write_token)
-                .compare_and_swap(
-                    repository_id,
-                    metadata_key,
-                    expected_hash,
-                    new_hash,
-                    key_type,
-                )
-                .await
-                .map_err(|err| {
-                    warn_error_to_status(&err, |err| {
-                        Status::internal(format!("failed to update metadata: {err}"))
-                    })
-                })?;
+            // The governed path swaps the pointer, writes the same projection
+            // row, and appends the classified event in one transaction. The
+            // classification is not always `branch.metadata_changed`: the
+            // PROTECT bit travels inside this same CAS, and CR-032 pins
+            // `branch.protection_changed` as its own kind. `protect_changed` is
+            // already computed above for the admin-permission gate, so the two
+            // decisions cannot drift apart.
+            //
+            // PIN(WP-116): a CAS that moves the PROTECT bit AND other metadata
+            // in one write is classified as the protection change, because that
+            // is the transition with the stricter authorization and the named
+            // consumer. The pinned set's second open question is whether these
+            // two kinds stay distinct at all; if they merge, this branch
+            // collapses rather than changing meaning.
+            let previous = match &governed {
+                Some(governed) => {
+                    let event =
+                        match governed.cell_id() {
+                            Some(cell_id) => {
+                                // Read before the transaction, so the name and tip
+                                // are a preflight observation. They go in the
+                                // payload only; the aggregate version is resolved
+                                // by the coordinator from what it commits.
+                                let branch = governed
+                                    .branch_snapshot(repository_id.data(), branch_id.as_ref())
+                                    .await?
+                                    .ok_or_else(|| {
+                                        Status::not_found(format!("Branch {branch_id} not found"))
+                                    })?;
+                                let built = if protect_changed {
+                                    outbox_builders::branch_protection_changed(
+                                        cell_id,
+                                        repository_id.data(),
+                                        branch_id.as_ref(),
+                                        &branch.name,
+                                        &branch.latest_hash,
+                                        expected_hash.as_ref(),
+                                        new_hash.as_ref(),
+                                        proposed_metadata
+                                            .get_bool(branch::PROTECT)
+                                            .unwrap_or_default(),
+                                    )
+                                } else {
+                                    outbox_builders::branch_metadata_changed(
+                                        cell_id,
+                                        repository_id.data(),
+                                        branch_id.as_ref(),
+                                        &branch.name,
+                                        &branch.latest_hash,
+                                        expected_hash.as_ref(),
+                                        new_hash.as_ref(),
+                                    )
+                                };
+                                Some(built.map_err(|error| {
+                                    crate::grpc::map_domain_error_to_status(&error)
+                                })?)
+                            }
+                            None => None,
+                        };
+                    let projection = ProjectionWrite {
+                        partition: repository_id.data().to_vec(),
+                        key_type: key_type as i16,
+                        key: metadata_key.as_ref().to_vec(),
+                        value: Some(new_hash.as_ref().to_vec()),
+                    };
+                    match governed
+                        .commit(
+                            repository_id.data(),
+                            Some(branch_id.as_ref()),
+                            expected_hash.as_ref(),
+                            new_hash.as_ref(),
+                            projection,
+                            event,
+                        )
+                        .await?
+                    {
+                        MetadataCasOutcome::Applied => expected_hash,
+                        MetadataCasOutcome::Lost(observed) => Hash::from(observed.as_slice()),
+                    }
+                }
+                None => {
+                    let write_token = get_write_token();
+                    repository
+                        .write_mutable_store(&write_token)
+                        .compare_and_swap(
+                            repository_id,
+                            metadata_key,
+                            expected_hash,
+                            new_hash,
+                            key_type,
+                        )
+                        .await
+                        .map_err(|err| {
+                            warn_error_to_status(&err, |err| {
+                                Status::internal(format!("failed to update metadata: {err}"))
+                            })
+                        })?
+                }
+            };
 
             if previous == expected_hash {
                 Ok(Response::new(BranchMetadataSetResponse {

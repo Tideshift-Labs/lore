@@ -71,6 +71,10 @@ pub async fn handler(
             repository_id: &req.id,
         },
     )? {
+        // BLOCKED(WP-116): no derivation for `RepositoryDeleteInput::delete_proof`.
+        // Same blocker as the v0 handler, which carries the full record. Both
+        // delete entry points share one coordinator method and one missing
+        // artefact: a frozen `delete_proof` preimage in CR-029.
         return Err(reject_unwired_governed_operation(
             &admitted,
             "lore.repository.v1.RepositoryService/RepositoryDelete",

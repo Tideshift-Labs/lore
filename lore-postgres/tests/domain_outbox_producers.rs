@@ -45,6 +45,7 @@ use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
 use lore_postgres::domain::coordinator::MetadataCasInput;
 use lore_postgres::domain::coordinator::PendingEvent;
+use lore_postgres::domain::coordinator::ProjectionWrite;
 use lore_postgres::domain::coordinator::RepositoryCreateInput;
 use lore_postgres::domain::coordinator::RepositoryDeleteInput;
 use lore_postgres::domain::errors::DomainOutcome;
@@ -54,6 +55,7 @@ use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptKey;
 use lore_postgres::pool::TlsConfig;
+use lore_postgres::store::mutable_store::PostgresMutableStore;
 use tokio_postgres::Client;
 use uuid::NoContext;
 use uuid::Timestamp;
@@ -609,7 +611,14 @@ async fn repository_delete_retry_on_an_already_tombstoned_repository_leaves_no_s
 // metadata_compare_and_swap
 // ---------------------------------------------------------------------------
 
-/// A CAS mismatch is a decisive rejection and must leave no row.
+/// A CAS mismatch is a decisive rejection and must leave no row. The
+/// coordinator's `MutationResult.observed_pointer` must carry the exact
+/// bytes actually read under the row lock -- the current repository metadata
+/// hash -- never the caller's wrong `expected_hash` and never empty. This is
+/// the property `GovernedMetadataCas::commit` (`lore-server/src/domain.rs`)
+/// depends on to preserve CR-029 Phase 5's in-band CAS-loss pointer; the
+/// seam's own mapping of that value is separately proven, without Postgres,
+/// in `lore-server/src/domain/p12_tests.rs`.
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
 async fn metadata_cas_mismatch_leaves_no_row() {
@@ -622,19 +631,23 @@ async fn metadata_cas_mismatch_leaves_no_row() {
     let repository_id = rand_repo_id();
 
     let (create_op, _w) = admitted_operation(&store, "repository_create").await;
+    let create_input = repository_create_input(repository_id.clone(), rand_name(), None);
+    let actual_current_metadata_hash = create_input.metadata_hash.clone();
     store
-        .repository_create(
-            &create_op,
-            &repository_create_input(repository_id.clone(), rand_name(), None),
-        )
+        .repository_create(&create_op, &create_input)
         .await
         .expect("create must succeed");
 
     let (cas_op, _w) = admitted_operation(&store, "metadata_compare_and_swap").await;
+    let wrong_expected_hash = rand::random::<[u8; 32]>().to_vec();
+    assert_ne!(
+        wrong_expected_hash, actual_current_metadata_hash,
+        "test fixture sanity: the wrong hash must not coincidentally match the real one"
+    );
     let cas_input = MetadataCasInput {
         repository_id: repository_id.clone(),
         branch_id: None,
-        expected_hash: rand::random::<[u8; 32]>().to_vec(), // deliberately wrong
+        expected_hash: wrong_expected_hash.clone(), // deliberately wrong
         new_hash: rand::random::<[u8; 32]>().to_vec(),
         projection: Vec::new(),
         event: Some({
@@ -652,6 +665,75 @@ async fn metadata_cas_mismatch_leaves_no_row() {
         .await
         .expect("mismatched CAS must return a decisive rejection");
     assert!(matches!(result.outcome, DomainOutcome::NotApplied { .. }));
+    assert_eq!(
+        result.observed_pointer,
+        Some(actual_current_metadata_hash),
+        "observed_pointer must be the real current metadata hash the transaction read under \
+         its row lock"
+    );
+    assert_ne!(
+        result.observed_pointer,
+        Some(wrong_expected_hash),
+        "observed_pointer must never echo back the caller's wrong expected_hash"
+    );
+
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        0
+    );
+}
+
+/// The branch-scoped variant of the same property: a branch metadata CAS
+/// mismatch reports the branch's actual current metadata hash as
+/// `observed_pointer`, not the repository's.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn branch_metadata_cas_mismatch_reports_the_branch_metadata_hash_as_observed_pointer() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let repository_id = rand_repo_id();
+
+    let (create_op, _w) = admitted_operation(&store, "repository_create").await;
+    let create_input = repository_create_input(repository_id.clone(), rand_name(), None);
+    let branch_id = create_input.default_branch_id.clone();
+    let actual_branch_metadata_hash = create_input.default_branch_metadata_hash.clone();
+    store
+        .repository_create(&create_op, &create_input)
+        .await
+        .expect("create must succeed");
+
+    let (cas_op, _w) = admitted_operation(&store, "metadata_compare_and_swap").await;
+    let wrong_expected_hash = rand::random::<[u8; 32]>().to_vec();
+    let cas_input = MetadataCasInput {
+        repository_id: repository_id.clone(),
+        branch_id: Some(branch_id),
+        expected_hash: wrong_expected_hash,
+        new_hash: rand::random::<[u8; 32]>().to_vec(),
+        projection: Vec::new(),
+        event: Some({
+            let mut e = pending_event(
+                repository_id.clone(),
+                CommittedOrdinal::RepositoryGeneration,
+                Vec::new(),
+            );
+            e.event_kind = "branch.metadata_changed".to_string();
+            e
+        }),
+    };
+    let result = store
+        .metadata_compare_and_swap(&cas_op, &cas_input)
+        .await
+        .expect("mismatched branch CAS must return a decisive rejection");
+    assert!(matches!(result.outcome, DomainOutcome::NotApplied { .. }));
+    assert_eq!(
+        result.observed_pointer,
+        Some(actual_branch_metadata_hash),
+        "a branch-scoped CAS loss must report the BRANCH's metadata hash, not the repository's"
+    );
 
     assert_eq!(
         outbox_row_count_for_repository(&db, &repository_id).await,
@@ -660,7 +742,11 @@ async fn metadata_cas_mismatch_leaves_no_row() {
 }
 
 /// A successful repository-metadata CAS commits exactly one row at the new
-/// generation.
+/// generation, and writes the same `lore_mutable` projection row a direct
+/// (ungoverned) writer would have written -- same partition, `key_type`, and
+/// key, with the new pointer as its value. CR-029 requires this: a reader
+/// that used the projection before governed cutover must not silently stop
+/// working after it, and that is a real-Postgres property, not a unit one.
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
 async fn metadata_cas_success_commits_exactly_one_row_with_the_new_generation() {
@@ -670,6 +756,13 @@ async fn metadata_cas_success_commits_exactly_one_row_with_the_new_generation() 
     };
     let store = store(&url).await;
     let db = client(&url).await;
+    // The projection write below lands in `lore_mutable`, the CR-007 store's
+    // own table -- distinct from the domain schema `store()` installs.
+    // Nothing else in this file writes a non-empty projection, so this is
+    // the first test that needs it.
+    PostgresMutableStore::connect(&url, 2, &TlsConfig::default())
+        .await
+        .expect("install the lore_mutable schema for the projection write");
     let repository_id = rand_repo_id();
 
     let (create_op, _w) = admitted_operation(&store, "repository_create").await;
@@ -681,12 +774,23 @@ async fn metadata_cas_success_commits_exactly_one_row_with_the_new_generation() 
         .expect("create must succeed");
 
     let (cas_op, _w) = admitted_operation(&store, "metadata_compare_and_swap").await;
+    let new_metadata_hash = rand::random::<[u8; 32]>().to_vec();
+    // Same shape a real handler builds: partition = repository, an arbitrary
+    // but fixed key_type/key identifying "this repository's metadata
+    // pointer", value = the new hash.
+    let projection_key_type: i16 = 4;
+    let projection_key = rand::random::<[u8; 32]>().to_vec();
     let cas_input = MetadataCasInput {
         repository_id: repository_id.clone(),
         branch_id: None,
         expected_hash: original_metadata_hash,
-        new_hash: rand::random::<[u8; 32]>().to_vec(),
-        projection: Vec::new(),
+        new_hash: new_metadata_hash.clone(),
+        projection: vec![ProjectionWrite {
+            partition: repository_id.clone(),
+            key_type: projection_key_type,
+            key: projection_key.clone(),
+            value: Some(new_metadata_hash.clone()),
+        }],
         event: Some({
             let mut e = pending_event(
                 repository_id.clone(),
@@ -711,6 +815,22 @@ async fn metadata_cas_success_commits_exactly_one_row_with_the_new_generation() 
     let row = one_outbox_row_for_repository(&db, &repository_id).await;
     assert_eq!(row.event_kind, "repository.metadata_changed");
     assert_eq!(row.repository_generation, 2);
+
+    let projection_value: Option<Vec<u8>> = db
+        .query_opt(
+            "SELECT value FROM lore_mutable WHERE partition = $1 AND key_type = $2 AND key = $3",
+            &[&repository_id, &projection_key_type, &projection_key],
+        )
+        .await
+        .expect("query the projection row")
+        .map(|row| row.get("value"));
+    assert_eq!(
+        projection_value,
+        Some(new_metadata_hash),
+        "the committed transaction must have written the exact same lore_mutable row (same \
+         partition/key_type/key) that a direct writer would have written, with the new pointer \
+         as its value"
+    );
 }
 
 // ---------------------------------------------------------------------------

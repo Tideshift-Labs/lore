@@ -69,6 +69,26 @@ pub async fn handler(
             repository_id: &req.id,
         },
     )? {
+        // BLOCKED(WP-116): no derivation for `RepositoryDeleteInput::delete_proof`.
+        //
+        // The coordinator method exists and its outbox event is classified, but
+        // the tombstone row requires a 32-byte `delete_proof`
+        // (`lore-postgres/src/domain/schema.rs`: a NOT NULL CHECK of exactly 32
+        // bytes on any tombstoned row). CR-029 names the field three times, each
+        // time only as an "attempt-compatible immutable delete proof", and
+        // freezes no preimage, no field list, no serialisation, and no domain
+        // separator. Nothing in either repository computes one.
+        //
+        // Inventing 32 bytes here is the exact failure CR-029's own MISSING-2
+        // record describes for `canonical_intent_digest`: one side mints a
+        // value, the other cannot reproduce it, and the divergence is silent.
+        // The proof is committed into the principal-scoped receipt and returned
+        // by receipt lookup, so a wrong shape becomes permanent evidence.
+        //
+        // Missing artefact: a frozen `delete_proof` derivation in CR-029, on
+        // the same terms as its canonical-intent digest contract: one canonical
+        // preimage, its exact field order and framing, and independently
+        // computed golden vectors on both sides.
         return Err(reject_unwired_governed_operation(
             &admitted,
             "lore.RepositoryService/RepositoryDelete",

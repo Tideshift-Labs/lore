@@ -52,6 +52,20 @@ pub async fn handler(
             repository_id: &req.id,
         },
     )? {
+        // BLOCKED(WP-116): a frozen authenticated forwarding contract for the
+        // forwarded v1 RepositoryService.
+        //
+        // This site is fenced by contract, not by missing effort. CR-029's
+        // CARRIAGE-02-LORE obligation requires forwarded v1 repository create
+        // to "refuse governed carriage before delegation and keep its
+        // coordinator guard until a separately frozen authenticated forwarding
+        // contract exists". The forwarded services carry no interceptor at all
+        // (see INV-BD), so there is no verified principal here to select a
+        // mediated scope from; wiring it would admit an operation whose
+        // authority nothing established.
+        //
+        // Do not remove this guard when the sibling repository-create sites are
+        // wired. Those have a verified principal; this one does not.
         return Err(reject_unwired_governed_operation(
             &admitted,
             "lore.forwarded_repository.v1.ForwardedRepositoryService/RepositoryCreate",

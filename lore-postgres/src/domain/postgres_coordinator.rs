@@ -43,6 +43,30 @@ use crate::domain::store::PostgresDomainStore;
 ///
 /// A `None` value deletes, matching `MutableStore::store`'s zero-hash contract,
 /// so the projection stays byte-compatible with what today's readers expect.
+///
+/// PIN(WP-116): this takes no key lock, while the ungoverned writer does.
+///
+/// `PostgresMutableStore::compare_and_swap` takes an advisory lock on
+/// `(partition, key_type, key)` before it reads and decides. This function
+/// writes the same rows under the domain transaction's row locks instead, so
+/// the two writers serialise on nothing shared. That is harmless while only one
+/// of them can run, and `reject_domain_key` is what normally guarantees
+/// that — but it refuses a domain-owned key only when **enforcement is
+/// enabled**, whereas a governed mutation is admitted whenever carriage is
+/// present, enforcement or not. A cell with a coordinator, enforcement off, and
+/// a carriage-bearing client therefore has two writers to one key under two
+/// lock disciplines, and `lore_mutable` can keep the loser's value.
+///
+/// Not closed here, deliberately. Adding the advisory lock to this path is a
+/// lock-ordering change on every governed mutation, and F-032-3 orders row
+/// locks without naming this one; that belongs in its own reviewed change, not
+/// as a late addition to a producer slice. It is also unreachable today: valid
+/// carriage is minted only by the control-plane dispatch adapter, which has no
+/// production caller while `PLATFORM-REPOSITORY-CLAIM-READY` is withheld.
+///
+/// The real question for the owner is narrower than the lock: should a cell
+/// with enforcement off admit governed mutations at all? If the answer is no,
+/// this disappears without a lock change.
 async fn apply_projection(
     tx: &Transaction<'_>,
     writes: &[ProjectionWrite],
@@ -163,9 +187,12 @@ impl PostgresDomainStore {
         .await?;
         match admitted {
             ConsumeResult::Admitted(a) => Ok(BeginAdmitted::Admitted(tx, a.admission_clock)),
-            ConsumeResult::Committed { outcome, .. } => {
+            ConsumeResult::Committed {
+                outcome,
+                public_result,
+            } => {
                 classify_commit(tx.commit().await, "domain admission replay commit")?;
-                Ok(BeginAdmitted::Committed(outcome))
+                Ok(BeginAdmitted::Committed(outcome, public_result))
             }
             ConsumeResult::Rejected => {
                 // Nothing was mutated, so rolling back is the honest close.
@@ -185,15 +212,30 @@ impl PostgresDomainStore {
 
 enum BeginAdmitted<'a> {
     Admitted(deadpool_postgres::Transaction<'a>, std::time::SystemTime),
-    Committed(DomainOutcome),
+    /// A durable terminal outcome already exists, with whatever opaque public
+    /// result the original transaction retained.
+    Committed(DomainOutcome, Option<Vec<u8>>),
     Rejected,
 }
 
-fn replayed_mutation(outcome: DomainOutcome) -> MutationResult {
+/// Rebuild the caller-visible result of an operation that already committed.
+///
+/// The generations are deliberately absent: this transaction did not produce
+/// them and the receipt does not retain them, so reporting a number here would
+/// be a guess.
+///
+/// `public_result` is not a guess. It is the exact bytes the original
+/// transaction stored, which for a lost metadata compare-and-swap is the
+/// pointer it observed under its row lock. Dropping it was a real defect: an
+/// exact retry of a lost governed CAS is precisely the case the receipt
+/// machinery exists to answer, and without the pointer the handler has a
+/// `CAS_MISMATCH_V1` it cannot report in-band and must turn into an error.
+fn replayed_mutation(outcome: DomainOutcome, public_result: Option<Vec<u8>>) -> MutationResult {
     MutationResult {
         outcome,
         repository_generation: None,
         branch_generation: None,
+        observed_pointer: public_result,
     }
 }
 
@@ -396,7 +438,9 @@ impl DomainTransactionStore for PostgresDomainStore {
             .await?
         {
             BeginAdmitted::Admitted(tx, clock) => (tx, clock),
-            BeginAdmitted::Committed(outcome) => return Ok(replayed_mutation(outcome)),
+            BeginAdmitted::Committed(outcome, public_result) => {
+                return Ok(replayed_mutation(outcome, public_result));
+            }
             BeginAdmitted::Rejected => {
                 return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
             }
@@ -432,6 +476,7 @@ impl DomainTransactionStore for PostgresDomainStore {
                     outcome,
                     repository_generation: Some(existing.generation),
                     branch_generation: None,
+                    observed_pointer: None,
                 });
             } else {
                 FINGERPRINT_MISMATCH_V1
@@ -547,6 +592,7 @@ impl DomainTransactionStore for PostgresDomainStore {
             outcome,
             repository_generation: Some(1),
             branch_generation: Some(1),
+            observed_pointer: None,
         })
     }
 
@@ -565,7 +611,9 @@ impl DomainTransactionStore for PostgresDomainStore {
             .await?
         {
             BeginAdmitted::Admitted(tx, clock) => (tx, clock),
-            BeginAdmitted::Committed(outcome) => return Ok(replayed_mutation(outcome)),
+            BeginAdmitted::Committed(outcome, public_result) => {
+                return Ok(replayed_mutation(outcome, public_result));
+            }
             BeginAdmitted::Rejected => {
                 return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
             }
@@ -589,6 +637,7 @@ impl DomainTransactionStore for PostgresDomainStore {
                 outcome,
                 repository_generation: Some(existing.generation),
                 branch_generation: None,
+                observed_pointer: None,
             });
         }
 
@@ -675,6 +724,7 @@ impl DomainTransactionStore for PostgresDomainStore {
             outcome,
             repository_generation: Some(generation),
             branch_generation: None,
+            observed_pointer: None,
         })
     }
 
@@ -693,7 +743,9 @@ impl DomainTransactionStore for PostgresDomainStore {
             .await?
         {
             BeginAdmitted::Admitted(tx, clock) => (tx, clock),
-            BeginAdmitted::Committed(outcome) => return Ok(replayed_mutation(outcome)),
+            BeginAdmitted::Committed(outcome, public_result) => {
+                return Ok(replayed_mutation(outcome, public_result));
+            }
             BeginAdmitted::Rejected => {
                 return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
             }
@@ -737,8 +789,23 @@ impl DomainTransactionStore for PostgresDomainStore {
         };
 
         if current != input.expected_hash {
-            let result = MutationResult::rejected(CAS_MISMATCH_V1);
-            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
+            // The losing writer's answer carries the pointer this transaction
+            // read under the row lock, so the caller can retry against the
+            // value the CAS actually compared rather than against a later
+            // re-read. See `MutationResult::observed_pointer`.
+            let result = MutationResult::cas_lost(current);
+            // Retained in the receipt, not just returned, so an exact retry of
+            // this same operation can answer with the identical pointer instead
+            // of failing. It is 32 bytes, well inside the receipt's public
+            // result bound.
+            receipts::commit_terminal(
+                &tx,
+                &operation.key,
+                &result.outcome,
+                result.observed_pointer.as_deref(),
+                clock,
+            )
+            .await?;
             classify_commit(tx.commit().await, "metadata cas mismatch commit")?;
             return Ok(result);
         }
@@ -802,6 +869,7 @@ impl DomainTransactionStore for PostgresDomainStore {
             outcome,
             repository_generation: Some(repository_generation),
             branch_generation,
+            observed_pointer: None,
         })
     }
 
@@ -820,7 +888,9 @@ impl DomainTransactionStore for PostgresDomainStore {
             .await?
         {
             BeginAdmitted::Admitted(tx, clock) => (tx, clock),
-            BeginAdmitted::Committed(outcome) => return Ok(replayed_mutation(outcome)),
+            BeginAdmitted::Committed(outcome, public_result) => {
+                return Ok(replayed_mutation(outcome, public_result));
+            }
             BeginAdmitted::Rejected => {
                 return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
             }
@@ -915,6 +985,7 @@ impl DomainTransactionStore for PostgresDomainStore {
                 outcome,
                 repository_generation: Some(repository.generation),
                 branch_generation: Some(branch.generation),
+                observed_pointer: None,
             });
         }
 
@@ -954,6 +1025,7 @@ impl DomainTransactionStore for PostgresDomainStore {
             outcome,
             repository_generation: Some(repository.generation),
             branch_generation: Some(branch_generation),
+            observed_pointer: None,
         })
     }
 
@@ -973,7 +1045,9 @@ impl DomainTransactionStore for PostgresDomainStore {
             .await?
         {
             BeginAdmitted::Admitted(tx, clock) => (tx, clock),
-            BeginAdmitted::Committed(outcome) => return Ok(replayed_mutation(outcome)),
+            BeginAdmitted::Committed(outcome, public_result) => {
+                return Ok(replayed_mutation(outcome, public_result));
+            }
             BeginAdmitted::Rejected => {
                 return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
             }
@@ -1032,6 +1106,7 @@ impl DomainTransactionStore for PostgresDomainStore {
             outcome,
             repository_generation: Some(generation),
             branch_generation: None,
+            observed_pointer: None,
         })
     }
 }

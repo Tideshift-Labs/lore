@@ -366,6 +366,21 @@ pub struct MutationResult {
     pub repository_generation: Option<i64>,
     /// Branch generation after the transaction, when one applies.
     pub branch_generation: Option<i64>,
+    /// The pointer the transaction observed, on a compare-and-swap that lost.
+    ///
+    /// CR-029 Phase 5 requires the metadata CAS handlers to "preserve v1's
+    /// in-band current pointer on CAS loss": a CAS miss is a successful RPC
+    /// whose response carries the value that was actually there, not an error.
+    /// The ungoverned path gets that from the store's own CAS return value.
+    /// The governed path has to carry it out of the transaction, because the
+    /// only read that can be trusted is the one taken under the row lock the
+    /// transaction already holds. A re-read after the transaction commits is a
+    /// second source of truth that a concurrent writer can move in between, and
+    /// it would answer a question the caller did not ask: not "what did the CAS
+    /// see" but "what is there now".
+    ///
+    /// `None` on every other outcome, including an applied CAS.
+    pub observed_pointer: Option<Vec<u8>>,
 }
 
 impl MutationResult {
@@ -379,6 +394,16 @@ impl MutationResult {
             },
             repository_generation: None,
             branch_generation: None,
+            observed_pointer: None,
+        }
+    }
+
+    /// A decisive compare-and-swap loss that carries the pointer the
+    /// transaction observed under its row lock.
+    pub fn cas_lost(observed: Vec<u8>) -> Self {
+        Self {
+            observed_pointer: Some(observed),
+            ..Self::rejected(CAS_MISMATCH_V1)
         }
     }
 }

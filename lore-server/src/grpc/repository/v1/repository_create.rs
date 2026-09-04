@@ -89,6 +89,8 @@ pub async fn handler(
             repository_id: &req.id,
         },
     )? {
+        // WP-116 Part 3 wires this site, alongside its v0 sibling. Not blocked
+        // on a contract; blocked on the projection move. See the v0 handler.
         return Err(reject_unwired_governed_operation(
             &admitted,
             "lore.repository.v1.RepositoryService/RepositoryCreate",

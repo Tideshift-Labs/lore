@@ -732,6 +732,7 @@ async fn publish_returns_aborted_and_never_calls_the_store_when_preflight_change
         outcome: DomainOutcome::Applied,
         repository_generation: Some(1),
         branch_generation: Some(1),
+        observed_pointer: None,
     }));
     let domain = Arc::new(DomainContext::new(script.clone(), false));
     let governed = build_governed(
@@ -766,6 +767,7 @@ async fn publish_carries_the_witness_generations_and_hashes_into_the_commit_inpu
         outcome: DomainOutcome::Applied,
         repository_generation: Some(9),
         branch_generation: Some(9),
+        observed_pointer: None,
     }));
     let domain = Arc::new(DomainContext::new(script.clone(), false));
     let current_head = Hash::hash_buffer(b"witness-carriage-current-head");
@@ -818,6 +820,7 @@ async fn publish_with_a_configured_cell_id_and_an_advancing_head_builds_the_bran
         outcome: DomainOutcome::Applied,
         repository_generation: Some(4),
         branch_generation: Some(6),
+        observed_pointer: None,
     }));
     let domain =
         Arc::new(DomainContext::new(script.clone(), false).with_cell_id(Some("cell-a".to_owned())));
@@ -880,6 +883,7 @@ async fn publish_with_a_configured_cell_id_and_the_current_head_builds_no_event(
         outcome: DomainOutcome::Applied,
         repository_generation: Some(4),
         branch_generation: Some(6),
+        observed_pointer: None,
     }));
     let domain =
         Arc::new(DomainContext::new(script.clone(), false).with_cell_id(Some("cell-a".to_owned())));

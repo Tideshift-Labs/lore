@@ -76,6 +76,13 @@ pub async fn handler(
             repository_id: &req.id,
         },
     )? {
+        // WP-116 Part 3 wires this site. It is not blocked on a contract: it
+        // needs the create write set moved off the direct store path and into
+        // `RepositoryCreateInput`'s projection rows, which is WP-116 Phase 4's
+        // "move repository operations" in full. See also the BLOCKED note on
+        // `RepositoryCreateInput::event`, which one `Option` cannot satisfy
+        // because a create commits both a repository publication and a branch
+        // creation.
         return Err(reject_unwired_governed_operation(
             &admitted,
             "lore.RepositoryService/RepositoryCreate",

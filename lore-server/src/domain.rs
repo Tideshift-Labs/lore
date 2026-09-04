@@ -35,8 +35,14 @@ use anyhow::anyhow;
 use lore_postgres::domain::DatabaseIdentity;
 use lore_postgres::domain::DomainSchemaState;
 use lore_postgres::domain::bypass::DomainEnforcement;
+use lore_postgres::domain::coordinator::BranchSnapshot;
+use lore_postgres::domain::coordinator::CAS_MISMATCH_V1;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
+use lore_postgres::domain::coordinator::MetadataCasInput;
+use lore_postgres::domain::coordinator::PendingEvent;
+use lore_postgres::domain::coordinator::ProjectionWrite;
+use lore_postgres::domain::errors::DomainOutcome;
 use lore_postgres::domain::fragments::PostgresFragmentCoordinator;
 use lore_postgres::domain::locks::LockFencingReadiness;
 use lore_postgres::domain::locks::PostgresLockCoordinator;
@@ -350,6 +356,148 @@ pub fn admit_at_entry(
         return Ok(None);
     };
     domain.admit(metadata, authorization, scope)
+}
+
+/// The governed metadata compare-and-swap seam, shared by all four CAS sites.
+///
+/// Repository and branch metadata CAS each exist twice, on v0 and v1, and the
+/// four handlers differ only in their response shape. Everything between
+/// admission and the coordinator is identical, so it lives here once: four
+/// copies of a governed mutation path is how two of them drift, and CR-029's
+/// whole point is that v0 and v1 stop disagreeing about what a write means.
+///
+/// This is deliberately not a handler helper. It is the same seam
+/// [`admit_at_entry`] belongs to: it turns an [`AdmittedOperation`] into a
+/// committed domain transaction and nothing else. It performs no
+/// authorization, no validation, and no I/O of its own.
+pub struct GovernedMetadataCas {
+    domain: Arc<DomainContext>,
+    operation: GovernedOperation,
+}
+
+/// What a governed metadata CAS committed.
+///
+/// A CAS loss is **not** an error here, matching the ungoverned path and
+/// CR-029 Phase 5: it is a successful RPC whose response carries the pointer
+/// that was actually there.
+pub enum MetadataCasOutcome {
+    /// The swap applied. The pointer is now the requested one.
+    Applied,
+    /// The swap lost. This is the pointer the transaction observed under its
+    /// row lock, which is what the caller must retry against.
+    Lost(Vec<u8>),
+}
+
+impl GovernedMetadataCas {
+    /// Prepare the governed call, or `Ok(None)` for the ungoverned path.
+    ///
+    /// `digest` must already have been computed from validated wire values
+    /// through the one shared canonical-intent definition. Lore never accepts a
+    /// body- or handler-supplied digest (CR-029's canonical-intent contract),
+    /// which is why this takes the bytes rather than the request. It is the
+    /// 32 bytes `canonical_intent_digest` returns.
+    pub fn prepare(
+        domain: Option<&Arc<DomainContext>>,
+        admitted: Option<AdmittedOperation>,
+        method: &'static str,
+        digest: Vec<u8>,
+    ) -> Result<Option<Self>, Status> {
+        let Some(admitted) = admitted else {
+            return Ok(None);
+        };
+        let Some(domain) = domain else {
+            // Unreachable in practice: `admit_at_entry` returns `None` when
+            // there is no coordinator. Refusing rather than asserting keeps
+            // that an enforced property instead of an assumed one.
+            return Err(Status::failed_precondition(
+                "Domain coordinator is unavailable",
+            ));
+        };
+        Ok(Some(Self {
+            domain: domain.clone(),
+            operation: admitted.into_governed(method, digest),
+        }))
+    }
+
+    /// This cell's configured identity, or `None` when it has none.
+    ///
+    /// Handlers need it to decide whether to build an event at all; see
+    /// [`DomainContext::cell_id`].
+    pub fn cell_id(&self) -> Option<&str> {
+        self.domain.cell_id()
+    }
+
+    /// Read a branch's committed identity for the event's bounded payload.
+    ///
+    /// A branch event names the branch and its tip, and neither is in the CAS
+    /// request. This is a read **before** the transaction, so the values are a
+    /// preflight observation rather than a committed one, which is why they go
+    /// in the payload and never in the aggregate version: the version's ordinal
+    /// and identity are resolved by the coordinator from what it actually
+    /// commits.
+    pub async fn branch_snapshot(
+        &self,
+        repository_id: &[u8],
+        branch_id: &[u8],
+    ) -> Result<Option<BranchSnapshot>, Status> {
+        self.domain
+            .store()
+            .branch_snapshot(repository_id, branch_id)
+            .await
+            .map_err(|error| crate::grpc::map_domain_error_to_status(&error))
+    }
+
+    /// Commit the swap, its projection row, and its classified event in one
+    /// transaction.
+    ///
+    /// `branch_id` selects the aggregate: `None` swaps the repository's own
+    /// metadata pointer, `Some` swaps a branch's.
+    pub async fn commit(
+        &self,
+        repository_id: &[u8],
+        branch_id: Option<&[u8]>,
+        expected_hash: &[u8],
+        new_hash: &[u8],
+        projection: ProjectionWrite,
+        event: Option<PendingEvent>,
+    ) -> Result<MetadataCasOutcome, Status> {
+        let input = MetadataCasInput {
+            repository_id: repository_id.to_vec(),
+            branch_id: branch_id.map(<[u8]>::to_vec),
+            expected_hash: expected_hash.to_vec(),
+            new_hash: new_hash.to_vec(),
+            projection: vec![projection],
+            event,
+        };
+        let result = self
+            .domain
+            .store()
+            .metadata_compare_and_swap(&self.operation, &input)
+            .await
+            .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?;
+        match result.outcome {
+            DomainOutcome::Applied => Ok(MetadataCasOutcome::Applied),
+            DomainOutcome::NotApplied { reason, .. } => match reason.as_str() {
+                CAS_MISMATCH_V1 => {
+                    // The coordinator promises the observed pointer on exactly
+                    // this reason. Its absence is a coordinator defect, not a
+                    // caller error, so it must not be reported as a CAS loss
+                    // with a fabricated or empty pointer: a client would then
+                    // retry against a value nothing ever held.
+                    let observed = result.observed_pointer.ok_or_else(|| {
+                        Status::internal(
+                            "governed metadata CAS lost without reporting the observed pointer",
+                        )
+                    })?;
+                    Ok(MetadataCasOutcome::Lost(observed))
+                }
+                // A tombstoned or absent target is indistinguishable by
+                // contract, and the coordinator's own rejection reasons already
+                // carry that mapping.
+                other => Err(crate::grpc::map_domain_rejection_to_status(other)),
+            },
+        }
+    }
 }
 
 /// Refuse an admitted operation that has no coordinator call site yet.

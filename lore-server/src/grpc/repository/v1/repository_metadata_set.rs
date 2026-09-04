@@ -7,6 +7,8 @@ use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::KeyType;
+use lore_postgres::domain::coordinator::ProjectionWrite;
+use lore_postgres::domain::outbox::builders as outbox_builders;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetResponse;
 use lore_revision::metadata::Metadata;
@@ -21,9 +23,12 @@ use tonic::Status;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::domain::DomainContext;
+use crate::domain::GovernedMetadataCas;
 use crate::domain::GovernedScope;
+use crate::domain::MetadataCasOutcome;
 use crate::domain::admit_at_entry;
-use crate::domain::reject_unwired_governed_operation;
+use crate::domain_intent::CanonicalIntent;
+use crate::domain_intent::canonical_intent_digest;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization_optional;
@@ -63,24 +68,42 @@ pub async fn handler(
 
     // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
     // at handler entry, before any handler logic or authorization side effect.
-    if let Some(admitted) = admit_at_entry(
+    let admitted = admit_at_entry(
         domain_context,
         &request_metadata,
         request_authorization.as_ref(),
         GovernedScope::TargetRepository {
             repository_id: &req.id,
         },
-    )? {
-        return Err(reject_unwired_governed_operation(
-            &admitted,
-            "lore.repository.v1.RepositoryService/RepositoryMetadataSet",
-        ));
-    }
+    )?;
 
     let repository_id: Context = req.id.into();
     if repository_id == Context::default() {
         return Err(Status::invalid_argument("Missing repository id"));
     }
+
+    // Same family and same digest as v0: CR-029 freezes one canonical intent
+    // per semantic operation, not one per wire shape, so v0 and v1 of the same
+    // CAS must produce identical 32 bytes for identical values.
+    //
+    // After the empty/default check, per INTENT-02-LORE; see the v0 handler.
+    let governed = match admitted {
+        Some(admitted) => {
+            let digest = canonical_intent_digest(&CanonicalIntent::RepositoryMetadataCas {
+                repository_id: repository_id.data(),
+                expected_hash: &req.expected,
+                new_hash: &req.updated,
+            })
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            GovernedMetadataCas::prepare(
+                domain_context,
+                Some(admitted),
+                "lore.repository.v1.RepositoryService/RepositoryMetadataSet",
+                digest,
+            )?
+        }
+        None => None,
+    };
 
     let expected: Hash = req.expected.into();
     let updated: Hash = req.updated.into();
@@ -131,22 +154,60 @@ pub async fn handler(
                 repository::METADATA,
                 hex::encode(repository_id.data()).as_str(),
             );
-            let write_token = get_write_token();
-            let previous = repository
-                .write_mutable_store(&write_token)
-                .compare_and_swap(
-                    repository_id.into(),
-                    metadata_key,
-                    expected,
-                    updated,
-                    KeyType::RepositoryMetadata,
-                )
-                .await
-                .map_err(|err| {
-                    warn_error_to_status(&err, |err| {
-                        Status::internal(format!("failed to update metadata: {err}"))
-                    })
-                })?;
+            let previous = match &governed {
+                Some(governed) => {
+                    let event = match governed.cell_id() {
+                        Some(cell_id) => Some(
+                            outbox_builders::repository_metadata_changed(
+                                cell_id,
+                                repository_id.data(),
+                                expected.as_ref(),
+                                updated.as_ref(),
+                            )
+                            .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?,
+                        ),
+                        None => None,
+                    };
+                    let projection = ProjectionWrite {
+                        partition: repository_id.data().to_vec(),
+                        key_type: KeyType::RepositoryMetadata as i16,
+                        key: metadata_key.as_ref().to_vec(),
+                        value: Some(updated.as_ref().to_vec()),
+                    };
+                    match governed
+                        .commit(
+                            repository_id.data(),
+                            None,
+                            expected.as_ref(),
+                            updated.as_ref(),
+                            projection,
+                            event,
+                        )
+                        .await?
+                    {
+                        MetadataCasOutcome::Applied => expected,
+                        MetadataCasOutcome::Lost(observed) => Hash::from(observed.as_slice()),
+                    }
+                }
+                None => {
+                    let write_token = get_write_token();
+                    repository
+                        .write_mutable_store(&write_token)
+                        .compare_and_swap(
+                            repository_id.into(),
+                            metadata_key,
+                            expected,
+                            updated,
+                            KeyType::RepositoryMetadata,
+                        )
+                        .await
+                        .map_err(|err| {
+                            warn_error_to_status(&err, |err| {
+                                Status::internal(format!("failed to update metadata: {err}"))
+                            })
+                        })?
+                }
+            };
 
             let metadata = if previous == expected {
                 updated
@@ -332,16 +393,21 @@ mod tests {
             }
         }
 
-        // CR-029 item 7: every other test in this file passes `None` for the
-        // coordinator, so `reject_unwired_governed_operation` is never
-        // reached — the only client-visible behaviour change in the whole
-        // handler-wiring commit had zero coverage. With a real coordinator
-        // present and valid carriage plus a verified principal, admission
-        // must short-circuit before the handler body runs at all:
-        // `Code::Unimplemented`, and not even one mutable-store call
-        // attempted (a real call would panic this test).
+        // WP-116 Part 2 wired this site, so valid carriage is no longer
+        // refused. The test is kept and inverted rather than deleted, because
+        // the property it really guards outlived the refusal: a governed
+        // request must never reach the **ungoverned** mutable store. That
+        // store now writes through the domain coordinator's projection inside
+        // one transaction, and a stray direct call would be a second,
+        // unfenced writer to the same row.
+        //
+        // `PanicOnAnyCallMutableStore` is what enforces it: any call panics.
+        // The request stops earlier still, in metadata-blob validation, which
+        // is why the code is `InvalidArgument` — the zero expected hash and
+        // the all-ones proposed hash name no real blob. `Unimplemented` here
+        // would mean the site had regressed back behind its guard.
         #[tokio::test]
-        async fn valid_carriage_with_a_coordinator_present_is_refused_as_unimplemented_before_any_store_access()
+        async fn valid_carriage_with_a_coordinator_present_is_admitted_and_never_touches_the_ungoverned_store()
          {
             let (immutable, _, _) = test_store_create().await.unwrap();
             let domain_context = Arc::new(build_domain_context(false));
@@ -366,7 +432,12 @@ mod tests {
             .await
             .unwrap_err();
 
-            assert_eq!(err.code(), Code::Unimplemented);
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "this site is wired; a refusal would mean it regressed behind its guard"
+            );
+            assert_eq!(err.code(), Code::InvalidArgument);
         }
 
         /// Writes a valid metadata blob to the immutable store and returns its

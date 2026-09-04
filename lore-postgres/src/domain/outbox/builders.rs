@@ -510,25 +510,37 @@ pub fn branch_metadata_changed(
 
 /// `branch.protection_changed` — a branch's protection flag moved.
 ///
+/// The protect flag travels inside the branch metadata CAS, so this carries the
+/// pointer move as well as the flag: the same committed write changes both, and
+/// a consumer that saw only the flag could not tell which metadata blob the new
+/// protection state belongs to.
+///
 /// PIN(WP-116): the fixture's second open question is whether this stays
-/// distinct from `branch.metadata_changed`, since the protect toggle travels
-/// inside the same metadata CAS while `BranchProtect`/`BranchUnprotect` are
-/// separate RPCs that write no metadata and hold no domain context at all
-/// (WP-119 inventory B9, B10, disagreement D2). The builder exists because the
-/// value is pinned; it has no emission call site until one of those two writers
-/// is governed.
+/// distinct from `branch.metadata_changed`. WP-116 Part 2 emits it from both
+/// branch metadata CAS sites when the PROTECT bit moves. The standalone
+/// `BranchProtect`/`BranchUnprotect` RPCs still write no metadata and hold no
+/// domain context at all (WP-119 inventory B9, B10, disagreement D2), so they
+/// remain invisible to this rail.
+#[allow(clippy::too_many_arguments)]
 pub fn branch_protection_changed(
     cell_id: &str,
     repository_id: &[u8],
     branch_id: &[u8],
     branch_name: &str,
     latest_hash: &[u8],
+    previous_metadata_hash: &[u8],
+    new_metadata_hash: &[u8],
     protected: bool,
 ) -> Result<PendingEvent, DomainError> {
     let payload = payload(&[
         ("repository_id", PayloadValue::Hex(repository_id)),
         ("branch_id", PayloadValue::Hex(branch_id)),
         ("branch_name", PayloadValue::Text(branch_name)),
+        (
+            "previous_metadata_hash",
+            PayloadValue::Hex(previous_metadata_hash),
+        ),
+        ("new_metadata_hash", PayloadValue::Hex(new_metadata_hash)),
         ("protected", PayloadValue::Bool(protected)),
     ]);
     branch_event(
