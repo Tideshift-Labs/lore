@@ -169,6 +169,13 @@ $inventory = @(
             # mechanism: the singleton's FOR UPDATE orders two contending passes rather than
             # letting one win and the other no-op.
             'two_concurrent_cursor_advances_serialise_and_each_resumes_after_the_other'
+            # CR-032 / WP-119 Part F: `PostgresFragmentCoordinator::with_outbox_cell_id`'s
+            # `fragment.lifecycle_generation_advanced` and `association.generation_advanced`
+            # summary producers.
+            'a_readability_crossing_commits_exactly_one_lifecycle_summary_row_not_one_per_fragment'
+            'a_promotion_with_unchanged_readability_appends_no_lifecycle_summary_row'
+            'create_association_commits_one_association_generation_advanced_row_per_epoch_move'
+            'commit_publication_valid_arm_settles_the_write_claim_before_appending_the_summary'
         )
     },
     [pscustomobject]@{

@@ -68,6 +68,7 @@ use lore_postgres::domain::fragments::schema;
 use lore_postgres::domain::fragments::states::FragmentLifecycleState;
 use lore_postgres::domain::lock_order::LockClass;
 use lore_postgres::domain::lock_order::LockSequence;
+use lore_postgres::domain::outbox::version::AggregateVersion;
 use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptKey;
@@ -2746,7 +2747,7 @@ async fn stale_association_rejection_comes_from_repository_tombstone_not_generat
                 expected_generation: None,
                 delete_proof: rand::random::<[u8; 32]>().to_vec(),
                 projection: Vec::new(),
-                event: None,
+                events: Vec::new(),
             },
         )
         .await
@@ -10428,3 +10429,537 @@ async fn two_concurrent_cursor_advances_serialise_and_each_resumes_after_the_oth
     assert!(!first.exhausted);
     assert!(!second.exhausted);
 }
+
+// ---------------------------------------------------------------------------
+// CR-032 / WP-119 Part F: fragment-lifecycle and association outbox summaries.
+//
+// `PostgresFragmentCoordinator::with_outbox_cell_id` stamps the trusted cell
+// id the coordinator's own internal `append_lifecycle_summaries`/
+// `append_association_summary` need to append anything; a coordinator built
+// with `None` (every other test in this file) performs every lifecycle
+// mutation and appends nothing, which is exercised implicitly throughout the
+// rest of the suite and not repeated here.
+
+fn outbox_cell_id() -> String {
+    format!("wp119-fragment-{:08x}", rand::random::<u32>())
+}
+
+impl TestDomainStore {
+    fn fragment_coordinator_with_cell_id(&self, cell_id: &str) -> TestFragmentCoordinator {
+        TestFragmentCoordinator(
+            self.0
+                .fragment_coordinator()
+                .with_outbox_cell_id(Some(cell_id.to_owned())),
+        )
+    }
+}
+
+async fn outbox_row_count_for_repository(client: &Client, repository_id: &[u8]) -> i64 {
+    client
+        .query_one(
+            "SELECT count(*) FROM lore_outbox_events WHERE repository_id = $1",
+            &[&repository_id],
+        )
+        .await
+        .expect("count outbox rows for repository")
+        .get(0)
+}
+
+struct FragmentOutboxRow {
+    event_kind: String,
+    aggregate_kind: String,
+    aggregate_id: Vec<u8>,
+    aggregate_version: Vec<u8>,
+}
+
+/// All outbox rows for a repository, ordered by `created_at` ascending -- see
+/// `domain_outbox_producers.rs`'s `all_outbox_rows_for_repository` for why
+/// `created_at` (not `event_id`) carries the ordering signal here.
+///
+/// `event_kind` is a secondary sort key: `created_at` is `clock_timestamp()`,
+/// microsecond-precision, and `begin_obliterate`'s owned arm appends its
+/// association and lifecycle summaries in one transaction close enough
+/// together to tie at that resolution. Without the tiebreak, a case asserting
+/// on row position (not just on the set of rows present) is ordering-
+/// dependent on a tie it cannot control and will flake.
+async fn all_outbox_rows_for_repository(
+    client: &Client,
+    repository_id: &[u8],
+) -> Vec<FragmentOutboxRow> {
+    client
+        .query(
+            "SELECT event_kind, aggregate_kind, aggregate_id, aggregate_version \
+             FROM lore_outbox_events WHERE repository_id = $1 \
+             ORDER BY created_at ASC, event_kind ASC",
+            &[&repository_id],
+        )
+        .await
+        .expect("query outbox rows for repository")
+        .into_iter()
+        .map(|row| FragmentOutboxRow {
+            event_kind: row.get("event_kind"),
+            aggregate_kind: row.get("aggregate_kind"),
+            aggregate_id: row.get("aggregate_id"),
+            aggregate_version: row.get("aggregate_version"),
+        })
+        .collect()
+}
+
+async fn one_outbox_row_for_repository(client: &Client, repository_id: &[u8]) -> FragmentOutboxRow {
+    let rows = all_outbox_rows_for_repository(client, repository_id).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one outbox row for the repository, got {}: kinds {:?}",
+        rows.len(),
+        rows.iter().map(|r| &r.event_kind).collect::<Vec<_>>()
+    );
+    rows.into_iter().next().expect("one row")
+}
+
+/// F1: a fragment shared by three associations in one repository crosses
+/// readability once and commits exactly one `fragment.lifecycle_generation_advanced`
+/// row for that repository -- not one row per associated fragment. A second,
+/// independent crossing commits a second row with `ordinal + 1`.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn a_readability_crossing_commits_exactly_one_lifecycle_summary_row_not_one_per_fragment() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let cell_id = outbox_cell_id();
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator_with_cell_id(&cell_id);
+    let db = client(&url).await;
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+
+    // Three distinct fragments, all associated with the one repository under
+    // test. Only the first two are ever marked missing below; the third
+    // proves the repository's row count does not scale with how many
+    // fragments it happens to have associated.
+    let mut hashes = Vec::with_capacity(3);
+    for seed in 0u8..3 {
+        let hash = random_hash();
+        let BeginOutcome::Admitted(intent) = coordinator
+            .begin_direct_write(&hash, &legacy_key(&hash))
+            .await
+            .expect("begin fragment")
+        else {
+            panic!("a fresh hash must admit a direct write");
+        };
+        assert_eq!(
+            coordinator
+                .commit_remote(
+                    &intent,
+                    IoObservation::Valid(manifest(
+                        "f1-summary/key",
+                        0x10 + seed,
+                        EpochAuthority::Remote
+                    ))
+                )
+                .await
+                .expect("commit fragment"),
+            CommitVerdict::Published
+        );
+        assert_eq!(
+            coordinator
+                .create_association(&hash, &repository_id, &context)
+                .await
+                .expect("associate fragment"),
+            CommitVerdict::Published
+        );
+        hashes.push(hash);
+    }
+    // Every association above is content-association traffic, not lifecycle
+    // traffic, and it stamps its own `association.generation_advanced` rows;
+    // clear those out of the way so the assertions below are unambiguous
+    // about which kind they are counting.
+    let baseline_generation = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture baseline witness")
+        .expect("repository must exist")
+        .fragment_lifecycle_generation;
+
+    let resolved = coordinator
+        .resolve(&repository_id, &context, &hashes[..1])
+        .await
+        .expect("resolve first fragment to capture its epoch witness");
+    let (epoch_witness, ..) = expect_readable(&resolved[0]);
+    let first_witness = epoch_witness.clone();
+
+    coordinator
+        .mark_missing(&first_witness, MissingDiagnostic::Absent)
+        .await
+        .expect("first crossing must succeed");
+
+    let after_first = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness after first crossing")
+        .expect("repository must exist")
+        .fragment_lifecycle_generation;
+    assert_eq!(
+        after_first,
+        baseline_generation + 1,
+        "one crossing must advance the generation by exactly one"
+    );
+
+    let rows_after_first = all_outbox_rows_for_repository(&db, &repository_id)
+        .await
+        .into_iter()
+        .filter(|row| row.event_kind == "fragment.lifecycle_generation_advanced")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows_after_first.len(),
+        1,
+        "the repository has three associated fragments but only one crossed; it must own \
+         exactly one lifecycle-summary row, not three"
+    );
+    assert_eq!(rows_after_first[0].aggregate_kind, "fragment_lifecycle");
+    assert_eq!(rows_after_first[0].aggregate_id, repository_id.to_vec());
+    let decoded = AggregateVersion::decode(&rows_after_first[0].aggregate_version).expect("decode");
+    assert_eq!(
+        decoded.ordinal,
+        u64::try_from(after_first).expect("fits u64")
+    );
+    assert!(
+        decoded.identity.is_empty(),
+        "fragment_lifecycle aggregate identity is empty per PIN-4"
+    );
+
+    // A second, independent crossing on the second (still-readable) fragment.
+    let resolved = coordinator
+        .resolve(&repository_id, &context, &hashes[1..2])
+        .await
+        .expect("resolve second fragment to capture its epoch witness");
+    let (epoch_witness, ..) = expect_readable(&resolved[0]);
+    let second_witness = epoch_witness.clone();
+    coordinator
+        .mark_missing(&second_witness, MissingDiagnostic::Absent)
+        .await
+        .expect("second crossing must succeed");
+
+    let after_second = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness after second crossing")
+        .expect("repository must exist")
+        .fragment_lifecycle_generation;
+    assert_eq!(after_second, baseline_generation + 2);
+
+    let rows_after_second = all_outbox_rows_for_repository(&db, &repository_id)
+        .await
+        .into_iter()
+        .filter(|row| row.event_kind == "fragment.lifecycle_generation_advanced")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows_after_second.len(),
+        2,
+        "a second, independent crossing must add a second row rather than replace the first"
+    );
+    let second_decoded =
+        AggregateVersion::decode(&rows_after_second[1].aggregate_version).expect("decode");
+    assert_eq!(
+        second_decoded.ordinal,
+        decoded.ordinal + 1,
+        "the second crossing's ordinal must be exactly the first's plus one"
+    );
+}
+
+/// F1 (negative control): a `Staged` -> `Remote` promotion moves no repository
+/// scalar (CR-032: "unchanged readability: No by default") and must append no
+/// lifecycle-summary row, even though it is a real committed transition on an
+/// associated fragment.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn a_promotion_with_unchanged_readability_appends_no_lifecycle_summary_row() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let cell_id = outbox_cell_id();
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator_with_cell_id(&cell_id);
+    let db = client(&url).await;
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(stage_intent) =
+        coordinator.begin_stage(&hash).await.expect("begin stage")
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    assert_eq!(
+        coordinator
+            .commit_staged(
+                &stage_intent,
+                IoObservation::Valid(manifest(
+                    "f1-promotion/staged",
+                    0x20,
+                    EpochAuthority::Staged
+                ))
+            )
+            .await
+            .expect("commit staged"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate staged fragment"),
+        CommitVerdict::Published
+    );
+    let before = outbox_row_count_for_repository(&db, &repository_id).await;
+
+    let BeginOutcome::Admitted(promotion_intent) = coordinator
+        .begin_promotion(&hash)
+        .await
+        .expect("begin promotion")
+    else {
+        panic!("a Staged head must admit begin_promotion");
+    };
+    let verdict = coordinator
+        .commit_promotion(
+            &promotion_intent,
+            IoObservation::Valid(manifest(
+                "f1-promotion/remote",
+                0x21,
+                EpochAuthority::Remote,
+            )),
+        )
+        .await
+        .expect("commit promotion must not error");
+    assert_eq!(verdict, CommitVerdict::Published);
+
+    let after = outbox_row_count_for_repository(&db, &repository_id).await;
+    assert_eq!(
+        after, before,
+        "a Staged -> Remote promotion crosses no readability boundary and must append nothing"
+    );
+}
+
+/// F2: `create_association` commits exactly one `association.generation_advanced`
+/// row per epoch move, with the pinned identity (the association epoch, as an
+/// 8-byte big-endian value) and ordinal (the committed
+/// `content_association_generation`).
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn create_association_commits_one_association_generation_advanced_row_per_epoch_move() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let cell_id = outbox_cell_id();
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator_with_cell_id(&cell_id);
+    let db = client(&url).await;
+    let repository_id = create_repository(&store).await;
+    let context_a = random_context();
+    let context_b = random_context();
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, &legacy_key(&hash))
+        .await
+        .expect("begin fragment")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest("f2-association/key", 0x30, EpochAuthority::Remote))
+            )
+            .await
+            .expect("commit fragment"),
+        CommitVerdict::Published
+    );
+
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context_a)
+            .await
+            .expect("first association"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        1
+    );
+    let first_row = one_outbox_row_for_repository(&db, &repository_id).await;
+    assert_eq!(first_row.event_kind, "association.generation_advanced");
+    assert_eq!(first_row.aggregate_kind, "association");
+    assert_eq!(first_row.aggregate_id, repository_id.to_vec());
+    let first_decoded = AggregateVersion::decode(&first_row.aggregate_version).expect("decode");
+    assert_eq!(
+        first_decoded.identity.len(),
+        8,
+        "association identity is the 8-byte big-endian association_epoch"
+    );
+
+    // A second, distinct association on the same repository (different
+    // context) is a second epoch move and must commit a second row, with the
+    // ordinal advancing by exactly one and a different epoch identity.
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context_b)
+            .await
+            .expect("second association"),
+        CommitVerdict::Published
+    );
+    let rows = all_outbox_rows_for_repository(&db, &repository_id)
+        .await
+        .into_iter()
+        .filter(|row| row.event_kind == "association.generation_advanced")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    let second_decoded = AggregateVersion::decode(&rows[1].aggregate_version).expect("decode");
+    assert_eq!(
+        second_decoded.ordinal,
+        first_decoded.ordinal + 1,
+        "a second epoch move must advance the ordinal by exactly one"
+    );
+    assert_ne!(
+        second_decoded.identity, first_decoded.identity,
+        "two distinct association_epoch fence values must not collide"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F-032-3 lock order: write-claim settlement (`LockClass::Fragments`) must
+// run BEFORE the outbox append (`LockClass::OutboxInsert`) inside
+// `commit_publication`. `LockSequence` only catches an inversion when a
+// claim is actually present on the committing transaction, so both cases
+// below need a real write claim (via `claim_repair`) together with a real
+// readability crossing on an associated repository -- an empty fanout would
+// never enter `OutboxInsert` at all, making the ordering unobservable.
+// ---------------------------------------------------------------------------
+
+/// The `IoObservation::Valid` arm (unreadable -> readable): claim settlement
+/// before the append. A reversed order would return `Err` from
+/// `LockSequence::enter`'s downward-move refusal; this test's success is
+/// itself part of the proof.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn commit_publication_valid_arm_settles_the_write_claim_before_appending_the_summary() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let cell_id = outbox_cell_id();
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator_with_cell_id(&cell_id);
+    let db = client(&url).await;
+    let repository_id = create_repository(&store).await;
+    let context = random_context();
+    let hash = random_hash();
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, &legacy_key(&hash))
+        .await
+        .expect("begin fragment")
+    else {
+        panic!("a fresh hash must admit a direct write");
+    };
+    assert_eq!(
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest("f-order-valid/key", 0x40, EpochAuthority::Remote))
+            )
+            .await
+            .expect("commit initial fragment"),
+        CommitVerdict::Published
+    );
+    assert_eq!(
+        coordinator
+            .create_association(&hash, &repository_id, &context)
+            .await
+            .expect("associate fragment"),
+        CommitVerdict::Published
+    );
+
+    let resolved = coordinator
+        .resolve(&repository_id, &context, std::slice::from_ref(&hash))
+        .await
+        .expect("resolve to capture epoch witness");
+    let (epoch_witness, ..) = expect_readable(&resolved[0]);
+    let witness = epoch_witness.clone();
+    coordinator
+        .mark_missing(&witness, MissingDiagnostic::Absent)
+        .await
+        .expect("mark missing to reach an unreadable head");
+    let before = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness before repair")
+        .expect("repository must exist")
+        .fragment_lifecycle_generation;
+    let rows_before_repair = outbox_row_count_for_repository(&db, &repository_id).await;
+
+    // A repair over the now-Missing head: `claim_repair` carries a real
+    // write claim, and `commit_remote`'s wrapper authorizes + settles it
+    // (`FragmentWriteSettlement::Decisive`) as part of this exact commit.
+    let BeginOutcome::Admitted(repair_intent) = coordinator
+        .claim_repair(&hash)
+        .await
+        .expect("claim repair over a Missing head")
+    else {
+        panic!("a Missing head must admit a claimed repair");
+    };
+    let verdict = coordinator
+        .commit_remote(
+            &repair_intent,
+            IoObservation::Valid(manifest(
+                "f-order-valid/repaired",
+                0x41,
+                EpochAuthority::Remote,
+            )),
+        )
+        .await
+        .expect(
+            "the Valid arm must settle the write claim before appending the outbox row; a \
+             reversed order would fail here with a lock-order violation",
+        );
+    assert_eq!(verdict, CommitVerdict::Published);
+
+    let after = coordinator
+        .capture_push_witness(&repository_id)
+        .await
+        .expect("capture witness after repair")
+        .expect("repository must exist")
+        .fragment_lifecycle_generation;
+    assert_eq!(
+        after,
+        before + 1,
+        "the repair crosses Missing back to readable and must move the generation once"
+    );
+
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        rows_before_repair + 1,
+        "the repair's crossing must append exactly one new row on top of the ones already \
+         there (the mark_missing crossing above already owns one)"
+    );
+}
+
+// The `IoObservation::Unusable` ("publication missing") arm's claim-before-
+// append ordering does NOT get an equivalent test here. Structural finding,
+// confirmed empirically against real Postgres before writing anything
+// further: every admission path that can produce a non-`None` write claim
+// (`begin_direct_write`, `begin_stage`, `claim_repair`) either short-circuits
+// to `BeginOutcome::AlreadyReadable` with no claim at all when the current
+// head is already readable, or requires the opposite (`claim_repair`'s
+// `require_missing` refuses with `BeginOutcome::Fenced` unless the head is
+// already `Missing` or a resuming `PreparingRemote` repair lineage -- both
+// non-readable). Every admitted intent therefore carries a head state of
+// `PreparingStage`/`PreparingRemote` at BEGIN time, which is what
+// `commit_publication` reads back at COMMIT time too (a concurrent mutation
+// in between would move `last_fence` and hit the earlier `Fenced` branch
+// first). So `was_readable` is always `false` whenever `write_claim` is
+// `Some` -- the "Missing arm, claim present, was_readable = true" case this
+// ordering pin asks for cannot be constructed through any public admission
+// path. Flagged back rather than built as a vacuous or misleading pass;
+// `commit_publication_valid_arm_...` above is the reachable half.

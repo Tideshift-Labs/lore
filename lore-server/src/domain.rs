@@ -1073,9 +1073,14 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
         mutable_enforcement.enable();
     }
 
-    let fragment_coordinator = store.fragment_coordinator();
     let database_identity = store.identity().clone();
     let cell_id = resolve_cell_id(settings)?;
+    // The fragment coordinator stamps the same cell identity on its bounded
+    // CR-032 summaries that the governed repository seam stamps on its rows, so
+    // it is resolved once, here, and handed to both.
+    let fragment_coordinator = store
+        .fragment_coordinator()
+        .with_outbox_cell_id(cell_id.clone());
     let context = if lock_fencing {
         DomainContext::new_with_lock_coordinator(
             Arc::new(store),

@@ -65,6 +65,8 @@ use deadpool_postgres::Pool;
 use deadpool_postgres::Transaction;
 
 use crate::domain::PostgresDomainStore;
+use crate::domain::coordinator::CommittedVersions;
+use crate::domain::coordinator::PendingEvent;
 use crate::domain::errors::DomainError;
 // WP-118 Phase 9. Expands to nothing in a default build; `failpoints::hit` is
 // not nameable there. See `super::failpoint`.
@@ -77,6 +79,9 @@ use crate::domain::fragments::states::FragmentWriteClaimState;
 use crate::domain::fragments::states::MissingDiagnostic;
 use crate::domain::lock_order::LockClass;
 use crate::domain::lock_order::LockSequence;
+use crate::domain::outbox;
+use crate::domain::outbox::builders;
+use crate::domain::outbox::version::AggregateVersion;
 use crate::domain::schema::STATE_LIVE;
 
 /// Fixed for WP-118 by CR-031's F-031 amendment. A push whose lifecycle scalar
@@ -166,6 +171,25 @@ pub const MAX_STAGED_LEASE_MEMBERS: usize = MAX_PUSH_FRAGMENT_REVALIDATIONS;
 pub struct PostgresFragmentCoordinator {
     pool: Pool,
     database_identity: String,
+    /// Trusted cell identity stamped on the CR-032 summary events this
+    /// coordinator appends, or `None` to append none.
+    ///
+    /// Defaulted to `None` by [`PostgresDomainStore::fragment_coordinator`] and
+    /// set by the server's own wiring, which is the only place a cell identity
+    /// is resolved from configuration. A cell with no configured `cell_id`
+    /// still performs every lifecycle mutation and simply produces no outbox
+    /// rows, matching what the governed repository seam does.
+    outbox_cell_id: Option<String>,
+}
+
+impl PostgresFragmentCoordinator {
+    /// Stamp the trusted cell identity on the summary events this coordinator
+    /// appends.
+    #[must_use]
+    pub fn with_outbox_cell_id(mut self, cell_id: Option<String>) -> Self {
+        self.outbox_cell_id = cell_id;
+        self
+    }
 }
 
 impl PostgresDomainStore {
@@ -180,6 +204,7 @@ impl PostgresDomainStore {
         PostgresFragmentCoordinator {
             pool: self.pool().clone(),
             database_identity: self.identity().as_marker(),
+            outbox_cell_id: None,
         }
     }
 }
@@ -2972,7 +2997,14 @@ impl PostgresFragmentCoordinator {
             // because it retires associations whether or not the head was
             // readable, so it always affects something (INV-EF P1-1).
             let confirmed = confirm_lifecycle_fanout(&tx, &witness.hash, &fanout).await?;
-            apply_lifecycle_generation(&tx, &confirmed).await?;
+            let advances = apply_lifecycle_generation(&tx, &confirmed).await?;
+            append_lifecycle_summaries(
+                &tx,
+                &mut sequence,
+                self.outbox_cell_id.as_deref(),
+                &advances,
+            )
+            .await?;
         }
         classify_commit(tx.commit().await, "mark missing commit")?;
         failpoint!("lifecycle.mark_missing.settled")?;
@@ -3038,7 +3070,16 @@ impl PostgresFragmentCoordinator {
         )
         .await
         .map_err(|error| DomainError::from_pg("association create insert", error))?;
-        bump_association_generation(&tx, repository_id).await?;
+        let advance = bump_association_generation(&tx, repository_id).await?;
+        append_association_summary(
+            &tx,
+            &mut sequence,
+            self.outbox_cell_id.as_deref(),
+            repository_id,
+            advance,
+            association_epoch,
+        )
+        .await?;
         classify_commit(tx.commit().await, "association create commit")?;
         failpoint!("association.create.settled")?;
         Ok(CommitVerdict::Published)
@@ -3097,7 +3138,16 @@ impl PostgresFragmentCoordinator {
         )
         .await
         .map_err(|error| DomainError::from_pg("guarded association insert", error))?;
-        bump_association_generation(&tx, repository_id).await?;
+        let advance = bump_association_generation(&tx, repository_id).await?;
+        append_association_summary(
+            &tx,
+            &mut sequence,
+            self.outbox_cell_id.as_deref(),
+            repository_id,
+            advance,
+            association_epoch,
+        )
+        .await?;
         classify_commit(tx.commit().await, "guarded association commit")?;
         failpoint!("association.create_guarded.settled")?;
         Ok(CommitVerdict::Published)
@@ -3125,11 +3175,17 @@ impl PostgresFragmentCoordinator {
         }
         failpoint!("association.tombstone.locked")?;
         sequence.enter(LockClass::Associations)?;
+        // `RETURNING` the epoch rather than a row count: the predicate names the
+        // full primary key, so at most one row moves, and the summary event
+        // needs the epoch this retirement leaves on the row. That epoch is the
+        // one the prior live bind wrote, because this statement deliberately
+        // does not move it — see `append_association_summary`'s D8 note.
         let updated = tx
-            .execute(
+            .query_opt(
                 "UPDATE lore_fragment_associations \
                     SET state = $4, updated_at = clock_timestamp() \
-                  WHERE hash = $1 AND repository_id = $2 AND context = $3 AND state = $5",
+                  WHERE hash = $1 AND repository_id = $2 AND context = $3 AND state = $5 \
+              RETURNING association_epoch",
                 &[
                     &hash,
                     &repository_id,
@@ -3140,10 +3196,20 @@ impl PostgresFragmentCoordinator {
             )
             .await
             .map_err(|error| DomainError::from_pg("association tombstone update", error))?;
-        if updated == 0 {
+        let Some(updated) = updated else {
             return Ok(CommitVerdict::Fenced);
-        }
-        bump_association_generation(&tx, repository_id).await?;
+        };
+        let association_epoch: i64 = updated.get("association_epoch");
+        let advance = bump_association_generation(&tx, repository_id).await?;
+        append_association_summary(
+            &tx,
+            &mut sequence,
+            self.outbox_cell_id.as_deref(),
+            repository_id,
+            advance,
+            association_epoch,
+        )
+        .await?;
         classify_commit(tx.commit().await, "association tombstone commit")?;
         failpoint!("association.tombstone.settled")?;
         Ok(CommitVerdict::Published)
@@ -3293,7 +3359,16 @@ impl PostgresFragmentCoordinator {
                     "the exact fragment association moved while it was locked".to_owned(),
                 ));
             }
-            bump_association_generation(&tx, repository_id).await?;
+            let advance = bump_association_generation(&tx, repository_id).await?;
+            append_association_summary(
+                &tx,
+                &mut sequence,
+                self.outbox_cell_id.as_deref(),
+                repository_id,
+                advance,
+                association_fence,
+            )
+            .await?;
             classify_commit(tx.commit().await, "association-only obliterate commit")?;
             return Ok(FragmentObliterateBegin::AssociationOnly);
         }
@@ -3371,10 +3446,44 @@ impl PostgresFragmentCoordinator {
                 "the fragment head moved while it was locked".to_owned(),
             ));
         }
-        bump_association_generation(&tx, repository_id).await?;
-        if head.state.is_readable() {
-            apply_lifecycle_generation(&tx, &confirmed).await?;
-        }
+        let association_advance = bump_association_generation(&tx, repository_id).await?;
+        let lifecycle_advances = if head.state.is_readable() {
+            apply_lifecycle_generation(&tx, &confirmed).await?
+        } else {
+            Vec::new()
+        };
+        // Both summaries this transition owes, appended together as the
+        // transaction's last writes. The association row always moves here; the
+        // lifecycle row moves only on a readability crossing, which is the same
+        // condition the scalar itself is gated on.
+        //
+        // PIN(WP-118): the two later obliterate phases emit nothing.
+        // `commit_obliterate_children` commits no fence, no generation, and no
+        // epoch at all (WP-119 inventory D7), so it has no committed version to
+        // key an event on, and `commit_obliterate_payload` moves only the
+        // head's `final_fence` — neither advances a repository scalar, so
+        // neither has a bounded summary to publish. The user-visible takedown
+        // is already represented: this method's two rows carry the fence, and
+        // the obliterate handler's own `repository.obliterated` (CR-032 PIN-3)
+        // carries the address. Giving the later phases their own kinds is a
+        // value-set change and belongs to the fixture's fifth open question,
+        // not to this producer.
+        append_association_summary(
+            &tx,
+            &mut sequence,
+            self.outbox_cell_id.as_deref(),
+            repository_id,
+            association_advance,
+            deletion_fence,
+        )
+        .await?;
+        append_lifecycle_summaries(
+            &tx,
+            &mut sequence,
+            self.outbox_cell_id.as_deref(),
+            &lifecycle_advances,
+        )
+        .await?;
         classify_commit(tx.commit().await, "owned obliterate begin commit")?;
         // The ownership-publishing exit only. This method's other successful
         // exits (NoOp, foreign/coordinated retry, tombstoned replay) are
@@ -4326,12 +4435,25 @@ impl PostgresFragmentCoordinator {
                 )
                 .await
                 .map_err(|error| DomainError::from_pg("publication missing update", error))?;
-                if was_readable {
-                    apply_lifecycle_generation(&tx, &confirmed).await?;
-                }
+                let advances = if was_readable {
+                    apply_lifecycle_generation(&tx, &confirmed).await?
+                } else {
+                    Vec::new()
+                };
+                // The claim settlement takes `LockClass::Fragments`, which is
+                // ahead of `OutboxInsert`, so it must run BEFORE the append or
+                // `LockSequence::enter` rejects the whole transaction. This
+                // ordering is load-bearing, not stylistic.
                 if let Some((claim, settlement)) = write_claim {
                     settle_write_claim_locked(&tx, &mut sequence, claim, settlement).await?;
                 }
+                append_lifecycle_summaries(
+                    &tx,
+                    &mut sequence,
+                    self.outbox_cell_id.as_deref(),
+                    &advances,
+                )
+                .await?;
                 classify_commit(tx.commit().await, "publication missing commit")?;
                 return Ok(CommitVerdict::Published);
             }
@@ -4435,13 +4557,33 @@ impl PostgresFragmentCoordinator {
         .await
         .map_err(|error| DomainError::from_pg("publication metering upsert", error))?;
 
-        if !was_readable {
+        let advances = if !was_readable {
             // Unreadable to readable is a lifecycle transition too.
-            apply_lifecycle_generation(&tx, &confirmed).await?;
-        }
+            apply_lifecycle_generation(&tx, &confirmed).await?
+        } else {
+            // PIN(WP-118): a `Staged` -> `Remote` promotion lands here with
+            // both states readable, so it crosses nothing, moves no scalar, and
+            // emits nothing. That is CR-032's classification verbatim
+            // ("`Staged` to `Remote` authority promotion with unchanged
+            // readability: No by default; add only after naming a consumer that
+            // requires this distinction"), and it is why promotion is absent
+            // from this producer rather than merely unimplemented. Naming such
+            // a consumer means a new pinned `event_kind`, not a summary row
+            // here: the existing summary's ordinal is the lifecycle generation,
+            // which promotion deliberately does not move.
+            Vec::new()
+        };
+        // Before the append, for the lock-order reason the sibling arm records.
         if let Some((claim, settlement)) = write_claim {
             settle_write_claim_locked(&tx, &mut sequence, claim, settlement).await?;
         }
+        append_lifecycle_summaries(
+            &tx,
+            &mut sequence,
+            self.outbox_cell_id.as_deref(),
+            &advances,
+        )
+        .await?;
         classify_commit(tx.commit().await, "publication commit")?;
         failpoint!("publication.commit.settled")?;
         Ok(CommitVerdict::Published)
@@ -5919,19 +6061,47 @@ async fn stamp_operation_fence(
 /// it without holding the row gets no error — it gets an unserialised increment.
 /// Verify the precondition at any new call site; do not infer it from the fact
 /// that the existing ones are fine.
+///
+/// Returns the two committed scalars the CR-032 summary needs — the
+/// repository's own generation, which partitions the outbox row, and the
+/// association generation, which is the event's ordinal — or `None` when the
+/// repository row is absent. `None` is not a normal outcome at any current call
+/// site, all of which lock the row first; it is returned rather than
+/// synthesised so a future caller that skips the lock produces no event instead
+/// of an event keyed on a guessed version.
 async fn bump_association_generation(
     tx: &Transaction<'_>,
     repository_id: &[u8],
-) -> Result<(), DomainError> {
-    tx.execute(
-        "UPDATE lore_domain_repositories \
-            SET content_association_generation = content_association_generation + 1 \
-          WHERE repository_id = $1",
-        &[&repository_id],
-    )
-    .await
-    .map_err(|error| DomainError::from_pg("association generation bump", error))?;
-    Ok(())
+) -> Result<Option<AssociationAdvance>, DomainError> {
+    let row = tx
+        .query_opt(
+            "UPDATE lore_domain_repositories \
+                SET content_association_generation = content_association_generation + 1 \
+              WHERE repository_id = $1 \
+          RETURNING generation, content_association_generation",
+            &[&repository_id],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("association generation bump", error))?;
+    Ok(row.map(|row| AssociationAdvance {
+        repository_generation: row.get("generation"),
+        association_generation: row.get("content_association_generation"),
+    }))
+}
+
+/// One repository whose association scalar this transaction advanced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AssociationAdvance {
+    repository_generation: i64,
+    association_generation: i64,
+}
+
+/// One repository whose fragment-lifecycle scalar this transaction advanced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LifecycleAdvance {
+    repository_id: Vec<u8>,
+    repository_generation: i64,
+    lifecycle_generation: i64,
 }
 
 /// Read, without locking, the repositories a readable/unreadable transition on
@@ -6071,25 +6241,197 @@ async fn confirm_lifecycle_fanout(
 ///
 /// One statement over rows [`confirm_lifecycle_fanout`] has already proved this
 /// transaction holds, so a partial fanout is not representable.
+///
+/// Returns one [`LifecycleAdvance`] per repository whose scalar actually moved,
+/// sorted by repository id. `RETURNING` order is not defined by Postgres, and
+/// these become outbox rows, so the sort makes the append order a property of
+/// the code rather than of the plan.
 async fn apply_lifecycle_generation(
     tx: &Transaction<'_>,
     locked: &[Vec<u8>],
-) -> Result<(), DomainError> {
+) -> Result<Vec<LifecycleAdvance>, DomainError> {
     if locked.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // Bound by `locked`, which this has just proved is a superset of `current`.
     // Writing the already-locked set makes "one statement over rows this
     // transaction holds" literally true rather than true by inference.
-    tx.execute(
-        "UPDATE lore_domain_repositories \
-            SET fragment_lifecycle_generation = fragment_lifecycle_generation + 1 \
-          WHERE repository_id = ANY($1)",
-        &[&locked],
+    let rows = tx
+        .query(
+            "UPDATE lore_domain_repositories \
+                SET fragment_lifecycle_generation = fragment_lifecycle_generation + 1 \
+              WHERE repository_id = ANY($1) \
+          RETURNING repository_id, generation, fragment_lifecycle_generation",
+            &[&locked],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("lifecycle generation bump", error))?;
+    let mut advances = rows
+        .into_iter()
+        .map(|row| LifecycleAdvance {
+            repository_id: row.get("repository_id"),
+            repository_generation: row.get("generation"),
+            lifecycle_generation: row.get("fragment_lifecycle_generation"),
+        })
+        .collect::<Vec<_>>();
+    advances.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
+    Ok(advances)
+}
+
+/// Append one classified event as the transaction's last write.
+///
+/// Mirrors the lock coordinator's own append step: the ordinal is resolved from
+/// what this transaction committed rather than taken from the caller, the
+/// identity half is encoded per F-032-4, and `LockClass::OutboxInsert` is
+/// entered so a later row lock in the same transaction fails loudly instead of
+/// inverting F-032-3.
+///
+/// A fragment transaction commits no branch generation, so
+/// `CommittedVersions::branch_generation` is always `None` here and both
+/// summary builders name an `Exact` ordinal.
+async fn append_summary_event(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    repository_id: &[u8],
+    repository_generation: i64,
+    event: &PendingEvent,
+) -> Result<(), DomainError> {
+    let committed = CommittedVersions {
+        repository_generation,
+        branch_generation: None,
+    };
+    let version = AggregateVersion::new(
+        event.aggregate_ordinal.resolve(committed)?,
+        event.aggregate_identity.clone(),
+    )?
+    .encode();
+    sequence.enter(LockClass::OutboxInsert)?;
+    outbox::append(
+        tx,
+        &outbox::OutboxEvent {
+            cell_id: &event.cell_id,
+            repository_id,
+            repository_generation,
+            event_kind: &event.event_kind,
+            aggregate_kind: &event.aggregate_kind,
+            aggregate_id: &event.aggregate_id,
+            aggregate_version: &version,
+            payload_schema_version: event.payload_schema_version,
+            payload: &event.payload,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Append the bounded per-repository `fragment.lifecycle_generation_advanced`
+/// summary, one row per repository whose scalar advanced.
+///
+/// CR-032 requires "one bounded repository/global lifecycle-generation summary
+/// only when a named consumer requires invalidation; no per-fragment row by
+/// default". This is that summary and it is per **repository**: a fragment
+/// shared by three repositories produces three rows because three repositories'
+/// hydration caches went stale, not because three fragments changed. A
+/// per-fragment row is never written here and the hash never appears in the
+/// payload.
+///
+/// PIN(WP-118): the row count is bounded by
+/// [`MAX_LIFECYCLE_GENERATION_FANOUT`] (4,096), which is the same bound the
+/// transition's repository row locks already carry — so the append adds no new
+/// unbounded cost, but it does track a bound WP-118 records as "a bound, not a
+/// measurement" (deferred P2-7). If staging measurement narrows the fanout
+/// bound, this narrows with it; the two must not drift apart.
+async fn append_lifecycle_summaries(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    cell_id: Option<&str>,
+    advances: &[LifecycleAdvance],
+) -> Result<(), DomainError> {
+    let Some(cell_id) = cell_id else {
+        return Ok(());
+    };
+    for advance in advances {
+        let ordinal = u64::try_from(advance.lifecycle_generation).map_err(|_| {
+            DomainError::Internal(format!(
+                "fragment_lifecycle_generation must be non-negative, got {}",
+                advance.lifecycle_generation
+            ))
+        })?;
+        let event = builders::fragment_lifecycle_generation_advanced(
+            cell_id,
+            &advance.repository_id,
+            ordinal,
+        )?;
+        append_summary_event(
+            tx,
+            sequence,
+            &advance.repository_id,
+            advance.repository_generation,
+            &event,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Append the bounded per-repository `association.generation_advanced` summary.
+///
+/// `association_epoch` is the identity half of `aggregate_version`, encoded as
+/// the 8-byte big-endian association fence, so it sits far inside F-032-4's
+/// 64-raw-byte producer bound.
+///
+/// BLOCKED(WP-118): `tombstone_association` moves the generation without moving
+/// `association_epoch` (WP-119 inventory disagreement D8), so a retirement
+/// publishes the prior live bind's epoch and a consumer fencing on the identity
+/// alone cannot tell the two apart. The epoch handed here is the epoch actually
+/// stored on the row, which keeps the event honest; closing D8 is a writer
+/// change in this coordinator, not something the event can paper over.
+async fn append_association_summary(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    cell_id: Option<&str>,
+    repository_id: &[u8],
+    advance: Option<AssociationAdvance>,
+    association_epoch: i64,
+) -> Result<(), DomainError> {
+    // The two `None`s mean opposite things and must not share an arm. A cell
+    // with no configured identity produces no outbox rows and that is normal.
+    // An absent `advance` means `bump_association_generation` updated no row,
+    // which its own documentation calls damage — every call site locks the
+    // repository row first, so a `None` here says the row vanished underneath a
+    // held lock. Collapsing the two swallowed that, in a helper whose sibling
+    // `lock_lifecycle_fanout` raises `Internal` for the exactly analogous
+    // absent-repository-row condition.
+    let Some(advance) = advance else {
+        return Err(DomainError::Internal(format!(
+            "the association generation bump for repository {} updated no row, but its \
+             repository row was locked by this transaction",
+            hex_lower(repository_id)
+        )));
+    };
+    let Some(cell_id) = cell_id else {
+        return Ok(());
+    };
+    let ordinal = u64::try_from(advance.association_generation).map_err(|_| {
+        DomainError::Internal(format!(
+            "content_association_generation must be non-negative, got {}",
+            advance.association_generation
+        ))
+    })?;
+    let event = builders::association_generation_advanced(
+        cell_id,
+        repository_id,
+        ordinal,
+        &association_epoch.to_be_bytes(),
+    )?;
+    append_summary_event(
+        tx,
+        sequence,
+        repository_id,
+        advance.repository_generation,
+        &event,
     )
     .await
-    .map_err(|error| DomainError::from_pg("lifecycle generation bump", error))?;
-    Ok(())
 }
 
 async fn fragment_schema_presence(
