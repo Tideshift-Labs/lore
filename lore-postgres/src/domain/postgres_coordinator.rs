@@ -767,6 +767,170 @@ impl DomainTransactionStore for PostgresDomainStore {
         })
     }
 
+    async fn branch_delete(
+        &self,
+        operation: &GovernedOperation,
+        input: &BranchDeleteInput,
+    ) -> Result<MutationResult, DomainError> {
+        let _t = self
+            .instruments()
+            .start("branch_delete", self.pool().status());
+        // Before the pool checkout, for the same reason the two delete-shaped
+        // siblings check there: an overrun found here costs no transaction.
+        validate_pending_events(&input.events, "branch_delete")?;
+        let mut client = self.checkout().await?;
+        let mut sequence = LockSequence::new();
+        let (tx, clock) = match self
+            .begin_admitted(&mut client, operation, &mut sequence)
+            .await?
+        {
+            BeginAdmitted::Admitted(tx, clock) => (tx, clock),
+            BeginAdmitted::Committed(outcome, public_result) => {
+                return Ok(replayed_mutation(outcome, public_result));
+            }
+            BeginAdmitted::Rejected => {
+                return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
+            }
+        };
+
+        let Some(repository) = lock_repository(&tx, &mut sequence, &input.repository_id).await?
+        else {
+            let result = MutationResult::rejected(NOT_FOUND_V1);
+            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
+            classify_commit(
+                tx.commit().await,
+                "branch delete repository not-found commit",
+            )?;
+            return Ok(result);
+        };
+        if repository.state == schema::STATE_TOMBSTONED {
+            // A branch of a tombstoned repository is already hidden by the
+            // repository's own tombstone, and resurrecting the branch row to
+            // tombstone it a second time would publish a `branch.deleted` for a
+            // transition the repository event already covered.
+            let result = MutationResult::rejected(TOMBSTONED_V1);
+            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
+            classify_commit(
+                tx.commit().await,
+                "branch delete repository tombstone commit",
+            )?;
+            return Ok(result);
+        }
+
+        let Some(existing) =
+            lock_branch(&tx, &mut sequence, &input.repository_id, &input.branch_id).await?
+        else {
+            let result = MutationResult::rejected(NOT_FOUND_V1);
+            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
+            classify_commit(tx.commit().await, "branch delete not-found commit")?;
+            return Ok(result);
+        };
+
+        if existing.state == schema::STATE_TOMBSTONED {
+            // The tombstone preserves its record, so an exact delete retry is
+            // idempotent rather than an error — and returns before the append
+            // step, so the retry emits no second event.
+            let outcome = DomainOutcome::Applied;
+            receipts::commit_terminal(&tx, &operation.key, &outcome, None, clock).await?;
+            classify_commit(tx.commit().await, "branch delete retry commit")?;
+            return Ok(MutationResult {
+                outcome,
+                repository_generation: Some(repository.generation),
+                branch_generation: Some(existing.generation),
+                observed_pointer: None,
+            });
+        }
+
+        // Rechecked under the locked repository row, not trusted from the
+        // handler's preflight: the default branch can move between a preflight
+        // read and this commit, and deleting it would leave the repository row
+        // pointing at a tombstone.
+        //
+        // Checked BEFORE the generation fence on purpose. Being the default
+        // branch is a condition no retry can fix, while `GENERATION_MISMATCH_V1`
+        // maps to `ABORTED` — the code that tells a client its read was stale and
+        // to try again. Answering a permanently impossible delete with a
+        // retryable code buys a guaranteed-futile round trip and reads, in a log,
+        // like contention rather than a rule.
+        if repository.default_branch_id == input.branch_id {
+            let result = MutationResult::rejected(DEFAULT_BRANCH_V1);
+            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
+            classify_commit(tx.commit().await, "branch delete default-branch commit")?;
+            return Ok(result);
+        }
+
+        if let Some(expected) = input.expected_generation
+            && expected != existing.generation
+        {
+            let result = MutationResult::rejected(GENERATION_MISMATCH_V1);
+            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
+            classify_commit(tx.commit().await, "branch delete generation commit")?;
+            return Ok(result);
+        }
+
+        let generation = next_generation(existing.generation)?;
+
+        // `repository_generation` is restamped to the generation this branch is
+        // now written against, which is the repository's current one. A branch
+        // delete does not change the repository, so that value is the locked
+        // row's, unbumped — unlike `repository_delete`, where the branches are
+        // hidden BY a repository transition and carry its new generation.
+        tx.execute(
+            "UPDATE lore_domain_branches \
+             SET state = $3, generation = $4, repository_generation = $5, \
+                 deleted_at = $6, delete_proof = $7 \
+             WHERE repository_id = $1 AND branch_id = $2",
+            &[
+                &input.repository_id,
+                &input.branch_id,
+                &schema::STATE_TOMBSTONED,
+                &generation,
+                &repository.generation,
+                &clock,
+                &input.delete_proof,
+            ],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("branch tombstone", e))?;
+
+        // Only THIS branch's name mapping is released, in the same transaction
+        // that tombstones its owner, so the name is recyclable only after the
+        // tombstone exists. Scoped by `branch_id` as well as `repository_id`:
+        // the repository-wide `DELETE` `repository_delete` uses is correct only
+        // because it tombstones every branch in the same statement.
+        tx.execute(
+            "DELETE FROM lore_domain_branch_names \
+             WHERE repository_id = $1 AND branch_id = $2",
+            &[&input.repository_id, &input.branch_id],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("branch name release", e))?;
+
+        apply_projection(&tx, &input.projection).await?;
+        append_events(
+            &tx,
+            &mut sequence,
+            &input.repository_id,
+            CommittedVersions {
+                repository_generation: repository.generation,
+                branch_generation: Some(generation),
+            },
+            &input.events,
+        )
+        .await?;
+
+        let outcome = DomainOutcome::Applied;
+        receipts::commit_terminal(&tx, &operation.key, &outcome, None, clock).await?;
+        classify_commit(tx.commit().await, "branch delete commit")?;
+
+        Ok(MutationResult {
+            outcome,
+            repository_generation: Some(repository.generation),
+            branch_generation: Some(generation),
+            observed_pointer: None,
+        })
+    }
+
     async fn metadata_compare_and_swap(
         &self,
         operation: &GovernedOperation,

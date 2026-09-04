@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_postgres::domain::DomainError;
 use lore_postgres::domain::DomainOutcome;
+use lore_postgres::domain::coordinator::BranchDeleteInput;
 use lore_postgres::domain::coordinator::BranchPushCommitInput;
 use lore_postgres::domain::coordinator::BranchSnapshot;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
@@ -271,6 +272,14 @@ impl DomainTransactionStore for RecordingStore {
         _input: &RepositoryDeleteInput,
     ) -> Result<MutationResult, DomainError> {
         unreachable!("receipt-rail tests do not call repository_delete")
+    }
+
+    async fn branch_delete(
+        &self,
+        _operation: &GovernedOperation,
+        _input: &BranchDeleteInput,
+    ) -> Result<MutationResult, DomainError> {
+        unreachable!("receipt-rail tests do not call branch_delete")
     }
 
     async fn metadata_compare_and_swap(

@@ -40,8 +40,10 @@ use lore_base::types::RepositoryId;
 use lore_postgres::domain::DatabaseIdentity;
 use lore_postgres::domain::DomainSchemaState;
 use lore_postgres::domain::bypass::DomainEnforcement;
+use lore_postgres::domain::coordinator::BranchDeleteInput;
 use lore_postgres::domain::coordinator::BranchSnapshot;
 use lore_postgres::domain::coordinator::CAS_MISMATCH_V1;
+use lore_postgres::domain::coordinator::DEFAULT_BRANCH_V1;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
 use lore_postgres::domain::coordinator::MetadataCasInput;
@@ -1238,6 +1240,320 @@ impl GovernedRepositoryDelete {
     }
 }
 
+/// The 32 proof bytes a branch tombstone requires, or the fence while CR-029
+/// derives none.
+///
+/// The exact shape of [`RepositoryDeleteProof`], and blocked on the exact same
+/// missing artefact, so the two are deliberately separate types rather than one
+/// shared enum: freezing a repository delete proof must not silently open the
+/// branch path, and vice versa. `lore_domain_branches_tombstone_evidence`
+/// requires 32 bytes on a tombstoned branch row, so this is not a value the
+/// coordinator can be called without.
+///
+/// Missing artefact: a frozen `delete_proof` derivation in CR-029 on the same
+/// terms as its canonical-intent digest contract — one canonical preimage, its
+/// exact field order and framing, and independently computed golden vectors on
+/// both sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchDeleteProof {
+    /// No derivation exists. [`GovernedBranchDelete::commit`] refuses.
+    Unfrozen,
+}
+
+impl BranchDeleteProof {
+    /// The 32 proof bytes the tombstone row requires, or `None` while CR-029
+    /// freezes no derivation.
+    ///
+    /// Exhaustive with no `_` arm, for the reason
+    /// [`RepositoryDeleteProof::bytes`] is: the variant that carries real bytes
+    /// must be a compile error here until it is handled.
+    fn bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Unfrozen => None,
+        }
+    }
+}
+
+/// Everything one branch delete retires, as the handler observed it.
+pub struct BranchDeletePublication<'a> {
+    /// Repository-format salt, from the target `RepositoryContext`.
+    ///
+    /// Taken from the context rather than hardcoded, so the retired key is
+    /// byte-identical to the one `delete_name_to_id` derives on the same
+    /// repository.
+    pub salt: &'a [u8],
+    /// 16-byte owning repository identity.
+    pub repository_id: &'a [u8],
+    /// 16-byte branch identity.
+    pub branch_id: &'a [u8],
+    /// Branch name as authored. The live-name key folds case.
+    pub name: &'a str,
+    /// Generation the caller expects to be tombstoning, when it read one.
+    pub expected_generation: Option<i64>,
+    /// 32-byte tip the branch is being tombstoned at. The `branch.deleted`
+    /// event's aggregate identity, per CR-032's branch row.
+    pub final_latest_hash: &'a [u8],
+    /// BLOCKED(WP-116): delete_proof derivation unfrozen in CR-029.
+    pub delete_proof: BranchDeleteProof,
+}
+
+impl BranchDeletePublication<'_> {
+    /// The `lore_mutable` row a branch delete removes today, rebuilt exactly.
+    ///
+    /// **One row, not three.** This is the whole of what the legacy writer
+    /// touches: `lore_revision::branch::delete` performs its protection,
+    /// default-branch and current-branch checks and then calls
+    /// `delete_name_to_id` and nothing else, which reaches `MutableStore::store`
+    /// with a null hash — a delete, expressed here as `value: None`.
+    ///
+    /// The branch **metadata** and **latest** rows deliberately survive, and
+    /// that asymmetry with [`RepositoryDeletePublication::projection`] is in the
+    /// legacy path rather than introduced here: a repository delete removes them
+    /// through `branch::mutable_delete` on its way out, while a branch delete
+    /// leaves them. The v1 handler depends on that. It re-reads the branch's
+    /// metadata pointer through `branch::metadata_hash` **after** the delete and
+    /// builds its `Branch` record from it plus the metadata it loaded before,
+    /// and a repeat call on an already-deleted branch reaches both reads with
+    /// nothing else having run. Retiring either row here would make the governed
+    /// delete answer differently from the legacy one.
+    ///
+    /// The key folds case because `branch::mutable_name_key` hashes
+    /// `name.to_lowercase()`; the repository name key does not fold. Both rules
+    /// are reproduced from their own module rather than from each other.
+    fn projection(&self) -> Vec<ProjectionWrite> {
+        vec![ProjectionWrite {
+            partition: self.repository_id.to_vec(),
+            key_type: KeyType::BranchId as i16,
+            key: hash::hash_function_arg(self.salt, branch::ID, &self.name.to_lowercase())
+                .as_ref()
+                .to_vec(),
+            value: None,
+        }]
+    }
+}
+
+/// What a governed branch delete committed.
+pub struct BranchDeleteOutcome {
+    /// Branch generation this transaction committed, or the existing one an
+    /// exact retry found.
+    pub branch_generation: Option<i64>,
+}
+
+/// The governed branch-delete seam, shared by the v0 and v1 delete sites.
+///
+/// Built for the reason every seam in this module is: branch delete exists twice
+/// on the wire, the two handlers differ only in their response shapes, and
+/// everything between admission and the coordinator is identical. Two copies of
+/// a governed mutation path is how the two come to mean different things.
+///
+/// This is the only seam that can emit `branch.deleted`, the last unemitted row
+/// in CR-032's classification table. The ungoverned writers it replaces
+/// (WP-119 writer inventory B4 and B5) each perform one unsynchronised
+/// `MutableStore::store` with no domain row, no generation, and no event.
+///
+/// # Fenced by two missing values, not by missing plumbing
+///
+/// The projection row, the classified event, the coordinator input, the
+/// coordinator call and the outcome mapping are all here and complete. Two
+/// inputs have no derivation, and they fence at different layers:
+///
+/// - [`BranchDeleteProof`] has no frozen preimage, and [`Self::commit`] refuses
+///   on it before it touches the coordinator. Same artefact as
+///   [`RepositoryDeleteProof`].
+/// - **There is no `CanonicalIntent::BranchDelete` family.** CR-029's
+///   canonical-intent contract freezes six, `lore-server/src/domain_intent.rs`
+///   defines those six, and `packages/control-plane/src/repository-operation-intent.ts`
+///   defines the same six on the platform side. `AdmittedOperation::into_governed`
+///   requires a digest and `receipts::consume` compares the resulting binding
+///   against the `PREPARED` row the platform wrote, so a Lore-side seventh family
+///   with no platform counterpart would fail every admission it was offered.
+///   Freezing it is a CR-029 amendment with cross-language golden vectors, not a
+///   Lore-side edit.
+///
+/// The second is why **both handlers still refuse at entry** through
+/// `reject_unwired_governed_operation` rather than calling [`Self::prepare`]:
+/// they have no digest to hand it. That entry refusal is also what stops a
+/// delete that will certainly refuse from first running its pre-hook and
+/// notification side effects. `lore-server/tests/p12_governed_wiring.rs` pins
+/// both facts: that the two sites stay guarded, and that this seam is otherwise
+/// complete.
+pub struct GovernedBranchDelete {
+    domain: Arc<DomainContext>,
+    operation: GovernedOperation,
+}
+
+impl GovernedBranchDelete {
+    /// Prepare the governed call, or `Ok(None)` for the ungoverned path.
+    ///
+    /// Identical admission rules to [`GovernedRepositoryDelete::prepare`],
+    /// including the refusal on a cell that is not enforcing: an unenforcing
+    /// cell still writes the generic mutable path unfenced, so admitting a
+    /// governed delete there would put two writers on the same name row under
+    /// two lock disciplines.
+    ///
+    /// That refusal is also this seam's answer to INV-DX's R-SHOULD-8, which
+    /// found `require_permission`'s `enforce` flag to be a third state CR-029's
+    /// two-state branch-delete contract does not model. A governed branch delete
+    /// is admitted only on an enforcing cell, so the unmodelled state cannot
+    /// reach this path at all; it remains open for the ungoverned one.
+    pub fn prepare(
+        domain: Option<&Arc<DomainContext>>,
+        admitted: Option<AdmittedOperation>,
+        method: &'static str,
+        digest: Vec<u8>,
+    ) -> Result<Option<Self>, Status> {
+        let Some(admitted) = admitted else {
+            return Ok(None);
+        };
+        let Some(domain) = domain else {
+            return Err(Status::failed_precondition(
+                "Domain coordinator is unavailable",
+            ));
+        };
+        if !domain.enforcement_enabled() {
+            warn!(
+                method,
+                operation_id = %admitted.key.operation_id,
+                "Refusing a governed branch delete on a cell that is not enforcing"
+            );
+            return Err(Status::failed_precondition(
+                "Governed branch delete requires domain enforcement on this cell",
+            ));
+        }
+        Ok(Some(Self {
+            domain: domain.clone(),
+            operation: admitted.into_governed(method, digest),
+        }))
+    }
+
+    /// Commit the tombstone, its projection row, and its classified event in one
+    /// transaction.
+    pub async fn commit(
+        &self,
+        publication: &BranchDeletePublication<'_>,
+    ) -> Result<BranchDeleteOutcome, Status> {
+        // BLOCKED(WP-116): branch delete_proof derivation unfrozen in CR-029.
+        //
+        // Fails closed, first, before the projection is built and before the
+        // coordinator is reached. Everything past this line is the rest of the
+        // wiring and runs unchanged the moment the proof has a derivation.
+        //
+        // Named "branch delete_proof" rather than reusing the repository seam's
+        // marker text so the two are individually greppable and individually
+        // pinnable: freezing the repository derivation must not read as having
+        // freed this one.
+        let Some(delete_proof) = publication.delete_proof.bytes() else {
+            warn!(
+                operation_id = %self.operation.key.operation_id,
+                "Refusing a governed branch delete: CR-029 freezes no branch delete_proof \
+                 derivation, and a minted proof would become permanent receipt evidence"
+            );
+            return Err(Status::unimplemented(
+                "Governed branch delete requires a frozen CR-029 delete_proof derivation",
+            ));
+        };
+        // Both ids become part of a `lore_mutable` key or an event identity, so
+        // both are width-checked before the first key is derived.
+        // `hash_function_arg` hashes whatever it is handed, so a short or long id
+        // produces a plausible key for a row that does not exist and the delete
+        // silently retires nothing.
+        checked_id_16(publication.repository_id, "repository_id")?;
+        checked_id_16(publication.branch_id, "branch_id")?;
+        // An empty name is not a row this may skip. The legacy path treats a
+        // branch with no readable name as absent and returns `BranchNotFound`
+        // before it writes anything, so an empty name here means the handler
+        // published something the legacy path would have refused. Retiring the
+        // hash of the empty string would delete a key nothing ever wrote.
+        if publication.name.is_empty() {
+            return Err(Status::invalid_argument(
+                "branch name must be known to release its live-name row",
+            ));
+        }
+        let input = self.input(publication, delete_proof)?;
+        self.publish(&input).await
+    }
+
+    /// The classified event this transition owes, and the coordinator input it
+    /// commits with.
+    ///
+    /// Split out of [`Self::commit`] so the carriage is real, reviewable code
+    /// rather than a promise inside a branch nothing reaches.
+    fn input(
+        &self,
+        publication: &BranchDeletePublication<'_>,
+        delete_proof: Vec<u8>,
+    ) -> Result<BranchDeleteInput, Status> {
+        // CR-032 classifies a branch tombstone as ONE `branch.deleted` row on
+        // the branch aggregate, keyed on the committed branch generation with
+        // the branch's final tip as its identity. `None` when this cell has no
+        // configured identity, exactly as the create and delete seams do.
+        let events = match self.domain.cell_id() {
+            Some(cell_id) => {
+                vec![
+                    outbox_builders::branch_deleted(
+                        cell_id,
+                        publication.repository_id,
+                        publication.branch_id,
+                        publication.name,
+                        publication.final_latest_hash,
+                    )
+                    .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?,
+                ]
+            }
+            None => Vec::new(),
+        };
+        Ok(BranchDeleteInput {
+            repository_id: publication.repository_id.to_vec(),
+            branch_id: publication.branch_id.to_vec(),
+            expected_generation: publication.expected_generation,
+            delete_proof,
+            projection: publication.projection(),
+            events,
+        })
+    }
+
+    /// Hand the built input to the coordinator and map its outcome.
+    async fn publish(&self, input: &BranchDeleteInput) -> Result<BranchDeleteOutcome, Status> {
+        let result = self
+            .domain
+            .store()
+            .branch_delete(&self.operation, input)
+            .await
+            .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?;
+        match result.outcome {
+            DomainOutcome::Applied => Ok(BranchDeleteOutcome {
+                branch_generation: result.branch_generation,
+            }),
+            DomainOutcome::NotApplied { reason, .. } => {
+                Err(map_branch_delete_rejection(reason.as_str()))
+            }
+        }
+    }
+}
+
+/// Map a branch-delete-specific rejection, deferring to the shared mapper
+/// elsewhere.
+///
+/// Exactly one reason is answered here rather than by
+/// [`crate::grpc::map_domain_rejection_to_status`], on the same terms
+/// [`map_repository_create_rejection`] answers exactly one: the shared mapper's
+/// vocabulary is what every family agrees on, and `DEFAULT_BRANCH_V1` is a
+/// reason only this family can produce. Adding it to the shared mapper would
+/// oblige every other family to have an opinion about it.
+///
+/// `FAILED_PRECONDITION` matches what the ungoverned handlers already return for
+/// the same refusal, so the governed and legacy paths answer a default-branch
+/// delete identically. It is deliberately not the shared mapper's `NOT_FOUND`:
+/// the caller can already see the repository and its default branch, so nothing
+/// is disclosed by naming the rule it broke, and reporting `NOT_FOUND` for a
+/// branch the caller just read would be an answer to a question nobody asked.
+fn map_branch_delete_rejection(reason: &str) -> Status {
+    match reason {
+        DEFAULT_BRANCH_V1 => Status::failed_precondition(reason.to_owned()),
+        other => crate::grpc::map_domain_rejection_to_status(other),
+    }
+}
+
 /// Map a create-specific rejection, deferring to the shared mapper elsewhere.
 ///
 /// Exactly one reason is answered here rather than by
@@ -1615,6 +1931,7 @@ pub(crate) mod test_support {
     use lore_postgres::domain::backfill::DomainBackfillSource;
     use lore_postgres::domain::backfill::OrphanKey;
     use lore_postgres::domain::backfill::RepositoryFacts;
+    use lore_postgres::domain::coordinator::BranchDeleteInput;
     use lore_postgres::domain::coordinator::BranchPushCommitInput;
     use lore_postgres::domain::coordinator::BranchSnapshot;
     use lore_postgres::domain::coordinator::MetadataCasInput;
@@ -1825,6 +2142,14 @@ pub(crate) mod test_support {
             unreachable!("DomainContext::admit tests never call the coordinator")
         }
 
+        async fn branch_delete(
+            &self,
+            _operation: &GovernedOperation,
+            _input: &BranchDeleteInput,
+        ) -> Result<MutationResult, DomainError> {
+            unreachable!("DomainContext::admit tests never call the coordinator")
+        }
+
         async fn metadata_compare_and_swap(
             &self,
             _operation: &GovernedOperation,
@@ -1964,6 +2289,14 @@ pub(crate) mod test_support {
             &self,
             _operation: &GovernedOperation,
             _input: &RepositoryDeleteInput,
+        ) -> Result<MutationResult, DomainError> {
+            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn branch_delete(
+            &self,
+            _operation: &GovernedOperation,
+            _input: &BranchDeleteInput,
         ) -> Result<MutationResult, DomainError> {
             unreachable!("ScriptedDomainStore only scripts branch_push_commit")
         }

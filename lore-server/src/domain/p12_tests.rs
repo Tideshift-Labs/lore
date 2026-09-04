@@ -5,8 +5,12 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use lore_postgres::domain::coordinator::ADMISSION_REJECTED_V1;
+use lore_postgres::domain::coordinator::BranchDeleteInput;
 use lore_postgres::domain::coordinator::BranchPushCommitInput;
+use lore_postgres::domain::coordinator::DEFAULT_BRANCH_V1;
+use lore_postgres::domain::coordinator::GENERATION_MISMATCH_V1;
 use lore_postgres::domain::coordinator::MutationResult;
+use lore_postgres::domain::coordinator::NOT_FOUND_V1;
 use lore_postgres::domain::coordinator::RepositoryCreateInput;
 use lore_postgres::domain::coordinator::RepositoryDeleteInput;
 use lore_postgres::domain::coordinator::RepositorySnapshot;
@@ -269,6 +273,14 @@ impl DomainTransactionStore for MetadataCasScriptedStore {
         &self,
         _operation: &GovernedOperation,
         _input: &RepositoryDeleteInput,
+    ) -> Result<MutationResult, DomainError> {
+        unreachable!("MetadataCasScriptedStore only scripts metadata_compare_and_swap")
+    }
+
+    async fn branch_delete(
+        &self,
+        _operation: &GovernedOperation,
+        _input: &BranchDeleteInput,
     ) -> Result<MutationResult, DomainError> {
         unreachable!("MetadataCasScriptedStore only scripts metadata_compare_and_swap")
     }
@@ -560,6 +572,16 @@ impl DomainTransactionStore for RepositoryCreateScriptedStore {
         &self,
         _operation: &GovernedOperation,
         _input: &RepositoryDeleteInput,
+    ) -> Result<MutationResult, DomainError> {
+        unreachable!(
+            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
+        )
+    }
+
+    async fn branch_delete(
+        &self,
+        _operation: &GovernedOperation,
+        _input: &BranchDeleteInput,
     ) -> Result<MutationResult, DomainError> {
         unreachable!(
             "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
@@ -1066,6 +1088,172 @@ async fn commit_refuses_on_the_unfrozen_delete_proof_before_touching_the_coordin
 }
 
 // ---------------------------------------------------------------------------
+// GovernedBranchDelete: fenced the same way GovernedRepositoryDelete is, on two
+// missing artefacts (BranchDeleteProof::Unfrozen, and the absent
+// CanonicalIntent::BranchDelete family), so `prepare`/`commit`'s own admission
+// and proof-refusal logic is what's reachable and testable here -- the
+// coordinator call inside `publish()` is not reachable through `commit()`
+// today, the same shape as GovernedRepositoryDelete's own tests above.
+// ---------------------------------------------------------------------------
+
+fn dummy_branch_delete_operation() -> GovernedOperation {
+    let mut operation = dummy_create_operation();
+    operation.binding.method = "branch_delete".to_owned();
+    operation
+}
+
+/// `GovernedBranchDelete::prepare` with no admitted operation is the legacy
+/// carve-out, exactly like every other governed seam's `Ok(None)` path.
+#[test]
+fn branch_delete_prepare_with_no_admitted_operation_is_the_legacy_path() {
+    let result = GovernedBranchDelete::prepare(None, None, "branch_delete", vec![0u8; 32]);
+    assert!(matches!(result, Ok(None)));
+}
+
+/// The same 2026-09-03 ruling `GovernedRepositoryCreate`/`GovernedRepositoryDelete`
+/// already carry: an admitted operation against a cell whose coordinator exists
+/// but is not enforcing is refused `FAILED_PRECONDITION`, never silently
+/// downgraded to the legacy path.
+#[test]
+fn branch_delete_prepare_refuses_carriage_when_enforcement_is_off() {
+    let domain = Arc::new(context(false));
+    let admitted = AdmittedOperation {
+        key: ReceiptKey {
+            verified_issuer: "https://issuer.example".to_owned(),
+            authenticated_subject: "branch-delete-prepare-enforcement-off-test".to_owned(),
+            tenant_scope_key: vec![7; 16],
+            operation_id: Uuid::now_v7(),
+        },
+        carried: DomainOperationMetadata {
+            operation_id: Uuid::now_v7(),
+            fingerprint_version: i32::from(FINGERPRINT_VERSION_V1),
+            fingerprint: vec![0x42; FINGERPRINT_V1_LEN],
+            prepare_token: [0x53; PREPARE_TOKEN_LEN],
+            mediated_scope: None,
+        },
+    };
+    // `GovernedBranchDelete` has no `Debug` impl -- match explicitly, same
+    // convention as this file's other `Debug`-less-type cases.
+    let result = GovernedBranchDelete::prepare(
+        Some(&domain),
+        Some(admitted),
+        "branch_delete",
+        vec![0u8; 32],
+    );
+    let Err(error) = result else {
+        panic!("carriage with enforcement off must be refused, not admitted");
+    };
+    assert_eq!(error.code(), Code::FailedPrecondition);
+}
+
+/// The mirror case: the same admitted operation against a cell that IS
+/// enforcing is accepted.
+#[test]
+fn branch_delete_prepare_admits_carriage_when_enforcement_is_on() {
+    let domain = Arc::new(context(true));
+    let admitted = AdmittedOperation {
+        key: ReceiptKey {
+            verified_issuer: "https://issuer.example".to_owned(),
+            authenticated_subject: "branch-delete-prepare-enforcement-on-test".to_owned(),
+            tenant_scope_key: vec![7; 16],
+            operation_id: Uuid::now_v7(),
+        },
+        carried: DomainOperationMetadata {
+            operation_id: Uuid::now_v7(),
+            fingerprint_version: i32::from(FINGERPRINT_VERSION_V1),
+            fingerprint: vec![0x42; FINGERPRINT_V1_LEN],
+            prepare_token: [0x53; PREPARE_TOKEN_LEN],
+            mediated_scope: None,
+        },
+    };
+    let result = GovernedBranchDelete::prepare(
+        Some(&domain),
+        Some(admitted),
+        "branch_delete",
+        vec![0u8; 32],
+    )
+    .expect("carriage with enforcement on must be admitted");
+    assert!(result.is_some());
+}
+
+/// `GovernedBranchDelete::commit` refuses on `BranchDeleteProof::Unfrozen`
+/// before it builds a projection, derives an event, or reaches the
+/// coordinator -- `UnreachableDomainStore` backs the domain context, so a
+/// regression that called into the store at all would panic the test rather
+/// than merely fail an assertion. Mirrors
+/// `commit_refuses_on_the_unfrozen_delete_proof_before_touching_the_coordinator`
+/// above, for the branch-delete seam's own (separate) proof type.
+#[tokio::test]
+async fn branch_delete_commit_refuses_on_the_unfrozen_delete_proof_before_touching_the_coordinator()
+{
+    let domain = Arc::new(context(true));
+    let operation = dummy_branch_delete_operation();
+    let governed = GovernedBranchDelete { domain, operation };
+    let publication = BranchDeletePublication {
+        salt: b"wp119-branch-delete-salt",
+        repository_id: &[0x66u8; 16],
+        branch_id: &[0x77u8; 16],
+        name: "unfrozen-proof-branch",
+        expected_generation: None,
+        final_latest_hash: &[0x88u8; 32],
+        delete_proof: BranchDeleteProof::Unfrozen,
+    };
+
+    let result = governed.commit(&publication).await;
+    let Err(error) = result else {
+        panic!("an unfrozen delete_proof must refuse, not commit");
+    };
+    assert_eq!(error.code(), Code::Unimplemented);
+}
+
+/// `BranchDeletePublication::projection()` reproduces exactly the one row the
+/// legacy writer leaves (`lore_revision::branch::delete` calls only
+/// `delete_name_to_id`, unlike a repository delete's 2 + 3N): `KeyType::BranchId`,
+/// partitioned on the repository id, keyed by the same
+/// `hash::hash_function_arg(salt, branch::ID, name.to_lowercase())` the legacy
+/// path derives, and a delete (`value: None`).
+///
+/// Independently reproduces the key through the same primitive the legacy
+/// writer calls, rather than trusting `projection()` to grade itself -- a wrong
+/// function tag, wrong argument, or a missed `.to_lowercase()` would still
+/// produce a `Hash`, just the wrong one.
+#[test]
+fn branch_delete_projection_reproduces_the_one_row_matching_the_legacy_key_derivation() {
+    let salt = b"wp119-branch-delete-projection-salt";
+    let repository_id = [0x11u8; 16];
+    let branch_id = [0x22u8; 16];
+    let name = "Feature/Some-Branch";
+    let publication = BranchDeletePublication {
+        salt,
+        repository_id: &repository_id,
+        branch_id: &branch_id,
+        name,
+        expected_generation: Some(4),
+        final_latest_hash: &[0x99u8; 32],
+        delete_proof: BranchDeleteProof::Unfrozen,
+    };
+
+    let rows = publication.projection();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a branch delete retires exactly one lore_mutable row, not the 2 + 3N a repository \
+         delete does"
+    );
+    assert!(
+        rows[0].value.is_none(),
+        "the one projection row is a delete"
+    );
+    assert_eq!(rows[0].key_type, KeyType::BranchId as i16);
+    assert_eq!(rows[0].partition, repository_id.to_vec());
+    assert_eq!(
+        rows[0].key,
+        hash::hash_function_arg(salt, branch::ID, &name.to_lowercase()).as_ref(),
+        "the key must fold the name to lowercase, matching branch::mutable_name_key"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // WP-119 Phase 8 reviewer gap: `DomainContext::attach_admission` (`wiring.rs`
 // calls this once, from `configure_event_relay`, after every startup
 // precondition passes) must refuse a second handle rather than replacing the
@@ -1112,5 +1300,71 @@ fn attach_admission_succeeds_once_and_refuses_a_second_handle() {
     assert!(
         Arc::ptr_eq(attached, &first),
         "the ORIGINAL handle must remain attached after a refused second attach, not the rejected one"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WP-119: `map_branch_delete_rejection`, the branch-delete seam's own mapper.
+//
+// A pure function, and the one place where a permanent, actionable refusal can
+// silently become an opaque server error. `DEFAULT_BRANCH_V1` is a reason only
+// this family produces, so the shared `crate::grpc::map_domain_rejection_to_status`
+// does not know it and its unrecognised-reason arm answers
+// `Status::internal("Internal error")`. If the local arm is ever dropped, a
+// caller that tried to delete the default branch stops being told a rule it can
+// act on and starts getting a server fault, and no other test in this file or
+// in the real-Postgres tier would notice: the coordinator would still commit the
+// correct decisive `NOT_APPLIED`, and only the gRPC code a client sees changes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_branch_delete_mapper_answers_its_own_reason_and_defers_every_other() {
+    // The one reason this family owns.
+    assert_eq!(
+        map_branch_delete_rejection(DEFAULT_BRANCH_V1).code(),
+        Code::FailedPrecondition,
+        "deleting the default branch is a rule the caller can act on, and it is \
+         what the ungoverned handlers already answer for the same refusal"
+    );
+
+    // Deferral to the shared mapper, proven with reasons whose codes DIFFER
+    // from the arm above. Asserting only on a reason that also maps to
+    // `FailedPrecondition` would pass with the deferral removed entirely.
+    assert_eq!(
+        map_branch_delete_rejection(NOT_FOUND_V1).code(),
+        Code::NotFound,
+        "the shared vocabulary must survive: a local arm that swallowed \
+         everything would answer FailedPrecondition here"
+    );
+    assert_eq!(
+        map_branch_delete_rejection(GENERATION_MISMATCH_V1).code(),
+        Code::Aborted,
+        "a stale generation is retryable and must stay Aborted, unlike the \
+         permanent default-branch refusal"
+    );
+    assert_eq!(
+        map_branch_delete_rejection(TOMBSTONED_V1).code(),
+        Code::NotFound,
+        "a tombstoned target is indistinguishable from an absent one by \
+         contract, and that non-disclosure rule lives in the shared mapper"
+    );
+
+    // An unrecognised reason must NOT be guessed into a plausible code. The
+    // shared mapper refuses to invent one, because a wrong code can instruct a
+    // client to retry a decisive rejection forever.
+    assert_eq!(
+        map_branch_delete_rejection("SOME_REASON_NOBODY_DEFINED_V1").code(),
+        Code::Internal,
+        "vocabulary drift must surface as Internal, never as a guessed code"
+    );
+
+    // The two codes that must never be confused, stated as a relation rather
+    // than as two independent constants: the whole reason the default-branch
+    // check runs BEFORE the generation fence in the coordinator is that one is
+    // permanent and the other tells the caller to try again.
+    assert_ne!(
+        map_branch_delete_rejection(DEFAULT_BRANCH_V1).code(),
+        map_branch_delete_rejection(GENERATION_MISMATCH_V1).code(),
+        "a permanent refusal and a retryable one must not share a code"
     );
 }

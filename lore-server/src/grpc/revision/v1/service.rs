@@ -212,6 +212,7 @@ impl RevisionService for LoreRevisionV1Service {
                 &self.forwarded_requests,
                 &self.hook_dispatcher,
                 &self.instrument_provider,
+                self.domain_context.as_ref(),
             ),
         )
         .await

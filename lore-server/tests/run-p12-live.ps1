@@ -3,11 +3,11 @@
 
 <#
 .SYNOPSIS
-Runs `lore-server/tests/p12_live.rs`'s two real-construction cases on the shared test PostgreSQL,
+Runs `lore-server/tests/p12_live.rs`'s three real-construction cases on the shared test PostgreSQL,
 one fresh database each.
 
 .DESCRIPTION
-The Rust cases stay `#[ignore]`. This runner verifies the fixed two-case inventory against
+The Rust cases stay `#[ignore]`. This runner verifies the fixed three-case inventory against
 `cargo test ... -- --ignored --list` (a renamed, removed, or newly-added case is a setup failure,
 never a silent short count), runs each in its own fresh database, and reports PASS, FAIL, and
 NOT RUN distinctly. Uses the workspace's existing test PostgreSQL container rather than
@@ -15,7 +15,7 @@ provisioning a disposable one, on the pattern of `lore-postgres/tests/run-active
 and `lore-postgres/tests/run-fragment-lifecycle-live.ps1` — other agent lanes run in this checkout
 concurrently and a `postgres:16` container of its own is contention this proof does not need.
 
-Exit code is 1 unless both cases are PASS. Cite PASS against EXPECTED, never the exit code alone.
+Exit code is 1 unless every case is PASS. Cite PASS against EXPECTED, never the exit code alone.
 #>
 
 [CmdletBinding()]
@@ -42,6 +42,7 @@ $setupError = $null
 $runPassed = $false
 
 $expectedTests = @(
+    'branch_delete_governed_and_real_legacy_delete_agree_on_the_lore_mutable_end_state',
     'exact_mediated_obliterate_consumes_while_tuple_tamper_preserves_prepared',
     'governed_create_projection_rows_match_the_legacy_writers_exactly'
 )

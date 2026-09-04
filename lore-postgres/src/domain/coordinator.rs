@@ -352,6 +352,41 @@ pub struct RepositoryDeleteInput {
     pub events: Vec<PendingEvent>,
 }
 
+/// Tombstone one branch, releasing its own live name in the same transaction.
+///
+/// The narrow sibling of [`RepositoryDeleteInput`]. A repository tombstone hides
+/// every branch it owns with one bounded generation event; this one retires
+/// exactly one branch and owes exactly one `branch.deleted` row, keyed on the
+/// committed **branch** generation. Neither is expressible as the other: the
+/// repository transition bumps the repository generation and this one does not
+/// touch it.
+#[derive(Debug, Clone)]
+pub struct BranchDeleteInput {
+    /// Owning repository. Locked first, and its `default_branch_id` is the
+    /// default-branch recheck's only trustworthy source.
+    pub repository_id: Vec<u8>,
+    /// Identity to tombstone.
+    pub branch_id: Vec<u8>,
+    /// Branch generation the caller expects to be tombstoning, when it read
+    /// one. `None` skips the fence, matching
+    /// [`RepositoryDeleteInput::expected_generation`].
+    pub expected_generation: Option<i64>,
+    /// Attempt-compatible immutable delete proof recorded on the tombstone.
+    ///
+    /// `lore_domain_branches_tombstone_evidence` requires exactly 32 bytes on a
+    /// tombstoned row, so this is not optional at the schema level even though
+    /// CR-029 freezes no derivation for it yet.
+    pub delete_proof: Vec<u8>,
+    /// Projection rows to remove in step.
+    pub projection: Vec<ProjectionWrite>,
+    /// Classified events to append last, in the order given.
+    ///
+    /// The same bounded `Vec` as [`RepositoryDeleteInput::events`], checked by
+    /// [`validate_pending_events`] before the transaction opens. A branch delete
+    /// carries one event today.
+    pub events: Vec<PendingEvent>,
+}
+
 /// Compare-and-swap one metadata pointer.
 #[derive(Debug, Clone)]
 pub struct MetadataCasInput {
@@ -464,6 +499,22 @@ pub const FINGERPRINT_MISMATCH_V1: &str = "FINGERPRINT_MISMATCH_V1";
 pub const CAS_MISMATCH_V1: &str = "CAS_MISMATCH_V1";
 /// The prepare token was absent, wrong, or already consumed.
 pub const ADMISSION_REJECTED_V1: &str = "ADMISSION_REJECTED_V1";
+/// The branch is its repository's default branch and cannot be deleted.
+///
+/// Rechecked under the locked repository row rather than trusted from the
+/// handler's preflight, because the default branch can move between the
+/// preflight read and the commit. It is answered by the branch-delete seam's own
+/// mapper rather than by the shared one, on the same terms
+/// `map_repository_create_rejection` is: the shared mapper's vocabulary is what
+/// every family agrees on, and a reason only one family can produce belongs with
+/// that family.
+///
+/// The **protection** half of CR-029's "default/protected rules" recheck has no
+/// counterpart here on purpose: protection lives in the branch metadata blob,
+/// which the domain rows do not carry, so the transaction cannot recheck it. The
+/// handler's preflight remains the only enforcement of that rule, and pretending
+/// otherwise with a reason nothing can raise would be worse than naming the gap.
+pub const DEFAULT_BRANCH_V1: &str = "DEFAULT_BRANCH_V1";
 
 /// The narrow server-facing domain transaction API.
 ///
@@ -557,6 +608,24 @@ pub trait DomainTransactionStore: Send + Sync {
         &self,
         operation: &GovernedOperation,
         input: &RepositoryDeleteInput,
+    ) -> Result<MutationResult, DomainError>;
+
+    /// Tombstone one branch, release only its own live name, and remove its
+    /// projection row, in one transaction.
+    ///
+    /// The counterpart to [`Self::repository_delete`] for a single branch, and
+    /// the only writer that can emit `branch.deleted`. The ungoverned path it
+    /// replaces (WP-119 writer inventory B4 and B5) is one unsynchronised
+    /// `MutableStore::store` with no domain row, no generation, and no event, so
+    /// a crash between it and the notification leaves nothing to re-drive.
+    ///
+    /// Deleting an already-tombstoned branch is `APPLIED` with the existing
+    /// generation and **no** new event, which is CR-032's "exact create/delete
+    /// retry: No new event" enforced here rather than trusted to the caller.
+    async fn branch_delete(
+        &self,
+        operation: &GovernedOperation,
+        input: &BranchDeleteInput,
     ) -> Result<MutationResult, DomainError>;
 
     /// Compare-and-swap a repository or branch metadata pointer.

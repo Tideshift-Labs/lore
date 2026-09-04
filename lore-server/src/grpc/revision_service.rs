@@ -170,6 +170,7 @@ impl RevisionService for LoreRevisionService {
                 self.notification.clone(),
                 &self.hook_dispatcher,
                 &self.instrument_provider,
+                self.domain_context.as_ref(),
             ),
         )
         .await

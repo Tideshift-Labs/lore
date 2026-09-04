@@ -36,6 +36,8 @@ $expectedTests = @(
     'grpc::handlers::branch_metadata_set::test::enforcing_cell_rejects_before_legacy_metadata_cas_body',
     'grpc::revision::v1::branch_metadata_set::test::enforcing_cell_rejects_before_v1_metadata_cas_body',
     'grpc::handlers::obliterate::tests::enforcing_cell_rejects_before_obliterate_body',
+    'grpc::handlers::branch_delete::test::enforcing_cell_rejects_before_legacy_branch_delete_body',
+    'grpc::revision::v1::branch_delete::test::enforcing_cell_rejects_before_v1_branch_delete_body',
     'domain::tests::a_mediated_prepare_key_cannot_be_consumed_by_a_repository_scoped_governed_mutation'
 )
 $p12IntegrationTest = 'exact_mediated_obliterate_consumes_while_tuple_tamper_preserves_prepared'
@@ -101,8 +103,8 @@ function Assert-ExpectedCatalog {
     $libCatalog = @(Get-EnforcementTestCatalog -Target 'lib')
     $p12Catalog = @(Get-EnforcementTestCatalog -Target 'p12_live')
     $missing = @($expectedTests | Where-Object { $_ -notin $libCatalog })
-    if ($expectedTests.Count -ne 7 -or $missing.Count -ne 0 -or $p12IntegrationTest -notin $p12Catalog) {
-        throw "expected seven library tests plus the P12 integration test; missing=[$($missing -join ', ')]; p12Present=$($p12IntegrationTest -in $p12Catalog)"
+    if ($expectedTests.Count -ne 9 -or $missing.Count -ne 0 -or $p12IntegrationTest -notin $p12Catalog) {
+        throw "expected nine library tests plus the P12 integration test; missing=[$($missing -join ', ')]; p12Present=$($p12IntegrationTest -in $p12Catalog)"
     }
 }
 

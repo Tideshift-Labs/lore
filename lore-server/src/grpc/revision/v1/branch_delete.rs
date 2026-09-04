@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -19,9 +20,14 @@ use tracing::info;
 use tracing::warn;
 
 use super::branch_record::build_branch;
+use crate::domain::DomainContext;
+use crate::domain::GovernedScope;
+use crate::domain::admit_at_entry;
+use crate::domain::reject_unwired_governed_operation;
 use crate::grpc::ServerResultExt;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::get_authorization_optional;
 use crate::grpc::hook_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -36,6 +42,11 @@ use crate::util::setup_execution;
 ///
 /// Depending on server configuration, this request may get completely delegated to another server
 /// via `ForwardedRevisionService`
+// The eighth argument is the domain coordinator, threaded from the service the
+// same way every other governed v1 handler takes it. Collapsing the store and
+// hook arguments into a struct to stay under the limit would change a shape
+// shared with every sibling handler in this module.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "BranchDelete::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchDeleteRequest>,
@@ -45,9 +56,61 @@ pub async fn handler(
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<BranchDeleteResponse>, Status> {
     let caller_context = CallerContext::from_original_request(&request)?;
+    // Captured before `into_inner` consumes the request: the domain-operation
+    // headers and the verified principal both live outside the message body.
+    let request_metadata = request.metadata().clone();
+    let request_authorization = get_authorization_optional(request.extensions());
     let req = request.into_inner();
+
+    // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
+    // at handler entry, before any handler logic or side effect — and before the
+    // forward/local split, so both of this handler's branches are covered by one
+    // gate. This site had no gate at all until now (WP-119 writer inventory B5),
+    // so carriage was silently ignored and a caller that asked for governed
+    // semantics got today's unsynchronised single-key write while believing its
+    // operation had been admitted and receipted.
+    //
+    // The scope is the repository, not the branch: `GovernedScope` keys a
+    // receipt namespace on the repository identity for every direct operation
+    // except create, and a branch is not its own tenant.
+    if let Some(admitted) = admit_at_entry(
+        domain_context,
+        &request_metadata,
+        request_authorization.as_ref(),
+        GovernedScope::TargetRepository {
+            repository_id: caller_context.repository_id.data(),
+        },
+    )? {
+        // BLOCKED(WP-116): branch delete_proof derivation unfrozen in CR-029,
+        // and CR-029 freezes no `CanonicalIntent::BranchDelete` family. The v0
+        // site at `crate::grpc::handlers::branch_delete` carries the full
+        // reasoning for both missing artefacts; it is recorded once there rather
+        // than copied here, because two copies of a blocked-reason record is how
+        // the two come to name different blockers.
+        //
+        // In short: `crate::domain::GovernedBranchDelete` and
+        // `PostgresDomainStore::branch_delete` are complete, the seam fails
+        // closed on the unfrozen tombstone proof, and this handler cannot even
+        // reach that fence because `GovernedBranchDelete::prepare` needs a
+        // canonical-intent digest no frozen family can produce for a branch
+        // delete.
+        //
+        // NOT covered by this gate: the forwarded entry point at
+        // `crate::grpc::forwarded_revision::v1::branch_delete`, which reaches
+        // `branch_delete_implementation` directly and holds no domain context.
+        // That is CR-029's CARRIAGE-02-LORE case — a forwarded request has no
+        // verified principal to admit against at all — and it is fenced by the
+        // same missing authenticated-forwarding contract that fences forwarded
+        // repository create, not by this handler.
+        return Err(reject_unwired_governed_operation(
+            &admitted,
+            "lore.revision.v1.RevisionService/BranchDelete",
+        ));
+    }
+
     if let Some(forwarded_requests) = forwarded_requests
         && forwarded_requests.rpc_flags().revision_branch_delete
     {
@@ -219,6 +282,53 @@ mod test {
         }
     }
 
+    /// The entry gate refuses before the legacy body runs, not after it.
+    ///
+    /// The v1 sibling of the v0 case, and it is discriminating for a different
+    /// reason worth stating rather than assuming. Without the gate this handler
+    /// reaches `branch::metadata` on a branch that does not exist and answers
+    /// `NotFound`, so a regression that removed the gate would still return an
+    /// error and still satisfy `expect_err`. The assertion on the exact code is
+    /// therefore load-bearing here in a way it is not on v0: `InvalidArgument`
+    /// can only come from the shared admission gate, and `NotFound` is what the
+    /// legacy body returns.
+    ///
+    /// `MockNotificationSender::new()` carries no expectation and mockall panics
+    /// on an unexpected call, which is the proof that the refusal precedes
+    /// `branch_deleted`.
+    ///
+    /// The gate sits before the forward/local split, so this one case covers
+    /// both of this handler's branches. It does not cover the forwarded entry
+    /// point, which holds no domain context at all; `p12_governed_wiring.rs`
+    /// pins that separately as a deliberate CARRIAGE-02-LORE omission.
+    #[tokio::test]
+    #[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
+    async fn enforcing_cell_rejects_before_v1_branch_delete_body() {
+        let Some(domain) = crate::domain::test_support::configured_enforcing_context().await else {
+            panic!("LORE_TEST_PG_URL must be set; a skipped live case is NOT RUN, never a pass");
+        };
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, _) = test_store_create().await.expect("test stores");
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+        let hook_dispatcher = HookDispatcher::empty();
+
+        let error = handler(
+            make_request(repository, branch_id),
+            immutable_store,
+            mutable_store,
+            notification_sender,
+            &None, /* no forwarded requests */
+            &hook_dispatcher,
+            &instrument_provider,
+            Some(&domain),
+        )
+        .await
+        .expect_err("enforcement must reject missing operation carriage at entry");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
     /// Returns the latest revision the test branch was forked at, so
     /// callers can assert against the resulting `latest` field.
     async fn create_test_branch(
@@ -348,6 +458,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    None,
                 )
                 .await
                 .expect("Request failed");
@@ -405,6 +516,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    None,
                 )
                 .await
                 .expect("first delete should succeed");
@@ -418,6 +530,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    None,
                 )
                 .await
                 .expect("second delete should succeed (idempotent)");
@@ -449,6 +562,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    None,
                 )
                 .await
                 .expect_err("delete on unknown branch should fail");
@@ -486,6 +600,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    None,
                 )
                 .await
                 .expect_err("default branch delete should fail");
@@ -527,6 +642,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    None,
                 )
                 .await
                 .expect_err("current-branch delete should fail");
@@ -566,6 +682,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    None,
                 )
                 .await
                 .expect_err("protected delete should fail");
@@ -716,6 +833,7 @@ mod test {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &instrument_provider,
+                    None,
                 )
                 .await
                 .expect("should succeed");
@@ -755,6 +873,7 @@ mod test {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &instrument_provider,
+                    None,
                 )
                 .await
                 .expect_err("forwarded error should propagate");
@@ -790,6 +909,7 @@ mod test {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &instrument_provider,
+                    None,
                 )
                 .await
                 .expect_err("transport error should become internal status");
@@ -837,6 +957,7 @@ mod test {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &instrument_provider,
+                    None,
                 )
                 .await
                 .expect("local execution should succeed");

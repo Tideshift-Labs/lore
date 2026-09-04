@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -18,7 +19,12 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::domain::DomainContext;
+use crate::domain::GovernedScope;
+use crate::domain::admit_at_entry;
+use crate::domain::reject_unwired_governed_operation;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization_optional;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::hook_error_to_status;
@@ -35,12 +41,75 @@ pub async fn handler(
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<BranchDeleteResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
+    // Captured before `into_inner` consumes the request: the domain-operation
+    // headers and the verified principal both live outside the message body.
+    let request_metadata = request.metadata().clone();
+    let request_authorization = get_authorization_optional(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
     let branch = BranchId::from(req.branch);
+
+    // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
+    // at handler entry, before any handler logic or side effect. This site had
+    // no gate at all until now (WP-119 writer inventory B4), so carriage was
+    // silently ignored and a caller that asked for governed semantics got
+    // today's unsynchronised single-key write while believing its operation had
+    // been admitted and receipted. Refusing is the strictly better answer.
+    if let Some(admitted) = admit_at_entry(
+        domain_context,
+        &request_metadata,
+        request_authorization.as_ref(),
+        GovernedScope::TargetRepository {
+            repository_id: repository_id.data(),
+        },
+    )? {
+        // BLOCKED(WP-116): branch delete_proof derivation unfrozen in CR-029,
+        // and CR-029 freezes no `CanonicalIntent::BranchDelete` family.
+        //
+        // Everything else this site needs is built and shared with the v1 site:
+        // `crate::domain::GovernedBranchDelete` carries the one projection row
+        // (`BranchDeletePublication::projection`, the single live-name key
+        // `branch::delete` retires), the one classified `branch.deleted` event
+        // CR-032 assigns to a branch tombstone, the `BranchDeleteInput`
+        // carriage, the coordinator call, and the outcome mapping.
+        // `PostgresDomainStore::branch_delete` is real and complete.
+        //
+        // Two inputs have no derivation, and the second is why the refusal is
+        // HERE rather than at the seam:
+        //
+        // 1. The 32-byte tombstone proof `lore_domain_branches_tombstone_evidence`
+        //    requires on any tombstoned branch row. CR-029 names it only as an
+        //    "attempt-compatible immutable tombstone proof" and freezes no
+        //    preimage, field list, serialisation, or domain separator. It is
+        //    committed into the principal-scoped receipt and returned by receipt
+        //    lookup, so a minted shape becomes permanent evidence.
+        //    `GovernedBranchDelete::commit` fails closed on it.
+        // 2. There is no `CanonicalIntent::BranchDelete`. CR-029's
+        //    canonical-intent contract freezes six families;
+        //    `crate::domain_intent` defines those six and the platform's
+        //    `repository-operation-intent.ts` defines the same six.
+        //    `GovernedBranchDelete::prepare` needs a digest this handler cannot
+        //    derive, and a Lore-side seventh family would fail every admission
+        //    the platform offered it. So this site cannot even reach the seam's
+        //    own fence, which is why it must refuse at entry.
+        //
+        // Refusing here also keeps a delete that will certainly refuse from
+        // first dispatching the pre-hook and the `branch_deleted` notification.
+        //
+        // Missing artefacts: a frozen branch `delete_proof` derivation and a
+        // frozen seventh canonical-intent family, both in CR-029 and both on the
+        // same terms as its existing canonical-intent digest contract: one
+        // canonical preimage, its exact field order and framing, and
+        // independently computed golden vectors on both sides.
+        return Err(reject_unwired_governed_operation(
+            &admitted,
+            "lore.RevisionService/BranchDelete",
+        ));
+    }
 
     debug!({BRANCH_ID} = %branch, "Handling branch delete");
 
@@ -132,6 +201,61 @@ mod test {
         fn labels(&self) -> &[KeyValue] {
             &[]
         }
+    }
+
+    /// The entry gate refuses before the legacy body runs, not after it.
+    ///
+    /// The discriminating assertions are both negative, and both would pass
+    /// vacuously if written any other way:
+    ///
+    /// * `MockNotificationSender::new()` carries NO expectation, and mockall
+    ///   panics on an unexpected call. That IS the proof that the refusal
+    ///   precedes `branch_deleted`, which is the side effect the gate exists to
+    ///   prevent. Setting an explicit zero-times expectation would say the same
+    ///   thing less loudly.
+    /// * The branch does not exist. Without the gate this handler treats a
+    ///   missing branch as SUCCESS (`is_branch_not_found` returns
+    ///   `Ok(BranchDeleteResponse {})`), so a regression that removed the gate
+    ///   would return `Ok` and fail `expect_err` rather than quietly returning a
+    ///   different error code.
+    ///
+    /// Enforcement with no carriage is `InvalidArgument` from the shared gate,
+    /// not the `Unimplemented` a carriage-bearing request gets: this pins that
+    /// the cell refuses at entry at all, which is the property that was missing
+    /// entirely before WP-119 (writer inventory B4).
+    #[tokio::test]
+    #[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
+    async fn enforcing_cell_rejects_before_legacy_branch_delete_body() {
+        let Some(domain) = crate::domain::test_support::configured_enforcing_context().await else {
+            panic!("LORE_TEST_PG_URL must be set; a skipped live case is NOT RUN, never a pass");
+        };
+        let repository = random::<RepositoryId>();
+        let branch = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, _) = test_store_create().await.expect("test stores");
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+        let hook_dispatcher = HookDispatcher::empty();
+
+        let mut request = Request::new(BranchDeleteRequest {
+            branch: branch.into(),
+        });
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+
+        let error = handler(
+            request,
+            immutable_store,
+            mutable_store,
+            notification_sender,
+            &hook_dispatcher,
+            &instrument_provider,
+            Some(&domain),
+        )
+        .await
+        .expect_err("enforcement must reject missing operation carriage at entry");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
     async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: BranchId) {
@@ -234,6 +358,7 @@ mod test {
                 notification_sender.clone(),
                 &hook_dispatcher,
                 &instrument_provider,
+                None,
             )
             .await
             .expect("Request failed");
@@ -269,6 +394,7 @@ mod test {
                 notification_sender.clone(),
                 &hook_dispatcher,
                 &instrument_provider,
+                None,
             )
             .await
             .expect("Request failed");
@@ -317,6 +443,7 @@ mod test {
                 notification_sender.clone(),
                 &hook_dispatcher,
                 &instrument_provider,
+                None,
             )
             .await
             .unwrap_err();
