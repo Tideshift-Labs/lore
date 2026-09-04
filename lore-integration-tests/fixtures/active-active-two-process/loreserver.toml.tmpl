@@ -114,13 +114,26 @@ private_transport_version = 1
 durable_payload_version_min = 1
 durable_payload_version_max = 1
 
-# NOTE(WP-109 Phase 3): `[plugins.remote.receiver]` is deliberately ABSENT.
-# `RemoteNotificationPluginFactory::create` builds the plugin with no
-# `ReceiverRuntime` (`factory.rs:69`), and the only entry point that starts a
-# durable receiver, `factory::create_with_receiver`, has no non-test caller.
-# Declaring the table here would produce a boot-time warning and a cell that
-# still runs no receiver, which is a worse artefact than its documented
-# absence. See the harness report's BLOCKED entry.
+# The durable receiver, or a comment saying why this boot has none. Rendered
+# per boot by `cell::Cell::receiver_block` rather than written out here,
+# because it is tied to the relay switch below: loreserver refuses to start
+# with a receiver declared and no relay, since the receiver consumes on the
+# relay's own Postgres pool and gateway channel. Cases D and E boot a process
+# with the relay off on purpose.
+#
+# The block carries its OWN client certificate and key, and that is a contract
+# requirement rather than tidiness: the private gateway maps one mTLS identity
+# to one cell and one role, `Consume`/`Ack` require the `receiver` role, and the
+# `relay` leaf above authenticates and is then refused as
+# UNAUTHORIZED_RECEIVER_ROLE_V1. Trust roots are shared, because they
+# authenticate the gateway rather than this cell.
+#
+# The membership identity carries this process's gRPC port. The runner starts
+# ONE gateway for the whole run and the gateway keeps a per-identity monotonic
+# generation guard for its own lifetime, while each case gets a fresh database
+# whose generation counter restarts at one; two cases sharing an identity would
+# leave the second one's receiver permanently refused.
+{{RECEIVER_BLOCK}}
 
 [outbox_relay]
 enabled = {{RELAY_ENABLED}}

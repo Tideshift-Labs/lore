@@ -58,6 +58,21 @@ pub enum StartupRefusal {
     /// The `[plugins.remote]` section is missing or invalid.
     #[error("[outbox_relay] enabled requires a valid [plugins.remote] section: {0}")]
     RemoteConfig(String),
+    /// A durable receiver is declared on a cell that runs no relay.
+    ///
+    /// Refused rather than ignored. The receiver runs on the relay's own
+    /// Postgres pool and its gateway channel, both of which exist only when the
+    /// relay is enabled, so the alternative is a cell that silently starts no
+    /// receiver while its configuration says it has one — and a cell with no
+    /// receiver and a cell whose receiver is caught up report the same empty
+    /// checkpoint vector.
+    #[error(
+        "[plugins.remote.receiver] declares a durable invalidation receiver, but [outbox_relay] \
+         is not enabled on this cell. The receiver consumes on the relay's own Postgres pool and \
+         gateway channel, so it cannot run without one: either enable the relay or remove the \
+         receiver section"
+    )]
+    ReceiverWithoutRelay,
     /// The outbox schema state row (or its table) is absent.
     #[error(
         "the outbox schema state is absent from this cell's database: either the outbox schema \

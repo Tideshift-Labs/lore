@@ -32,15 +32,18 @@
 //! | [`fake_gateway`] | a request-counting, scriptable, in-process gateway for tests |
 //! | [`error`] | the layered error types and the closed failure classification |
 //!
-//! # What the receiver does not connect to yet
+//! # The receiver runs under its own role credential
 //!
-//! The private gateway's frozen schema pins exactly one method, `Publish`.
-//! There is no receiver-side subscribe or acknowledge RPC: WP-110 Phases 6-8
-//! own "public `Subscribe`, bounded replay, durable receiver" and have not
-//! landed. So the receiver runs against [`stream::DurableStreamSource`], which
-//! carries the three operations the contract's lifecycle needs. See that
-//! module's `BLOCKED(WP-111)` note. When the RPC is pinned, one more
-//! implementation of that trait lands and nothing in [`receiver`] changes.
+//! The private gateway maps one mTLS identity to one cell and **one role**, and
+//! `Consume`/`Ack` require the `receiver` role: the `relay` credential this
+//! plugin's sender publishes with authenticates and is then refused as
+//! `UNAUTHORIZED_RECEIVER_ROLE_V1`. A SPIFFE SAN names exactly one role, so no
+//! single certificate can serve both. `[plugins.remote.receiver]` therefore
+//! carries its own `client_cert_path`/`client_key_path`, inherits the plugin's
+//! trust roots, and gets its own channel to the same gateway
+//! ([`config::ReceiverConfig::mtls`]). A receiver declared on an mTLS cell with
+//! no credential of its own is refused at parse time rather than left to loop
+//! forever against a rejection no retry can fix.
 //!
 //! Also not here, by design: `local-shadow-remote`'s **composition**. This
 //! module supplies its shadow branch through

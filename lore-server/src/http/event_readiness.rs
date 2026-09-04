@@ -50,10 +50,22 @@ pub struct EventReadinessResponse {
     pub stale: bool,
     /// Fixed reason string when `relay_ready` is false.
     pub relay_reason: Option<&'static str>,
-    /// TODO(WP-119 Step C): the durable-receiver facet. It needs the receiver
-    /// membership and checkpoint projection, which Step C owns; reporting a
-    /// hard-coded value here would be worse than reporting its absence.
+    /// This process's own durable-receiver facet.
+    ///
+    /// `None` — absent, not false — when this loreserver runs no receiver,
+    /// which is every cell that has not declared `[plugins.remote.receiver]`.
+    /// "No receiver is configured here" and "the receiver is behind" are
+    /// different states and a reader that cannot tell them apart is why this
+    /// endpoint exists.
     pub receiver_ready: Option<bool>,
+    /// Fixed reason string when `receiver_ready` is false. `None` when the
+    /// receiver is ready or absent.
+    pub receiver_reason: Option<&'static str>,
+    /// Distance from the receiver's contiguous frontier to the highest
+    /// sequence it has seen.
+    pub receiver_lag: u64,
+    /// The membership generation the receiver is running, once it has one.
+    pub receiver_generation: Option<i64>,
     /// Whether this cell runs WP-114 CD-6's terminal write-claim prune
     /// scheduler at all. False on every cell whose governed fragment route is
     /// off, which writes no claims to prune.
@@ -93,6 +105,9 @@ impl EventReadinessResponse {
             stale: false,
             relay_reason: Some(crate::event_relay::readiness::REASON_LOOP_NOT_RUNNING),
             receiver_ready: None,
+            receiver_reason: None,
+            receiver_lag: 0,
+            receiver_generation: None,
             prune_configured: false,
             prune_ready: None,
             prune_reason: None,
@@ -122,7 +137,10 @@ pub async fn handler(State(state): State<Arc<ServerHealth>>) -> impl IntoRespons
                 observation_age_seconds: snapshot.observation_age.map(|age| age.as_secs_f64()),
                 stale: snapshot.stale,
                 relay_reason: snapshot.relay_reason,
-                receiver_ready: None,
+                receiver_ready: snapshot.durable_receiver_ready,
+                receiver_reason: snapshot.durable_receiver_reason,
+                receiver_lag: snapshot.durable_receiver_lag,
+                receiver_generation: snapshot.durable_receiver_generation,
                 prune_configured: false,
                 prune_ready: None,
                 prune_reason: None,
@@ -244,10 +262,52 @@ mod tests {
         );
     }
 
-    /// Step C's facet must read as absent, not as a passing value.
+    /// The durable-receiver facet must read as absent, not as a passing value,
+    /// on a cell that runs no receiver — with or without a relay.
     #[tokio::test]
     async fn the_receiver_facet_is_absent_rather_than_defaulted() {
         let json = body(health(None)).await;
         assert!(json["receiver_ready"].is_null());
+
+        let readiness = Arc::new(EventRelayReadiness::new(
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+        ));
+        readiness.set_loop_running(true);
+        readiness.record_backlog(&OutboxBacklog {
+            pending_count: 0,
+            pending_bytes: 0,
+            oldest_pending_age: None,
+            claimed_count: 0,
+            dead_letter_count: 0,
+        });
+        let json = body(health(Some(readiness))).await;
+        assert_eq!(json["relay_ready"], true);
+        assert!(
+            json["receiver_ready"].is_null(),
+            "a healthy relay must not imply a receiver this process does not run"
+        );
+    }
+
+    /// An attached receiver is reported through this surface, with its reason.
+    #[tokio::test]
+    async fn an_attached_receiver_reports_its_facet_and_reason() {
+        let readiness = Arc::new(EventRelayReadiness::new(
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+        ));
+        readiness
+            .attach_durable_receiver(Arc::new(
+                crate::plugins::remote_notification::ReceiverReadiness::new(),
+            ))
+            .expect("the first attach must be accepted");
+        let json = body(health(Some(readiness))).await;
+        assert_eq!(json["receiver_ready"], false);
+        assert_eq!(
+            json["receiver_reason"],
+            crate::plugins::remote_notification::receiver::REASON_NOT_STARTED
+        );
     }
 }

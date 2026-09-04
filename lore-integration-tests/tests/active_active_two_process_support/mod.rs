@@ -102,9 +102,47 @@ pub struct Env {
     pub gateway_uri: String,
     pub cell_id: String,
     pub placement_epoch: i64,
+    /// The cell's authoritative DURABLE stream, as the gateway names it
+    /// (`<KIND>-<cell_id>`).
+    ///
+    /// Stamped into `lore_outbox_membership_state` by [`backend::SharedBackend`]
+    /// before either process boots, because that row is the cell's own
+    /// placement authority and nothing in loreserver writes it: a receiver
+    /// reads it to decide what to assert to the gateway, and the gateway
+    /// refuses a `Consume` whose identity, epoch, or revision disagrees with
+    /// what it is serving.
+    pub stream_identity: String,
+    /// That stream's epoch. The gateway derives it from the JetStream stream's
+    /// creation timestamp in whole seconds, so it is discovered by the runner
+    /// at provisioning time rather than chosen here — a guessed value is
+    /// refused as `RECEIVER_EPOCH_MISMATCH_V1` and the receiver never becomes
+    /// ready.
+    pub stream_epoch: i64,
+    /// The placement revision the gateway is configured to serve. A receiver
+    /// asserting any other value is refused as
+    /// `RECEIVER_PLACEMENT_MISMATCH_V1`.
+    pub placement_revision: i64,
+    /// The `relay`-role client credential, which may publish.
     pub client_cert: PathBuf,
     pub client_key: PathBuf,
+    /// The `receiver`-role client credential, which may consume.
+    ///
+    /// A separate leaf, not a convenience: the private gateway maps one mTLS
+    /// identity to one cell and ONE role, and `Consume` refuses the relay
+    /// credential as `UNAUTHORIZED_RECEIVER_ROLE_V1`. A SPIFFE SAN names one
+    /// role, so no single certificate can carry both.
+    pub receiver_cert: PathBuf,
+    pub receiver_key: PathBuf,
     pub trust_roots: PathBuf,
+    /// This runner invocation's own identifier.
+    ///
+    /// Part of every receiver's membership identity, because the gateway
+    /// derives a durable consumer's NAME from the cell, the receiver identity,
+    /// and the membership generation — and the broker's streams outlive a run.
+    /// A run that reused a previous run's identity at the same generation would
+    /// attach to that run's consumer, inherit sequences it acknowledged and
+    /// this run never saw, and gap its contiguous frontier permanently.
+    pub run_id: String,
     /// Per-case scratch root for config and state directories.
     pub work_dir: PathBuf,
     /// First of the five loopback ports this case owns.
@@ -146,9 +184,19 @@ impl Env {
             placement_epoch: required("LORE_AA2P_PLACEMENT_EPOCH")
                 .parse()
                 .expect("LORE_AA2P_PLACEMENT_EPOCH must be an i64"),
+            stream_identity: required("LORE_AA2P_STREAM_IDENTITY"),
+            stream_epoch: required("LORE_AA2P_STREAM_EPOCH")
+                .parse()
+                .expect("LORE_AA2P_STREAM_EPOCH must be an i64"),
+            placement_revision: required("LORE_AA2P_PLACEMENT_REVISION")
+                .parse()
+                .expect("LORE_AA2P_PLACEMENT_REVISION must be an i64"),
             client_cert: PathBuf::from(required("LORE_AA2P_CLIENT_CERT")),
             client_key: PathBuf::from(required("LORE_AA2P_CLIENT_KEY")),
+            receiver_cert: PathBuf::from(required("LORE_AA2P_RECEIVER_CERT")),
+            receiver_key: PathBuf::from(required("LORE_AA2P_RECEIVER_KEY")),
             trust_roots: PathBuf::from(required("LORE_AA2P_TRUST_ROOTS")),
+            run_id: required("LORE_AA2P_RUN_ID"),
             work_dir: PathBuf::from(required("LORE_AA2P_WORK_DIR")),
             port_base,
         }

@@ -284,8 +284,10 @@ impl ReceiverReadiness {
 pub struct ReceiverRuntime {
     /// WP-119's Step C membership and checkpoint projection.
     pub store: Arc<dyn super::receiver_store::ReceiverStore>,
-    /// The durable stream. See [`super::stream`]'s `BLOCKED(WP-111)` note for
-    /// why this is a trait today.
+    /// The durable stream. A trait so the lifecycle races this receiver's hard
+    /// cases are made of can be scripted in process; `SCHEMA-119` hands in
+    /// [`super::stream::GrpcDurableStream`] over the cell's `receiver`-role
+    /// channel.
     pub stream: Arc<dyn DurableStreamSource>,
     /// The process-local derived state invalidations act on.
     pub target: Arc<dyn InvalidationTarget>,

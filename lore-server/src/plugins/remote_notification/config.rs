@@ -43,12 +43,20 @@
 //! checkpoint_interval_ms  = 1000
 //! checkpoint_every_events = 256
 //! idle_poll_ms            = 250
+//!
+//! # The `receiver`-role credential. NOT the relay's, and not optional on an
+//! # mTLS cell: the gateway maps one identity to one cell and one role, and
+//! # Consume refuses a relay credential. Trust roots are inherited from above.
+//! client_cert_path = "/var/run/secrets/commit0/cell-receiver/tls.crt"
+//! client_key_path  = "/var/run/secrets/commit0/cell-receiver/tls.key"
 //! ```
 //!
 //! The whole `[plugins.remote.receiver]` table is optional, and its absence
 //! means "this cell declares no required durable receiver". Present, it makes
 //! the receiver's failure a readiness failure, so it is the switch that turns a
-//! cell into one whose retention depends on this replica keeping up.
+//! cell into one whose retention depends on this replica keeping up — and it
+//! additionally requires `[outbox_relay] enabled = true`, because the receiver
+//! consumes on the relay's own Postgres pool.
 //!
 //! Certificate material is referenced by path and never inlined, so no config
 //! error message and no log line can carry a key.
@@ -205,6 +213,13 @@ struct RawReceiver {
     lifecycle_generation: u64,
     lag_readiness_threshold: u64,
 
+    /// The `receiver`-role client certificate and key. See
+    /// [`ReceiverConfig::mtls`] for why they are separate from the plugin's.
+    /// The trust roots are not repeated: they authenticate the gateway, which
+    /// is the same gateway either role reaches.
+    client_cert_path: Option<PathBuf>,
+    client_key_path: Option<PathBuf>,
+
     checkpoint_interval_ms: Option<u64>,
     checkpoint_every_events: Option<u64>,
     idle_poll_ms: Option<u64>,
@@ -240,6 +255,20 @@ pub struct ReceiverConfig {
     /// number is the one that fences.
     pub lifecycle_generation: u64,
     pub lag_readiness_threshold: u64,
+    /// The `receiver`-role mTLS material this replica consumes under.
+    ///
+    /// **Not the same credential the sender publishes with, and it cannot be.**
+    /// The private gateway maps one mTLS identity to exactly one cell and one
+    /// role, and `Consume`/`Ack` require the `receiver` role: a `relay`
+    /// credential authenticates and is then refused as
+    /// `UNAUTHORIZED_RECEIVER_ROLE_V1`. A SPIFFE SAN names one role, so no
+    /// single certificate can carry both. The trust roots are shared, because
+    /// they authenticate the gateway rather than this cell.
+    ///
+    /// `None` only in the explicitly-marked insecure test configuration, where
+    /// the plugin presents no client identity at all and the two roles are
+    /// indistinguishable to a fake gateway.
+    pub mtls: Option<MtlsConfig>,
     /// Longest interval between two checkpoint reports while events flow.
     pub checkpoint_interval: Duration,
     /// Most events applied between two checkpoint reports.
@@ -386,7 +415,7 @@ impl RemoteNotificationConfig {
 
         let retry = Self::validate_retry(raw.retry.as_ref())?;
         let contract = Self::validate_contract(raw.contract.as_ref())?;
-        let receiver = Self::validate_receiver(raw.receiver.as_ref())?;
+        let receiver = Self::validate_receiver(raw.receiver.as_ref(), mtls.as_ref())?;
 
         Ok(Self {
             gateway_uri,
@@ -524,6 +553,7 @@ impl RemoteNotificationConfig {
 
     fn validate_receiver(
         raw: Option<&RawReceiver>,
+        plugin_mtls: Option<&MtlsConfig>,
     ) -> Result<Option<ReceiverConfig>, RemoteNotificationError> {
         let Some(raw) = raw else { return Ok(None) };
         if raw.membership_identity.is_empty()
@@ -575,14 +605,95 @@ impl RemoteNotificationConfig {
             ));
         }
 
+        let mtls = Self::validate_receiver_mtls(raw, plugin_mtls)?;
+
         Ok(Some(ReceiverConfig {
             membership_identity: raw.membership_identity.clone(),
             lifecycle_generation: raw.lifecycle_generation,
             lag_readiness_threshold: raw.lag_readiness_threshold,
+            mtls,
             checkpoint_interval,
             checkpoint_every_events,
             idle_poll,
         }))
+    }
+
+    /// Resolve the `receiver`-role credential, refusing every shape that would
+    /// leave a receiver authenticating and then being refused forever.
+    ///
+    /// The three legal shapes, and why the rest are faults:
+    ///
+    /// * plugin mTLS **and** a receiver cert/key pair — the production shape.
+    ///   Two least-privilege credentials, one gateway, one trust anchor.
+    /// * plugin mTLS with **no** receiver pair — refused. The relay credential
+    ///   is all this cell would have to consume with, and `Consume` refuses it
+    ///   as `UNAUTHORIZED_RECEIVER_ROLE_V1` on every attempt. That is not a
+    ///   condition a retry fixes, and it produces no boot failure to point at:
+    ///   the receiver would loop, the facet would stay false, and the reason
+    ///   would read as a transient stream problem.
+    /// * insecure test transport with no receiver pair — allowed. The plugin
+    ///   presents no client identity at all, so there is no role to separate.
+    ///
+    /// # Errors
+    /// [`RemoteNotificationError::ConfigField`] naming the offending field.
+    fn validate_receiver_mtls(
+        raw: &RawReceiver,
+        plugin_mtls: Option<&MtlsConfig>,
+    ) -> Result<Option<MtlsConfig>, RemoteNotificationError> {
+        match (
+            raw.client_cert_path.clone(),
+            raw.client_key_path.clone(),
+            plugin_mtls,
+        ) {
+            (Some(client_cert_path), Some(client_key_path), Some(plugin)) => {
+                // Pointing the receiver at the relay's own leaf is the exact
+                // failure this separation exists to prevent, and it parses
+                // clean unless it is refused here: the gateway would
+                // authenticate the credential and then refuse every Consume as
+                // UNAUTHORIZED_RECEIVER_ROLE_V1, with no boot failure to point
+                // at. Compared as configured paths, which catches the mistake
+                // an operator actually makes — copying the line above.
+                if client_cert_path == plugin.client_cert_path
+                    || client_key_path == plugin.client_key_path
+                {
+                    return Err(RemoteNotificationError::field(
+                        "receiver.client_cert_path",
+                        "the receiver credential must not be the plugin's own: one certificate \
+                         carries one SPIFFE role, and the publishing credential is refused on \
+                         Consume as UNAUTHORIZED_RECEIVER_ROLE_V1",
+                    ));
+                }
+                Ok(Some(MtlsConfig {
+                    client_cert_path,
+                    client_key_path,
+                    trust_roots_path: plugin.trust_roots_path.clone(),
+                }))
+            }
+            (Some(_), Some(_), None) => Err(RemoteNotificationError::field(
+                "receiver.client_cert_path",
+                "a receiver credential was configured on a plugin with no mTLS material; the \
+                 receiver channel has no trust roots to verify the gateway with",
+            )),
+            (None, None, None) => Ok(None),
+            (None, None, Some(_)) => Err(RemoteNotificationError::field(
+                "receiver.client_cert_path",
+                "a durable receiver needs its own `receiver`-role certificate and key: the \
+                 private gateway maps one mTLS identity to one cell and one role, and Consume \
+                 refuses a relay credential as UNAUTHORIZED_RECEIVER_ROLE_V1 on every attempt",
+            )),
+            (cert, _, _) => {
+                let missing = if cert.is_none() {
+                    "receiver.client_cert_path"
+                } else {
+                    "receiver.client_key_path"
+                };
+                Err(RemoteNotificationError::field(
+                    missing,
+                    "the receiver credential is partially configured; set both \
+                     receiver.client_cert_path and receiver.client_key_path, or neither",
+                ))
+            }
+        }
     }
 
     /// Bound one optional millisecond setting, or take its default.
@@ -830,6 +941,133 @@ mod tests {
             "{MINIMAL}\n[receiver]\nmembership_identity = \"r\"\nlifecycle_generation = 0\nlag_readiness_threshold = 10\n"
         ));
         assert!(RemoteNotificationConfig::parse(&cfg).is_err());
+    }
+
+    // -- the receiver's own role credential --------------------------------
+
+    /// The production shape: two least-privilege leaves, one shared trust
+    /// anchor. The trust roots are inherited rather than repeated, because they
+    /// authenticate the gateway rather than this cell.
+    #[test]
+    fn a_receiver_credential_is_accepted_and_inherits_the_plugins_trust_roots() {
+        let cfg = RemoteNotificationConfig::parse(&table(&format!(
+            "{MINIMAL}\n[receiver]\nmembership_identity = \"r\"\nlifecycle_generation = 1\n\
+             lag_readiness_threshold = 10\nclient_cert_path = \"/secrets/recv.crt\"\n\
+             client_key_path = \"/secrets/recv.key\"\n"
+        )))
+        .expect("a receiver with its own credential is valid");
+        let receiver = cfg.receiver.expect("the receiver section parsed");
+        let mtls = receiver
+            .mtls
+            .expect("the receiver carries its own material");
+        assert_eq!(mtls.client_cert_path, PathBuf::from("/secrets/recv.crt"));
+        assert_eq!(mtls.client_key_path, PathBuf::from("/secrets/recv.key"));
+        assert_eq!(mtls.trust_roots_path, PathBuf::from("/secrets/ca.crt"));
+        assert_ne!(
+            mtls.client_cert_path,
+            cfg.mtls
+                .expect("the plugin carries material")
+                .client_cert_path,
+            "the two roles must not share one leaf; a SPIFFE SAN names exactly one role"
+        );
+    }
+
+    /// A receiver on an mTLS cell with no credential of its own is REFUSED at
+    /// parse time.
+    ///
+    /// It cannot be allowed to fall back on the plugin's: `Consume` requires
+    /// the `receiver` role and refuses a `relay` credential as
+    /// `UNAUTHORIZED_RECEIVER_ROLE_V1` on every attempt. That produces no boot
+    /// failure and no self-healing state — just a receiver that loops and a
+    /// facet that never goes true, reported as a stream problem.
+    #[test]
+    fn a_receiver_without_its_own_credential_is_rejected_on_an_mtls_cell() {
+        let err = RemoteNotificationConfig::parse(&table(&format!(
+            "{MINIMAL}\n[receiver]\nmembership_identity = \"r\"\nlifecycle_generation = 1\n\
+             lag_readiness_threshold = 10\n"
+        )))
+        .expect_err("a receiver with no role credential must be refused");
+        assert!(
+            matches!(
+                err,
+                RemoteNotificationError::ConfigField {
+                    field: "receiver.client_cert_path",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// Reusing the relay's own leaf for the receiver is refused. It is the one
+    /// misconfiguration that looks right, parses, boots, and then refuses every
+    /// `Consume` forever with nothing in the boot log.
+    #[test]
+    fn the_receiver_may_not_reuse_the_plugins_own_credential() {
+        let err = RemoteNotificationConfig::parse(&table(&format!(
+            "{MINIMAL}\n[receiver]\nmembership_identity = \"r\"\nlifecycle_generation = 1\n\
+             lag_readiness_threshold = 10\nclient_cert_path = \"/secrets/tls.crt\"\n\
+             client_key_path = \"/secrets/tls.key\"\n"
+        )))
+        .expect_err("the relay's own leaf must be refused for the receiver");
+        assert!(
+            matches!(
+                err,
+                RemoteNotificationError::ConfigField {
+                    field: "receiver.client_cert_path",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// A half-configured receiver credential is a fault, not a fallback.
+    #[test]
+    fn a_partial_receiver_credential_names_the_missing_field() {
+        let err = RemoteNotificationConfig::parse(&table(&format!(
+            "{MINIMAL}\n[receiver]\nmembership_identity = \"r\"\nlifecycle_generation = 1\n\
+             lag_readiness_threshold = 10\nclient_cert_path = \"/secrets/recv.crt\"\n"
+        )))
+        .expect_err("a half-configured receiver credential must be refused");
+        assert!(
+            matches!(
+                err,
+                RemoteNotificationError::ConfigField {
+                    field: "receiver.client_key_path",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// The insecure test transport presents no client identity at all, so there
+    /// is no role to separate and no credential to demand.
+    #[test]
+    fn an_insecure_test_cell_may_declare_a_receiver_with_no_credential() {
+        let cfg = RemoteNotificationConfig::parse(&table(
+            r#"
+            gateway_uri = "http://127.0.0.1:1"
+            cell_id = "sfo3-cell-a"
+            placement_epoch = 12
+            producer_instance_id = "loreserver-sfo3-cell-a-2"
+            allow_insecure_transport_for_test = true
+
+            [receiver]
+            membership_identity = "r"
+            lifecycle_generation = 1
+            lag_readiness_threshold = 10
+            "#,
+        ))
+        .expect("an insecure test cell may declare a receiver");
+        assert!(cfg.mtls.is_none());
+        assert!(
+            cfg.receiver
+                .expect("the receiver section parsed")
+                .mtls
+                .is_none()
+        );
     }
 
     #[test]

@@ -238,18 +238,20 @@ fn build_plugin_with_readiness(
              invalidations; no receiver started"
         ),
         None if config.receiver.is_some() && mode.runs_durable_receiver() => {
-            // BLOCKED(WP-111): the private gateway's frozen schema pins only
-            // `/lorehub.notification.internal.v1.PrivateNotificationService/Publish`.
-            // It carries no receiver-side subscribe, consume, or acknowledge
-            // RPC, and WP-110 Phases 6-8 own that surface. Until one exists,
-            // the plain factory path has no durable stream to hand the
-            // receiver, so a cell that declares a required receiver gets this
-            // warning rather than a silently absent task. `SCHEMA-119` calls
-            // `create_with_receiver` with a real stream once WP-110 lands one.
+            // Unreachable through `SCHEMA-119`'s server construction, and kept
+            // as a loud diagnostic rather than deleted.
+            //
+            // `event_relay::wiring::prepare_event_relay` builds the
+            // `ReceiverRuntime` for any cell that declares this table, and
+            // refuses startup outright when the relay it needs is disabled, so
+            // the only way to reach this arm is a caller that took the plain
+            // registry path with a receiver configured. That caller would
+            // otherwise get a cell with no receiver, no checkpoint, and nothing
+            // in the log to distinguish it from one that is caught up.
             tracing::warn!(
-                "`[plugins.remote.receiver]` is configured but no durable stream source is \
-                 available in this build; the durable invalidation receiver did not start and \
-                 the cell must not be treated as required-event ready"
+                "`[plugins.remote.receiver]` is configured but this plugin was built without a \
+                 durable stream source; the durable invalidation receiver did not start and the \
+                 cell must not be treated as required-event ready"
             );
         }
         None => {}

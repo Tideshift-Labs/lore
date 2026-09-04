@@ -30,7 +30,7 @@
 //! [`admission::OutboxAdmission`] answers from local Postgres facts only, and
 //! [`admission::rejection_status`] maps a closed verdict to
 //! `RESOURCE_EXHAUSTED` with bounded `RetryInfo`. WP-119 Phase 8 wired it:
-//! [`wiring::configure_event_relay`] attaches the handle to the
+//! [`wiring::spawn_event_relay`] attaches the handle to the
 //! `DomainContext`, and `DomainContext::admit` — the single server-side choke
 //! point every governed repository, branch, lock, and obliterate handler
 //! reaches through `admit_at_entry` — refuses a closed verdict just before it

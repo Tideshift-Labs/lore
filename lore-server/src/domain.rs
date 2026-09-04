@@ -148,7 +148,7 @@ pub struct DomainContext {
     ///
     /// A `OnceLock` rather than a constructor argument because of an ordering
     /// fact, not a preference: the relay is checked against the database
-    /// identity this context's construction attests, so `configure_event_relay`
+    /// identity this context's construction attests, so `prepare_event_relay`
     /// necessarily runs after this type exists. The relay's own wiring sets it,
     /// once, and only when `[outbox_relay] enabled = true` — an absent handle
     /// is a cell with no relay, and it admits exactly as it did before WP-119.
@@ -229,7 +229,7 @@ impl DomainContext {
 
     /// Attach CR-032's required-event admission gate.
     ///
-    /// Called once, from `event_relay::wiring::configure_event_relay`, after
+    /// Called once, from `event_relay::wiring::spawn_event_relay`, after
     /// every relay startup precondition has passed. `Err` carries the handle
     /// back when one is already attached; the caller treats that as a wiring
     /// fault rather than replacing a live gate, because two gates over one

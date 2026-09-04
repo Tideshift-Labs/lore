@@ -1677,6 +1677,16 @@ async fn configure_composite_substore(
     }
 }
 
+/// Build the notification sender, and the local public service when there is
+/// one.
+///
+/// `durable_receiver` is `SCHEMA-119`'s live-receiver path: when the relay's
+/// preparation built a [`ReceiverRuntime`], the `remote` plugin is constructed
+/// through `factory::create_with_receiver` instead of through the registry, and
+/// the receiver's readiness facet comes back as the third return value for the
+/// relay readiness surface to report. Every other cell is unchanged — `local`
+/// mode and `remote` without a receiver take exactly the paths they did before.
+#[allow(clippy::type_complexity)]
 async fn configure_notification(
     endpoints: &mut JoinSet<Result<()>>,
     registry: &PluginRegistry,
@@ -1684,15 +1694,30 @@ async fn configure_notification(
     notification_settings: &Option<NotificationSettings>,
     immutable_store: Option<&Arc<dyn ImmutableStore>>,
     plugins: &HashMap<String, toml::Value>,
-) -> Result<(Arc<dyn NotificationSender>, Option<NotificationService>)> {
+    durable_receiver: Option<crate::event_relay::wiring::DurableReceiverWiring>,
+) -> Result<(
+    Arc<dyn NotificationSender>,
+    Option<NotificationService>,
+    Option<Arc<crate::plugins::remote_notification::ReceiverReadiness>>,
+)> {
     let mode = notification_settings
         .as_ref()
         .map_or("local", |ns| ns.mode.as_ref());
     match mode {
         "local" => {
+            // Unreachable with a receiver: the relay refuses to prepare one
+            // under any mode but `remote`. Checked rather than assumed, because
+            // silently dropping the runtime here would produce a cell that
+            // reports its receiver absent while its configuration declares one.
+            if durable_receiver.is_some() {
+                return Err(anyhow::anyhow!(
+                    "a durable receiver runtime was built for [notification] mode = \"local\", \
+                     which mounts the local public service and runs no durable receiver"
+                ));
+            }
             info!("Starting local notification service");
             let sender = Arc::new(crate::notification::local::NotificationSender::default());
-            Ok((sender.clone(), Some(NotificationService::new(sender))))
+            Ok((sender.clone(), Some(NotificationService::new(sender)), None))
         }
         plugin_name => {
             info!(plugin_name = plugin_name, "Creating notification plugin");
@@ -1703,19 +1728,56 @@ async fn configure_notification(
                 .cloned()
                 .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
 
-            let context = NotificationPluginContext {
-                environment: environment.clone(),
-                immutable_store: immutable_store.cloned(),
+            let mut receiver_readiness = None;
+            let output = match durable_receiver {
+                Some(wiring) if plugin_name == crate::plugins::remote_notification::PLUGIN_NAME => {
+                    // Deliberately not through the registry. The factory trait
+                    // returns a plugin and nothing else, and the receiver's
+                    // readiness facet has to reach the relay's readiness
+                    // surface; a registry lookup could not carry it back. The
+                    // same `[plugins.remote]` table is parsed and bounded by
+                    // the same code either way, so nothing is skipped.
+                    let (plugin, _sender, readiness) =
+                        crate::plugins::remote_notification::factory::create_with_receiver(
+                            &plugin_config,
+                            wiring.transport,
+                            wiring.runtime,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to create notification plugin '{plugin_name}' with a \
+                                 durable receiver: {e}"
+                            )
+                        })?;
+                    receiver_readiness = Some(readiness);
+                    plugin
+                }
+                Some(_) => {
+                    return Err(anyhow::anyhow!(
+                        "a durable receiver runtime was built for [notification] mode = \
+                         \"{plugin_name}\", but only the `remote` plugin runs one"
+                    ));
+                }
+                None => {
+                    let context = NotificationPluginContext {
+                        environment: environment.clone(),
+                        immutable_store: immutable_store.cloned(),
+                    };
+                    registry
+                        .create_notification(plugin_name, &plugin_config, &context)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to create notification plugin '{plugin_name}': {e}"
+                            )
+                        })?
+                }
             };
 
-            let output = registry
-                .create_notification(plugin_name, &plugin_config, &context)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to create notification plugin '{plugin_name}': {e}")
-                })?;
-
-            // Spawn background tasks for the receiver tasks from the plugin
+            // Spawn background tasks for the receiver tasks from the plugin.
+            // With a durable receiver attached this is two tasks rather than
+            // one: the live-hint worker and the receiver, both owned by the
+            // server's `JoinSet` and both stopped by the same shutdown.
             for task in output.receivers {
                 lore_spawn!(endpoints, async move {
                     task.await.map_err(|e| {
@@ -1724,7 +1786,7 @@ async fn configure_notification(
                 });
             }
 
-            Ok((output.sender, None))
+            Ok((output.sender, None, receiver_readiness))
         }
     }
 }
@@ -2225,31 +2287,52 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         None;
 
     if !is_maintenance {
-        let (notification, notification_service) = configure_notification(
+        // CR-032 / WP-119 Step B, in two halves.
+        //
+        // The preparation runs FIRST and spawns nothing. It owns the whole
+        // fail-closed startup sequence — notification mode, `[plugins.remote]`,
+        // Postgres mode, co-location, schema state, cutover — and it builds the
+        // relay's pool and gateway transport. A misconfigured notification mode
+        // is still reported by its own mode check rather than by a confusing
+        // gateway-connect failure, because that check runs before any I/O.
+        //
+        // It runs before `configure_notification` for one reason: a cell that
+        // declares `[plugins.remote.receiver]` needs that pool and that channel
+        // handed to the notification plugin at construction, since the durable
+        // receiver is one of the plugin's own `receivers`. Returns `None` on
+        // every cell that has not set `[outbox_relay] enabled = true`.
+        let event_relay_prepared = crate::event_relay::wiring::prepare_event_relay(
+            &settings,
+            configured_domain_identity.as_ref(),
+            domain_context.as_ref(),
+        )
+        .await?;
+
+        let (notification, notification_service, receiver_readiness) = configure_notification(
             &mut endpoints,
             &plugin_registry,
             &settings.environment,
             &settings.notification,
             local_store().as_ref(),
             &settings.plugins,
+            event_relay_prepared
+                .as_ref()
+                .and_then(|prepared| prepared.durable_receiver()),
         )
         .await?;
 
-        // CR-032 / WP-119 Step B. Built after the notification plugin so a
-        // misconfigured notification mode is reported by the mode check rather
-        // than by a confusing gateway-connect failure, and before the gRPC
-        // surface so a cell that cannot relay never accepts a mutation that
-        // would append a row nothing will publish. Returns `None` on every cell
-        // that has not set `[outbox_relay] enabled = true`, which is all of
-        // them today.
-        event_relay_handles = crate::event_relay::wiring::configure_event_relay(
-            &settings,
-            configured_domain_identity.as_ref(),
-            domain_context.as_ref(),
-            &mut endpoints,
-            _shutdown_rx.clone(),
-        )
-        .await?;
+        // The second half: attach the admission gate and the receiver's
+        // readiness facet, then start the tasks. Still before the gRPC surface,
+        // so a cell that cannot relay never accepts a mutation that would
+        // append a row nothing will publish.
+        if let Some(prepared) = event_relay_prepared {
+            event_relay_handles = Some(crate::event_relay::wiring::spawn_event_relay(
+                prepared,
+                receiver_readiness,
+                &mut endpoints,
+                _shutdown_rx.clone(),
+            )?);
+        }
 
         // WP-114 CD-6, beside the relay worker and on the same drain signal.
         // Inert unless the governed fragment route is enabled: that route is

@@ -30,6 +30,14 @@ churning them costs more than keeping them), and MinIO's `local` `mc` alias,
 which it sets to the same endpoint and credentials the compose `minio-init`
 one-shot already uses.
 
+It also leaves behind one durable CONSUMER per receiver generation, because
+every receiver identity is namespaced to the run (see `LORE_AA2P_RUN_ID` below)
+and consumer names are derived from it. That is deliberate: reusing an identity
+across runs attaches to the previous run's consumer and gaps the new receiver's
+frontier permanently. The cost is a slowly growing consumer list on the local
+broker, which is a developer's own `nats consumer rm` to prune; this runner does
+not delete broker resources it cannot prove it created.
+
 .PARAMETER KeepOnFailure
 Leave the case database, the bucket, and the process logs behind when a case
 fails, for debugging.
@@ -263,21 +271,62 @@ try {
     # default and the streams this run publishes to would never be created.
     Push-Location $gatewayRoot
     try {
-        Invoke-Checked bun @('scripts/provision-streams.ts', '--cell', $CellId, '--url', $NatsUrl) | Out-Null
+        $provisionOutput = Invoke-Checked bun @('scripts/provision-streams.ts', '--cell', $CellId, '--url', $NatsUrl)
     }
     finally { Pop-Location }
+
+    # The cell's authoritative DURABLE stream, and its epoch.
+    #
+    # The gateway derives a stream's epoch from the JetStream stream's CREATION
+    # TIMESTAMP in whole UNIX seconds (`broker/jetstream.ts`'s
+    # `streamEpochFromCreated`) and refuses any Consume whose epoch disagrees
+    # with what the broker reports. So the epoch is a discovered value, not a
+    # chosen one: the harness stamps it into the cell's membership state, and a
+    # constant anywhere in this stack would be wrong on every machine and
+    # silently so, leaving every receiver looping on RECEIVER_EPOCH_MISMATCH_V1
+    # with no boot failure to point at.
+    #
+    # `ensureCellStreams` UPDATES an existing stream rather than recreating it,
+    # and this runner deliberately leaves the cell's streams behind, so the
+    # value is stable across runs on one machine.
+    $streamIdentity = "DURABLE-$CellId"
+    $createdMatch = [regex]::Match(
+        $provisionOutput,
+        ('(?m)^\s*' + [regex]::Escape($streamIdentity) + '\s.*\bcreated=(?<created>\S+)\s*$')
+    )
+    if (-not $createdMatch.Success) {
+        throw "could not read $streamIdentity's creation timestamp from the provisioner output; " +
+        "the durable receiver's stream epoch cannot be derived.`n$provisionOutput"
+    }
+    # The fraction is dropped before parsing rather than after: NATS reports
+    # nanosecond precision and .NET parses at most seven fractional digits.
+    # Flooring to whole seconds is the derivation itself, so nothing is lost.
+    $createdText = [regex]::Replace($createdMatch.Groups['created'].Value, '\.\d+', '')
+    $streamEpoch = [DateTimeOffset]::Parse(
+        $createdText,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind
+    ).ToUnixTimeSeconds()
+    if ($streamEpoch -le 0) {
+        throw "derived a non-positive stream epoch ($streamEpoch) from '$createdText'"
+    }
+    Write-Host "   $streamIdentity epoch $streamEpoch (created $createdText)"
 
     $gatewayPrivatePort = $PortBase - 20
     $gatewayAdminPort = $PortBase - 19
     # `-AsArray` is load-bearing: `ConvertTo-Json` collapses a one-element array
     # to a bare object, and the gateway refuses a placement that is not a JSON
     # array with "must be a JSON array of placement records".
+    # The revision the gateway serves. A receiver asserting any other value is
+    # refused as RECEIVER_PLACEMENT_MISMATCH_V1, so the same variable reaches
+    # the cases and is stamped into the cell's membership state.
+    $placementRevision = 1
     $placement = @{
         region_id          = 'sfo3'
         cell_id            = $CellId
         shard_id           = 'shard-local'
         placement_epoch    = 12
-        placement_revision = 1
+        placement_revision = $placementRevision
         state              = 'active'
         contract_version   = 1
         credential_version = 1
@@ -355,9 +404,23 @@ try {
             LORE_AA2P_GATEWAY_URI        = "https://localhost:$gatewayPrivatePort"
             LORE_AA2P_CELL_ID            = $CellId
             LORE_AA2P_PLACEMENT_EPOCH    = '12'
+            LORE_AA2P_STREAM_IDENTITY    = $streamIdentity
+            LORE_AA2P_STREAM_EPOCH       = "$streamEpoch"
+            LORE_AA2P_PLACEMENT_REVISION = "$placementRevision"
             LORE_AA2P_CLIENT_CERT        = (Join-Path $certDir 'relay.crt')
             LORE_AA2P_CLIENT_KEY         = (Join-Path $certDir 'relay.key')
+            # The receiver's own least-privilege leaf. `Consume` and `Ack`
+            # require the `receiver` role, and the relay leaf above
+            # authenticates and is then UNAUTHORIZED_RECEIVER_ROLE_V1.
+            LORE_AA2P_RECEIVER_CERT      = (Join-Path $certDir 'receiver.crt')
+            LORE_AA2P_RECEIVER_KEY       = (Join-Path $certDir 'receiver.key')
             LORE_AA2P_TRUST_ROOTS        = (Join-Path $certDir 'ca.crt')
+            # Namespaces every receiver's membership identity to THIS run. The
+            # broker's streams and durable consumers outlive a run while the
+            # case database does not, and a receiver that reuses a previous
+            # run's identity at generation 1 attaches to that run's consumer
+            # and inherits a permanent frontier gap. See `cell.rs`.
+            LORE_AA2P_RUN_ID             = $runId
             LORE_AA2P_WORK_DIR           = $caseWork
             LORE_AA2P_PORT_BASE          = "$casePortBase"
             # The TEST process opens its own immutable store against the same
@@ -457,10 +520,11 @@ $notRunCount = @($results | Where-Object { $_.Status -eq 'NOT RUN' }).Count
 Write-Host "Summary: PASS=$passCount FAIL=$failCount NOT RUN=$notRunCount EXPECTED=$($results.Count)"
 Write-Host ''
 Write-Host 'BLOCKED, not covered by any case above:'
-Write-Host '  - durable-receiver observation. No non-test caller constructs a ReceiverRuntime, so'
-Write-Host '    no receiver consumes, no checkpoint frontier moves, and /event_readiness reports'
-Write-Host '    receiver_ready as absent. Missing artefact: a production caller of'
-Write-Host '    lore-server/src/plugins/remote_notification/factory.rs::create_with_receiver.'
+Write-Host '  - receiver resume from a captured position. A receiver that captured and then failed'
+Write-Host '    allocates a NEW generation instead of resuming, because DurableStreamSource has no'
+Write-Host '    resume-at-position operation that also restores the persisted frontier.'
+Write-Host '    Missing artefact: ReceiverStore::read_checkpoint plus the TODO(WP-111) in'
+Write-Host '    lore-server/src/plugins/remote_notification/receiver.rs.'
 Write-Host '  - fenced public lock mutations. Arming fenced routing makes Lock/Unlock/AdminLock'
 Write-Host '    refuse until WP-120 lands. Missing artefact: schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE.'
 

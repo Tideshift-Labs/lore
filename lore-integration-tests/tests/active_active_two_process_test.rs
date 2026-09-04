@@ -47,6 +47,15 @@ mod active_active_two_process_tests {
     /// of a process also pays for the lazy gateway channel's first connect.
     const RELAY_DEADLINE: Duration = Duration::from_secs(60);
 
+    /// Ceiling on any "the durable receiver should have got there by now" wait.
+    ///
+    /// A receiver's bootstrap is a round trip more than a publish: it joins,
+    /// opens a `Consume` stream, drains to the captured position, writes a
+    /// checkpoint, and only then passes its readiness compare-and-set. The
+    /// first of those also pays for the lazy gateway channel's first connect,
+    /// which is why this is not tighter than the relay's own bound.
+    const RECEIVER_DEADLINE: Duration = Duration::from_secs(60);
+
     /// Everything a case shares before it decides how many processes to start.
     struct Fixture {
         env: Env,
@@ -178,6 +187,24 @@ mod active_active_two_process_tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// True once the broker has accepted this row.
+    ///
+    /// **Not** `state == "broker_accepted"`, and the difference is load-bearing
+    /// now that a durable receiver runs. `broker_accepted` used to be terminal
+    /// only because nothing in the tree ever advanced it; the consumer-safety
+    /// evaluator moves an accepted row to `consumer_safe` as soon as the
+    /// required membership's checkpoints cover its sequence, which on this
+    /// two-process cell happens within a probe interval or two of the publish.
+    /// A poll comparing against the single string therefore loses the race
+    /// roughly whenever the receiver is healthy, and reports it as a
+    /// sixty-second timeout on the relay.
+    ///
+    /// Both states mean the broker accepted the row and only `pending` means it
+    /// did not, so this is the whole accepted set rather than a tolerance.
+    fn broker_accepted(row: &OutboxRow) -> bool {
+        row.state == "broker_accepted" || row.state == "consumer_safe"
     }
 
     /// The outbox rows a governed push produced, for a message.
@@ -569,6 +596,16 @@ mod active_active_two_process_tests {
     /// from boot would fire on those instead of on the push — a case that says
     /// "killed between a push's COMMIT and its claim" while actually killing on
     /// a repository create is worse than no case at all.
+    ///
+    /// The case then carries the CONSUMER half, because this is the only case
+    /// that already has both processes relaying after a recovery: it waits for
+    /// process B's durable receiver to report ready, takes its checkpoint
+    /// frontier as a baseline, publishes one more governed push, and requires
+    /// that frontier to advance within the same membership generation. The
+    /// recovered row above is deliberately not the subject — it may be
+    /// published before either receiver has captured a position, so an
+    /// assertion on it would be a race between two background loops rather than
+    /// a proof.
     #[tokio::test]
     #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
     async fn case_d_a_kill_before_the_relay_claim_relays_the_row_exactly_once_after_restart() {
@@ -678,7 +715,7 @@ mod active_active_two_process_tests {
                 .outbox_rows_of_kind(BRANCH_PUSHED)
                 .await
                 .first()
-                .is_some_and(|row| row.state == "broker_accepted")
+                .is_some_and(broker_accepted)
         );
 
         let rows = fixture.backend.outbox_rows_of_kind(BRANCH_PUSHED).await;
@@ -696,6 +733,11 @@ mod active_active_two_process_tests {
             rows[0].stream_identity.is_some(),
             "an accepted row records the stream it was accepted on"
         );
+        // Kept so the receiver half below can tell the recovered row apart from
+        // the push it makes for itself. Without it, "the frontier advanced"
+        // could be satisfied by this row, which may be published before either
+        // receiver captured a position.
+        let recovered_event_id = rows[0].event_id;
         assert_eq!(
             fixture.backend.dead_letter_count().await,
             0,
@@ -710,15 +752,148 @@ mod active_active_two_process_tests {
             "the branch the killed process advanced must still hold that revision"
         );
 
-        // The durable receiver's frontier cannot move: no non-test caller
-        // starts a receiver, so nothing reports a checkpoint. Pinned rather
-        // than skipped so the day one runs, this case has to be revisited.
+        // -- the durable receiver half -----------------------------------
+        //
+        // Both processes now run one, because both are relaying and the
+        // template renders `[plugins.remote.receiver]` with the relay switch.
+        //
+        // Waiting for B's receiver to report READY is what makes the frontier
+        // assertion below discriminating rather than lucky. Ready means it has
+        // joined a generation, captured a stream position, taken its
+        // authoritative baseline, drained to that position, and written a
+        // checkpoint at the cell's current placement. Anything published AFTER
+        // that is something it provably had to consume.
+        //
+        // The recovered row above is deliberately NOT that event: A restarts
+        // relaying first and may well publish it before either receiver
+        // captures, so an assertion built on it would pass or hang depending on
+        // a race between two background loops.
+        wait_until!(
+            format!(
+                "process B's durable receiver to report itself ready; last seen {:?}",
+                b.event_readiness().await
+            ),
+            RECEIVER_DEADLINE,
+            b.event_readiness().await.receiver_ready == Some(true)
+        );
+        let identity = b.receiver_identity();
+        let (generation, baseline) = fixture
+            .backend
+            .checkpoint_frontier_of(&identity)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "receiver {identity} reported itself ready, so it must have written a \
+                     checkpoint at the current placement: the readiness compare-and-set refuses \
+                     without one"
+                )
+            });
+
+        // A SECOND governed push, so the event whose consumption is asserted
+        // provably did not exist when B's receiver captured its position.
+        let second = fixture
+            .backend
+            .serialize_revision(repository_id(repository), revision, 2, None)
+            .await;
+        let prepared = carriage::prepare_push(
+            &fixture.backend,
+            fixture.minter.issuer(),
+            "case-d-writer",
+            &repository,
+            &branch,
+            second.as_ref(),
+            false,
+            false,
+            0x32,
+        )
+        .await;
+        let request = carriage::push_request(
+            &token,
+            &repository,
+            &branch,
+            second.as_ref(),
+            false,
+            false,
+            Some(&prepared),
+        );
+        carriage::branch_push(a.grpc_endpoint(), request)
+            .await
+            .unwrap_or_else(|status| {
+                panic!("the second governed push must succeed, got {status:?}")
+            });
+
+        wait_until!(
+            format!(
+                "the second push's row to be accepted by the broker; last seen [{}]",
+                describe(&fixture.backend.outbox_rows_of_kind(BRANCH_PUSHED).await)
+            ),
+            RELAY_DEADLINE,
+            fixture
+                .backend
+                .outbox_rows_of_kind(BRANCH_PUSHED)
+                .await
+                .iter()
+                .filter(|row| broker_accepted(row))
+                .count()
+                == 2
+        );
+
+        // The exact sequence the second push was accepted at. Asserting the
+        // frontier reaches THIS number, rather than merely that it moved, is
+        // what stops the recovered row from satisfying the case: both rows
+        // travel the same stream, so "the frontier advanced" alone is true as
+        // soon as the receiver consumes either one.
+        let second_row = fixture
+            .backend
+            .outbox_rows_of_kind(BRANCH_PUSHED)
+            .await
+            .into_iter()
+            .find(|row| row.event_id != recovered_event_id)
+            .expect("the second governed push must have appended its own outbox row");
+        let second_sequence = second_row
+            .broker_sequence
+            .expect("an accepted row carries the broker sequence its acceptance evidence named");
+        assert!(
+            second_sequence > baseline,
+            "the second push was accepted at sequence {second_sequence}, which is not above the \
+             frontier {baseline} the receiver had already proved; the case cannot discriminate"
+        );
+
+        wait_until!(
+            format!(
+                "receiver {identity} to carry its contiguous frontier to at least the second \
+                 push's sequence {second_sequence} on generation {generation}; last seen {:?} \
+                 with readiness {:?}",
+                fixture.backend.checkpoint_frontier_of(&identity).await,
+                b.event_readiness().await
+            ),
+            RECEIVER_DEADLINE,
+            fixture
+                .backend
+                .checkpoint_frontier_of(&identity)
+                .await
+                .is_some_and(|(seen, frontier)| seen == generation && frontier >= second_sequence)
+        );
+
+        // The generation must be the SAME one that was ready. A frontier that
+        // "advanced" by retiring and re-capturing at a later position would be
+        // a receiver that skipped the event, not one that consumed it.
+        let (final_generation, final_frontier) = fixture
+            .backend
+            .checkpoint_frontier_of(&identity)
+            .await
+            .expect("the frontier that just advanced must still be readable");
         assert_eq!(
-            fixture.backend.max_checkpoint_frontier().await,
-            -1,
-            "no checkpoint row can exist while no durable receiver runs; \
-             if this fails, the receiver has been wired and case D must now \
-             assert the frontier ADVANCES rather than that it is absent"
+            final_generation, generation,
+            "the frontier must advance within the generation that was ready; a new generation \
+             captures at a later position and would advance without consuming anything"
+        );
+        assert!(final_frontier >= second_sequence);
+        assert_eq!(
+            b.event_readiness().await.receiver_ready,
+            Some(true),
+            "consuming the event must leave the receiver ready, not blocked on a gap or a \
+             parked poison event"
         );
     }
 
@@ -859,7 +1034,7 @@ mod active_active_two_process_tests {
                 .outbox_rows_of_kind(BRANCH_PUSHED)
                 .await
                 .first()
-                .is_some_and(|row| row.state == "broker_accepted")
+                .is_some_and(broker_accepted)
         );
 
         let rows = fixture.backend.outbox_rows_of_kind(BRANCH_PUSHED).await;
@@ -1037,18 +1212,21 @@ mod active_active_two_process_tests {
     // Case G — the event-plane readiness facets, at rest
     // -----------------------------------------------------------------------
 
-    /// Both processes report their relay facets true with no work outstanding,
-    /// and both report the durable-receiver facet as ABSENT.
+    /// Both processes report their relay AND durable-receiver facets true with
+    /// no work outstanding.
     ///
-    /// The absent receiver facet is a real gap, pinned here rather than
-    /// skipped. `RemoteNotificationPluginFactory::create` builds the plugin with
-    /// no `ReceiverRuntime` (`factory.rs:69`), and the only entry point that
-    /// starts one, `factory::create_with_receiver`, has no non-test caller in
-    /// the tree — so no receiver runs, nothing reports a checkpoint, and
-    /// `/event_readiness` returns `null` for the facet because reporting a
-    /// value would be worse than reporting its absence
-    /// (`lore-server/src/http/event_readiness.rs:52-56`). Surfacing the facet
-    /// truthfully is not an edit to that file; it needs a receiver to exist.
+    /// The receiver facet is a per-PROCESS fact, which is why it is asserted on
+    /// each process separately rather than once for the cell: the two
+    /// loreservers join the membership under different identities, run
+    /// independent generations, and consume through separate durable consumers.
+    /// One of them being caught up says nothing about the other.
+    ///
+    /// A true facet here is not merely "a receiver task exists". The readiness
+    /// compare-and-set behind it refuses without a checkpoint at the cell's
+    /// current placement, so `receiver_ready == Some(true)` means this process
+    /// joined, captured, baselined, drained, and durably reported a frontier —
+    /// which is also why the checkpoint row is read back from the database
+    /// afterwards rather than trusted from the HTTP body.
     #[tokio::test]
     #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
     async fn case_g_both_processes_report_their_event_plane_facets_at_rest() {
@@ -1125,12 +1303,82 @@ mod active_active_two_process_tests {
                 readiness.dead_letter_count, 0,
                 "process {label} must see no dead letters at rest"
             );
+            // The receiver facet is on its own clock: it is written by the
+            // receiver task, not by the relay's probe, and its bootstrap is a
+            // round trip more than a publish. Waiting on it separately keeps a
+            // slow first gateway connect from reading as a failed facet.
+            wait_until!(
+                format!(
+                    "process {label}'s durable receiver to report itself ready; last seen {:?}",
+                    cell.event_readiness().await
+                ),
+                RECEIVER_DEADLINE,
+                cell.event_readiness().await.receiver_ready == Some(true)
+            );
+            let readiness = cell.event_readiness().await;
             assert_eq!(
-                readiness.receiver_ready, None,
-                "process {label} must report the durable-receiver facet as ABSENT, because no \
-                 non-test caller starts a receiver; if this fails, the receiver has been wired \
-                 and this case must now assert the facet is TRUE"
+                readiness.receiver_ready,
+                Some(true),
+                "process {label} must report its durable receiver ready at rest; reason was {:?}",
+                readiness.receiver_reason
+            );
+            assert_eq!(
+                readiness.receiver_reason, None,
+                "a ready receiver carries no reason"
+            );
+
+            // And the facet is backed by a durable checkpoint, read from the
+            // database rather than believed from the process reporting on
+            // itself. The generation is compared against the one the process
+            // reports, so a checkpoint left behind by an earlier generation
+            // cannot stand in for this one.
+            let identity = cell.receiver_identity();
+            let (generation, _) = fixture
+                .backend
+                .checkpoint_frontier_of(&identity)
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "process {label} reports receiver {identity} ready, so a checkpoint row \
+                         must exist: the readiness compare-and-set refuses without one at the \
+                         current placement"
+                    )
+                });
+            assert_eq!(
+                Some(generation),
+                readiness.receiver_generation,
+                "process {label}'s checkpoint must belong to the generation it reports running"
+            );
+
+            // The frontier has to reach the highest sequence this cell was told
+            // one of its own rows was accepted at. That number is the
+            // discriminating one: a frontier compared against zero, or against
+            // itself, is satisfied by the database CHECK constraint alone and
+            // proves nothing about consumption.
+            let accepted =
+                fixture.backend.max_broker_sequence().await.expect(
+                    "the governed create's rows drained, so the cell has accepted sequences",
+                );
+            wait_until!(
+                format!(
+                    "process {label}'s receiver {identity} to carry its frontier to the cell's \
+                     highest accepted sequence {accepted}; last seen {:?}",
+                    fixture.backend.checkpoint_frontier_of(&identity).await
+                ),
+                RECEIVER_DEADLINE,
+                fixture
+                    .backend
+                    .checkpoint_frontier_of(&identity)
+                    .await
+                    .is_some_and(|(seen, frontier)| seen == generation && frontier >= accepted)
             );
         }
+
+        assert_ne!(
+            a.receiver_identity(),
+            b.receiver_identity(),
+            "the two processes must join the membership under different identities, or one \
+             process's receiver could satisfy an assertion about the other's"
+        );
     }
 }

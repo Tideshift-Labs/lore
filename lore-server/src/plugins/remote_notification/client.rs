@@ -116,47 +116,80 @@ impl GrpcPublishTransport {
     pub fn connect_lazy(
         config: &RemoteNotificationConfig,
     ) -> Result<Self, RemoteNotificationError> {
-        let mut endpoint = tonic::transport::Endpoint::from_shared(config.gateway_uri.clone())
-            .map_err(|e| RemoteNotificationError::GatewayChannel(e.to_string()))?;
-
-        if let Some(mtls) = config.mtls.as_ref() {
-            endpoint = endpoint
-                .tls_config(Self::tls_config(mtls)?)
-                .map_err(|e| RemoteNotificationError::GatewayChannel(e.to_string()))?;
-        }
-
         Ok(Self {
-            channel: endpoint.connect_lazy(),
+            channel: connect_gateway_channel(&config.gateway_uri, config.mtls.as_ref())?,
         })
     }
 
-    fn tls_config(
-        mtls: &MtlsConfig,
-    ) -> Result<tonic::transport::ClientTlsConfig, RemoteNotificationError> {
-        let client_cert = std::fs::read(&mtls.client_cert_path).map_err(|_| {
-            RemoteNotificationError::MtlsMaterialUnreadable {
-                field: "client_cert_path",
-            }
-        })?;
-        let client_key = std::fs::read(&mtls.client_key_path).map_err(|_| {
-            RemoteNotificationError::MtlsMaterialUnreadable {
-                field: "client_key_path",
-            }
-        })?;
-        let trust_roots = std::fs::read(&mtls.trust_roots_path).map_err(|_| {
-            RemoteNotificationError::MtlsMaterialUnreadable {
-                field: "trust_roots_path",
-            }
-        })?;
-
-        Ok(tonic::transport::ClientTlsConfig::new()
-            .identity(tonic::transport::Identity::from_pem(
-                client_cert,
-                client_key,
-            ))
-            .ca_certificate(tonic::transport::Certificate::from_pem(trust_roots))
-            .assume_http2(true))
+    /// The lazy channel this transport publishes over.
+    ///
+    /// Handed out for the **insecure test transport only**, where the plugin
+    /// presents no client identity and a durable receiver can therefore share
+    /// this channel. A cell with real mTLS must not: the gateway maps one
+    /// identity to one cell and one role, and this channel carries the `relay`
+    /// credential, which `Consume` refuses. See
+    /// [`super::config::ReceiverConfig::mtls`].
+    pub fn channel(&self) -> tonic::transport::Channel {
+        self.channel.clone()
     }
+}
+
+/// Build one lazy channel to the private gateway under the supplied identity.
+///
+/// Separate from [`GrpcPublishTransport`] because a cell running a durable
+/// receiver opens **two** channels to one gateway, under two different
+/// credentials. The gateway maps one mTLS identity to one cell and one role, so
+/// the `relay` credential that may publish is refused on `Consume`, and a
+/// SPIFFE SAN names exactly one role — no single certificate can serve both.
+///
+/// The channel is **lazy** in both uses: a gateway that is down at boot must not
+/// stop a cell from starting and serving storage.
+///
+/// # Errors
+/// Returns [`RemoteNotificationError::MtlsMaterialUnreadable`] naming the field
+/// whose file could not be read, or
+/// [`RemoteNotificationError::GatewayChannel`] when the endpoint or TLS
+/// configuration is rejected. Neither message carries key material.
+pub fn connect_gateway_channel(
+    gateway_uri: &str,
+    mtls: Option<&MtlsConfig>,
+) -> Result<tonic::transport::Channel, RemoteNotificationError> {
+    let mut endpoint = tonic::transport::Endpoint::from_shared(gateway_uri.to_owned())
+        .map_err(|e| RemoteNotificationError::GatewayChannel(e.to_string()))?;
+    if let Some(mtls) = mtls {
+        endpoint = endpoint
+            .tls_config(tls_config(mtls)?)
+            .map_err(|e| RemoteNotificationError::GatewayChannel(e.to_string()))?;
+    }
+    Ok(endpoint.connect_lazy())
+}
+
+fn tls_config(
+    mtls: &MtlsConfig,
+) -> Result<tonic::transport::ClientTlsConfig, RemoteNotificationError> {
+    let client_cert = std::fs::read(&mtls.client_cert_path).map_err(|_| {
+        RemoteNotificationError::MtlsMaterialUnreadable {
+            field: "client_cert_path",
+        }
+    })?;
+    let client_key = std::fs::read(&mtls.client_key_path).map_err(|_| {
+        RemoteNotificationError::MtlsMaterialUnreadable {
+            field: "client_key_path",
+        }
+    })?;
+    let trust_roots = std::fs::read(&mtls.trust_roots_path).map_err(|_| {
+        RemoteNotificationError::MtlsMaterialUnreadable {
+            field: "trust_roots_path",
+        }
+    })?;
+
+    Ok(tonic::transport::ClientTlsConfig::new()
+        .identity(tonic::transport::Identity::from_pem(
+            client_cert,
+            client_key,
+        ))
+        .ca_certificate(tonic::transport::Certificate::from_pem(trust_roots))
+        .assume_http2(true))
 }
 
 #[async_trait]

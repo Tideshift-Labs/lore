@@ -558,6 +558,14 @@ fn default_notification_mode() -> String {
 /// requires `[notification] mode = "remote"` (the relay publishes through the
 /// private gateway client that mode configures) and a cell whose outbox schema
 /// state is present, compatible, and cut over.
+///
+/// The reverse dependency also holds and is enforced: a cell that declares
+/// `[plugins.remote.receiver]` **must** enable this section, or startup fails
+/// with `StartupRefusal::ReceiverWithoutRelay`. The durable invalidation
+/// receiver consumes on the relay's own Postgres pool and reaches the gateway
+/// on a channel this wiring builds, so without a relay it could only be
+/// silently absent — and a cell running no receiver reports the same empty
+/// checkpoint vector as a cell whose receiver is perfectly caught up.
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct OutboxRelaySettings {

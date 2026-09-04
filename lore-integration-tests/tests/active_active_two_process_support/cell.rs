@@ -58,11 +58,20 @@ pub struct EventReadiness {
     pub loop_running: bool,
     pub pending_count: i64,
     pub dead_letter_count: i64,
-    /// `None` when the facet is not surfaced at all, which is its current
-    /// state. No non-test caller starts a durable receiver, so there is no
-    /// readiness for this field to report; see case G and the harness report's
-    /// BLOCKED entry.
+    /// This process's own durable-receiver facet.
+    ///
+    /// `None` when this process runs no receiver at all, which is every boot
+    /// with the relay disabled: the receiver consumes on the relay's pool and
+    /// channel, so loreserver refuses to start with one declared and no relay.
     pub receiver_ready: Option<bool>,
+    /// Why that facet is false, from the receiver's own closed reason set.
+    /// Carried so a stuck receiver names its own boundary in the failure
+    /// message rather than timing out anonymously.
+    #[serde(default)]
+    pub receiver_reason: Option<String>,
+    /// The membership generation the receiver is running.
+    #[serde(default)]
+    pub receiver_generation: Option<i64>,
 }
 
 /// The two things a case varies between boots of one process.
@@ -153,6 +162,36 @@ impl Cell {
             ("CLIENT_KEY", toml_path(&env.client_key)),
             ("TRUST_ROOTS", toml_path(&env.trust_roots)),
             ("RELAY_OWNER", format!("wp109-relay-{name}-{grpc_port}")),
+            // Two namespaces, and both are load-bearing.
+            //
+            // The gRPC port separates CASES within a run. The gateway keeps a
+            // process-lifetime, per-identity monotonic generation guard
+            // (`admitGeneration`) and the runner starts ONE gateway for the
+            // whole run, while every case gets a fresh database whose
+            // generation counter restarts at one. Two cases sharing an identity
+            // would leave the second one's receiver refused as
+            // `STALE_MEMBERSHIP_GENERATION_V1` forever. Each case owns its own
+            // ten-port band, so the port is that namespace.
+            //
+            // The run id separates RUNS. The gateway derives a durable
+            // consumer's name from the cell, the receiver identity, and the
+            // membership generation, and `capture_new` on a consumer that
+            // already exists ATTACHES rather than recreating — by design, so
+            // two gateway replicas serving one generation report one position.
+            // But the broker's streams and consumers outlive a run while the
+            // case database does not, so a second run reusing an identity at
+            // generation 1 attaches to the FIRST run's consumer, is served only
+            // what that consumer never acknowledged, and carries a permanent
+            // gap below its first delivery. Its contiguous frontier then never
+            // reaches the sequences this run published. Measured: a rerun's
+            // case G sat at frontier 34 against an accepted sequence of 45
+            // until it timed out.
+            (
+                "RECEIVER_IDENTITY",
+                format!("wp109-recv-{name}-{grpc_port}-{}", env.run_id),
+            ),
+            ("RECEIVER_CERT", toml_path(&env.receiver_cert)),
+            ("RECEIVER_KEY", toml_path(&env.receiver_key)),
             // Five seconds is the reviewed floor (`MIN_CLAIM_LEASE`). The
             // failover case has to outlive a lease and then observe the
             // reclaim, so the shortest legal lease is the one that keeps that
@@ -191,16 +230,76 @@ impl Cell {
 
     /// The relay owner this process claims outbox rows under.
     pub fn relay_owner(&self) -> String {
+        self.rendered("RELAY_OWNER")
+    }
+
+    /// The membership identity this process's durable receiver joins under.
+    ///
+    /// The key every checkpoint row this process writes is scoped by, so an
+    /// assertion about one process's receiver can never be satisfied by the
+    /// other's.
+    pub fn receiver_identity(&self) -> String {
+        self.rendered("RECEIVER_IDENTITY")
+    }
+
+    /// The `[plugins.remote.receiver]` table for this boot, or a comment.
+    ///
+    /// Tied to `relay_enabled` because loreserver REFUSES to start with a
+    /// receiver declared and no relay
+    /// (`StartupRefusal::ReceiverWithoutRelay`): the receiver consumes on the
+    /// relay's own Postgres pool and gateway channel. Cases D and E boot a
+    /// process quiet on purpose, so an unconditional table would stop those
+    /// processes from booting at all.
+    ///
+    /// The checkpoint cadence is deliberately far tighter than the shipped
+    /// defaults (a second and 256 events). A proof that waits on a frontier
+    /// reaching Postgres should wait on the receiver, not on a batching
+    /// interval chosen for production write volume.
+    fn receiver_block(
+        relay_enabled: bool,
+        receiver_identity: &str,
+        receiver_cert: &str,
+        receiver_key: &str,
+    ) -> String {
+        if !relay_enabled {
+            return "# No [plugins.remote.receiver]: this boot runs no relay, and loreserver\n\
+                    # refuses to start a receiver without one (the receiver consumes on the\n\
+                    # relay's own pool and gateway channel)."
+                .to_owned();
+        }
+        format!(
+            "[plugins.remote.receiver]\n\
+             membership_identity = \"{receiver_identity}\"\n\
+             lifecycle_generation = 1\n\
+             lag_readiness_threshold = 1024\n\
+             checkpoint_interval_ms = 250\n\
+             checkpoint_every_events = 1\n\
+             idle_poll_ms = 100\n\
+             client_cert_path = \"{receiver_cert}\"\n\
+             client_key_path = \"{receiver_key}\""
+        )
+    }
+
+    fn rendered(&self, token: &str) -> String {
         self.render_pairs
             .iter()
-            .find(|(token, _)| *token == "RELAY_OWNER")
+            .find(|(candidate, _)| *candidate == token)
             .map(|(_, value)| value.clone())
-            .expect("every rendered process names its relay owner")
+            .unwrap_or_else(|| panic!("every rendered process substitutes {token}"))
     }
 
     fn spawn(&mut self, options: BootOptions<'_>) {
         let mut pairs = self.render_pairs.clone();
         pairs.push(("RELAY_ENABLED", options.relay_enabled.to_string()));
+        pairs.push((
+            "RECEIVER_BLOCK",
+            Self::receiver_block(
+                options.relay_enabled,
+                &self.rendered("RECEIVER_IDENTITY"),
+                &self.rendered("RECEIVER_CERT"),
+                &self.rendered("RECEIVER_KEY"),
+            ),
+        ));
         std::fs::write(self.config_dir.join("local.toml"), render(&pairs))
             .expect("write the process configuration");
 

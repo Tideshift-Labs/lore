@@ -266,7 +266,7 @@ async fn startup_succeeds_with_a_present_compatible_cutover_stamped_schema_state
 /// The minimal valid `Settings` TOML, matching `settings.rs`'s own
 /// `test_settings_empty_plugins_and_hooks` fixture shape (the smallest shape
 /// that `Settings` itself accepts), with `[outbox_relay] enabled = true`
-/// added and no `[notification]` section -- `configure_event_relay` treats
+/// added and no `[notification]` section -- `prepare_event_relay` treats
 /// an absent section as mode `"local"`.
 fn minimal_settings_with_relay_enabled_and_no_notification_section()
 -> lore_server::settings::Settings {
@@ -305,10 +305,10 @@ fn minimal_settings_with_relay_enabled_and_no_notification_section()
     toml::from_str(toml_text).expect("minimal Settings TOML must parse")
 }
 
-/// `configure_event_relay` (`event_relay::wiring`) is `[outbox_relay]
+/// `prepare_event_relay` (`event_relay::wiring`) is `[outbox_relay]
 /// enabled = true` combined with `Settings.notification`. With no
 /// `[notification]` section (mode defaults to `"local"` inside
-/// `configure_event_relay` itself), this must fail typed BEFORE the
+/// `prepare_event_relay` itself), this must fail typed BEFORE the
 /// function ever looks at Postgres -- proven here by passing
 /// `database_identity: None` and getting a `NotificationModeNotRemote`
 /// refusal rather than the `NotPostgresMode` refusal that omitted argument
@@ -318,18 +318,13 @@ fn minimal_settings_with_relay_enabled_and_no_notification_section()
 #[tokio::test]
 async fn relay_enabled_with_no_remote_notification_mode_fails_startup_typed() {
     let settings = minimal_settings_with_relay_enabled_and_no_notification_section();
-    let mut endpoints = tokio::task::JoinSet::new();
-    let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let result = lore_server::event_relay::wiring::configure_event_relay(
-        &settings,
-        None,
+    let result = lore_server::event_relay::wiring::prepare_event_relay(
+        &settings, None,
         // No domain coordinator either: the notification-mode check must still
         // win, which is the same ordering assertion this test already makes
         // against `database_identity: None`.
         None,
-        &mut endpoints,
-        shutdown_rx,
     )
     .await;
     let error = match result {
@@ -343,9 +338,158 @@ async fn relay_enabled_with_no_remote_notification_mode_fails_startup_typed() {
         StartupRefusal::NotificationModeNotRemote(mode) => assert_eq!(mode, "local"),
         other => panic!("expected NotificationModeNotRemote, got {other:?}"),
     }
+    // "No worker task may be spawned on a refused configuration" is now
+    // structural rather than asserted: `prepare_event_relay` takes no `JoinSet`
+    // and cannot spawn. `spawn_event_relay` is the only half that does, and it
+    // is unreachable without a preparation.
+}
+
+// ---------------------------------------------------------------------------
+// A receiver declared on a cell with no relay
+// ---------------------------------------------------------------------------
+
+/// `[notification] mode = "remote"`, a parseable `[plugins.remote]`, and
+/// `[outbox_relay] enabled = false`.
+///
+/// No `[plugins.postgres]` section, so any check that reached the database
+/// would refuse with `NotPostgresMode` instead — which is what makes the two
+/// tests below an ordering assertion as well as a behaviour one.
+const DISABLED_RELAY_REMOTE_MODE: &str = r#"
+    [server]
+    runtime_shutdown_timeout_seconds = 0
+
+    [server.http]
+    enabled = false
+    host = "127.0.0.1"
+    max_file_size = 1024
+    port = 8080
+    request_timeout_seconds = 30
+    request_body_timeout_seconds = 30
+    available_interval_seconds = 5
+    available_timeout_seconds = 30
+    store_health_check = false
+
+    [immutable_store]
+    mode = "local"
+
+    [immutable_store.local]
+    path = "/tmp/immutable"
+    flush_delay_seconds = 5
+
+    [mutable_store]
+    mode = "local"
+
+    [mutable_store.local]
+    path = "/tmp/mutable"
+    flush_delay_seconds = 5
+
+    [notification]
+    mode = "remote"
+
+    [plugins.remote]
+    gateway_uri = "http://127.0.0.1:1"
+    cell_id = "sfo3-cell-a"
+    placement_epoch = 12
+    producer_instance_id = "loreserver-sfo3-cell-a-2"
+    allow_insecure_transport_for_test = true
+
+    [outbox_relay]
+    enabled = false
+"#;
+
+/// The same document with a durable receiver declared.
+///
+/// Appended rather than interpolated because `Settings` deserializes with a
+/// borrowed lifetime, so the source has to be `'static`.
+const DISABLED_RELAY_REMOTE_MODE_WITH_RECEIVER: &str = r#"
+    [server]
+    runtime_shutdown_timeout_seconds = 0
+
+    [server.http]
+    enabled = false
+    host = "127.0.0.1"
+    max_file_size = 1024
+    port = 8080
+    request_timeout_seconds = 30
+    request_body_timeout_seconds = 30
+    available_interval_seconds = 5
+    available_timeout_seconds = 30
+    store_health_check = false
+
+    [immutable_store]
+    mode = "local"
+
+    [immutable_store.local]
+    path = "/tmp/immutable"
+    flush_delay_seconds = 5
+
+    [mutable_store]
+    mode = "local"
+
+    [mutable_store.local]
+    path = "/tmp/mutable"
+    flush_delay_seconds = 5
+
+    [notification]
+    mode = "remote"
+
+    [plugins.remote]
+    gateway_uri = "http://127.0.0.1:1"
+    cell_id = "sfo3-cell-a"
+    placement_epoch = 12
+    producer_instance_id = "loreserver-sfo3-cell-a-2"
+    allow_insecure_transport_for_test = true
+
+    [plugins.remote.receiver]
+    membership_identity = "loreserver-sfo3-cell-a-2"
+    lifecycle_generation = 1
+    lag_readiness_threshold = 1024
+
+    [outbox_relay]
+    enabled = false
+"#;
+
+fn settings_from(toml_text: &'static str) -> lore_server::settings::Settings {
+    toml::from_str(toml_text).expect("the remote-mode Settings TOML must parse")
+}
+
+/// A declared durable receiver on a cell that runs no relay is a REFUSAL, not
+/// a silently absent task.
+///
+/// The receiver consumes on the relay's own pool and gateway channel, so
+/// without a relay it could only be missing — and a cell with no receiver and a
+/// cell whose receiver is caught up write the same (empty) checkpoint vector,
+/// which is exactly the pair an operator cannot tell apart afterwards.
+#[tokio::test]
+async fn a_receiver_declared_without_a_relay_refuses_startup_typed() {
+    let settings = settings_from(DISABLED_RELAY_REMOTE_MODE_WITH_RECEIVER);
+    let result = lore_server::event_relay::wiring::prepare_event_relay(&settings, None, None).await;
+    let error = match result {
+        Ok(_) => panic!("[plugins.remote.receiver] with no relay must refuse startup"),
+        Err(error) => error,
+    };
+    let refusal = error
+        .downcast_ref::<StartupRefusal>()
+        .unwrap_or_else(|| panic!("expected a StartupRefusal, got: {error:#}"));
     assert!(
-        endpoints.is_empty(),
-        "no worker task may be spawned on a refused configuration"
+        matches!(refusal, StartupRefusal::ReceiverWithoutRelay),
+        "expected ReceiverWithoutRelay, got {refusal:?}"
+    );
+}
+
+/// The control for the test above: the SAME disabled relay with no receiver
+/// section is `Ok(None)`, which is what every cell in the tree is today. Without
+/// this, the refusal above would also pass if the disabled path had started
+/// refusing outright.
+#[tokio::test]
+async fn a_disabled_relay_with_no_receiver_stays_absent_rather_than_refusing() {
+    let settings = settings_from(DISABLED_RELAY_REMOTE_MODE);
+    let prepared = lore_server::event_relay::wiring::prepare_event_relay(&settings, None, None)
+        .await
+        .expect("a disabled relay with no receiver must not refuse");
+    assert!(
+        prepared.is_none(),
+        "a disabled relay prepares nothing at all"
     );
 }
 

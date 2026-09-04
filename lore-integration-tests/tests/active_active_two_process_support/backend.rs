@@ -37,6 +37,9 @@ use lore_postgres::domain::backfill::DomainBackfillSource;
 use lore_postgres::domain::backfill::OrphanKey;
 use lore_postgres::domain::backfill::RepositoryFacts;
 use lore_postgres::domain::errors::DomainError;
+use lore_postgres::domain::outbox::MembershipCas;
+use lore_postgres::domain::outbox::membership::read_membership_state;
+use lore_postgres::domain::outbox::membership::set_current_placement;
 use lore_postgres::domain::outbox::stamp_cutover;
 use lore_postgres::pool::TlsConfig;
 use lore_postgres::store::immutable_store::ObjectStoreSettings;
@@ -219,6 +222,42 @@ impl SharedBackend {
         stamp_cutover(&authority, &env.cell_id)
             .await
             .expect("stamp the outbox cutover marker before either process boots");
+
+        // The cell's AUTHORITATIVE placement. `stamp_cutover` seeds the
+        // membership-state row with a NULL stream, and nothing inside
+        // loreserver ever fills it in: which stream a cell consumes from is a
+        // control-plane fact, and this harness is playing the control plane.
+        //
+        // It is stamped even for cases that run no receiver, because it costs
+        // nothing and because a case that starts a receiver against an unset
+        // placement waits forever on `no_current_placement` rather than failing
+        // — the least debuggable shape available.
+        //
+        // All three values come from the runner, not from here. The gateway
+        // derives the stream epoch from the JetStream stream's creation
+        // timestamp and refuses a `Consume` that disagrees, so a constant in
+        // this file would be wrong on every machine and silently so.
+        let state = read_membership_state(&authority, &env.cell_id)
+            .await
+            .expect("read the outbox membership state")
+            .expect("stamp_cutover seeds the membership-state row");
+        match set_current_placement(
+            &authority,
+            &env.cell_id,
+            &env.stream_identity,
+            env.stream_epoch,
+            env.placement_revision,
+            state.membership_version,
+        )
+        .await
+        .expect("stamp the cell's authoritative placement")
+        {
+            MembershipCas::Applied { .. } => {}
+            other => panic!(
+                "the placement stamp must apply on a fresh case database, got {other:?}; \
+                 nothing else has written this cell's membership state yet"
+            ),
+        }
 
         Self {
             domain: Arc::new(domain),
@@ -509,6 +548,54 @@ impl SharedBackend {
             .await
             .expect("read the checkpoint projection");
         row.get(0)
+    }
+
+    /// The frontier one receiver identity has reported, at its highest
+    /// membership generation, with that generation.
+    ///
+    /// `None` when that receiver has reported no checkpoint at all, which is a
+    /// different fact from a frontier of zero. Scoped to one receiver identity
+    /// on purpose: with two processes consuming, a `max()` over the whole cell
+    /// would let process A's progress satisfy an assertion about process B's.
+    ///
+    /// The highest generation, not every generation, because a restart
+    /// allocates a new one and a stale predecessor's frontier says nothing
+    /// about the receiver running now.
+    pub async fn checkpoint_frontier_of(&self, receiver_identity: &str) -> Option<(i64, i64)> {
+        self.authority
+            .query_opt(
+                "SELECT membership_generation, contiguous_frontier \
+                   FROM lore_outbox_checkpoints \
+                  WHERE cell_id = $1 AND receiver_identity = $2 \
+                  ORDER BY membership_generation DESC LIMIT 1",
+                &[&self.cell_id, &receiver_identity],
+            )
+            .await
+            .expect("read the checkpoint projection for one receiver")
+            .map(|row| {
+                (
+                    row.get("membership_generation"),
+                    row.get("contiguous_frontier"),
+                )
+            })
+    }
+
+    /// The highest broker sequence this cell has been told a row was accepted
+    /// at, or `None` when nothing has been accepted.
+    ///
+    /// The number a caught-up receiver's contiguous frontier has to reach. Read
+    /// from the outbox rather than from either process, for the same reason
+    /// every other assertion here is: a process reporting on its own progress
+    /// is not authority for it.
+    pub async fn max_broker_sequence(&self) -> Option<i64> {
+        self.authority
+            .query_one(
+                "SELECT max(broker_sequence)::bigint FROM lore_outbox_events WHERE cell_id = $1",
+                &[&self.cell_id],
+            )
+            .await
+            .expect("read the highest accepted broker sequence")
+            .get(0)
     }
 
     /// The cutover marker, proving the relay's startup gate had something to

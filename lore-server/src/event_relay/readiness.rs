@@ -22,6 +22,22 @@
 //!   from storage readiness because broker loss must never make reads
 //!   unavailable.
 //!
+//! # The two receiver facets are different questions
+//!
+//! `receiver_ready` above is the **cell's** question: can any consumer be
+//! declared safe, from the `consumer_safe` evaluator's view of the whole
+//! required membership. `durable_receiver_ready` is **this process's** question:
+//! is the durable invalidation receiver running in this loreserver caught up
+//! inside its own lag threshold with no unresolved blocker. A cell can answer
+//! the first while this process's receiver is bootstrapping, and this process's
+//! receiver can be perfectly ready while the cell's required set is not
+//! satisfied, so the two are reported side by side rather than merged.
+//!
+//! The durable facet is `None` — absent, not false — on a cell that runs no
+//! receiver, because "no receiver is configured here" and "the receiver is
+//! behind" are different states and a reader that cannot tell them apart is
+//! exactly what this endpoint exists to avoid.
+//!
 //! # Fail closed on silence
 //!
 //! A facet computed from a backlog observation is only as good as the
@@ -32,7 +48,9 @@
 //! silently ages, and a readiness signal that cannot tell "healthy" from "not
 //! looked at recently" is not a readiness signal.
 
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -41,6 +59,7 @@ use std::time::Instant;
 use lore_postgres::domain::outbox::OutboxBacklog;
 
 use crate::event_relay::metrics;
+use crate::plugins::remote_notification::ReceiverReadiness;
 
 /// A point-in-time view of all three facets and the evidence behind them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +93,16 @@ pub struct ReadinessSnapshot {
     /// Why the relay facet is false, or `None` when it is true. A fixed,
     /// low-cardinality string.
     pub relay_reason: Option<&'static str>,
+    /// This process's own durable-receiver facet, or `None` when this
+    /// loreserver runs no receiver.
+    pub durable_receiver_ready: Option<bool>,
+    /// Why that facet is false, from the receiver's own closed reason set.
+    pub durable_receiver_reason: Option<&'static str>,
+    /// Distance from the receiver's contiguous frontier to the highest
+    /// sequence it has seen. Zero when no receiver runs.
+    pub durable_receiver_lag: u64,
+    /// The membership generation the receiver is running, once it has one.
+    pub durable_receiver_generation: Option<i64>,
 }
 
 /// Reasons the relay facet reports false. Fixed strings; never interpolated.
@@ -116,6 +145,13 @@ pub struct EventRelayReadiness {
     loop_running: AtomicBool,
     last: Mutex<Option<Observation>>,
     last_receiver: Mutex<Option<ReceiverObservation>>,
+    /// This process's own durable receiver, attached once by server
+    /// construction when the cell declares one.
+    ///
+    /// A handle rather than a value because the receiver moves between
+    /// generations, and each new generation writes through the same handle; a
+    /// snapshot copied in at wiring time would report the bootstrap forever.
+    durable_receiver: OnceLock<Arc<ReceiverReadiness>>,
     max_oldest_unpublished: Duration,
     /// Twice the probe interval plus one publish deadline. Precomputed so the
     /// read path does no arithmetic on configuration it does not own.
@@ -142,6 +178,7 @@ impl EventRelayReadiness {
             loop_running: AtomicBool::new(false),
             last: Mutex::new(None),
             last_receiver: Mutex::new(None),
+            durable_receiver: OnceLock::new(),
             max_oldest_unpublished,
             // Doubling the interval gives one whole missed probe of tolerance,
             // so an ordinary scheduling hiccup is not an incident; the deadline
@@ -150,6 +187,21 @@ impl EventRelayReadiness {
                 .saturating_mul(2)
                 .saturating_add(publish_deadline),
         }
+    }
+
+    /// Attach this process's durable-receiver facet.
+    ///
+    /// Once only, and a second attach is an error rather than a replacement:
+    /// two receivers over one cell in one process would mean two facets and a
+    /// coin flip over which one this surface reported.
+    ///
+    /// # Errors
+    /// Returns the rejected handle when one is already attached.
+    pub fn attach_durable_receiver(
+        &self,
+        receiver: Arc<ReceiverReadiness>,
+    ) -> Result<(), Arc<ReceiverReadiness>> {
+        self.durable_receiver.set(receiver)
     }
 
     /// Mark the loop alive or stopped.
@@ -241,6 +293,11 @@ impl EventRelayReadiness {
             Some(observation) => observation.block,
         };
 
+        // This process's own receiver, read live through its handle. No
+        // staleness rule applies: the receiver writes its facet on every step
+        // and on every blocked boundary, so there is no observation to age.
+        let durable = self.durable_receiver.get().map(|handle| handle.snapshot());
+
         ReadinessSnapshot {
             relay_ready: relay_reason.is_none(),
             event_ready,
@@ -255,6 +312,10 @@ impl EventRelayReadiness {
             observation_age,
             stale,
             relay_reason,
+            durable_receiver_ready: durable.as_ref().map(|snapshot| snapshot.ready),
+            durable_receiver_reason: durable.as_ref().and_then(|snapshot| snapshot.reason),
+            durable_receiver_lag: durable.as_ref().map_or(0, |snapshot| snapshot.lag),
+            durable_receiver_generation: durable.as_ref().and_then(|snapshot| snapshot.generation),
         }
     }
 
@@ -501,5 +562,65 @@ mod tests {
             assert!(reason.is_ascii());
             assert!(!reason.contains(' '));
         }
+    }
+
+    // -- this process's own durable receiver -------------------------------
+
+    /// Absent, not false. A cell that runs no receiver and a cell whose
+    /// receiver is behind are different states, and collapsing them would make
+    /// the facet unreadable.
+    #[test]
+    fn the_durable_receiver_facet_is_absent_until_one_is_attached() {
+        let snapshot = readiness().snapshot();
+        assert_eq!(snapshot.durable_receiver_ready, None);
+        assert_eq!(snapshot.durable_receiver_reason, None);
+        assert_eq!(snapshot.durable_receiver_generation, None);
+    }
+
+    /// An attached receiver that has not started reports FALSE with its own
+    /// reason, which is the fail-closed initial state the handle ships with.
+    #[test]
+    fn an_attached_receiver_reports_its_own_not_started_state() {
+        let readiness = readiness();
+        readiness
+            .attach_durable_receiver(Arc::new(ReceiverReadiness::new()))
+            .expect("the first attach must be accepted");
+        let snapshot = readiness.snapshot();
+        assert_eq!(snapshot.durable_receiver_ready, Some(false));
+        assert_eq!(
+            snapshot.durable_receiver_reason,
+            Some(crate::plugins::remote_notification::receiver::REASON_NOT_STARTED)
+        );
+    }
+
+    /// The relay facet is untouched by the receiver's. A receiver that has not
+    /// started must not make a caught-up relay report itself behind.
+    #[test]
+    fn the_durable_receiver_facet_does_not_move_the_relay_or_event_facets() {
+        let readiness = readiness();
+        readiness.set_loop_running(true);
+        readiness.record_backlog(&backlog(Some(Duration::from_secs(1)), 0));
+        readiness
+            .attach_durable_receiver(Arc::new(ReceiverReadiness::new()))
+            .expect("the first attach must be accepted");
+        let snapshot = readiness.snapshot();
+        assert!(snapshot.relay_ready);
+        assert!(snapshot.event_ready);
+        assert_eq!(snapshot.durable_receiver_ready, Some(false));
+    }
+
+    #[test]
+    fn a_second_durable_receiver_attach_is_refused_rather_than_replacing_the_first() {
+        let readiness = readiness();
+        readiness
+            .attach_durable_receiver(Arc::new(ReceiverReadiness::new()))
+            .expect("the first attach must be accepted");
+        assert!(
+            readiness
+                .attach_durable_receiver(Arc::new(ReceiverReadiness::new()))
+                .is_err(),
+            "two receivers over one cell in one process would mean two facets and a coin flip \
+             over which one this surface reported"
+        );
     }
 }
