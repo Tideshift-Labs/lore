@@ -142,6 +142,7 @@ async fn insert_tombstone(
 ) -> Result<u64, tokio_postgres::Error> {
     let scope: [u8; 8] = rand::random();
     let fingerprint: [u8; 32] = rand::random();
+    let canonical_intent_digest: [u8; 32] = rand::random();
     let authorization_id: [u8; 16] = rand::random();
     let claim_id: [u8; 16] = rand::random();
     let reserve_charge_nonce: [u8; 32] = rand::random();
@@ -150,20 +151,32 @@ async fn insert_tombstone(
     let receipt_prune_digest: [u8; 32] = rand::random();
     let fence_prune_digest: [u8; 32] = rand::random();
     let phase1_response = b"phase1-response".as_slice();
+    let phase1_request_digest: [u8; 32] = rand::random();
+    let phase1_verification_digest: [u8; 32] = rand::random();
+    let terminal_outcome: i16 = 0;
+    let terminal_receipt_sha256: [u8; 32] = rand::random();
+    let platform_terminal_status_revision: i64 = 0;
+    let release_proof_reservation_revision: i64 = 0;
+    let release_proof_reservation_nonce: [u8; 32] = rand::random();
     let tombstone_digest: [u8; 32] = rand::random();
     tx.execute(
         "INSERT INTO lore_domain_operation_reserve_release_tombstones (
             verified_issuer, authenticated_subject, tenant_scope_key, operation_id,
-            method, scope, fingerprint_version, fingerprint,
+            method, scope, fingerprint_version, fingerprint, canonical_intent_digest,
             authorization_id, authorization_revision, claim_id, claim_revision,
             reserve_charge_revision, reserve_charge_nonce,
             tombstone_reservation_revision, tombstone_reservation_nonce,
             terminal_ack_digest, receipt_prune_digest, fence_prune_digest, phase1_response,
+            phase1_request_digest, phase1_verification_digest, terminal_outcome,
+            terminal_receipt_sha256, platform_terminal_status_revision, platform_acknowledged_at,
+            release_proof_reservation_revision, release_proof_reservation_nonce,
             created_at, compact_after, final_prune_after, tombstone_digest
-        ) VALUES ($1, $2, $3, $4, 'lore.domain.v1.test/Method', $5, 1, $6,
-                  $7, 0, $8, 0, 0, $9, 0, $10, $11, $12, $13, $14,
+        ) VALUES ($1, $2, $3, $4, 'lore.domain.v1.test/Method', $5, 1, $6, $7,
+                  $8, 0, $9, 0, 0, $10, 0, $11, $12, $13, $14, $15,
+                  $16, $17, $18, $19, $20, clock_timestamp() + interval '1 day',
+                  $21, $22,
                   clock_timestamp(), clock_timestamp() + interval '1 day',
-                  clock_timestamp() + interval '2 days', $15)",
+                  clock_timestamp() + interval '2 days', $23)",
         &[
             &key.verified_issuer,
             &key.authenticated_subject,
@@ -171,6 +184,7 @@ async fn insert_tombstone(
             &key.operation_id.as_slice(),
             &scope.as_slice(),
             &fingerprint.as_slice(),
+            &canonical_intent_digest.as_slice(),
             &authorization_id.as_slice(),
             &claim_id.as_slice(),
             &reserve_charge_nonce.as_slice(),
@@ -179,6 +193,13 @@ async fn insert_tombstone(
             &receipt_prune_digest.as_slice(),
             &fence_prune_digest.as_slice(),
             &phase1_response,
+            &phase1_request_digest.as_slice(),
+            &phase1_verification_digest.as_slice(),
+            &terminal_outcome,
+            &terminal_receipt_sha256.as_slice(),
+            &platform_terminal_status_revision,
+            &release_proof_reservation_revision,
+            &release_proof_reservation_nonce.as_slice(),
             &tombstone_digest.as_slice(),
         ],
     )
