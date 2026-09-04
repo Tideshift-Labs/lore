@@ -432,7 +432,7 @@ async fn steady_state_transient_and_poison_fail_readiness_without_acknowledging(
     .expect("the test config declares a required receiver");
     let readiness = receiver.readiness();
     let cancel = receiver.cancellation_token();
-    let handle = tokio::spawn(receiver.run());
+    let handle = lore_base::lore_spawn!(receiver.run());
 
     assert!(
         wait_until(|| readiness.is_ready(), Duration::from_secs(10)).await,

@@ -190,7 +190,7 @@ async fn remote_mode_spawns_a_durable_receiver_that_reaches_readiness() {
     let receiver_task = receivers.remove(1);
     drop(receivers); // the unpolled live-hint worker future is simply dropped, unstarted
     drop(sender);
-    let receiver_handle = tokio::spawn(receiver_task);
+    let receiver_handle = lore_base::lore_spawn!(receiver_task);
 
     let reached_ready = wait_until(|| readiness.is_ready(), Duration::from_secs(5)).await;
     assert!(
