@@ -37,10 +37,18 @@
 //! durable_payload_version_max = 1
 //!
 //! [plugins.remote.receiver]
-//! membership_identity   = "loreserver-sfo3-cell-a-2"
-//! lifecycle_generation  = 1
+//! membership_identity     = "loreserver-sfo3-cell-a-2"
+//! lifecycle_generation    = 1
 //! lag_readiness_threshold = 5000
+//! checkpoint_interval_ms  = 1000
+//! checkpoint_every_events = 256
+//! idle_poll_ms            = 250
 //! ```
+//!
+//! The whole `[plugins.remote.receiver]` table is optional, and its absence
+//! means "this cell declares no required durable receiver". Present, it makes
+//! the receiver's failure a readiness failure, so it is the switch that turns a
+//! cell into one whose retention depends on this replica keeping up.
 //!
 //! Certificate material is referenced by path and never inlined, so no config
 //! error message and no log line can carry a key.
@@ -51,6 +59,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::error::RemoteNotificationError;
+use super::mode::PluginMode;
 use super::wire::DURABLE_PAYLOAD_VERSION;
 use super::wire::TRANSPORT_VERSION;
 
@@ -58,12 +67,9 @@ use super::wire::TRANSPORT_VERSION;
 /// table it reads.
 pub const PLUGIN_NAME: &str = "remote";
 
-/// The only `mode` value this plugin accepts if the operator states one.
-/// `local-shadow-remote` is a **server-level** composition of a local sender
-/// and a bounded shadow sender; selecting the ordinary remote plugin does not
-/// implement it, so naming it here is rejected rather than silently downgraded.
-const MODE_REMOTE: &str = "remote";
-const MODE_LOCAL_SHADOW_REMOTE: &str = "local-shadow-remote";
+/// The only mode this plugin is selectable for. The other two are named and
+/// validated in [`super::mode`], which owns the whole ladder.
+const SELECTABLE_MODE: PluginMode = PluginMode::Remote;
 
 /// Bounds on the ordinary live-hint queue. A queue of zero cannot accept an
 /// event; an unbounded one is prohibited outright by the contract.
@@ -95,6 +101,26 @@ const CELL_ID_MAX_BYTES: usize = 63;
 
 /// Contract bound on `producer_instance_id`, counted in UTF-8 **bytes**.
 pub const PRODUCER_INSTANCE_ID_MAX_BYTES: usize = 128;
+
+/// Bounds on the durable receiver's checkpoint cadence.
+///
+/// The cadence is a two-sided trade the contract does not pin a number for.
+/// Too slow, and WP-119's retention reaper cannot advance, so a cell retains
+/// rows it has already consumed. Too fast, and every applied event costs a
+/// fenced transaction against the membership counter that every other writer
+/// also serialises on. The defaults report at most once a second and at least
+/// once every 256 applied events.
+const CHECKPOINT_INTERVAL_MIN_MS: u64 = 100;
+const CHECKPOINT_INTERVAL_MAX_MS: u64 = 300_000;
+const CHECKPOINT_INTERVAL_DEFAULT_MS: u64 = 1_000;
+const CHECKPOINT_EVERY_EVENTS_MIN: u64 = 1;
+const CHECKPOINT_EVERY_EVENTS_MAX: u64 = 100_000;
+const CHECKPOINT_EVERY_EVENTS_DEFAULT: u64 = 256;
+
+/// Bounds on the idle poll interval. A zero poll would spin.
+const IDLE_POLL_MIN_MS: u64 = 10;
+const IDLE_POLL_MAX_MS: u64 = 60_000;
+const IDLE_POLL_DEFAULT_MS: u64 = 250;
 
 /// Contract bound on a durable receiver's membership identity. Not pinned by
 /// the contract as a width; bounded here so a config cannot make an unbounded
@@ -163,6 +189,10 @@ struct RawReceiver {
     membership_identity: String,
     lifecycle_generation: u64,
     lag_readiness_threshold: u64,
+
+    checkpoint_interval_ms: Option<u64>,
+    checkpoint_every_events: Option<u64>,
+    idle_poll_ms: Option<u64>,
 }
 
 /// The bounded live-hint retry budget.
@@ -182,12 +212,25 @@ pub struct ContractConfig {
     pub durable_payload_version_max: u32,
 }
 
-/// Durable-receiver identity. Validated at startup; consumed in Phase 3.
+/// Durable-receiver identity and cadence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiverConfig {
     pub membership_identity: String,
+    /// The generation floor this replica expects.
+    ///
+    /// The authoritative generation is **allocated** by WP-119's membership
+    /// counter at join, not chosen here. This value is a diagnostic floor: a
+    /// replica that joins below it has come back against a cell whose counter
+    /// moved backwards, which is worth a loud log even though the allocated
+    /// number is the one that fences.
     pub lifecycle_generation: u64,
     pub lag_readiness_threshold: u64,
+    /// Longest interval between two checkpoint reports while events flow.
+    pub checkpoint_interval: Duration,
+    /// Most events applied between two checkpoint reports.
+    pub checkpoint_every_events: u64,
+    /// How long the receiver waits after a caught-up read before asking again.
+    pub idle_poll: Duration,
 }
 
 /// mTLS material, referenced by path. The bytes are read at construction and
@@ -246,21 +289,13 @@ impl RemoteNotificationConfig {
     }
 
     fn from_raw(raw: RawConfig) -> Result<Self, RemoteNotificationError> {
+        // The mode ladder itself lives in `super::mode`. Here it is only
+        // validated: an operator who restates the mode in this table must
+        // restate the one this plugin is actually being selected for, so a
+        // `local-shadow-remote` deployment fails loudly rather than silently
+        // running ordinary remote mode with its public service unmounted.
         if let Some(mode) = raw.mode.as_deref() {
-            if mode == MODE_LOCAL_SHADOW_REMOTE {
-                return Err(RemoteNotificationError::field(
-                    "mode",
-                    "`local-shadow-remote` is a server-level composition of a local sender and a \
-                     separate bounded shadow sender. Selecting this plugin does not implement it; \
-                     it is wired in common server construction, not here",
-                ));
-            }
-            if mode != MODE_REMOTE {
-                return Err(RemoteNotificationError::field(
-                    "mode",
-                    format!("unknown mode `{mode}`; this plugin implements `remote` only"),
-                ));
-            }
+            PluginMode::parse(mode)?.require_selectable()?;
         }
 
         let gateway_uri = raw.gateway_uri.trim().to_string();
@@ -496,18 +531,71 @@ impl RemoteNotificationConfig {
                 "must be non-zero; a zero threshold can never be satisfied",
             ));
         }
+        let checkpoint_interval = Self::bounded_millis(
+            "receiver.checkpoint_interval_ms",
+            raw.checkpoint_interval_ms,
+            CHECKPOINT_INTERVAL_MIN_MS,
+            CHECKPOINT_INTERVAL_MAX_MS,
+            CHECKPOINT_INTERVAL_DEFAULT_MS,
+        )?;
+        let idle_poll = Self::bounded_millis(
+            "receiver.idle_poll_ms",
+            raw.idle_poll_ms,
+            IDLE_POLL_MIN_MS,
+            IDLE_POLL_MAX_MS,
+            IDLE_POLL_DEFAULT_MS,
+        )?;
+        let checkpoint_every_events = raw
+            .checkpoint_every_events
+            .unwrap_or(CHECKPOINT_EVERY_EVENTS_DEFAULT);
+        if !(CHECKPOINT_EVERY_EVENTS_MIN..=CHECKPOINT_EVERY_EVENTS_MAX)
+            .contains(&checkpoint_every_events)
+        {
+            return Err(RemoteNotificationError::field(
+                "receiver.checkpoint_every_events",
+                format!(
+                    "must be {CHECKPOINT_EVERY_EVENTS_MIN}..={CHECKPOINT_EVERY_EVENTS_MAX}; a \
+                     receiver that never checkpoints blocks retention forever"
+                ),
+            ));
+        }
+
         Ok(Some(ReceiverConfig {
             membership_identity: raw.membership_identity.clone(),
             lifecycle_generation: raw.lifecycle_generation,
             lag_readiness_threshold: raw.lag_readiness_threshold,
+            checkpoint_interval,
+            checkpoint_every_events,
+            idle_poll,
         }))
+    }
+
+    /// Bound one optional millisecond setting, or take its default.
+    ///
+    /// # Errors
+    /// [`RemoteNotificationError::ConfigField`] naming the field.
+    fn bounded_millis(
+        field: &'static str,
+        value: Option<u64>,
+        min: u64,
+        max: u64,
+        default: u64,
+    ) -> Result<Duration, RemoteNotificationError> {
+        let millis = value.unwrap_or(default);
+        if !(min..=max).contains(&millis) {
+            return Err(RemoteNotificationError::field(
+                field,
+                format!("must be {min}..={max} milliseconds"),
+            ));
+        }
+        Ok(Duration::from_millis(millis))
     }
 
     /// Diagnostics safe to report at boot and on the diagnostics surface. Never
     /// includes a path to credential material, and never the material itself.
     pub fn diagnostics(&self) -> Vec<(&'static str, String)> {
         vec![
-            ("mode", MODE_REMOTE.to_string()),
+            ("mode", SELECTABLE_MODE.as_str().to_string()),
             ("cell_id", self.cell_id.clone()),
             ("placement_epoch", self.placement_epoch.to_string()),
             ("queue_capacity", self.queue_capacity.to_string()),

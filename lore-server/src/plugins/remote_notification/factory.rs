@@ -18,6 +18,11 @@ use super::client::PublishTransport;
 use super::config::INSECURE_TRANSPORT_BANNER;
 use super::config::PLUGIN_NAME;
 use super::config::RemoteNotificationConfig;
+use super::error::RemoteNotificationError;
+use super::mode::PluginMode;
+use super::receiver::DurableReceiver;
+use super::receiver::ReceiverReadiness;
+use super::receiver::ReceiverRuntime;
 use super::sender;
 use crate::plugins::NotificationPlugin;
 use crate::plugins::NotificationPluginContext;
@@ -61,7 +66,7 @@ impl NotificationPluginFactory for RemoteNotificationPluginFactory {
             .map_err(|e| e.into_plugin_error(PLUGIN_NAME))?;
         let client =
             PrivateGatewayClient::connect(&config).map_err(|e| e.into_plugin_error(PLUGIN_NAME))?;
-        Ok(build_plugin(&config, client).0)
+        Ok(build_plugin(&config, client, PluginMode::Remote, None).0)
     }
 
     fn name(&self) -> &'static str {
@@ -92,15 +97,115 @@ pub fn create_with_transport(
     let config =
         RemoteNotificationConfig::parse(config).map_err(|e| e.into_plugin_error(PLUGIN_NAME))?;
     let client = PrivateGatewayClient::with_transport(&config, transport);
-    Ok(build_plugin(&config, client))
+    Ok(build_plugin(&config, client, PluginMode::Remote, None))
+}
+
+/// Build the plugin with a live durable receiver attached.
+///
+/// This is the entry point `SCHEMA-119` calls once it holds the Postgres pool
+/// and the durable stream. Everything the receiver needs that this component
+/// cannot reach on its own arrives through [`ReceiverRuntime`], and the
+/// receiver task comes back as a second entry in `NotificationPlugin.receivers`
+/// so the server's `JoinSet` owns its lifecycle exactly as it owns the live-hint
+/// worker's.
+///
+/// Returns the plugin, the concrete sender, and the receiver's readiness facet
+/// — which is a handle rather than a value, so an aggregator can keep reading
+/// it as the receiver moves between generations.
+///
+/// # Errors
+/// The same configuration faults [`NotificationPluginFactory::create`] returns.
+pub fn create_with_receiver(
+    config: &toml::Value,
+    transport: std::sync::Arc<dyn PublishTransport>,
+    runtime: ReceiverRuntime,
+) -> Result<
+    (
+        NotificationPlugin,
+        std::sync::Arc<sender::RemoteNotificationSender>,
+        std::sync::Arc<ReceiverReadiness>,
+    ),
+    PluginError,
+> {
+    let config =
+        RemoteNotificationConfig::parse(config).map_err(|e| e.into_plugin_error(PLUGIN_NAME))?;
+    if config.receiver.is_none() {
+        return Err(RemoteNotificationError::field(
+            "receiver",
+            "a durable receiver runtime was supplied but `[plugins.remote.receiver]` is absent; \
+             the cell must declare its membership identity, lifecycle generation, and lag \
+             readiness threshold before a receiver can run",
+        )
+        .into_plugin_error(PLUGIN_NAME));
+    }
+    let client = PrivateGatewayClient::with_transport(&config, transport);
+    let (plugin, sender, readiness) =
+        build_plugin_with_readiness(&config, client, PluginMode::Remote, Some(runtime));
+    let readiness = readiness.ok_or_else(|| {
+        RemoteNotificationError::field(
+            "receiver",
+            "the durable receiver did not start despite a supplied runtime",
+        )
+        .into_plugin_error(PLUGIN_NAME)
+    })?;
+    Ok((plugin, sender, readiness))
+}
+
+/// Build the observation-only branch of `local-shadow-remote`.
+///
+/// The branch publishes `SHADOW_OBSERVATION` to `.shadow` subjects and starts
+/// **no** durable receiver — the rule lives in
+/// [`PluginMode::runs_durable_receiver`] and is applied here rather than
+/// remembered. The returned `NotificationPlugin`'s sender is meant to sit
+/// beside Lore's local sender under a server-level multiplexer, not to replace
+/// it: this function deliberately cannot unmount the public service, because
+/// it never touches server construction.
+///
+/// # Errors
+/// The same configuration faults [`NotificationPluginFactory::create`] returns.
+pub fn create_shadow_branch(
+    config: &toml::Value,
+    transport: std::sync::Arc<dyn PublishTransport>,
+) -> Result<
+    (
+        NotificationPlugin,
+        std::sync::Arc<sender::RemoteNotificationSender>,
+    ),
+    PluginError,
+> {
+    let config =
+        RemoteNotificationConfig::parse(config).map_err(|e| e.into_plugin_error(PLUGIN_NAME))?;
+    let client = PrivateGatewayClient::with_transport(&config, transport);
+    Ok(build_plugin(
+        &config,
+        client,
+        PluginMode::LocalShadowRemote,
+        None,
+    ))
 }
 
 fn build_plugin(
     config: &RemoteNotificationConfig,
     client: PrivateGatewayClient,
+    mode: PluginMode,
+    runtime: Option<ReceiverRuntime>,
 ) -> (
     NotificationPlugin,
     std::sync::Arc<sender::RemoteNotificationSender>,
+) {
+    let (plugin, sender, _) = build_plugin_with_readiness(config, client, mode, runtime);
+    (plugin, sender)
+}
+
+fn build_plugin_with_readiness(
+    config: &RemoteNotificationConfig,
+    client: PrivateGatewayClient,
+    mode: PluginMode,
+    runtime: Option<ReceiverRuntime>,
+) -> (
+    NotificationPlugin,
+    std::sync::Arc<sender::RemoteNotificationSender>,
+    Option<std::sync::Arc<ReceiverReadiness>>,
 ) {
     if config.mtls.is_none() {
         tracing::warn!("{INSECURE_TRANSPORT_BANNER}");
@@ -108,19 +213,55 @@ fn build_plugin(
     for (key, value) in config.diagnostics() {
         tracing::info!(setting = key, value = %value, "remote notification plugin setting");
     }
+    tracing::info!(mode = %mode, "remote notification plugin mode");
 
-    let (sender, worker) = sender::build(config, client, false);
+    let (sender, worker) = sender::build(config, client, mode.publishes_shadow_only());
+    let mut receivers: Vec<crate::plugins::NotificationReceiver> = vec![Box::pin(worker.run())];
+    let mut readiness = None;
 
-    // TODO(WP-111 Phase 3): the durable invalidation receiver attaches here as a
-    // second `NotificationReceiver`, and a required receiver's failure becomes an
-    // event-readiness failure. It consumes `config.receiver`, which is already
-    // parsed and bounded above.
+    match runtime {
+        Some(runtime) if mode.runs_durable_receiver() => {
+            match DurableReceiver::new(config, runtime) {
+                Some(receiver) => {
+                    readiness = Some(receiver.readiness());
+                    receivers.push(Box::pin(receiver.run()));
+                }
+                None => tracing::warn!(
+                    "a durable receiver runtime was supplied but no `[plugins.remote.receiver]` \
+                     is configured; no receiver started"
+                ),
+            }
+        }
+        Some(_) => tracing::warn!(
+            mode = %mode,
+            "a durable receiver runtime was supplied for a mode that must not consume durable \
+             invalidations; no receiver started"
+        ),
+        None if config.receiver.is_some() && mode.runs_durable_receiver() => {
+            // BLOCKED(WP-111): the private gateway's frozen schema pins only
+            // `/lorehub.notification.internal.v1.PrivateNotificationService/Publish`.
+            // It carries no receiver-side subscribe, consume, or acknowledge
+            // RPC, and WP-110 Phases 6-8 own that surface. Until one exists,
+            // the plain factory path has no durable stream to hand the
+            // receiver, so a cell that declares a required receiver gets this
+            // warning rather than a silently absent task. `SCHEMA-119` calls
+            // `create_with_receiver` with a real stream once WP-110 lands one.
+            tracing::warn!(
+                "`[plugins.remote.receiver]` is configured but no durable stream source is \
+                 available in this build; the durable invalidation receiver did not start and \
+                 the cell must not be treated as required-event ready"
+            );
+        }
+        None => {}
+    }
+
     (
         NotificationPlugin {
             sender: sender.clone(),
-            receivers: vec![Box::pin(worker.run())],
+            receivers,
         },
         sender,
+        readiness,
     )
 }
 

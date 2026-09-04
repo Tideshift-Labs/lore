@@ -49,6 +49,13 @@ pub(crate) struct Instruments {
     /// broker acknowledgement. Recorded per attempt, not per logical
     /// publication, so a retried hint contributes only its successful attempt.
     ack_latency_ms: Histogram<f64>,
+    /// Durable receiver bootstrap attempts that did not reach readiness, by
+    /// the closed readiness reason that ended them.
+    receiver_bootstrap_failures: Counter<u64>,
+    /// Durable invalidation dispositions, by outcome class.
+    receiver_outcomes: Counter<u64>,
+    /// Checkpoint report results, by outcome class.
+    receiver_checkpoints: Counter<u64>,
 }
 
 impl Instruments {
@@ -83,6 +90,23 @@ impl Instruments {
                 )
                 .build(),
             ack_latency_ms: provider.latency_histogram_ms("publish.ack_latency"),
+            receiver_bootstrap_failures: meter
+                .u64_counter(provider.scope_name("receiver.bootstrap_failures"))
+                .with_description(
+                    "Durable receiver bootstrap attempts that did not reach readiness, by reason",
+                )
+                .build(),
+            receiver_outcomes: meter
+                .u64_counter(provider.scope_name("receiver.outcomes"))
+                .with_description(
+                    "Durable invalidation dispositions, by outcome (applied, duplicate, stale, \
+                     refetched, parked)",
+                )
+                .build(),
+            receiver_checkpoints: meter
+                .u64_counter(provider.scope_name("receiver.checkpoints"))
+                .with_description("Durable receiver checkpoint report results, by outcome")
+                .build(),
         }
     }
 
@@ -148,6 +172,30 @@ pub(crate) fn record_ack_latency_ms(delivery_class: &'static str, millis: f64) {
         .record(millis, &[KeyValue::new("delivery_class", delivery_class)]);
 }
 
+/// One bootstrap attempt that did not reach readiness.
+///
+/// `reason` comes from `super::receiver`'s closed readiness-reason set, which
+/// is where the cardinality bound lives.
+pub(crate) fn record_receiver_bootstrap(reason: &'static str) {
+    Instruments::instance()
+        .receiver_bootstrap_failures
+        .add(1, &[KeyValue::new("reason", reason)]);
+}
+
+/// One durable invalidation disposition.
+pub(crate) fn record_receiver_outcome(outcome: &'static str) {
+    Instruments::instance()
+        .receiver_outcomes
+        .add(1, &[KeyValue::new("outcome", outcome)]);
+}
+
+/// One checkpoint report result.
+pub(crate) fn record_receiver_checkpoint(outcome: &'static str) {
+    Instruments::instance()
+        .receiver_checkpoints
+        .add(1, &[KeyValue::new("outcome", outcome)]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +230,8 @@ mod tests {
         record_publish_retry(CLASS_LIVE_HINT);
         record_dropped_hint(CLASS_LIVE_HINT, "timeout");
         record_ack_latency_ms(CLASS_DURABLE, 12.5);
+        record_receiver_bootstrap("placement_moved");
+        record_receiver_outcome("applied");
+        record_receiver_checkpoint("applied");
     }
 }

@@ -11,9 +11,9 @@
 //!
 //! ## What is here, and what is not
 //!
-//! Phases 1 and 2 of WP-111 only: the pinned private contract and the bounded
-//! best-effort `LIVE_HINT` sender, plus the durable Publish entry point CR-032's
-//! relay calls.
+//! WP-111 Phases 1 through 4: the pinned private contract, the bounded
+//! best-effort `LIVE_HINT` sender, the durable Publish entry point CR-032's
+//! relay calls, the durable invalidation **receiver**, and the mode ladder.
 //!
 //! | Module | Role |
 //! | --- | --- |
@@ -22,13 +22,32 @@
 //! | [`config`] | `[plugins.remote]`, parsed and bounded before any I/O |
 //! | [`client`] | one Publish attempt, and the closed classification of the answer |
 //! | [`sender`] | the bounded queue, the single drain worker, and the retry budget |
+//! | [`mode`] | the `local` / `remote` / `local-shadow-remote` ladder |
+//! | [`stream`] | the durable stream seam the receiver consumes, and its fake |
+//! | [`receiver_store`] | WP-119's Step C membership and checkpoint API, narrowed to six calls |
+//! | [`frontier`] | the contiguous acknowledgement frontier and its blockers |
+//! | [`apply`] | version comparison, envelope decoding, and the invalidation target |
+//! | [`receiver`] | the ordered bootstrap, the steady state, and the readiness facet |
 //! | [`factory`] | the `NotificationPluginFactory` for mode `remote` |
 //! | [`fake_gateway`] | a request-counting, scriptable, in-process gateway for tests |
 //! | [`error`] | the layered error types and the closed failure classification |
 //!
-//! Not here, by design: the durable invalidation **receiver**, checkpointing,
-//! `local-shadow-remote` composition, and the migration modes. Those are WP-111
-//! Phase 3 onward. Every attachment point carries a `TODO(WP-111 Phase 3)`.
+//! # What the receiver does not connect to yet
+//!
+//! The private gateway's frozen schema pins exactly one method, `Publish`.
+//! There is no receiver-side subscribe or acknowledge RPC: WP-110 Phases 6-8
+//! own "public `Subscribe`, bounded replay, durable receiver" and have not
+//! landed. So the receiver runs against [`stream::DurableStreamSource`], which
+//! carries the three operations the contract's lifecycle needs. See that
+//! module's `BLOCKED(WP-111)` note. When the RPC is pinned, one more
+//! implementation of that trait lands and nothing in [`receiver`] changes.
+//!
+//! Also not here, by design: `local-shadow-remote`'s **composition**. This
+//! module supplies its shadow branch through
+//! [`factory::create_shadow_branch`]; aggregating that branch with the local
+//! sender and the mounted public service is `SCHEMA-119`'s, because it owns
+//! the common construction, readiness, and drain files both branches thread
+//! through.
 //!
 //! ## This component is not mutation authority
 //!
@@ -38,25 +57,42 @@
 //! produces best-effort live hints, and offers the relay a durable publish
 //! entry point that classifies but never retries.
 //!
-//! ## Registration is deliberately deferred
+//! ## Registration
 //!
-//! [`register`] is a no-op. `build.rs` auto-discovers this module and emits the
-//! call into the generated `plugins/mod.rs`, but wiring the factory into the
-//! registry belongs to WP-119's serialized `SCHEMA-119` window, which owns the
-//! common settings, server-construction, readiness, and drain files this plugin
-//! must be threaded through. See [`register`] for the exact line that window
-//! adds.
+//! [`register`] wires [`RemoteNotificationPluginFactory`] into the registry, so
+//! `[notification] mode = "remote"` resolves. `build.rs` auto-discovers this
+//! module and emits the call into the generated `plugins/mod.rs`. WP-111
+//! shipped it as a no-op and `SCHEMA-119` added the line, because that window
+//! owns the common settings, server-construction, readiness, and drain files
+//! this plugin threads through. A test in this module pins the registered
+//! state, so a later refactor that drops the line fails there rather than at a
+//! cell's boot.
+//!
+//! Registration alone starts no durable receiver. That needs a
+//! [`receiver::ReceiverRuntime`], which only `SCHEMA-119` can build, through
+//! [`factory::create_with_receiver`].
 
+pub mod apply;
 pub mod client;
 pub mod config;
 pub mod envelope;
 pub mod error;
 pub mod factory;
 pub mod fake_gateway;
+pub mod frontier;
 mod metrics;
+pub mod mode;
+pub mod receiver;
+pub mod receiver_store;
 pub mod sender;
+pub mod stream;
 pub mod wire;
 
+pub use apply::DecodedDelivery;
+pub use apply::DeliveryViolation;
+pub use apply::InvalidationTarget;
+pub use apply::NoopInvalidationTarget;
+pub use apply::RecordingInvalidationTarget;
 pub use client::BrokerAcceptance;
 pub use client::MAX_DURABLE_PUBLISH_DEADLINE;
 pub use client::PrivateGatewayClient;
@@ -75,7 +111,27 @@ pub use error::RemoteNotificationError;
 pub use error::TerminalClass;
 pub use error::TransientClass;
 pub use factory::RemoteNotificationPluginFactory;
+pub use frontier::AckFrontier;
+pub use mode::PluginMode;
+pub use receiver::BootstrapFailure;
+pub use receiver::DurableReceiver;
+pub use receiver::ReceiverReadiness;
+pub use receiver::ReceiverReadinessSnapshot;
+pub use receiver::ReceiverRuntime;
+pub use receiver::ReceiverSession;
+pub use receiver::StepOutcome;
+pub use receiver_store::InMemoryReceiverStore;
+pub use receiver_store::PostgresReceiverStore;
+pub use receiver_store::ReceiverStore;
+pub use receiver_store::ReceiverStoreError;
 pub use sender::RemoteNotificationSender;
+pub use stream::CapturedStreamPosition;
+pub use stream::DeliveredEnvelope;
+pub use stream::DurableStreamSource;
+pub use stream::FakeDurableStream;
+pub use stream::StreamDelivery;
+pub use stream::StreamError;
+pub use stream::StreamPlacement;
 
 use crate::plugins::PluginRegistry;
 
