@@ -80,6 +80,9 @@ pub struct HealthFacets {
     /// WP-114 CD-6's terminal write-claim prune facet, when this cell runs the
     /// scheduler.
     pub fragment_prune: Option<Arc<crate::fragment_prune::FragmentPruneReadiness>>,
+    /// WP-114 CD-8's cell-scale retention facet, when this cell runs the
+    /// scheduler.
+    pub cell_retention: Option<Arc<lore_object_dispatch::cell_retention::CellRetentionReadiness>>,
 }
 
 pub struct ServerHealth {
@@ -108,6 +111,14 @@ pub struct ServerHealth {
     /// reads, and putting it behind the load balancer's probe would make it
     /// one.
     pub fragment_prune: Option<Arc<crate::fragment_prune::FragmentPruneReadiness>>,
+    /// WP-114 CD-8's cell-scale retention facet, when this cell runs the
+    /// scheduler.
+    ///
+    /// Same placement rule as `fragment_prune`: reported on `/event_readiness`,
+    /// never consulted by `/health_check`. A dispatch evidence table that has
+    /// stopped draining blocks activation and must be visible; it is not a
+    /// reason to pull a node that is serving reads.
+    pub cell_retention: Option<Arc<lore_object_dispatch::cell_retention::CellRetentionReadiness>>,
 }
 
 impl ServerHealth {
@@ -122,6 +133,7 @@ impl ServerHealth {
             drain: None,
             event_relay: None,
             fragment_prune: None,
+            cell_retention: None,
         }
     }
 }
@@ -297,6 +309,7 @@ impl LoreHttpServer {
             drain: None,
             event_relay: None,
             fragment_prune: None,
+            cell_retention: None,
         });
 
         let app = Router::new()
@@ -354,6 +367,7 @@ impl LoreHttpServer {
             drain,
             event_relay: facets.event_relay,
             fragment_prune: facets.fragment_prune,
+            cell_retention: facets.cell_retention,
         };
 
         let presign_config = build_presign_config(&settings.presign)?;

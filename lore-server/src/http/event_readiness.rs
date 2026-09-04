@@ -88,6 +88,35 @@ pub struct EventReadinessResponse {
     /// plan nothing while rows sit past retention forever. `-1` means the probe
     /// did not run, which is not the same as zero.
     pub prune_last_unblocked_backlog: i64,
+    /// Whether this cell runs WP-114 CD-8's cell-scale retention scheduler at
+    /// all. False on every cell whose governed fragment route is off, which
+    /// opened no dispatch pool and wrote no evidence rows to retain.
+    pub retention_configured: bool,
+    /// The retention facet: false while the scheduler cannot show the dispatch
+    /// evidence tables draining. `None` when no scheduler is configured, so a
+    /// reader cannot mistake "not running" for "drained".
+    pub retention_ready: Option<bool>,
+    /// Fixed reason string when `retention_ready` is false. Names which of the
+    /// three causes was seen, so an operator knows whether to chase an orphaned
+    /// spool object or raise the batch.
+    pub retention_reason: Option<&'static str>,
+    /// Consecutive retention passes that made no progress.
+    pub retention_consecutive_stalls: u32,
+    /// Terminal request rows the last pass removed.
+    pub retention_last_pruned: i64,
+    /// Candidates the last pass locked.
+    pub retention_last_examined: i64,
+    /// Rows a further pass could have taken, at the last probe. `-1` means the
+    /// probe did not run, which is not the same as zero.
+    pub retention_last_prunable_backlog: i64,
+    /// Rows past the horizon held back by non-terminal payload evidence, at the
+    /// last probe. This is the count with no other red gate anywhere: none of
+    /// the conditions holding these rows back is transient, so any value above
+    /// zero fails the facet unconditionally. `-1` means not measured.
+    pub retention_last_blocked_backlog: i64,
+    /// Charge grants under an expired budget configuration still waiting, at
+    /// the last probe. `-1` means not measured.
+    pub retention_last_grant_backlog: i64,
 }
 
 impl EventReadinessResponse {
@@ -115,6 +144,15 @@ impl EventReadinessResponse {
             prune_last_pruned: 0,
             prune_last_examined: 0,
             prune_last_unblocked_backlog: -1,
+            retention_configured: false,
+            retention_ready: None,
+            retention_reason: None,
+            retention_consecutive_stalls: 0,
+            retention_last_pruned: 0,
+            retention_last_examined: 0,
+            retention_last_prunable_backlog: -1,
+            retention_last_blocked_backlog: -1,
+            retention_last_grant_backlog: -1,
         }
     }
 }
@@ -148,6 +186,15 @@ pub async fn handler(State(state): State<Arc<ServerHealth>>) -> impl IntoRespons
                 prune_last_pruned: 0,
                 prune_last_examined: 0,
                 prune_last_unblocked_backlog: -1,
+                retention_configured: false,
+                retention_ready: None,
+                retention_reason: None,
+                retention_consecutive_stalls: 0,
+                retention_last_pruned: 0,
+                retention_last_examined: 0,
+                retention_last_prunable_backlog: -1,
+                retention_last_blocked_backlog: -1,
+                retention_last_grant_backlog: -1,
             }
         }
     };
@@ -163,6 +210,21 @@ pub async fn handler(State(state): State<Arc<ServerHealth>>) -> impl IntoRespons
         response.prune_last_pruned = snapshot.last_pruned;
         response.prune_last_examined = snapshot.last_examined;
         response.prune_last_unblocked_backlog = snapshot.last_unblocked_backlog;
+    }
+    // WP-114 CD-8's facet, beside the prune's and independent of it in the same
+    // way: the two schedulers drain different tables and either can be running
+    // without the other having anything to do.
+    if let Some(retention) = state.cell_retention.as_ref() {
+        let snapshot = retention.snapshot();
+        response.retention_configured = true;
+        response.retention_ready = Some(snapshot.retention_ready);
+        response.retention_reason = snapshot.retention_reason;
+        response.retention_consecutive_stalls = snapshot.consecutive_stalls;
+        response.retention_last_pruned = snapshot.last_pruned;
+        response.retention_last_examined = snapshot.last_examined;
+        response.retention_last_prunable_backlog = snapshot.last_prunable_backlog;
+        response.retention_last_blocked_backlog = snapshot.last_blocked_backlog;
+        response.retention_last_grant_backlog = snapshot.last_grant_backlog;
     }
     Json(response)
 }
@@ -191,6 +253,7 @@ mod tests {
             drain: None,
             event_relay,
             fragment_prune: None,
+            cell_retention: None,
         })
     }
 

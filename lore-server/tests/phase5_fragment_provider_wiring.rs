@@ -129,7 +129,7 @@ fn lifecycle_is_composed_and_proven_ready_before_provider_activation() {
     let legacy = between(
         startup,
         "} else {",
-        "(immutable_store, configured_domain)\n        };",
+        "(immutable_store, cell_retention_handle, configured_domain)\n        };",
     );
     assert_precedes(
         legacy,
@@ -290,7 +290,7 @@ fn one_arc_dispatch_pool_serves_attestation_and_charge_authority() {
     assert_eq!(connect.matches("Arc::new(").count(), 1);
     assert!(connect.contains("DispatchRuntimeClient::new(pool.clone())"));
     assert!(connect.contains("attest_cell_schema(&dispatch, boundary)"));
-    assert!(connect.contains("PostgresProviderChargeAuthority::new(pool)"));
+    assert!(connect.contains("PostgresProviderChargeAuthority::new(pool.clone())"));
     assert_precedes(
         connect,
         "let ValidatedFragmentProcessPoolInventory { inventory, budget }",
@@ -309,6 +309,24 @@ fn one_arc_dispatch_pool_serves_attestation_and_charge_authority() {
         connect,
         "PostgresProviderChargeAuthority::new",
         "with_transport_port(",
+    );
+    // WP-114 CD-8 runs its retention pass on this same Arc rather than opening a
+    // second pool, so `DISPATCH_PROCESS_CONNECTION_LIMIT`'s process inventory is
+    // unchanged. Checked over the whole seam because the retained field and its
+    // accessor sit outside `connect`'s window: one construction site in the
+    // file, and the accessor mints its client from the retained field.
+    assert_eq!(
+        FRAGMENT_SEAM.matches("DispatchRuntimePool::new(").count(),
+        1
+    );
+    let retention = between(
+        FRAGMENT_SEAM,
+        "    pub fn cell_retention(",
+        "#[derive(Debug, Clone, PartialEq, Eq)]",
+    );
+    assert!(
+        retention.contains("CellRetentionClient::new(self.pool.clone())"),
+        "the retention client must be minted from the entry's own retained pool"
     );
 }
 
@@ -392,7 +410,7 @@ fn physical_database_identity_is_bound_before_schema_charge_or_gateway_construct
     assert_precedes(
         connect,
         "attest_database_identity(config.expected_database_identity.0)",
-        "PostgresProviderChargeAuthority::new(pool)",
+        "PostgresProviderChargeAuthority::new(pool.clone())",
     );
     assert_precedes(
         connect,
@@ -453,4 +471,88 @@ fn get_remains_unmetered_and_phase5_config_has_no_spool_route() {
     }
     assert!(raw_config.contains("dispatch_postgres_url"));
     assert!(raw_config.contains("provider_boundary_id"));
+}
+
+/// WP-114 CD-8 gave `lore-server` a direct `lore-object-dispatch` dependency,
+/// so `DispatchRuntimePool::new` became nameable at the composition root for
+/// the first time.
+///
+/// Nothing else pins that it stays unused there. CD-8's contract is that the
+/// retention pass runs on the pool the provider entry already opened, so that
+/// `DISPATCH_PROCESS_CONNECTION_LIMIT`'s five-pool process inventory is not
+/// renegotiated; a second pool opened anywhere in this crate would break that
+/// silently, since every pool validates its own budget in isolation and the
+/// inventory check would still pass.
+///
+/// Scanned over the whole crate rather than one file, because the point is that
+/// no file does it.
+#[test]
+fn lore_server_opens_no_dispatch_pool_of_its_own() {
+    fn walk(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir).expect("lore-server/src must be readable");
+        for entry in entries {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found.push(path);
+            }
+        }
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sources = Vec::new();
+    walk(&root, &mut sources);
+    assert!(
+        sources.len() > 20,
+        "the crate walk found only {} files, so it is proving nothing",
+        sources.len()
+    );
+
+    let mut scanned_the_wiring = false;
+    for path in &sources {
+        let text = std::fs::read_to_string(path).expect("a readable source file");
+        if path.ends_with("fragment_retention.rs") {
+            scanned_the_wiring = true;
+            assert!(
+                text.contains("handle.into_client()"),
+                "the retention client must come from the provider entry's own pool"
+            );
+        }
+        // Comments stripped conservatively, so prose that legitimately names the
+        // pool type does not trip a rule about constructing one. A line holding
+        // a quote is kept whole rather than cut at its first `//`, the same rule
+        // the seam's own scanner uses, so a string literal cannot hide code.
+        let code = text
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("//") {
+                    return "";
+                }
+                if line.contains('"') {
+                    return line;
+                }
+                match line.find("//") {
+                    Some(index) => &line[..index],
+                    None => line,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        for token in ["DispatchRuntimePool", "DispatchPoolConfig"] {
+            assert!(
+                !code.contains(token),
+                "{} names {token}; the retention pass must run on the provider \
+                 entry's existing pool, not one this crate opens",
+                path.display(),
+            );
+        }
+    }
+    assert!(
+        scanned_the_wiring,
+        "the CD-8 wiring module was not among the scanned files"
+    );
 }

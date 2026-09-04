@@ -86,6 +86,7 @@ pub use lore_fragment_provider::FRAGMENT_PROVIDER_ATTEMPT_CLASSES;
 pub use lore_fragment_provider::FRAGMENT_PROVIDER_INGRESS_CAP_BYTES;
 pub use lore_fragment_provider::FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS;
 pub use lore_fragment_provider::FragmentAttemptLedger;
+pub use lore_fragment_provider::FragmentCellRetentionHandle;
 pub use lore_fragment_provider::FragmentDatabaseIdentity;
 pub use lore_fragment_provider::FragmentDatabaseIdentityError;
 pub use lore_fragment_provider::FragmentDirectPutOperation;

@@ -73,6 +73,7 @@ mod tests {
             drain,
             event_relay: None,
             fragment_prune: None,
+            cell_retention: None,
         })
     }
 

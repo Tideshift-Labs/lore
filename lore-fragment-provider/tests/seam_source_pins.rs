@@ -767,3 +767,73 @@ fn the_seam_addresses_only_its_own_boundary() {
         "exactly one line may supply the target, got {builder}",
     );
 }
+
+/// WP-114 CD-8 publishes exactly one dispatch type the forbidden list does not
+/// cover, and this records why that is permitted and pins what it buys.
+///
+/// `FragmentProviderEntry::cell_retention` hands out a `CellRetentionClient`
+/// built on the entry's own pool, because `lore-server` schedules the retention
+/// pass and the pool cannot cross `lore-postgres` as itself. That does not
+/// falsify claim 2: the client's pool field is private with no accessor, so a
+/// holder cannot recover the pool, cannot construct a `DispatchRuntimeClient`,
+/// and cannot reach any of the four dispatch mutations — whose request types
+/// remain unnameable regardless.
+///
+/// **That reasoning is about the client's method set, and nothing else checked
+/// it.** A later `pub fn pool(&self)` on `CellRetentionClient`, or a new
+/// mutation on it, would widen this seam with no test failing anywhere. So the
+/// set is pinned here, against the dispatch crate's own source. A deliberate
+/// addition updates this list and states what it costs; an accidental one is a
+/// failure.
+#[test]
+fn the_cell_retention_client_buys_only_the_retention_procedures() {
+    const RETENTION_CLIENT: &str = include_str!("../../lore-object-dispatch/src/cell_retention.rs");
+    const PERMITTED: [&str; 4] = ["new", "read_state", "prune_once", "backlog"];
+
+    let shipped = shipped_code(&read("src/lib.rs"));
+    assert!(
+        shipped.contains("pub fn cell_retention("),
+        "this pin describes an accessor that no longer exists",
+    );
+    // The forbidden names must still be absent from that accessor's own
+    // signature and from the handle it returns.
+    for signature in public_fn_signatures(&shipped) {
+        assert!(
+            hits(&signature, &forbidden_reexport_names()).is_empty(),
+            "the retention accessor must publish no forbidden type: {signature}"
+        );
+    }
+
+    let client_impl = block_after(RETENTION_CLIENT, "impl CellRetentionClient {", '{', '}');
+    let mut methods = Vec::new();
+    let mut rest = strip_line_comments(&client_impl);
+    while let Some(offset) = rest.find("pub fn ").or_else(|| rest.find("pub async fn ")) {
+        let tail = rest[offset..]
+            .trim_start_matches("pub ")
+            .trim_start_matches("async ")
+            .trim_start_matches("fn ");
+        let end = tail.find(['(', '<']).expect("a method name ends somewhere");
+        methods.push(tail[..end].trim().to_string());
+        rest = rest[offset + 7..].to_string();
+    }
+    // Equality, not containment. A containment check passes just as happily
+    // when the scan has quietly stopped seeing methods, which is the failure
+    // mode that makes a source scan look like coverage while proving nothing.
+    methods.sort();
+    let mut permitted: Vec<String> = PERMITTED.iter().map(|name| (*name).to_string()).collect();
+    permitted.sort();
+    assert_eq!(
+        methods, permitted,
+        "CellRetentionClient's public method set changed. A new method is one \
+         this seam's authorised export was assessed without: either it is safe \
+         to hand a `lore-postgres`-crossing holder, in which case add it here \
+         and say why, or the accessor must stop handing out this client. A \
+         missing one means the scan stopped seeing methods and is proving \
+         nothing.",
+    );
+    // The reasoning above rests on the pool being unrecoverable from the client.
+    assert!(
+        !methods.iter().any(|method| method == "pool"),
+        "a pool accessor on CellRetentionClient falsifies \"a dispatch client cannot be constructed\"",
+    );
+}

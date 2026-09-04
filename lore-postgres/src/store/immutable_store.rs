@@ -78,6 +78,7 @@ use crate::domain::fragments::DecodeSupport;
 use crate::domain::fragments::ENCODING_MASK;
 use crate::domain::fragments::EpochAuthority;
 use crate::domain::fragments::FragmentAttemptLedger;
+use crate::domain::fragments::FragmentCellRetentionHandle;
 use crate::domain::fragments::FragmentDirectPutOperation;
 use crate::domain::fragments::FragmentDispatchRuntimeConfig;
 use crate::domain::fragments::FragmentGetAttempt;
@@ -414,6 +415,30 @@ impl PostgresImmutableStore {
             provider_write_authority_revision,
         };
         self
+    }
+
+    /// WP-114 CD-8's retention client, on the dispatch pool this store's
+    /// provider entry already opened.
+    ///
+    /// `None` on the legacy route: a cell with no governed fragment path opened
+    /// no dispatch pool and has no dispatch evidence rows to retain.
+    ///
+    /// This is a pass-through and nothing more. The handle is opaque here on
+    /// purpose — naming what is inside it would mean depending on
+    /// `lore-object-dispatch`, which this crate must not do. `lore-server`
+    /// opens it and composes the scheduler.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresFragmentProviderActivationError`] when the pool is not
+    /// the runtime pool.
+    pub fn cell_retention(
+        &self,
+    ) -> Result<Option<FragmentCellRetentionHandle>, PostgresFragmentProviderActivationError> {
+        let FragmentLifecycleRoute::Coordinated { provider, .. } = &self.fragment_route else {
+            return Ok(None);
+        };
+        Ok(Some(provider.cell_retention()?))
     }
 
     /// Attach the staged cleanup collaborator without changing provider or

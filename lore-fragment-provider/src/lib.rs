@@ -267,6 +267,7 @@ pub use lore_object_dispatch::ProviderTransport;
 use lore_object_dispatch::ProviderTransportRefusal;
 pub use lore_object_dispatch::UnwiredChargeAuthority;
 pub use lore_object_dispatch::UnwiredProviderTransport;
+use lore_object_dispatch::cell_retention::CellRetentionClient;
 use lore_object_dispatch::cell_schema_install::CELL_SCHEMA_LAYERS;
 use lore_object_dispatch::cell_schema_install::CellSchemaLayerId;
 use lore_object_dispatch::dispatch_client::DispatchAuthorityError;
@@ -1588,6 +1589,41 @@ pub struct ValidatedFragmentProcessPoolInventory {
 pub struct FragmentProviderEntry {
     gateway: FragmentProviderGateway,
     _dispatch: DispatchRuntimeClient,
+    /// The one pool this entry opened, retained so WP-114 CD-8's retention
+    /// scheduler runs on it rather than opening a second one. Private, and
+    /// reachable only through [`FragmentProviderEntry::cell_retention`], which
+    /// hands out a retention client and never the pool: publishing the pool
+    /// type would falsify the seam's "a dispatch client cannot be constructed"
+    /// claim, which `seam_source_pins.rs` pins by name.
+    pool: Arc<DispatchRuntimePool>,
+}
+
+/// A carrier for the process's cell-retention client, in a type `lore-postgres`
+/// can name.
+///
+/// CD-8's scheduler is composed in `lore-server`, but the pool it must run on is
+/// opened here and reaches `lore-server` only by passing through
+/// `lore-postgres`, which may not depend on `lore-object-dispatch`. So the
+/// client travels inside this opaque handle: `lore-postgres` moves it without
+/// naming its contents, and `lore-server` — which may take that dependency —
+/// opens it.
+///
+/// Holding one grants retention procedures and nothing else. 0024's procedures
+/// compute their horizon, replay floor, withhold clauses and batch ceiling
+/// inside `SECURITY DEFINER` bodies from the database's own clock, so a holder
+/// cannot widen what a pass removes, and cannot reach any other authority
+/// mutation: those request types stay unnameable outside the dispatch crate.
+#[derive(Debug)]
+pub struct FragmentCellRetentionHandle {
+    client: CellRetentionClient,
+}
+
+impl FragmentCellRetentionHandle {
+    /// Take the retention client for scheduling.
+    #[must_use]
+    pub fn into_client(self) -> CellRetentionClient {
+        self.client
+    }
 }
 
 impl FragmentProviderEntry {
@@ -1631,7 +1667,7 @@ impl FragmentProviderEntry {
         let attestation = attest_cell_schema(&dispatch, boundary)
             .await
             .map_err(FragmentProviderActivationError::Schema)?;
-        let charge_authority = PostgresProviderChargeAuthority::new(pool)
+        let charge_authority = PostgresProviderChargeAuthority::new(pool.clone())
             .map_err(FragmentProviderActivationError::ChargeAuthority)?;
         let gateway = FragmentProviderGateway::with_transport_port(
             attestation,
@@ -1643,11 +1679,30 @@ impl FragmentProviderEntry {
         Ok(Self {
             gateway,
             _dispatch: dispatch,
+            pool,
         })
     }
 
     pub fn boundary(&self) -> &CellProviderBoundary {
         self.gateway.boundary()
+    }
+
+    /// Mint WP-114 CD-8's retention client on the pool this entry already owns.
+    ///
+    /// Opens no connection and no second pool, so the CR-033 D8 process
+    /// connection inventory is unchanged. The client's own constructor refuses a
+    /// pool that does not connect as the runtime role.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FragmentProviderActivationError::DispatchClient`] when the pool
+    /// is not the runtime pool.
+    pub fn cell_retention(
+        &self,
+    ) -> Result<FragmentCellRetentionHandle, FragmentProviderActivationError> {
+        let client = CellRetentionClient::new(self.pool.clone())
+            .map_err(FragmentProviderActivationError::DispatchClient)?;
+        Ok(FragmentCellRetentionHandle { client })
     }
 
     pub async fn admit_operation(
@@ -2720,14 +2775,31 @@ mod tests {
     }
 
     /// Pins the honest scope of the attestation. 0019's readback covers four of
-    /// the five installed layers; CD-4's budget-limiter layer — the one the
-    /// charge itself executes against — is not among them.
+    /// the six installed layers, and the two it leaves out are left out for
+    /// different reasons rather than by oversight.
+    ///
+    /// CD-4's budget-limiter layer — the one the charge itself executes against
+    /// — has no readback at all here. CD-8's cell-retention layer has one, but
+    /// it is 0024's own `read_state`, called by `lore-server` when it schedules
+    /// the retention pass, not by this connect-time attestation. A cell may run
+    /// the governed provider route with the retention layer absent; that is a
+    /// refusal at the scheduler, not at provider activation.
     #[test]
-    fn the_attestation_does_not_cover_the_budget_limiter_layer() {
-        assert_eq!(CELL_SCHEMA_LAYERS.len(), 5);
-        assert!(!ATTESTED_LAYERS.contains(&CellSchemaLayerId::BudgetLimiter));
+    fn the_attestation_covers_every_layer_with_a_readback_here() {
+        const UNATTESTED: [CellSchemaLayerId; 2] = [
+            CellSchemaLayerId::BudgetLimiter,
+            CellSchemaLayerId::CellRetention,
+        ];
+        assert_eq!(CELL_SCHEMA_LAYERS.len(), 6);
+        for excluded in UNATTESTED {
+            assert!(
+                !ATTESTED_LAYERS.contains(&excluded),
+                "layer {} is documented as unattested here but appears in ATTESTED_LAYERS",
+                excluded.label(),
+            );
+        }
         for layer in CELL_SCHEMA_LAYERS {
-            if layer.id != CellSchemaLayerId::BudgetLimiter {
+            if !UNATTESTED.contains(&layer.id) {
                 assert!(
                     ATTESTED_LAYERS.contains(&layer.id),
                     "layer {} must be attested or explicitly excluded",

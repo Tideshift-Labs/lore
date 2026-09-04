@@ -3014,6 +3014,7 @@ dependencies = [
  "lore-hashicorp",
  "lore-macro",
  "lore-notification",
+ "lore-object-dispatch",
  "lore-postgres",
  "lore-proto",
  "lore-revision",

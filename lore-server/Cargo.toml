@@ -68,6 +68,12 @@ opentelemetry_sdk = { workspace = true }
 lore-base = { workspace = true }
 lore-aws = { workspace = true }
 lore-postgres = { workspace = true }
+# WP-114 CD-8. `lore-server` is the composition root that schedules the cell
+# retention task, so it names the task, its settings and its readiness facet.
+# The boundary rule this respects is `lore-postgres`'s, not this crate's: that
+# crate must not depend on `lore-object-dispatch`, which is why the retention
+# client reaches here inside an opaque seam handle rather than as a pool.
+lore-object-dispatch = { workspace = true }
 lore-hashicorp = { workspace = true }
 lore-storage = { workspace = true }
 lore-revision = { workspace = true }

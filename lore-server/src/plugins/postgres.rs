@@ -26,6 +26,7 @@ use std::time::Duration;
 use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
+use lore_object_dispatch::cell_retention::CellRetentionSettings;
 use lore_postgres::domain::DatabaseIdentity;
 use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::fragments::BudgetPin;
@@ -210,6 +211,25 @@ pub struct FragmentProviderConfig {
     pub prune_terminal_retention_millis: Option<u64>,
     /// Consecutive non-progressing passes that flip the prune facet false.
     pub prune_stall_ticks: Option<u32>,
+    /// Whether WP-114 CD-8's cell-scale retention scheduler runs.
+    ///
+    /// Absent means enabled, on the same reasoning as `prune_enabled`: the
+    /// governed route is the only thing that writes the dispatch evidence rows
+    /// this removes, so if that route is on they accumulate, and CD-8 exists
+    /// precisely to refuse an unpruned evidence table. `false` is an operator
+    /// taking that growth on deliberately, for a dark or staging cell, for a
+    /// bounded time.
+    pub cell_retention_enabled: Option<bool>,
+    /// Milliseconds between retention passes.
+    pub cell_retention_interval_millis: Option<u64>,
+    /// Terminal requests one retention pass may take.
+    pub cell_retention_batch: Option<u32>,
+    /// How long a closed request is kept before it becomes a candidate. The
+    /// operator's window only: each row's own hard expiry is a separate replay
+    /// floor that no value here can shorten.
+    pub cell_retention_terminal_retention_millis: Option<u64>,
+    /// Consecutive non-progressing passes that flip the retention facet false.
+    pub cell_retention_stall_ticks: Option<u32>,
 }
 
 impl fmt::Debug for FragmentProviderConfig {
@@ -588,6 +608,37 @@ pub(crate) fn fragment_prune_settings(
         provider.prune_batch,
         provider.prune_terminal_retention_millis,
         provider.prune_stall_ticks,
+    )
+    .map(Some)
+    .map_err(|error| config_error(PLUGIN_NAME, error.to_string()))
+}
+
+/// The reviewed cell-retention settings for this cell, or `None` when no
+/// retention scheduler should run.
+///
+/// `None` covers all three inert cases with one answer, exactly as
+/// [`fragment_prune_settings`] does: no `fragment_provider` block, one that is
+/// `enabled = false`, and one with `cell_retention_enabled = false`. The first
+/// two opened no dispatch pool at all, so there is nothing to run a pass on;
+/// the third is an operator's explicit choice.
+///
+/// An out-of-bounds value is an `Err` here rather than a clamp, and it reaches
+/// the caller on the boot path, so a cell configured with one does not come up.
+pub(crate) fn cell_retention_settings(
+    config: &toml::Value,
+) -> Result<Option<CellRetentionSettings>, PluginError> {
+    let cfg = parse_config(PLUGIN_NAME, config)?;
+    let Some(provider) = cfg.fragment_provider.as_ref().filter(|p| p.enabled) else {
+        return Ok(None);
+    };
+    if provider.cell_retention_enabled == Some(false) {
+        return Ok(None);
+    }
+    CellRetentionSettings::new(
+        provider.cell_retention_interval_millis,
+        provider.cell_retention_batch,
+        provider.cell_retention_terminal_retention_millis,
+        provider.cell_retention_stall_ticks,
     )
     .map(Some)
     .map_err(|error| config_error(PLUGIN_NAME, error.to_string()))
@@ -1385,6 +1436,244 @@ bucket = "fragments"
             bound.acquire_timeout(),
             std::time::Duration::from_millis(250)
         );
+    }
+
+    // WP-114 CD-6/CD-8's settings-mapping wiring. `fragment_prune_settings` and
+    // `cell_retention_settings` are `pub(crate)`, so nothing outside this file
+    // can exercise them directly; both are covered here, in the same fixture
+    // style as the in-flight-put-bound tests above. Neither had a same-file
+    // unit test before this pass (`fragment_prune_settings` had none at all).
+
+    /// A fully valid, `enabled = true` `[fragment_provider]` block (every
+    /// field `enabled_fragment_provider_config` requires, mirroring
+    /// `heterogeneous_store_configuration_builds_the_exact_five_pool_inventory`'s
+    /// fixture below), with `extra` appended inside that same table.
+    ///
+    /// `parse_config` runs `enabled_fragment_provider_config` unconditionally
+    /// once `enabled = true`, regardless of which sub-feature a test actually
+    /// means to exercise, so a prune/retention-only test still needs every
+    /// dispatch/boundary/budget key present or it fails on
+    /// `dispatch_pool_max` before ever reaching the field under test.
+    fn enabled_fragment_provider_config(extra: &str) -> toml::Value {
+        let text = format!(
+            r#"
+url = "postgresql://immutable@db.example/cell"
+pool_max = 1
+[object_store]
+bucket = "fragments"
+endpoint_url = "https://objects.example.com"
+region = "us-test-1"
+timeout_millis = 5000
+[fragment_provider]
+enabled = true
+dispatch_postgres_url = "postgresql://dispatcher@db-alias.example/cell?sslmode=require"
+dispatch_ca_cert_path = "C:/secrets/dispatch-ca.pem"
+dispatch_pool_max = 5
+dispatch_connect_timeout_millis = 1000
+dispatch_acquire_timeout_millis = 1000
+dispatch_statement_timeout_millis = 2000
+dispatch_lock_timeout_millis = 3000
+provider_boundary_id = "cell.primary"
+endpoint_host = "objects.example.com"
+region = "us-test-1"
+budget_revision = "budget-v1"
+budget_fence = 7
+provider_late_effect_bound_millis = 60000
+{extra}
+"#
+        );
+        match toml::from_str(&text) {
+            Ok(config) => config,
+            Err(error) => panic!("fixture config must parse: {error}"),
+        }
+    }
+
+    #[test]
+    fn fragment_prune_settings_is_none_when_fragment_provider_is_absent() {
+        let config = immutable_config("");
+        assert!(
+            fragment_prune_settings(&config)
+                .expect("must not error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fragment_prune_settings_is_none_when_fragment_provider_is_disabled() {
+        let config = immutable_config("[fragment_provider]\nenabled = false\n");
+        assert!(
+            fragment_prune_settings(&config)
+                .expect("must not error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fragment_prune_settings_is_none_when_prune_enabled_is_false() {
+        let config = enabled_fragment_provider_config("prune_enabled = false");
+        assert!(
+            fragment_prune_settings(&config)
+                .expect("must not error")
+                .is_none()
+        );
+    }
+
+    /// `prune_enabled` omitted (as opposed to explicitly `false`) means
+    /// enabled, and every other key omitted takes the scheduler's own
+    /// defaults.
+    #[test]
+    fn fragment_prune_settings_defaults_when_enabled_with_no_other_keys() {
+        let config = enabled_fragment_provider_config("");
+        let settings = fragment_prune_settings(&config)
+            .expect("must not error")
+            .expect("an enabled block with no prune_enabled must produce settings");
+        assert_eq!(
+            settings,
+            crate::fragment_prune::FragmentPruneSettings::default()
+        );
+    }
+
+    /// Every explicit key lands on the field its name says, not a
+    /// transposed neighbor.
+    #[test]
+    fn fragment_prune_settings_threads_explicit_values_in_the_right_positions() {
+        let config = enabled_fragment_provider_config(
+            "prune_interval_millis = 5000\nprune_batch = 77\n\
+             prune_terminal_retention_millis = 90000\nprune_stall_ticks = 5",
+        );
+        let settings = fragment_prune_settings(&config)
+            .expect("must not error")
+            .expect("enabled settings must produce a value");
+        assert_eq!(settings.interval, Duration::from_millis(5_000));
+        assert_eq!(settings.batch, 77);
+        assert_eq!(settings.terminal_retention, Duration::from_millis(90_000));
+        assert_eq!(settings.stall_ticks, 5);
+    }
+
+    /// Each out-of-bounds key is refused, and named by its own field --
+    /// proves the four constructor arguments were not transposed en route
+    /// from the parsed config to `FragmentPruneSettings::new`.
+    #[test]
+    fn fragment_prune_settings_out_of_bounds_values_name_their_own_field() {
+        let cases = [
+            (
+                "prune_interval_millis = 999",
+                "fragment_provider.prune_interval_millis",
+            ),
+            ("prune_batch = 0", "fragment_provider.prune_batch"),
+            (
+                "prune_terminal_retention_millis = 0",
+                "fragment_provider.prune_terminal_retention_millis",
+            ),
+            (
+                "prune_stall_ticks = 0",
+                "fragment_provider.prune_stall_ticks",
+            ),
+        ];
+        for (bad_key, expected_field) in cases {
+            let config = enabled_fragment_provider_config(bad_key);
+            let error =
+                fragment_prune_settings(&config).expect_err(&format!("{bad_key} must be refused"));
+            assert!(
+                error.to_string().contains(expected_field),
+                "{bad_key} must be refused by name ({expected_field}), got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cell_retention_settings_is_none_when_fragment_provider_is_absent() {
+        let config = immutable_config("");
+        assert!(
+            cell_retention_settings(&config)
+                .expect("must not error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cell_retention_settings_is_none_when_fragment_provider_is_disabled() {
+        let config = immutable_config("[fragment_provider]\nenabled = false\n");
+        assert!(
+            cell_retention_settings(&config)
+                .expect("must not error")
+                .is_none()
+        );
+    }
+
+    /// Distinct from an absent `fragment_provider` block and from omitting
+    /// the key entirely: an operator's explicit opt-out, which
+    /// `cell_retention_settings` checks with `== Some(false)`, not a falsy
+    /// coercion of `Option<bool>`.
+    #[test]
+    fn cell_retention_settings_is_none_when_cell_retention_enabled_is_false() {
+        let config = enabled_fragment_provider_config("cell_retention_enabled = false");
+        assert!(
+            cell_retention_settings(&config)
+                .expect("must not error")
+                .is_none()
+        );
+    }
+
+    /// `cell_retention_enabled` omitted means enabled, on the same reasoning
+    /// as `prune_enabled` above, and every other key omitted takes
+    /// `CellRetentionSettings`' own defaults.
+    #[test]
+    fn cell_retention_settings_defaults_when_enabled_with_no_other_keys() {
+        let config = enabled_fragment_provider_config("");
+        let settings = cell_retention_settings(&config)
+            .expect("must not error")
+            .expect("an enabled block with no cell_retention_enabled must produce settings");
+        assert_eq!(settings, CellRetentionSettings::default());
+    }
+
+    /// Every explicit key lands on the field its name says, not a
+    /// transposed neighbor.
+    #[test]
+    fn cell_retention_settings_threads_explicit_values_in_the_right_positions() {
+        let config = enabled_fragment_provider_config(
+            "cell_retention_enabled = true\ncell_retention_interval_millis = 5000\n\
+             cell_retention_batch = 50\ncell_retention_terminal_retention_millis = 120000\n\
+             cell_retention_stall_ticks = 4",
+        );
+        let settings = cell_retention_settings(&config)
+            .expect("must not error")
+            .expect("enabled settings must produce a value");
+        assert_eq!(settings.interval, Duration::from_millis(5_000));
+        assert_eq!(settings.batch, 50);
+        assert_eq!(settings.terminal_retention, Duration::from_millis(120_000));
+        assert_eq!(settings.stall_ticks, 4);
+    }
+
+    /// Each out-of-bounds key is refused, and named by its own field --
+    /// proves the four constructor arguments were not transposed en route
+    /// from the parsed config to `CellRetentionSettings::new`.
+    #[test]
+    fn cell_retention_settings_out_of_bounds_values_name_their_own_field() {
+        let cases = [
+            (
+                "cell_retention_interval_millis = 999",
+                "cell_retention.interval_millis",
+            ),
+            ("cell_retention_batch = 0", "cell_retention.batch"),
+            (
+                "cell_retention_terminal_retention_millis = 0",
+                "cell_retention.terminal_retention_millis",
+            ),
+            (
+                "cell_retention_stall_ticks = 0",
+                "cell_retention.stall_ticks",
+            ),
+        ];
+        for (bad_key, expected_field) in cases {
+            let config = enabled_fragment_provider_config(bad_key);
+            let error =
+                cell_retention_settings(&config).expect_err(&format!("{bad_key} must be refused"));
+            assert!(
+                error.to_string().contains(expected_field),
+                "{bad_key} must be refused by name ({expected_field}), got {error}"
+            );
+        }
     }
 
     #[test]

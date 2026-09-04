@@ -9,6 +9,7 @@ pub mod drain;
 pub mod event_relay;
 pub mod execution_state;
 pub mod fragment_prune;
+pub mod fragment_retention;
 pub mod grpc;
 pub mod hooks;
 pub mod http;

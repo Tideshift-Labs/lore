@@ -78,6 +78,7 @@ mod tests {
             drain: None,
             event_relay: None,
             fragment_prune: None,
+            cell_retention: None,
         };
         let test_shared_state = ServerState {
             immutable_store,
@@ -109,6 +110,7 @@ mod tests {
             drain: None,
             event_relay: None,
             fragment_prune: None,
+            cell_retention: None,
         });
 
         let app = axum::Router::new().route(
@@ -137,6 +139,7 @@ mod tests {
             drain: Some(drain),
             event_relay: None,
             fragment_prune: None,
+            cell_retention: None,
         });
 
         let app = axum::Router::new().route(
@@ -165,6 +168,7 @@ mod tests {
             drain: Some(drain),
             event_relay: None,
             fragment_prune: None,
+            cell_retention: None,
         });
 
         let app = axum::Router::new().route(
@@ -196,6 +200,7 @@ mod tests {
             drain: Some(drain),
             event_relay: None,
             fragment_prune: None,
+            cell_retention: None,
         };
         let test_shared_state = ServerState {
             immutable_store,

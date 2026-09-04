@@ -29,6 +29,7 @@ use lore_base::runtime::runtime;
 use lore_base::runtime::runtime_with_settings;
 use lore_base::runtime::set_task_lifecycle_callback;
 use lore_base::version::LORE_LIBRARY_VERSION;
+use lore_postgres::domain::fragments::FragmentCellRetentionHandle;
 use lore_revision::cluster::topology::Topology;
 use lore_revision::environment::EnvironmentConfig;
 use lore_revision::lock::LockStore;
@@ -827,6 +828,9 @@ struct HttpSurfaceFacets {
     /// the reason the route exists: an undrained internal table is a condition
     /// an operator must see and a load balancer must not act on.
     fragment_prune: Option<Arc<crate::fragment_prune::FragmentPruneReadiness>>,
+    /// WP-114 CD-8's cell-scale retention facet, on the same route and by the
+    /// same rule as the prune facet above.
+    cell_retention: Option<Arc<lore_object_dispatch::cell_retention::CellRetentionReadiness>>,
 }
 
 async fn launch_http_server(
@@ -842,6 +846,7 @@ async fn launch_http_server(
         graceful_drain,
         event_relay,
         fragment_prune,
+        cell_retention,
     } = facets;
     LoreHttpServer::serve(
         settings,
@@ -852,6 +857,7 @@ async fn launch_http_server(
         crate::http::server::HealthFacets {
             event_relay,
             fragment_prune,
+            cell_retention,
         },
         async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
@@ -1058,10 +1064,14 @@ async fn configure_immutable_store_via_plugin(
     settings: &Settings,
     topology: Option<Arc<dyn Topology + Send + Sync>>,
     fragment_activation: Option<plugins::postgres::FragmentProviderActivation>,
-) -> Result<Arc<dyn ImmutableStore>> {
+) -> Result<(Arc<dyn ImmutableStore>, Option<FragmentCellRetentionHandle>)> {
     let mode = &settings.immutable_store.mode;
 
-    match mode.as_str() {
+    // Only the Postgres plugin path can produce a retention handle: it is the
+    // one mode that opens a dispatch pool, and only when the governed fragment
+    // route is enabled. Every other mode returns `None` rather than a facet it
+    // has nothing behind.
+    let store = match mode.as_str() {
         store_mode::LOCAL => {
             let local_settings = settings
                 .immutable_store
@@ -1113,14 +1123,22 @@ async fn configure_immutable_store_via_plugin(
                         .map_err(|e| {
                             anyhow!("Failed to create immutable store plugin '{mode}': {e}")
                         })?;
-                return Ok(Arc::new(store));
+                // Taken before the concrete store is erased behind the trait
+                // object: WP-114 CD-8's client is reachable only from the
+                // concrete Postgres store, and only on the coordinated route.
+                let cell_retention = store.cell_retention().map_err(|error| {
+                    anyhow!("Failed to take the cell retention client: {error}")
+                })?;
+                return Ok((Arc::new(store), cell_retention));
             }
 
             registry
                 .create_immutable_store(mode, &plugin_config)
                 .map_err(|e| anyhow!("Failed to create immutable store plugin '{mode}': {e}"))
         }
-    }
+    }?;
+
+    Ok((store, None))
 }
 
 fn resolved_postgres_store_config(settings: &Settings, store_type: &str) -> Result<toml::Value> {
@@ -1129,6 +1147,23 @@ fn resolved_postgres_store_config(settings: &Settings, store_type: &str) -> Resu
             "fragment_provider requires a resolved [plugins.postgres.{store_type}] configuration"
         )
     })
+}
+
+/// WP-114 CD-8's reviewed retention settings, or `None` on a cell that runs
+/// none.
+///
+/// Reads the same resolved immutable-store configuration as
+/// [`postgres_fragment_prune_settings`], and for the same reason: the
+/// `fragment_provider` block is where both schedulers' enablement is decided.
+fn postgres_cell_retention_settings(
+    settings: &Settings,
+) -> Result<Option<lore_object_dispatch::cell_retention::CellRetentionSettings>> {
+    if settings.immutable_store.mode != "postgres" {
+        return Ok(None);
+    }
+    let immutable_config = resolved_postgres_store_config(settings, "immutable_store")?;
+    plugins::postgres::cell_retention_settings(&immutable_config)
+        .map_err(|error| anyhow!("Invalid Postgres cell retention configuration: {error}"))
 }
 
 /// The prune scheduler's reviewed settings, or `None` on a cell that runs none.
@@ -2123,7 +2158,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         .map(lore_postgres::domain::fragments::FragmentProcessPoolInventory::validate)
         .transpose()
         .map_err(|error| anyhow!("Invalid Postgres process pool inventory: {error}"))?;
-    let (immutable_store, configured_domain) =
+    let (immutable_store, cell_retention_handle, configured_domain) =
         if let Some(process_pool_inventory) = fragment_process_pool_inventory {
             let configured_domain = crate::domain::configure_domain_context(&settings).await?;
             let coordinator = configured_domain
@@ -2145,16 +2180,16 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 process_pool_inventory,
                 expected_database_identity,
             );
-            let immutable_store = configure_immutable_store_via_plugin(
+            let (immutable_store, cell_retention_handle) = configure_immutable_store_via_plugin(
                 &plugin_registry,
                 &settings,
                 topology.clone(),
                 Some(fragment_activation),
             )
             .await?;
-            (immutable_store, configured_domain)
+            (immutable_store, cell_retention_handle, configured_domain)
         } else {
-            let immutable_store = configure_immutable_store_via_plugin(
+            let (immutable_store, cell_retention_handle) = configure_immutable_store_via_plugin(
                 &plugin_registry,
                 &settings,
                 topology.clone(),
@@ -2162,7 +2197,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             )
             .await?;
             let configured_domain = crate::domain::configure_domain_context(&settings).await?;
-            (immutable_store, configured_domain)
+            (immutable_store, cell_retention_handle, configured_domain)
         };
 
     // CR-029: the domain coordinator is built before mutable-store publication
@@ -2303,6 +2338,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // maintenance node runs neither.
     let mut fragment_prune_readiness: Option<Arc<crate::fragment_prune::FragmentPruneReadiness>> =
         None;
+    // WP-114 CD-8's facet, declared here for the same reason as the two above.
+    let mut cell_retention_readiness: Option<
+        Arc<lore_object_dispatch::cell_retention::CellRetentionReadiness>,
+    > = None;
 
     if !is_maintenance {
         // CR-032 / WP-119 Step B, in two halves.
@@ -2361,6 +2400,19 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             &mut endpoints,
             _shutdown_rx.clone(),
         );
+
+        // WP-114 CD-8, on the same drain signal and inert on the same cells.
+        // Unlike the prune this one can refuse startup: it proves the retention
+        // layer is installed before spawning, because a cell without it would
+        // fail every pass and report the reason only through the facet, several
+        // ticks later.
+        cell_retention_readiness = crate::fragment_retention::configure_cell_retention(
+            cell_retention_handle,
+            postgres_cell_retention_settings(&settings)?,
+            &mut endpoints,
+            _shutdown_rx.clone(),
+        )
+        .await?;
 
         // Build hook dispatcher: register build.rs-discovered hooks then config-provided hooks
         let hook_ctx = HookRegistrationContext {
@@ -2649,6 +2701,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                         graceful_drain,
                         event_relay: event_relay_readiness,
                         fragment_prune: fragment_prune_readiness,
+                        cell_retention: cell_retention_readiness,
                     },
                 )
             );

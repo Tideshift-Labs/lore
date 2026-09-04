@@ -193,6 +193,7 @@ pub use provider::FRAGMENT_PROVIDER_ATTEMPT_CLASSES;
 pub use provider::FRAGMENT_PROVIDER_INGRESS_CAP_BYTES;
 pub use provider::FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS;
 pub use provider::FragmentAttemptLedger;
+pub use provider::FragmentCellRetentionHandle;
 pub use provider::FragmentDatabaseIdentity;
 pub use provider::FragmentDatabaseIdentityError;
 pub use provider::FragmentDirectPutOperation;
