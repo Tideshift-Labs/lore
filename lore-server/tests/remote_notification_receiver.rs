@@ -645,3 +645,659 @@ async fn a_placement_move_observed_at_the_readiness_cas_retires_and_a_fresh_gene
     assert_eq!(retired.state, "retired");
     assert_eq!(ready.state, "ready");
 }
+
+// ---------------------------------------------------------------------------
+// 4. Resume from a captured/checkpointed position (WP-111 resume)
+// ---------------------------------------------------------------------------
+//
+// These four cases prove the receiver-side resume path this file's module
+// docs describe as still `TODO(WP-111)` at `03c7454`: a restart that finds
+// this identity's own generation already captured (and possibly baselined or
+// ready) must resume it -- never allocate a fresh generation and never
+// replay what a persisted checkpoint already proved -- while a placement
+// that moved out from under a stale generation must still retire it and
+// bootstrap a fresh one, exactly as a first-ever bootstrap does.
+//
+// Every discriminator below is deliberately picked so a plausible wrong
+// implementation fails a *specific* assertion rather than the suite merely
+// erroring:
+//   - the fresh `FakeDurableStream` in every case here is built with a
+//     `start_sequence` that disagrees with the correct resume position (900,
+//     6, or 3 below), so a resume that silently fell back to `capture_new`
+//     would be caught by `captured.start_sequence` alone, without needing to
+//     inspect `resume_from` directly;
+//   - case 4's gap sits strictly below `highest_seen`, so a resume that used
+//     `highest_seen + 1` instead of the checkpoint's own
+//     `contiguous_frontier + 1` would silently and permanently skip the gap
+//     rather than erroring -- the two candidate positions are chosen to
+//     differ (3 vs 5) so that bug is visible as a wrong `start_sequence`
+//     rather than a hang.
+
+/// A restart that finds its own generation already `ready`, with a real
+/// checkpoint behind it, must resume the SAME generation at the checkpoint's
+/// `contiguous_frontier + 1` -- never re-baseline, never re-apply the
+/// already-acknowledged range, and never allocate a new generation.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_restart_after_readiness_resumes_the_same_generation_past_the_checkpointed_frontier() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "resume-ready").await;
+    let url = namespace.pg_url().to_owned();
+    relay_harness::ensure_schema_bootstrapped(&url).await;
+    let pool = build_pool(&url, 8, &TlsConfig::default()).expect("build pool");
+    bootstrap_cell(&pool, CELL, "DURABLE-sfo3-cell-a", 8).await;
+
+    let store = PostgresReceiverStore::new(pool.clone(), CELL);
+
+    // The first receiver: a real bootstrap and a live steady-state loop that
+    // drains, applies, and acknowledges five events before this "process"
+    // stops.
+    let stream1 = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 1);
+    for ordinal in 1..=5u64 {
+        stream1.push_envelope(
+            i64::try_from(ordinal).unwrap(),
+            durable(0x9f, ordinal, None),
+        );
+    }
+    let target1 = RecordingInvalidationTarget::new();
+    let receiver1 = DurableReceiver::new(
+        &config(),
+        ReceiverRuntime {
+            store: Arc::new(store.clone()),
+            stream: Arc::new(stream1.clone()),
+            target: Arc::new(target1.clone()),
+        },
+    )
+    .expect("the test config declares a required receiver");
+    let readiness1 = receiver1.readiness();
+    let cancel1 = receiver1.cancellation_token();
+    let handle1 = lore_base::lore_spawn!(receiver1.run());
+
+    assert!(
+        wait_until(|| readiness1.is_ready(), Duration::from_secs(10)).await,
+        "the first generation must reach readiness having drained all five events"
+    );
+    cancel1.cancel();
+    tokio::time::timeout(Duration::from_secs(10), handle1)
+        .await
+        .expect("the first receiver task stops after cancellation")
+        .expect("the first receiver task does not panic")
+        .expect("run() never returns an Err");
+
+    assert_eq!(
+        target1
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, TargetCall::Apply { .. }))
+            .count(),
+        5,
+        "all five events were applied exactly once by the first generation"
+    );
+
+    // Independent proof: the real projection shows one ready generation with
+    // its frontier checkpointed at 5.
+    {
+        let client = pool.get().await.expect("checkout pool client");
+        let record = checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
+            .await
+            .expect("read checkpoint")
+            .expect("the first generation persisted a checkpoint before stopping");
+        assert_eq!(record.contiguous_frontier, 5);
+    }
+    let snapshot = store
+        .read_membership()
+        .await
+        .expect("read membership")
+        .expect("membership row present");
+    assert_eq!(snapshot.members.len(), 1);
+    assert_eq!(snapshot.members[0].state, "ready");
+
+    // The second "process": a fresh receiver over the SAME store and cell.
+    // The fake stream's own default start (999) deliberately disagrees with
+    // the correct resume position (6), so a resume that fell back to
+    // `capture_new` would be caught here rather than by inspecting the
+    // capture request directly.
+    let stream2 = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 999);
+    let target2 = RecordingInvalidationTarget::new();
+    let receiver2 = DurableReceiver::new(
+        &config(),
+        ReceiverRuntime {
+            store: Arc::new(store.clone()),
+            stream: Arc::new(stream2.clone()),
+            target: Arc::new(target2.clone()),
+        },
+    )
+    .expect("the test config declares a required receiver");
+
+    let mut session2 = receiver2
+        .bootstrap()
+        .await
+        .expect("a restart resumes the same generation rather than failing");
+
+    assert!(session2.ready);
+    assert_eq!(
+        session2.membership_generation, 1,
+        "the restart must resume generation 1, never allocate a new one"
+    );
+    assert_eq!(
+        session2.captured.start_sequence, 6,
+        "the resumed capture must start at the checkpointed frontier plus one, not the stream's \
+         own default and not the original capture position"
+    );
+    assert_eq!(
+        session2.contiguous_frontier(),
+        5,
+        "the resumed session's frontier must reconstruct exactly what was persisted"
+    );
+    assert_eq!(
+        stream2.captures(),
+        vec![(IDENTITY.to_string(), 1)],
+        "exactly one capture call, for the resumed generation"
+    );
+    assert!(
+        target2
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, TargetCall::Apply { .. }))
+            .count()
+            .eq(&0),
+        "sequences 1..=5 must never be re-applied across the resume boundary"
+    );
+
+    // Deliver the next event and prove the resumed session picks up exactly
+    // where the checkpoint left off.
+    stream2.push_envelope(6, durable(0x9f, 6, None));
+    assert_eq!(
+        receiver2.step(&mut session2).await,
+        StepOutcome::Applied,
+        "delivery resumes at 6"
+    );
+    assert_eq!(stream2.acked(), vec![6], "1..=5 are never re-acknowledged");
+    assert_eq!(
+        target2
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, TargetCall::Apply { .. }))
+            .count(),
+        1
+    );
+
+    let outcome = store
+        .report_checkpoint(&session2.checkpoint_report(IDENTITY))
+        .await
+        .expect("checkpoint report succeeds");
+    assert_eq!(
+        outcome,
+        CheckpointOutcome::Applied {
+            contiguous_frontier: 6
+        }
+    );
+
+    let client = pool.get().await.expect("checkout pool client");
+    let record = checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
+        .await
+        .expect("read checkpoint")
+        .expect("a checkpoint was persisted");
+    assert_eq!(record.contiguous_frontier, 6);
+
+    let snapshot = store
+        .read_membership()
+        .await
+        .expect("read membership")
+        .expect("membership row present");
+    assert_eq!(
+        snapshot.members.len(),
+        1,
+        "the resume must never create a second membership row for this identity"
+    );
+    assert_eq!(snapshot.members[0].state, "ready");
+}
+
+/// A restart that finds its own generation captured but never baselined (a
+/// crash between `record_capture` and `record_baseline`) must resume the
+/// SAME generation from the persisted captured position -- there is no
+/// checkpoint yet to derive a later one from -- and complete the remaining
+/// baseline, drain, and readiness steps fresh.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_restart_after_capture_but_before_baseline_resumes_from_the_captured_position() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "resume-captured").await;
+    let url = namespace.pg_url().to_owned();
+    relay_harness::ensure_schema_bootstrapped(&url).await;
+    let pool = build_pool(&url, 8, &TlsConfig::default()).expect("build pool");
+    let v0 = bootstrap_cell(&pool, CELL, "DURABLE-sfo3-cell-a", 8).await;
+
+    let store = PostgresReceiverStore::new(pool.clone(), CELL);
+
+    // Manually drive Step C exactly up through `record_capture`, simulating
+    // a crash before this generation ever took its baseline.
+    let MembershipCas::Applied {
+        membership_generation: gen1,
+        ..
+    } = store.join(IDENTITY, v0).await.expect("join answers")
+    else {
+        panic!("expected the join to apply");
+    };
+    match store
+        .record_capture(
+            IDENTITY,
+            gen1,
+            &CapturedPosition {
+                stream_identity: "DURABLE-sfo3-cell-a".to_string(),
+                stream_epoch: 8,
+                start_sequence: 900,
+            },
+        )
+        .await
+        .expect("capture answers")
+    {
+        MembershipCas::Applied { .. } => {}
+        other => panic!("expected the capture to apply: {other:?}"),
+    }
+
+    // The fake stream's own default (1) deliberately disagrees with the
+    // persisted captured position (900).
+    let stream2 = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 1);
+    let target2 = RecordingInvalidationTarget::new();
+    let receiver2 = DurableReceiver::new(
+        &config(),
+        ReceiverRuntime {
+            store: Arc::new(store.clone()),
+            stream: Arc::new(stream2.clone()),
+            target: Arc::new(target2.clone()),
+        },
+    )
+    .expect("the test config declares a required receiver");
+
+    let session2 = receiver2
+        .bootstrap()
+        .await
+        .expect("a restart resumes the captured-but-unbaselined generation");
+
+    assert!(session2.ready);
+    assert_eq!(
+        session2.membership_generation, gen1,
+        "the restart must reuse the generation that already captured, not allocate a new one"
+    );
+    assert_eq!(
+        session2.captured.start_sequence, 900,
+        "with no checkpoint yet, resume must use the persisted captured position, not the \
+         stream's own default"
+    );
+    assert_eq!(
+        session2.contiguous_frontier(),
+        899,
+        "nothing was ever drained before the crash, so the frontier starts one below the capture"
+    );
+    assert_eq!(
+        stream2.captures(),
+        vec![(IDENTITY.to_string(), gen1)],
+        "exactly one capture call for the resumed generation"
+    );
+    assert_eq!(
+        target2.baselines(),
+        1,
+        "the baseline was never taken before the crash and must be taken now"
+    );
+
+    // Independent proof against the real projection.
+    let snapshot = store
+        .read_membership()
+        .await
+        .expect("read membership")
+        .expect("membership row present");
+    assert_eq!(
+        snapshot.members.len(),
+        1,
+        "the resume must never leave a second row for this identity"
+    );
+    let member = &snapshot.members[0];
+    assert_eq!(member.membership_generation, gen1);
+    assert_eq!(member.state, "ready");
+    assert!(member.baseline_at.is_some());
+    let captured = member
+        .captured
+        .as_ref()
+        .expect("captured position is present");
+    assert_eq!(captured.start_sequence, 900);
+
+    let client = pool.get().await.expect("checkout pool client");
+    let record = checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, gen1)
+        .await
+        .expect("read checkpoint")
+        .expect("the resumed bootstrap persisted a checkpoint before claiming readiness");
+    assert_eq!(record.contiguous_frontier, 899);
+}
+
+/// A restart whose own captured generation's placement no longer matches the
+/// cell's current authoritative placement must not resume it -- a fresh
+/// generation captures anew at the current placement instead, exactly as a
+/// first-ever bootstrap into a moved placement does.
+///
+/// The stale generation is deliberately left as-is (`"joining"`, never
+/// touched again), not actively retired: `resumable_generation`'s epoch check
+/// (`receiver.rs`) returns `None` without calling any store method on it, and
+/// `receiver_store.rs`'s own module docs are explicit that retirement is
+/// Step C's affair via `readiness_cas` on a *live bootstrap attempt* for that
+/// generation or WP-119's separate hard-dead-member path -- never this
+/// receiver reaching back to tombstone a generation it decided not to touch.
+/// A bootstrap that resumed a placement-mismatched generation to explicitly
+/// retire it would need to attempt a capture and a drain against the WRONG
+/// broker to discover that, which is exactly the risk resuming exists to
+/// avoid.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_captured_generation_whose_placement_moved_is_not_resumed_and_a_fresh_generation_bootstraps()
+ {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "resume-moved").await;
+    let url = namespace.pg_url().to_owned();
+    relay_harness::ensure_schema_bootstrapped(&url).await;
+    let pool = build_pool(&url, 8, &TlsConfig::default()).expect("build pool");
+    let v0 = bootstrap_cell(&pool, CELL, "DURABLE-sfo3-cell-a", 8).await;
+
+    let store = PostgresReceiverStore::new(pool.clone(), CELL);
+
+    // Generation 1: captured and baselined at the OLD placement, but never
+    // reached readiness -- a resumable candidate under the same shape as the
+    // previous case.
+    let MembershipCas::Applied {
+        membership_generation: gen1,
+        membership_version: v1,
+    } = store.join(IDENTITY, v0).await.expect("join answers")
+    else {
+        panic!("expected the join to apply");
+    };
+    match store
+        .record_capture(
+            IDENTITY,
+            gen1,
+            &CapturedPosition {
+                stream_identity: "DURABLE-sfo3-cell-a".to_string(),
+                stream_epoch: 8,
+                start_sequence: 900,
+            },
+        )
+        .await
+        .expect("capture answers")
+    {
+        MembershipCas::Applied { .. } => {}
+        other => panic!("expected the capture to apply: {other:?}"),
+    }
+    match store
+        .record_baseline(IDENTITY, gen1)
+        .await
+        .expect("baseline answers")
+    {
+        MembershipCas::Applied { .. } => {}
+        other => panic!("expected the baseline to apply: {other:?}"),
+    }
+
+    // The placement moves before any restart is attempted.
+    let client = pool.get().await.expect("checkout pool client");
+    let moved =
+        membership::set_current_placement(&**client, CELL, "DURABLE-sfo3-cell-a-r2", 9, 2, v1)
+            .await
+            .expect("placement moves");
+    assert!(matches!(moved, MembershipCas::Applied { .. }));
+    drop(client);
+
+    // A fresh receiver, at the NEW placement. `resumable_generation` refuses
+    // generation 1 on the epoch check alone, so ONE bootstrap() call is
+    // enough to fall all the way through to a fresh join -- there is no
+    // failed attempt to retry here, unlike a genuine mid-bootstrap CAS race.
+    let stream2 = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a-r2", 9), 1);
+    let target2 = RecordingInvalidationTarget::new();
+    let receiver2 = DurableReceiver::new(
+        &config(),
+        ReceiverRuntime {
+            store: Arc::new(store.clone()),
+            stream: Arc::new(stream2.clone()),
+            target: Arc::new(target2.clone()),
+        },
+    )
+    .expect("the test config declares a required receiver");
+
+    let session2 = receiver2
+        .bootstrap()
+        .await
+        .expect("a fresh generation bootstraps despite the stale one's placement mismatch");
+
+    assert!(session2.ready);
+    assert_eq!(
+        session2.membership_generation,
+        gen1 + 1,
+        "a fresh generation bootstraps; the stale one is never resumed"
+    );
+    assert_eq!(
+        session2.captured.placement.stream_identity,
+        "DURABLE-sfo3-cell-a-r2"
+    );
+    assert_eq!(session2.captured.placement.stream_epoch, 9);
+    assert_eq!(
+        session2.captured.start_sequence, 1,
+        "the fresh generation captures new at the current placement's edge, never the stale \
+         generation's old position"
+    );
+    assert_eq!(
+        stream2.captures(),
+        vec![(IDENTITY.to_string(), gen1 + 1)],
+        "the stale generation is never asked to capture again"
+    );
+    assert_eq!(
+        target2.baselines(),
+        1,
+        "the fresh generation takes its own baseline"
+    );
+
+    let snapshot = store
+        .read_membership()
+        .await
+        .expect("read membership")
+        .expect("membership row present");
+    assert_eq!(snapshot.members.len(), 2);
+    let stale = snapshot
+        .members
+        .iter()
+        .find(|member| member.membership_generation == gen1)
+        .expect("generation 1's row is present");
+    let ready = snapshot
+        .members
+        .iter()
+        .find(|member| member.membership_generation == gen1 + 1)
+        .expect("generation 2's row is present");
+    assert_eq!(
+        stale.state, "joining",
+        "the mismatched generation is left exactly as it was -- captured and baselined but never \
+         reached; retiring it is not this receiver's job (see the test's own doc comment)"
+    );
+    assert_eq!(ready.state, "ready");
+}
+
+/// A checkpoint left with an unresolved broker-sequence gap must refuse the
+/// resume, even though the generation is otherwise eligible (captured, own
+/// identity, matching placement): a fresh generation captures anew instead,
+/// and the stale generation's own checkpoint record is left untouched.
+///
+/// `resumable_generation`'s own doc comment (`receiver.rs`) explains why: the
+/// projection records the frontier and the blockers, not the out-of-order
+/// acknowledgements above them, so a resumed frontier seeded at
+/// `contiguous_frontier + 1` would never see 4 acknowledged again (the broker
+/// does not redeliver an already-acknowledged sequence) and would stall at
+/// the gap forever. Starting a new generation is one generation more
+/// expensive and actually recovers.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_persisted_checkpoint_with_a_blocker_is_not_resumed_and_a_fresh_generation_bootstraps() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "resume-gap").await;
+    let url = namespace.pg_url().to_owned();
+    relay_harness::ensure_schema_bootstrapped(&url).await;
+    let pool = build_pool(&url, 8, &TlsConfig::default()).expect("build pool");
+    bootstrap_cell(&pool, CELL, "DURABLE-sfo3-cell-a", 8).await;
+
+    let store = PostgresReceiverStore::new(pool.clone(), CELL);
+
+    // Generation 1 reaches readiness first (with an empty, blocker-free
+    // checkpoint from its own bootstrap), then its OWN steady-state
+    // processing hits a broker-sequence gap it never resolves before the
+    // process stops -- a live receiver that is ready can still carry an
+    // unresolved blocker; `readiness_cas` only requires SOME checkpoint to
+    // exist at the current placement, not a blocker-free one.
+    let stream1 = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 1);
+    let target1 = RecordingInvalidationTarget::new();
+    let receiver1 = DurableReceiver::new(
+        &config(),
+        ReceiverRuntime {
+            store: Arc::new(store.clone()),
+            stream: Arc::new(stream1.clone()),
+            target: Arc::new(target1.clone()),
+        },
+    )
+    .expect("the test config declares a required receiver");
+    let mut session1 = receiver1.bootstrap().await.expect("bootstraps");
+    assert!(session1.ready);
+    assert_eq!(session1.contiguous_frontier(), 0);
+
+    // Ack 1 and 2 in order.
+    stream1.push_envelope(1, durable(0x9f, 1, None));
+    assert_eq!(receiver1.step(&mut session1).await, StepOutcome::Applied);
+    stream1.push_envelope(2, durable(0x9f, 2, None));
+    assert_eq!(receiver1.step(&mut session1).await, StepOutcome::Applied);
+    assert_eq!(session1.contiguous_frontier(), 2);
+
+    // Broker sequence 3 is never delivered before the crash; broker sequence
+    // 4 arrives and is acknowledged, but the frontier cannot advance past the
+    // gap at 3.
+    stream1.push_envelope(4, durable(0x9f, 3, None));
+    assert_eq!(receiver1.step(&mut session1).await, StepOutcome::Applied);
+    assert_eq!(
+        session1.contiguous_frontier(),
+        2,
+        "an acknowledgement above a gap must not advance the frontier"
+    );
+    assert!(session1.has_blockers());
+
+    let outcome = store
+        .report_checkpoint(&session1.checkpoint_report(IDENTITY))
+        .await
+        .expect("checkpoint report succeeds");
+    assert_eq!(
+        outcome,
+        CheckpointOutcome::Applied {
+            contiguous_frontier: 2
+        }
+    );
+    {
+        let client = pool.get().await.expect("checkout pool client");
+        let record = checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
+            .await
+            .expect("read checkpoint")
+            .expect("a checkpoint with the unresolved gap was persisted");
+        assert_eq!(record.contiguous_frontier, 2);
+        assert_eq!(
+            record.gaps,
+            vec![lore_postgres::domain::outbox::SequenceGap { from: 3, to: 3 }]
+        );
+        assert!(record.has_blockers());
+    }
+
+    // The fake stream's own default (1) is what a fresh `capture_new` would
+    // actually return, deliberately distinct from either candidate resume
+    // position (3, the gap, or 5, `highest_seen + 1`) so a wrong
+    // implementation that resumed anyway is caught by `start_sequence` alone.
+    let stream2 = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 1);
+    let target2 = RecordingInvalidationTarget::new();
+    let receiver2 = DurableReceiver::new(
+        &config(),
+        ReceiverRuntime {
+            store: Arc::new(store.clone()),
+            stream: Arc::new(stream2.clone()),
+            target: Arc::new(target2.clone()),
+        },
+    )
+    .expect("the test config declares a required receiver");
+
+    let session2 = receiver2
+        .bootstrap()
+        .await
+        .expect("a fresh generation bootstraps despite the stale one's unresolved gap");
+
+    assert!(session2.ready);
+    assert_eq!(
+        session2.membership_generation, 2,
+        "the gap-carrying generation is never resumed; a fresh one bootstraps"
+    );
+    assert_eq!(
+        session2.captured.start_sequence, 1,
+        "the fresh generation captures new, not at the gap and not at highest_seen + 1"
+    );
+    assert_eq!(session2.contiguous_frontier(), 0);
+    assert_eq!(
+        stream2.captures(),
+        vec![(IDENTITY.to_string(), 2)],
+        "the stale generation is never asked to capture again"
+    );
+    assert_eq!(
+        target2.baselines(),
+        1,
+        "the fresh generation takes its own baseline"
+    );
+
+    // Independent proof: generation 1's checkpoint is untouched (still
+    // carrying its gap), and generation 2 has its own clean one.
+    let client = pool.get().await.expect("checkout pool client");
+    let stale_record =
+        checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
+            .await
+            .expect("read checkpoint")
+            .expect("generation 1's checkpoint is untouched");
+    assert_eq!(stale_record.contiguous_frontier, 2);
+    assert_eq!(
+        stale_record.gaps,
+        vec![lore_postgres::domain::outbox::SequenceGap { from: 3, to: 3 }]
+    );
+    let fresh_record =
+        checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 2)
+            .await
+            .expect("read checkpoint")
+            .expect("generation 2 persisted its own checkpoint before claiming readiness");
+    assert_eq!(fresh_record.contiguous_frontier, 0);
+    assert!(fresh_record.gaps.is_empty());
+
+    let snapshot = store
+        .read_membership()
+        .await
+        .expect("read membership")
+        .expect("membership row present");
+    assert_eq!(snapshot.members.len(), 2);
+    let stale = snapshot
+        .members
+        .iter()
+        .find(|member| member.membership_generation == 1)
+        .expect("generation 1's row is present");
+    let ready = snapshot
+        .members
+        .iter()
+        .find(|member| member.membership_generation == 2)
+        .expect("generation 2's row is present");
+    assert_eq!(
+        stale.state, "ready",
+        "generation 1's own membership state is unaffected -- only its checkpoint carried the \
+         gap, and the resume decision never wrote to this row"
+    );
+    assert_eq!(ready.state, "ready");
+}

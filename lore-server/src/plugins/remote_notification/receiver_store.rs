@@ -40,6 +40,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use lore_postgres::domain::outbox::CheckpointOutcome;
+use lore_postgres::domain::outbox::CheckpointRecord;
 use lore_postgres::domain::outbox::CheckpointReport;
 use lore_postgres::domain::outbox::MembershipCas;
 use lore_postgres::domain::outbox::MembershipMember;
@@ -68,7 +69,7 @@ pub enum ReceiverStoreError {
     Rejected(String),
 }
 
-/// The receiver's six durable operations.
+/// The receiver's seven durable operations.
 #[async_trait]
 pub trait ReceiverStore: Send + Sync + std::fmt::Debug {
     /// The cell this store is scoped to.
@@ -130,6 +131,25 @@ pub trait ReceiverStore: Send + Sync + std::fmt::Debug {
         receiver_identity: &str,
         membership_generation: i64,
     ) -> Result<MembershipCas, ReceiverStoreError>;
+
+    /// Read back one generation's persisted frontier and blockers.
+    ///
+    /// The read that makes a resume possible. A generation that captured a
+    /// position and then crashed cannot rebuild its frontier from that
+    /// position — the broker does not redeliver a sequence the generation
+    /// already acknowledged — so the persisted projection is the only record
+    /// of what it proved. `None` is a generation that captured and never
+    /// reported, which resumes at its captured position instead.
+    ///
+    /// # Errors
+    /// [`ReceiverStoreError`] when the read could not complete.
+    async fn read_checkpoint(
+        &self,
+        stream_identity: &str,
+        stream_epoch: i64,
+        receiver_identity: &str,
+        membership_generation: i64,
+    ) -> Result<Option<CheckpointRecord>, ReceiverStoreError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +299,25 @@ impl ReceiverStore for PostgresReceiverStore {
         .await
         .map_err(classify)
     }
+
+    async fn read_checkpoint(
+        &self,
+        stream_identity: &str,
+        stream_epoch: i64,
+        receiver_identity: &str,
+        membership_generation: i64,
+    ) -> Result<Option<CheckpointRecord>, ReceiverStoreError> {
+        let client = self.pool.get().await.map_err(pool_error)?;
+        lore_postgres::domain::outbox::checkpoint::read_checkpoint(
+            &**client,
+            stream_identity,
+            stream_epoch,
+            receiver_identity,
+            membership_generation,
+        )
+        .await
+        .map_err(classify)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +365,11 @@ pub enum StoreCall {
         /// The generation the CAS was attempted for.
         membership_generation: i64,
     },
+    /// A persisted-checkpoint read back, as a resume performs.
+    ReadCheckpoint {
+        /// The generation the read was for.
+        membership_generation: i64,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -349,6 +393,27 @@ struct InMemoryState {
     calls: Vec<StoreCall>,
     overrides: Vec<Override>,
     frontier: Option<i64>,
+    /// The persisted projection, keyed the way Step C keys it.
+    ///
+    /// Whole records rather than the bare frontier, because a resume's
+    /// decision is made on the blockers as much as on the frontier: a
+    /// checkpoint carrying a gap or a park is deliberately not resumable, and
+    /// a fake that stored only the frontier could not tell the two apart.
+    checkpoints: Vec<CheckpointRecord>,
+}
+
+/// Replace the record on Step C's conflict target, or append a new one.
+fn upsert_checkpoint(checkpoints: &mut Vec<CheckpointRecord>, record: CheckpointRecord) {
+    let existing = checkpoints.iter_mut().find(|current| {
+        current.stream_identity == record.stream_identity
+            && current.stream_epoch == record.stream_epoch
+            && current.receiver_identity == record.receiver_identity
+            && current.membership_generation == record.membership_generation
+    });
+    match existing {
+        Some(current) => *current = record,
+        None => checkpoints.push(record),
+    }
 }
 
 impl InMemoryState {
@@ -396,6 +461,7 @@ impl InMemoryReceiverStore {
                 calls: Vec::new(),
                 overrides: Vec::new(),
                 frontier: None,
+                checkpoints: Vec::new(),
             })),
         }
     }
@@ -418,6 +484,33 @@ impl InMemoryReceiverStore {
         let mut state = self.lock();
         state.current_stream_identity = Some(stream_identity.to_string());
         state.current_stream_epoch = Some(stream_epoch);
+        self
+    }
+
+    /// Place one member row directly, as a previous process left it.
+    ///
+    /// The resume path reads member rows it did not write itself: a receiver
+    /// that captured a position and then restarted finds its own row already
+    /// there, and the whole decision turns on what that row says. Scripting a
+    /// [`ReceiverStore::join`] cannot produce one, because a join only ever
+    /// makes an uncaptured `joining` row.
+    ///
+    /// The generation counter moves past the seeded row, so a later join in
+    /// the same test allocates a fresh generation rather than colliding.
+    pub fn seed_member(&self, member: MembershipMember) -> &Self {
+        let mut state = self.lock();
+        state.next_generation = state.next_generation.max(member.membership_generation + 1);
+        state.members.push(member);
+        self
+    }
+
+    /// Place one persisted checkpoint directly, as a previous process left it.
+    ///
+    /// Deliberately does not move [`Self::projected_frontier`]: that accessor
+    /// answers "what did a report project", and a seeded row is state this
+    /// process never reported.
+    pub fn seed_checkpoint(&self, record: CheckpointRecord) -> &Self {
+        upsert_checkpoint(&mut self.lock().checkpoints, record);
         self
     }
 
@@ -684,6 +777,23 @@ impl ReceiverStore for InMemoryReceiverStore {
             });
         }
         state.frontier = Some(report.contiguous_frontier);
+        let now = SystemTime::UNIX_EPOCH;
+        upsert_checkpoint(
+            &mut state.checkpoints,
+            CheckpointRecord {
+                cell_id: self.cell_id.clone(),
+                stream_identity: report.stream_identity.clone(),
+                stream_epoch: report.stream_epoch,
+                receiver_identity: report.receiver_identity.clone(),
+                membership_generation: report.membership_generation,
+                membership_version: report.membership_version,
+                contiguous_frontier: report.contiguous_frontier,
+                gaps: report.gaps.clone(),
+                poison: report.poison.clone(),
+                reported_at: now,
+                projection_at: now,
+            },
+        );
         Ok(CheckpointOutcome::Applied {
             contiguous_frontier: report.contiguous_frontier,
         })
@@ -704,11 +814,73 @@ impl ReceiverStore for InMemoryReceiverStore {
             return scripted;
         }
         let mut state = self.lock();
-        // Step C refuses this CAS without a persisted checkpoint at the current
-        // placement, so the fake refuses it too: a baseline alone never marks a
-        // receiver caught up, and a fake that granted readiness anyway would
-        // let a receiver that skipped its checkpoint still pass its tests.
-        if state.frontier.is_none() {
+        // Step C's answers, in Step C's own order (`membership::readiness_cas`).
+        // The order is part of the contract this fake stands in for: a fake
+        // that reached the same verdicts by a different route would answer
+        // differently for a row that trips two of them at once, and a fake
+        // that skipped one outright would let a receiver reach readiness in a
+        // state the real store refuses. That matters more now that
+        // [`Self::seed_member`] can place a row this process never wrote.
+        let (member_state, captured, baselined) = {
+            let Some(member) = state.member_mut(receiver_identity, membership_generation) else {
+                return Ok(MembershipCas::GenerationNotFound);
+            };
+            (
+                member.state.clone(),
+                member.captured.clone(),
+                member.baseline_at.is_some(),
+            )
+        };
+        // A generation that is already ready is not rewritten. This is the
+        // shape a restart of a ready generation sees, and Step C answers it
+        // BEFORE rereading the placement.
+        if member_state == "ready" {
+            return Ok(MembershipCas::AlreadyRecorded);
+        }
+        if member_state != "joining" {
+            return Ok(MembershipCas::WrongState {
+                state: member_state,
+            });
+        }
+        let Some(captured) = captured else {
+            return Ok(MembershipCas::WrongState {
+                state: "joining (no captured position)".to_string(),
+            });
+        };
+        if !baselined {
+            return Ok(MembershipCas::WrongState {
+                state: "joining (no authoritative baseline)".to_string(),
+            });
+        }
+        // The fence the whole bootstrap order exists to reach: the placement
+        // this generation RECORDED, compared against the cell's current one.
+        // Step C retires the row on a mismatch.
+        if state.current_stream_identity.as_deref() != Some(captured.stream_identity.as_str())
+            || state.current_stream_epoch != Some(captured.stream_epoch)
+        {
+            let current_stream_identity = state.current_stream_identity.clone();
+            let current_stream_epoch = state.current_stream_epoch;
+            if let Some(member) = state.member_mut(receiver_identity, membership_generation) {
+                member.state = "retired".to_string();
+            }
+            state.membership_version += 1;
+            return Ok(MembershipCas::PlacementMoved {
+                current_stream_identity,
+                current_stream_epoch,
+            });
+        }
+        // Step C refuses this CAS without a persisted checkpoint for THIS
+        // generation at the current placement, so the fake refuses it too: a
+        // baseline alone never marks a receiver caught up, and a fake that
+        // granted readiness anyway would let a receiver that skipped its
+        // checkpoint still pass its tests.
+        let checkpointed = state.checkpoints.iter().any(|record| {
+            record.receiver_identity == receiver_identity
+                && record.membership_generation == membership_generation
+                && Some(record.stream_identity.as_str()) == state.current_stream_identity.as_deref()
+                && Some(record.stream_epoch) == state.current_stream_epoch
+        });
+        if !checkpointed {
             return Ok(MembershipCas::NoCheckpointAtCurrentPlacement);
         }
         let Some(member) = state.member_mut(receiver_identity, membership_generation) else {
@@ -721,6 +893,29 @@ impl ReceiverStore for InMemoryReceiverStore {
             membership_version,
             membership_generation,
         })
+    }
+
+    async fn read_checkpoint(
+        &self,
+        stream_identity: &str,
+        stream_epoch: i64,
+        receiver_identity: &str,
+        membership_generation: i64,
+    ) -> Result<Option<CheckpointRecord>, ReceiverStoreError> {
+        self.record(StoreCall::ReadCheckpoint {
+            membership_generation,
+        });
+        let state = self.lock();
+        Ok(state
+            .checkpoints
+            .iter()
+            .find(|record| {
+                record.stream_identity == stream_identity
+                    && record.stream_epoch == stream_epoch
+                    && record.receiver_identity == receiver_identity
+                    && record.membership_generation == membership_generation
+            })
+            .cloned())
     }
 }
 
@@ -771,10 +966,36 @@ mod tests {
         );
     }
 
+    /// Drive one generation through capture and baseline, so a readiness
+    /// compare-and-set reaches the checkpoint fence rather than stopping at an
+    /// earlier one.
+    async fn ready_to_cas(store: &InMemoryReceiverStore, receiver_identity: &str) {
+        store
+            .join(receiver_identity, 1)
+            .await
+            .expect("join answers");
+        store
+            .record_capture(
+                receiver_identity,
+                1,
+                &CapturedPosition {
+                    stream_identity: "DURABLE-sfo3-cell-a".to_string(),
+                    stream_epoch: 8,
+                    start_sequence: 900,
+                },
+            )
+            .await
+            .expect("capture answers");
+        store
+            .record_baseline(receiver_identity, 1)
+            .await
+            .expect("baseline answers");
+    }
+
     #[tokio::test]
     async fn a_scripted_outcome_is_consumed_once() {
         let store = InMemoryReceiverStore::new("sfo3-cell-a");
-        store.join("receiver-1", 1).await.expect("join answers");
+        ready_to_cas(&store, "receiver-1").await;
         store
             .report_checkpoint(&report(1, 2, 916))
             .await
@@ -799,11 +1020,54 @@ mod tests {
     #[tokio::test]
     async fn readiness_is_refused_without_a_checkpoint() {
         let store = InMemoryReceiverStore::new("sfo3-cell-a");
-        store.join("receiver-1", 1).await.expect("join answers");
+        ready_to_cas(&store, "receiver-1").await;
         assert_eq!(
             store.readiness_cas("receiver-1", 1).await,
             Ok(MembershipCas::NoCheckpointAtCurrentPlacement)
         );
+    }
+
+    /// A generation that has not captured cannot reach the checkpoint fence at
+    /// all. Step C answers `WrongState` first, and a fake that answered
+    /// `NoCheckpointAtCurrentPlacement` here would misreport which of the
+    /// bootstrap's ordered steps was actually missing.
+    #[tokio::test]
+    async fn readiness_before_a_capture_is_the_wrong_state_not_a_missing_checkpoint() {
+        let store = InMemoryReceiverStore::new("sfo3-cell-a");
+        store.join("receiver-1", 1).await.expect("join answers");
+        assert_eq!(
+            store.readiness_cas("receiver-1", 1).await,
+            Ok(MembershipCas::WrongState {
+                state: "joining (no captured position)".to_string(),
+            })
+        );
+    }
+
+    /// The fence the ordered bootstrap exists to reach, modelled: the
+    /// placement this generation RECORDED is compared against the cell's
+    /// current one, and a mismatch retires the row. Without this the fake
+    /// would grant readiness to a seeded generation Step C refuses, which is
+    /// exactly the shape [`InMemoryReceiverStore::seed_member`] makes easy to
+    /// build.
+    #[tokio::test]
+    async fn readiness_at_a_placement_that_moved_retires_rather_than_applying() {
+        let store = InMemoryReceiverStore::new("sfo3-cell-a");
+        ready_to_cas(&store, "receiver-1").await;
+        store
+            .report_checkpoint(&report(1, 2, 916))
+            .await
+            .expect("checkpoint answers");
+        store.set_current_placement("DURABLE-sfo3-cell-a-r2", 9);
+        assert!(matches!(
+            store.readiness_cas("receiver-1", 1).await,
+            Ok(MembershipCas::PlacementMoved { .. })
+        ));
+        let snapshot = store
+            .read_membership()
+            .await
+            .expect("read answers")
+            .expect("an installed cell has a snapshot");
+        assert_eq!(snapshot.members[0].state, "retired");
     }
 
     /// A join leaves an uncaptured `joining` row that a later bootstrap can

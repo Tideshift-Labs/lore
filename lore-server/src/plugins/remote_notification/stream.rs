@@ -585,6 +585,8 @@ struct FakeState {
     captures: Vec<(String, i64)>,
     capture_error: Option<StreamError>,
     ack_error: Option<StreamError>,
+    /// Answer every capture with this position, whatever was asked for.
+    forced_capture_start: Option<i64>,
 }
 
 /// A deterministic, in-process durable stream.
@@ -661,6 +663,20 @@ impl FakeDurableStream {
         self
     }
 
+    /// Answer every capture with `start_sequence`, ignoring what was asked
+    /// for.
+    ///
+    /// Models a gateway that does NOT echo a requested resume position
+    /// byte-exactly, which the contract forbids and
+    /// [`GrpcDurableStream::capture`] refuses. The receiver checks the echo
+    /// itself as well, because it is the component whose frontier a wrong
+    /// answer would overstate, and that check needs a source that can give a
+    /// wrong answer.
+    pub fn force_capture_start(&self, start_sequence: i64) -> &Self {
+        self.lock().forced_capture_start = Some(start_sequence);
+        self
+    }
+
     /// Make every [`DurableStreamSource::ack`] fail until cleared.
     pub fn fail_acks_with(&self, error: Option<StreamError>) -> &Self {
         self.lock().ack_error = error;
@@ -732,10 +748,13 @@ impl DurableStreamSource for FakeDurableStream {
         if request.placement != placement {
             return Err(StreamError::PlacementMoved { current: placement });
         }
+        let start_sequence = state
+            .forced_capture_start
+            .unwrap_or_else(|| request.resume_from.unwrap_or(self.start_sequence));
         Ok(CapturedStreamPosition {
             placement,
             placement_revision: request.placement_revision,
-            start_sequence: request.resume_from.unwrap_or(self.start_sequence),
+            start_sequence,
         })
     }
 

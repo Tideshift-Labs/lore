@@ -17,6 +17,26 @@
 //! | persist the frontier and blockers | a readiness claim with no checkpoint behind it |
 //! | readiness compare-and-set | a placement that moved while all of the above was happening |
 //!
+//! # Resuming an existing generation
+//!
+//! A process restart does not always cost a generation. When this receiver's
+//! own highest generation already captured a position, is not retired or
+//! draining, and its captured identity and epoch still equal the cell's
+//! authoritative placement, the bootstrap resumes it: it reads that
+//! generation's PERSISTED frontier back through
+//! [`super::receiver_store::ReceiverStore::read_checkpoint`], captures with
+//! `captured_position` one past that frontier, takes a fresh baseline, and
+//! drains from there. It does not join, and it does not re-record the capture.
+//!
+//! The persisted frontier is the load-bearing part. The broker does not
+//! redeliver a sequence this generation already acknowledged, so a resume that
+//! rebuilt its frontier from the captured position would stall at the first
+//! such sequence forever. For the same reason a persisted checkpoint carrying
+//! a gap or a park is NOT resumed — the projection records blockers but not
+//! the acknowledgements above them — and those cases start a new generation
+//! exactly as they did before resume existed. Every other outcome of the
+//! ordered proof below is unchanged.
+//!
 //! The last one is why the order matters more than any single step. Step C's
 //! `readiness_cas` rereads the authoritative identity and epoch and succeeds
 //! only when both still equal the captured values, so a reset at *any* of the
@@ -65,6 +85,7 @@ use std::time::Instant;
 use lore_postgres::domain::outbox::CheckpointOutcome;
 use lore_postgres::domain::outbox::CheckpointReport;
 use lore_postgres::domain::outbox::MembershipCas;
+use lore_postgres::domain::outbox::MembershipSnapshot;
 use lore_postgres::domain::outbox::VersionOrder;
 use lore_postgres::domain::outbox::membership::CapturedPosition;
 use tokio_util::sync::CancellationToken;
@@ -366,6 +387,17 @@ impl ReceiverSession {
     }
 }
 
+/// A generation this bootstrap may resume rather than replace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResumableGeneration {
+    /// The generation to resume. Already joined, already captured.
+    membership_generation: i64,
+    /// The first sequence this bootstrap is responsible for: one past the
+    /// persisted contiguous frontier, or the captured position when this
+    /// generation never reported one.
+    start_sequence: i64,
+}
+
 /// The durable invalidation receiver.
 pub struct DurableReceiver {
     cell_id: String,
@@ -544,7 +576,20 @@ impl DurableReceiver {
         };
         let placement_revision = snapshot.state.current_placement_revision;
 
-        // 2. Take this generation. Reusing an uncaptured one is not an
+        // 2. Take this generation.
+        //
+        //    A restart is the first case. A generation that already captured a
+        //    position and whose captured identity and epoch still equal the
+        //    cell's authoritative placement is resumed rather than replaced,
+        //    which is the contract's crash-and-retry rule: "crash and retry
+        //    resume the same receiver generation and captured position only
+        //    while authoritative identity and epoch still match". Resuming
+        //    reads the generation's PERSISTED frontier back, because the broker
+        //    does not redeliver a sequence this generation already acknowledged
+        //    — a resume that rebuilt its frontier from the captured position
+        //    would stall at the first such sequence and never advance again.
+        //
+        //    Reusing an uncaptured one is the second case, and is not an
         //    optimisation.
         //
         //    A bootstrap that fails after the join leaves a `joining` row with
@@ -558,15 +603,13 @@ impl DurableReceiver {
         //    is byte-for-byte what a fresh join produces, so reusing ours is
         //    both correct and the only way to bound that.
         //
-        //    A generation that HAS captured is deliberately not reused: its
-        //    position is pinned and this seam has no way to resume a consumer
-        //    at a recorded position.
-        //
-        //    TODO(WP-111): resume a captured-but-not-ready generation once
-        //    WP-110 pins a receiver-side RPC, which is what would give
-        //    `DurableStreamSource` a resume-at-position operation. Until then
-        //    that path costs one generation, and only when the capture
-        //    succeeded and a later step failed.
+        //    A captured generation that is NOT resumable — a moved placement,
+        //    a retired or draining row, or a persisted checkpoint carrying a
+        //    blocker — falls through to the same fresh join, exactly as before.
+        let resumable = self
+            .resumable_generation(&snapshot, identity, &placement)
+            .await?;
+
         let reusable = snapshot
             .members
             .iter()
@@ -583,45 +626,59 @@ impl DurableReceiver {
         // bootstrap's own checkpoint report conflict every single time — a
         // guaranteed wasted round trip, and one that would hide a real
         // conflict behind an expected one.
-        let (cell_membership_version, membership_generation) = if let Some(member) = reusable {
-            debug!(
-                cell_id = %self.cell_id,
-                receiver_identity = %identity,
-                membership_generation = member.membership_generation,
-                "reusing this receiver's uncaptured generation rather than allocating another"
-            );
-            (cell_membership_version, member.membership_generation)
-        } else {
-            match self
-                .runtime
-                .store
-                .join(identity, cell_membership_version)
-                .await
-                .map_err(store_failure)?
-            {
-                MembershipCas::Applied {
-                    membership_version,
-                    membership_generation,
-                } => (membership_version, membership_generation),
-                MembershipCas::VersionConflict { .. } => {
-                    // Another replica joined between the read and the write.
-                    // The retry is cheap and correct: reread and allocate our
-                    // own.
-                    return Err(BootstrapFailure::Transient(REASON_BOOTSTRAPPING));
+        let (cell_membership_version, membership_generation, resume_from) =
+            if let Some(resume) = resumable {
+                info!(
+                    cell_id = %self.cell_id,
+                    receiver_identity = %identity,
+                    membership_generation = resume.membership_generation,
+                    start_sequence = resume.start_sequence,
+                    "resuming this receiver's captured generation from its persisted position"
+                );
+                (
+                    cell_membership_version,
+                    resume.membership_generation,
+                    Some(resume.start_sequence),
+                )
+            } else if let Some(member) = reusable {
+                debug!(
+                    cell_id = %self.cell_id,
+                    receiver_identity = %identity,
+                    membership_generation = member.membership_generation,
+                    "reusing this receiver's uncaptured generation rather than allocating another"
+                );
+                (cell_membership_version, member.membership_generation, None)
+            } else {
+                match self
+                    .runtime
+                    .store
+                    .join(identity, cell_membership_version)
+                    .await
+                    .map_err(store_failure)?
+                {
+                    MembershipCas::Applied {
+                        membership_version,
+                        membership_generation,
+                    } => (membership_version, membership_generation, None),
+                    MembershipCas::VersionConflict { .. } => {
+                        // Another replica joined between the read and the write.
+                        // The retry is cheap and correct: reread and allocate our
+                        // own.
+                        return Err(BootstrapFailure::Transient(REASON_BOOTSTRAPPING));
+                    }
+                    MembershipCas::CellUnknown => {
+                        return Err(BootstrapFailure::Rejected(format!(
+                            "cell {} is unknown to the outbox membership state",
+                            self.cell_id
+                        )));
+                    }
+                    other => {
+                        return Err(BootstrapFailure::Rejected(format!(
+                            "joining receiver {identity} answered {other:?}"
+                        )));
+                    }
                 }
-                MembershipCas::CellUnknown => {
-                    return Err(BootstrapFailure::Rejected(format!(
-                        "cell {} is unknown to the outbox membership state",
-                        self.cell_id
-                    )));
-                }
-                other => {
-                    return Err(BootstrapFailure::Rejected(format!(
-                        "joining receiver {identity} answered {other:?}"
-                    )));
-                }
-            }
-        };
+            };
         if membership_generation < i64::try_from(self.receiver.lifecycle_generation).unwrap_or(0) {
             warn!(
                 cell_id = %self.cell_id,
@@ -635,18 +692,11 @@ impl DurableReceiver {
 
         // 3. Capture the durable consumer's position, BEFORE the baseline.
         //
-        //    Always `capture_new`. Resuming a captured position is the
-        //    contract's crash/retry case and the wire supports it, but doing it
-        //    correctly needs this generation's PERSISTED frontier read back:
-        //    the broker does not redeliver a sequence this generation already
-        //    acknowledged, so a resume that rebuilt its frontier from the
-        //    capture would stall at the first such sequence and never advance
-        //    again. The reuse above is therefore restricted to generations that
-        //    never captured, where there is no frontier to lose.
-        //
-        //    TODO(WP-111): add `read_checkpoint` to `ReceiverStore` and resume
-        //    a captured generation from its persisted frontier, using
-        //    `CaptureRequest::resume_from`.
+        //    `capture_new` for a generation that never captured, and
+        //    `captured_position` for a resume. The gateway echoes a requested
+        //    resume position byte-exactly or fails the stream, so a resume
+        //    that returns a nearby position is a refusal rather than a silently
+        //    skipped event.
         let captured = self
             .runtime
             .stream
@@ -655,37 +705,73 @@ impl DurableReceiver {
                 membership_generation,
                 placement: placement.clone(),
                 placement_revision,
-                resume_from: None,
+                resume_from,
             })
             .await
             .map_err(stream_failure)?;
 
+        // 3b. The resume echo, checked HERE and not only in the transport.
+        //
+        //     The frontier this session reports is seeded from
+        //     `captured.start_sequence`, so a source that answered a resume
+        //     with a HIGHER position would have this generation claim every
+        //     sequence in between as proved, and WP-119's reaper would delete
+        //     rows nobody consumed. `GrpcDurableStream` already refuses a
+        //     mismatched echo, but `DurableStreamSource` is a trait and the
+        //     frontier guarantee belongs to the component that owns the
+        //     frontier. Retiring matches what the transport's own refusal
+        //     maps to.
+        if let Some(requested) = resume_from
+            && captured.start_sequence != requested
+        {
+            warn!(
+                cell_id = %self.cell_id,
+                receiver_identity = %identity,
+                membership_generation,
+                requested,
+                echoed = captured.start_sequence,
+                "the durable stream did not echo the requested resume position; retiring this \
+                 generation rather than trusting a position nothing pinned"
+            );
+            return Err(BootstrapFailure::Retired(REASON_PLACEMENT_MOVED));
+        }
+
         // 4. Record the capture. Step C refuses a second capture on one
         //    generation, so this is where the ordering becomes a shape.
-        match self
-            .runtime
-            .store
-            .record_capture(
-                identity,
-                membership_generation,
-                &CapturedPosition {
-                    stream_identity: captured.placement.stream_identity.clone(),
-                    stream_epoch: captured.placement.stream_epoch,
-                    start_sequence: captured.start_sequence,
-                },
-            )
-            .await
-            .map_err(store_failure)?
-        {
-            // The `membership_version` these two answers carry is the MEMBER
-            // row's column, stamped once at join and never updated — not the
-            // cell's live counter. `report_checkpoint` compares against the
-            // cell's, so adopting the member row's value here would send a
-            // version that is stale by construction the moment any other
-            // replica joins. The cell version read at step 1 is the right one,
-            // and a conflict on it is resolved where the conflict is reported.
-            MembershipCas::Applied { .. } | MembershipCas::AlreadyRecorded => {}
-            other => return Err(retire_on(other)),
+        //
+        //    A resume skips it. The capture it would record is this
+        //    generation's ALREADY RECORDED position — that is what made the
+        //    generation resumable — and the resume's own start sequence is one
+        //    past the persisted frontier rather than that position. Writing it
+        //    would answer `AlreadyRecorded` and change nothing, so the call is
+        //    not made rather than made and ignored.
+        if resume_from.is_none() {
+            match self
+                .runtime
+                .store
+                .record_capture(
+                    identity,
+                    membership_generation,
+                    &CapturedPosition {
+                        stream_identity: captured.placement.stream_identity.clone(),
+                        stream_epoch: captured.placement.stream_epoch,
+                        start_sequence: captured.start_sequence,
+                    },
+                )
+                .await
+                .map_err(store_failure)?
+            {
+                // The `membership_version` these two answers carry is the
+                // MEMBER row's column, stamped once at join and never updated —
+                // not the cell's live counter. `report_checkpoint` compares
+                // against the cell's, so adopting the member row's value here
+                // would send a version that is stale by construction the moment
+                // any other replica joins. The cell version read at step 1 is
+                // the right one, and a conflict on it is resolved where the
+                // conflict is reported.
+                MembershipCas::Applied { .. } | MembershipCas::AlreadyRecorded => {}
+                other => return Err(retire_on(other)),
+            }
         }
 
         // 5. The authoritative baseline, then 6. record it.
@@ -733,8 +819,19 @@ impl DurableReceiver {
         //    that had already captured, baselined, and drained, and cost
         //    another one, every time a second replica happened to join
         //    mid-bootstrap.
-        if let Err(BootstrapFailure::Transient(_)) = self.checkpoint(&mut session).await {
-            self.checkpoint(&mut session).await?;
+        //
+        //    Every OTHER failure propagates. It must: a `Retired` answer here
+        //    is Step C reporting that this generation's epoch moved, that a
+        //    successor replaced it, or that it is already retired, and the
+        //    readiness compare-and-set below cannot be relied on to catch any
+        //    of them — `readiness_cas` answers `AlreadyRecorded` for a row that
+        //    is already `ready` BEFORE it rereads the placement, so a resumed
+        //    generation whose checkpoint was refused would otherwise claim
+        //    readiness while every future checkpoint it sends is refused too.
+        match self.checkpoint(&mut session).await {
+            Ok(()) => {}
+            Err(BootstrapFailure::Transient(_)) => self.checkpoint(&mut session).await?,
+            Err(other) => return Err(other),
         }
 
         // 9. The readiness compare-and-set, which rereads the authoritative
@@ -750,6 +847,18 @@ impl DurableReceiver {
                 membership_version, ..
             } => {
                 session.membership_version = membership_version;
+                session.ready = true;
+            }
+            // A resumed generation that was already ready before the restart.
+            // Step C does not rewrite it and does not bump the cell's version,
+            // so the version read at step 1 (and adopted by the checkpoint
+            // above on a conflict) is still the current one. The generation is
+            // ready by the same proof it was ready by before: this bootstrap
+            // took a fresh baseline, drained from its persisted frontier, and
+            // reported a checkpoint that Step C accepted at the current
+            // placement — the checkpoint is what fences the epoch here, because
+            // this answer is returned before `readiness_cas` rereads it.
+            MembershipCas::AlreadyRecorded => {
                 session.ready = true;
             }
             MembershipCas::PlacementMoved { .. } => {
@@ -775,6 +884,126 @@ impl DurableReceiver {
             "durable invalidation receiver is ready"
         );
         Ok(session)
+    }
+
+    /// Decide whether this bootstrap resumes an existing generation.
+    ///
+    /// Reads the receiver's own highest generation and, when it qualifies,
+    /// the persisted frontier that generation proved. Returns `None` for
+    /// every case that must start a new generation, which is the behaviour
+    /// this seam had before resume existed.
+    ///
+    /// # Why a persisted blocker refuses the resume
+    ///
+    /// The projection records the frontier, the gaps, and the parks — not the
+    /// acknowledged sequences. Where there is no blocker that is a complete
+    /// record: [`AckFrontier`] closes every run that starts one past the
+    /// frontier as it acknowledges, so an empty gap and poison list means
+    /// nothing above the frontier was ever acknowledged, and
+    /// `AckFrontier::starting_at(frontier + 1)` reproduces the persisted state
+    /// exactly.
+    ///
+    /// A blocker breaks that. A gap is by construction below some
+    /// acknowledged sequence, and a park is normally below several, and none
+    /// of those acknowledgements survives in the projection. The broker will
+    /// not redeliver them, so a resumed frontier would stop at the first one
+    /// and never advance again — a permanent stall where starting a new
+    /// generation is merely one generation more expensive. A park is also
+    /// exactly the state an operator restarts a process to clear, and
+    /// resuming it would take that away.
+    ///
+    /// # Errors
+    /// [`BootstrapFailure`] when the checkpoint read could not complete. The
+    /// read is not optional: guessing "no checkpoint" from an unavailable
+    /// store would resume at the captured position and re-consume every
+    /// sequence this generation already proved.
+    async fn resumable_generation(
+        &self,
+        snapshot: &MembershipSnapshot,
+        identity: &str,
+        placement: &StreamPlacement,
+    ) -> Result<Option<ResumableGeneration>, BootstrapFailure> {
+        // A standing reset fence requires a REPLACEMENT generation with a
+        // newly captured identity, epoch, and position — that is what the fence
+        // is for, and `readiness_cas` clears it only on the transition to
+        // ready, which a resumed already-ready generation never makes. Today
+        // `accept_reset` also moves the placement and retires every member, so
+        // the two checks below would refuse the resume anyway; this one states
+        // the rule directly rather than leaving it a consequence of two others.
+        if snapshot.reset_in_progress {
+            return Ok(None);
+        }
+
+        // The receiver's own highest generation, and only that one. A lower
+        // generation cannot checkpoint at all — Step C answers `StaleGeneration`
+        // for anything but the greatest this identity holds.
+        let latest = snapshot
+            .members
+            .iter()
+            .filter(|member| member.receiver_identity == identity)
+            .max_by_key(|member| member.membership_generation);
+        let Some(latest) = latest else {
+            return Ok(None);
+        };
+        if latest.state != "joining" && latest.state != "ready" {
+            return Ok(None);
+        }
+        let Some(captured) = latest.captured.as_ref() else {
+            return Ok(None);
+        };
+        // The contract's own condition: a crash resumes the same generation and
+        // captured position ONLY while the authoritative identity and epoch
+        // still match. They do not, so this generation is retired by the same
+        // path a placement move takes.
+        if captured.stream_identity != placement.stream_identity
+            || captured.stream_epoch != placement.stream_epoch
+        {
+            debug!(
+                cell_id = %self.cell_id,
+                receiver_identity = %identity,
+                membership_generation = latest.membership_generation,
+                captured_epoch = captured.stream_epoch,
+                current_epoch = placement.stream_epoch,
+                "the captured generation is bound to a placement that moved; starting a new one"
+            );
+            return Ok(None);
+        }
+
+        let record = self
+            .runtime
+            .store
+            .read_checkpoint(
+                &captured.stream_identity,
+                captured.stream_epoch,
+                identity,
+                latest.membership_generation,
+            )
+            .await
+            .map_err(store_failure)?;
+
+        let start_sequence = match record {
+            Some(record) if record.has_blockers() => {
+                debug!(
+                    cell_id = %self.cell_id,
+                    receiver_identity = %identity,
+                    membership_generation = latest.membership_generation,
+                    gaps = record.gaps.len(),
+                    poison = record.poison.len(),
+                    "the captured generation's checkpoint carries a blocker; starting a new one"
+                );
+                return Ok(None);
+            }
+            // One past everything this generation proved.
+            Some(record) => record.contiguous_frontier.saturating_add(1),
+            // It captured and never reported, so the captured position is
+            // still the first sequence it is responsible for.
+            None => captured.start_sequence,
+        };
+
+        Ok(Some(ResumableGeneration {
+            membership_generation: latest.membership_generation,
+            start_sequence,
+        }))
     }
 
     /// Read every event from the captured position to the current edge.
@@ -1246,6 +1475,7 @@ mod tests {
                 StoreCall::Baseline { .. } => "baseline",
                 StoreCall::Checkpoint(_) => "checkpoint",
                 StoreCall::Readiness { .. } => "readiness",
+                StoreCall::ReadCheckpoint { .. } => "read_checkpoint",
             })
             .collect();
         assert_eq!(
@@ -1447,6 +1677,297 @@ mod tests {
             session.ready,
             "the fence stands because a replacement generation is required; refusing to \
              bootstrap under it would make the fence permanent"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Resuming a captured generation
+    //
+    // The live-Postgres suite in `tests/remote_notification_receiver.rs`
+    // proves the same behaviours against the real projection, but it is
+    // `#[ignore]`d. These run in the default tier, so a regression in the
+    // resume decision is caught by `cargo test -p lore-server` rather than
+    // only by someone who has a database.
+    // -----------------------------------------------------------------
+
+    /// One member row as a previous process would have left it.
+    fn seeded_member(
+        state: &str,
+        membership_generation: i64,
+        captured: Option<(&str, i64, i64)>,
+        baselined: bool,
+    ) -> lore_postgres::domain::outbox::MembershipMember {
+        lore_postgres::domain::outbox::MembershipMember {
+            receiver_identity: IDENTITY.to_string(),
+            membership_generation,
+            state: state.to_string(),
+            membership_version: 1,
+            captured: captured.map(|(stream_identity, stream_epoch, start_sequence)| {
+                CapturedPosition {
+                    stream_identity: stream_identity.to_string(),
+                    stream_epoch,
+                    start_sequence,
+                }
+            }),
+            baseline_at: baselined.then_some(std::time::SystemTime::UNIX_EPOCH),
+            ready_at: (state == "ready").then_some(std::time::SystemTime::UNIX_EPOCH),
+        }
+    }
+
+    /// One persisted checkpoint as a previous process would have left it.
+    fn seeded_checkpoint(
+        membership_generation: i64,
+        contiguous_frontier: i64,
+        gaps: Vec<lore_postgres::domain::outbox::SequenceGap>,
+    ) -> lore_postgres::domain::outbox::CheckpointRecord {
+        lore_postgres::domain::outbox::CheckpointRecord {
+            cell_id: CELL.to_string(),
+            stream_identity: "DURABLE-sfo3-cell-a".to_string(),
+            stream_epoch: 8,
+            receiver_identity: IDENTITY.to_string(),
+            membership_generation,
+            membership_version: 1,
+            contiguous_frontier,
+            gaps,
+            poison: Vec::new(),
+            reported_at: std::time::SystemTime::UNIX_EPOCH,
+            projection_at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn joined(store: &InMemoryReceiverStore) -> usize {
+        store
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, StoreCall::Join { .. }))
+            .count()
+    }
+
+    /// The whole point of the change: a restart resumes its own ready
+    /// generation one past the frontier it persisted, not at the stream's own
+    /// idea of where to start.
+    #[tokio::test]
+    async fn a_restart_resumes_its_captured_generation_past_the_persisted_frontier() {
+        // 999 is deliberately not a plausible resume position, so a fallback
+        // to `capture_new` is caught here rather than by reading the request.
+        let harness = harness(999);
+        harness
+            .store
+            .seed_member(seeded_member(
+                "ready",
+                1,
+                Some(("DURABLE-sfo3-cell-a", 8, 900)),
+                true,
+            ))
+            .seed_checkpoint(seeded_checkpoint(1, 905, Vec::new()));
+
+        let session = harness
+            .receiver
+            .bootstrap()
+            .await
+            .expect("a restart resumes rather than failing");
+
+        assert_eq!(session.membership_generation, 1);
+        assert_eq!(session.captured.start_sequence, 906);
+        assert_eq!(session.contiguous_frontier(), 905);
+        assert!(session.ready);
+        assert_eq!(joined(&harness.store), 0, "a resume never joins");
+        assert_eq!(harness.stream.captures(), vec![(IDENTITY.to_string(), 1)]);
+        assert!(
+            !harness
+                .store
+                .calls()
+                .iter()
+                .any(|call| matches!(call, StoreCall::Capture { .. })),
+            "a resume never re-records a capture it did not take"
+        );
+    }
+
+    /// A crash between `record_capture` and `record_baseline` leaves no
+    /// checkpoint to derive a later position from, so the captured position is
+    /// still the first sequence this generation owes.
+    #[tokio::test]
+    async fn a_restart_with_no_checkpoint_resumes_at_the_captured_position() {
+        let harness = harness(999);
+        harness.store.seed_member(seeded_member(
+            "joining",
+            1,
+            Some(("DURABLE-sfo3-cell-a", 8, 900)),
+            false,
+        ));
+
+        let session = harness.receiver.bootstrap().await.expect("resumes");
+
+        assert_eq!(session.membership_generation, 1);
+        assert_eq!(session.captured.start_sequence, 900);
+        assert_eq!(session.contiguous_frontier(), 899);
+        assert_eq!(joined(&harness.store), 0);
+        assert!(
+            harness
+                .target
+                .calls()
+                .iter()
+                .any(|call| matches!(call, TargetCall::Baseline)),
+            "a restarted process holds no belief a baseline established, so it takes one"
+        );
+    }
+
+    /// The finding the whole blocker rule exists for: the projection does not
+    /// record the acknowledgements above a gap, so resuming would stall the
+    /// frontier at it forever. A new generation is one generation more
+    /// expensive and actually recovers.
+    #[tokio::test]
+    async fn a_persisted_blocker_refuses_the_resume_and_a_new_generation_joins() {
+        let harness = harness(900);
+        harness
+            .store
+            .seed_member(seeded_member(
+                "ready",
+                1,
+                Some(("DURABLE-sfo3-cell-a", 8, 1)),
+                true,
+            ))
+            .seed_checkpoint(seeded_checkpoint(
+                1,
+                2,
+                vec![lore_postgres::domain::outbox::SequenceGap { from: 3, to: 3 }],
+            ));
+
+        let session = harness
+            .receiver
+            .bootstrap()
+            .await
+            .expect("bootstraps fresh");
+
+        assert_eq!(joined(&harness.store), 1, "a refused resume joins instead");
+        assert_ne!(session.membership_generation, 1);
+        assert_eq!(session.captured.start_sequence, 900);
+    }
+
+    /// The contract's own condition: a crash resumes the same generation only
+    /// while the authoritative identity and epoch still match.
+    #[tokio::test]
+    async fn a_captured_generation_whose_epoch_moved_is_not_resumed() {
+        let harness = harness(900);
+        harness.store.seed_member(seeded_member(
+            "ready",
+            1,
+            Some(("DURABLE-sfo3-cell-a", 7, 100)),
+            true,
+        ));
+
+        let session = harness
+            .receiver
+            .bootstrap()
+            .await
+            .expect("bootstraps fresh");
+
+        assert_eq!(joined(&harness.store), 1);
+        assert_ne!(session.membership_generation, 1);
+    }
+
+    /// A standing reset fence requires a replacement generation with a newly
+    /// captured identity, epoch, and position. Resuming would deny it one.
+    #[tokio::test]
+    async fn a_standing_reset_fence_refuses_the_resume() {
+        let harness = harness(900);
+        harness.store.set_reset_in_progress(true);
+        harness
+            .store
+            .seed_member(seeded_member(
+                "ready",
+                1,
+                Some(("DURABLE-sfo3-cell-a", 8, 900)),
+                true,
+            ))
+            .seed_checkpoint(seeded_checkpoint(1, 905, Vec::new()));
+
+        let session = harness
+            .receiver
+            .bootstrap()
+            .await
+            .expect("bootstraps fresh");
+
+        assert_eq!(joined(&harness.store), 1);
+        assert_ne!(session.membership_generation, 1);
+    }
+
+    /// A retired generation is never resumed, however complete its checkpoint.
+    #[tokio::test]
+    async fn a_retired_generation_is_not_resumed() {
+        let harness = harness(900);
+        harness
+            .store
+            .seed_member(seeded_member(
+                "retired",
+                1,
+                Some(("DURABLE-sfo3-cell-a", 8, 900)),
+                true,
+            ))
+            .seed_checkpoint(seeded_checkpoint(1, 905, Vec::new()));
+
+        let session = harness
+            .receiver
+            .bootstrap()
+            .await
+            .expect("bootstraps fresh");
+
+        assert_eq!(joined(&harness.store), 1);
+        assert_ne!(session.membership_generation, 1);
+    }
+
+    /// The frontier this session reports is seeded from what the source
+    /// answered, so a source that answers a resume with a HIGHER position
+    /// would have this generation claim sequences nobody acknowledged and
+    /// WP-119's reaper would delete rows nobody read. The receiver refuses it
+    /// rather than trusting one transport to have checked.
+    #[tokio::test]
+    async fn a_resume_position_the_stream_does_not_echo_retires() {
+        let harness = harness(900);
+        harness
+            .store
+            .seed_member(seeded_member(
+                "ready",
+                1,
+                Some(("DURABLE-sfo3-cell-a", 8, 900)),
+                true,
+            ))
+            .seed_checkpoint(seeded_checkpoint(1, 905, Vec::new()));
+        harness.stream.force_capture_start(4_000);
+
+        assert_eq!(
+            harness.receiver.bootstrap().await.err(),
+            Some(BootstrapFailure::Retired(REASON_PLACEMENT_MOVED))
+        );
+    }
+
+    /// A checkpoint refused for any reason other than a version conflict must
+    /// fail the bootstrap. `readiness_cas` answers `AlreadyRecorded` for a row
+    /// that is already ready BEFORE it rereads the placement, so a swallowed
+    /// refusal would let a resumed generation claim readiness while every
+    /// checkpoint it goes on to send is refused.
+    #[tokio::test]
+    async fn a_checkpoint_refused_as_stale_fails_the_resume_rather_than_reaching_readiness() {
+        let harness = harness(900);
+        harness
+            .store
+            .seed_member(seeded_member(
+                "ready",
+                1,
+                Some(("DURABLE-sfo3-cell-a", 8, 900)),
+                true,
+            ))
+            .seed_checkpoint(seeded_checkpoint(1, 905, Vec::new()));
+        harness
+            .store
+            .next_checkpoint(Ok(CheckpointOutcome::StaleGeneration {
+                current_membership_generation: 4,
+            }));
+
+        assert_eq!(
+            harness.receiver.bootstrap().await.err(),
+            Some(BootstrapFailure::Retired(REASON_PLACEMENT_MOVED)),
+            "a stale generation must not reach readiness through AlreadyRecorded"
         );
     }
 
