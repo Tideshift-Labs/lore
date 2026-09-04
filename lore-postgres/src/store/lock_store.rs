@@ -107,6 +107,20 @@ fn row_to_lock_data(row: &Row) -> LockData {
     }
 }
 
+// BLOCKED(WP-117): unfenced lock path reaches store/lock_store.rs directly;
+// events flow only when fenced routing is armed
+// (PUBLIC_MUTATION_CONTRACT_AVAILABLE, WP-120).
+//
+// Every method below is the production lock writer today, and none of them can
+// append a CR-032 `lock_namespace` event. `lore_locks` does carry a `fence`
+// column and both lock-generation columns — SCHEMA-117 added them — but this
+// store never writes or reads any of them, and it holds no lock-namespace row,
+// so it commits no version for an event to key on. The producer lives on
+// `domain::locks::PostgresLockCoordinator`, which writes the same table through
+// its own fenced SQL; see `lore-server/src/grpc/lock_service.rs`'s
+// `fenced_public_mutation_unavailable` for why the public RPCs cannot reach it
+// yet. Do not add an outbox append here — a second writer of the same rows
+// under a different lock discipline is exactly what CR-030 exists to end.
 #[async_trait]
 impl LockStore for PostgresLockStore {
     #[tracing::instrument(level = "debug", skip_all)]

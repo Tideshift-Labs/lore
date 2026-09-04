@@ -241,7 +241,7 @@ async fn acquire_lock_on_path(
             expected_ownership_token: None,
         }],
         lease_duration: None,
-        event: None,
+        outbox_cell_id: None,
     };
     let operation = prepare_bound_operation(
         store,

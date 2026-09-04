@@ -22,6 +22,7 @@ use crate::domain::lock_order::LockSequence;
 use crate::domain::lock_order::lock_branch;
 use crate::domain::lock_order::lock_repository;
 use crate::domain::outbox;
+use crate::domain::outbox::builders;
 use crate::domain::outbox::version::AggregateVersion;
 use crate::domain::receipts;
 use crate::domain::receipts::ConsumeResult;
@@ -95,8 +96,9 @@ pub struct AcquireOrRenewInput {
     pub resources: Vec<LockResourceInput>,
     /// Finite expiry, disabled in production until token-capable clients land.
     pub lease_duration: Option<Duration>,
-    /// Optional transaction-local outbox record.
-    pub event: Option<PendingEvent>,
+    /// Trusted cell identity to stamp on the classified outbox event, or
+    /// `None` to append none. See [`LockTransition`].
+    pub outbox_cell_id: Option<String>,
 }
 
 /// Token-checked normal release.
@@ -110,8 +112,9 @@ pub struct ReleaseInput {
     pub owner: VerifiedLockOwner,
     /// Atomic resource batch.
     pub resources: Vec<LockResourceInput>,
-    /// Optional transaction-local outbox record.
-    pub event: Option<PendingEvent>,
+    /// Trusted cell identity to stamp on the classified outbox event, or
+    /// `None` to append none. See [`LockTransition`].
+    pub outbox_cell_id: Option<String>,
 }
 
 /// Dark server-side force release. No current public RPC reaches it.
@@ -127,8 +130,129 @@ pub struct ForceReleaseInput {
     pub acting_owner: VerifiedLockOwner,
     /// Atomic token-bearing resource batch.
     pub resources: Vec<LockResourceInput>,
-    /// Optional transaction-local outbox record.
-    pub event: Option<PendingEvent>,
+    /// Trusted cell identity to stamp on the classified outbox event, or
+    /// `None` to append none. See [`LockTransition`].
+    pub outbox_cell_id: Option<String>,
+}
+
+/// Which pinned `lock_namespace` event kind one committed batch is.
+///
+/// CR-032 classifies a lock mutation as "Yes, once per committed logical lock
+/// batch", so a batch produces exactly one row and this enum is what decides
+/// which kind that row carries. The coordinator classifies rather than the
+/// caller for the same reason it resolves the ordinal itself: the answer
+/// depends on the rows it read under its own lock, and on the fence and token
+/// it minted inside its own transaction.
+///
+/// Two transitions the pinned set names deliberately produce nothing here:
+/// `cleanup_exact` changes no logical ownership (CR-032 "Expired-row cleanup
+/// that changes no logical ownership: No"), and a rejected or replayed
+/// admission commits no transition at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockTransition {
+    /// No resource in the batch was held by a current row, so every row this
+    /// batch wrote is a fresh hold. Covers a dark admin acquire over an absent
+    /// row, and a re-acquire of the caller's own row that is no longer current
+    /// — which renews nothing, because there was nothing live to renew.
+    Acquired,
+    /// At least one resource was held by a current row belonging to this exact
+    /// owner and token, so the batch extended a live hold.
+    ///
+    /// Deliberately "at least one" rather than "every". A token-bearing batch
+    /// can legitimately mix a current row with the caller's own row that has
+    /// since fallen out of currency, and requiring every resource to be current
+    /// classified that batch as a first acquire even though it renewed a live
+    /// lock.
+    Renewed,
+    /// At least one resource's existing row was not current and was held by a
+    /// different owner, so this batch changed ownership.
+    ///
+    /// "Not current" is [`row_is_current`]'s answer, so this covers an expired
+    /// lease **and** a row left behind by a lock-generation bump. Both are rows
+    /// no reader can observe as a live lock and both change ownership when the
+    /// batch overwrites them, which is what the pinned `lock.taken_over` kind
+    /// names; the classification is not narrower than the expiry case the
+    /// CR-032 row happens to word it as.
+    TakenOver,
+    /// The owner released.
+    Released,
+    /// An administrator released on the owner's behalf.
+    ForceReleased,
+}
+
+/// Canonical `aggregate_id` for the `lock_namespace` aggregate.
+///
+/// PIN(WP-117): the pinned value set says the lock aggregate's `aggregate_id`
+/// is "lock namespace, UTF-8", but a lock namespace is a
+/// `(repository_id, branch_id)` row with no name of its own
+/// (`lore_domain_lock_namespaces`), so the string has to be derived. It is the
+/// lowercase hex of the 16 repository bytes followed immediately by the
+/// lowercase hex of the 16 branch bytes: 64 characters, no separator.
+///
+/// Two properties this shape has and the obvious alternatives do not. It is
+/// **injective**, because both halves are fixed width, so no separator is
+/// needed to keep two different namespaces apart — and a separator would not
+/// fit anyway, since 64 characters is already exactly
+/// [`MAX_AGGREGATE_ID_BYTES`](crate::domain::outbox::append::MAX_AGGREGATE_ID_BYTES).
+/// And it is **stable**, because it names identities rather than the branch
+/// name, which can be up to 1,000 bytes — the same width trap CR-032's
+/// 2026-09-03 branch amendment resolved by moving the branch aggregate off the
+/// name and onto the 16-byte id.
+fn lock_namespace_id(repository_id: &[u8], branch_id: &[u8]) -> String {
+    let mut out = String::with_capacity(64);
+    out.push_str(&hex::encode(repository_id));
+    out.push_str(&hex::encode(branch_id));
+    out
+}
+
+/// Build the one classified event a committed lock batch owes.
+///
+/// `committed_fence` is always the `last_applied_fence` this transaction wrote.
+/// What `owner_token` means differs by path, and the difference is real rather
+/// than an inconsistency to be smoothed over:
+///
+/// * On **acquire, renew and takeover** the fence belongs to a row this
+///   transaction wrote, and the token is that same row's. The pair names one
+///   row.
+/// * On **release and force-release** the transaction deletes rows and then
+///   draws a fresh namespace fence that belongs to no row, so the token is the
+///   one the batch retired. The pair names the fence the namespace advanced to
+///   and the authority that was given up to advance it.
+///
+/// Both are the committed `last_applied_fence` a consumer compares, which is
+/// what the pinned ordinal is; only the identity's referent moves.
+fn build_lock_event(
+    cell_id: &str,
+    transition: LockTransition,
+    repository_id: &[u8],
+    branch_id: &[u8],
+    owner: &VerifiedLockOwner,
+    committed_fence: i64,
+    owner_token: &[u8],
+) -> Result<PendingEvent, DomainError> {
+    let namespace = lock_namespace_id(repository_id, branch_id);
+    let fence = u64::try_from(committed_fence).map_err(|_| {
+        DomainError::Internal(format!(
+            "lock outbox aggregate_version ordinal must be non-negative, got {committed_fence}"
+        ))
+    })?;
+    let owner = owner.authenticated_subject.as_str();
+    let build = match transition {
+        LockTransition::Acquired => builders::lock_acquired,
+        LockTransition::Renewed => builders::lock_renewed,
+        LockTransition::TakenOver => builders::lock_taken_over,
+        LockTransition::Released => builders::lock_released,
+        LockTransition::ForceReleased => builders::lock_force_released,
+    };
+    build(
+        cell_id,
+        repository_id,
+        branch_id,
+        &namespace,
+        owner,
+        fence,
+        owner_token,
+    )
 }
 
 /// One committed fenced lock returned by acquire/renew.
@@ -523,6 +647,37 @@ impl PostgresLockCoordinator {
             }
         }
 
+        // Classify the batch before the first mutation, while the rows read
+        // under the namespace lock still describe the pre-transition state.
+        // After the upsert loop every row looks like a fresh acquire.
+        //
+        // `acquire_or_renew_binding` refuses a batch that mixes tokenless and
+        // token-bearing resources, but it does NOT make every token-bearing
+        // resource current: a batch may legitimately hold one live row and one
+        // of the caller's own rows that has fallen out of currency. So the
+        // renewal test is "at least one current row", not "every resource is
+        // current" — the latter classified that batch as a first acquire.
+        let mut current_rows = 0usize;
+        let mut taken_over = false;
+        for resource in &resources {
+            match by_hash.get(&resource.resource_hash) {
+                Some(row) if row_is_current(row, &namespace, clock) => current_rows += 1,
+                // A stale-generation or expired row held by somebody else is
+                // the only shape that changes ownership here: a live foreign
+                // row was already refused above, and re-taking your own
+                // expired row is a fresh acquire, not a takeover.
+                Some(row) if !row.owner.ct_matches(&input.owner) => taken_over = true,
+                _ => {}
+            }
+        }
+        let transition = if taken_over {
+            LockTransition::TakenOver
+        } else if current_rows > 0 {
+            LockTransition::Renewed
+        } else {
+            LockTransition::Acquired
+        };
+
         for resource in &resources {
             let existing = by_hash.get(&resource.resource_hash);
             let fence = next_fence(&tx).await?;
@@ -564,12 +719,34 @@ impl PostgresLockCoordinator {
             .last()
             .map_or(namespace.last_applied_fence, |lock| lock.fence);
         update_namespace_fence(&tx, &input.repository_id, &input.branch_id, last_fence).await?;
+        // The ordinal is the fence this transaction committed and the identity
+        // is the ownership token of the row that fence belongs to, which is the
+        // last resource in the sorted batch — the same row `last_fence` came
+        // from.
+        //
+        // The `committed.last()` arm is defensive, not a reachable suppression:
+        // `sorted_resources` already refuses an empty batch, so a committed
+        // acquire always wrote at least one row. It is matched rather than
+        // indexed so that a future empty-batch path produces no event instead
+        // of an event keyed on `namespace.last_applied_fence` with no token.
+        let event = match (input.outbox_cell_id.as_deref(), committed.last()) {
+            (Some(cell_id), Some(last)) => Some(build_lock_event(
+                cell_id,
+                transition,
+                &input.repository_id,
+                &input.branch_id,
+                &input.owner,
+                last_fence,
+                &last.ownership_token,
+            )?),
+            _ => None,
+        };
         append_event(
             &tx,
             &mut sequence,
             &input.repository_id,
             repository.generation,
-            input.event.as_ref(),
+            event.as_ref(),
         )
         .await?;
         let outcome = DomainOutcome::Applied;
@@ -605,7 +782,7 @@ impl PostgresLockCoordinator {
             &input.owner,
             None,
             &input.resources,
-            input.event.as_ref(),
+            input.outbox_cell_id.as_deref(),
         )
         .await
     }
@@ -629,7 +806,7 @@ impl PostgresLockCoordinator {
             &input.target_owner,
             Some(&input.acting_owner),
             &input.resources,
-            input.event.as_ref(),
+            input.outbox_cell_id.as_deref(),
         )
         .await
     }
@@ -644,10 +821,20 @@ impl PostgresLockCoordinator {
         repository_id: &[u8],
         branch_id: &[u8],
         target: &VerifiedLockOwner,
-        _acting: Option<&VerifiedLockOwner>,
+        acting: Option<&VerifiedLockOwner>,
         resources: &[LockResourceInput],
-        event: Option<&PendingEvent>,
+        outbox_cell_id: Option<&str>,
     ) -> Result<LockMutationResult, DomainError> {
+        // The acting administrator is the one thing that distinguishes the two
+        // public entry points once they share this body, so it is also what
+        // classifies the event: `force_release` is the only caller that passes
+        // one. Reading the discriminator off the parameter keeps the two kinds
+        // from drifting apart the way two copies of this body would.
+        let transition = if acting.is_some() {
+            LockTransition::ForceReleased
+        } else {
+            LockTransition::Released
+        };
         validate_lock_target(operation, repository_id, branch_id, target)?;
         if resources.is_empty() {
             let mut client = self.checkout().await?;
@@ -767,12 +954,37 @@ impl PostgresLockCoordinator {
         }
         let fence = next_fence(&tx).await?;
         update_namespace_fence(&tx, repository_id, branch_id, fence).await?;
+        // A release commits a fresh namespace fence rather than a per-row one,
+        // so the identity half names the token this batch retired: the last
+        // ordered resource's, matching the acquire path's choice of the last
+        // ordered row. Every release resource carries a token by the check
+        // above, so the `ok_or_else` is a type-level obligation rather than a
+        // reachable state, and the `ordered.last()` arm is defensive for the
+        // same reason the acquire path's is: an empty batch already returned
+        // above, and `sorted_resources` refuses one anyway.
+        let event = match (outbox_cell_id, ordered.last()) {
+            (Some(cell_id), Some(last)) => {
+                let token = last.expected_ownership_token.ok_or_else(|| {
+                    DomainError::Internal("release token vanished after validation".to_owned())
+                })?;
+                Some(build_lock_event(
+                    cell_id,
+                    transition,
+                    repository_id,
+                    branch_id,
+                    target,
+                    fence,
+                    &token,
+                )?)
+            }
+            _ => None,
+        };
         append_event(
             &tx,
             &mut sequence,
             repository_id,
             repository.generation,
-            event,
+            event.as_ref(),
         )
         .await?;
         let outcome = DomainOutcome::Applied;
@@ -941,6 +1153,13 @@ impl PostgresLockCoordinator {
     /// no reader can observe as a live lock anyway, so removing it changes
     /// nothing a witness reports. Widening that predicate to any current row
     /// would break the witness contract, not merely this method.
+    ///
+    /// It appends **no** outbox event, and that follows from the same property:
+    /// CR-032 classifies "Expired-row cleanup that changes no logical
+    /// ownership" as emitting no row, and the `WHERE` clause above is exactly
+    /// what makes that true here. If the predicate is ever widened to reach a
+    /// current row, this method starts changing logical ownership and owes a
+    /// [`LockTransition`] event; the two changes belong together.
     pub async fn cleanup_exact(
         &self,
         repository_id: &[u8],

@@ -32,6 +32,7 @@ use lore_postgres::domain::locks::acquire_or_renew_binding;
 use lore_postgres::domain::locks::force_release_binding;
 use lore_postgres::domain::locks::lock_tenant_scope_key;
 use lore_postgres::domain::locks::release_binding;
+use lore_postgres::domain::outbox::version::AggregateVersion;
 use lore_postgres::domain::receipts::MARKER_SAFETY_EPSILON;
 use lore_postgres::domain::receipts::NORMAL_FUTURE_SKEW;
 use lore_postgres::domain::receipts::OperationBinding;
@@ -223,7 +224,7 @@ fn acquire_input(
         acting_owner: None,
         resources,
         lease_duration,
-        event: None,
+        outbox_cell_id: None,
     }
 }
 
@@ -266,6 +267,827 @@ fn assert_rejection(
 ) {
     assert_eq!(result.rejection, Some(expected), "result={result:?}");
     assert!(matches!(result.outcome, DomainOutcome::NotApplied { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// CR-032 / WP-119 Part L: `lock_namespace` outbox producers.
+//
+// `PostgresLockCoordinator::acquire_or_renew`/`release`/`force_release` build
+// and append their one classified event internally (`LockTransition`,
+// `build_lock_event` in `lore-postgres/src/domain/locks/coordinator.rs`) when
+// `outbox_cell_id` is supplied; the caller never constructs the event. These
+// tests drive that classification end to end against real Postgres.
+
+fn outbox_cell_id() -> String {
+    format!("wp119-lock-{:08x}", rand::random::<u32>())
+}
+
+/// The pinned `lock_namespace` `aggregate_id`: lowercase hex of the 16
+/// repository bytes immediately followed by lowercase hex of the 16 branch
+/// bytes, per `lock_namespace_id` in the coordinator.
+fn lock_namespace_aggregate_id(repository_id: &[u8; 16], branch_id: &[u8; 16]) -> Vec<u8> {
+    let mut out = String::with_capacity(64);
+    for byte in repository_id.iter().chain(branch_id.iter()) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out.into_bytes()
+}
+
+async fn outbox_row_count_for_repository(client: &Client, repository_id: &[u8]) -> i64 {
+    client
+        .query_one(
+            "SELECT count(*) FROM lore_outbox_events WHERE repository_id = $1",
+            &[&repository_id],
+        )
+        .await
+        .expect("count outbox rows for repository")
+        .get(0)
+}
+
+struct LockOutboxRow {
+    event_kind: String,
+    aggregate_kind: String,
+    aggregate_id: Vec<u8>,
+    aggregate_version: Vec<u8>,
+    cell_id: String,
+}
+
+async fn one_outbox_row_for_repository(client: &Client, repository_id: &[u8]) -> LockOutboxRow {
+    let row = client
+        .query_one(
+            "SELECT event_kind, aggregate_kind, aggregate_id, aggregate_version, cell_id \
+             FROM lore_outbox_events WHERE repository_id = $1",
+            &[&repository_id],
+        )
+        .await
+        .expect("exactly one outbox row for repository");
+    LockOutboxRow {
+        event_kind: row.get("event_kind"),
+        aggregate_kind: row.get("aggregate_kind"),
+        aggregate_id: row.get("aggregate_id"),
+        aggregate_version: row.get("aggregate_version"),
+        cell_id: row.get("cell_id"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn a_fresh_acquire_commits_exactly_one_lock_acquired_row_with_the_fence_and_owner_token() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let coordinator = store.lock_coordinator();
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let lock_owner = owner("https://issuer.example", "wp119-acquire");
+    let hash: [u8; 32] = rand::random();
+    let cell_id = outbox_cell_id();
+
+    let mut input = acquire_input(
+        &repository_id,
+        &branch_id,
+        lock_owner.clone(),
+        vec![resource(hash, None)],
+        None,
+    );
+    input.outbox_cell_id = Some(cell_id.clone());
+    let operation = prepare_bound_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&input).expect("valid acquire binding"),
+    )
+    .await;
+    let result = coordinator
+        .acquire_or_renew(&operation, &input)
+        .await
+        .expect("fresh acquire must succeed");
+    assert_eq!(result.outcome, DomainOutcome::Applied);
+    assert_eq!(result.locks.len(), 1);
+    let lock = &result.locks[0];
+
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        1
+    );
+    let row = one_outbox_row_for_repository(&db, &repository_id).await;
+    assert_eq!(row.event_kind, "lock.acquired");
+    assert_eq!(row.aggregate_kind, "lock_namespace");
+    assert_eq!(row.cell_id, cell_id);
+    assert_eq!(
+        row.aggregate_id,
+        lock_namespace_aggregate_id(&repository_id, &branch_id)
+    );
+    let decoded = AggregateVersion::decode(&row.aggregate_version).expect("decode");
+    assert_eq!(
+        decoded.ordinal,
+        u64::try_from(lock.fence).expect("fence fits u64"),
+        "ordinal must be the fence read back from the committed lock row, not a caller value"
+    );
+    assert_eq!(
+        decoded.identity, lock.ownership_token,
+        "identity must be the owner token minted inside the transaction"
+    );
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn a_same_owner_renewal_commits_exactly_one_lock_renewed_row_with_the_new_fence_and_token() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let coordinator = store.lock_coordinator();
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let lock_owner = owner("https://issuer.example", "wp119-renew");
+    let hash: [u8; 32] = rand::random();
+
+    // First acquire with no cell id supplied: proves an unclassified batch
+    // leaves no row, and gives the renewal something real to renew.
+    let held = acquire_one(&store, &lock_owner, &repository_id, &branch_id, hash, None).await;
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        0,
+        "an acquire with no outbox_cell_id must append nothing"
+    );
+
+    let cell_id = outbox_cell_id();
+    let mut input = acquire_input(
+        &repository_id,
+        &branch_id,
+        lock_owner.clone(),
+        vec![resource(hash, Some(held.ownership_token))],
+        None,
+    );
+    input.outbox_cell_id = Some(cell_id.clone());
+    let operation = prepare_bound_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&input).expect("valid renew binding"),
+    )
+    .await;
+    let result = coordinator
+        .acquire_or_renew(&operation, &input)
+        .await
+        .expect("renewal by the same owner must succeed");
+    assert_eq!(result.outcome, DomainOutcome::Applied);
+    let renewed = &result.locks[0];
+    assert_ne!(
+        renewed.ownership_token, held.ownership_token,
+        "test fixture sanity: every committed row mints a fresh token, including a renewal"
+    );
+
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        1
+    );
+    let row = one_outbox_row_for_repository(&db, &repository_id).await;
+    assert_eq!(row.event_kind, "lock.renewed");
+    let decoded = AggregateVersion::decode(&row.aggregate_version).expect("decode");
+    assert_eq!(
+        decoded.ordinal,
+        u64::try_from(renewed.fence).expect("fence fits u64")
+    );
+    assert_eq!(decoded.identity, renewed.ownership_token);
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn an_expiry_takeover_by_a_different_owner_commits_exactly_one_lock_taken_over_row_with_the_successors_fence()
+ {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let coordinator = store.lock_coordinator();
+    let (repository_id, branch_id) = create_repository(&store).await;
+    coordinator
+        .backfill(&BackfillIssuerMap::new())
+        .await
+        .expect("empty backfill");
+    coordinator
+        .enable_fencing_for_component_fixture(true)
+        .await
+        .expect("enable finite leases in test fixture");
+    let owner_a = owner("https://issuer.example", "wp119-predecessor");
+    let owner_b = owner("https://issuer.example", "wp119-successor");
+    let hash: [u8; 32] = rand::random();
+
+    let predecessor = acquire_one(
+        &store,
+        &owner_a,
+        &repository_id,
+        &branch_id,
+        hash,
+        Some(Duration::from_millis(40)),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(90)).await;
+
+    let cell_id = outbox_cell_id();
+    let mut input = acquire_input(
+        &repository_id,
+        &branch_id,
+        owner_b.clone(),
+        vec![resource(hash, None)],
+        Some(Duration::from_secs(2)),
+    );
+    input.outbox_cell_id = Some(cell_id.clone());
+    let operation = prepare_bound_operation(
+        &store,
+        &owner_b,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&input).expect("valid takeover binding"),
+    )
+    .await;
+    let result = coordinator
+        .acquire_or_renew(&operation, &input)
+        .await
+        .expect("takeover of an expired lock must succeed");
+    assert_eq!(result.outcome, DomainOutcome::Applied);
+    let successor = &result.locks[0];
+    assert_ne!(successor.fence, predecessor.fence);
+
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        1
+    );
+    let row = one_outbox_row_for_repository(&db, &repository_id).await;
+    assert_eq!(row.event_kind, "lock.taken_over");
+    let decoded = AggregateVersion::decode(&row.aggregate_version).expect("decode");
+    assert_eq!(
+        decoded.ordinal,
+        u64::try_from(successor.fence).expect("fence fits u64"),
+        "ordinal must be the successor's committed fence, not the predecessor's"
+    );
+    assert_eq!(decoded.identity, successor.ownership_token);
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn owner_release_and_admin_force_release_each_commit_their_pinned_kind() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let coordinator = store.lock_coordinator();
+
+    // -- normal, owner-initiated release --
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let lock_owner = owner("https://issuer.example", "wp119-release");
+    let hash: [u8; 32] = rand::random();
+    let held = acquire_one(&store, &lock_owner, &repository_id, &branch_id, hash, None).await;
+
+    let cell_id = outbox_cell_id();
+    let release_input = ReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        owner: lock_owner.clone(),
+        resources: vec![resource(hash, Some(held.ownership_token))],
+        outbox_cell_id: Some(cell_id.clone()),
+    };
+    let release_op = prepare_bound_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        release_binding(&release_input).expect("valid release binding"),
+    )
+    .await;
+    let released = coordinator
+        .release(&release_op, &release_input)
+        .await
+        .expect("owner release must succeed");
+    assert_eq!(released.outcome, DomainOutcome::Applied);
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        1
+    );
+    let row = one_outbox_row_for_repository(&db, &repository_id).await;
+    assert_eq!(row.event_kind, "lock.released");
+    assert_eq!(row.cell_id, cell_id);
+    let decoded = AggregateVersion::decode(&row.aggregate_version).expect("decode");
+    assert_eq!(decoded.identity, held.ownership_token);
+
+    // -- dark administrative force release, a fresh repository/lock --
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let target = owner("https://issuer.example", "wp119-force-target");
+    let admin = owner("https://issuer.example", "wp119-force-admin");
+    let hash: [u8; 32] = rand::random();
+    let held = acquire_one(&store, &target, &repository_id, &branch_id, hash, None).await;
+
+    let force_cell_id = outbox_cell_id();
+    let force_input = ForceReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        target_owner: target,
+        acting_owner: admin.clone(),
+        resources: vec![resource(hash, Some(held.ownership_token))],
+        outbox_cell_id: Some(force_cell_id.clone()),
+    };
+    let force_op = prepare_bound_operation(
+        &store,
+        &admin,
+        &repository_id,
+        &branch_id,
+        force_release_binding(&force_input).expect("valid force-release binding"),
+    )
+    .await;
+    let forced = coordinator
+        .force_release(&force_op, &force_input)
+        .await
+        .expect("admin force release must succeed");
+    assert_eq!(forced.outcome, DomainOutcome::Applied);
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        1
+    );
+    let row = one_outbox_row_for_repository(&db, &repository_id).await;
+    assert_eq!(row.event_kind, "lock.force_released");
+    assert_eq!(row.cell_id, force_cell_id);
+    let decoded = AggregateVersion::decode(&row.aggregate_version).expect("decode");
+    assert_eq!(decoded.identity, held.ownership_token);
+}
+
+/// CR-032 classifies "Expired-row cleanup that changes no logical ownership"
+/// as emitting no row, and neither `cleanup_exact` nor the lease/backfill
+/// bootstrap calls that arm finite leases accept an `outbox_cell_id` at all --
+/// there is no caller-reachable way to make either append one.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn cleanup_and_lease_bootstrap_paths_never_append_an_outbox_row() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let coordinator = store.lock_coordinator();
+    let (repository_id, branch_id) = create_repository(&store).await;
+
+    // Lease/backfill bootstrap: arms finite leases and reconciles legacy rows,
+    // touching schema-state and backfill bookkeeping only, never `lore_locks`
+    // through the fenced batch path.
+    coordinator
+        .backfill(&BackfillIssuerMap::new())
+        .await
+        .expect("empty backfill");
+    coordinator
+        .enable_fencing_for_component_fixture(true)
+        .await
+        .expect("enable finite leases in test fixture");
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        0,
+        "lease/backfill bootstrap must not touch the outbox"
+    );
+
+    // An expired row, cleaned up: no ownership change, no event.
+    let lock_owner = owner("https://issuer.example", "wp119-cleanup");
+    let hash: [u8; 32] = rand::random();
+    let expired = acquire_one(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        hash,
+        Some(Duration::from_millis(40)),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(90)).await;
+    let cleaned = coordinator
+        .cleanup_exact(
+            &repository_id,
+            &branch_id,
+            &hash,
+            expired.repository_lock_generation,
+            expired.branch_lock_generation,
+            expired.fence,
+        )
+        .await
+        .expect("cleanup of the expired row");
+    assert!(
+        cleaned,
+        "the expired row must be logically absent and cleaned up"
+    );
+
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        0,
+        "cleanup_exact changes no logical ownership and must append nothing"
+    );
+}
+
+/// A decisive rejection commits a receipt and returns before any lock
+/// mutation, structurally through `commit_rejection`, which never sees the
+/// caller's `outbox_cell_id` at all. Every case below supplies one anyway, so
+/// a future regression that threaded it through would still be caught.
+/// Covers all four `LockRejection` variants a rejection can carry (not
+/// `AdmissionRejected`, which never reaches `commit_rejection`).
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn every_lock_rejection_kind_leaves_the_outbox_empty() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let coordinator = store.lock_coordinator();
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let owner_a = owner("https://issuer.example", "wp119-rej-a");
+    let owner_b = owner("https://issuer.example", "wp119-rej-b");
+    let hash: [u8; 32] = rand::random();
+    // Held for the resource's side effect (a currently owned row for the
+    // ForeignOwner/AuthorityMismatch cases below), not for its own fields.
+    let _held = acquire_one(&store, &owner_a, &repository_id, &branch_id, hash, None).await;
+
+    // ForeignOwner: a different owner tries to acquire/renew a currently held
+    // resource.
+    let mut foreign_input = acquire_input(
+        &repository_id,
+        &branch_id,
+        owner_b.clone(),
+        vec![resource(hash, None)],
+        None,
+    );
+    foreign_input.outbox_cell_id = Some(outbox_cell_id());
+    let foreign_op = prepare_bound_operation(
+        &store,
+        &owner_b,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&foreign_input).expect("valid binding"),
+    )
+    .await;
+    let foreign_result = coordinator
+        .acquire_or_renew(&foreign_op, &foreign_input)
+        .await
+        .expect("foreign acquire result");
+    assert_rejection(&foreign_result, LockRejection::ForeignOwner);
+
+    // AuthorityMismatch: the true owner renews with the wrong token.
+    let mut mismatch_input = acquire_input(
+        &repository_id,
+        &branch_id,
+        owner_a.clone(),
+        vec![resource(hash, Some(rand::random()))],
+        None,
+    );
+    mismatch_input.outbox_cell_id = Some(outbox_cell_id());
+    let mismatch_op = prepare_bound_operation(
+        &store,
+        &owner_a,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&mismatch_input).expect("valid binding"),
+    )
+    .await;
+    let mismatch_result = coordinator
+        .acquire_or_renew(&mismatch_op, &mismatch_input)
+        .await
+        .expect("wrong-token renew result");
+    assert_rejection(&mismatch_result, LockRejection::AuthorityMismatch);
+
+    // NotFound: releasing a resource with no current row.
+    let missing_hash: [u8; 32] = rand::random();
+    let not_found_input = ReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        owner: owner_a.clone(),
+        resources: vec![resource(missing_hash, Some(rand::random()))],
+        outbox_cell_id: Some(outbox_cell_id()),
+    };
+    let not_found_op = prepare_bound_operation(
+        &store,
+        &owner_a,
+        &repository_id,
+        &branch_id,
+        release_binding(&not_found_input).expect("valid binding"),
+    )
+    .await;
+    let not_found_result = coordinator
+        .release(&not_found_op, &not_found_input)
+        .await
+        .expect("release of an absent resource");
+    assert_rejection(&not_found_result, LockRejection::NotFound);
+
+    // NamespaceMismatch: a repository that was never created.
+    let absent_repository_id: [u8; 16] = rand::random();
+    let absent_branch_id: [u8; 16] = rand::random();
+    let mut namespace_input = acquire_input(
+        &absent_repository_id,
+        &absent_branch_id,
+        owner_a.clone(),
+        vec![resource(rand::random(), None)],
+        None,
+    );
+    namespace_input.outbox_cell_id = Some(outbox_cell_id());
+    let namespace_op = prepare_bound_operation(
+        &store,
+        &owner_a,
+        &absent_repository_id,
+        &absent_branch_id,
+        acquire_or_renew_binding(&namespace_input).expect("valid binding"),
+    )
+    .await;
+    let namespace_result = coordinator
+        .acquire_or_renew(&namespace_op, &namespace_input)
+        .await
+        .expect("acquire against an absent repository");
+    assert_rejection(&namespace_result, LockRejection::NamespaceMismatch);
+
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        0,
+        "no rejection above may leave a row on the held resource's repository"
+    );
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &absent_repository_id).await,
+        0,
+        "the NamespaceMismatch case must not leave a row keyed on the absent repository either"
+    );
+}
+
+/// A receipt replay (an exact retry of an already-committed operation)
+/// returns the original result without re-running the mutation, so it must
+/// not append a second event even when the retry supplies its own
+/// `outbox_cell_id`.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn a_replayed_receipt_appends_no_second_row() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let coordinator = store.lock_coordinator();
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let lock_owner = owner("https://issuer.example", "wp119-replay");
+    let hash: [u8; 32] = rand::random();
+    let cell_id = outbox_cell_id();
+
+    let mut input = acquire_input(
+        &repository_id,
+        &branch_id,
+        lock_owner.clone(),
+        vec![resource(hash, None)],
+        None,
+    );
+    input.outbox_cell_id = Some(cell_id.clone());
+    let operation = prepare_bound_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&input).expect("valid binding"),
+    )
+    .await;
+    let first = coordinator
+        .acquire_or_renew(&operation, &input)
+        .await
+        .expect("first acquire must succeed");
+    assert_eq!(first.outcome, DomainOutcome::Applied);
+    assert!(!first.replayed);
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        1
+    );
+
+    // The exact same prepared operation (same receipt key/binding/token),
+    // resubmitted with the same input, must replay rather than re-mutate.
+    let second = coordinator
+        .acquire_or_renew(&operation, &input)
+        .await
+        .expect("replayed acquire must succeed");
+    assert!(
+        second.replayed,
+        "an exact retry must be reported as replayed"
+    );
+    assert_eq!(second.outcome, first.outcome);
+
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        1,
+        "a replayed receipt must not append a second event"
+    );
+}
+
+/// An empty-resource release commits `empty-release-v1` and returns before
+/// any fence is drawn or any resource examined, so it must append nothing
+/// even with an `outbox_cell_id` supplied.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn an_empty_resource_release_appends_no_row() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let coordinator = store.lock_coordinator();
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let lock_owner = owner("https://issuer.example", "wp119-empty-release");
+
+    let input = ReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        owner: lock_owner.clone(),
+        resources: Vec::new(),
+        outbox_cell_id: Some(outbox_cell_id()),
+    };
+    let operation = prepare_bound_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        release_binding(&input).expect("valid empty-release binding"),
+    )
+    .await;
+    let result = coordinator
+        .release(&operation, &input)
+        .await
+        .expect("empty release must succeed");
+    assert_eq!(result.outcome, DomainOutcome::Applied);
+    assert_eq!(result.locks.len(), 0);
+
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        0,
+        "an empty-resource release must append nothing"
+    );
+}
+
+/// A token-bearing batch where at least one resource is still current and
+/// owned by the caller, and another of the caller's OWN resources has fallen
+/// out of currency (here, via a namespace generation bump, not lease
+/// expiry -- leases are off in production, so the generation path is the
+/// realistic one), classifies as `lock.renewed`, not `lock.acquired`. Only a
+/// row current and owned by somebody else drives `lock.taken_over`.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn a_mixed_batch_of_the_callers_own_current_and_stale_generation_rows_is_a_renewal() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let coordinator = store.lock_coordinator();
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let lock_owner = owner("https://issuer.example", "wp119-mixed-batch");
+    let stays_current_hash: [u8; 32] = rand::random();
+    let goes_stale_hash: [u8; 32] = rand::random();
+
+    // Both resources acquired by the same owner, before the generation bump.
+    let goes_stale = acquire_one(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        goes_stale_hash,
+        None,
+    )
+    .await;
+
+    // Bump the repository's lock generation through a real production write
+    // (begin_obliterate), making every row acquired before it logically
+    // stale without touching any row's `expires_at`.
+    let obliterate_operation = prepare_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        "begin_obliterate",
+    )
+    .await;
+    let obliterate = store
+        .begin_obliterate(&obliterate_operation, &repository_id, None)
+        .await
+        .expect("begin real repository obliteration");
+    assert_eq!(obliterate.outcome, DomainOutcome::Applied);
+
+    // A fresh acquire of the still-current-generation resource, after the
+    // bump, by the same owner: this row is current at request time.
+    let stays_current = acquire_one(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        stays_current_hash,
+        None,
+    )
+    .await;
+
+    let cell_id = outbox_cell_id();
+    let mut input = acquire_input(
+        &repository_id,
+        &branch_id,
+        lock_owner.clone(),
+        vec![
+            resource(stays_current_hash, Some(stays_current.ownership_token)),
+            resource(goes_stale_hash, Some(goes_stale.ownership_token)),
+        ],
+        None,
+    );
+    input.outbox_cell_id = Some(cell_id.clone());
+    let operation = prepare_bound_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&input).expect("valid mixed-batch binding"),
+    )
+    .await;
+    let result = coordinator
+        .acquire_or_renew(&operation, &input)
+        .await
+        .expect("mixed-currency batch by the same owner must succeed");
+    assert_eq!(result.outcome, DomainOutcome::Applied);
+    assert_eq!(result.locks.len(), 2);
+
+    let row = one_outbox_row_for_repository(&db, &repository_id).await;
+    assert_eq!(
+        row.event_kind, "lock.renewed",
+        "a batch with at least one current row and no foreign row is a renewal, even when \
+         another of the caller's own rows went stale from a generation bump"
+    );
+}
+
+/// `lock.taken_over` fires when the existing row is not current because the
+/// namespace's lock generation moved past it (a real `begin_obliterate`
+/// bump), not only because a lease expired. This is the production-relevant
+/// path, since finite leases stay off until WP-120.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn a_stale_generation_row_held_by_a_different_owner_is_a_takeover() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let coordinator = store.lock_coordinator();
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let owner_a = owner("https://issuer.example", "wp119-gen-predecessor");
+    let owner_b = owner("https://issuer.example", "wp119-gen-successor");
+    let hash: [u8; 32] = rand::random();
+
+    let predecessor = acquire_one(&store, &owner_a, &repository_id, &branch_id, hash, None).await;
+
+    let obliterate_operation = prepare_operation(
+        &store,
+        &owner_a,
+        &repository_id,
+        &branch_id,
+        "begin_obliterate",
+    )
+    .await;
+    let obliterate = store
+        .begin_obliterate(&obliterate_operation, &repository_id, None)
+        .await
+        .expect("begin real repository obliteration");
+    assert_eq!(obliterate.outcome, DomainOutcome::Applied);
+
+    let cell_id = outbox_cell_id();
+    let mut input = acquire_input(
+        &repository_id,
+        &branch_id,
+        owner_b.clone(),
+        vec![resource(hash, None)],
+        None,
+    );
+    input.outbox_cell_id = Some(cell_id.clone());
+    let operation = prepare_bound_operation(
+        &store,
+        &owner_b,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&input).expect("valid generation-takeover binding"),
+    )
+    .await;
+    let result = coordinator
+        .acquire_or_renew(&operation, &input)
+        .await
+        .expect("takeover of a stale-generation foreign row must succeed");
+    assert_eq!(result.outcome, DomainOutcome::Applied);
+    let successor = &result.locks[0];
+    assert_ne!(successor.fence, predecessor.fence);
+    assert!(
+        successor.repository_lock_generation > predecessor.repository_lock_generation,
+        "test fixture sanity: the successor must actually observe the bumped generation"
+    );
+
+    let row = one_outbox_row_for_repository(&db, &repository_id).await;
+    assert_eq!(
+        row.event_kind, "lock.taken_over",
+        "a foreign row made non-current by a generation bump is a takeover, not an acquire"
+    );
+    let decoded = AggregateVersion::decode(&row.aggregate_version).expect("decode");
+    assert_eq!(decoded.identity, successor.ownership_token);
 }
 
 #[tokio::test]
@@ -478,7 +1300,7 @@ async fn same_subject_under_different_issuers_is_foreign_for_every_owner_operati
         branch_id: branch_id.to_vec(),
         owner: owner_b.clone(),
         resources: vec![resource(hash, Some(held.ownership_token))],
-        event: None,
+        outbox_cell_id: None,
     };
     let release_op = prepare_bound_operation(
         &store,
@@ -746,7 +1568,7 @@ async fn stale_release_renew_force_and_cleanup_cannot_touch_a_successor() {
         branch_id: branch_id.to_vec(),
         owner: owner_a.clone(),
         resources: vec![resource(hash, Some(predecessor.ownership_token))],
-        event: None,
+        outbox_cell_id: None,
     };
     let stale_release_op = prepare_bound_operation(
         &store,
@@ -789,7 +1611,7 @@ async fn stale_release_renew_force_and_cleanup_cannot_touch_a_successor() {
         target_owner: owner_a,
         acting_owner: admin.clone(),
         resources: vec![resource(hash, Some(predecessor.ownership_token))],
-        event: None,
+        outbox_cell_id: None,
     };
     let stale_force_op = prepare_bound_operation(
         &store,
@@ -893,7 +1715,7 @@ async fn obsolete_repository_and_branch_generations_make_rows_logically_absent()
                 expected_generation: obliterate.repository_generation,
                 delete_proof: rand::random::<[u8; 32]>().to_vec(),
                 projection: Vec::new(),
-                event: None,
+                events: Vec::new(),
             },
         )
         .await
@@ -1146,7 +1968,7 @@ async fn missing_and_repeated_release_are_not_found_and_empty_list_is_ok() {
         branch_id: branch_id.to_vec(),
         owner: lock_owner.clone(),
         resources: vec![resource(missing_hash, Some(rand::random()))],
-        event: None,
+        outbox_cell_id: None,
     };
     let missing_op = prepare_bound_operation(
         &store,
@@ -1169,7 +1991,7 @@ async fn missing_and_repeated_release_are_not_found_and_empty_list_is_ok() {
         branch_id: branch_id.to_vec(),
         owner: lock_owner.clone(),
         resources: vec![resource(hash, Some(held.ownership_token))],
-        event: None,
+        outbox_cell_id: None,
     };
     let release_op = prepare_bound_operation(
         &store,
@@ -1189,7 +2011,7 @@ async fn missing_and_repeated_release_are_not_found_and_empty_list_is_ok() {
         branch_id: branch_id.to_vec(),
         owner: lock_owner.clone(),
         resources: vec![resource(hash, Some(held.ownership_token))],
-        event: None,
+        outbox_cell_id: None,
     };
     let repeat_op = prepare_bound_operation(
         &store,
@@ -1211,7 +2033,7 @@ async fn missing_and_repeated_release_are_not_found_and_empty_list_is_ok() {
         branch_id: branch_id.to_vec(),
         owner: empty_owner.clone(),
         resources: Vec::new(),
-        event: None,
+        outbox_cell_id: None,
     };
     let empty_operation = prepare_bound_operation(
         &store,

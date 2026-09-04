@@ -176,6 +176,28 @@ fn fenced_lock_to_wire(lock: FencedLock) -> Result<lore_proto::lock::Lock, Statu
     })
 }
 
+/// The single refusal every fenced lock **mutation** site returns.
+///
+/// BLOCKED(WP-117): unfenced lock path reaches store/lock_store.rs directly;
+/// events flow only when fenced routing is armed
+/// (PUBLIC_MUTATION_CONTRACT_AVAILABLE, WP-120).
+///
+/// Concretely: on a cell with no coordinator, Lock/Unlock/AdminLock write
+/// `lore-postgres`'s `store/lock_store.rs` with no transaction, no fence, and
+/// no coordinator call, so there is nothing for a producer to append to. On a
+/// cell that *has* a coordinator, all three refuse here rather than route,
+/// because `PostgresLockCoordinator::acquire_or_renew`/`release` need two
+/// things the public wire cannot supply today: a `GovernedOperation` (the
+/// CR-029 receipt key, binding, and prepare token, which the public lock RPCs
+/// carry no metadata for) and a per-resource `expected_ownership_token`, which
+/// is precisely the token-bearing contract WP-120 owns. Both are contract
+/// gaps, not missing plumbing here.
+///
+/// WP-119 Part L therefore stops at the coordinator: every committed lock
+/// transition now builds and appends its pinned `lock_namespace` event
+/// (`LockTransition`), so arming the route in WP-120 is the only remaining step
+/// before lock events reach the outbox. The producer half is not deferred, only
+/// its caller.
 fn fenced_public_mutation_unavailable() -> Status {
     Status::failed_precondition(
         "Fenced lock mutations require the token-bearing public contract from WP-120",

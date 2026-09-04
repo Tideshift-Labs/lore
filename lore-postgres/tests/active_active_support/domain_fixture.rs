@@ -251,6 +251,6 @@ pub fn acquire_input(
         acting_owner: None,
         resources,
         lease_duration: lease,
-        event: None,
+        outbox_cell_id: None,
     }
 }

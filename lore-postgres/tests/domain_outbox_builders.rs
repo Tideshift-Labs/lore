@@ -540,6 +540,106 @@ fn lock_acquired_shape() {
     assert_eq!(event.aggregate_identity, owner_token);
 }
 
+/// Reproduces `idempotency-key.json`'s `lock-acquired` vector through
+/// `builders::lock_acquired`. `Exact(committed_fence)` resolves independent of
+/// any `CommittedVersions`, unlike the repository/branch-generation ordinals
+/// the other reproduction tests resolve.
+#[test]
+fn lock_acquired_builder_reproduces_the_idempotency_key_fixture_vector() {
+    let fixture = load_fixture("idempotency-key.json");
+    let vector = find_vector(&fixture, "lock-acquired");
+    let cell_id = vector["inputs"]["cell_id"].as_str().expect("cell_id");
+    let repository_id = decode_hex(
+        "repository_hex",
+        vector["inputs"]["repository_hex"]
+            .as_str()
+            .expect("repository_hex"),
+    );
+    let repository_generation = vector["inputs"]["repository_generation"]
+        .as_str()
+        .expect("repository_generation")
+        .parse::<i64>()
+        .expect("repository_generation is a decimal integer");
+    let namespace = vector["inputs"]["aggregate_id_utf8"]
+        .as_str()
+        .expect("aggregate_id_utf8");
+    let expected_ordinal = vector["inputs"]["aggregate_version_ordinal"]
+        .as_str()
+        .expect("aggregate_version_ordinal")
+        .parse::<u64>()
+        .expect("ordinal is a decimal integer");
+    let expected_identity_bytes = vector["inputs"]["aggregate_version_identity_bytes"]
+        .as_u64()
+        .expect("aggregate_version_identity_bytes");
+    let aggregate_version_hex = vector["inputs"]["aggregate_version_hex"]
+        .as_str()
+        .expect("aggregate_version_hex");
+    let full_version_bytes = decode_hex("aggregate_version_hex", aggregate_version_hex);
+    assert_eq!(
+        full_version_bytes.len(),
+        8 + expected_identity_bytes as usize
+    );
+    let owner_token = full_version_bytes[8..].to_vec();
+    let expected_key = decode_hex(
+        "idempotency_key_hex",
+        vector["idempotency_key_hex"]
+            .as_str()
+            .expect("idempotency_key_hex"),
+    );
+
+    // Arbitrary: neither feeds the idempotency_key preimage. `repository_id`
+    // and `branch_id` here are the lock-payload arguments, not the outbox
+    // row's own `repository_id` column (bound to the fixture's
+    // `repository_hex` below) or the aggregate_id (bound to `namespace`).
+    let payload_repository_id = [0x11u8; 16];
+    let payload_branch_id = [0x22u8; 16];
+    let event = builders::lock_acquired(
+        cell_id,
+        &payload_repository_id,
+        &payload_branch_id,
+        namespace,
+        "user-123",
+        expected_ordinal,
+        &owner_token,
+    )
+    .expect("build lock_acquired");
+    assert_eq!(event.aggregate_id, namespace.as_bytes().to_vec());
+
+    let ordinal = event
+        .aggregate_ordinal
+        .resolve(CommittedVersions {
+            repository_generation,
+            branch_generation: None,
+        })
+        .expect("resolve the exact committed fence");
+    assert_eq!(ordinal, expected_ordinal);
+    let aggregate_version = AggregateVersion::new(ordinal, event.aggregate_identity.clone())
+        .expect("in-bounds identity")
+        .encode();
+    assert_eq!(
+        aggregate_version, full_version_bytes,
+        "the encoded aggregate_version must equal the fixture's own aggregate_version_hex"
+    );
+
+    let outbox_event = OutboxEvent {
+        cell_id: &event.cell_id,
+        repository_id: &repository_id,
+        repository_generation,
+        event_kind: &event.event_kind,
+        aggregate_kind: &event.aggregate_kind,
+        aggregate_id: &event.aggregate_id,
+        aggregate_version: &aggregate_version,
+        payload_schema_version: event.payload_schema_version,
+        payload: &event.payload,
+    };
+    let key = idempotency_key(&outbox_event);
+    assert_eq!(
+        key.to_vec(),
+        expected_key,
+        "builders::lock_acquired must reproduce the fixture's pinned idempotency_key"
+    );
+}
+
 #[test]
 fn lock_renewed_and_released_and_force_released_share_the_lock_shape() {
     let repository_id = repo_id();

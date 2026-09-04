@@ -72,7 +72,17 @@ $inventory = @(
             'same_database_identity_accepts_only_the_domain_authority_database',
             'lock_backfill_is_restartable_and_quarantines_ambiguous_legacy_owners',
             'backfill_proves_fence_sequence_headroom_before_cutover',
-            'push_witness_capture_and_transaction_local_revalidation_detect_change'
+            'push_witness_capture_and_transaction_local_revalidation_detect_change',
+            'a_fresh_acquire_commits_exactly_one_lock_acquired_row_with_the_fence_and_owner_token',
+            'a_same_owner_renewal_commits_exactly_one_lock_renewed_row_with_the_new_fence_and_token',
+            'an_expiry_takeover_by_a_different_owner_commits_exactly_one_lock_taken_over_row_with_the_successors_fence',
+            'owner_release_and_admin_force_release_each_commit_their_pinned_kind',
+            'cleanup_and_lease_bootstrap_paths_never_append_an_outbox_row',
+            'every_lock_rejection_kind_leaves_the_outbox_empty',
+            'a_replayed_receipt_appends_no_second_row',
+            'an_empty_resource_release_appends_no_row',
+            'a_mixed_batch_of_the_callers_own_current_and_stale_generation_rows_is_a_renewal',
+            'a_stale_generation_row_held_by_a_different_owner_is_a_takeover'
         )
     },
     [pscustomobject]@{
@@ -96,19 +106,29 @@ $inventory = @(
         Package       = 'lore-server'
         Target        = 'lib'
         Exact         = $false
-        # `grpc::handlers::branch_push::governed_tests::` is this runner's alone, so
-        # the prefix polices the whole module.
+        # The prefix narrowed twice, both times for the same reason: a claim
+        # asserts this runner owns EVERY live case beneath it, so a case another
+        # package adds there makes the claim false and the guard refuses to start
+        # rather than under-run. Narrowing is the fix; dropping the claim is not,
+        # because a target with no prefix at all polices nothing.
         #
-        # `domain::tests::` no longer can. It became a shared module when WP-116 added
+        # `domain::tests::` went first, when WP-116 added
         # `a_mediated_prepare_key_cannot_be_consumed_by_a_repository_scoped_governed_mutation`
         # there, which `run-domain-enforcement-live.ps1` owns and runs as its seventh
-        # case. Claiming the prefix here would assert that this runner owns every live
-        # case in that module, which it does not, and the guard correctly refused to
-        # start rather than under-run. Per the shared-module rule above, the boot
-        # regression this runner DOES own stays policed by exact name in `Cases`, so
-        # nothing this tier covers became silently skippable.
+        # case.
+        #
+        # `grpc::handlers::branch_push::governed_tests::` followed, when the
+        # notification-hint work added
+        # `committed_governed_push_fires_exactly_one_lorehub_notify_hook_post_and_a_repeat_no_op_fires_none`
+        # and `hint_sender_queue_exhaustion_does_not_change_a_committed_governed_pushs_result`.
+        # Those two are about the hook and hint rails, not lock fencing, so running
+        # them here would claim coverage this tier does not own. The claim narrowed
+        # to `::enforce_fenced_locks_`, which this runner does own whole, and the
+        # one fenced-lock case outside it stays policed by exact name in `Cases` --
+        # the same shared-module treatment `grpc::handlers::branch_push::tests::`
+        # already gets.
         ExactPrefixes = @(
-            'grpc::handlers::branch_push::governed_tests::'
+            'grpc::handlers::branch_push::governed_tests::enforce_fenced_locks_'
         )
         Cases         = @(
             'domain::tests::a_never_migrated_postgres_cell_boots_on_the_legacy_lock_route',

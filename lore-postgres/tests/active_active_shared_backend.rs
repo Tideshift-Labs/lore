@@ -1156,7 +1156,7 @@ async fn c2_an_expired_lease_takeover_by_one_set_fences_the_other_sets_renew_and
         branch_id: branch_id.to_vec(),
         owner: owner_a.clone(),
         resources: vec![fixture::resource(hash, Some(held.ownership_token))],
-        event: None,
+        outbox_cell_id: None,
     };
     let release_op = fixture::admitted_lock(
         &backend.a.domain,
@@ -1243,7 +1243,7 @@ async fn c3_a_release_racing_a_force_release_removes_the_row_exactly_once() {
         branch_id: branch_id.to_vec(),
         owner: holder.clone(),
         resources: vec![fixture::resource(hash, Some(held.ownership_token))],
-        event: None,
+        outbox_cell_id: None,
     };
     let release_op = fixture::admitted_lock(
         &backend.a.domain,
@@ -1259,7 +1259,7 @@ async fn c3_a_release_racing_a_force_release_removes_the_row_exactly_once() {
         target_owner: holder.clone(),
         acting_owner: admin.clone(),
         resources: vec![fixture::resource(hash, Some(held.ownership_token))],
-        event: None,
+        outbox_cell_id: None,
     };
     let force_op = fixture::admitted_lock(
         &backend.b.domain,
