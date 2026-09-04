@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -277,6 +278,14 @@ async fn event_loop(
                     }
                     Ok(None) => {
                         lore_debug!("Notification stream closed for {repository}");
+                        // `OK`, stated rather than left absent. Stripping the
+                        // transport's own `grpc-status` from the trailers took away
+                        // the only thing distinguishing a server ending the stream
+                        // cleanly from THIS process cancelling its own
+                        // subscription, and the two call for different reconnect
+                        // decisions. `None` now means exactly one thing: nobody
+                        // told us, because we stopped listening.
+                        close.status_code = Some(tonic::Code::Ok.into());
                         if let Ok(Some(map)) = stream.trailers().await {
                             close.trailers = ascii_pairs(&map);
                         }

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -210,8 +211,13 @@ pub trait NotificationRouter: Send + Sync {
 /// whether that position is still usable, or the reverse.
 #[derive(Debug, Clone, Default)]
 pub struct NotificationStreamClose {
-    /// The numeric gRPC status code the server closed with, or `None` when the
-    /// stream ended without one — a clean end of stream, or a local cancellation.
+    /// The numeric gRPC status code the stream ended with. `0` is a clean end of
+    /// stream; `None` means nobody said, which happens on exactly one path — this
+    /// process cancelled its own subscription, so the stream was never wound down
+    /// far enough to carry a status.
+    ///
+    /// Locally synthesized transport failures also arrive here as codes, so this
+    /// says what ended the stream, not necessarily what a server decided.
     ///
     /// Numeric rather than a transport enum so this crate's public surface does
     /// not commit to one gRPC library's type.
