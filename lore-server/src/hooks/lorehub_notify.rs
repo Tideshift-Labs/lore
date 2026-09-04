@@ -23,6 +23,32 @@
 //! `event_id` (synthesized deterministically), so a retried POST that already landed
 //! is a no-op.
 //!
+//! # This hook is deliberately not routed through the CR-032 outbox
+//!
+//! A Postgres-mode cell now has a durable outbox and a relay
+//! (`crate::event_relay`), so "there is no persistent outbox" above is a
+//! statement about **this** path, not about the process. Keeping the two
+//! separate is the design, not an omission (WP-119 Phase 7):
+//!
+//! * An outbox row is a **cell-internal invalidation** addressed to the
+//!   notification plane. It carries a repository generation and an aggregate
+//!   version, and it exists so a receiver can tell what it has already seen.
+//!   It is **not** a platform audit record: it has no actor, no client IP, no
+//!   occurred-at wall clock, and no HMAC — every field the Lorehub receiver
+//!   authenticates and files. Reading a row as an audit event would fabricate
+//!   the four fields it does not contain.
+//! * This hook is a **signed, actor-attributed HTTP POST** to a platform
+//!   endpoint outside the cell. Its integrity comes from the MAC over the exact
+//!   bytes sent, which is a property of this hook and not of the relay.
+//!
+//! The residual is therefore real and accepted: a crash between the commit and
+//! this hook's POST loses the notification, and nothing replays it. That is the
+//! same at-least-once-with-a-hole the retry paragraph above describes, and it
+//! stays until a hook-outbox package owns durable delivery for the signed
+//! platform contract specifically. Do not close it by emitting an outbox row
+//! instead — that changes what the platform is told, not how reliably it is
+//! told.
+//!
 //! # The event contract (pinned by Lorehub WP-026)
 //!
 //! A single signed JSON POST per event:

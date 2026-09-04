@@ -55,6 +55,7 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+use crate::event_relay::admission::OutboxAdmission;
 use crate::event_relay::config::EventRelayConfig;
 use crate::event_relay::envelope_map::EnvelopeSource;
 use crate::event_relay::envelope_map::map_event;
@@ -121,6 +122,7 @@ pub struct EventRelayWorker {
     config: EventRelayConfig,
     readiness: Arc<EventRelayReadiness>,
     source: EnvelopeSource,
+    admission: Option<Arc<OutboxAdmission>>,
 }
 
 impl EventRelayWorker {
@@ -138,7 +140,20 @@ impl EventRelayWorker {
             config,
             readiness,
             source,
+            admission: None,
         }
+    }
+
+    /// Refresh this admission gate's cached verdict on the readiness tick.
+    ///
+    /// Optional so a component test can run the loop without one. In the
+    /// server it is always set: `wiring` builds the gate and the worker
+    /// together, and the mutation choke point reads a cache nothing else in
+    /// the process refreshes.
+    #[must_use]
+    pub fn with_admission(mut self, admission: Arc<OutboxAdmission>) -> Self {
+        self.admission = Some(admission);
+        self
     }
 
     /// Run until `shutdown` goes true.
@@ -255,8 +270,16 @@ impl EventRelayWorker {
         .await
     }
 
-    /// Refresh the backlog facts readiness reports.
+    /// Refresh the backlog facts readiness reports, and the admission verdict
+    /// the mutation choke point reads.
+    ///
+    /// The two are refreshed on one tick because they answer the same question
+    /// from the same table at the same bounded staleness, and because this is
+    /// the only place in the process allowed to pay for the probe: CR-032's
+    /// gate must not put a bounded-but-`O(pending)` query on the hot path of
+    /// every governed mutation. See `admission`'s module documentation.
     async fn refresh_backlog(&self) {
+        self.refresh_admission().await;
         let client = match self.pool.get().await {
             Ok(client) => client,
             Err(e) => {
@@ -279,6 +302,20 @@ impl EventRelayWorker {
                 }
                 self.readiness.record_backlog(&backlog);
             }
+        }
+    }
+
+    /// Republish the admission verdict, if this worker carries the gate.
+    ///
+    /// A probe failure is logged and leaves the previous verdict standing, on
+    /// the same reasoning as the backlog probe above: a probe that could not
+    /// run is evidence of nothing, in either direction.
+    async fn refresh_admission(&self) {
+        let Some(admission) = self.admission.as_ref() else {
+            return;
+        };
+        if let Err(e) = admission.refresh().await {
+            warn!(error = %e, "Outbox admission probe failed; the previous verdict stands");
         }
     }
 

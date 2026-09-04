@@ -29,6 +29,7 @@
 //! registry trait would add a selection axis with one possible value.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -64,6 +65,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::event_relay::admission::OutboxAdmission;
 use crate::grpc::domain_operation_metadata;
 use crate::plugins::postgres::assert_domain_store_colocated;
 use crate::plugins::postgres::connect_domain_store;
@@ -141,6 +143,16 @@ pub struct DomainContext {
     enforcement: bool,
     lock_coordinator: Option<Arc<PostgresLockCoordinator>>,
     cell_id: Option<String>,
+    /// CR-032's required-event admission gate, present only on a cell whose
+    /// relay was built and passed every startup precondition.
+    ///
+    /// A `OnceLock` rather than a constructor argument because of an ordering
+    /// fact, not a preference: the relay is checked against the database
+    /// identity this context's construction attests, so `configure_event_relay`
+    /// necessarily runs after this type exists. The relay's own wiring sets it,
+    /// once, and only when `[outbox_relay] enabled = true` — an absent handle
+    /// is a cell with no relay, and it admits exactly as it did before WP-119.
+    admission: OnceLock<Arc<OutboxAdmission>>,
 }
 
 impl DomainContext {
@@ -151,6 +163,7 @@ impl DomainContext {
             enforcement,
             lock_coordinator: None,
             cell_id: None,
+            admission: OnceLock::new(),
         }
     }
 
@@ -167,6 +180,7 @@ impl DomainContext {
             enforcement,
             lock_coordinator: Some(lock_coordinator),
             cell_id: None,
+            admission: OnceLock::new(),
         }
     }
 
@@ -211,6 +225,26 @@ impl DomainContext {
     /// Active fenced-lock coordinator, absent until SCHEMA-117 cutover.
     pub fn lock_coordinator(&self) -> Option<&Arc<PostgresLockCoordinator>> {
         self.lock_coordinator.as_ref()
+    }
+
+    /// Attach CR-032's required-event admission gate.
+    ///
+    /// Called once, from `event_relay::wiring::configure_event_relay`, after
+    /// every relay startup precondition has passed. `Err` carries the handle
+    /// back when one is already attached; the caller treats that as a wiring
+    /// fault rather than replacing a live gate, because two gates over one
+    /// cell would mean two caches and a coin flip over which one a mutation
+    /// reads.
+    pub fn attach_admission(
+        &self,
+        admission: Arc<OutboxAdmission>,
+    ) -> Result<(), Arc<OutboxAdmission>> {
+        self.admission.set(admission)
+    }
+
+    /// The attached admission gate, or `None` on a cell with no relay.
+    pub fn admission(&self) -> Option<&Arc<OutboxAdmission>> {
+        self.admission.get()
     }
 
     /// Turn request metadata plus a target identity into a governed operation.
@@ -277,6 +311,27 @@ impl DomainContext {
             }
             (false, None) => scope.tenant_scope_key()?,
         };
+
+        // CR-032 "Lag, readiness, and backpressure". Every path that reaches
+        // here is about to return a governed operation, and a governed
+        // operation is exactly what appends an outbox row — so this is the
+        // choke point, and it is the last thing checked. Everything above is a
+        // client fault (malformed carriage, a missing principal, an unusable
+        // scope) and stays classified as one: a backlog is a cell condition and
+        // must not relabel a bad request.
+        //
+        // The gate is deliberately not conditioned on `self.enforcement`. What
+        // decides whether a mutation produces a durable event is having been
+        // admitted, not the enforcement flag, and a cell running a relay with
+        // enforcement off would otherwise append rows into a backlog nothing
+        // is allowed to refuse. The handle's own presence is the enablement
+        // switch: it exists only on a cell with `[outbox_relay] enabled`.
+        //
+        // The read is cache-only. See `event_relay::admission`'s module
+        // documentation for why a database probe may not run here.
+        if let Some(admission) = self.admission.get() {
+            admission.refuse_if_closed()?;
+        }
 
         Ok(Some(AdmittedOperation {
             key: ReceiptKey {

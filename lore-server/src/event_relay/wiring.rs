@@ -37,6 +37,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::info;
 
+use crate::domain::DomainContext;
 use crate::event_relay::admission::OutboxAdmission;
 use crate::event_relay::config::EventRelayConfig;
 use crate::event_relay::envelope_map::EnvelopeSource;
@@ -93,13 +94,10 @@ pub struct EventRelayHandles {
     pub reset_service: Arc<StreamResetHandler>,
     /// Required-event mutation admission.
     ///
-    /// TODO(WP-119 Phase 8): call `OutboxAdmission::check` before the
-    /// transaction opens, at `lore-server/src/domain.rs`'s
-    /// `DomainContext::admit` (reached through `admit_at_entry`), mapping a
-    /// `Reject` verdict through
-    /// `crate::event_relay::admission::rejection_status`. That file is the
-    /// concurrent producers lane's for this round, so the handle is built,
-    /// tested, and handed over rather than wired here.
+    /// Already attached to the `DomainContext` by [`configure_event_relay`],
+    /// and refreshed by the worker's readiness tick. Returned as well so the
+    /// operator surface can report the gate's own limits and current verdict
+    /// without going through the coordinator.
     pub admission: Arc<OutboxAdmission>,
 }
 
@@ -112,6 +110,7 @@ pub struct EventRelayHandles {
 pub async fn configure_event_relay(
     settings: &Settings,
     database_identity: Option<&DatabaseIdentity>,
+    domain: Option<&Arc<DomainContext>>,
     endpoints: &mut JoinSet<Result<()>>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<Option<EventRelayHandles>> {
@@ -157,6 +156,14 @@ pub async fn configure_event_relay(
     let database_identity =
         database_identity.ok_or_else(|| anyhow!(StartupRefusal::NotPostgresMode))?;
 
+    // Same refusal, one step further: the relay may not run without the
+    // coordinator whose admission gate it feeds. An identity with no context
+    // is unreachable today (a Postgres-mode cell that connects always builds
+    // one), and checking it here is what keeps it unreachable — a reordering
+    // that dropped the context would otherwise start a relay whose backpressure
+    // silently reaches nothing.
+    let domain = domain.ok_or_else(|| anyhow!(StartupRefusal::NotPostgresMode))?;
+
     let pool = build_relay_pool(settings)?;
     let state = startup::enforce_startup_preconditions_against_identity(&pool, database_identity)
         .await
@@ -198,7 +205,17 @@ pub async fn configure_event_relay(
         remote.cell_id.clone(),
     ));
 
-    let worker = EventRelayWorker::new(pool, publisher, config, readiness.clone(), source);
+    // The gate is attached before the worker starts, so no window exists in
+    // which the cell accepts required-event mutations against a relay that has
+    // been declared healthy. Attaching twice is a wiring fault, not a
+    // recoverable state: two gates over one cell would mean two caches and a
+    // coin flip over which verdict a mutation reads.
+    domain
+        .attach_admission(admission.clone())
+        .map_err(|_| anyhow!("The domain coordinator already carries an outbox admission gate"))?;
+
+    let worker = EventRelayWorker::new(pool, publisher, config, readiness.clone(), source)
+        .with_admission(admission.clone());
     lore_spawn!(endpoints, worker.run(shutdown.clone()));
     lore_spawn!(endpoints, evaluator.run(shutdown));
 

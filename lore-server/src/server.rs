@@ -804,6 +804,11 @@ struct HttpSurfaceFacets {
     graceful_drain: bool,
     /// CR-032's event-plane facets, behind `/event_readiness`.
     event_relay: Option<Arc<crate::event_relay::readiness::EventRelayReadiness>>,
+    /// WP-114 CD-6's terminal write-claim prune facet, reported on the same
+    /// route. It shares that endpoint rather than `/health_check` for exactly
+    /// the reason the route exists: an undrained internal table is a condition
+    /// an operator must see and a load balancer must not act on.
+    fragment_prune: Option<Arc<crate::fragment_prune::FragmentPruneReadiness>>,
 }
 
 async fn launch_http_server(
@@ -818,6 +823,7 @@ async fn launch_http_server(
         drain_state,
         graceful_drain,
         event_relay,
+        fragment_prune,
     } = facets;
     LoreHttpServer::serve(
         settings,
@@ -825,7 +831,10 @@ async fn launch_http_server(
         mutable_store,
         jwt_verifier,
         Some(drain_state.clone()),
-        event_relay,
+        crate::http::server::HealthFacets {
+            event_relay,
+            fragment_prune,
+        },
         async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
             // Under graceful drain, keep the health/status surface up until
@@ -1102,6 +1111,22 @@ fn resolved_postgres_store_config(settings: &Settings, store_type: &str) -> Resu
             "fragment_provider requires a resolved [plugins.postgres.{store_type}] configuration"
         )
     })
+}
+
+/// The prune scheduler's reviewed settings, or `None` on a cell that runs none.
+///
+/// Reads the immutable store's resolved configuration because that is where the
+/// `fragment_provider` block lives and where its enablement is decided; the
+/// same value `postgres_fragment_process_pool_inventory` reads two lines above.
+fn postgres_fragment_prune_settings(
+    settings: &Settings,
+) -> Result<Option<crate::fragment_prune::FragmentPruneSettings>> {
+    if settings.immutable_store.mode != "postgres" {
+        return Ok(None);
+    }
+    let immutable_config = resolved_postgres_store_config(settings, "immutable_store")?;
+    plugins::postgres::fragment_prune_settings(&immutable_config)
+        .map_err(|error| anyhow!("Invalid Postgres immutable store configuration: {error}"))
 }
 
 fn postgres_fragment_process_pool_inventory(
@@ -2080,6 +2105,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // is checked against: a relay reading a different database would report an
     // empty backlog that means nothing.
     let configured_domain_identity = configured_domain.database_identity.clone();
+    // Also kept before the partial move. WP-114 CD-6's prune scheduler runs on
+    // this same coordinator and pool; a cell whose governed fragment route is
+    // off has no claims to prune and gets no task.
+    let configured_fragment_coordinator = configured_domain.fragment_coordinator.clone();
     let domain_context = configured_domain.context;
     // The internal forwarding endpoint reaches the same repository handlers, so
     // it gets the same coordinator handle rather than an ungoverned bypass.
@@ -2189,6 +2218,11 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // node runs no relay and reports `configured: false`, which is the honest
     // answer rather than a green one.
     let mut event_relay_handles: Option<crate::event_relay::wiring::EventRelayHandles> = None;
+    // Declared beside the relay handles and for the same reason: the HTTP
+    // surface reports the facet whether or not a scheduler was started, and a
+    // maintenance node runs neither.
+    let mut fragment_prune_readiness: Option<Arc<crate::fragment_prune::FragmentPruneReadiness>> =
+        None;
 
     if !is_maintenance {
         let (notification, notification_service) = configure_notification(
@@ -2211,10 +2245,21 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         event_relay_handles = crate::event_relay::wiring::configure_event_relay(
             &settings,
             configured_domain_identity.as_ref(),
+            domain_context.as_ref(),
             &mut endpoints,
             _shutdown_rx.clone(),
         )
         .await?;
+
+        // WP-114 CD-6, beside the relay worker and on the same drain signal.
+        // Inert unless the governed fragment route is enabled: that route is
+        // the only writer of the claims this removes.
+        fragment_prune_readiness = crate::fragment_prune::configure_fragment_prune(
+            configured_fragment_coordinator.as_ref(),
+            postgres_fragment_prune_settings(&settings)?,
+            &mut endpoints,
+            _shutdown_rx.clone(),
+        );
 
         // Build hook dispatcher: register build.rs-discovered hooks then config-provided hooks
         let hook_ctx = HookRegistrationContext {
@@ -2502,6 +2547,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                         drain_state,
                         graceful_drain,
                         event_relay: event_relay_readiness,
+                        fragment_prune: fragment_prune_readiness,
                     },
                 )
             );

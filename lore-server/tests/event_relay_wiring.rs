@@ -324,6 +324,10 @@ async fn relay_enabled_with_no_remote_notification_mode_fails_startup_typed() {
     let result = lore_server::event_relay::wiring::configure_event_relay(
         &settings,
         None,
+        // No domain coordinator either: the notification-mode check must still
+        // win, which is the same ordering assertion this test already makes
+        // against `database_identity: None`.
+        None,
         &mut endpoints,
         shutdown_rx,
     )

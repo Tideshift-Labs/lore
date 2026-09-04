@@ -8,6 +8,7 @@ pub mod domain_intent;
 pub mod drain;
 pub mod event_relay;
 pub mod execution_state;
+pub mod fragment_prune;
 pub mod grpc;
 pub mod hooks;
 pub mod http;

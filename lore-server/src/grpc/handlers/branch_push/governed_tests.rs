@@ -13,6 +13,7 @@
 //! [`crate::domain::test_support::ScriptedDomainStore`].
 
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
@@ -37,6 +38,7 @@ use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptKey;
 use lore_postgres::pool::TlsConfig;
+use lore_postgres::store::mutable_store::PostgresMutableStore;
 use lore_revision::branch;
 use lore_revision::lock::util::assemble_resource_for_path;
 use lore_revision::node::Node;
@@ -44,18 +46,35 @@ use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::state;
 use lore_storage::hash::hash_string;
+use lore_telemetry::InstrumentProvider;
+use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
+use tokio::sync::mpsc;
 use tokio_postgres::Client;
 use tonic::Code;
+use tonic::metadata::BinaryMetadataValue;
 use uuid::NoContext;
 use uuid::Timestamp;
 use uuid::Uuid;
 
 use super::*;
+use crate::auth::jwt::AuthorizationToken;
 use crate::domain::DomainContext;
 use crate::domain::test_support::ScriptedDomainStore;
+use crate::grpc::domain_operation_metadata::FINGERPRINT_KEY;
+use crate::grpc::domain_operation_metadata::FINGERPRINT_V1_LEN;
+use crate::grpc::domain_operation_metadata::FINGERPRINT_VERSION_V1;
+use crate::grpc::domain_operation_metadata::OPERATION_ID_KEY;
+use crate::grpc::domain_operation_metadata::PREPARE_TOKEN_KEY;
+use crate::grpc::domain_operation_metadata::scope_key_target_repository;
 use crate::grpc::get_write_token;
 use crate::grpc::server::RevisionListAcceleration;
+use crate::hooks::HookRegistrationContext;
+use crate::hooks::HookRegistry;
+use crate::notification::testing::MockNotificationSender;
+use crate::plugins::remote_notification::factory::create_with_transport;
+use crate::plugins::remote_notification::fake_gateway::FakeGateway;
+use crate::plugins::remote_notification::fake_gateway::ScriptedResponse;
 
 // ---------------------------------------------------------------------------
 // Shared fixtures — live Postgres (Section A/C)
@@ -1136,4 +1155,539 @@ async fn ungoverned_push_is_unchanged_by_governance() {
             .success,
         "governance must not change the ungoverned advancing branch"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Section D — WP-119 Phase 7: the hint (`NotificationSender`) and platform
+// (`lorehub_notify`) rails, unchanged by governance (live Postgres,
+// `#[ignore]`).
+//
+// Both rails fire from `handler()` itself, not from `push_with_governance`/
+// `GovernedPushCommit::publish` (Section B's level) -- proving they still
+// fire, exactly once, and unaffected by the WP-119 admission/outbox wiring
+// needs driving the real top-level `handler()` with a fully governed,
+// carriage-complete request against a real fenced coordinator. This section
+// prepares its own real `domain_operation_prepare`d receipt per push (the
+// same shape `tests/p12_live.rs`'s `create_repository` helper uses for
+// repository create), because `handler()`'s own `admit`/`prepare_governed_push`
+// independently derive the (`ReceiptKey`, `OperationBinding`) pair from the
+// request -- a prepared receipt that does not match those exactly is a
+// coordinator-level rejection, not a governance-wiring one.
+// ---------------------------------------------------------------------------
+
+struct TestInstrumentProvider;
+
+impl InstrumentProvider for TestInstrumentProvider {
+    fn namespace(&self) -> &'static str {
+        "governed-hint-hook-test"
+    }
+}
+
+/// Like `create_repository`, but with a ZERO `default_branch_latest_hash`
+/// rather than a random placeholder.
+///
+/// `create_repository`'s random value is fine for Section A/C, which never
+/// push through governance and never compare it against a real local head.
+/// Section D's tests DO drive a real governed push through `handler()`, and
+/// `GovernedPushCommit::publish`'s own preflight
+/// (`self.expected_latest_hash.as_slice() != current_head.as_ref()`) compares
+/// the domain row's captured `latest_hash` against the LOCAL repository's
+/// actual current head -- so the two must agree on what "no revision pushed
+/// yet" looks like, which is the zero hash on both sides.
+async fn create_repository_with_zero_head(store: &PostgresDomainStore) -> ([u8; 16], [u8; 16]) {
+    let repository_id: [u8; 16] = rand::random();
+    let branch_id: [u8; 16] = rand::random();
+    let operation = prepare_create_operation(store).await;
+    let input = RepositoryCreateInput {
+        repository_id: repository_id.to_vec(),
+        name: format!("wp119-hint-hook-{:016x}", rand::random::<u64>()),
+        metadata_hash: rand::random::<[u8; 32]>().to_vec(),
+        default_branch_id: branch_id.to_vec(),
+        default_branch_name: "main".to_owned(),
+        default_branch_metadata_hash: rand::random::<[u8; 32]>().to_vec(),
+        default_branch_latest_hash: vec![0u8; 32],
+        creation_fingerprint: rand::random::<[u8; 32]>().to_vec(),
+        creation_fingerprint_version: 1,
+        projection: Vec::new(),
+        events: Vec::new(),
+    };
+    let result = store
+        .repository_create(&operation, &input)
+        .await
+        .expect("create repository fixture");
+    assert_eq!(result.outcome, DomainOutcome::Applied);
+    (repository_id, branch_id)
+}
+
+/// Bootstraps SCHEMA-117, creates one zero-head repository/branch (see
+/// `create_repository_with_zero_head`), and wraps the real coordinator in a
+/// fully governed, cell-identified `DomainContext` -- everything `handler()`
+/// needs to take the governed branch entirely (not
+/// `reject_unwired_governed_operation`'s no-coordinator-call-site path).
+async fn fenced_domain_context(
+    url: &str,
+) -> (
+    Arc<dyn DomainTransactionStore>,
+    Arc<DomainContext>,
+    Arc<dyn lore_storage::MutableStore>,
+    [u8; 16],
+    [u8; 16],
+) {
+    let store = PostgresDomainStore::connect(url, 4, &TlsConfig::default())
+        .await
+        .expect("connect domain store");
+    store
+        .lock_coordinator()
+        .bootstrap()
+        .await
+        .expect("install isolated SCHEMA-117 fixture");
+    // The governed push's projection write lands in `lore_mutable`, the
+    // legacy CR-007 mutable store's own table. `PostgresDomainStore::connect`
+    // bootstraps only the domain schema, not this one, and -- more than a
+    // bootstrap step -- `load_latest`'s later reads must land on the SAME
+    // table the coordinator wrote: a purely local/in-memory `MutableStore`
+    // (as `crate::store::test_store_create()` builds) would never observe a
+    // governed push's projection row at all, since it is a different backend
+    // entirely, not merely an unbootstrapped one. Kept alive and handed back
+    // rather than dropped, matching a real Postgres-mode cell where the
+    // legacy `MutableStore` handlers read IS this table.
+    let mutable_store: Arc<dyn lore_storage::MutableStore> = Arc::new(
+        PostgresMutableStore::connect(url, 2, &TlsConfig::default())
+            .await
+            .expect("connect mutable store; also bootstraps lore_mutable"),
+    );
+    let (repository_id_bytes, branch_id_bytes) = create_repository_with_zero_head(&store).await;
+    let lock_coordinator = Arc::new(store.lock_coordinator());
+    let store: Arc<dyn DomainTransactionStore> = Arc::new(store);
+    let domain = Arc::new(
+        DomainContext::new_with_lock_coordinator(store.clone(), true, lock_coordinator)
+            .with_cell_id(Some(format!(
+                "cell-hint-hook-{:016x}",
+                rand::random::<u64>()
+            ))),
+    );
+    (
+        store,
+        domain,
+        mutable_store,
+        repository_id_bytes,
+        branch_id_bytes,
+    )
+}
+
+/// Like `local_repository_with_root`, but leaves the branch at the zero
+/// head (no local push) and takes the real Postgres-backed `mutable_store`
+/// `fenced_domain_context` connected (see its doc comment for why a purely
+/// local one cannot see a governed push's projection row) rather than
+/// building its own. `handler()` takes raw `immutable_store`/`mutable_store`
+/// and constructs its own `RepositoryContext` internally, so a push it is
+/// meant to actually commit must run against the SAME stores any later
+/// `serialize_*` call wrote content into. Pairs with
+/// `create_repository_with_zero_head` above -- both sides start at the zero
+/// hash, so the FIRST governed push through `handler()` is what advances the
+/// branch, not a pre-established fixture push outside governance.
+async fn local_repository_with_zero_head(
+    repository: RepositoryId,
+    branch: BranchId,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+) -> (
+    Arc<dyn lore_storage::ImmutableStore>,
+    Arc<dyn lore_storage::MutableStore>,
+    Arc<RepositoryContext>,
+    Arc<lore_revision::interface::ExecutionContext>,
+) {
+    let (immutable_store, _local_mutable_store, execution) = crate::store::test_store_create()
+        .await
+        .expect("create local test stores");
+    let repository_ctx = Arc::new(RepositoryContext::new_server_context(
+        immutable_store.clone(),
+        mutable_store.clone(),
+        repository,
+    ));
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), {
+        let repository_ctx = repository_ctx.clone();
+        async move {
+            create_root_branch_with_id(&repository_ctx, branch, "main").await;
+        }
+    }))
+    .await;
+    (immutable_store, mutable_store, repository_ctx, execution)
+}
+
+/// `domain_operation_prepare`s a real `branch_push_commit` receipt matching
+/// exactly what `handler()`'s own `admit`/`prepare_governed_push` will
+/// independently derive from the request this builds, then carries it as
+/// wire metadata plus the `AuthorizationToken` extension `get_authorization_optional`
+/// reads.
+async fn prepare_and_build_push_request(
+    store: &Arc<dyn DomainTransactionStore>,
+    repository_id_bytes: [u8; 16],
+    branch_id_bytes: [u8; 16],
+    requested_revision: Hash,
+    pusher_token: &AuthorizationToken,
+) -> Request<BranchPushRequest> {
+    let operation_id = Uuid::now_v7();
+    let fingerprint: [u8; FINGERPRINT_V1_LEN] = rand::random();
+    let tenant_scope_key = scope_key_target_repository(&repository_id_bytes)
+        .expect("canonical target-repository scope");
+    let digest = canonical_intent_digest(&CanonicalIntent::BranchPush {
+        repository_id: &repository_id_bytes,
+        branch_id: &branch_id_bytes,
+        requested_revision: requested_revision.as_ref(),
+        force: false,
+        fast_forward_merge: false,
+    })
+    .expect("branch push intent must hash");
+    let key = ReceiptKey {
+        verified_issuer: pusher_token.issuer.clone(),
+        authenticated_subject: pusher_token.user_id.clone(),
+        tenant_scope_key: tenant_scope_key.clone(),
+        operation_id,
+    };
+    let binding = OperationBinding {
+        method: "branch_push_commit".to_owned(),
+        scope: tenant_scope_key,
+        fingerprint_version: 1,
+        fingerprint: fingerprint.to_vec(),
+        canonical_intent_digest: digest,
+    };
+    let prepared = store
+        .domain_operation_prepare(&key, &binding, None)
+        .await
+        .expect("prepare branch push operation");
+    let PrepareResult::Prepared { token, .. } = prepared else {
+        panic!("branch push operation must prepare, got {prepared:?}");
+    };
+
+    let mut request = Request::new(BranchPushRequest {
+        branch: BranchId::from(branch_id_bytes).into(),
+        revision: requested_revision.into(),
+        force: false,
+        fast_forward_merge: false,
+    });
+    request.metadata_mut().insert_bin(
+        REPOSITORY_ID_KEY,
+        BinaryMetadataValue::from_bytes(&repository_id_bytes),
+    );
+    request.metadata_mut().insert_bin(
+        OPERATION_ID_KEY,
+        BinaryMetadataValue::from_bytes(operation_id.as_bytes()),
+    );
+    let mut fingerprint_header = vec![FINGERPRINT_VERSION_V1];
+    fingerprint_header.extend_from_slice(&fingerprint);
+    request.metadata_mut().insert_bin(
+        FINGERPRINT_KEY,
+        BinaryMetadataValue::from_bytes(&fingerprint_header),
+    );
+    request
+        .metadata_mut()
+        .insert_bin(PREPARE_TOKEN_KEY, BinaryMetadataValue::from_bytes(&token));
+    request.extensions_mut().insert(pusher_token.clone());
+    request
+}
+
+/// A minimal stub receiver for the real `lorehub_notify` hook. Captures every
+/// request's headers and raw body, and notifies `tx` once per request so a
+/// test can `.recv().await` deterministically rather than sleeping and
+/// polling -- the same shape `no_op_push_does_not_repeat_notification_or_post_hook`
+/// (branch_push.rs's own `mod tests`) uses for its `RecordingPostHook`.
+async fn start_recording_stub_receiver(
+    tx: mpsc::UnboundedSender<()>,
+) -> (
+    String,
+    Arc<StdMutex<Vec<(axum::http::HeaderMap, bytes::Bytes)>>>,
+) {
+    let captured: Arc<StdMutex<Vec<(axum::http::HeaderMap, bytes::Bytes)>>> =
+        Arc::new(StdMutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("read local_addr");
+    let capture_for_handler = captured.clone();
+    let app = axum::Router::new().route(
+        "/internal/lore-events",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
+            let capture_for_handler = capture_for_handler.clone();
+            let tx = tx.clone();
+            async move {
+                capture_for_handler
+                    .lock()
+                    .expect("captured lock")
+                    .push((headers, body));
+                let _ = tx.send(());
+                axum::http::StatusCode::OK
+            }
+        }),
+    );
+    lore_base::lore_spawn!(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}/internal/lore-events"), captured)
+}
+
+/// Item 2(a)+2(c): a committed governed branch push fires exactly one signed
+/// `lorehub_notify` hook POST with the documented, unchanged payload shape,
+/// and an identical no-op re-push of the same revision (a real second
+/// governed operation, not a retried request) fires neither a second hint
+/// nor a second hook POST.
+#[tokio::test]
+#[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
+async fn committed_governed_push_fires_exactly_one_lorehub_notify_hook_post_and_a_repeat_no_op_fires_none()
+ {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let (store, domain, domain_mutable_store, repository_id_bytes, branch_id_bytes) =
+        fenced_domain_context(&url).await;
+    let repository = RepositoryId::from(repository_id_bytes);
+    let branch = BranchId::from(branch_id_bytes);
+
+    let (hook_tx, mut hook_rx) = mpsc::unbounded_channel();
+    let (stub_url, captured) = start_recording_stub_receiver(hook_tx).await;
+    let mut registry = HookRegistry::new();
+    let registration_ctx = HookRegistrationContext {
+        notification_sender: Arc::new(MockNotificationSender::new()),
+    };
+    crate::hooks::lorehub_notify::register(&mut registry, &registration_ctx);
+    let mut hook_table = toml::map::Map::new();
+    hook_table.insert("webhook_url".to_owned(), toml::Value::String(stub_url));
+    hook_table.insert(
+        "hmac_secret".to_owned(),
+        toml::Value::String("governed-hook-test-secret".to_owned()),
+    );
+    let hook = registry
+        .create_hook("lorehub_notify", &toml::Value::Table(hook_table))
+        .expect("build the real lorehub_notify hook");
+    let hooks = HookDispatcher::from_hooks_default(vec![("lorehub_notify".to_owned(), hook)]);
+
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .times(1)
+        .returning(|_, _, _, _, _| ());
+    let notification_sender: Arc<dyn NotificationSender> = Arc::new(notification_sender);
+
+    let instruments = TestInstrumentProvider;
+    let pusher_token = AuthorizationToken {
+        issuer: "https://issuer.example/hint-hook".to_owned(),
+        user_id: "hint-hook-pusher".to_owned(),
+        is_service_account: None,
+        ..Default::default()
+    };
+
+    let (immutable_store, mutable_store, repository_ctx, execution) =
+        local_repository_with_zero_head(repository, branch, domain_mutable_store).await;
+    let first_revision =
+        Box::pin(LORE_CONTEXT.scope(execution, {
+            let repository_ctx = repository_ctx.clone();
+            async move {
+                serialize_file_revision(&repository_ctx, Hash::default(), 1, "hero.uasset").await
+            }
+        }))
+        .await;
+
+    let request = prepare_and_build_push_request(
+        &store,
+        repository_id_bytes,
+        branch_id_bytes,
+        first_revision,
+        &pusher_token,
+    )
+    .await;
+    let response = handler(
+        request,
+        immutable_store.clone(),
+        mutable_store.clone(),
+        notification_sender.clone(),
+        &hooks,
+        branch::DEFAULT_HISTORY_STEP_SIZE,
+        RevisionListAcceleration::default(),
+        &instruments,
+        None,
+        Some(&domain),
+    )
+    .await
+    .expect("a committed governed push must succeed")
+    .into_inner();
+    assert!(response.success, "the advancing governed push must succeed");
+    assert_eq!(response.revision, first_revision.as_ref().to_vec());
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), hook_rx.recv())
+        .await
+        .expect("the real lorehub_notify hook must fire within the bound")
+        .expect("hook observation channel must not close early");
+    // A wrongly-doubled dispatch is still a bug even if the FIRST observation
+    // arrived promptly; give any spurious extra POST a moment to land before
+    // asserting the count is exactly one.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    {
+        let requests = captured.lock().expect("captured lock");
+        assert_eq!(
+            requests.len(),
+            1,
+            "a committed governed push must fire exactly one lorehub_notify hook POST"
+        );
+        let (headers, body) = &requests[0];
+        assert!(
+            headers.contains_key("x-lorehub-timestamp"),
+            "the hook's signed-header contract must be unchanged by governance"
+        );
+        assert!(
+            headers.contains_key("x-lorehub-signature"),
+            "the hook's signed-header contract must be unchanged by governance"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(body).expect("hook body must be the documented JSON shape");
+        assert_eq!(payload["type"], "branch_push");
+        assert!(
+            !payload["revision_signature"].is_null(),
+            "the documented payload shape must be unchanged by governance"
+        );
+        assert!(!payload["branch"].is_null());
+        assert!(!payload["revision_number"].is_null());
+    }
+
+    // The no-op leg: a second, independently prepared governed operation
+    // requesting the SAME revision the branch already sits at. Neither the
+    // hint (`.times(1)` on the shared mock, checked at drop) nor the hook may
+    // fire again.
+    let repeat_request = prepare_and_build_push_request(
+        &store,
+        repository_id_bytes,
+        branch_id_bytes,
+        first_revision,
+        &pusher_token,
+    )
+    .await;
+    let repeated = handler(
+        repeat_request,
+        immutable_store,
+        mutable_store,
+        notification_sender,
+        &hooks,
+        branch::DEFAULT_HISTORY_STEP_SIZE,
+        RevisionListAcceleration::default(),
+        &instruments,
+        None,
+        Some(&domain),
+    )
+    .await
+    .expect("a no-op governed re-push must still succeed")
+    .into_inner();
+    assert!(
+        repeated.success,
+        "a no-op governed re-push must still succeed"
+    );
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), hook_rx.recv())
+            .await
+            .is_err(),
+        "a no-op governed re-push must not dispatch a second post-hook"
+    );
+    let requests = captured.lock().expect("captured lock");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a no-op governed re-push must not fire a second lorehub_notify hook POST"
+    );
+}
+
+/// Item 2(b): a direct-plugin hint sender that is exhausted (its transport
+/// rejects every request, its retry budget and queue capacity are tiny) must
+/// not change the committed governed mutation's own result. The hook rail is
+/// `HookDispatcher::empty()` here -- irrelevant to this property.
+#[tokio::test]
+#[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
+async fn hint_sender_queue_exhaustion_does_not_change_a_committed_governed_pushs_result() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let (store, domain, domain_mutable_store, repository_id_bytes, branch_id_bytes) =
+        fenced_domain_context(&url).await;
+    let repository = RepositoryId::from(repository_id_bytes);
+    let branch = BranchId::from(branch_id_bytes);
+
+    // Always-rejecting transport with a one-slot queue and a single attempt:
+    // the first `branch_pushed` call already exhausts retries, and the queue
+    // has no room to buffer a second even if it arrived before the worker
+    // drained.
+    let gateway = FakeGateway::always(ScriptedResponse::unavailable());
+    let config: toml::Value = toml::from_str(
+        r#"
+        gateway_uri = "http://127.0.0.1:1"
+        cell_id = "sfo3-hint-exhaustion-test"
+        placement_epoch = 1
+        producer_instance_id = "loreserver-hint-exhaustion-test"
+        allow_insecure_transport_for_test = true
+        queue_capacity = 1
+        request_timeout_ms = 100
+
+        [retry]
+        initial_backoff_ms = 1
+        max_backoff_ms = 2
+        max_attempts = 1
+        "#,
+    )
+    .expect("hint sender fixture config parses");
+    let (plugin, _sender) =
+        create_with_transport(&config, Arc::new(gateway.clone())).expect("build the hint plugin");
+    let notification: Arc<dyn NotificationSender> = plugin.sender.clone();
+
+    let instruments = TestInstrumentProvider;
+    let pusher_token = AuthorizationToken {
+        issuer: "https://issuer.example/hint-exhaustion".to_owned(),
+        user_id: "hint-exhaustion-pusher".to_owned(),
+        is_service_account: None,
+        ..Default::default()
+    };
+
+    let (immutable_store, mutable_store, repository_ctx, execution) =
+        local_repository_with_zero_head(repository, branch, domain_mutable_store).await;
+    let first_revision =
+        Box::pin(LORE_CONTEXT.scope(execution, {
+            let repository_ctx = repository_ctx.clone();
+            async move {
+                serialize_file_revision(&repository_ctx, Hash::default(), 1, "hero.uasset").await
+            }
+        }))
+        .await;
+
+    let request = prepare_and_build_push_request(
+        &store,
+        repository_id_bytes,
+        branch_id_bytes,
+        first_revision,
+        &pusher_token,
+    )
+    .await;
+    let response = handler(
+        request,
+        immutable_store,
+        mutable_store,
+        notification,
+        &HookDispatcher::empty(),
+        branch::DEFAULT_HISTORY_STEP_SIZE,
+        RevisionListAcceleration::default(),
+        &instruments,
+        None,
+        Some(&domain),
+    )
+    .await
+    .expect("a committed governed push must succeed even when the hint sender is exhausted")
+    .into_inner();
+    assert!(
+        response.success,
+        "an exhausted hint sender must not affect the committed mutation's own result"
+    );
+    assert_eq!(response.revision, first_revision.as_ref().to_vec());
+
+    // Independent confirmation straight from the domain row, not just the RPC
+    // response shape: the push actually landed.
+    let committed = store
+        .branch_snapshot(&repository_id_bytes, &branch_id_bytes)
+        .await
+        .expect("branch snapshot must read")
+        .expect("branch must still exist");
+    assert_eq!(committed.latest_hash, first_revision.as_ref().to_vec());
 }

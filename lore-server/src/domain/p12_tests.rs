@@ -903,3 +903,53 @@ async fn commit_maps_a_non_tombstoned_rejection_through_the_shared_mapper() {
     };
     assert_eq!(error.code(), Code::FailedPrecondition);
 }
+
+// ---------------------------------------------------------------------------
+// WP-119 Phase 8 reviewer gap: `DomainContext::attach_admission` (`wiring.rs`
+// calls this once, from `configure_event_relay`, after every startup
+// precondition passes) must refuse a second handle rather than replacing the
+// first -- two gates over one cell would mean two caches and a coin flip
+// over which verdict a mutation reads. Offline: `attach_admission` and
+// `admission` are both plain `OnceLock` operations, and `OutboxAdmission::new`
+// takes a `Pool`, which `build_pool` constructs lazily (no connection is
+// opened until first use), so this needs no live Postgres.
+// ---------------------------------------------------------------------------
+
+fn unconnected_admission() -> Arc<crate::event_relay::admission::OutboxAdmission> {
+    let pool = lore_postgres::pool::build_pool(
+        "postgresql://unused@127.0.0.1:1/unused",
+        1,
+        &lore_postgres::pool::TlsConfig::default(),
+    )
+    .expect("build_pool constructs lazily and must not dial anything");
+    Arc::new(crate::event_relay::admission::OutboxAdmission::new(
+        pool,
+        lore_postgres::domain::outbox::relay::AdmissionLimits::default(),
+    ))
+}
+
+#[test]
+fn attach_admission_succeeds_once_and_refuses_a_second_handle() {
+    let domain = context(true);
+    let first = unconnected_admission();
+    domain
+        .attach_admission(first.clone())
+        .expect("the first attach must succeed");
+
+    let second = unconnected_admission();
+    let rejected = domain
+        .attach_admission(second.clone())
+        .expect_err("a second attach must be refused, not silently replace the first");
+    assert!(
+        Arc::ptr_eq(&rejected, &second),
+        "the refusal must hand back the exact handle that was rejected"
+    );
+
+    let attached = domain
+        .admission()
+        .expect("a successfully attached gate must be readable back");
+    assert!(
+        Arc::ptr_eq(attached, &first),
+        "the ORIGINAL handle must remain attached after a refused second attach, not the rejected one"
+    );
+}

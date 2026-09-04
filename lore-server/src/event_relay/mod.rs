@@ -25,24 +25,24 @@
 //! | [`retry_info`] | `google.rpc.RetryInfo`, hand-transcribed |
 //! | [`wiring`] | server construction, in one reviewable sequence |
 //!
-//! # The admission seam is built here and called elsewhere
+//! # The admission seam is built here and read at the mutation choke point
 //!
-//! [`admission::OutboxAdmission`] is complete: it answers from local Postgres
-//! facts only, and [`admission::rejection_status`] maps a closed verdict to
-//! `RESOURCE_EXHAUSTED` with bounded `RetryInfo`. It is not yet called.
+//! [`admission::OutboxAdmission`] answers from local Postgres facts only, and
+//! [`admission::rejection_status`] maps a closed verdict to
+//! `RESOURCE_EXHAUSTED` with bounded `RetryInfo`. WP-119 Phase 8 wired it:
+//! [`wiring::configure_event_relay`] attaches the handle to the
+//! `DomainContext`, and `DomainContext::admit` — the single server-side choke
+//! point every governed repository, branch, lock, and obliterate handler
+//! reaches through `admit_at_entry` — refuses a closed verdict just before it
+//! would return `Ok(Some(AdmittedOperation))`, so every client-fault
+//! classification above still wins over a backlog rejection.
 //!
-//! TODO(WP-119 Phase 8): call `OutboxAdmission::check` before the mutation
-//! transaction opens, in `lore-server/src/domain.rs` at
-//! `DomainContext::admit` — the single server-side choke point every governed
-//! repository, branch, lock, and obliterate handler reaches through
-//! `admit_at_entry`. The call belongs after carriage validation and before
-//! `Ok(Some(AdmittedOperation))` is returned, so a malformed request still
-//! gets `INVALID_ARGUMENT` rather than a backlog rejection, and it should run
-//! only under enforcement. `admit` and `admit_at_entry` are synchronous today,
-//! so wiring it makes them `async` and adds `.await` at the twelve handler
-//! call sites. That file belongs to the concurrent producers lane in this
-//! round, which is why the handle is built, tested, and handed over rather
-//! than wired here.
+//! `admit` stayed **synchronous**, and the twelve handler call sites were not
+//! touched. The gate reads a cached verdict that the worker's readiness tick
+//! refreshes; the database probe never runs on a mutation path. That is not
+//! only an ergonomic win — `relay::admission_check` is bounded but still
+//! `O(pending)`, so running it per mutation would cost the most exactly when
+//! the cell is already behind.
 //!
 //! # `consumer_safe` is never inferred from an acknowledgement
 //!

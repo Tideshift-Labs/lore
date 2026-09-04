@@ -69,6 +69,19 @@ pub struct ServerState {
     pub presign_config: Option<PresignConfig>,
 }
 
+/// The readiness facets `/event_readiness` reports, grouped so [`serve`]'s
+/// signature stays readable as facets are added.
+///
+/// [`serve`]: LoreHttpServer::serve
+#[derive(Default)]
+pub struct HealthFacets {
+    /// CR-032's event-plane facets, when this cell runs a relay.
+    pub event_relay: Option<Arc<crate::event_relay::readiness::EventRelayReadiness>>,
+    /// WP-114 CD-6's terminal write-claim prune facet, when this cell runs the
+    /// scheduler.
+    pub fragment_prune: Option<Arc<crate::fragment_prune::FragmentPruneReadiness>>,
+}
+
 pub struct ServerHealth {
     pub immutable_store: Weak<dyn lore_storage::ImmutableStore>,
     pub available: AtomicBool,
@@ -85,6 +98,16 @@ pub struct ServerHealth {
     /// broker loss cannot pull a node that is serving reads perfectly well out
     /// of the load balancer.
     pub event_relay: Option<Arc<crate::event_relay::readiness::EventRelayReadiness>>,
+    /// WP-114 CD-6's terminal write-claim prune facet, when this cell runs the
+    /// scheduler.
+    ///
+    /// On `/event_readiness` beside the relay facets, and — same rule as
+    /// `event_relay` — deliberately **not** consulted by `/health_check`. An
+    /// evidence table that has stopped draining is an activation-blocking
+    /// condition an operator must see; it is not a reason to stop serving
+    /// reads, and putting it behind the load balancer's probe would make it
+    /// one.
+    pub fragment_prune: Option<Arc<crate::fragment_prune::FragmentPruneReadiness>>,
 }
 
 impl ServerHealth {
@@ -98,6 +121,7 @@ impl ServerHealth {
             store_health_check: false,
             drain: None,
             event_relay: None,
+            fragment_prune: None,
         }
     }
 }
@@ -272,6 +296,7 @@ impl LoreHttpServer {
             store_health_check: false,
             drain: None,
             event_relay: None,
+            fragment_prune: None,
         });
 
         let app = Router::new()
@@ -301,7 +326,7 @@ impl LoreHttpServer {
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
         drain: Option<Arc<DrainState>>,
-        event_relay: Option<Arc<crate::event_relay::readiness::EventRelayReadiness>>,
+        facets: HealthFacets,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let addr = SocketAddr::from_str(format!("{}:{}", settings.host, settings.port).as_str())
@@ -327,7 +352,8 @@ impl LoreHttpServer {
             },
             store_health_check: settings.store_health_check,
             drain,
-            event_relay,
+            event_relay: facets.event_relay,
+            fragment_prune: facets.fragment_prune,
         };
 
         let presign_config = build_presign_config(&settings.presign)?;

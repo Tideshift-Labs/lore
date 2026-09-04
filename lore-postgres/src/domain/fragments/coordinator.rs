@@ -2385,10 +2385,81 @@ impl PostgresFragmentCoordinator {
         Ok(())
     }
 
+    /// Terminal claims past the retention horizon that **no live barrier is
+    /// blocking**, counted up to one past the batch size.
+    ///
+    /// A scheduler cannot tell whether it is keeping up from
+    /// [`FragmentWriteClaimPruneReport`] alone. `examined == 0` says the plan
+    /// query returned nothing, and that is **not** the same as "the table is
+    /// drained": the plan's `EXISTS` on `lore_fragment_epochs` withholds a
+    /// Decisive claim whose evidence was never copied, and such a row is
+    /// withheld forever while the report keeps reporting zero. A scheduler
+    /// keying its health on `examined` would report green over exactly the
+    /// unbounded growth WP-114 CD-8 refuses to activate on.
+    ///
+    /// This is the discriminating count. It deliberately **excludes** the live
+    /// send-barrier case — mirroring the plan's own anti-join and its state
+    /// literals — because that one is transient by construction: a hash under
+    /// continuous write traffic legitimately withholds its Decisive claims, and
+    /// counting them would flip a health signal on a hot hash that is behaving
+    /// correctly. It deliberately **includes** the missing-evidence case, which
+    /// is the one that never clears on its own.
+    ///
+    /// So `pruned == 0` alongside a non-zero count here means rows that nothing
+    /// transient is blocking were not removed. Repeated, that is a real stall.
+    ///
+    /// The count is bounded by `max_claims + 1`: past that the exact total does
+    /// not change any decision, and an unbounded `count(*)` over a table this
+    /// exists to detect the unbounded growth of would be the wrong shape.
+    pub async fn unblocked_terminal_write_claim_backlog(
+        &self,
+        batch: &FragmentWriteClaimPruneBatch,
+    ) -> Result<i64, DomainError> {
+        let client = self.checkout().await?;
+        // Every state test here is an SQL literal, and must stay that way, for
+        // the reason spelled out at length in `prune_terminal_write_claims`
+        // below: `state = 2 OR state = 4` is what lets the planner prove
+        // implication with `lore_fragment_write_claims_terminal_prune`
+        // (`WHERE state IN (2, 4)`), and `state IN (0, 1, 3)` with
+        // `lore_fragment_write_claims_barrier`. Bound as `$n` the proof fails
+        // and both degrade to sequential scans of the whole claims table.
+        //
+        // The barrier arms mirror `write_claim_barrier_for_prune` exactly:
+        // Prepared blocks on `send_not_after`, Sending and Ambiguous on
+        // `hard_not_after`.
+        let probe = batch.max_claims.saturating_add(1);
+        let row = client
+            .query_one(
+                "SELECT count(*)::bigint AS backlog FROM ( \
+                   SELECT 1 FROM lore_fragment_write_claims AS claim \
+                    WHERE claim.settled_at <= clock_timestamp() \
+                                            - ($1::bigint * interval '1 millisecond') \
+                      AND (claim.state = 2 OR claim.state = 4) \
+                      AND NOT EXISTS ( \
+                          SELECT 1 FROM lore_fragment_write_claims AS active \
+                           WHERE active.hash = claim.hash \
+                             AND active.state IN (0, 1, 3) \
+                             AND (CASE WHEN active.state = 0 \
+                                       THEN active.send_not_after \
+                                       ELSE active.hard_not_after END) \
+                                 > clock_timestamp()) \
+                    LIMIT $2) AS bounded",
+                &[&batch.terminal_retention_millis, &probe],
+            )
+            .await
+            .map_err(|error| {
+                DomainError::from_pg("fragment write claim unblocked terminal backlog", error)
+            })?;
+        Ok(row.get("backlog"))
+    }
+
     /// Prune a bounded batch of terminal write claims using database time.
     ///
-    /// No scheduler calls this yet. Phase 6B or an operations package must
-    /// explicitly invoke it. Prepared, Sending, and Ambiguous are never
+    /// The scheduler is `lore-server`'s `fragment_prune` module (WP-114 CD-6).
+    /// It pairs each pass with
+    /// [`Self::unblocked_terminal_write_claim_backlog`], because this report
+    /// cannot on its own distinguish a drained table from a withheld one.
+    /// Prepared, Sending, and Ambiguous are never
     /// selected by age. A Decisive claim is deleted only when its exact target
     /// digest and size have been copied into durable epoch evidence; NoSend is
     /// safe after terminal retention because it never names a cleanup target.

@@ -72,6 +72,7 @@ mod tests {
             store_health_check: false,
             drain,
             event_relay: None,
+            fragment_prune: None,
         })
     }
 

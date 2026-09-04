@@ -193,6 +193,23 @@ pub struct FragmentProviderConfig {
     pub budget_revision: Option<String>,
     pub budget_fence: Option<u64>,
     pub provider_write_authority_revision: Option<String>,
+    /// Whether the terminal write-claim prune scheduler runs (WP-114 CD-6's
+    /// hand-down from WP-118).
+    ///
+    /// Absent means enabled, because the governed route is the only thing that
+    /// writes the claims this prunes: if that route is on, the rows accumulate,
+    /// and CD-8 does not accept an unpruned evidence table. `false` is an
+    /// operator taking the table's growth on deliberately, for a dark or
+    /// staging cell, for a bounded time.
+    pub prune_enabled: Option<bool>,
+    /// Milliseconds between prune passes.
+    pub prune_interval_millis: Option<u64>,
+    /// Candidates one pass may plan.
+    pub prune_batch: Option<u32>,
+    /// How long a settled claim is kept before it becomes a candidate.
+    pub prune_terminal_retention_millis: Option<u64>,
+    /// Consecutive non-progressing passes that flip the prune facet false.
+    pub prune_stall_ticks: Option<u32>,
 }
 
 impl fmt::Debug for FragmentProviderConfig {
@@ -545,6 +562,37 @@ fn parse_config(name: &str, config: &toml::Value) -> Result<PostgresStoreConfig,
 /// consults it only to preserve the legacy construction order when the block
 /// is absent or disabled; enabled construction still validates the value again
 /// at its real composition door.
+/// The reviewed prune-scheduler settings for this cell, or `None` when no
+/// scheduler should run.
+///
+/// `None` covers all three inert cases with one answer: no `fragment_provider`
+/// block, one that is `enabled = false`, and one with `prune_enabled = false`.
+/// The first two write no write-claims at all, so a scheduler would poll an
+/// empty table forever; the third is an operator's explicit choice.
+///
+/// An out-of-bounds value is an `Err` here rather than a clamp, and it reaches
+/// the caller on the boot path, so a cell configured with one does not come up
+/// — the same treatment `fragment_in_flight_puts` gets, for the same reason.
+pub(crate) fn fragment_prune_settings(
+    config: &toml::Value,
+) -> Result<Option<crate::fragment_prune::FragmentPruneSettings>, PluginError> {
+    let cfg = parse_config(PLUGIN_NAME, config)?;
+    let Some(provider) = cfg.fragment_provider.as_ref().filter(|p| p.enabled) else {
+        return Ok(None);
+    };
+    if provider.prune_enabled == Some(false) {
+        return Ok(None);
+    }
+    crate::fragment_prune::FragmentPruneSettings::new(
+        provider.prune_interval_millis,
+        provider.prune_batch,
+        provider.prune_terminal_retention_millis,
+        provider.prune_stall_ticks,
+    )
+    .map(Some)
+    .map_err(|error| config_error(PLUGIN_NAME, error.to_string()))
+}
+
 pub(crate) fn fragment_provider_enabled(config: &toml::Value) -> Result<bool, PluginError> {
     let cfg = parse_config(PLUGIN_NAME, config)?;
     Ok(cfg
