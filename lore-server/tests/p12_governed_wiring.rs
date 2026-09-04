@@ -928,3 +928,70 @@ fn the_claim_witness_is_mediated_only_and_required_when_mediated() {
         "handlers must consume the assembled witness, never build one"
     );
 }
+
+/// WP-116: one method string for a governed create, not two that must agree.
+///
+/// The regression this pins actually happened, against a live cell. The receipt
+/// binding carried the gRPC path and the ReBAC callback carried the platform
+/// family constant, so the platform's single stored method could satisfy only
+/// one of them: the callback acknowledged and then `ReceiptRow::matches` failed,
+/// and the create died at the coordinator with `ADMISSION_REJECTED_V1` after the
+/// authorization side effect had already run. The two wire versions also
+/// disagreed with each other, so one operation id was consumable only by
+/// whichever version the caller happened to reach.
+///
+/// The fix was to delete the choice rather than correct it, so this pin is about
+/// the SHAPE, not the value: `GovernedRepositoryCreate::prepare` must take no
+/// method argument, and the seam must bind the same constant it sends.
+#[test]
+fn a_governed_create_binds_the_same_method_it_sends_on_the_callback() {
+    let seam = rust_fn_body(GOVERNED_SEAM, "impl GovernedRepositoryCreate {");
+    assert!(
+        seam.contains("admitted.into_governed(PLATFORM_METHOD_REPOSITORY_CREATE, digest)"),
+        "the create seam must bind the platform family constant; binding a \
+         handler-supplied gRPC path is what made the receipt match fail after \
+         the callback had already succeeded"
+    );
+
+    // A `method` parameter is the mechanism the two values diverged through, so
+    // its absence is the property, not merely today's argument being right.
+    let signature = {
+        let start = seam
+            .find("pub fn prepare(")
+            .expect("the create seam must expose `prepare`");
+        let rest = &seam[start..];
+        let end = rest
+            .find(") -> Result<Option<Self>, Status> {")
+            .expect("`prepare`'s signature must terminate");
+        &rest[..end]
+    };
+    assert!(
+        !signature.contains("method"),
+        "`GovernedRepositoryCreate::prepare` must take no method argument: both \
+         wire versions are one operation family to the platform, and a \
+         per-handler argument is how v0 and v1 came to bind different methods \
+         for one operation id"
+    );
+
+    // Neither create handler may name a method at its `prepare` call.
+    for (label, source) in [
+        ("v0 repository create", CREATE_HANDLER),
+        (
+            "v1 repository create",
+            include_str!("../src/grpc/repository/v1/repository_create.rs"),
+        ),
+    ] {
+        let start = source
+            .find("GovernedRepositoryCreate::prepare(")
+            .unwrap_or_else(|| panic!("{label} must call the shared create seam"));
+        let rest = &source[start..];
+        let end = rest
+            .find(")?")
+            .unwrap_or_else(|| panic!("{label} call must terminate"));
+        let call = &rest[..end];
+        assert!(
+            !call.contains('"'),
+            "{label} must pass no method string to the create seam; found: {call}"
+        );
+    }
+}

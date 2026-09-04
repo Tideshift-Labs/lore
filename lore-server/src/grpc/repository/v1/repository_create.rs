@@ -135,12 +135,7 @@ pub async fn handler(
                 caller_created: None,
             })
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            GovernedRepositoryCreate::prepare(
-                domain_context,
-                Some(admitted),
-                "lore.repository.v1.RepositoryService/RepositoryCreate",
-                digest,
-            )?
+            GovernedRepositoryCreate::prepare(domain_context, Some(admitted), digest)?
         }
         None => None,
     };

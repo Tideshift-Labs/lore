@@ -29,6 +29,7 @@ use lore_server::domain::AdmittedOperation;
 use lore_server::domain::DomainContext;
 use lore_server::domain::GovernedRepositoryCreate;
 use lore_server::domain::GovernedScope;
+use lore_server::domain::PLATFORM_METHOD_REPOSITORY_CREATE;
 use lore_server::domain::RepositoryCreatePublication;
 use lore_server::domain_intent::CanonicalIntent;
 use lore_server::domain_intent::canonical_intent_digest;
@@ -123,7 +124,7 @@ async fn create_repository(
     })
     .expect("fixture create intent must hash");
     let binding = OperationBinding {
-        method: "repository_create".to_string(),
+        method: PLATFORM_METHOD_REPOSITORY_CREATE.to_string(),
         scope: key.tenant_scope_key.clone(),
         fingerprint_version: 1,
         fingerprint: fingerprint.clone(),
@@ -512,7 +513,7 @@ async fn governed_create_projection_rows_match_the_legacy_writers_exactly() {
             })
             .expect("create intent must hash");
             let binding = OperationBinding {
-                method: "repository_create".to_string(),
+                method: PLATFORM_METHOD_REPOSITORY_CREATE.to_string(),
                 scope: key.tenant_scope_key.clone(),
                 fingerprint_version: 1,
                 fingerprint: rand::random::<[u8; 32]>().to_vec(),
@@ -536,14 +537,9 @@ async fn governed_create_projection_rows_match_the_legacy_writers_exactly() {
                     claim_witness: None,
                 },
             };
-            let governed = GovernedRepositoryCreate::prepare(
-                Some(&domain),
-                Some(admitted),
-                "repository_create",
-                digest,
-            )
-            .expect("prepare must not error")
-            .expect("enforcement is on; must admit");
+            let governed = GovernedRepositoryCreate::prepare(Some(&domain), Some(admitted), digest)
+                .expect("prepare must not error")
+                .expect("enforcement is on; must admit");
 
             let default_branch_latest_hash = lore_storage::Hash::default();
             let publication = RepositoryCreatePublication {

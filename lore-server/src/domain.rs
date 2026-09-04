@@ -732,15 +732,32 @@ pub struct RepositoryCreateOutcome {
     pub metadata_hash: Hash,
 }
 
-/// The platform method name a governed create acknowledges under.
+/// The one method name a governed repository create is known by.
 ///
-/// Deliberately **not** [`GovernedOperation`]'s binding method. That one is the
-/// gRPC path and differs between the two wire versions
-/// (`lore.RepositoryService/RepositoryCreate` and
-/// `lore.repository.v1.RepositoryService/RepositoryCreate`), while the platform
-/// authorization row carries one family name for both. Sending the binding
-/// method would make every v0 create fail the verifier's exact match and every
-/// v1 create fail it differently.
+/// It is the receipt binding's method **and** the ReBAC callback's `method`,
+/// because the platform has exactly one value for both and cannot satisfy two.
+/// `acknowledgeCreateClaim` compares the callback's method against the
+/// authorization row; the prepare verifier compares the prepare request's method
+/// against that same row; and `ReceiptRow::matches`
+/// (`lore-postgres/src/domain/receipts.rs:306`) compares the stored method
+/// against whatever binding a handler later presents. One row, three
+/// comparisons, so one string.
+///
+/// # Why this is a constant and not a handler argument
+///
+/// The first cut of this passed the gRPC path into the binding
+/// (`lore.RepositoryService/RepositoryCreate` on v0,
+/// `lore.repository.v1.RepositoryService/RepositoryCreate` on v1) and this
+/// constant only to the callback. Those two are independent values that had to
+/// agree, and they did not: the platform's single stored method made the
+/// callback pass and the receipt match fail, so a live governed create died at
+/// the coordinator with `ADMISSION_REJECTED_V1` after the callback had already
+/// succeeded. Worse, the two paths disagreed with **each other** — one operation
+/// id could only ever be consumed by whichever wire version the caller happened
+/// to reach, which is precisely the v0/v1 divergence CR-029 exists to end.
+///
+/// [`GovernedRepositoryCreate::prepare`] therefore takes no `method` argument at
+/// all. Divergence is unrepresentable rather than merely corrected.
 pub const PLATFORM_METHOD_REPOSITORY_CREATE: &str = "repository.create";
 
 /// The complete attached platform claim a governed create hands the ReBAC
@@ -881,10 +898,15 @@ impl GovernedRepositoryCreate {
     /// the legacy path, because the caller asked for governed semantics and
     /// would otherwise get today's unsynchronised writes while believing its
     /// operation had been receipted.
+    /// # No `method` argument
+    ///
+    /// Both wire versions of repository create are the same operation family to
+    /// the platform, so the method is [`PLATFORM_METHOD_REPOSITORY_CREATE`] and
+    /// a handler has no say in it. See that constant for what passing it per
+    /// handler cost.
     pub fn prepare(
         domain: Option<&Arc<DomainContext>>,
         admitted: Option<AdmittedOperation>,
-        method: &'static str,
         digest: Vec<u8>,
     ) -> Result<Option<Self>, Status> {
         let Some(admitted) = admitted else {
@@ -900,7 +922,7 @@ impl GovernedRepositoryCreate {
         };
         if !domain.enforcement_enabled() {
             warn!(
-                method,
+                method = PLATFORM_METHOD_REPOSITORY_CREATE,
                 operation_id = %admitted.key.operation_id,
                 "Refusing a governed repository create on a cell that is not enforcing"
             );
@@ -911,7 +933,7 @@ impl GovernedRepositoryCreate {
         let create_witness = build_create_witness(&admitted, &digest)?;
         Ok(Some(Self {
             domain: domain.clone(),
-            operation: admitted.into_governed(method, digest),
+            operation: admitted.into_governed(PLATFORM_METHOD_REPOSITORY_CREATE, digest),
             create_witness,
         }))
     }
@@ -3073,7 +3095,7 @@ mod tests {
                 operation_id,
             };
             let binding = OperationBinding {
-                method: "lore.RepositoryService/RepositoryCreate".to_string(),
+                method: PLATFORM_METHOD_REPOSITORY_CREATE.to_string(),
                 scope: mediated_key.tenant_scope_key.clone(),
                 fingerprint_version: 1,
                 fingerprint: rand::random::<[u8; 32]>().to_vec(),

@@ -744,7 +744,7 @@ impl DummyPublicationBytes {
 /// early return).
 #[test]
 fn prepare_with_no_admitted_operation_is_the_legacy_path() {
-    let result = GovernedRepositoryCreate::prepare(None, None, "repository_create", vec![0u8; 32]);
+    let result = GovernedRepositoryCreate::prepare(None, None, vec![0u8; 32]);
     assert!(matches!(result, Ok(None)));
 }
 
@@ -775,12 +775,7 @@ fn prepare_refuses_carriage_when_enforcement_is_off() {
     // explicitly instead, matching this file's other `Debug`-less-type
     // convention (see `commit_maps_cas_mismatch_without_observed_pointer_to_status_internal`
     // above).
-    let result = GovernedRepositoryCreate::prepare(
-        Some(&domain),
-        Some(admitted),
-        "repository_create",
-        vec![0u8; 32],
-    );
+    let result = GovernedRepositoryCreate::prepare(Some(&domain), Some(admitted), vec![0u8; 32]);
     let Err(error) = result else {
         panic!("carriage with enforcement off must be refused, not admitted");
     };
@@ -808,13 +803,8 @@ fn prepare_admits_carriage_when_enforcement_is_on() {
             claim_witness: None,
         },
     };
-    let result = GovernedRepositoryCreate::prepare(
-        Some(&domain),
-        Some(admitted),
-        "repository_create",
-        vec![0u8; 32],
-    )
-    .expect("carriage with enforcement on must be admitted");
+    let result = GovernedRepositoryCreate::prepare(Some(&domain), Some(admitted), vec![0u8; 32])
+        .expect("carriage with enforcement on must be admitted");
     assert!(result.is_some());
 }
 
@@ -1540,14 +1530,9 @@ fn create_witness_is_none_for_a_direct_non_mediated_governed_create() {
             claim_witness: None,
         },
     };
-    let governed = GovernedRepositoryCreate::prepare(
-        Some(&domain),
-        Some(admitted),
-        "repository_create",
-        vec![0u8; 32],
-    )
-    .expect("carriage with enforcement on must be admitted")
-    .expect("carriage must govern");
+    let governed = GovernedRepositoryCreate::prepare(Some(&domain), Some(admitted), vec![0u8; 32])
+        .expect("carriage with enforcement on must be admitted")
+        .expect("carriage must govern");
     assert!(
         governed.create_witness().is_none(),
         "a direct governed create (no mediated scope) must carry no platform claim witness"
@@ -1568,12 +1553,7 @@ fn prepare_refuses_mediated_scope_without_claim_witness_before_touching_the_coor
     let domain = Arc::new(context(true));
     let admitted = mediated_admitted_operation(None);
 
-    let result = GovernedRepositoryCreate::prepare(
-        Some(&domain),
-        Some(admitted),
-        "repository_create",
-        vec![0u8; 32],
-    );
+    let result = GovernedRepositoryCreate::prepare(Some(&domain), Some(admitted), vec![0u8; 32]);
     let Err(error) = result else {
         panic!("mediated carriage missing a claim witness must be refused, not admitted");
     };
@@ -1595,14 +1575,9 @@ async fn prepare_assembles_the_full_create_witness_from_three_separate_provenanc
     let expected_carried = admitted.carried.clone();
     let digest = vec![0x77u8; 32];
 
-    let governed = GovernedRepositoryCreate::prepare(
-        Some(&domain),
-        Some(admitted),
-        "repository_create",
-        digest.clone(),
-    )
-    .expect("mediated carriage with a claim witness must not error")
-    .expect("mediated carriage with a claim witness must govern");
+    let governed = GovernedRepositoryCreate::prepare(Some(&domain), Some(admitted), digest.clone())
+        .expect("mediated carriage with a claim witness must not error")
+        .expect("mediated carriage with a claim witness must govern");
 
     let witness = governed
         .create_witness()
@@ -1985,14 +1960,10 @@ async fn governed_repository_create_refuses_a_claim_witness_with_no_configured_a
             ));
             let domain = Arc::new(context(true));
             let admitted = mediated_admitted_operation(Some(claim_witness_fixture()));
-            let governed = GovernedRepositoryCreate::prepare(
-                Some(&domain),
-                Some(admitted),
-                "repository_create",
-                vec![0u8; 32],
-            )
-            .expect("mediated carriage with a claim witness must not error")
-            .expect("mediated carriage with a claim witness must govern");
+            let governed =
+                GovernedRepositoryCreate::prepare(Some(&domain), Some(admitted), vec![0u8; 32])
+                    .expect("mediated carriage with a claim witness must not error")
+                    .expect("mediated carriage with a claim witness must govern");
             assert!(
                 governed.create_witness().is_some(),
                 "fixture setup: this test needs a witness-bearing governed create"
