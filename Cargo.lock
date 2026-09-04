@@ -2966,7 +2966,6 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "serde_with",
- "serial_test",
  "smallvec",
  "tempfile",
  "thiserror 2.0.18",

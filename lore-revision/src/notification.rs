@@ -453,10 +453,37 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-
-    use serial_test::serial;
+    use std::sync::MutexGuard;
+    use std::sync::PoisonError;
 
     use super::*;
+
+    /// Installs `router` as the process-wide notification router for the life of
+    /// this guard: serialized against every other guard of this type (the same
+    /// static lock, taken here and held until drop) because `NOTIFICATION_ROUTER`
+    /// is one process-global slot, and cleared automatically on drop — including
+    /// when the test panics, so a failing assertion can never leak a router into a
+    /// later test sharing this binary. Replaces a bare `#[serial]` + manual
+    /// `set_notification_router` pair: those left the slot installed past a
+    /// panicking assertion, since nothing ran on the unwind path.
+    struct InstalledRouter {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl InstalledRouter {
+        fn new(router: Arc<dyn NotificationRouter>) -> Self {
+            static LOCK: Mutex<()> = Mutex::new(());
+            let lock = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            set_notification_router(router);
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for InstalledRouter {
+        fn drop(&mut self) {
+            clear_notification_router();
+        }
+    }
 
     // ── NotificationRoute / NotificationStreamClose: defaults are the stock,
     // no-router behaviour ───────────────────────────────────────────────────
@@ -515,12 +542,7 @@ mod tests {
         }
     }
 
-    // `#[serial]`: `NOTIFICATION_ROUTER` is one process-wide slot. Two of these
-    // tests running concurrently would each observe whichever router the other
-    // last installed.
-
     #[test]
-    #[serial]
     fn set_notification_router_then_notification_router_returns_the_installed_router() {
         let router = Arc::new(RecordingRouter {
             route: NotificationRoute {
@@ -529,7 +551,7 @@ mod tests {
             },
             closes: Mutex::new(Vec::new()),
         });
-        set_notification_router(router.clone());
+        let _guard = InstalledRouter::new(router.clone());
 
         let installed = notification_router().expect("a router was just installed");
         let route = installed.route(RepositoryId::default());
@@ -545,7 +567,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn set_notification_router_replaces_a_previously_installed_router() {
         let first = Arc::new(RecordingRouter {
             route: NotificationRoute {
@@ -554,7 +575,7 @@ mod tests {
             },
             closes: Mutex::new(Vec::new()),
         });
-        set_notification_router(first);
+        let _first_guard = InstalledRouter::new(first);
 
         let second = Arc::new(RecordingRouter {
             route: NotificationRoute {
@@ -563,6 +584,11 @@ mod tests {
             },
             closes: Mutex::new(Vec::new()),
         });
+        // A second install while the first guard is still alive: this is the
+        // real-world "replace" path (a fresh call to `set_notification_router`
+        // over an existing installation), not a second, separately-locked guard —
+        // `InstalledRouter`'s own lock would deadlock on a second acquire from the
+        // same thread, which is not the shape being tested here.
         set_notification_router(second);
 
         let installed = notification_router().expect("a router was just installed");
@@ -571,13 +597,12 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn on_stream_close_delivers_the_full_close_shape_to_the_installed_router() {
         let router = Arc::new(RecordingRouter {
             route: NotificationRoute::default(),
             closes: Mutex::new(Vec::new()),
         });
-        set_notification_router(router.clone());
+        let _guard = InstalledRouter::new(router.clone());
 
         let repository = RepositoryId::default();
         let close = NotificationStreamClose {
