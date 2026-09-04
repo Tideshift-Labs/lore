@@ -760,6 +760,17 @@ pub struct RepositoryCreateOutcome {
 /// all. Divergence is unrepresentable rather than merely corrected.
 pub const PLATFORM_METHOD_REPOSITORY_CREATE: &str = "repository.create";
 
+/// The one method name a governed repository delete is known by.
+///
+/// [`PLATFORM_METHOD_REPOSITORY_CREATE`]'s reasoning applies unchanged; only the
+/// family differs. Bound here **before** delete is wired, rather than after the
+/// same defect is found a second time: the platform named this value
+/// (`REPOSITORY_DELETE_METHOD` in
+/// `packages/control-plane/src/repository-operation-dispatch.ts`), so there is
+/// nothing left to discover and no reason to leave a `method` argument for a
+/// future handler to fill in wrongly.
+pub const PLATFORM_METHOD_REPOSITORY_DELETE: &str = "repository.delete";
+
 /// The complete attached platform claim a governed create hands the ReBAC
 /// `CreateResource` callback.
 ///
@@ -1273,10 +1284,15 @@ impl GovernedRepositoryDelete {
     /// cell still writes the generic mutable path unfenced, so admitting a
     /// governed delete there would put two writers on the same rows under two
     /// lock disciplines.
+    ///
+    /// # No `method` argument
+    ///
+    /// Same reason as the create seam, applied before rather than after the
+    /// defect: the method is [`PLATFORM_METHOD_REPOSITORY_DELETE`] and the two
+    /// wire versions have no say in it.
     pub fn prepare(
         domain: Option<&Arc<DomainContext>>,
         admitted: Option<AdmittedOperation>,
-        method: &'static str,
         digest: Vec<u8>,
     ) -> Result<Option<Self>, Status> {
         let Some(admitted) = admitted else {
@@ -1289,7 +1305,7 @@ impl GovernedRepositoryDelete {
         };
         if !domain.enforcement_enabled() {
             warn!(
-                method,
+                method = PLATFORM_METHOD_REPOSITORY_DELETE,
                 operation_id = %admitted.key.operation_id,
                 "Refusing a governed repository delete on a cell that is not enforcing"
             );
@@ -1299,7 +1315,7 @@ impl GovernedRepositoryDelete {
         }
         Ok(Some(Self {
             domain: domain.clone(),
-            operation: admitted.into_governed(method, digest),
+            operation: admitted.into_governed(PLATFORM_METHOD_REPOSITORY_DELETE, digest),
         }))
     }
 

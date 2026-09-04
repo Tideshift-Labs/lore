@@ -995,3 +995,118 @@ fn a_governed_create_binds_the_same_method_it_sends_on_the_callback() {
         );
     }
 }
+
+/// The governed delete seam binds its method the same way, before it is wired.
+///
+/// The create seam paid for this lesson against a live cell. Delete has no
+/// production call site yet, so there is no defect here to fix — the point is
+/// that there is no `method` argument for the wiring change to fill in wrongly.
+#[test]
+fn the_governed_delete_seam_binds_its_method_by_construction_too() {
+    let seam = rust_fn_body(GOVERNED_SEAM, "impl GovernedRepositoryDelete {");
+    assert!(
+        seam.contains("admitted.into_governed(PLATFORM_METHOD_REPOSITORY_DELETE, digest)"),
+        "the delete seam must bind the platform family constant"
+    );
+    let signature = {
+        let start = seam
+            .find("pub fn prepare(")
+            .expect("the delete seam must expose `prepare`");
+        let rest = &seam[start..];
+        let end = rest
+            .find(") -> Result<Option<Self>, Status> {")
+            .expect("`prepare`'s signature must terminate");
+        &rest[..end]
+    };
+    assert!(
+        !signature.contains("method"),
+        "`GovernedRepositoryDelete::prepare` must take no method argument"
+    );
+    assert!(
+        GOVERNED_SEAM
+            .contains("pub const PLATFORM_METHOD_REPOSITORY_DELETE: &str = \"repository.delete\";"),
+        "the delete family constant must stay `repository.delete`, which is \
+         `REPOSITORY_DELETE_METHOD` in the platform's dispatch module"
+    );
+}
+
+/// The four metadata-CAS sites still bind their own gRPC path, and this test
+/// exists to make that state impossible to forget.
+///
+/// It is a **tracking** pin, so it is written to fail the moment the gap closes
+/// rather than to bless the gap. Two things trip it: a site that stops passing a
+/// gRPC-path literal, and a Lore-side platform method constant appearing for
+/// either family. Whoever does the fix updates this test as part of it, which is
+/// the point.
+///
+/// # Why these four were not fixed with create and delete
+///
+/// The defect is identical — `repository_metadata_set` and `branch_metadata_set`
+/// each bind one method on v0 and a different one on v1, so one operation id is
+/// consumable only by whichever wire version the caller reaches. The value is
+/// not. The platform names a method constant per family and today it has exactly
+/// two, `repository.create` and `repository.delete`
+/// (`packages/control-plane/src/repository-operation-dispatch.ts`). Nothing
+/// names a metadata-CAS method, and the intent families in
+/// `repository-operation-intent.ts` are canonical-digest domain separators in a
+/// different vocabulary, not method strings. Guessing one would produce a
+/// mismatch that looks fixed and fails identically at the coordinator, after the
+/// authorization side effect — which is exactly how the create defect presented.
+///
+/// Their shared seam, `GovernedMetadataCas`, genuinely serves two families, so
+/// its fix is a constant per family rather than the deleted parameter the
+/// single-family seams could take.
+///
+/// `branch_push` (`branch_push_commit`) and `obliterate` (`begin_obliterate`)
+/// are deliberately NOT listed: each binds one string across both wire versions,
+/// so neither carries the divergence. Whether those two strings match the
+/// platform's authorization rows is a separate, unverified question and not
+/// something a source-level pin can answer.
+#[test]
+fn the_four_metadata_cas_sites_still_bind_a_per_handler_grpc_path() {
+    let divergent: [(&str, &str, &str); 4] = [
+        (
+            "v0 repository metadata set",
+            include_str!("../src/grpc/handlers/repository_metadata_set.rs"),
+            "\"lore.RepositoryService/RepositoryMetadataSet\"",
+        ),
+        (
+            "v1 repository metadata set",
+            include_str!("../src/grpc/repository/v1/repository_metadata_set.rs"),
+            "\"lore.repository.v1.RepositoryService/RepositoryMetadataSet\"",
+        ),
+        (
+            "v0 branch metadata set",
+            include_str!("../src/grpc/handlers/branch_metadata_set.rs"),
+            "\"lore.RevisionService/BranchMetadataSet\"",
+        ),
+        (
+            "v1 branch metadata set",
+            include_str!("../src/grpc/revision/v1/branch_metadata_set.rs"),
+            "\"lore.revision.v1.RevisionService/BranchMetadataSet\"",
+        ),
+    ];
+    for (label, source, literal) in divergent {
+        assert!(
+            source.contains(literal),
+            "{label} no longer binds {literal}. If you fixed the v0/v1 method \
+             divergence, that is the intended outcome and this tracking pin is \
+             now stale: update it, and check that its sibling version was fixed \
+             in the same change rather than left behind."
+        );
+    }
+
+    // A Lore-side constant for either family means the platform named the
+    // value, which is the one thing that was missing.
+    for absent in [
+        "PLATFORM_METHOD_REPOSITORY_METADATA",
+        "PLATFORM_METHOD_BRANCH_METADATA",
+    ] {
+        assert!(
+            !GOVERNED_SEAM.contains(absent),
+            "{absent} exists, so the platform has named this family's method. \
+             Bind it at both wire versions and retire this pin; leaving one \
+             version on its gRPC path is the defect, not half of a fix."
+        );
+    }
+}
