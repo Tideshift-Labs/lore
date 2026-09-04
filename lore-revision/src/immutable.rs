@@ -7,10 +7,13 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
+use lore_transport::AttemptId;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
+use lore_transport::resolve;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
@@ -51,6 +54,11 @@ pub enum ImmutableError {
     NotSupported,
     Oversized,
     SlowDown,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 use lore_storage::options::ReadOptions;
@@ -190,8 +198,19 @@ pub async fn store_raw_remote_retry(
 ) -> Result<(), ImmutableError> {
     let mut retry = lore_storage::retry(50, 10_000, 60);
     loop {
-        match remote_storage.put(address, fragment, payload.clone()).await {
+        // The `_outcome` form (WP-120): the plain one collapses a lost response into
+        // `Disconnected` below this loop, which the arm two down would then report as a
+        // confirmed connectivity failure of a write that may well have landed.
+        let attempt = AttemptId::new();
+        match remote_storage
+            .put_outcome(address, fragment, payload.clone())
+            .await
+            .and_then(|outcome| resolve(outcome, "lore-storage/0.4 Put", &attempt))
+        {
             Ok(_) => return Ok(()),
+            Err(ProtocolError::OutcomeUnknown(unknown)) => {
+                return Err(OutcomeUnknown::clone(&unknown).into());
+            }
             Err(ProtocolError::SlowDown(_)) => {
                 if !retry.wait().await {
                     return Err(ImmutableError::internal(

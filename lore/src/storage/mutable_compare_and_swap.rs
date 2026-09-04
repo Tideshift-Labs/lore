@@ -154,10 +154,16 @@ async fn swap_item(
         let Some(session) = session else {
             return emit_complete(&item, Hash::default(), LoreErrorCode::Internal);
         };
+        // The `_outcome` form (WP-120). A lost CAS response is the hardest case to recover
+        // from — the current value cannot attribute the attempt once a successor has run — so
+        // it must not reach the caller as an ordinary connectivity failure.
+        let attempt = lore_transport::AttemptId::new();
         match session
-            .mutable_compare_and_swap(item.key, item.expected, item.value, item.key_type)
+            .mutable_compare_and_swap_outcome(item.key, item.expected, item.value, item.key_type)
             .await
-        {
+            .and_then(|outcome| {
+                lore_transport::resolve(outcome, "lore-storage/0.4 MutableCompareAndSwap", &attempt)
+            }) {
             Ok(previous) => emit_complete(&item, previous, LoreErrorCode::None),
             Err(err) => emit_complete(
                 &item,

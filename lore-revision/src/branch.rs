@@ -19,6 +19,7 @@ use std::sync::atomic::AtomicUsize;
 use dashmap::DashMap;
 use dashmap::Entry;
 use futures::StreamExt;
+use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
 use lore_base::types::BranchMetadata;
 use lore_base::types::BranchPoint;
@@ -343,11 +344,17 @@ pub enum BranchError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for BranchError {
     fn translated(&self) -> LoreError {
         match self {
+            BranchError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             BranchError::Disconnected(_) => LoreError::Connection,
             BranchError::SlowDown(_) => LoreError::SlowDown,
             BranchError::Oversized(_) => LoreError::Oversized,

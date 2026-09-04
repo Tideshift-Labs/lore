@@ -52,6 +52,19 @@
 
 #define LORE_INTERFACE_VERSION "0.9.1-nightly"
 
+// The status an operation reports when a mutation was dispatched and its outcome is not known
+// (WP-120).
+//
+// This is the *general* FFI code, the one carried by an operation's return value and by
+// `lore_complete_event_data_t.status`. It is deliberately the same number as the per-item
+// `LORE_ERROR_CODE_OUTCOME_UNKNOWN` and deliberately a separate name: the two numberings are
+// independent, and a C caller reading one should not have to know that they happen to agree.
+//
+// A caller that sees it must treat the mutation as neither applied nor rejected. Reading
+// current state does not resolve it: a later read reports where the repository is now, not what
+// this attempt did. Retrying is the one response that is always wrong.
+#define LORE_STATUS_OUTCOME_UNKNOWN 193
+
 // The kind of value held by a metadata entry.
 //
 // This is both the tag a caller passes across the API and the tag written into
@@ -167,6 +180,14 @@ typedef enum lore_error_code_t {
   LORE_ERROR_CODE_INTERNAL = -1,
   // The backing store is overloaded; the caller should retry later.
   LORE_ERROR_CODE_SLOW_DOWN = 31,
+  // A dispatched mutable item whose outcome is not known (WP-120).
+  //
+  // Last in declaration order because the order is the serialized wire format, so a
+  // new variant belongs at the end even though its numeric code is not the largest.
+  // A per-item unknown must reach the caller as itself: flattening it to `Internal`
+  // while the batch continues is exactly how a copied or healed item that may have
+  // landed gets reported as one that did not.
+  LORE_ERROR_CODE_OUTCOME_UNKNOWN = 193,
 } lore_error_code_t;
 
 // Whether a repository being created or cloned should be backed by a shared store.
@@ -5660,6 +5681,20 @@ typedef struct lore_revision_tree_commit_args_t {
 
 // Return the tag identifying the type of an event.
 uint32_t lore_event_type(const struct lore_event_t *event);
+
+// Whether this build implements the `outcome_unknown_v1` caller contract (WP-120).
+//
+// Returns 1 when it does, 0 when it does not. A caller queries this before declaring the
+// capability to a server: linking the library is not the declaration, and a cell that gates
+// mutations on the capability reads what the caller declares.
+uint8_t lore_supports_outcome_unknown_v1(void);
+
+// Whether a status or per-item error code reports an unknown outcome (WP-120).
+//
+// The predicate exists so no caller has to match on the message text. Rust callers have
+// `is_outcome_unknown()` on every error set that can carry one; this is the same question for
+// a caller holding only the integer.
+uint8_t lore_status_is_outcome_unknown(int32_t status);
 
 // Resolve user IDs to display names using the remote authentication service.
 // Requires an authenticated connection.

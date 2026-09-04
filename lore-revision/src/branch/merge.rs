@@ -6,6 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
@@ -350,11 +351,17 @@ pub enum MergeError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for MergeError {
     fn translated(&self) -> LoreError {
         match self {
+            MergeError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             MergeError::Disconnected(_) => LoreError::Connection,
             MergeError::SlowDown(_) => LoreError::SlowDown,
             MergeError::Oversized(_) => LoreError::Oversized,

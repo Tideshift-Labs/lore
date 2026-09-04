@@ -5,6 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use lore_base::error::OutcomeUnknown;
 use lore_base::types::BranchPoint;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
@@ -87,11 +88,23 @@ pub enum LayerError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for LayerError {
     fn translated(&self) -> LoreError {
-        LoreError::Internal
+        match self {
+            // An unresolved attempt keeps its own code all the way to the FFI
+            // boundary (WP-120). Reported as `Internal` it is indistinguishable
+            // from an operation that provably did not happen, which is the one
+            // reading a caller must never be given.
+            LayerError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
+            _ => LoreError::Internal,
+        }
     }
 
     fn inner(&self) -> String {

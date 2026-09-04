@@ -25,6 +25,7 @@ use crate::errors::NotAuthenticated;
 use crate::errors::NotAuthorized;
 use crate::errors::NotFound;
 use crate::errors::NotSupported;
+use crate::errors::OutcomeUnknown;
 use crate::errors::Oversized;
 use crate::errors::SlowDown;
 use crate::errors::TokenNotFound;
@@ -45,11 +46,17 @@ pub enum LoginError {
     NotSupported,
     Oversized,
     TokenNotFound,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for LoginError {
     fn translated(&self) -> LoreError {
         match self {
+            LoginError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             LoginError::Disconnected(_) => LoreError::Connection,
             LoginError::SlowDown(_) => LoreError::SlowDown,
             LoginError::Oversized(_) => LoreError::Oversized,
@@ -75,11 +82,17 @@ pub enum InteractiveLoginError {
     NotSupported,
     Oversized,
     TokenNotFound,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for InteractiveLoginError {
     fn translated(&self) -> LoreError {
         match self {
+            InteractiveLoginError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             InteractiveLoginError::Disconnected(_) => LoreError::Connection,
             InteractiveLoginError::SlowDown(_) => LoreError::SlowDown,
             InteractiveLoginError::Oversized(_) => LoreError::Oversized,

@@ -61,6 +61,11 @@ pub enum HistoryError {
     TokenNotFound,
     FileNotFound,
     MissingIdentity,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl crate::event::EventError for HistoryError {}

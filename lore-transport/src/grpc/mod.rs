@@ -55,6 +55,11 @@ use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
 use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
+use crate::outcome::AttemptId;
+use crate::outcome::GrpcRpc;
+use crate::outcome::grpc_replay_class;
+use crate::outcome::outcome_unknown;
+use crate::replay::ReplayClass;
 use crate::traits::*;
 use crate::types::*;
 
@@ -1115,8 +1120,9 @@ impl GRPCAdmin {
 #[async_trait]
 impl Admin for GRPCAdmin {
     async fn obliterate(&self, address: Address) -> Result<(), ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::AdminObliterate,
             || async { self.client.read().await.obliterate(address).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
@@ -1182,6 +1188,51 @@ where
     Err(ProtocolError::from(lore_base::error::Disconnected))
 }
 
+/// Run one gRPC call under its replay class (WP-120 Phase 3).
+///
+/// Every call site names its RPC, and [`grpc_replay_class`] decides from that whether losing
+/// the channel is something this layer may paper over. A read is reissued exactly as before. A
+/// mutation is not: the request went out, its answer did not come back, and no amount of
+/// reconnecting turns that into knowledge of what the server did.
+///
+/// **The mutable branch is fail-closed, and that is a deliberate cost.** gRPC gives this layer
+/// no dispatch state — the QUIC client knows whether bytes reached the wire because it writes
+/// them itself, and there is no equivalent here. So a mutation that failed *before* leaving the
+/// client is reported the same as one whose answer was lost. Reporting the safe direction as
+/// the ambiguous one costs availability; reporting the ambiguous one as retryable costs a
+/// duplicate mutation, and the contract is explicit that a retry needs positive proof of
+/// non-dispatch rather than the absence of proof of dispatch. The one place that proof does
+/// exist on this transport is the streaming send in `storage_client`, which knows its payload
+/// came back unsent, and it uses it.
+///
+/// The attempt id is minted before the call, not after the failure, so it names the attempt the
+/// server would have recorded rather than the moment this client noticed.
+async fn with_reconnect_classified<T, Op, OpFut, Rebuild, RebuildFut>(
+    connection: &GRPCConnection,
+    rpc: GrpcRpc,
+    op: Op,
+    rebuild: Rebuild,
+) -> Result<T, ProtocolError>
+where
+    Op: Fn() -> OpFut,
+    OpFut: Future<Output = Result<T, ProtocolError>>,
+    Rebuild: Fn(u32) -> RebuildFut,
+    RebuildFut: Future<Output = Result<(), ProtocolError>>,
+{
+    match grpc_replay_class(rpc) {
+        ReplayClass::ReadRetryable => with_reconnect(connection, op, rebuild).await,
+        ReplayClass::MutableNoReplay => {
+            let attempt = AttemptId::new();
+            match op().await {
+                Err(ProtocolError::Disconnected(_)) => {
+                    Err(outcome_unknown(rpc.wire_name(), &attempt))
+                }
+                result => result,
+            }
+        }
+    }
+}
+
 impl GRPCStorage {
     /// Look up the cached session context.
     ///
@@ -1200,12 +1251,58 @@ impl GRPCStorage {
 
     /// Storage needs no client rebuild: `StorageService` resolves the channel when it opens a
     /// stream, so a reconnected channel is picked up by the next rotation on its own.
-    async fn with_reconnect<T, Op, Fut>(&self, op: Op) -> Result<T, ProtocolError>
+    ///
+    /// **The stream-backed verbs must not use the fail-closed unary policy (WP-120).** `Get`,
+    /// `GetMetadata`, `Put` and `Copy` go through `StorageService`'s stream cache, which is the
+    /// one layer on this transport that knows a request's dispatch state: it returns
+    /// [`ProtocolError::OutcomeUnknown`] for a mutation it handed to the stream task, and
+    /// `Disconnected` only where it holds positive proof the payload was never sent. Wrapping
+    /// that in [`with_reconnect_classified`] would turn real non-dispatch proof back into an
+    /// unknown outcome — a false unknown — and would drop the reconnect that the proof exists
+    /// to authorise. So `Disconnected` here is reconnected and reissued for either replay
+    /// class, and an unknown passes through untouched, because [`with_reconnect`] only ever
+    /// matches `Disconnected`.
+    ///
+    /// This is exactly why the split exists: `Verify`, `MutableStore`, `MutableCompareAndSwap`,
+    /// `Query` and `MutableLoad` are plain unary RPCs with no such proof, and they go through
+    /// [`Self::with_reconnect_classified_unary`] instead.
+    ///
+    /// The RPC is still named at every call site. It costs nothing at runtime and keeps the
+    /// stream-backed verbs inside the same no-wildcard classification table as everything else,
+    /// so a new one cannot be added here without deciding its replay class.
+    async fn with_reconnect_dispatch_aware<T, Op, Fut>(
+        &self,
+        rpc: GrpcRpc,
+        op: Op,
+    ) -> Result<T, ProtocolError>
     where
         Op: Fn() -> Fut,
         Fut: Future<Output = Result<T, ProtocolError>>,
     {
+        // Read for its exhaustiveness, not its value: an unclassified verb does not compile.
+        let _class = grpc_replay_class(rpc);
         with_reconnect(&self.connection, op, |reconnect_id| async move {
+            self.connection.reconnect(reconnect_id).await.map(|_| ())
+        })
+        .await
+    }
+
+    /// The unary storage verbs, which have no dispatch state of their own.
+    ///
+    /// `Verify`, `MutableStore`, `MutableCompareAndSwap`, `Query` and `MutableLoad` are single
+    /// RPCs rather than stream items, so nothing below this point can say whether a request
+    /// that lost its channel was sent. They take the fail-closed policy: reads reissue,
+    /// mutations become [`ProtocolError::OutcomeUnknown`] rather than being sent again.
+    async fn with_reconnect_classified_unary<T, Op, Fut>(
+        &self,
+        rpc: GrpcRpc,
+        op: Op,
+    ) -> Result<T, ProtocolError>
+    where
+        Op: Fn() -> Fut,
+        Fut: Future<Output = Result<T, ProtocolError>>,
+    {
+        with_reconnect_classified(&self.connection, rpc, op, |reconnect_id| async move {
             self.connection.reconnect(reconnect_id).await.map(|_| ())
         })
         .await
@@ -1251,8 +1348,10 @@ impl Storage for GRPCStorage {
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| self.client.get(session_id, &ctx, address))
-            .await
+        self.with_reconnect_dispatch_aware(GrpcRpc::StorageGet, || {
+            self.client.get(session_id, &ctx, address)
+        })
+        .await
     }
 
     async fn get_metadata(
@@ -1261,8 +1360,10 @@ impl Storage for GRPCStorage {
         address: &Address,
     ) -> Result<Fragment, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| self.client.get_metadata(session_id, &ctx, address))
-            .await
+        self.with_reconnect_dispatch_aware(GrpcRpc::StorageGetMetadata, || {
+            self.client.get_metadata(session_id, &ctx, address)
+        })
+        .await
     }
 
     async fn get_resolved(
@@ -1300,7 +1401,7 @@ impl Storage for GRPCStorage {
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| {
+        self.with_reconnect_dispatch_aware(GrpcRpc::StoragePut, || {
             self.client
                 .put(session_id, &ctx, address, fragment, payload.clone())
         })
@@ -1309,8 +1410,10 @@ impl Storage for GRPCStorage {
 
     async fn query(&self, session_id: u32, address: &[Address]) -> Result<Bytes, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| self.client.query(&ctx, address))
-            .await
+        self.with_reconnect_classified_unary(GrpcRpc::StorageQuery, || {
+            self.client.query(&ctx, address)
+        })
+        .await
     }
 
     async fn verify(
@@ -1320,8 +1423,10 @@ impl Storage for GRPCStorage {
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| self.client.verify(&ctx, address, heal))
-            .await
+        self.with_reconnect_classified_unary(GrpcRpc::StorageVerify, || {
+            self.client.verify(&ctx, address, heal)
+        })
+        .await
     }
 
     async fn copy(
@@ -1332,7 +1437,7 @@ impl Storage for GRPCStorage {
         target_context: Context,
     ) -> Result<(), ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| {
+        self.with_reconnect_dispatch_aware(GrpcRpc::StorageCopy, || {
             self.client.copy(
                 session_id,
                 &ctx,
@@ -1351,8 +1456,10 @@ impl Storage for GRPCStorage {
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| self.client.mutable_load(&ctx, key, key_type))
-            .await
+        self.with_reconnect_classified_unary(GrpcRpc::StorageMutableLoad, || {
+            self.client.mutable_load(&ctx, key, key_type)
+        })
+        .await
     }
 
     async fn mutable_store(
@@ -1363,8 +1470,10 @@ impl Storage for GRPCStorage {
         key_type: KeyType,
     ) -> Result<(), ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| self.client.mutable_store(&ctx, key, value, key_type))
-            .await
+        self.with_reconnect_classified_unary(GrpcRpc::StorageMutableStore, || {
+            self.client.mutable_store(&ctx, key, value, key_type)
+        })
+        .await
     }
 
     async fn mutable_compare_and_swap(
@@ -1376,7 +1485,7 @@ impl Storage for GRPCStorage {
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| {
+        self.with_reconnect_classified_unary(GrpcRpc::StorageMutableCompareAndSwap, || {
             self.client
                 .mutable_compare_and_swap(&ctx, key, expected, value, key_type)
         })
@@ -1450,8 +1559,9 @@ impl Revision for GRPCRevision {
         creator: &str,
         stack: &[BranchPoint],
     ) -> Result<Hash, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RevisionBranchCreate,
             || async {
                 self.client
                     .read()
@@ -1465,8 +1575,9 @@ impl Revision for GRPCRevision {
     }
 
     async fn branch_delete(&self, branch: BranchId) -> Result<(), ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RevisionBranchDelete,
             || async { self.client.read().await.branch_delete(branch).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
@@ -1478,8 +1589,9 @@ impl Revision for GRPCRevision {
         branch: Option<BranchId>,
         name: Option<&str>,
     ) -> Result<BranchQueryResponse, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RevisionBranchQuery,
             || async { self.client.read().await.branch_query(branch, name).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
@@ -1493,8 +1605,9 @@ impl Revision for GRPCRevision {
         force: bool,
         fast_forward_merge: bool,
     ) -> Result<BranchPushResponse, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RevisionBranchPush,
             || async {
                 self.client
                     .read()
@@ -1508,8 +1621,9 @@ impl Revision for GRPCRevision {
     }
 
     async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RevisionBranchList,
             || async { self.client.read().await.branch_list().await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
@@ -1520,8 +1634,9 @@ impl Revision for GRPCRevision {
         &self,
         signature: RevisionListStart,
     ) -> Result<RevisionListResponse, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RevisionRevisionList,
             || async {
                 self.client
                     .read()
@@ -1535,8 +1650,9 @@ impl Revision for GRPCRevision {
     }
 
     async fn branch_metadata_get(&self, branch: BranchId) -> Result<Hash, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RevisionBranchMetadataGet,
             || async { self.client.read().await.branch_metadata_get(branch).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
@@ -1549,8 +1665,9 @@ impl Revision for GRPCRevision {
         expected: Hash,
         new: Hash,
     ) -> Result<MetadataSetResult, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RevisionBranchMetadataSet,
             || async {
                 self.client
                     .read()
@@ -1607,8 +1724,9 @@ impl Repository for GRPCRepository {
         creator: &str,
         created: u64,
     ) -> Result<RepositoryData, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RepositoryCreate,
             || async {
                 self.client
                     .read()
@@ -1630,8 +1748,9 @@ impl Repository for GRPCRepository {
     }
 
     async fn delete(&self, id: RepositoryId) -> Result<(), ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RepositoryDelete,
             || async { self.client.read().await.delete(id).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
@@ -1643,8 +1762,9 @@ impl Repository for GRPCRepository {
         id: Option<RepositoryId>,
         name: Option<&str>,
     ) -> Result<RepositoryData, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RepositoryQuery,
             || async { self.client.read().await.query(id, name).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
@@ -1652,8 +1772,9 @@ impl Repository for GRPCRepository {
     }
 
     async fn list(&self) -> Result<Vec<RepositoryData>, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RepositoryList,
             || async { self.client.read().await.list().await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
@@ -1661,8 +1782,9 @@ impl Repository for GRPCRepository {
     }
 
     async fn metadata_get(&self, id: RepositoryId) -> Result<Hash, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RepositoryMetadataGet,
             || async { self.client.read().await.metadata_get(id).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
@@ -1675,8 +1797,9 @@ impl Repository for GRPCRepository {
         expected: Hash,
         new: Hash,
     ) -> Result<MetadataSetResult, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::RepositoryMetadataSet,
             || async {
                 self.client
                     .read()
@@ -1729,8 +1852,9 @@ impl Lock for GRPCLock {
         resources: &[LockResource],
         owner: Option<&str>,
     ) -> Result<Vec<LockData>, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::LockLock,
             || async { self.client.read().await.lock(resources, owner).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
@@ -1743,8 +1867,9 @@ impl Lock for GRPCLock {
         owner: Option<&str>,
         description: Option<&str>,
     ) -> Result<Vec<LockData>, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::LockQuery,
             || async {
                 self.client
                     .read()
@@ -1758,8 +1883,9 @@ impl Lock for GRPCLock {
     }
 
     async fn status(&self, resources: &[LockResource]) -> Result<Vec<LockData>, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::LockStatus,
             || async { self.client.read().await.status(resources).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
@@ -1767,8 +1893,9 @@ impl Lock for GRPCLock {
     }
 
     async fn unlock(&self, resources: &[LockResource]) -> Result<Vec<LockResource>, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::LockUnlock,
             || async { self.client.read().await.unlock(resources).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
@@ -1796,8 +1923,9 @@ impl GRPCEnvironment {
 #[async_trait]
 impl Environment for GRPCEnvironment {
     async fn get(&self) -> Result<EnvironmentConfig, ProtocolError> {
-        with_reconnect(
+        with_reconnect_classified(
             &self.connection,
+            GrpcRpc::EnvironmentGet,
             || async { self.client.read().await.get().await },
             |reconnect_id| self.reconnect(reconnect_id),
         )

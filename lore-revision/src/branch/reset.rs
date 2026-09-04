@@ -68,11 +68,17 @@ pub enum ResetError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for ResetError {
     fn translated(&self) -> LoreError {
         match self {
+            ResetError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             ResetError::Disconnected(_) => LoreError::Connection,
             ResetError::SlowDown(_) => LoreError::SlowDown,
             ResetError::Oversized(_) => LoreError::Oversized,

@@ -12,7 +12,9 @@ use dashmap::DashMap;
 use dashmap::Entry;
 use lore_base::types::KeyType;
 use lore_error_set::prelude::*;
+use lore_transport::AttemptId;
 use lore_transport::StorageSession;
+use lore_transport::resolve;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -261,9 +263,14 @@ pub async fn write_resolved(
             })?;
         let mut remote_cleared = false;
         if let Some(session) = remote_session {
+            // The zero-hash removal form of `PutResolved` (WP-120). It takes the resolve key
+            // away, so a lost response leaves it in a state this caller cannot read back and
+            // attribute; reporting that as `Disconnected` would claim the key is still there.
+            let attempt = AttemptId::new();
             session
-                .put_resolved(&key, address, Fragment::default(), None)
+                .put_resolved_outcome(&key, address, Fragment::default(), None)
                 .await
+                .and_then(|outcome| resolve(outcome, "lore-storage/0.4 PutResolved", &attempt))
                 .map_err(|err| crate::error::protocol_error_to_storage(err, address))?;
             remote_cleared = true;
         }
@@ -313,9 +320,13 @@ pub async fn write_resolved(
         if written.published {
             lore_base::lore_trace!("Key {key} published with the upload of {address}");
         } else if stored_durable {
+            // The `_outcome` form (WP-120). This advances a mutable resolve key, so a lost
+            // response leaves the key in a state no later read can attribute to this attempt.
+            let attempt = AttemptId::new();
             session
-                .mutable_store(key, address.hash, KeyType::Resolve)
+                .mutable_store_outcome(key, address.hash, KeyType::Resolve)
                 .await
+                .and_then(|outcome| resolve(outcome, "lore-storage/0.4 MutableStore", &attempt))
                 .map_err(|err| crate::error::protocol_error_to_storage(err, address))?;
         } else {
             lore_base::lore_warn!(
@@ -357,9 +368,14 @@ async fn remote_put_resolved_retry(
 ) -> Result<(), StorageError> {
     let mut retry = store_retry();
     loop {
+        // The `_outcome` form, for the reason given on [`remote_put_retry`]. `PutResolved`
+        // needs it more than `Put` does, not less: it publishes a resolve key as well as the
+        // bytes, so a lost response leaves a mutable key in an unknown state.
+        let attempt = AttemptId::new();
         match session
-            .put_resolved(&key, address, fragment, payload.clone())
+            .put_resolved_outcome(&key, address, fragment, payload.clone())
             .await
+            .and_then(|outcome| resolve(outcome, "lore-storage/0.4 PutResolved", &attempt))
         {
             Ok(_) => return Ok(()),
             Err(ref e) if e.is_slow_down() => {
@@ -380,8 +396,26 @@ async fn remote_put_retry(
 ) -> Result<(), StorageError> {
     let mut retry = store_retry();
     loop {
-        match session.put(address, fragment, payload.clone()).await {
-            Ok(_) => return Ok(()),
+        // The `_outcome` form, not the plain one (WP-120). The plain form collapses a lost
+        // response into `Disconnected` inside the transport, which reads to everything above
+        // here as "the write did not happen" — and this loop would then be free to send the
+        // `Put` again. Resolving the outcome here, above the loop's own retry, is what makes
+        // the ambiguity reach the caller as itself.
+        //
+        // The id is minted per dispatch rather than per call because each turn of this loop is
+        // a separate attempt, and an unresolved one has to name the attempt it belongs to.
+        let attempt = AttemptId::new();
+        match session
+            .put_outcome(address, fragment, payload.clone())
+            .await
+        {
+            Ok(outcome) => {
+                return resolve(outcome, "lore-storage/0.4 Put", &attempt)
+                    .map_err(|err| crate::error::protocol_error_to_storage(err, address));
+            }
+            // A `SlowDown` is the server declining the request, so nothing was applied and
+            // waiting is the correct response. Every other answered error is the server's
+            // verdict and goes back as it is.
             Err(ref e) if e.is_slow_down() => {
                 if !retry.wait().await {
                     return Err(StorageError::from(SlowDown));

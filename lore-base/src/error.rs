@@ -36,7 +36,8 @@
 //! | 118–125 | Resource limits | A size, depth, or efficiency bound was hit. |
 //! | 126–128 | *reserved* | The shell's "found but not executable", "not found", and "bad argument to exit". |
 //! | 129–192 | *reserved* | `128 + signal`, i.e. killed by a signal. 130 is Ctrl-C, 137 is `SIGKILL`, 143 is `SIGTERM`. |
-//! | 193–254 | *reserved* | Free for future groups. |
+//! | 193–199 | Outcome | The request was dispatched and what it did is not known. |
+//! | 200–254 | *reserved* | Free for future groups. |
 //! | 255 | *reserved* | `Internal`, which is `-1` truncated to a `u8`. |
 //!
 //! The trait carries a code as `i32` rather than a `u8` because `Internal` is
@@ -467,6 +468,46 @@ pub struct MaxHistorySearchDepth;
 #[ffi_code(120)]
 pub struct InefficientCompression;
 
+// ---------------------------------------------------------------------------
+// Outcome (193–199)
+//
+// The request reached the server and what it did is not known. This is not a
+// failure and not a success, and it is emphatically not a connectivity error:
+// the whole point of giving it its own group is that the ordinary "retry
+// later" reading of the 28–39 block is the one response that must never be
+// applied to it.
+//
+// The block comes out of the 193–254 headroom rather than out of an existing
+// group because no existing group's meaning is true of it. A caller branching
+// on the range learns "the outcome is unresolved", which is the only thing it
+// may act on until an operation-specific authoritative read says more.
+// ---------------------------------------------------------------------------
+
+/// A mutable request was dispatched and no decisive answer came back.
+///
+/// The server may or may not have applied it. Nothing in this error says which,
+/// and nothing later may infer it from current state: a subsequent read reports
+/// where the repository is now, not what this attempt did.
+///
+/// `attempt_id` is minted before the request is dispatched, so it names the
+/// attempt whose outcome is unresolved rather than the moment the loss was
+/// noticed. A caller carries it into its own durable record and quotes it to
+/// whatever authoritative receipt lookup can eventually resolve the attempt.
+/// It is deliberately a `String` rather than a typed id: this crate sits below
+/// every transport that mints one, and the value crosses the FFI boundary as
+/// text either way.
+#[derive(Debug, Clone, Error, FfiError)]
+#[error(
+    "{operation}: dispatched, response lost, outcome unknown (attempt {attempt_id}); read authoritative state before any new attempt"
+)]
+#[ffi_code(193)]
+pub struct OutcomeUnknown {
+    /// The operation whose response was lost, named as the wire names it.
+    pub operation: String,
+    /// The identity the attempt was dispatched under.
+    pub attempt_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::RangeInclusive;
@@ -484,6 +525,7 @@ mod tests {
         NotFound,
         Configuration,
         ResourceLimits,
+        Outcome,
     }
 
     impl Group {
@@ -496,6 +538,7 @@ mod tests {
             Self::NotFound,
             Self::Configuration,
             Self::ResourceLimits,
+            Self::Outcome,
         ];
 
         fn block(self) -> RangeInclusive<i32> {
@@ -508,6 +551,7 @@ mod tests {
                 Self::NotFound => 79..=99,
                 Self::Configuration => 110..=117,
                 Self::ResourceLimits => 118..=125,
+                Self::Outcome => 193..=199,
             }
         }
     }
@@ -752,6 +796,15 @@ mod tests {
                 "InefficientCompression",
                 Group::ResourceLimits,
                 InefficientCompression.ffi_code(),
+            ),
+            (
+                "OutcomeUnknown",
+                Group::Outcome,
+                OutcomeUnknown {
+                    operation: text(),
+                    attempt_id: text(),
+                }
+                .ffi_code(),
             ),
         ]
     }

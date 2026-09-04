@@ -435,6 +435,14 @@ pub enum LoreErrorCode {
     Internal = -1,
     /// The backing store is overloaded; the caller should retry later.
     SlowDown = 31,
+    /// A dispatched mutable item whose outcome is not known (WP-120).
+    ///
+    /// Last in declaration order because the order is the serialized wire format, so a
+    /// new variant belongs at the end even though its numeric code is not the largest.
+    /// A per-item unknown must reach the caller as itself: flattening it to `Internal`
+    /// while the batch continues is exactly how a copied or healed item that may have
+    /// landed gets reported as one that did not.
+    OutcomeUnknown = 193,
 }
 
 // cbindgen cannot evaluate a const in a discriminant position — it drops the
@@ -448,6 +456,8 @@ const _: () =
 const _: () = assert!(LoreErrorCode::SlowDown as i32 == lore_base::error::SlowDown::FFI_CODE);
 const _: () =
     assert!(LoreErrorCode::AddressNotFound as i32 == lore_base::error::AddressNotFound::FFI_CODE);
+const _: () =
+    assert!(LoreErrorCode::OutcomeUnknown as i32 == lore_base::error::OutcomeUnknown::FFI_CODE);
 
 /// Data for an error event.
 #[repr(C)]

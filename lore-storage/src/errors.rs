@@ -11,6 +11,7 @@ pub use lore_base::error::NotAuthorized;
 pub use lore_base::error::NotConnected;
 pub use lore_base::error::NotFound;
 pub use lore_base::error::NotSupported;
+pub use lore_base::error::OutcomeUnknown;
 pub use lore_base::error::Oversized;
 pub use lore_base::error::PayloadNotFound;
 pub use lore_base::error::SlowDown;

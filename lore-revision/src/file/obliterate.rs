@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use lore_base::error::OutcomeUnknown;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -82,11 +83,17 @@ pub enum ObliterateError {
     TokenNotFound,
     WriteRequired,
     MissingIdentity,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for ObliterateError {
     fn translated(&self) -> LoreError {
         match self {
+            ObliterateError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             ObliterateError::InvalidArguments(_)
             | ObliterateError::InvalidPath(_)
             | ObliterateError::InvalidAddress(_) => LoreError::InvalidArguments,

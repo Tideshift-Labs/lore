@@ -67,11 +67,17 @@ pub enum InfoError {
     TokenNotFound,
     WriteRequired,
     MissingIdentity,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for InfoError {
     fn translated(&self) -> LoreError {
         match self {
+            InfoError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             InfoError::NotFound(_) => LoreError::NotFound,
             _ => LoreError::Internal,
         }

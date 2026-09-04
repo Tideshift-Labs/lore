@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
@@ -182,11 +183,17 @@ pub enum RestoreError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for RestoreError {
     fn translated(&self) -> LoreError {
         match self {
+            RestoreError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             RestoreError::Disconnected(_) => LoreError::Connection,
             RestoreError::SlowDown(_) => LoreError::SlowDown,
             RestoreError::Oversized(_) => LoreError::Oversized,

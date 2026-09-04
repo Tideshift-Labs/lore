@@ -13,6 +13,7 @@ use lore_base::error::NotAuthenticated;
 use lore_base::error::NotAuthorized;
 use lore_base::error::NotFound;
 use lore_base::error::NotSupported;
+use lore_base::error::OutcomeUnknown;
 use lore_base::error::Oversized;
 use lore_base::error::SlowDown;
 use lore_base::lore_debug;
@@ -41,6 +42,9 @@ pub enum ExchangeError {
     NoRemote,
     NotSupported,
     Oversized,
+    /// Declared so an unknown outcome forwarded from `ProtocolError` survives this hop
+    /// rather than being collapsed (WP-120). The exchange itself never produces one.
+    OutcomeUnknown,
 }
 
 type AuthUrl = String;

@@ -13,6 +13,7 @@ use std::sync::atomic::Ordering;
 use dashmap::DashMap;
 use dashmap::DashSet;
 use dashmap::Entry;
+use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
@@ -120,11 +121,17 @@ pub enum CloneError {
     TokenNotFound,
     NotConnected,
     MissingIdentity,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for CloneError {
     fn translated(&self) -> LoreError {
         match self {
+            CloneError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             CloneError::Disconnected(_) => LoreError::Connection,
             CloneError::SlowDown(_) => LoreError::SlowDown,
             CloneError::Oversized(_) => LoreError::Oversized,

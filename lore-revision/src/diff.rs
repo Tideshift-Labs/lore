@@ -10,6 +10,7 @@ use tokio::task::JoinSet;
 use crate::change;
 use crate::change::NodeChange;
 use crate::errors::InvalidArguments;
+use crate::errors::OutcomeUnknown;
 use crate::filter::FilterMode;
 use crate::lore_debug;
 use crate::path::emit_path_ignore;
@@ -22,6 +23,11 @@ use crate::util::path::RelativePath;
 #[error_set]
 pub enum DiffError {
     InvalidArguments,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 /// Calculate the difference between two revisions, as the set of changes

@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+use lore_base::error::OutcomeUnknown;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -44,11 +45,17 @@ pub enum SharedStoreError {
     Oversized,
     PayloadNotFound,
     SlowDown,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for SharedStoreError {
     fn translated(&self) -> LoreError {
         match self {
+            SharedStoreError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             SharedStoreError::InvalidPath(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }

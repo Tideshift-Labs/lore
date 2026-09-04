@@ -12,6 +12,43 @@ pub extern "C" fn lore_event_type(event: &LoreEvent) -> u32 {
     event.discriminant()
 }
 
+/// The status an operation reports when a mutation was dispatched and its outcome is not known
+/// (WP-120).
+///
+/// This is the *general* FFI code, the one carried by an operation's return value and by
+/// `lore_complete_event_data_t.status`. It is deliberately the same number as the per-item
+/// `LORE_ERROR_CODE_OUTCOME_UNKNOWN` and deliberately a separate name: the two numberings are
+/// independent, and a C caller reading one should not have to know that they happen to agree.
+///
+/// A caller that sees it must treat the mutation as neither applied nor rejected. Reading
+/// current state does not resolve it: a later read reports where the repository is now, not what
+/// this attempt did. Retrying is the one response that is always wrong.
+pub const LORE_STATUS_OUTCOME_UNKNOWN: i32 = 193;
+
+// Ties the C-visible number to the Rust enum. A code that moves in `lore-base` fails the build
+// here rather than leaving the header describing the old numbering.
+const _: () = assert!(LORE_STATUS_OUTCOME_UNKNOWN == LoreError::OutcomeUnknown as i32);
+
+/// Whether this build implements the `outcome_unknown_v1` caller contract (WP-120).
+///
+/// Returns 1 when it does, 0 when it does not. A caller queries this before declaring the
+/// capability to a server: linking the library is not the declaration, and a cell that gates
+/// mutations on the capability reads what the caller declares.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_supports_outcome_unknown_v1() -> u8 {
+    u8::from(lore_transport::supports_outcome_unknown_v1())
+}
+
+/// Whether a status or per-item error code reports an unknown outcome (WP-120).
+///
+/// The predicate exists so no caller has to match on the message text. Rust callers have
+/// `is_outcome_unknown()` on every error set that can carry one; this is the same question for
+/// a caller holding only the integer.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_status_is_outcome_unknown(status: i32) -> u8 {
+    u8::from(status == LORE_STATUS_OUTCOME_UNKNOWN)
+}
+
 pub type LoreLogConfig = crate::log::LoreLogConfig;
 pub type LoreGlobalArgs = lore_revision::interface::LoreGlobalArgs;
 pub type LoreEventCallback = lore_revision::interface::LoreEventCallback;

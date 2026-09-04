@@ -38,6 +38,11 @@ use super::CORRELATION_ID_HEADER;
 use super::PARTITION_ID_KEY;
 use super::REPOSITORY_ID_KEY;
 use crate::error::ProtocolError;
+use crate::outcome::AttemptId;
+use crate::outcome::GrpcRpc;
+use crate::outcome::grpc_replay_class;
+use crate::outcome::outcome_unknown;
+use crate::replay::ReplayClass;
 
 /// Translate a response's in-band `status` into a [`ProtocolError`], or `None` when the item
 /// succeeded. Absence means `OK`, so a peer that predates the field reads as success.
@@ -364,13 +369,21 @@ impl<K: Clone, S> StreamCache<K, S> {
     /// division QUIC draws between reissuing a command and reconnecting the socket. The dead
     /// handle is discarded on the way out, so the request that follows a successful reconnect
     /// establishes a stream on the new channel rather than inheriting this one.
+    /// `rpc` is what makes the mutable half of this loop safe (WP-120 Phase 3). A read reissues
+    /// exactly as it always did. A mutation reissues only on the one failure that carries
+    /// positive proof it was never dispatched — the send whose payload came straight back
+    /// because the stream task was already gone. A mutation that reached the task and got no
+    /// answer is [`ProtocolError::OutcomeUnknown`] and is not sent again.
     async fn request(
         &self,
+        rpc: GrpcRpc,
         key: (u32, Verb),
         payload: K,
         spawn: impl Fn() -> StreamHandle<K, S>,
     ) -> Result<S, ProtocolError> {
         let mut failed: Option<StreamHandle<K, S>> = None;
+        let replay = grpc_replay_class(rpc);
+        let attempt = AttemptId::new();
 
         for _ in 0..MAX_STREAM_REISSUES {
             let handle = match (&failed, self.streams.get(&key)) {
@@ -383,15 +396,30 @@ impl<K: Clone, S> StreamCache<K, S> {
                 }
             };
 
+            // `Err` here is the sole non-dispatch proof this transport has: the channel handed
+            // the payload back because the receiving task is gone, so nothing was written.
+            //
+            // `Ok` is weaker than it looks, and the name below is chosen to be the honest
+            // reading of it: the payload is in the task's buffer, not necessarily on the wire.
+            // That is the right side to be imprecise on. Treating a buffered request as
+            // possibly-dispatched costs an unknown outcome for a mutation that may never have
+            // left; treating it as certainly-undispatched would license sending a mutation
+            // twice. Only the first of those is recoverable by reading authoritative state.
             let (tx, rx) = oneshot::channel();
-            let answer = match handle.sender.send((payload.clone(), tx)).await {
-                Ok(()) => rx.await.ok(),
-                Err(_) => None,
-            };
+            let dispatched = handle.sender.send((payload.clone(), tx)).await.is_ok();
+            let answer = if dispatched { rx.await.ok() } else { None };
+
             let server_verdict =
                 answer.filter(|answer| !matches!(answer, Err(err) if err.is_disconnected()));
             if let Some(result) = server_verdict {
                 return result;
+            }
+
+            if dispatched && replay == ReplayClass::MutableNoReplay {
+                // Do not discard the handle: whether this stream is reusable is a separate
+                // question from whether this mutation may be repeated, and the next caller's
+                // rotation decides it.
+                return Err(outcome_unknown(rpc.wire_name(), &attempt));
             }
 
             if !handle.opened.load(Ordering::Relaxed) {
@@ -493,9 +521,12 @@ impl StorageService {
 
         let (fragment, payload) = self
             .get_streams
-            .request((session_id, Verb::Get), *address, || {
-                self.spawn_get_stream(ctx)
-            })
+            .request(
+                GrpcRpc::StorageGet,
+                (session_id, Verb::Get),
+                *address,
+                || self.spawn_get_stream(ctx),
+            )
             .await?;
 
         let fragment = Fragment {
@@ -546,9 +577,12 @@ impl StorageService {
 
         let (fragment, _payload) = self
             .get_streams
-            .request((session_id, Verb::GetMetadata), *address, || {
-                self.spawn_get_metadata_stream(ctx)
-            })
+            .request(
+                GrpcRpc::StorageGetMetadata,
+                (session_id, Verb::GetMetadata),
+                *address,
+                || self.spawn_get_metadata_stream(ctx),
+            )
             .await?;
 
         let fragment = Fragment {
@@ -590,9 +624,12 @@ impl StorageService {
         };
 
         self.put_streams
-            .request((session_id, Verb::Put), request, || {
-                self.spawn_put_stream(ctx)
-            })
+            .request(
+                GrpcRpc::StoragePut,
+                (session_id, Verb::Put),
+                request,
+                || self.spawn_put_stream(ctx),
+            )
             .await
     }
 
@@ -686,9 +723,12 @@ impl StorageService {
         };
 
         self.copy_streams
-            .request((session_id, Verb::Copy), request, || {
-                self.spawn_copy_stream(ctx)
-            })
+            .request(
+                GrpcRpc::StorageCopy,
+                (session_id, Verb::Copy),
+                request,
+                || self.spawn_copy_stream(ctx),
+            )
             .await
     }
 
@@ -825,9 +865,12 @@ impl StorageService {
 
         let res = self
             .get_resolved_streams
-            .request((session_id, Verb::GetResolved), request, || {
-                self.spawn_get_resolved_stream(ctx)
-            })
+            .request(
+                GrpcRpc::StorageGetResolved,
+                (session_id, Verb::GetResolved),
+                request,
+                || self.spawn_get_resolved_stream(ctx),
+            )
             .await?;
 
         if res.resolved.len() != size_of::<Hash>() {
@@ -900,9 +943,12 @@ impl StorageService {
             .internal("permit acquire")?;
 
         self.put_resolved_streams
-            .request((session_id, Verb::PutResolved), request, || {
-                self.spawn_put_resolved_stream(ctx)
-            })
+            .request(
+                GrpcRpc::StoragePutResolved,
+                (session_id, Verb::PutResolved),
+                request,
+                || self.spawn_put_resolved_stream(ctx),
+            )
             .await
             .map(|_| ())
     }

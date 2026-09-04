@@ -24,6 +24,7 @@ use crate::errors::NotAuthenticated;
 use crate::errors::NotAuthorized;
 use crate::errors::NotFound;
 use crate::errors::NotSupported;
+use crate::errors::OutcomeUnknown;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
@@ -46,6 +47,11 @@ pub enum StoreError {
     Maintenance,
     NoRemote,
     NotSupported,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 /// Validate that a fragment's sizes appear valid. Use before allocating or

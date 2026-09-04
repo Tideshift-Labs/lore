@@ -65,11 +65,17 @@ pub enum CreateError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for CreateError {
     fn translated(&self) -> LoreError {
         match self {
+            CreateError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             CreateError::Disconnected(_) => LoreError::Connection,
             CreateError::SlowDown(_) => LoreError::SlowDown,
             CreateError::Oversized(_) => LoreError::Oversized,

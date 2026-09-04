@@ -215,7 +215,12 @@ impl PutItemOutcome {
 /// caller-fixable and reported as `InvalidArguments`; an address lookup miss maps to
 /// `AddressNotFound`; everything else is `Internal`.
 pub(crate) fn storage_error_to_code(err: &StorageError) -> LoreErrorCode {
-    if err.is_slow_down() {
+    // Checked before anything else, and before the `Internal` fallback most of all: an item
+    // whose outcome is unknown that reported `INTERNAL` would be indistinguishable from one
+    // that provably failed, while the batch around it carried on (WP-120).
+    if err.is_outcome_unknown() {
+        LoreErrorCode::OutcomeUnknown
+    } else if err.is_slow_down() {
         LoreErrorCode::SlowDown
     } else if err.is_oversized() {
         LoreErrorCode::InvalidArguments
@@ -230,7 +235,9 @@ pub(crate) fn storage_error_to_code(err: &StorageError) -> LoreErrorCode {
 /// [`storage_error_to_code`]; `StoreError` is the trait-method error type and so does not carry
 /// the `NotConnected` / `Disconnected` cases.
 pub(crate) fn store_error_to_code(err: &StoreError) -> LoreErrorCode {
-    if err.is_slow_down() {
+    if err.is_outcome_unknown() {
+        LoreErrorCode::OutcomeUnknown
+    } else if err.is_slow_down() {
         LoreErrorCode::SlowDown
     } else if err.is_oversized() {
         LoreErrorCode::InvalidArguments
@@ -250,7 +257,9 @@ pub(crate) fn store_error_to_code(err: &StoreError) -> LoreErrorCode {
 /// callers want; transport-level back-pressure surfaces as `SlowDown`; everything else
 /// (disconnected, internal, not-authorized, etc.) is `Internal`.
 pub(crate) fn protocol_error_to_code(err: &ProtocolError) -> LoreErrorCode {
-    if err.is_slow_down() {
+    if err.is_outcome_unknown() {
+        LoreErrorCode::OutcomeUnknown
+    } else if err.is_slow_down() {
         LoreErrorCode::SlowDown
     } else if err.is_oversized() {
         LoreErrorCode::InvalidArguments
@@ -276,6 +285,10 @@ pub(crate) fn aggregate_error_code(
 ) -> Option<LoreErrorCode> {
     fn severity(code: LoreErrorCode) -> u8 {
         match code {
+            // Above everything, because it is the only code the caller cannot act on by
+            // retrying, ignoring, or fixing its request: the batch touched durable state
+            // and nobody knows how. Summarising it as anything else loses that (WP-120).
+            LoreErrorCode::OutcomeUnknown => 5,
             LoreErrorCode::InvalidArguments => 4,
             LoreErrorCode::Internal => 3,
             LoreErrorCode::SlowDown => 2,

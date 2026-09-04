@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use lore_base::error::AddressNotFound;
+use lore_base::error::OutcomeUnknown;
 use lore_base::error::Oversized;
 use lore_base::error::PayloadNotFound;
 use lore_base::error::SlowDown;
@@ -19,6 +20,10 @@ fn store_error_exhaustive_match() {
         StoreError::from(Oversized {
             context: "test".to_string(),
         }),
+        StoreError::from(OutcomeUnknown {
+            operation: "StorageService.Put".to_string(),
+            attempt_id: "0199a0b1-c2d3-7e4f-8a9b-0c1d2e3f4a5b".to_string(),
+        }),
         StoreError::internal("test"),
     ];
 
@@ -35,6 +40,7 @@ fn store_error_exhaustive_match() {
             | StoreError::Maintenance(_)
             | StoreError::NoRemote(_)
             | StoreError::NotSupported(_)
+            | StoreError::OutcomeUnknown(_)
             | StoreError::Internal(_) => {}
         }
     }

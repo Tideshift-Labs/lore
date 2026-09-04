@@ -5,6 +5,7 @@ pub mod auth;
 pub mod connection;
 pub mod error;
 pub mod grpc;
+pub mod outcome;
 pub mod quic;
 pub mod replay;
 pub mod session;
@@ -15,6 +16,7 @@ pub mod util;
 
 pub use connection::*;
 pub use error::*;
+pub use outcome::*;
 pub use replay::*;
 pub use session::*;
 pub use traits::*;

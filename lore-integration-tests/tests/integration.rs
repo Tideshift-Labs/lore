@@ -5,6 +5,7 @@ mod active_active_two_process_test;
 mod aws_store_test;
 mod common;
 mod dynamodb_test;
+mod grpc_mutation_dispatch_loss_test;
 mod hashicorp;
 mod locks_test;
 mod presign_test;

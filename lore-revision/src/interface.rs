@@ -1143,6 +1143,12 @@ pub enum LoreError {
     /// A blob exceeded a size limit enforced by the caller or the protocol.
     Oversized = 118,
 
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Not a failure and not a success: the server may or may not have applied it.
+    /// Never retry on this code. Read authoritative state first.
+    OutcomeUnknown = 193,
+
     // Legacy error categories (transitional, will be removed). They sit in the
     // 100–109 range that `lore_base::error` reserves for them, so no discrete
     // error type is ever allocated a code that collides with one of these.

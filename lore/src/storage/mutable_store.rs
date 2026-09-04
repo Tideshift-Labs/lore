@@ -149,10 +149,16 @@ async fn store_item(
         let Some(session) = session else {
             return emit_complete(&item, LoreErrorCode::Internal);
         };
+        // The `_outcome` form (WP-120). The plain one collapses a lost response into
+        // `Disconnected` inside the transport, and this item would then report `INTERNAL` for
+        // a key that may well have been advanced.
+        let attempt = lore_transport::AttemptId::new();
         match session
-            .mutable_store(item.key, item.value, item.key_type)
+            .mutable_store_outcome(item.key, item.value, item.key_type)
             .await
-        {
+            .and_then(|outcome| {
+                lore_transport::resolve(outcome, "lore-storage/0.4 MutableStore", &attempt)
+            }) {
             Ok(()) => emit_complete(&item, LoreErrorCode::None),
             Err(err) => emit_complete(&item, crate::storage::protocol_error_to_code(&err)),
         }

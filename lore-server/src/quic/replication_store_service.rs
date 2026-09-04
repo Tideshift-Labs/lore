@@ -60,6 +60,14 @@ impl From<&StoreError> for ReplicationServiceErrorCode {
             | StoreError::NoRemote(_)
             | StoreError::NotSupported(_)
             | StoreError::Internal(_) => ReplicationServiceErrorCode::Internal,
+            // Exhaustiveness only, and deliberately not a new wire code (WP-120). This enum
+            // allocates from the service-specific 200+ range, and an unknown outcome has a
+            // core status of its own (101) that this range must not shadow. Nothing produces
+            // `StoreError::OutcomeUnknown` on this path today: the replication client keeps
+            // the typed unknown in the source chain of an `Internal`, and the storage protocol
+            // recognizes it there before mapping it to 101. Encoding 101 from here belongs to
+            // the replication lane, not to this package.
+            StoreError::OutcomeUnknown(_) => ReplicationServiceErrorCode::Internal,
         }
     }
 }

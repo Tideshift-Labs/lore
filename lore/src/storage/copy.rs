@@ -263,14 +263,21 @@ async fn copy_item(
         }
     };
 
+    // The `_outcome` form (WP-120). An unknown must reach the caller as itself rather than
+    // falling through to the upload path below: that fallback is another mutation, and issuing
+    // it on the strength of an ambiguous `Copy` is precisely the blind second write the
+    // contract forbids.
+    let copy_attempt = lore_transport::AttemptId::new();
     match session
-        .copy(
+        .copy_outcome(
             item.source_partition,
             item.source_address,
             item.target_context,
         )
         .await
-    {
+        .and_then(|outcome| {
+            lore_transport::resolve(outcome, "lore-storage/0.4 Copy", &copy_attempt)
+        }) {
         Ok(()) => return mirror_local_durable(&store, &item, effective).await,
         Err(ProtocolError::NotFound(_) | ProtocolError::NotAuthorized(_)) => {
             if effective.no_local {
@@ -306,9 +313,11 @@ async fn copy_item(
             ));
         }
     };
+    let put_attempt = lore_transport::AttemptId::new();
     if let Err(err) = session
-        .put(item.source_address, fragment, Some(payload))
+        .put_outcome(item.source_address, fragment, Some(payload))
         .await
+        .and_then(|outcome| lore_transport::resolve(outcome, "lore-storage/0.4 Put", &put_attempt))
     {
         return CopyOutcome::failed(emit_complete(
             &item,

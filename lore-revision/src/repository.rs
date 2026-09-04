@@ -34,6 +34,7 @@ use dashmap::DashMap;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
+use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
 use lore_base::lore_spawn_guarded;
 use lore_error_set::prelude::*;
@@ -1270,11 +1271,17 @@ pub enum RepositoryError {
     MaxHistorySearchDepth,
     NotConnected,
     MissingIdentity,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for RepositoryError {
     fn translated(&self) -> LoreError {
         match self {
+            RepositoryError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             RepositoryError::Disconnected(_) => LoreError::Connection,
             RepositoryError::SlowDown(_) => LoreError::SlowDown,
             RepositoryError::Oversized(_) => LoreError::Oversized,

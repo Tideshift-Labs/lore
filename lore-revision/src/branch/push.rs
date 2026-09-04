@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
 use lore_base::types::BranchPoint;
 use lore_error_set::prelude::*;
@@ -257,6 +258,11 @@ pub enum PushError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 #[derive(Clone, Debug)]
@@ -270,6 +276,7 @@ pub struct PushOptions {
 impl EventError for PushError {
     fn translated(&self) -> LoreError {
         match self {
+            PushError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             PushError::Disconnected(_) => LoreError::Connection,
             PushError::SlowDown(_) => LoreError::SlowDown,
             PushError::Oversized(_) => LoreError::Oversized,

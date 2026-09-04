@@ -82,11 +82,17 @@ pub enum MetadataErrors {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 impl EventError for MetadataErrors {
     fn translated(&self) -> LoreError {
         match self {
+            MetadataErrors::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
             MetadataErrors::FileNotFound(_) => LoreError::NotFound,
             MetadataErrors::Oversized(_) => LoreError::Oversized,
             MetadataErrors::Disconnected(_) => LoreError::Connection,
@@ -146,6 +152,11 @@ pub enum MetadataError {
     NotAuthorized,
     NotConnected,
     NotSupported,
+    /// A dispatched mutable request whose outcome is not known (WP-120).
+    ///
+    /// Declared so the ambiguity survives this layer. Collapsing it into a
+    /// connectivity error here would tell the caller the write did not happen.
+    OutcomeUnknown,
 }
 
 /// A set of keyed values, held as the buffer it is stored as. What it describes
