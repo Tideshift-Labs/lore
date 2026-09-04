@@ -45,6 +45,8 @@ mod quic_session_rebind_tests {
     use lore_revision::fragment;
     use lore_revision::lore::RepositoryId;
     use lore_revision::store::remote::RemoteImmutableStore;
+    use lore_server::auth::jwk::JWKServiceError;
+    use lore_server::auth::jwt::JwtVerifier;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
     use lore_server::hooks::HookDispatcher;
@@ -232,7 +234,14 @@ mod quic_session_rebind_tests {
             mutable_store: Arc<dyn MutableStore>,
             log: Log,
         ) -> Self {
-            Self::with_controls(immutable_store, mutable_store, log, None, None)
+            Self::with_controls(
+                immutable_store,
+                mutable_store,
+                log,
+                None,
+                None,
+                Arc::new(None),
+            )
         }
 
         fn with_sever(
@@ -241,7 +250,14 @@ mod quic_session_rebind_tests {
             log: Log,
             sever: Option<SeverResponse>,
         ) -> Self {
-            Self::with_controls(immutable_store, mutable_store, log, sever, None)
+            Self::with_controls(
+                immutable_store,
+                mutable_store,
+                log,
+                sever,
+                None,
+                Arc::new(None),
+            )
         }
 
         fn with_answered_error_hold(
@@ -256,6 +272,26 @@ mod quic_session_rebind_tests {
                 log,
                 None,
                 Some(hold_answered_error),
+                Arc::new(None),
+            )
+        }
+
+        /// The auth-ON variant: every accepted connection's `StorageServiceV4` carries a real
+        /// `JwtVerifier`, so `AuthorizeStart` runs the production token-verification and
+        /// repository-authorization path instead of skipping it. Used by B4.
+        fn with_jwt_verifier(
+            immutable_store: Arc<dyn ImmutableStore>,
+            mutable_store: Arc<dyn MutableStore>,
+            log: Log,
+            jwt_verifier: Arc<Option<JwtVerifier>>,
+        ) -> Self {
+            Self::with_controls(
+                immutable_store,
+                mutable_store,
+                log,
+                None,
+                None,
+                jwt_verifier,
             )
         }
 
@@ -265,13 +301,14 @@ mod quic_session_rebind_tests {
             log: Log,
             sever: Option<SeverResponse>,
             hold_answered_error: Option<HoldAnsweredError>,
+            jwt_verifier: Arc<Option<JwtVerifier>>,
         ) -> Self {
             let mut service_store = ServiceStore::default();
             service_store.add_service(
                 TEST_PROTOCOL_V4,
                 Box::new(move |context: Arc<AttributeMap>| {
                     let inner = StorageServiceV4::new(
-                        Arc::new(None),
+                        jwt_verifier.clone(),
                         immutable_store.clone(),
                         immutable_store.clone(),
                         mutable_store.clone(),
@@ -302,6 +339,171 @@ mod quic_session_rebind_tests {
         ) -> Option<(&&'static str, &StreamDataHandlerBuilder)> {
             self.service_store.get_stream_builder(protocol)
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Auth-ON QUIC support (B4).
+    //
+    // Every other QUIC suite in this crate runs auth-OFF, so there is no live authorization
+    // decision in them to force closed. What follows is the smallest harness that gives
+    // `AuthorizeStart` a REAL decision to make: `lore_server`'s own `JwtVerifier`, its own
+    // `verify_token`, and its own `verify_authorization`. Nothing here reimplements
+    // verification -- the only test-local part is where the signing key comes from and how a
+    // token's claims are minted.
+    //
+    // The client side needs no new seam either. `lore_transport::connect` takes a caller-supplied
+    // access token, and `auth::exchange::exchange` returns a supplied access token verbatim as
+    // the authorization token (with a comment saying exactly why: "A credential supplied by the
+    // caller is an instruction, not a refresh candidate, even when it is expired; the server must
+    // reject that exact credential"). So a test can hand the transport the precise credential it
+    // wants `session_start` to present, including an expired or de-authorized one, over the
+    // production path. The `auth_url` the environment advertises is never contacted for the same
+    // reason -- the supplied token short-circuits every exchange before any HTTP would happen.
+    // ---------------------------------------------------------------------------------------
+
+    /// The key id every minted token names, and the only one [`StaticJwkService`] serves.
+    const TEST_JWT_KID: &str = "wp108-b4-test-key";
+
+    /// The shared secret behind that key id. HS256 keeps the harness to one symmetric secret;
+    /// the algorithm is irrelevant to what B4 tests, which is the expiry/authorization decision
+    /// on top of a signature that verifies.
+    const TEST_JWT_SECRET: &[u8] = b"wp108-b4-hs256-test-secret";
+
+    /// A `JWKService` that serves one static HS256 key for [`TEST_JWT_KID`].
+    ///
+    /// `refresh_key` returns `Ok(None)` -- "the material behind this key id did not change" --
+    /// which is the honest answer for a static key and keeps `verify_token` reporting the
+    /// original validation failure rather than re-deriving it from the same key.
+    #[derive(Debug)]
+    struct StaticJwkService;
+
+    #[async_trait]
+    impl lore_server::auth::jwk::JWKService for StaticJwkService {
+        async fn get_key(
+            &self,
+            kid: &str,
+        ) -> Result<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm), JWKServiceError> {
+            if kid != TEST_JWT_KID {
+                return Err(JWKServiceError::NotFound);
+            }
+            Ok((
+                jsonwebtoken::DecodingKey::from_secret(TEST_JWT_SECRET),
+                jsonwebtoken::Algorithm::HS256,
+            ))
+        }
+
+        fn get_cached_key(
+            &self,
+            kid: &str,
+        ) -> Option<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm)> {
+            (kid == TEST_JWT_KID).then(|| {
+                (
+                    jsonwebtoken::DecodingKey::from_secret(TEST_JWT_SECRET),
+                    jsonwebtoken::Algorithm::HS256,
+                )
+            })
+        }
+
+        async fn refresh_key(
+            &self,
+            _kid: &str,
+        ) -> Result<Option<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>
+        {
+            Ok(None)
+        }
+    }
+
+    /// The audience every minted token carries, and the one the verifier pins.
+    ///
+    /// It must be pinned rather than left open: `jsonwebtoken`'s validation rejects a token that
+    /// carries an `aud` claim when the verifier names no audience
+    /// (`InvalidAudience`, `validation.rs`'s `(Parsed(_), None)` arm), and dropping `aud` from
+    /// the token instead is worse -- `AuthorizationToken::audience` is not optional, so the
+    /// primary decode would fail and fall back to `JWTUserInfo`, which carries no `resources`
+    /// and would make every arm fail authorization for a reason that has nothing to do with the
+    /// credential under test.
+    const TEST_JWT_AUDIENCE: &str = "wp108-b4-audience";
+
+    /// A verifier with the audience pinned and the issuer left open, so the only things it can
+    /// reject a well-formed token for are the two B4 cares about: an expired `exp`, and a
+    /// `resources` list that does not cover the repository the session is being started for.
+    fn test_jwt_verifier() -> Arc<Option<JwtVerifier>> {
+        Arc::new(Some(JwtVerifier {
+            jwk_service: Arc::new(StaticJwkService),
+            jwt_issuer: None,
+            jwt_audience: Some(vec![TEST_JWT_AUDIENCE.to_string()]),
+        }))
+    }
+
+    fn unix_now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_secs()
+    }
+
+    /// Mint a token carrying every claim `AuthorizationToken` declares, so `verify_token` takes
+    /// its primary decode path rather than the `JWTUserInfo` fallback.
+    ///
+    /// `authorized_repositories` become `resources` entries, which is what
+    /// `verify_authorization` matches against `urc-{repository}`. `expires_at` is an absolute
+    /// unix second: a value in the past is an expired credential, with no clock to control and
+    /// nothing to wait for.
+    fn mint_token(authorized_repositories: &[RepositoryId], expires_at: u64) -> String {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        header.kid = Some(TEST_JWT_KID.to_string());
+        let resources: Vec<serde_json::Value> = authorized_repositories
+            .iter()
+            .map(|repository| {
+                serde_json::json!({
+                    "resource_id": format!("urc-{repository}"),
+                    "permission": ["read", "write"],
+                })
+            })
+            .collect();
+        let claims = serde_json::json!({
+            "sub": "wp108-b4-user",
+            "iss": "wp108-b4-issuer",
+            "iat": 0,
+            "exp": expires_at,
+            "aud": [TEST_JWT_AUDIENCE],
+            "env": "test",
+            "name": "WP-108 B4",
+            "preferred_username": "wp108-b4-user",
+            "idp": "test-idp",
+            "resources": resources,
+        });
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(TEST_JWT_SECRET),
+        )
+        .expect("minting a test token should succeed")
+    }
+
+    /// A recording QUIC storage server with authorization ON.
+    fn start_auth_quic_server(
+        udp: std::net::UdpSocket,
+        immutable: Arc<dyn ImmutableStore>,
+        mutable: Arc<dyn MutableStore>,
+        log: Log,
+    ) -> QuinnServer {
+        let (cert_file, pkey_file, _ca) = server_certs().expect("test certificate paths");
+        QuinnServer::start(
+            QuinnConfigBuilder::new()
+                .socket(udp)
+                .cert_file(cert_file)
+                .pkey_file(pkey_file)
+                .stream_handler_factory(Box::new(RecordingHandlerFactory::with_jwt_verifier(
+                    immutable,
+                    mutable,
+                    log,
+                    test_jwt_verifier(),
+                )))
+                .build()
+                .expect("quinn config"),
+        )
+        .expect("quinn server start")
     }
 
     /// Fresh in-memory immutable+mutable stores, independent of any other backend's.
@@ -336,6 +538,32 @@ mod quic_session_rebind_tests {
         listener: std::net::TcpListener,
         addr: SocketAddr,
     ) -> tokio::sync::oneshot::Sender<()> {
+        start_grpc_backend_with_auth_url(listener, addr, None).await
+    }
+
+    /// As [`start_grpc_backend`], but the advertised environment names an `auth_url`.
+    ///
+    /// That single field is what makes `StorageClient::session_start` take its token branch and
+    /// present a credential at all; with it unset the client sends an empty token and an
+    /// auth-ON server rejects every session identically, which cannot distinguish a valid
+    /// credential from an expired one. The URL is never contacted: a caller-supplied access
+    /// token short-circuits `auth::exchange::exchange` before any HTTP request would be made,
+    /// which is exactly the production behaviour B4 relies on.
+    async fn start_grpc_backend_with_auth_url(
+        listener: std::net::TcpListener,
+        addr: SocketAddr,
+        auth_url: Option<&str>,
+    ) -> tokio::sync::oneshot::Sender<()> {
+        let environment = match auth_url {
+            None => EnvironmentConfig::default(),
+            Some(auth_url) => EnvironmentConfig {
+                endpoint: Some(lore_transport::Endpoint {
+                    auth_url: Some(auth_url.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        };
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let signal = async {
             shutdown_rx.await.ok();
@@ -350,7 +578,7 @@ mod quic_session_rebind_tests {
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
             let outcome = GrpcServerBuilder::new()
-                .with_environment(EnvironmentConfig::default())
+                .with_environment(environment)
                 .with_feature(FeatureSettings::default())
                 .with_immutable_store(immutable.clone(), immutable)
                 .with_mutable_store(mutable)
@@ -895,20 +1123,303 @@ mod quic_session_rebind_tests {
             .await
     }
 
-    // B4: replacement authorization uses the CURRENT credential and fails closed when it is no
-    // longer authorized.
+    /// One B4 arm's setup: an auth-ON QUIC server whose environment advertises an `auth_url`, a
+    /// connection holding `initial_token` as its supplied access token, and a session that has
+    /// already completed one authorized `session_start` and one real operation on epoch N.
+    ///
+    /// Returns everything an arm needs to rotate the credential, replace the connection, and
+    /// read what crossed each wire.
+    struct AuthScenario {
+        connection: Arc<lore_transport::Connection>,
+        session: Arc<lore_transport::StorageSession>,
+        partition: RepositoryId,
+        immutable: Arc<dyn ImmutableStore>,
+        mutable: Arc<dyn MutableStore>,
+        port: u16,
+        server_a: QuinnServer,
+        identity: String,
+        /// Held for the lifetime of the scenario: dropping the sender shuts the gRPC backend
+        /// down, and a later reconnect still needs it to resolve the environment.
+        _grpc_shutdown: tokio::sync::oneshot::Sender<()>,
+    }
+
+    /// The auth URL the environment advertises. Never contacted -- see
+    /// [`start_grpc_backend_with_auth_url`] -- but it must be non-empty for the client to
+    /// present a credential at all.
+    const UNREACHABLE_AUTH_URL: &str = "https://auth.invalid/wp108-b4";
+
+    /// Stand up one auth-ON arm and prove epoch N is genuinely authorized before anything is
+    /// revoked.
+    ///
+    /// `identity` is made unique per arm because the transport's connection cache is
+    /// process-global and keyed by url plus identity; sharing one would let an arm inherit
+    /// another's credentials.
+    async fn auth_scenario(
+        arm: &str,
+        partition: RepositoryId,
+        initial_token: &str,
+    ) -> AuthScenario {
+        let (tcp, udp) = bind_matched_pair();
+        let addr: SocketAddr = tcp.local_addr().unwrap();
+        let port = addr.port();
+        let grpc_shutdown =
+            start_grpc_backend_with_auth_url(tcp, addr, Some(UNREACHABLE_AUTH_URL)).await;
+
+        let (immutable, mutable) = fresh_stores().await;
+        let log_a: Log = Arc::new(StdMutex::new(Vec::new()));
+        let server_a =
+            start_auth_quic_server(udp, immutable.clone(), mutable.clone(), log_a.clone());
+
+        let identity = format!("wp108-b4-{arm}-{}", random::<u32>());
+        let connection = lore_transport::connect(
+            &format!("lore://127.0.0.1:{port}"),
+            &identity,
+            partition,
+            1,
+            "",
+            initial_token,
+        )
+        .await
+        .expect("connecting with a valid credential should succeed");
+        let session = connection
+            .session(partition, arm)
+            .await
+            .expect("the initial session_start must be authorized by the initial credential");
+
+        // Epoch N is genuinely authorized: this succeeds only because the server verified the
+        // token AND `verify_authorization` matched the repository. Without it, a later failure
+        // could just as well mean the harness never authorized anything in the first place.
+        let (fragment, address, payload) = random_fragment();
+        session
+            .put(address, fragment, Some(payload))
+            .await
+            .expect("the initial credential must authorize a real operation on epoch N");
+        assert!(
+            log_a
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|o| o.opcode == Command::Authorize as u8),
+            "the arm's own setup must have completed a real authorized session_start on epoch N"
+        );
+
+        AuthScenario {
+            connection,
+            session,
+            partition,
+            immutable,
+            mutable,
+            port,
+            server_a,
+            identity,
+            _grpc_shutdown: grpc_shutdown,
+        }
+    }
+
+    /// Replace the credential the connection will present at its NEXT `session_start`, over the
+    /// same public path a caller rotating its credentials takes: `connect` on an existing
+    /// (url, identity) adopts the supplied tokens onto the live connection.
+    async fn rotate_supplied_credential(scenario: &AuthScenario, replacement_token: &str) {
+        let adopted = lore_transport::connect(
+            &format!("lore://127.0.0.1:{}", scenario.port),
+            &scenario.identity,
+            scenario.partition,
+            1,
+            "",
+            replacement_token,
+        )
+        .await
+        .expect("adopting a replacement credential should reuse the live connection");
+        assert!(
+            Arc::ptr_eq(&adopted, &scenario.connection),
+            "the rotation must land on the SAME connection the session is bound to, or the \
+             replacement session_start would still present the old credential"
+        );
+    }
+
+    /// The wire evidence a failing B4 arm must show on the replacement connection.
+    ///
+    /// The `Authorize` count is pinned at exactly one, which is what both failing arms were
+    /// measured to cost rather than what `ATTEMPT_BUDGET` would permit. A refused authorization
+    /// is an ANSWERED error, so it is neither rebound nor retried: the budget is the ceiling,
+    /// and the honest observed cost sits well under it. Asserting only the ceiling would keep
+    /// passing if a future change started re-presenting a rejected credential, which is exactly
+    /// the authorization storm the single-flight rule exists to prevent.
+    const EXPECTED_REFUSED_AUTHORIZE_COMMANDS: usize = 1;
+
+    fn assert_replacement_failed_closed(log: &[Observed], arm: &str) {
+        let authorize_count = log
+            .iter()
+            .filter(|o| o.opcode == Command::Authorize as u8)
+            .count();
+        assert_eq!(
+            authorize_count,
+            EXPECTED_REFUSED_AUTHORIZE_COMMANDS,
+            "{arm}: the replacement session_start must be attempted exactly once and never \
+             re-presented after a refusal (ATTEMPT_BUDGET is {}, the ceiling, not the expected \
+             cost); observed {authorize_count} Authorize commands in {log:?}",
+            lore_transport::ATTEMPT_BUDGET
+        );
+        assert!(
+            log.iter().all(|o| o.opcode == Command::Authorize as u8),
+            "{arm}: nothing but the refused session_start attempt may reach the replacement \
+             server -- a rejected authorization must never be followed by the operation itself; \
+             observed: {log:?}"
+        );
+    }
+
+    /// Run one B4 arm to its end: rotate the credential, replace the connection, and return the
+    /// operation's result together with the replacement server's wire log.
+    ///
+    /// Consumes the scenario because `QuinnServer::close` takes the server by value. The gRPC
+    /// backend's shutdown sender stays bound here for the whole call, so the environment is
+    /// still resolvable when the client reconnects.
+    async fn run_after_credential_change(
+        scenario: AuthScenario,
+        replacement_token: &str,
+    ) -> (Result<(), lore_transport::ProtocolError>, Vec<Observed>) {
+        rotate_supplied_credential(&scenario, replacement_token).await;
+
+        let AuthScenario {
+            session,
+            immutable,
+            mutable,
+            port,
+            server_a,
+            _grpc_shutdown,
+            ..
+        } = scenario;
+
+        let udp2 = replace_quic_server(server_a, port).await;
+        let log_b: Log = Arc::new(StdMutex::new(Vec::new()));
+        let _server_b = start_auth_quic_server(udp2, immutable, mutable, log_b.clone());
+
+        let (fragment, address, payload) = random_fragment();
+        let result = session.put(address, fragment, Some(payload)).await;
+        let log = log_b.lock().unwrap().clone();
+        (result, log)
+    }
+
+    // B4: replacement authorization uses the CURRENT credential and fails closed when that
+    // credential is expired or no longer authorized.
     //
-    // NOT-RUN. This harness (like every sibling QUIC integration suite in this crate) is
-    // auth-OFF (`jwt_verifier: None` on both the gRPC and QUIC sides), so there is no live
-    // authorization decision to force closed. Proving "uses the CURRENT credential" and "fails
-    // closed on an expired/unauthorized credential" needs an auth-ON server (JWT issuance,
-    // verification, and a way to expire/revoke a credential mid-test) -- infrastructure this
-    // crate's other QUIC suites don't build either. Building it is a real addition, not a cheap
-    // extension of this file's harness; deferred rather than faked with a harness that cannot
-    // fail the way the case requires. `session_start`'s implementation (`StorageClient`) does
-    // read `self.credentials.tokens()` fresh at call time rather than caching a token from
-    // construction, which is the structural mechanism this case is about -- see
-    // `lore-transport/src/quic/storage_service/client.rs`'s `session_start`. No test function.
+    // This is the one path that makes rebinding safe under a changed credential: rebinding
+    // re-runs `session_start`, and `session_start` is where the server re-checks authorization.
+    // The two arms below drive the two failures `lore_server`'s own verifier can make
+    // deterministically -- an expired `exp` rejected by `JwtVerifier::verify_token`, and a
+    // `resources` list that no longer covers the repository, rejected by `verify_authorization`.
+    // Both are absolute facts about the token, so neither arm waits for anything or depends on
+    // how long a step took.
+    //
+    // A third arm holds the credential valid across the same replacement. Without it, both
+    // failing arms would be consistent with a harness that cannot authorize anything at all.
+
+    /// B4 arm 1: an EXPIRED credential fails the replacement `session_start` closed.
+    #[tokio::test]
+    async fn b4_replacement_authorization_fails_closed_on_an_expired_credential() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let partition = random::<RepositoryId>();
+                let now = unix_now_secs();
+                let scenario =
+                    auth_scenario("expired", partition, &mint_token(&[partition], now + 3600))
+                        .await;
+
+                // Expiry as an absolute past instant, not as elapsed time.
+                let expired = mint_token(&[partition], now - 3600);
+                let (result, log) = run_after_credential_change(scenario, &expired).await;
+
+                let error = result.expect_err(
+                    "an expired credential must fail the replacement session_start, not be \
+                     silently replaced by the epoch-N permission snapshot",
+                );
+                assert!(
+                    error.is_not_authorized(),
+                    "the failure must be an authorization failure and not an incidental transport \
+                     error, or this arm passes for the wrong reason; got {error:?}"
+                );
+                assert_replacement_failed_closed(&log, "expired");
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// B4 arm 2: a credential that is still valid but no longer covers this repository -- a
+    /// revocation of the grant rather than of the token -- fails the replacement `session_start`
+    /// closed at `verify_authorization`.
+    #[tokio::test]
+    async fn b4_replacement_authorization_fails_closed_on_a_revoked_grant() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let partition = random::<RepositoryId>();
+                let now = unix_now_secs();
+                let scenario =
+                    auth_scenario("revoked", partition, &mint_token(&[partition], now + 3600))
+                        .await;
+
+                // Unexpired, correctly signed, and authorized for some OTHER repository. Only
+                // `verify_authorization` can refuse this one.
+                let revoked = mint_token(&[random::<RepositoryId>()], now + 3600);
+                let (result, log) = run_after_credential_change(scenario, &revoked).await;
+
+                let error = result.expect_err(
+                    "a credential that no longer grants this repository must fail the replacement \
+                     session_start",
+                );
+                assert!(
+                    error.is_not_authorized(),
+                    "the failure must be an authorization failure and not an incidental transport \
+                     error; got {error:?}"
+                );
+                assert_replacement_failed_closed(&log, "revoked");
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// B4 arm 3, the control. The same harness, the same connection replacement, a credential
+    /// that is still valid: the operation succeeds.
+    ///
+    /// This is what makes arms 1 and 2 evidence. Without it, a harness that refused every
+    /// replacement session_start for an unrelated reason would produce exactly their result.
+    #[tokio::test]
+    async fn b4_replacement_authorization_succeeds_while_the_credential_is_still_valid()
+    -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let partition = random::<RepositoryId>();
+                let now = unix_now_secs();
+                let scenario =
+                    auth_scenario("valid", partition, &mint_token(&[partition], now + 3600)).await;
+
+                // A different token object, still valid and still granting this repository.
+                let still_valid = mint_token(&[partition], now + 7200);
+                let (result, log) = run_after_credential_change(scenario, &still_valid).await;
+
+                result.expect(
+                    "a still-valid credential must reauthorize on the replacement connection and \
+                     let the operation complete",
+                );
+                assert!(
+                    log.iter().any(|o| o.opcode == Command::Authorize as u8),
+                    "the control must have reauthorized on the replacement connection; observed: \
+                     {log:?}"
+                );
+                assert!(
+                    log.iter().any(|o| o.opcode == Command::Put as u8),
+                    "the control's operation must have reached the replacement server; observed: \
+                     {log:?}"
+                );
+
+                Ok(())
+            })
+            .await
+    }
 
     /// B5: a safe read recovers across a reconnect with no caller intervention -- one `.get()`
     /// call, no retry loop in the caller, no `invalidate()` call.
@@ -1267,21 +1778,257 @@ mod quic_session_rebind_tests {
             .await
     }
 
-    // B9: NOT-RUN.
-    //
-    // The full scenario -- lose the response after a public `Put`'s association commit, perform
-    // an intervening obliterate + re-store from an OTHER server/session, reconnect the original
-    // client, and assert exactly one epoch-N `Put`, zero epoch-N+1 `Put` bytes, no replacement
-    // `session_start` for that command, a typed `OutcomeUnknown`, AND that a lifecycle
-    // readback after the obliterate/re-store attributes neither success nor failure to the
-    // original attempt -- composes B7/B8's severed-response mechanism with a THIRD independent
-    // actor (an obliterate + re-store from a different server/session) racing against the first
-    // client's still-pending typed call, all before that call resolves. Building the severed-
-    // response half is what B7/B8 above prove is achievable; the obliterate/re-store race on top
-    // of it, ordered precisely enough to be non-flaky and to avoid attributing the original
-    // attempt's outcome, is a materially larger scenario than time in this pass allowed to build
-    // and verify without risking a vacuous or flaky assertion. Deferred, not faked. No test
-    // function.
+    /// B9: the three-actor case. A deterministic public `Put` loses its response after the
+    /// server has committed the association, a THIRD actor on an independent server obliterates
+    /// that association and re-stores the same fragment identity elsewhere, and only then does
+    /// the original client reconnect and rebind.
+    ///
+    /// What this proves, in the order the contract states it:
+    ///
+    /// 1. the original `Put` is dispatched exactly once on epoch N and nothing follows it on
+    ///    that connection (the barrier, via [`assert_no_bytes_after_severed_command`]);
+    /// 2. the typed ambiguity survives the whole scenario as `MutableOutcome::Unknown` -- the
+    ///    intervening lifecycle churn neither upgrades it to success nor downgrades it to a
+    ///    definite failure;
+    /// 3. the client rebinds on the replacement connection (a fresh `Authorize`) and issues ZERO
+    ///    `Put` bytes there: an unknown outcome is never redispatched blindly;
+    /// 4. authoritative state is the post-obliterate re-store. The original client's association
+    ///    stays tombstoned, and the fragment is readable only under the partition the third actor
+    ///    published it to.
+    ///
+    /// Determinism, not timing. The severing wrapper signals only after the real `Put` has
+    /// committed server-side, and server A is closed immediately on that signal, which fixes the
+    /// original call's outcome as unanswerable before the third actor moves. So the obliterate
+    /// and re-store are provably ordered after the commit and before any possible rebind -- the
+    /// replacement listener does not exist yet at that point. No sleeps, no grace-period race.
+    ///
+    /// Two harness facts, stated rather than glossed. There is no obliterate opcode in
+    /// `lore-storage/0.4` (see [`Command`]), so the obliterate is applied to the authoritative
+    /// store the servers share; the re-store that follows it goes over the real wire from an
+    /// independent session on an independent server. And the three servers share one pair of
+    /// backing stores on purpose: a fragment identity that lived in two unrelated stores could
+    /// not be obliterated in one place and observed from another.
+    #[tokio::test]
+    async fn b9_severed_put_survives_an_intervening_obliterate_and_restore() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                // One authoritative pair of stores behind every server in this scenario.
+                let (immutable, mutable) = fresh_stores().await;
+
+                // Server A: the original client's endpoint, severing the first `Put` response.
+                let (tcp_a, udp_a) = bind_matched_pair();
+                let addr_a: SocketAddr = tcp_a.local_addr().unwrap();
+                let port_a = addr_a.port();
+                let _grpc_a = start_grpc_backend(tcp_a, addr_a).await;
+                let log_a: Log = Arc::new(StdMutex::new(Vec::new()));
+                let (server_a, notify_processed) = start_severing_quic_server(
+                    udp_a,
+                    immutable.clone(),
+                    mutable.clone(),
+                    log_a.clone(),
+                    Command::Put as u8,
+                );
+
+                // Server B: the third actor's endpoint, independent of A but over the same
+                // authoritative stores.
+                let (tcp_b, udp_b) = bind_matched_pair();
+                let addr_b: SocketAddr = tcp_b.local_addr().unwrap();
+                let port_b = addr_b.port();
+                let _grpc_b = start_grpc_backend(tcp_b, addr_b).await;
+                let log_b: Log = Arc::new(StdMutex::new(Vec::new()));
+                let _server_b = start_recording_quic_server(
+                    udp_b,
+                    immutable.clone(),
+                    mutable.clone(),
+                    log_b.clone(),
+                );
+
+                let original_store =
+                    RemoteImmutableStore::new(&format!("lore://127.0.0.1:{port_a}"), None);
+                let original_partition = random::<RepositoryId>();
+                let original_session = original_store.session(original_partition).await?;
+
+                let third_actor_store =
+                    RemoteImmutableStore::new(&format!("lore://127.0.0.1:{port_b}"), None);
+                let third_actor_partition = random::<RepositoryId>();
+                let third_actor_session = third_actor_store.session(third_actor_partition).await?;
+
+                let (fragment, address, payload) = random_fragment();
+
+                let session_for_put = original_session.clone();
+                let payload_for_put = payload.clone();
+                // `lore_spawn!` rather than a bare `tokio::spawn`, so `LORE_CONTEXT` reaches the
+                // task the way the crate's own spawning rule requires. B11's tasks below already
+                // do this; the older severed cases predate it.
+                let put_task = lore_base::lore_spawn!(async move {
+                    session_for_put
+                        .put_outcome(address, fragment, Some(payload_for_put))
+                        .await
+                });
+
+                // The real association commit has happened under the original partition.
+                await_severed(&notify_processed, Command::Put).await;
+                immutable
+                    .clone()
+                    .get(original_partition, address)
+                    .await
+                    .expect("the real Put must have committed the association before it was cut");
+
+                // Cutting the connection here fixes the original call's outcome as unanswerable,
+                // independently of when its task is next polled. Everything below is therefore
+                // ordered after the commit and before any rebind can occur.
+                let udp_a2 = replace_quic_server(server_a, port_a).await;
+
+                // THIRD ACTOR, on server B. Republish the same fragment identity under its own
+                // partition, then tombstone the association the severed `Put` published. By the
+                // time the original client rebinds, its own association is gone and the
+                // authoritative copy is the third actor's.
+                //
+                // Re-store before obliterate, and the order is forced rather than chosen. A
+                // `store` back-fills the payload pointer onto every OTHER entry that shares the
+                // hash (`lore-storage/src/local/immutable_store.rs`, the `update_slot` loop after
+                // the insert), and an obliterated entry has been zeroed, so storing the hash
+                // while a tombstone for it exists reaches `assign_deduplicated_payload` with
+                // mismatched `size_content` and trips its `debug_assert` (`:116`). That is an
+                // engine-side question about obliterate/store interaction, not a transport one.
+                //
+                // What the order costs, stated rather than glossed: with the third actor's entry
+                // already present, `obliterate_one`'s `is_last_fragment` check (`:2003-2018`) is
+                // false, so the packstore payload is never released. This obliterate is a
+                // METADATA tombstone only. That is enough for every claim B9 makes -- all four
+                // are about the association, the typed ambiguity, and redispatch, none about
+                // payload bytes -- but it is not the full obliterate an only-copy case would run.
+                third_actor_session
+                    .put(address, fragment, Some(payload.clone()))
+                    .await
+                    .expect("the third actor's re-store should succeed on server B");
+                let obliterate_stats = Arc::new(lore_storage::StoreObliterateStats::default());
+                immutable
+                    .clone()
+                    .obliterate(original_partition, address, obliterate_stats)
+                    .await
+                    .expect("the third actor's obliterate must remove the original association");
+                let log_b_snapshot = log_b.lock().unwrap().clone();
+                assert!(
+                    log_b_snapshot
+                        .iter()
+                        .any(|o| o.opcode == Command::Put as u8),
+                    "the third actor's re-store must have crossed server B's real wire, not only \
+                     the shared store; observed: {log_b_snapshot:?}"
+                );
+
+                // The original client's replacement listener, on the port it will reconnect to.
+                let log_a2: Log = Arc::new(StdMutex::new(Vec::new()));
+                let _server_a2 = start_recording_quic_server(
+                    udp_a2,
+                    immutable.clone(),
+                    mutable.clone(),
+                    log_a2.clone(),
+                );
+
+                // (1) and (2): one epoch-N Put, nothing after it, and a typed unknown.
+                let outcome = put_task
+                    .await
+                    .expect("put task should not panic")
+                    .expect("a dispatched-then-lost Put must resolve Ok(Unknown), not Err");
+                assert!(
+                    outcome.is_unknown(),
+                    "the intervening obliterate and re-store must not resolve the original \
+                     attempt's ambiguity in either direction, got {outcome:?}"
+                );
+                let log_a_snapshot = log_a.lock().unwrap().clone();
+                assert_eq!(
+                    log_a_snapshot
+                        .iter()
+                        .filter(|o| o.opcode == Command::Put as u8)
+                        .count(),
+                    1,
+                    "exactly one Put may reach server A; observed: {log_a_snapshot:?}"
+                );
+                assert_no_bytes_after_severed_command(&log_a_snapshot, Command::Put as u8);
+
+                // (3): the client rebinds and reconciles by READING authoritative state. The
+                // association it published is gone, and it does not put it back.
+                let reconcile_error = original_session
+                    .get(&address)
+                    .await
+                    .expect_err("the obliterated association must not still be readable");
+                // Typed, not merely `is_err()`. A `Disconnected` would satisfy a bare error check
+                // just as well and would mean the reconnect failed rather than that the address
+                // is gone -- the opposite of what this step claims.
+                assert!(
+                    reconcile_error.is_not_found(),
+                    "the original client's association was obliterated, so its own read must \
+                     report it MISSING rather than fail for a transport reason or serve the \
+                     third actor's copy; got {reconcile_error:?}"
+                );
+                let log_a2_snapshot = log_a2.lock().unwrap().clone();
+                assert!(
+                    log_a2_snapshot
+                        .iter()
+                        .any(|o| o.opcode == Command::Authorize as u8),
+                    "the reconciling read must have rebound with a fresh Authorize on the \
+                     replacement connection; observed: {log_a2_snapshot:?}"
+                );
+                assert_eq!(
+                    log_a2_snapshot
+                        .iter()
+                        .filter(|o| o.opcode == Command::Put as u8)
+                        .count(),
+                    0,
+                    "zero Put bytes may cross the replacement connection -- an unknown outcome is \
+                     never redispatched; observed: {log_a2_snapshot:?}"
+                );
+
+                // (4): authoritative state is the third actor's re-store, and only that.
+                immutable
+                    .clone()
+                    .get(third_actor_partition, address)
+                    .await
+                    .expect("the post-obliterate re-store is the authoritative association");
+                assert!(
+                    immutable
+                        .clone()
+                        .get(original_partition, address)
+                        .await
+                        .is_err(),
+                    "the obliterated association must stay tombstoned"
+                );
+
+                // The absence above is only evidence if its presence was reachable. Redispatch
+                // the Put deliberately, as the caller and not the transport, and watch the
+                // tombstoned association come back -- which is exactly what a blind redispatch
+                // after the unknown outcome would have done.
+                original_session
+                    .put(address, fragment, Some(payload))
+                    .await
+                    .expect("a deliberate caller-issued put should succeed");
+                immutable
+                    .clone()
+                    .get(original_partition, address)
+                    .await
+                    .expect(
+                        "a deliberate redispatch DOES resurrect the obliterated association -- \
+                         which is what makes the assertion above a real check rather than a \
+                         vacuous absence",
+                    );
+                let log_a2_after_deliberate = log_a2.lock().unwrap().clone();
+                assert_eq!(
+                    log_a2_after_deliberate
+                        .iter()
+                        .filter(|o| o.opcode == Command::Put as u8)
+                        .count(),
+                    1,
+                    "the same wire that recorded zero Puts above must record a Put when one is \
+                     actually sent, or that zero was a property of the recorder rather than of \
+                     the client; observed: {log_a2_after_deliberate:?}"
+                );
+
+                Ok(())
+            })
+            .await
+    }
 
     /// B10: the barrier before any epoch-N+1 reconnect/rebind. Every dispatched `MutableNoReplay`
     /// opcode that loses its response branches to `OutcomeUnknown` with ZERO epoch-N+1 bytes,

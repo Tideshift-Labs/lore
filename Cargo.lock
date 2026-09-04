@@ -2773,6 +2773,7 @@ dependencies = [
  "aws-sdk-s3",
  "axum",
  "bytes",
+ "jsonwebtoken",
  "lore",
  "lore-aws",
  "lore-base",

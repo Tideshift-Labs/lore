@@ -48,6 +48,9 @@ lore-proto = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# Test-only token minting for the auth-ON QUIC harness (WP-108 case B4). Verification stays
+# `lore-server`'s: this only signs the tokens its `JwtVerifier` is then asked to accept or refuse.
+jsonwebtoken = { workspace = true }
 lore-server = { workspace = true }
 lore-transport = { workspace = true, features = ["test_seams"] }
 rcgen = { workspace = true }
