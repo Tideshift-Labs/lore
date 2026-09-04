@@ -533,6 +533,7 @@ async fn governed_create_projection_rows_match_the_legacy_writers_exactly() {
                     fingerprint: binding.fingerprint.clone(),
                     prepare_token: token,
                     mediated_scope: None,
+                    claim_witness: None,
                 },
             };
             let governed = GovernedRepositoryCreate::prepare(

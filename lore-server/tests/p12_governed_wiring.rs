@@ -711,3 +711,220 @@ fn the_removed_inline_branch_push_definition_cannot_return() {
     assert!(!PUSH.contains("blake3::Hasher::new()"));
     assert_eq!(PUSH.matches("CanonicalIntent::BranchPush").count(), 1);
 }
+
+/// The ReBAC create callback's proto contract.
+///
+/// Included as source rather than as a hand-copied field list so the pin below
+/// fails when a field is added to the message and left unpopulated — which is
+/// exactly the defect this file exists to catch, and exactly what happened to
+/// tags 3-21: they were frozen in the proto, generated into
+/// `lore-proto/src/grpc/ucs.auth.rs`, verified end to end by `auth-grpc`, and
+/// never once written by Lore.
+const REBAC_PROTO: &str = include_str!("../../lore-proto/proto/rebac_api.proto");
+
+/// The file that builds the callback request.
+const CREATE_HANDLER: &str = include_str!("../src/grpc/handlers/repository_create.rs");
+
+/// Extract one proto message body by name.
+fn proto_message(source: &str, name: &str) -> String {
+    let header = format!("message {name} {{");
+    let start = source
+        .find(&header)
+        .unwrap_or_else(|| panic!("{name} must exist in rebac_api.proto"))
+        + header.len();
+    let rest = &source[start..];
+    let end = rest
+        .find('}')
+        .unwrap_or_else(|| panic!("{name} must terminate"));
+    rest[..end].to_owned()
+}
+
+/// Field names of a proto message at or above `min_tag`, in declaration order.
+fn proto_fields_from_tag(body: &str, min_tag: u32) -> Vec<String> {
+    let mut fields = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let Some(statement) = line.strip_suffix(';') else {
+            continue;
+        };
+        let Some((lhs, tag)) = statement.rsplit_once('=') else {
+            continue;
+        };
+        let Ok(tag) = tag.trim().parse::<u32>() else {
+            continue;
+        };
+        let Some(name) = lhs.trim().rsplit(' ').next() else {
+            continue;
+        };
+        if tag >= min_tag {
+            fields.push(name.to_owned());
+        }
+    }
+    fields
+}
+
+/// Slice one Rust function body out of a source file by its signature prefix.
+fn rust_fn_body(source: &str, signature: &str) -> String {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("{signature} must exist"));
+    let rest = &source[start..];
+    let end = rest
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("{signature} must terminate at column zero"));
+    rest[..end].to_owned()
+}
+
+/// WP-116: a governed create attaches the COMPLETE platform claim.
+///
+/// `auth-grpc` decides which of two paths `CreateResource` takes by asking
+/// whether any of tags 3-21 is present, and the governed path it then selects is
+/// exact-match-or-deny with no fallback. A field left unset is elided by prost,
+/// arrives `undefined` under the verifier's `defaults: false` loader, and turns
+/// an authorized create into a `PERMISSION_DENIED` that names nothing useful. So
+/// "all of them or none of them" is the property, and a partial attachment is
+/// worse than no attachment.
+///
+/// Derived from the proto rather than from a list written here, so a tag added
+/// to `CreateResourceRequest` without a matching assignment fails this test
+/// instead of shipping as a silently absent field.
+#[test]
+fn the_governed_create_callback_populates_every_claim_field() {
+    let message = proto_message(REBAC_PROTO, "CreateResourceRequest");
+    let fields = proto_fields_from_tag(&message, 3);
+    assert_eq!(
+        fields.len(),
+        19,
+        "CreateResourceRequest tags 3.. must be the 19 CR-029 claim fields; a \
+         changed count means the callback contract moved and this pin, the \
+         attach helper, and the platform verifier all need reconciling: {fields:?}"
+    );
+
+    let attach = rust_fn_body(
+        CREATE_HANDLER,
+        "fn attach_create_claim(payload: &mut CreateResourceRequest",
+    );
+    for field in &fields {
+        assert!(
+            attach.contains(&format!("payload.{field} =")),
+            "the governed create callback must populate `{field}`; an unset \
+             field is elided on the wire and denied by the verifier"
+        );
+    }
+
+    // The method is the platform family constant, not the operation binding's
+    // gRPC path. The two wire versions bind different paths, so sourcing it
+    // from the binding would fail the verifier's exact match on both.
+    assert!(
+        attach.contains("payload.method = PLATFORM_METHOD_REPOSITORY_CREATE.to_owned();"),
+        "the callback's method must be the platform family constant"
+    );
+    assert!(
+        GOVERNED_SEAM
+            .contains("pub const PLATFORM_METHOD_REPOSITORY_CREATE: &str = \"repository.create\";"),
+        "the platform family constant must stay `repository.create`, which is \
+         what `apps/auth-grpc/src/service-rebac.ts` exact-matches"
+    );
+
+    // CR-029 freezes `authorization_id` to the operation UUID and the verifier
+    // requires the equality rather than tolerating it, so both fields come from
+    // the one value.
+    assert_eq!(
+        attach
+            .matches("witness.operation_id.to_vec().into();")
+            .count(),
+        2,
+        "`operation_id` and `authorization_id` must both carry the operation \
+         UUID; CR-029 freezes them equal and the verifier enforces it"
+    );
+}
+
+/// WP-116: the claim is attached only when there is a claim, and the
+/// acknowledgement is required before the mutation.
+///
+/// Two halves of one contract. A legacy or direct create must leave the request
+/// byte-identical to what it sends today, or it trips the verifier's governed
+/// branch with no claim to match and loses the catalog path it depends on. And a
+/// governed create must not proceed on an unacknowledged claim: the response is
+/// the only evidence Lore gets that the platform recognised THIS claim rather
+/// than merely permitting A create.
+#[test]
+fn the_claim_is_attached_only_when_present_and_its_acknowledgement_is_required() {
+    let callback = rust_fn_body(
+        CREATE_HANDLER,
+        "pub(crate) async fn repository_create_auth_resource(",
+    );
+    assert!(
+        callback.contains("if let Some(witness) = witness {\n        attach_create_claim("),
+        "the claim must be attached only under a present witness, so an \
+         ungoverned create keeps sending resource_id and resource_name alone"
+    );
+    assert_eq!(
+        CREATE_HANDLER.matches("attach_create_claim(").count(),
+        2,
+        "there must be exactly one definition and one call site of the attach \
+         helper; a second call site is a second place a field can be missed"
+    );
+    assert!(
+        callback.contains("verify_create_acknowledgement(response.into_inner(), witness)"),
+        "a governed create must verify the acknowledgement before returning"
+    );
+
+    let verify = rust_fn_body(CREATE_HANDLER, "fn verify_create_acknowledgement(");
+    for field in ["claim_id", "claim_revision", "claim_verification_witness"] {
+        assert!(
+            verify.contains(&format!("response.{field}")),
+            "the acknowledgement check must compare `{field}`; an unchecked \
+             field is a field the platform never had to echo"
+        );
+    }
+    let acknowledgement = proto_message(REBAC_PROTO, "CreateResourceResponse");
+    assert_eq!(
+        proto_fields_from_tag(&acknowledgement, 1).len(),
+        3,
+        "the acknowledgement is three fields; a fourth needs checking too"
+    );
+
+    // An `AlreadyExists` answer carries no claim triple. Treating it as success
+    // on the governed path would let the mutation open its transaction with no
+    // acknowledgement at all, which is the one ordering this callback exists to
+    // establish.
+    assert!(
+        callback.contains("err.code() == Code::AlreadyExists && witness.is_some()"),
+        "a governed create must not read AlreadyExists as an acknowledgement"
+    );
+}
+
+/// WP-116: the claim witness reaches the callback only through carriage, and
+/// only for a mediated operation.
+#[test]
+fn the_claim_witness_is_mediated_only_and_required_when_mediated() {
+    assert!(
+        GOVERNED_SEAM.contains("claim-witness carriage requires mediated-scope carriage"),
+        "claim-witness carriage must be refused without mediated-scope \
+         carriage; it names a platform claim only a mediated operation has"
+    );
+    assert!(
+        GOVERNED_SEAM
+            .contains("mediated governed repository create is missing claim-witness carriage"),
+        "a mediated governed create must refuse when the claim witness is \
+         absent, before the ReBAC callback and before any receipt is consumed"
+    );
+
+    // The witness is assembled once, at the seam, so no handler can build a
+    // second one from different provenances.
+    assert_eq!(
+        GOVERNED_SEAM
+            .matches("Ok(Some(GovernedCreateWitness {")
+            .count(),
+        1,
+        "the attached claim must be assembled at exactly one place"
+    );
+    assert!(
+        !CREATE_HANDLER.contains("GovernedCreateWitness {"),
+        "handlers must consume the assembled witness, never build one"
+    );
+}

@@ -399,7 +399,10 @@ async fn repository_create_inner(
 
     if let Some(auth_url) = auth_url {
         let client = Box::new(crate::authnz::rebac::grpc_get_rebac_client(auth_url).await?);
-        repository_create_auth_resource(client, authorization, repository.id, name).await?;
+        // The ungoverned v1 implementation. A governed v1 create never reaches
+        // here: it is routed to the shared `governed_repository_create` seam,
+        // which attaches the claim itself.
+        repository_create_auth_resource(client, authorization, repository.id, name, None).await?;
     }
 
     let metadata = RepositoryMetadata {

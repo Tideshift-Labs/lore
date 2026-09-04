@@ -1463,6 +1463,7 @@ mod tests {
                 fingerprint: vec![8; 32],
                 prepare_token: [9; 32],
                 mediated_scope: None,
+                claim_witness: None,
             },
         };
         let governed = prepare_governed_push(

@@ -75,6 +75,51 @@ pub const MEDIATED_SCOPE_V1_LEN: usize = 66;
 /// Exact canonical principal namespace width for carriage v1.
 pub const MEDIATED_PRINCIPAL_NAMESPACE_V1_LEN: usize = 49;
 
+// PIN(WP-116, 2026-09-04): claim carriage header, CR-029 amendment owed.
+//
+// `lore-domain-claim-witness-bin`, version 1, exactly 161 bytes, integers
+// big-endian:
+//
+// ```text
+//   0    1   version = 1
+//   1   16   claim_id
+//  17    8   claim_revision              u64, 1..=MAX_WIRE_REVISION
+//  25   32   claim_verification_witness
+//  57    8   authorization_revision      u64, 1..=MAX_WIRE_REVISION
+//  65   32   verification_nonce
+//  97   32   bound_fields_digest
+// 129   32   consumed_ticket_sha256
+// ```
+//
+// CR-029 freezes the four carriage headers above but not this one. The
+// amendment naming it is owed; until it lands, this comment is the contract,
+// and `packages/lore-client/src/domain-operation-metadata.ts` plus
+// `apps/auth-grpc/src/service-rebac.ts` are the platform sides that must agree.
+//
+// Why one header rather than three for the claim triple: the authorization
+// witness is as uncarried as the claim is. Lore records it at
+// `domain_operation_prepare` time, but `domain_operation_receipt_get` returns
+// bounded timing metadata only and deliberately never the witness, so the
+// create call site can reach neither. Seven values are needed, not three, and
+// one versioned fixed-width tuple makes present-together-or-absent structural
+// rather than a rule five separate readers have to remember — the same reason
+// [`MEDIATED_SCOPE_KEY`] is one header.
+/// Frozen CR-029 attached-claim witness for a governed repository create.
+pub const CLAIM_WITNESS_KEY: &str = "lore-domain-claim-witness-bin";
+/// Version 1 of the attached-claim witness tuple.
+pub const CLAIM_WITNESS_VERSION_V1: u8 = 1;
+/// Version + claim triple + authorization witness. See the PIN above.
+pub const CLAIM_WITNESS_V1_LEN: usize = 161;
+
+/// Largest revision this server forwards to auth-grpc.
+///
+/// The platform verifier reads both revisions through `positiveWireInteger`,
+/// which is `Number.isSafeInteger`-bounded, so a `u64` above 2^53-1 cannot
+/// survive the crossing intact. Refusing it here makes that a decisive
+/// client-side wire error at the gate instead of an opaque `PERMISSION_DENIED`
+/// from a verifier comparing a silently rounded value.
+pub const MAX_WIRE_REVISION: u64 = (1u64 << 53) - 1;
+
 /// Version byte leading every tenant scope key this server builds.
 pub const SCOPE_KEY_VERSION_V1: u8 = 1;
 /// Fixed method constant for repository create, whose target repository does not
@@ -112,7 +157,37 @@ pub struct DomainOperationMetadata {
     /// Mediated receipt namespace, present only for the control-plane service
     /// principal and interpreted by the shared admission function.
     pub mediated_scope: Option<MediatedScope>,
+    /// Attached platform claim, present only alongside a mediated scope.
+    ///
+    /// Carried rather than derived, and never an authority input here: Lore
+    /// forwards these bytes to auth-grpc, which exact-matches every one of them
+    /// against its own claim and authorization rows. A caller that supplies
+    /// values it did not receive gets a conclusive denial from the verifier, not
+    /// a widened path through this server.
+    pub claim_witness: Option<ClaimWitness>,
 }
+
+/// Validated version-1 attached-claim witness. See [`CLAIM_WITNESS_KEY`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimWitness {
+    /// Platform claim row identity.
+    pub claim_id: [u8; OPERATION_ID_LEN],
+    /// Monotonic claim revision.
+    pub claim_revision: u64,
+    /// Opaque claim verification witness. Never a digest input.
+    pub claim_verification_witness: [u8; DIGEST_LEN],
+    /// Monotonic authorization revision.
+    pub authorization_revision: u64,
+    /// Immutable verification nonce from the platform consume transition.
+    pub verification_nonce: [u8; DIGEST_LEN],
+    /// Digest over the authorization's bound fields.
+    pub bound_fields_digest: [u8; DIGEST_LEN],
+    /// SHA-256 commitment to the consumed preclaim ticket.
+    pub consumed_ticket_sha256: [u8; DIGEST_LEN],
+}
+
+/// Width of every 256-bit digest in the claim witness.
+pub const DIGEST_LEN: usize = 32;
 
 /// Validated version-1 mediated receipt namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +251,25 @@ pub enum DomainOperationMetadataError {
     /// The mediated-scope principal bytes are not the frozen canonical form.
     #[error("domain-operation mediated-scope principal namespace is not canonical")]
     InvalidMediatedPrincipalNamespace,
+
+    /// The claim-witness value names an unsupported schema.
+    #[error("unsupported domain-operation claim-witness version {version}")]
+    UnsupportedClaimWitnessVersion {
+        /// The version byte supplied.
+        version: u8,
+    },
+
+    /// A claim-witness revision is zero or beyond what the platform verifier
+    /// can compare. Never clamped to the nearest representable value.
+    #[error("domain-operation claim-witness {field} is {value}, expected 1..={max}")]
+    ClaimWitnessRevisionOutOfRange {
+        /// Which revision was out of range.
+        field: &'static str,
+        /// The value supplied.
+        value: u64,
+        /// Largest value the platform verifier can compare.
+        max: u64,
+    },
 
     /// The operation ID is 16 bytes but is not an RFC 9562 UUIDv7.
     #[error("domain-operation ID is not an RFC 9562 UUIDv7 (version {version})")]
@@ -310,12 +404,17 @@ pub fn extract(
     let fingerprint = read_bin(metadata, FINGERPRINT_KEY)?;
     let token = read_bin(metadata, PREPARE_TOKEN_KEY)?;
     let mediated = read_bin(metadata, MEDIATED_SCOPE_KEY)?;
+    let claim = read_bin(metadata, CLAIM_WITNESS_KEY)?;
 
     match (id.is_some(), fingerprint.is_some(), token.is_some()) {
-        (false, false, false) if mediated.is_none() => return Ok(None),
+        (false, false, false) if mediated.is_none() && claim.is_none() => return Ok(None),
         (false, false, false) => {
             return Err(DomainOperationMetadataError::PartialCarriage {
-                present: MEDIATED_SCOPE_KEY,
+                present: if mediated.is_some() {
+                    MEDIATED_SCOPE_KEY
+                } else {
+                    CLAIM_WITNESS_KEY
+                },
                 missing: OPERATION_ID_KEY,
             });
         }
@@ -380,13 +479,81 @@ fn validated(
         .map(|value| parse_mediated_scope(&value))
         .transpose()?;
 
+    let claim_witness = read_bin(metadata, CLAIM_WITNESS_KEY)?
+        .map(|value| parse_claim_witness(&value))
+        .transpose()?;
+
     Ok(DomainOperationMetadata {
         operation_id,
         fingerprint_version,
         fingerprint,
         prepare_token,
         mediated_scope,
+        claim_witness,
     })
+}
+
+/// Split the fixed-width claim-witness tuple. See [`CLAIM_WITNESS_KEY`]'s PIN
+/// for the layout this reads.
+fn parse_claim_witness(bytes: &[u8]) -> Result<ClaimWitness, DomainOperationMetadataError> {
+    // Converted to a fixed-width array rather than length-checked and then
+    // sliced, so the width is one fact the type system carries instead of a
+    // precondition each read below has to restate. Every `chunk` call is then
+    // total by construction.
+    let value: &[u8; CLAIM_WITNESS_V1_LEN] =
+        bytes
+            .try_into()
+            .map_err(|_| DomainOperationMetadataError::WrongLength {
+                header: CLAIM_WITNESS_KEY,
+                expected: CLAIM_WITNESS_V1_LEN,
+                actual: bytes.len(),
+            })?;
+    if value[0] != CLAIM_WITNESS_VERSION_V1 {
+        return Err(
+            DomainOperationMetadataError::UnsupportedClaimWitnessVersion { version: value[0] },
+        );
+    }
+
+    Ok(ClaimWitness {
+        claim_id: chunk::<OPERATION_ID_LEN>(value, 1),
+        claim_revision: read_revision(&chunk::<8>(value, 17), "claim_revision")?,
+        claim_verification_witness: chunk::<DIGEST_LEN>(value, 25),
+        authorization_revision: read_revision(&chunk::<8>(value, 57), "authorization_revision")?,
+        verification_nonce: chunk::<DIGEST_LEN>(value, 65),
+        bound_fields_digest: chunk::<DIGEST_LEN>(value, 97),
+        consumed_ticket_sha256: chunk::<DIGEST_LEN>(value, 129),
+    })
+}
+
+/// Copy `N` bytes out of the fixed-width claim-witness value at `OFFSET`.
+///
+/// Both the source width and the read width are compile-time constants, so an
+/// offset past the end is a build failure rather than a runtime panic on
+/// attacker-supplied bytes.
+fn chunk<const N: usize>(value: &[u8; CLAIM_WITNESS_V1_LEN], offset: usize) -> [u8; N] {
+    let mut out = [0u8; N];
+    out.copy_from_slice(&value[offset..offset + N]);
+    out
+}
+
+/// Read one big-endian `u64` revision, bounded to what the platform verifier
+/// can compare. Zero is refused too: both revisions are monotonic counters that
+/// start at one, and the verifier treats zero as out of bounds.
+fn read_revision(
+    bytes: &[u8; 8],
+    field: &'static str,
+) -> Result<u64, DomainOperationMetadataError> {
+    let value = u64::from_be_bytes(*bytes);
+    if value == 0 || value > MAX_WIRE_REVISION {
+        return Err(
+            DomainOperationMetadataError::ClaimWitnessRevisionOutOfRange {
+                field,
+                value,
+                max: MAX_WIRE_REVISION,
+            },
+        );
+    }
+    Ok(value)
 }
 
 fn parse_mediated_scope(bytes: &[u8]) -> Result<MediatedScope, DomainOperationMetadataError> {
@@ -1398,7 +1565,195 @@ mod tests {
             fingerprint: _,
             prepare_token: _,
             mediated_scope: _,
+            claim_witness: _,
         } = parsed;
+    }
+
+    // --- claim-witness carriage rejections --------------------------------
+    //
+    // The `admit`-level and callback-level cases live in `domain/p12_tests.rs`
+    // and every one of them feeds a well-formed value. These are the other half:
+    // the parser's fail-closed contract, which nothing else exercises. Each
+    // asserts the error VARIANT rather than merely that an error occurred,
+    // because a length rejection and a version rejection have different fixes
+    // and a test that cannot tell them apart cannot catch the two being
+    // confused.
+
+    /// A well-formed 161-byte claim witness with distinct, non-default values
+    /// in every slot, so a test that perturbs one field cannot pass by
+    /// accidentally matching another.
+    fn valid_claim_witness_bytes() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(CLAIM_WITNESS_V1_LEN);
+        bytes.push(CLAIM_WITNESS_VERSION_V1);
+        bytes.extend_from_slice(&[0xA1; 16]); // claim_id
+        bytes.extend_from_slice(&7u64.to_be_bytes()); // claim_revision
+        bytes.extend_from_slice(&[0xA2; 32]); // claim_verification_witness
+        bytes.extend_from_slice(&11u64.to_be_bytes()); // authorization_revision
+        bytes.extend_from_slice(&[0xA3; 32]); // verification_nonce
+        bytes.extend_from_slice(&[0xA4; 32]); // bound_fields_digest
+        bytes.extend_from_slice(&[0xA5; 32]); // consumed_ticket_sha256
+        assert_eq!(
+            bytes.len(),
+            CLAIM_WITNESS_V1_LEN,
+            "fixture layout drifted from CLAIM_WITNESS_V1_LEN"
+        );
+        bytes
+    }
+
+    /// The three core headers plus a claim witness built from `mutate`.
+    fn metadata_with_claim_witness(mutate: impl FnOnce(&mut Vec<u8>)) -> MetadataMap {
+        let (mut metadata, ..) = valid_metadata();
+        let mut witness = valid_claim_witness_bytes();
+        mutate(&mut witness);
+        insert(&mut metadata, CLAIM_WITNESS_KEY, &witness);
+        metadata
+    }
+
+    #[test]
+    fn a_well_formed_claim_witness_parses_into_every_field() {
+        let metadata = metadata_with_claim_witness(|_| {});
+        let parsed = require(&metadata).expect("a well-formed claim witness must parse");
+        let claim = parsed
+            .claim_witness
+            .expect("the claim witness must be present");
+        assert_eq!(claim.claim_id, [0xA1; 16]);
+        assert_eq!(claim.claim_revision, 7);
+        assert_eq!(claim.claim_verification_witness, [0xA2; 32]);
+        assert_eq!(claim.authorization_revision, 11);
+        assert_eq!(claim.verification_nonce, [0xA3; 32]);
+        assert_eq!(claim.bound_fields_digest, [0xA4; 32]);
+        assert_eq!(claim.consumed_ticket_sha256, [0xA5; 32]);
+    }
+
+    #[test]
+    fn a_claim_witness_of_the_wrong_length_is_refused_never_padded_or_truncated() {
+        for actual in [0usize, CLAIM_WITNESS_V1_LEN - 1, CLAIM_WITNESS_V1_LEN + 1] {
+            let metadata = metadata_with_claim_witness(|witness| witness.resize(actual, 0));
+            let error = require(&metadata).expect_err("a wrong-length claim witness must refuse");
+            assert_eq!(
+                error,
+                DomainOperationMetadataError::WrongLength {
+                    header: CLAIM_WITNESS_KEY,
+                    expected: CLAIM_WITNESS_V1_LEN,
+                    actual,
+                },
+                "{actual} bytes must be refused as a length error"
+            );
+            assert_eq!(Status::from(error).code(), Code::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn an_unknown_claim_witness_version_is_refused_not_coerced_to_version_one() {
+        for version in [0u8, 2, 255] {
+            let metadata = metadata_with_claim_witness(|witness| witness[0] = version);
+            let error = require(&metadata).expect_err("an unknown version must refuse");
+            assert_eq!(
+                error,
+                DomainOperationMetadataError::UnsupportedClaimWitnessVersion { version },
+                "version {version} must be refused rather than read as version 1"
+            );
+            assert_eq!(Status::from(error).code(), Code::InvalidArgument);
+        }
+    }
+
+    /// Both revisions, at both ends of the accepted range.
+    ///
+    /// The upper bound is the whole reason `MAX_WIRE_REVISION` exists: the
+    /// platform verifier compares both through `Number.isSafeInteger`, so a
+    /// value above 2^53-1 cannot survive the crossing. Pinning only the
+    /// rejection would leave the bound free to drift inward and silently refuse
+    /// legitimate revisions, so the largest ACCEPTED value is pinned too.
+    #[test]
+    fn a_claim_witness_revision_outside_one_to_max_wire_revision_is_refused() {
+        // offset, field name as the error reports it
+        let slots = [(17usize, "claim_revision"), (57, "authorization_revision")];
+        for (offset, field) in slots {
+            for value in [0u64, MAX_WIRE_REVISION + 1, u64::MAX] {
+                let metadata = metadata_with_claim_witness(|witness| {
+                    witness[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+                });
+                let error = require(&metadata).expect_err("an out-of-range revision must refuse");
+                assert_eq!(
+                    error,
+                    DomainOperationMetadataError::ClaimWitnessRevisionOutOfRange {
+                        field,
+                        value,
+                        max: MAX_WIRE_REVISION,
+                    },
+                    "{field} = {value} must be refused, and the error must name \
+                     {field} rather than the other revision"
+                );
+                assert_eq!(Status::from(error).code(), Code::InvalidArgument);
+            }
+
+            let metadata = metadata_with_claim_witness(|witness| {
+                witness[offset..offset + 8].copy_from_slice(&MAX_WIRE_REVISION.to_be_bytes());
+            });
+            let parsed = require(&metadata)
+                .unwrap_or_else(|error| panic!("{field} at MAX_WIRE_REVISION must parse: {error}"));
+            let claim = parsed
+                .claim_witness
+                .expect("the claim witness must be present");
+            let read = if offset == 17 {
+                claim.claim_revision
+            } else {
+                claim.authorization_revision
+            };
+            assert_eq!(read, MAX_WIRE_REVISION);
+        }
+    }
+
+    #[test]
+    fn a_divergent_duplicate_claim_witness_is_refused_and_an_identical_one_is_not() {
+        let (mut metadata, ..) = valid_metadata();
+        let witness = valid_claim_witness_bytes();
+        insert(&mut metadata, CLAIM_WITNESS_KEY, &witness);
+        metadata.append_bin(CLAIM_WITNESS_KEY, BinaryMetadataValue::from_bytes(&witness));
+        require(&metadata).expect("a byte-identical repeat carries no ambiguity");
+
+        let mut divergent = witness.clone();
+        divergent[1] ^= 0xFF;
+        metadata.append_bin(
+            CLAIM_WITNESS_KEY,
+            BinaryMetadataValue::from_bytes(&divergent),
+        );
+        let error = require(&metadata).expect_err("a divergent repeat must refuse");
+        assert_eq!(
+            error,
+            DomainOperationMetadataError::DivergentDuplicate {
+                header: CLAIM_WITNESS_KEY,
+            }
+        );
+        assert_eq!(Status::from(error).code(), Code::InvalidArgument);
+    }
+
+    /// The one that matters most.
+    ///
+    /// If a lone claim witness fell through `extract`'s legacy carve-out to
+    /// `Ok(None)`, a caller could attach a claim and be silently handed the
+    /// unsynchronised legacy path while believing it had been admitted. Absence
+    /// has a carve-out; partial carriage does not.
+    #[test]
+    fn a_claim_witness_alone_is_partial_carriage_never_the_legacy_carve_out() {
+        let metadata = metadata_with(&[(CLAIM_WITNESS_KEY, valid_claim_witness_bytes())]);
+        let error = extract(&metadata).expect_err("a lone claim witness must refuse");
+        assert_eq!(
+            error,
+            DomainOperationMetadataError::PartialCarriage {
+                present: CLAIM_WITNESS_KEY,
+                missing: OPERATION_ID_KEY,
+            }
+        );
+        assert_eq!(Status::from(error).code(), Code::InvalidArgument);
+
+        // The carve-out itself still works: no carriage at all is `Ok(None)`.
+        assert!(
+            extract(&MetadataMap::new())
+                .expect("no carriage must not error")
+                .is_none(),
+            "an empty metadata map is still the legacy carve-out"
+        );
     }
 }
 

@@ -1,9 +1,11 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
+use std::str::FromStr;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use lore_base::runtime::LORE_CONTEXT;
 use lore_postgres::domain::coordinator::ADMISSION_REJECTED_V1;
 use lore_postgres::domain::coordinator::BranchDeleteInput;
 use lore_postgres::domain::coordinator::BranchPushCommitInput;
@@ -27,22 +29,39 @@ use lore_postgres::domain::maintenance::VerifiedStaleFinalizeResult;
 use lore_postgres::domain::receipts::AuthorizationWitness;
 use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptLookup;
+use lore_proto::rebac::CreateResourceRequest;
+use lore_proto::rebac::CreateResourceResponse;
+use lore_proto::rebac::DeleteResourceRequest;
+use lore_proto::rebac::DeleteResourceResponse;
+use lore_revision::repository::RepositoryContext;
+use rand::random;
 use tonic::Code;
+use tonic::Request;
+use tonic::Response;
 use tonic::metadata::BinaryMetadataValue;
 use uuid::Uuid;
 
 use super::test_support::context;
 use super::*;
+use crate::authnz::rebac::RebacApiClient;
+use crate::authnz::rebac::RebacApiResult;
+use crate::grpc::domain_operation_metadata::CLAIM_WITNESS_KEY;
+use crate::grpc::domain_operation_metadata::CLAIM_WITNESS_V1_LEN;
+use crate::grpc::domain_operation_metadata::CLAIM_WITNESS_VERSION_V1;
+use crate::grpc::domain_operation_metadata::ClaimWitness;
 use crate::grpc::domain_operation_metadata::DomainOperationMetadata;
 use crate::grpc::domain_operation_metadata::FINGERPRINT_KEY;
 use crate::grpc::domain_operation_metadata::FINGERPRINT_V1_LEN;
 use crate::grpc::domain_operation_metadata::FINGERPRINT_VERSION_V1;
 use crate::grpc::domain_operation_metadata::MEDIATED_SCOPE_KEY;
 use crate::grpc::domain_operation_metadata::MEDIATED_SCOPE_V1_LEN;
+use crate::grpc::domain_operation_metadata::MediatedScope;
 use crate::grpc::domain_operation_metadata::OPERATION_ID_KEY;
 use crate::grpc::domain_operation_metadata::PREPARE_TOKEN_KEY;
 use crate::grpc::domain_operation_metadata::PREPARE_TOKEN_LEN;
 use crate::grpc::domain_operation_metadata::scope_key_mediated_namespace;
+use crate::grpc::handlers::repository_create::governed_repository_create;
+use crate::grpc::handlers::repository_create::repository_create_auth_resource;
 
 const ORG_UUID: [u8; 16] = [
     0x01, 0x91, 0x23, 0x45, 0x67, 0x89, 0x7a, 0xbc, 0x8d, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
@@ -661,6 +680,7 @@ fn build_governed_repository_create(
     let governed = GovernedRepositoryCreate {
         domain,
         operation: dummy_create_operation(),
+        create_witness: None,
     };
     (governed, captured_input)
 }
@@ -747,6 +767,7 @@ fn prepare_refuses_carriage_when_enforcement_is_off() {
             fingerprint: vec![0x42; FINGERPRINT_V1_LEN],
             prepare_token: [0x53; PREPARE_TOKEN_LEN],
             mediated_scope: None,
+            claim_witness: None,
         },
     };
     // `GovernedRepositoryCreate` has no `Debug` impl, so `Result::expect_err`
@@ -784,6 +805,7 @@ fn prepare_admits_carriage_when_enforcement_is_on() {
             fingerprint: vec![0x42; FINGERPRINT_V1_LEN],
             prepare_token: [0x53; PREPARE_TOKEN_LEN],
             mediated_scope: None,
+            claim_witness: None,
         },
     };
     let result = GovernedRepositoryCreate::prepare(
@@ -1130,6 +1152,7 @@ fn branch_delete_prepare_refuses_carriage_when_enforcement_is_off() {
             fingerprint: vec![0x42; FINGERPRINT_V1_LEN],
             prepare_token: [0x53; PREPARE_TOKEN_LEN],
             mediated_scope: None,
+            claim_witness: None,
         },
     };
     // `GovernedBranchDelete` has no `Debug` impl -- match explicitly, same
@@ -1164,6 +1187,7 @@ fn branch_delete_prepare_admits_carriage_when_enforcement_is_on() {
             fingerprint: vec![0x42; FINGERPRINT_V1_LEN],
             prepare_token: [0x53; PREPARE_TOKEN_LEN],
             mediated_scope: None,
+            claim_witness: None,
         },
     };
     let result = GovernedBranchDelete::prepare(
@@ -1366,5 +1390,700 @@ fn the_branch_delete_mapper_answers_its_own_reason_and_defers_every_other() {
         map_branch_delete_rejection(DEFAULT_BRANCH_V1).code(),
         map_branch_delete_rejection(GENERATION_MISMATCH_V1).code(),
         "a permanent refusal and a retryable one must not share a code"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WP-116 governed create witness: the platform claim `hasGovernedCreateWitness`
+// flip. Three downstream consumers of `CLAIM_WITNESS_KEY`
+// (`grpc::domain_operation_metadata`'s own header parsing is that module's
+// coverage, not this file's): `DomainContext::admit`'s mediated-only gate,
+// `GovernedRepositoryCreate::prepare`'s witness assembly, and
+// `repository_create_auth_resource`'s `CreateResourceRequest` population plus
+// its response-acknowledgement check.
+//
+// `claim_witness_wire_bytes` re-derives the 161-byte wire layout by hand from
+// the documented offsets (`domain_operation_metadata.rs`'s own PIN comment),
+// independent of `ClaimWitness` parsing itself -- the same "reproduce, don't
+// round-trip" shape every other fixed-width-header fixture in this file uses.
+// ---------------------------------------------------------------------------
+
+fn claim_witness_fixture() -> ClaimWitness {
+    ClaimWitness {
+        claim_id: [0x61; 16],
+        claim_revision: 7,
+        claim_verification_witness: [0x62; 32],
+        authorization_revision: 3,
+        verification_nonce: [0x63; 32],
+        bound_fields_digest: [0x64; 32],
+        consumed_ticket_sha256: [0x65; 32],
+    }
+}
+
+fn claim_witness_wire_bytes(witness: &ClaimWitness) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(CLAIM_WITNESS_V1_LEN);
+    bytes.push(CLAIM_WITNESS_VERSION_V1);
+    bytes.extend_from_slice(&witness.claim_id);
+    bytes.extend_from_slice(&witness.claim_revision.to_be_bytes());
+    bytes.extend_from_slice(&witness.claim_verification_witness);
+    bytes.extend_from_slice(&witness.authorization_revision.to_be_bytes());
+    bytes.extend_from_slice(&witness.verification_nonce);
+    bytes.extend_from_slice(&witness.bound_fields_digest);
+    bytes.extend_from_slice(&witness.consumed_ticket_sha256);
+    assert_eq!(
+        bytes.len(),
+        CLAIM_WITNESS_V1_LEN,
+        "fixture layout drifted from CLAIM_WITNESS_V1_LEN"
+    );
+    bytes
+}
+
+fn carriage_with_claim(include_mediated_scope: bool, include_claim_witness: bool) -> MetadataMap {
+    let mut metadata = carriage(include_mediated_scope);
+    if include_claim_witness {
+        metadata.insert_bin(
+            CLAIM_WITNESS_KEY,
+            BinaryMetadataValue::from_bytes(&claim_witness_wire_bytes(&claim_witness_fixture())),
+        );
+    }
+    metadata
+}
+
+/// `admit()`'s own gate: a claim witness is control-plane-only, and it is
+/// refused on a direct (non-mediated) operation even though the same carriage
+/// carries a syntactically valid claim-witness header. Uses a non-service
+/// identity so the earlier `(is_control_plane, mediated_scope)` match arm
+/// (`"control-plane governed mutation is missing mediated-scope carriage"`)
+/// cannot fire first and mask the assertion this test actually wants.
+#[test]
+fn admit_refuses_claim_witness_carried_without_mediated_scope() {
+    let error = context(true)
+        .admit(
+            &carriage_with_claim(false, true),
+            Some(&token("human-user", Some(false))),
+            direct_scope(),
+        )
+        .expect_err("claim witness without mediated scope must be refused");
+    assert_eq!(error.code(), Code::InvalidArgument);
+}
+
+/// The mirror case: a claim witness alongside a mediated scope, on the
+/// control-plane service principal, is admitted, and the parsed
+/// `claim_witness` survives unchanged into `AdmittedOperation`.
+#[test]
+fn admit_admits_claim_witness_carried_with_mediated_scope_on_the_control_plane() {
+    let admitted = context(true)
+        .admit(
+            &carriage_with_claim(true, true),
+            Some(&token("lorehub-control-plane", Some(true))),
+            direct_scope(),
+        )
+        .expect("mediated carriage with a claim witness must admit")
+        .expect("enforced carriage must be governed");
+
+    assert_eq!(
+        admitted.key.tenant_scope_key,
+        scope_key_mediated_namespace(&ORG_UUID, &PRINCIPAL_NAMESPACE)
+            .expect("frozen mediated tuple must be canonical")
+    );
+    assert_eq!(
+        admitted.carried.claim_witness,
+        Some(claim_witness_fixture())
+    );
+}
+
+/// Build an `AdmittedOperation` for a mediated governed create directly (not
+/// through header parsing, which is `domain_operation_metadata`'s own
+/// coverage): a mediated scope always present, and the caller chooses whether
+/// a claim witness rides along.
+fn mediated_admitted_operation(claim_witness: Option<ClaimWitness>) -> AdmittedOperation {
+    AdmittedOperation {
+        key: ReceiptKey {
+            verified_issuer: "https://issuer.example/create-witness".to_owned(),
+            authenticated_subject: "lorehub-control-plane".to_owned(),
+            tenant_scope_key: scope_key_mediated_namespace(&ORG_UUID, &PRINCIPAL_NAMESPACE)
+                .expect("frozen mediated tuple must be canonical"),
+            operation_id: Uuid::now_v7(),
+        },
+        carried: DomainOperationMetadata {
+            operation_id: Uuid::now_v7(),
+            fingerprint_version: i32::from(FINGERPRINT_VERSION_V1),
+            fingerprint: vec![0x42; FINGERPRINT_V1_LEN],
+            prepare_token: [0x53; PREPARE_TOKEN_LEN],
+            mediated_scope: Some(MediatedScope {
+                org_uuid: ORG_UUID,
+                initiating_principal_namespace: PRINCIPAL_NAMESPACE,
+            }),
+            claim_witness,
+        },
+    }
+}
+
+/// A direct (non-mediated) governed create carries no platform claim at all --
+/// `create_witness()` is `None`, not a degraded or partial witness.
+#[test]
+fn create_witness_is_none_for_a_direct_non_mediated_governed_create() {
+    let domain = Arc::new(context(true));
+    let admitted = AdmittedOperation {
+        key: ReceiptKey {
+            verified_issuer: "https://issuer.example".to_owned(),
+            authenticated_subject: "direct-create-tester".to_owned(),
+            tenant_scope_key: vec![7; 16],
+            operation_id: Uuid::now_v7(),
+        },
+        carried: DomainOperationMetadata {
+            operation_id: Uuid::now_v7(),
+            fingerprint_version: i32::from(FINGERPRINT_VERSION_V1),
+            fingerprint: vec![0x42; FINGERPRINT_V1_LEN],
+            prepare_token: [0x53; PREPARE_TOKEN_LEN],
+            mediated_scope: None,
+            claim_witness: None,
+        },
+    };
+    let governed = GovernedRepositoryCreate::prepare(
+        Some(&domain),
+        Some(admitted),
+        "repository_create",
+        vec![0u8; 32],
+    )
+    .expect("carriage with enforcement on must be admitted")
+    .expect("carriage must govern");
+    assert!(
+        governed.create_witness().is_none(),
+        "a direct governed create (no mediated scope) must carry no platform claim witness"
+    );
+}
+
+/// A mediated operation with no claim witness is refused before it ever
+/// becomes a `GovernedRepositoryCreate` -- and therefore before the handler
+/// could reach `repository_create_auth_resource`'s ReBAC callback at all,
+/// since that call site only exists behind a successfully constructed
+/// `GovernedRepositoryCreate`. `context(true)` backs an
+/// `UnreachableDomainStore`: `prepare()` never touches the coordinator on any
+/// path today, and this keeps that a proven property rather than an assumed
+/// one -- a future regression that routed this refusal through the store
+/// would panic this test instead of silently passing.
+#[test]
+fn prepare_refuses_mediated_scope_without_claim_witness_before_touching_the_coordinator() {
+    let domain = Arc::new(context(true));
+    let admitted = mediated_admitted_operation(None);
+
+    let result = GovernedRepositoryCreate::prepare(
+        Some(&domain),
+        Some(admitted),
+        "repository_create",
+        vec![0u8; 32],
+    );
+    let Err(error) = result else {
+        panic!("mediated carriage missing a claim witness must be refused, not admitted");
+    };
+    assert_eq!(error.code(), Code::InvalidArgument);
+}
+
+/// The full assembly: a mediated operation with both a mediated scope and a
+/// claim witness admits, and `create_witness()` combines all three
+/// provenances (the verified token, Lore's own validated carriage, and the
+/// claim-witness header) into the exact `GovernedCreateWitness` the ReBAC
+/// callback will send. `GovernedCreateWitness` has no `PartialEq`, so every
+/// field is asserted individually rather than compared as a whole value.
+#[tokio::test]
+async fn prepare_assembles_the_full_create_witness_from_three_separate_provenances() {
+    let domain = Arc::new(context(true));
+    let claim = claim_witness_fixture();
+    let admitted = mediated_admitted_operation(Some(claim.clone()));
+    let expected_key = admitted.key.clone();
+    let expected_carried = admitted.carried.clone();
+    let digest = vec![0x77u8; 32];
+
+    let governed = GovernedRepositoryCreate::prepare(
+        Some(&domain),
+        Some(admitted),
+        "repository_create",
+        digest.clone(),
+    )
+    .expect("mediated carriage with a claim witness must not error")
+    .expect("mediated carriage with a claim witness must govern");
+
+    let witness = governed
+        .create_witness()
+        .expect("a mediated governed create must carry the assembled witness");
+
+    assert_eq!(witness.verified_issuer, expected_key.verified_issuer);
+    assert_eq!(
+        witness.authenticated_subject,
+        expected_key.authenticated_subject
+    );
+    assert_eq!(witness.org_uuid, ORG_UUID);
+    assert_eq!(witness.initiating_principal_namespace, PRINCIPAL_NAMESPACE);
+    assert_eq!(witness.operation_id, *expected_key.operation_id.as_bytes());
+    assert_eq!(witness.scope, expected_key.tenant_scope_key);
+    assert_eq!(
+        witness.fingerprint_version,
+        u32::from(FINGERPRINT_VERSION_V1)
+    );
+    assert_eq!(witness.fingerprint, expected_carried.fingerprint);
+    assert_eq!(witness.canonical_intent_digest, digest);
+    assert_eq!(witness.prepare_token, expected_carried.prepare_token);
+    assert_eq!(witness.claim, claim);
+}
+
+// ---------------------------------------------------------------------------
+// `repository_create_auth_resource`: the `CreateResourceRequest` it builds and
+// the `CreateResourceResponse` acknowledgement it requires. `GovernedCreateWitness`
+// and `ClaimWitness` are constructed by hand here rather than through
+// `admit`/`prepare` above -- this section is about the ReBAC wire shape, not
+// about admission, and the two are proven independently.
+// ---------------------------------------------------------------------------
+
+fn create_witness_fixture() -> GovernedCreateWitness {
+    GovernedCreateWitness {
+        verified_issuer: "https://issuer.example/create-witness".to_owned(),
+        authenticated_subject: "lorehub-control-plane".to_owned(),
+        org_uuid: ORG_UUID,
+        initiating_principal_namespace: PRINCIPAL_NAMESPACE,
+        operation_id: [0x71; 16],
+        scope: vec![0x72; 20],
+        fingerprint_version: 1,
+        fingerprint: vec![0x73; 32],
+        canonical_intent_digest: vec![0x74; 32],
+        prepare_token: [0x75; PREPARE_TOKEN_LEN],
+        claim: claim_witness_fixture(),
+    }
+}
+
+/// A single-use recording fake: captures the one request it receives and
+/// returns a scripted response. `delete_resource` is `unreachable!` --
+/// `repository_create_auth_resource` never calls it, and a regression that
+/// did would panic this test rather than silently returning a default.
+struct RecordingRebacClient {
+    captured: Arc<Mutex<Option<CreateResourceRequest>>>,
+    response: Arc<Mutex<Option<RebacApiResult<CreateResourceResponse>>>>,
+}
+
+#[async_trait]
+impl RebacApiClient for RecordingRebacClient {
+    async fn create_resource(
+        &mut self,
+        request: Request<CreateResourceRequest>,
+    ) -> RebacApiResult<CreateResourceResponse> {
+        *self.captured.lock().unwrap() = Some(request.into_inner());
+        self.response
+            .lock()
+            .unwrap()
+            .take()
+            .expect("create_resource called more than once in a single-shot test double")
+    }
+
+    async fn delete_resource(
+        &mut self,
+        _request: Request<DeleteResourceRequest>,
+    ) -> RebacApiResult<DeleteResourceResponse> {
+        unreachable!("repository_create_auth_resource never calls delete_resource")
+    }
+}
+
+fn recording_client(
+    response: RebacApiResult<CreateResourceResponse>,
+) -> (
+    Box<dyn RebacApiClient + Send + Sync>,
+    Arc<Mutex<Option<CreateResourceRequest>>>,
+) {
+    let captured = Arc::new(Mutex::new(None));
+    let client = RecordingRebacClient {
+        captured: Arc::clone(&captured),
+        response: Arc::new(Mutex::new(Some(response))),
+    };
+    (Box::new(client), captured)
+}
+
+fn matching_response(witness: &GovernedCreateWitness) -> CreateResourceResponse {
+    CreateResourceResponse {
+        claim_id: witness.claim.claim_id.to_vec().into(),
+        claim_revision: witness.claim.claim_revision,
+        claim_verification_witness: witness.claim.claim_verification_witness.to_vec().into(),
+    }
+}
+
+fn fixture_repository() -> (RepositoryId, &'static str) {
+    let repo_name = "2fc8bf934117e250152eba9a1fc78e71";
+    let repository: RepositoryId = Context::from_str(repo_name)
+        .expect("fixture id must parse")
+        .into();
+    (repository, repo_name)
+}
+
+/// The legacy carve-out: `witness: None` sends exactly the pre-CR-029
+/// request, with every one of tags 3-21 left at its prost default. This is
+/// the property that keeps every ungoverned create off auth-grpc's
+/// `hasGovernedCreateWitness` path. Checked field-by-field rather than via a
+/// single struct comparison, so the pin does not depend on
+/// `CreateResourceRequest` deriving `Debug`.
+#[tokio::test]
+async fn repository_create_auth_resource_with_no_witness_sends_the_byte_identical_legacy_request() {
+    let (repository, repo_name) = fixture_repository();
+    let (client, captured) = recording_client(Ok(Response::new(CreateResourceResponse::default())));
+
+    repository_create_auth_resource(client, None, repository, repo_name, None)
+        .await
+        .expect("a legacy (non-witness) create must succeed");
+
+    let request = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("create_resource must have been called");
+    assert_eq!(request.resource_id, format!("urc-{repository}"));
+    assert_eq!(request.resource_name, repo_name);
+    assert!(request.verified_issuer.is_empty());
+    assert!(request.authenticated_subject.is_empty());
+    assert!(request.org_uuid.is_empty());
+    assert!(request.initiating_principal_namespace.is_empty());
+    assert!(request.operation_id.is_empty());
+    assert!(request.method.is_empty());
+    assert!(request.scope.is_empty());
+    assert_eq!(request.fingerprint_version, 0);
+    assert!(request.fingerprint.is_empty());
+    assert!(request.canonical_intent_digest.is_empty());
+    assert!(request.authorization_id.is_empty());
+    assert_eq!(request.authorization_revision, 0);
+    assert!(request.verification_nonce.is_empty());
+    assert!(request.bound_fields_digest.is_empty());
+    assert!(request.consumed_ticket_sha256.is_empty());
+    assert!(request.claim_id.is_empty());
+    assert_eq!(request.claim_revision, 0);
+    assert!(request.claim_verification_witness.is_empty());
+    assert!(request.prepare_token.is_empty());
+}
+
+/// `Some(witness)` populates every one of tags 3-21, each field checked
+/// individually against the witness, plus a non-default sweep proving no
+/// field could be silently elided on the wire (auth-grpc's proto loader runs
+/// with `defaults: false`, so a zero/empty field there is indistinguishable
+/// from absent).
+#[tokio::test]
+async fn repository_create_auth_resource_with_a_witness_populates_every_governed_field_non_default()
+{
+    let (repository, repo_name) = fixture_repository();
+    let witness = create_witness_fixture();
+    let (client, captured) = recording_client(Ok(Response::new(matching_response(&witness))));
+
+    repository_create_auth_resource(client, None, repository, repo_name, Some(&witness))
+        .await
+        .expect("a matching acknowledgement must succeed");
+
+    let request = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("create_resource must have been called");
+
+    assert_eq!(request.resource_id, format!("urc-{repository}"));
+    assert_eq!(request.resource_name, repo_name);
+    assert_eq!(request.verified_issuer, witness.verified_issuer);
+    assert_eq!(request.authenticated_subject, witness.authenticated_subject);
+    assert_eq!(request.org_uuid.as_ref(), witness.org_uuid.as_slice());
+    assert_eq!(
+        request.initiating_principal_namespace.as_ref(),
+        witness.initiating_principal_namespace.as_slice()
+    );
+    assert_eq!(
+        request.operation_id.as_ref(),
+        witness.operation_id.as_slice()
+    );
+    assert_eq!(
+        request.method, PLATFORM_METHOD_REPOSITORY_CREATE,
+        "the method tag is the fixed platform-family constant, not the gRPC binding method"
+    );
+    assert_eq!(request.scope.as_ref(), witness.scope.as_slice());
+    assert_eq!(request.fingerprint_version, witness.fingerprint_version);
+    assert_eq!(request.fingerprint.as_ref(), witness.fingerprint.as_slice());
+    assert_eq!(
+        request.canonical_intent_digest.as_ref(),
+        witness.canonical_intent_digest.as_slice()
+    );
+    assert_eq!(
+        request.authorization_id.as_ref(),
+        witness.operation_id.as_slice(),
+        "CR-029 freezes authorization_id to the operation id"
+    );
+    assert_eq!(
+        request.authorization_revision,
+        witness.claim.authorization_revision
+    );
+    assert_eq!(
+        request.verification_nonce.as_ref(),
+        witness.claim.verification_nonce.as_slice()
+    );
+    assert_eq!(
+        request.bound_fields_digest.as_ref(),
+        witness.claim.bound_fields_digest.as_slice()
+    );
+    assert_eq!(
+        request.consumed_ticket_sha256.as_ref(),
+        witness.claim.consumed_ticket_sha256.as_slice()
+    );
+    assert_eq!(request.claim_id.as_ref(), witness.claim.claim_id.as_slice());
+    assert_eq!(request.claim_revision, witness.claim.claim_revision);
+    assert_eq!(
+        request.claim_verification_witness.as_ref(),
+        witness.claim.claim_verification_witness.as_slice()
+    );
+    assert_eq!(
+        request.prepare_token.as_ref(),
+        witness.prepare_token.as_slice()
+    );
+
+    assert!(!request.verified_issuer.is_empty());
+    assert!(!request.authenticated_subject.is_empty());
+    assert!(!request.org_uuid.is_empty());
+    assert!(!request.initiating_principal_namespace.is_empty());
+    assert!(!request.operation_id.is_empty());
+    assert!(!request.method.is_empty());
+    assert!(!request.scope.is_empty());
+    assert_ne!(request.fingerprint_version, 0);
+    assert!(!request.fingerprint.is_empty());
+    assert!(!request.canonical_intent_digest.is_empty());
+    assert!(!request.authorization_id.is_empty());
+    assert_ne!(request.authorization_revision, 0);
+    assert!(!request.verification_nonce.is_empty());
+    assert!(!request.bound_fields_digest.is_empty());
+    assert!(!request.consumed_ticket_sha256.is_empty());
+    assert!(!request.claim_id.is_empty());
+    assert_ne!(request.claim_revision, 0);
+    assert!(!request.claim_verification_witness.is_empty());
+    assert!(!request.prepare_token.is_empty());
+}
+
+/// Three independent one-field-divergence cases: a `CreateResourceResponse`
+/// diverging on exactly one of the three acknowledged claim fields must be
+/// refused, never partially accepted.
+#[tokio::test]
+async fn repository_create_auth_resource_rejects_a_response_with_a_divergent_claim_id() {
+    let (repository, repo_name) = fixture_repository();
+    let witness = create_witness_fixture();
+    let mut response = matching_response(&witness);
+    response.claim_id = vec![0xFFu8; 16].into();
+    let (client, _captured) = recording_client(Ok(Response::new(response)));
+
+    let result =
+        repository_create_auth_resource(client, None, repository, repo_name, Some(&witness)).await;
+    assert!(
+        result.is_err(),
+        "a divergent claim_id acknowledgement must be refused, not accepted"
+    );
+}
+
+#[tokio::test]
+async fn repository_create_auth_resource_rejects_a_response_with_a_divergent_claim_revision() {
+    let (repository, repo_name) = fixture_repository();
+    let witness = create_witness_fixture();
+    let mut response = matching_response(&witness);
+    response.claim_revision += 1;
+    let (client, _captured) = recording_client(Ok(Response::new(response)));
+
+    let result =
+        repository_create_auth_resource(client, None, repository, repo_name, Some(&witness)).await;
+    assert!(
+        result.is_err(),
+        "a divergent claim_revision acknowledgement must be refused, not accepted"
+    );
+}
+
+#[tokio::test]
+async fn repository_create_auth_resource_rejects_a_response_with_a_divergent_claim_verification_witness()
+ {
+    let (repository, repo_name) = fixture_repository();
+    let witness = create_witness_fixture();
+    let mut response = matching_response(&witness);
+    response.claim_verification_witness = vec![0xFFu8; 32].into();
+    let (client, _captured) = recording_client(Ok(Response::new(response)));
+
+    let result =
+        repository_create_auth_resource(client, None, repository, repo_name, Some(&witness)).await;
+    assert!(
+        result.is_err(),
+        "a divergent claim_verification_witness acknowledgement must be refused, not accepted"
+    );
+}
+
+#[tokio::test]
+async fn repository_create_auth_resource_rejects_an_empty_or_default_response() {
+    let (repository, repo_name) = fixture_repository();
+    let witness = create_witness_fixture();
+    let (client, _captured) =
+        recording_client(Ok(Response::new(CreateResourceResponse::default())));
+
+    let result =
+        repository_create_auth_resource(client, None, repository, repo_name, Some(&witness)).await;
+    assert!(
+        result.is_err(),
+        "an empty/default acknowledgement must be refused for a governed create, not treated \
+         as a claim"
+    );
+}
+
+/// `Code::AlreadyExists` on the governed path carries no claim triple at all,
+/// so it must not be treated as an acknowledgement even though the same code
+/// is a success on the legacy path (the negative half of the pair below).
+#[tokio::test]
+async fn repository_create_auth_resource_governed_already_exists_is_not_an_acknowledgement() {
+    let (repository, repo_name) = fixture_repository();
+    let witness = create_witness_fixture();
+    let (client, _captured) = recording_client(Err(Status::already_exists("")));
+
+    let error =
+        repository_create_auth_resource(client, None, repository, repo_name, Some(&witness))
+            .await
+            .expect_err(
+                "AlreadyExists on the governed path carries no claim acknowledgement and must \
+                 be refused",
+            );
+    assert_eq!(error.code(), Code::FailedPrecondition);
+}
+
+/// The positive half of the pair above: `AlreadyExists` on the legacy
+/// (`witness: None`) path remains a success, exactly as it does today.
+#[tokio::test]
+async fn repository_create_auth_resource_ungoverned_already_exists_still_short_circuits_to_ok() {
+    let (repository, repo_name) = fixture_repository();
+    let (client, _captured) = recording_client(Err(Status::already_exists("")));
+
+    repository_create_auth_resource(client, None, repository, repo_name, None)
+        .await
+        .expect("AlreadyExists on the legacy path must remain a success, as it does today");
+}
+
+// ---------------------------------------------------------------------------
+// Two refusals added after a cold-review pass on the create seam. Both are
+// misconfiguration guards, not carriage-validation logic, so they belong at
+// this level (the shared `governed_repository_create` body and
+// `repository_create_auth_resource`'s own status mapping) rather than beside
+// `admit`/`prepare` above.
+// ---------------------------------------------------------------------------
+
+/// A cell can verify a principal, enforce the domain, and still have no ReBAC
+/// endpoint configured (`auth_url` and JWT authentication are independent
+/// settings). Without this guard a claimed create on such a cell would skip
+/// the callback entirely and commit a claim nothing ever acknowledged.
+/// `governed_repository_create` refuses `FAILED_PRECONDITION` before that can
+/// happen, so this test drives the real shared seam function (not a fixture
+/// standing in for it) with a witness-bearing `GovernedRepositoryCreate` and
+/// `auth_url: None`.
+#[tokio::test]
+async fn governed_repository_create_refuses_a_claim_witness_with_no_configured_auth_url() {
+    let (immutable_store, mutable_store, execution) = crate::store::test_store_create()
+        .await
+        .expect("test stores");
+    let repository_id: RepositoryId = random();
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                repository_id,
+            ));
+            let domain = Arc::new(context(true));
+            let admitted = mediated_admitted_operation(Some(claim_witness_fixture()));
+            let governed = GovernedRepositoryCreate::prepare(
+                Some(&domain),
+                Some(admitted),
+                "repository_create",
+                vec![0u8; 32],
+            )
+            .expect("mediated carriage with a claim witness must not error")
+            .expect("mediated carriage with a claim witness must govern");
+            assert!(
+                governed.create_witness().is_some(),
+                "fixture setup: this test needs a witness-bearing governed create"
+            );
+
+            let error = governed_repository_create(
+                &governed,
+                repository,
+                "wp116-claim-witness-no-auth-url",
+                "",
+                Context::from(uuid::Uuid::now_v7()),
+                "main",
+                "alice",
+                "alice",
+                0,
+                None, /* no auth_url */
+                None, /* no authorization */
+            )
+            .await
+            .expect_err("a claim witness with no configured authorization service must be refused");
+            assert_eq!(error.code(), Code::FailedPrecondition);
+        })
+        .await;
+}
+
+/// A malformed-claim `INVALID_ARGUMENT` from the verifier is refused as
+/// `INVALID_ARGUMENT`, not `INTERNAL` -- the caller's own wire fault, not a
+/// server defect. The verifier's own message is deliberately not forwarded,
+/// since it names a claim field this caller may not be entitled to see.
+#[tokio::test]
+async fn repository_create_auth_resource_maps_a_governed_invalid_argument_to_invalid_argument_not_internal()
+ {
+    let (repository, repo_name) = fixture_repository();
+    let witness = create_witness_fixture();
+    let (client, _captured) = recording_client(Err(Status::invalid_argument(
+        "claim_revision does not match",
+    )));
+
+    let error =
+        repository_create_auth_resource(client, None, repository, repo_name, Some(&witness))
+            .await
+            .expect_err("a governed InvalidArgument from the verifier must be refused");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert_eq!(
+        error.message(),
+        "Governed repository create carriage was rejected by the authorization service"
+    );
+    assert!(
+        !error.message().contains("claim_revision"),
+        "the verifier's own message must not be forwarded to the caller"
+    );
+}
+
+/// The mirror control: the SAME verifier error, on the legacy (`witness:
+/// None`) path, still falls through to `INTERNAL` exactly as it did before
+/// this change -- the new mapping is witness-gated, not a blanket change to
+/// every `InvalidArgument`.
+#[tokio::test]
+async fn repository_create_auth_resource_ungoverned_invalid_argument_still_falls_through_to_internal()
+ {
+    let (repository, repo_name) = fixture_repository();
+    let (client, _captured) = recording_client(Err(Status::invalid_argument(
+        "some unrelated verifier complaint",
+    )));
+
+    let error = repository_create_auth_resource(client, None, repository, repo_name, None)
+        .await
+        .expect_err("an ungoverned InvalidArgument must still fall through to Internal");
+    assert_eq!(error.code(), Code::Internal);
+}
+
+/// The pre-existing "missing Organization context" arm must keep winning over
+/// the new governed-InvalidArgument arm even when a witness is attached --
+/// proving the match arm order, not just that each arm individually maps
+/// correctly in isolation.
+#[tokio::test]
+async fn repository_create_auth_resource_missing_resource_context_wins_over_the_governed_invalid_argument_arm()
+ {
+    let (repository, repo_name) = fixture_repository();
+    let witness = create_witness_fixture();
+    let (client, _captured) = recording_client(Err(Status::invalid_argument(
+        "Missing resource context in resourceName",
+    )));
+
+    let error =
+        repository_create_auth_resource(client, None, repository, repo_name, Some(&witness))
+            .await
+            .expect_err("missing org context must still be refused even on the governed path");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert_eq!(
+        error.message(),
+        "Invalid repository name - missing Organization context"
     );
 }

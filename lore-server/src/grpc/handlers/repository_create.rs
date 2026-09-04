@@ -9,6 +9,7 @@ use lore_base::types::Context;
 use lore_proto::RepositoryCreateRequest;
 use lore_proto::RepositoryCreateResponse;
 use lore_proto::rebac::CreateResourceRequest;
+use lore_proto::rebac::CreateResourceResponse;
 use lore_revision::branch;
 use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
@@ -32,8 +33,10 @@ use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
 use crate::domain::DomainContext;
+use crate::domain::GovernedCreateWitness;
 use crate::domain::GovernedRepositoryCreate;
 use crate::domain::GovernedScope;
+use crate::domain::PLATFORM_METHOD_REPOSITORY_CREATE;
 use crate::domain::RepositoryCreatePublication;
 use crate::domain::admit_at_entry;
 use crate::domain_intent::CanonicalIntent;
@@ -336,7 +339,7 @@ async fn repository_create(
 
     if let Some(auth_url) = auth_url {
         let client = Box::new(grpc_get_rebac_client(auth_url).await?);
-        repository_create_auth_resource(client, authorization, repository.id, name).await?;
+        repository_create_auth_resource(client, authorization, repository.id, name, None).await?;
     }
 
     // Set up the repository metadata
@@ -507,9 +510,25 @@ pub(crate) async fn governed_repository_create(
         return Err(Status::invalid_argument("Invalid branch name"));
     }
 
+    // An attached claim with nowhere to acknowledge it. `auth_url` and JWT
+    // authentication are separate settings, so a cell can verify a principal,
+    // enforce the domain, and still have no ReBAC endpoint configured — and on
+    // that cell the `if let` below would skip the callback entirely and commit a
+    // claimed create that nothing ever acknowledged. The acknowledgement is the
+    // one ordering this callback exists to establish, so its absence is a cell
+    // misconfiguration and refused, not a step quietly omitted.
+    let create_witness = governed.create_witness();
+    if create_witness.is_some() && auth_url.is_none() {
+        return Err(Status::failed_precondition(
+            "Governed repository create requires a configured authorization service to \
+             acknowledge its claim",
+        ));
+    }
+
     if let Some(auth_url) = auth_url {
         let client = Box::new(grpc_get_rebac_client(auth_url).await?);
-        repository_create_auth_resource(client, authorization, repository.id, name).await?;
+        repository_create_auth_resource(client, authorization, repository.id, name, create_witness)
+            .await?;
     }
 
     let metadata = RepositoryMetadata {
@@ -593,28 +612,128 @@ pub(crate) async fn governed_repository_create(
     Ok((committed, outcome.metadata_hash))
 }
 
+/// Fill tags 3-21 of the ReBAC create callback from the attached claim.
+///
+/// One assignment per field, in tag order, so the reviewer's job is a
+/// side-by-side read against `rebac_api.proto` rather than a hunt through
+/// derivations. Two fields are not simple copies and both are load-bearing:
+///
+/// - `method` is the platform family constant, never the operation binding's
+///   gRPC path. See [`PLATFORM_METHOD_REPOSITORY_CREATE`].
+/// - `authorization_id` is the operation id. CR-029 freezes the two to the same
+///   value until a separate authorization-id column exists, and the verifier
+///   requires the equality rather than merely tolerating it.
+fn attach_create_claim(payload: &mut CreateResourceRequest, witness: &GovernedCreateWitness) {
+    payload.verified_issuer = witness.verified_issuer.clone();
+    payload.authenticated_subject = witness.authenticated_subject.clone();
+    payload.org_uuid = witness.org_uuid.to_vec().into();
+    payload.initiating_principal_namespace = witness.initiating_principal_namespace.to_vec().into();
+    payload.operation_id = witness.operation_id.to_vec().into();
+    payload.method = PLATFORM_METHOD_REPOSITORY_CREATE.to_owned();
+    payload.scope = witness.scope.clone().into();
+    payload.fingerprint_version = witness.fingerprint_version;
+    payload.fingerprint = witness.fingerprint.clone().into();
+    payload.canonical_intent_digest = witness.canonical_intent_digest.clone().into();
+    payload.authorization_id = witness.operation_id.to_vec().into();
+    payload.authorization_revision = witness.claim.authorization_revision;
+    payload.verification_nonce = witness.claim.verification_nonce.to_vec().into();
+    payload.bound_fields_digest = witness.claim.bound_fields_digest.to_vec().into();
+    payload.consumed_ticket_sha256 = witness.claim.consumed_ticket_sha256.to_vec().into();
+    payload.claim_id = witness.claim.claim_id.to_vec().into();
+    payload.claim_revision = witness.claim.claim_revision;
+    payload.claim_verification_witness = witness.claim.claim_verification_witness.to_vec().into();
+    payload.prepare_token = witness.prepare_token.to_vec().into();
+}
+
+/// Require an exact acknowledgement of the claim this call attached.
+///
+/// The response is the only evidence Lore gets that the platform recognised
+/// *this* claim rather than merely permitting *a* create, and it is checked
+/// before the mutation transaction opens. A default-valued response is the shape
+/// an older auth-grpc — or a verifier that took the catalog branch — returns, so
+/// it is refused rather than read as a silent success.
+fn verify_create_acknowledgement(
+    response: CreateResourceResponse,
+    witness: &GovernedCreateWitness,
+) -> Result<(), Status> {
+    let matches = response.claim_id.as_ref() == witness.claim.claim_id.as_slice()
+        && response.claim_revision == witness.claim.claim_revision
+        && response.claim_verification_witness.as_ref()
+            == witness.claim.claim_verification_witness.as_slice();
+    if matches {
+        return Ok(());
+    }
+    // Deliberately not logged field by field. The divergent value is the
+    // platform's answer about a claim this caller may not hold, and the caller
+    // already knows what it sent.
+    warn!(
+        operation_id = %uuid::Uuid::from_bytes(witness.operation_id),
+        "Governed repository create acknowledgement did not match the attached claim"
+    );
+    Err(Status::failed_precondition(
+        "Governed repository create was not acknowledged by the authorization service",
+    ))
+}
+
+/// Register the repository's auth resource, attaching the platform claim when
+/// this is a mediated governed create.
+///
+/// # Why `witness` is `Option` and why `None` must stay byte-identical
+///
+/// auth-grpc decides which of two paths a `CreateResource` takes by asking
+/// whether **any** of tags 3-21 is present (`hasGovernedCreateWitness`), and the
+/// governed path it selects is exact-match-or-deny with no fallback to the
+/// catalog. Its proto loader runs with `defaults: false`, so an unset proto3
+/// scalar arrives as `undefined` rather than a zero value — which is exactly
+/// what prost's default elision produces for `..Default::default()`. That is
+/// the property keeping every legacy and direct create on the catalog path, so
+/// the `None` arm below must never set a field.
+///
+/// The mirror of that rule binds the `Some` arm: **every** field it sets is
+/// non-default by construction (both revisions are refused at zero, the
+/// fingerprint version is 1, every digest and identity is fixed-width and
+/// non-empty, both strings come from a verified token). A field that could be
+/// its type's default would be elided on the wire and arrive `undefined`,
+/// failing the verifier's exact match with a denial that names the wrong cause.
 pub(crate) async fn repository_create_auth_resource(
     mut client: Box<dyn RebacApiClient + Send + Sync>,
     authorization: Option<String>,
     repository_id: RepositoryId,
     name: &str,
+    witness: Option<&GovernedCreateWitness>,
 ) -> Result<(), Status> {
     info!(
-        "Repository create auth resource for {} with name {}",
-        repository_id, name
+        "Repository create auth resource for {} with name {} (governed claim: {})",
+        repository_id,
+        name,
+        witness.is_some()
     );
 
-    let request = create_request_with_authorization(
-        CreateResourceRequest {
-            resource_id: format!("urc-{repository_id}"),
-            resource_name: String::from(name),
-            ..Default::default()
-        },
-        authorization,
-    )?;
+    let mut payload = CreateResourceRequest {
+        resource_id: format!("urc-{repository_id}"),
+        resource_name: String::from(name),
+        ..Default::default()
+    };
+    if let Some(witness) = witness {
+        attach_create_claim(&mut payload, witness);
+    }
+    let request = create_request_with_authorization(payload, authorization)?;
 
     match client.create_resource(request).await {
-        Ok(_) => Ok(()),
+        Ok(response) => match witness {
+            Some(witness) => verify_create_acknowledgement(response.into_inner(), witness),
+            None => Ok(()),
+        },
+        Err(err) if err.code() == Code::AlreadyExists && witness.is_some() => {
+            // The governed branch of the callback never answers this way: it
+            // either acknowledges the claim or denies. Accepting it would let
+            // the mutation proceed with no acknowledgement at all, which is the
+            // one ordering CR-029 requires this callback to establish.
+            info!(auth_error = ?err, requested_repo_id = %repository_id, "Governed create callback answered AlreadyExists with no claim acknowledgement");
+            Err(Status::failed_precondition(
+                "Governed repository create was not acknowledged by the authorization service",
+            ))
+        }
         Err(err) if err.code() == Code::AlreadyExists => {
             info!(auth_error = ?err, requested_repo_id = %repository_id, "Auth resource for already exists, continuing");
             Ok(())
@@ -651,6 +770,22 @@ pub(crate) async fn repository_create_auth_resource(
             info!(auth_error = ?err, requested_name = name, "Repository Create create_resource failed - invalid name was provided");
             Err(Status::invalid_argument(
                 "Invalid repository name - missing Organization context",
+            ))
+        }
+        Err(err) if err.code() == Code::InvalidArgument && witness.is_some() => {
+            // The verifier reports a malformed claim field as `INVALID_ARGUMENT`
+            // with a field-specific message. Only one such message had a mapping
+            // before this change, because a create carried no claim to be
+            // malformed; every other one fell through to the arm below and came
+            // back as `INTERNAL`, blaming the server for a caller's wire fault
+            // and paging an operator for it.
+            //
+            // The verifier's message is deliberately not forwarded. It names a
+            // field of a claim this caller may not hold, and the caller already
+            // knows what it attached.
+            info!(auth_error = ?err, requested_repo_id = %repository_id, "Governed create claim was rejected as malformed by the authorization service");
+            Err(Status::invalid_argument(
+                "Governed repository create carriage was rejected by the authorization service",
             ))
         }
         Err(err) => Err(warn_error_to_status(&err, |err| {
@@ -759,10 +894,15 @@ mod tests {
                 .expect_create_resource()
                 .return_once(|_| Err(Status::permission_denied("")));
 
-            let error =
-                repository_create_auth_resource(Box::new(client), None, repository, repo_name)
-                    .await
-                    .expect_err("Should have errored");
+            let error = repository_create_auth_resource(
+                Box::new(client),
+                None,
+                repository,
+                repo_name,
+                None,
+            )
+            .await
+            .expect_err("Should have errored");
             assert_eq!(error.code(), Code::PermissionDenied);
             assert_eq!(
                 error.message(),
@@ -782,10 +922,15 @@ mod tests {
                 .expect_create_resource()
                 .return_once(|_| Err(Status::not_found("")));
 
-            let error =
-                repository_create_auth_resource(Box::new(client), None, repository, repo_name)
-                    .await
-                    .expect_err("Should have errored");
+            let error = repository_create_auth_resource(
+                Box::new(client),
+                None,
+                repository,
+                repo_name,
+                None,
+            )
+            .await
+            .expect_err("Should have errored");
             assert_eq!(error.code(), Code::FailedPrecondition);
             assert_eq!(error.message(), "A required Auth entity was not found");
         }
@@ -804,10 +949,15 @@ mod tests {
                 ))
             });
 
-            let error =
-                repository_create_auth_resource(Box::new(client), None, repository, repo_name)
-                    .await
-                    .expect_err("Should have errored");
+            let error = repository_create_auth_resource(
+                Box::new(client),
+                None,
+                repository,
+                repo_name,
+                None,
+            )
+            .await
+            .expect_err("Should have errored");
             assert_eq!(error.code(), Code::InvalidArgument);
             assert_eq!(
                 error.message(),
@@ -827,7 +977,7 @@ mod tests {
                 .expect_create_resource()
                 .return_once(|_| Err(Status::already_exists("")));
 
-            repository_create_auth_resource(Box::new(client), None, repository, repo_name)
+            repository_create_auth_resource(Box::new(client), None, repository, repo_name, None)
                 .await
                 .expect("AlreadyExists should be treated as success");
         }
@@ -845,10 +995,15 @@ mod tests {
                 .expect_create_resource()
                 .return_once(|_| Err(Status::invalid_argument("You used my api wrong!")));
 
-            let error =
-                repository_create_auth_resource(Box::new(client), None, repository, repo_name)
-                    .await
-                    .expect_err("Should have errored");
+            let error = repository_create_auth_resource(
+                Box::new(client),
+                None,
+                repository,
+                repo_name,
+                None,
+            )
+            .await
+            .expect_err("Should have errored");
             assert_eq!(error.code(), Code::Internal);
             assert!(
                 error

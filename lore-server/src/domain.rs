@@ -315,6 +315,18 @@ impl DomainContext {
             (false, None) => scope.tenant_scope_key()?,
         };
 
+        // The attached claim is control-plane-only for the same reason the
+        // mediated scope is: it names a platform claim row that only a mediated
+        // operation has. Accepting it on a direct operation would put fields on
+        // the ReBAC callback that flip auth-grpc's `hasGovernedCreateWitness`
+        // for a create that has no claim to acknowledge, turning today's
+        // working catalog path into a denial.
+        if carried.claim_witness.is_some() && carried.mediated_scope.is_none() {
+            return Err(Status::invalid_argument(
+                "claim-witness carriage requires mediated-scope carriage",
+            ));
+        }
+
         // CR-032 "Lag, readiness, and backpressure". Every path that reaches
         // here is about to return a governed operation, and a governed
         // operation is exactly what appends an outbox row — so this is the
@@ -720,6 +732,117 @@ pub struct RepositoryCreateOutcome {
     pub metadata_hash: Hash,
 }
 
+/// The platform method name a governed create acknowledges under.
+///
+/// Deliberately **not** [`GovernedOperation`]'s binding method. That one is the
+/// gRPC path and differs between the two wire versions
+/// (`lore.RepositoryService/RepositoryCreate` and
+/// `lore.repository.v1.RepositoryService/RepositoryCreate`), while the platform
+/// authorization row carries one family name for both. Sending the binding
+/// method would make every v0 create fail the verifier's exact match and every
+/// v1 create fail it differently.
+pub const PLATFORM_METHOD_REPOSITORY_CREATE: &str = "repository.create";
+
+/// The complete attached platform claim a governed create hands the ReBAC
+/// `CreateResource` callback.
+///
+/// Assembled once, at [`GovernedRepositoryCreate::prepare`], from three
+/// separate provenances that must not be confused:
+///
+/// - **The verified JWT** supplies `verified_issuer` and
+///   `authenticated_subject`. Never a header, never the request body.
+/// - **Lore's own validated state** supplies `operation_id`, `scope`,
+///   `fingerprint_version`, `fingerprint`, `canonical_intent_digest`, and
+///   `prepare_token` — everything the receipt namespace is already keyed by.
+/// - **The claim-witness header** supplies the seven values Lore records at
+///   prepare time but cannot read back at the create call site, because
+///   `domain_operation_receipt_get` deliberately returns bounded timing
+///   metadata and never the witness.
+///
+/// Nothing here is an authority input to this server. auth-grpc exact-matches
+/// every field against its own claim and authorization rows, so a caller that
+/// supplies values it was not issued gets a conclusive denial rather than a
+/// widened path.
+#[derive(Debug, Clone)]
+pub struct GovernedCreateWitness {
+    /// Verified token issuer.
+    pub verified_issuer: String,
+    /// Authenticated subject; the control-plane service principal.
+    pub authenticated_subject: String,
+    /// 16-byte organisation identity, from the mediated scope.
+    pub org_uuid: [u8; 16],
+    /// Canonical 49-byte initiating principal namespace, from the mediated
+    /// scope.
+    pub initiating_principal_namespace:
+        [u8; domain_operation_metadata::MEDIATED_PRINCIPAL_NAMESPACE_V1_LEN],
+    /// 16-byte operation identity.
+    ///
+    /// CR-029 freezes `authorization_id` to this same value until a separate
+    /// authorization-id column exists, and the verifier requires the equality,
+    /// so there is one field here rather than two.
+    pub operation_id: [u8; 16],
+    /// Canonical mediated tenant scope key.
+    pub scope: Vec<u8>,
+    /// Fingerprint schema version.
+    pub fingerprint_version: u32,
+    /// Fingerprint bytes.
+    pub fingerprint: Vec<u8>,
+    /// The canonical-intent digest this handler computed.
+    pub canonical_intent_digest: Vec<u8>,
+    /// The single-use prepare token.
+    pub prepare_token: [u8; domain_operation_metadata::PREPARE_TOKEN_LEN],
+    /// The carried claim and authorization witness.
+    pub claim: domain_operation_metadata::ClaimWitness,
+}
+
+/// Assemble the attached claim for a mediated governed create.
+///
+/// Three outcomes, and the middle one is the whole reason this is a function
+/// rather than an `Option` map:
+///
+/// - No mediated scope — a direct governed create. `Ok(None)`, and the ReBAC
+///   callback keeps resolving through the catalog.
+/// - A mediated scope with no claim witness — refused. The control plane is the
+///   only caller that reaches this arm, the callback it is about to trigger
+///   exact-matches a claim, and a partially-attached claim is a denial from
+///   auth-grpc rather than a fallback. Refusing here makes it a decisive
+///   `INVALID_ARGUMENT` **before** the callback and before any receipt is
+///   consumed, which is the same ordering rule the rest of the entry gate keeps.
+/// - Both present — the assembled witness.
+fn build_create_witness(
+    admitted: &AdmittedOperation,
+    digest: &[u8],
+) -> Result<Option<GovernedCreateWitness>, Status> {
+    let Some(mediated) = admitted.carried.mediated_scope.as_ref() else {
+        return Ok(None);
+    };
+    let Some(claim) = admitted.carried.claim_witness.as_ref() else {
+        return Err(Status::invalid_argument(
+            "mediated governed repository create is missing claim-witness carriage",
+        ));
+    };
+    let fingerprint_version =
+        u32::try_from(admitted.carried.fingerprint_version).map_err(|_| {
+            // Unreachable through `validated`, which only ever produces version
+            // 1. Refusing rather than casting keeps the wire type conversion an
+            // enforced property instead of a silent truncation.
+            Status::invalid_argument("domain-operation fingerprint version is not representable")
+        })?;
+    Ok(Some(GovernedCreateWitness {
+        verified_issuer: admitted.key.verified_issuer.clone(),
+        authenticated_subject: admitted.key.authenticated_subject.clone(),
+        org_uuid: mediated.org_uuid,
+        initiating_principal_namespace: mediated.initiating_principal_namespace,
+        operation_id: *admitted.key.operation_id.as_bytes(),
+        scope: admitted.key.tenant_scope_key.clone(),
+        fingerprint_version,
+        fingerprint: admitted.carried.fingerprint.clone(),
+        canonical_intent_digest: digest.to_vec(),
+        prepare_token: admitted.carried.prepare_token,
+        claim: claim.clone(),
+    }))
+}
+
 /// The governed repository-create seam, shared by the v0 and v1 create sites.
 ///
 /// Repository create exists twice on the wire and the two handlers differ only
@@ -733,6 +856,7 @@ pub struct RepositoryCreateOutcome {
 pub struct GovernedRepositoryCreate {
     domain: Arc<DomainContext>,
     operation: GovernedOperation,
+    create_witness: Option<GovernedCreateWitness>,
 }
 
 impl GovernedRepositoryCreate {
@@ -784,10 +908,23 @@ impl GovernedRepositoryCreate {
                 "Governed repository create requires domain enforcement on this cell",
             ));
         }
+        let create_witness = build_create_witness(&admitted, &digest)?;
         Ok(Some(Self {
             domain: domain.clone(),
             operation: admitted.into_governed(method, digest),
+            create_witness,
         }))
+    }
+
+    /// The attached platform claim, or `None` for a direct governed create.
+    ///
+    /// `None` is not a degraded governed create: it is a governed create by a
+    /// principal that is not the control plane, which has no platform claim and
+    /// whose ReBAC callback must keep resolving through the catalog exactly as
+    /// it does today.
+    #[must_use]
+    pub fn create_witness(&self) -> Option<&GovernedCreateWitness> {
+        self.create_witness.as_ref()
     }
 
     /// Commit the domain rows, every projection row, and both classified
