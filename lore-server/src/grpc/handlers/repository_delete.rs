@@ -69,21 +69,33 @@ pub async fn handler(
             repository_id: &req.id,
         },
     )? {
-        // BLOCKED(WP-116): no derivation for `RepositoryDeleteInput::delete_proof`.
+        // BLOCKED(WP-116): delete_proof derivation unfrozen in CR-029.
         //
-        // The coordinator method exists and its outbox event is classified, but
-        // the tombstone row requires a 32-byte `delete_proof`
-        // (`lore-postgres/src/domain/schema.rs`: a NOT NULL CHECK of exactly 32
-        // bytes on any tombstoned row). CR-029 names the field three times, each
-        // time only as an "attempt-compatible immutable delete proof", and
-        // freezes no preimage, no field list, no serialisation, and no domain
-        // separator. Nothing in either repository computes one.
+        // Everything else this site needs is now built and shared with the v1
+        // site: `crate::domain::GovernedRepositoryDelete` carries the
+        // projection rows (`RepositoryDeletePublication::projection`, the mirror
+        // image of the create seam's, 2 + 3N rows), the one classified
+        // `repository.tombstoned` event CR-032 assigns to a repository
+        // tombstone, the `RepositoryDeleteInput` carriage, the coordinator call,
+        // and the outcome mapping. `GovernedRepositoryDelete::commit` fails
+        // closed on `RepositoryDeleteProof::Unfrozen` before it reaches any of
+        // it. The proof is the only missing input.
         //
-        // Inventing 32 bytes here is the exact failure CR-029's own MISSING-2
-        // record describes for `canonical_intent_digest`: one side mints a
-        // value, the other cannot reproduce it, and the divergence is silent.
-        // The proof is committed into the principal-scoped receipt and returned
-        // by receipt lookup, so a wrong shape becomes permanent evidence.
+        // The refusal stays HERE rather than at the seam so it happens at entry,
+        // before the ReBAC `DeleteResource` callback and before any branch
+        // enumeration: a governed delete that will certainly refuse must not
+        // first perform an authorization side effect. The seam's own refusal is
+        // the second, typed fence behind it.
+        //
+        // Why no proof is minted: the tombstone row requires exactly 32 bytes
+        // (`lore-postgres/src/domain/schema.rs`, a NOT NULL CHECK on any
+        // tombstoned row); CR-029 names the field three times, each time only as
+        // an "attempt-compatible immutable delete proof", and freezes no
+        // preimage, no field list, no serialisation, and no domain separator.
+        // Inventing 32 bytes here is CR-029's own MISSING-2 failure verbatim,
+        // and the proof is committed into the principal-scoped receipt and
+        // returned by receipt lookup, so a wrong shape becomes permanent
+        // evidence.
         //
         // Missing artefact: a frozen `delete_proof` derivation in CR-029, on
         // the same terms as its canonical-intent digest contract: one canonical

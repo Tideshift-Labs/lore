@@ -64,7 +64,8 @@ $cases = @(
     'repository_create_wired_two_events_commits_both_rows_with_pinned_fields_in_order',
     'repository_delete_commits_exactly_one_row_at_the_tombstone_generation',
     'repository_delete_not_found_rejection_leaves_no_row',
-    'repository_delete_retry_on_an_already_tombstoned_repository_leaves_no_second_row'
+    'repository_delete_retry_on_an_already_tombstoned_repository_leaves_no_second_row',
+    'repository_delete_with_three_extra_live_branches_still_commits_exactly_one_row'
 )
 
 $results = @(

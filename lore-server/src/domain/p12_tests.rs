@@ -905,6 +905,167 @@ async fn commit_maps_a_non_tombstoned_rejection_through_the_shared_mapper() {
 }
 
 // ---------------------------------------------------------------------------
+// WP-119 Part D reviewer gap: `RepositoryDeletePublication::projection()` and
+// `GovernedRepositoryDelete::commit`'s fenced-on-`RepositoryDeleteProof`
+// refusal had zero executed coverage. Both were confirmed row-exact/correct
+// against the legacy handlers by source read, which is not an executed
+// check; these pin the current shape so a regression is caught rather than
+// re-confirmed by another read.
+// ---------------------------------------------------------------------------
+
+/// `projection()` reproduces exactly 2 + 3N rows (minus one per branch with
+/// an empty name, which skips its `BranchId` row -- the legacy path's own
+/// `delete_name_to_id` is skipped there too), every row a delete (`value:
+/// None`), with the exact `KeyType`/partition/key-derivation shape the
+/// legacy v0 and v1 delete handlers build by hand.
+///
+/// Independently reproduces each row's key through the same primitive
+/// `hash::hash_function_arg`/`hash_function_args` the legacy handlers call,
+/// rather than trusting `projection()` to grade itself: a wrong function tag,
+/// wrong argument order, or a missed `.to_lowercase()` on the branch-name key
+/// would still produce a `Hash`, just the wrong one, and only an independent
+/// recomputation catches that.
+#[test]
+fn projection_reproduces_two_plus_three_n_rows_matching_the_legacy_key_derivation() {
+    let salt = b"wp119-part-d-salt";
+    let repository_id = [0x11u8; 16];
+    let name = "my-deleted-repo";
+    let named_branch = RepositoryDeleteBranch {
+        branch_id: [0x22u8; 16].to_vec(),
+        name: "Feature/Some-Branch".to_owned(),
+    };
+    let empty_name_branch = RepositoryDeleteBranch {
+        branch_id: [0x33u8; 16].to_vec(),
+        name: String::new(),
+    };
+    let branches = [named_branch.clone(), empty_name_branch.clone()];
+    let publication = RepositoryDeletePublication {
+        salt,
+        repository_id: &repository_id,
+        name,
+        expected_generation: Some(4),
+        branches: &branches,
+        delete_proof: RepositoryDeleteProof::Unfrozen,
+    };
+
+    let rows = publication.projection();
+    assert_eq!(
+        rows.len(),
+        7,
+        "2 base rows + 3 for the named branch + 2 for the empty-name branch (BranchId skipped)"
+    );
+    assert!(
+        rows.iter().all(|row| row.value.is_none()),
+        "every projection row is a delete"
+    );
+
+    let repository_hex = hex::encode(repository_id);
+    let global_partition = RepositoryId::default().data().to_vec();
+
+    assert_eq!(rows[0].key_type, KeyType::RepositoryMetadata as i16);
+    assert_eq!(rows[0].partition, repository_id.to_vec());
+    assert_eq!(
+        rows[0].key,
+        hash::hash_function_arg(salt, repository::METADATA, &repository_hex).as_ref()
+    );
+
+    assert_eq!(rows[1].key_type, KeyType::RepositoryId as i16);
+    assert_eq!(rows[1].partition, global_partition);
+    assert_eq!(
+        rows[1].key,
+        hash::hash_function_arg(salt, repository::ID, name).as_ref()
+    );
+
+    let named_branch_hex = hex::encode(named_branch.branch_id);
+    assert_eq!(rows[2].key_type, KeyType::BranchMetadata as i16);
+    assert_eq!(rows[2].partition, repository_id.to_vec());
+    assert_eq!(
+        rows[2].key,
+        hash::hash_function_args(salt, branch::METADATA, &repository_hex, &named_branch_hex)
+            .as_ref()
+    );
+    assert_eq!(rows[3].key_type, KeyType::BranchLatestPointer as i16);
+    assert_eq!(rows[3].partition, repository_id.to_vec());
+    assert_eq!(
+        rows[3].key,
+        hash::hash_function_args(salt, branch::LATEST, &repository_hex, &named_branch_hex).as_ref()
+    );
+    assert_eq!(rows[4].key_type, KeyType::BranchId as i16);
+    assert_eq!(rows[4].partition, repository_id.to_vec());
+    assert_eq!(
+        rows[4].key,
+        hash::hash_function_arg(salt, branch::ID, &named_branch.name.to_lowercase()).as_ref(),
+        "the branch-id key folds the name to lowercase, matching the name-to-id row's own key"
+    );
+
+    let empty_branch_hex = hex::encode(empty_name_branch.branch_id);
+    assert_eq!(rows[5].key_type, KeyType::BranchMetadata as i16);
+    assert_eq!(
+        rows[5].key,
+        hash::hash_function_args(salt, branch::METADATA, &repository_hex, &empty_branch_hex)
+            .as_ref()
+    );
+    assert_eq!(rows[6].key_type, KeyType::BranchLatestPointer as i16);
+    assert_eq!(
+        rows[6].key,
+        hash::hash_function_args(salt, branch::LATEST, &repository_hex, &empty_branch_hex).as_ref()
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.key_type == KeyType::BranchId as i16
+                && row.key == hash::hash_function_arg(salt, branch::ID, "").as_ref()),
+        "an empty branch name must retire no BranchId row, matching the legacy path's own \
+         skipped delete_name_to_id call"
+    );
+}
+
+/// A repository with no branches at all still owes its two base rows and
+/// nothing else.
+#[test]
+fn projection_with_no_branches_is_exactly_the_two_base_rows() {
+    let publication = RepositoryDeletePublication {
+        salt: b"wp119-part-d-salt",
+        repository_id: &[0x44u8; 16],
+        name: "no-branches-repo",
+        expected_generation: None,
+        branches: &[],
+        delete_proof: RepositoryDeleteProof::Unfrozen,
+    };
+    let rows = publication.projection();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].key_type, KeyType::RepositoryMetadata as i16);
+    assert_eq!(rows[1].key_type, KeyType::RepositoryId as i16);
+}
+
+/// `GovernedRepositoryDelete::commit` refuses on `RepositoryDeleteProof::Unfrozen`
+/// before it builds a projection, derives an event, or reaches the
+/// coordinator -- `UnreachableDomainStore` backs the domain context, so a
+/// regression that called into the store at all would panic the test rather
+/// than merely fail an assertion.
+#[tokio::test]
+async fn commit_refuses_on_the_unfrozen_delete_proof_before_touching_the_coordinator() {
+    let domain = Arc::new(context(true));
+    let mut operation = dummy_create_operation();
+    operation.binding.method = "repository_delete".to_owned();
+    let governed = GovernedRepositoryDelete { domain, operation };
+    let publication = RepositoryDeletePublication {
+        salt: b"wp119-part-d-salt",
+        repository_id: &[0x55u8; 16],
+        name: "unfrozen-proof-repo",
+        expected_generation: None,
+        branches: &[],
+        delete_proof: RepositoryDeleteProof::Unfrozen,
+    };
+
+    let result = governed.commit(&publication).await;
+    let Err(error) = result else {
+        panic!("an unfrozen delete_proof must refuse, not commit");
+    };
+    assert_eq!(error.code(), Code::Unimplemented);
+}
+
+// ---------------------------------------------------------------------------
 // WP-119 Phase 8 reviewer gap: `DomainContext::attach_admission` (`wiring.rs`
 // calls this once, from `configure_event_relay`, after every startup
 // precondition passes) must refuse a second handle rather than replacing the

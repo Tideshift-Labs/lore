@@ -222,7 +222,7 @@ async fn begin_obliterate_advances_live_generation_and_refuses_a_tombstoned_repo
         expected_generation: None,
         delete_proof: rand::random::<[u8; 32]>().to_vec(),
         projection: Vec::new(),
-        event: None,
+        events: Vec::new(),
     };
     let deleted = store
         .repository_delete(&delete_op, &delete_input)

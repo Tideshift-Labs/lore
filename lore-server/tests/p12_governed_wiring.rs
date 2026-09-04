@@ -18,11 +18,22 @@ struct Site {
 /// two authenticated repository-create sites. Three, not five.
 ///
 /// Each is guarded for a different reason and they must not be collapsed into
-/// one "not done yet" bucket: forwarded v1 create is fenced by CR-029's
-/// CARRIAGE-02-LORE until a frozen authenticated forwarding contract exists and
-/// has no verified principal to admit against at all, while both deletes are
-/// blocked on an unfrozen `delete_proof` derivation. Every one carries its
-/// reason at the call site.
+/// one "not done yet" bucket. **Forwarded v1 create** is fenced by CR-029's
+/// CARRIAGE-02-LORE until a frozen authenticated forwarding contract exists, and
+/// has no verified principal to admit against at all — a whole contract is
+/// missing.
+///
+/// **Both deletes** are a narrower case since WP-119 Part D, and the reason is
+/// updated rather than left as "not done yet": their shared seam,
+/// `GovernedRepositoryDelete`, is built — projection rows, the one classified
+/// `repository.tombstoned` event, the `RepositoryDeleteInput` carriage, the
+/// coordinator call, and the outcome mapping — and one input has no derivation.
+/// `RepositoryDeleteProof::Unfrozen` fails the seam closed, and the handlers
+/// keep refusing at **entry** so a delete that will certainly refuse never first
+/// performs the ReBAC `DeleteResource` side effect. Two fences, one missing
+/// value;
+/// `the_repository_delete_seam_is_complete_except_its_unfrozen_proof` pins that
+/// the second fence is the only one left.
 const GUARDED_SITES: [&str; 3] = [
     include_str!("../src/grpc/forwarded_repository/v1/repository_create.rs"),
     include_str!("../src/grpc/handlers/repository_delete.rs"),
@@ -290,6 +301,133 @@ fn the_three_still_unwired_sites_remain_explicitly_guarded() {
             "a guarded governed site must record why it is guarded"
         );
     }
+}
+
+/// WP-119 Part D: the shared delete seam is complete except its proof.
+///
+/// A guard whose recorded reason is "not wired yet" decays into "nobody
+/// remembers what was missing". This pins the narrower, checkable claim the
+/// guard now makes: every input the coordinator needs is built here, one is not
+/// derivable, and the seam refuses on exactly that one.
+#[test]
+fn the_repository_delete_seam_is_complete_except_its_unfrozen_proof() {
+    // The one classified event CR-032 assigns to a repository tombstone, built
+    // through the shared pinned builder exactly once. More than one call is a
+    // second definition of the same classification; zero is an unfed outbox.
+    assert_eq!(
+        GOVERNED_SEAM
+            .matches("outbox_builders::repository_tombstoned(")
+            .count(),
+        1,
+        "the governed delete seam must build repository.tombstoned through \
+         exactly one call to the shared pinned builder"
+    );
+    // CR-032 answers this transition with ONE bounded generation event, not one
+    // row per tombstoned branch. A loop or a per-branch builder call here is the
+    // superseded reading returning.
+    //
+    // Scoped to the delete seam's own `input` builder rather than to the whole
+    // file: a legitimate `GovernedBranchDelete` seam landing in this same file
+    // would build `branch_deleted` correctly and false-fail a file-wide check.
+    let delete_input_fn = {
+        let start = GOVERNED_SEAM
+            .find(
+                "        delete_proof: Vec<u8>,\n    ) -> Result<RepositoryDeleteInput, Status> {",
+            )
+            .expect("the governed delete seam must build its input in one named function");
+        let rest = &GOVERNED_SEAM[start..];
+        let end = rest
+            .find("\n    }")
+            .expect("the governed delete input builder must terminate");
+        &rest[..end]
+    };
+    assert!(
+        !delete_input_fn.contains("outbox_builders::branch_deleted("),
+        "a repository tombstone emits one bounded repository-generation event, \
+         never one branch.deleted row per hidden branch"
+    );
+    assert_eq!(
+        delete_input_fn
+            .matches("outbox_builders::repository_tombstoned(")
+            .count(),
+        1,
+        "the delete input builder must build exactly one classified event"
+    );
+
+    // The events must reach the coordinator. Scoped to the
+    // `RepositoryDeleteInput` literal for the same reason the create and push
+    // pins are scoped to theirs: a file-wide check is both unsound (a fixture
+    // elsewhere trips it) and too weak (a `let events = Vec::new();` above the
+    // literal satisfies it).
+    let literal = {
+        let start = GOVERNED_SEAM
+            .find("Ok(RepositoryDeleteInput {")
+            .expect("the governed delete seam must build its coordinator input as a literal");
+        let rest = &GOVERNED_SEAM[start..];
+        let end = rest
+            .find("\n        })")
+            .expect("the RepositoryDeleteInput literal must terminate");
+        &rest[..end]
+    };
+    assert!(
+        literal.contains("\n            events,"),
+        "the governed delete must pass its built event to the coordinator; a \
+         literal that sets `events: Vec::new()`, or omits the field, has \
+         regressed to an unfed outbox"
+    );
+    assert!(
+        !literal.contains("events: Vec::new()"),
+        "the governed delete must not regress to an unfed outbox"
+    );
+
+    // The seam reaches the coordinator, so "complete except the proof" is a
+    // property of the code rather than of this comment.
+    assert!(
+        GOVERNED_SEAM.contains(".repository_delete(&self.operation"),
+        "the governed delete seam must call the one coordinator method"
+    );
+    assert!(
+        GOVERNED_SEAM.contains("publication.projection()"),
+        "the governed delete must commit its projection rows with the tombstone"
+    );
+
+    // And the proof is the fence. `bytes()` returning `None` is what refuses;
+    // an `Unfrozen` variant that never reaches a refusal would be a comment,
+    // not a guard.
+    assert!(
+        GOVERNED_SEAM.contains("BLOCKED(WP-116): delete_proof derivation unfrozen in CR-029"),
+        "the seam must record why it is fenced, in the agreed marker form"
+    );
+    assert!(
+        GOVERNED_SEAM.contains("publication.delete_proof.bytes()"),
+        "the seam must fail closed on the proof before it builds anything"
+    );
+    // The strong form of "the proof is still unfrozen": the enum has exactly one
+    // variant. A taboo on one guessed variant NAME would be satisfied by calling
+    // the new variant anything else, which is how a naming pin passes while the
+    // thing it guards has already happened.
+    let proof_variants = {
+        let start = GOVERNED_SEAM
+            .find("pub enum RepositoryDeleteProof {")
+            .expect("the delete proof must stay a closed enum");
+        let rest = &GOVERNED_SEAM[start..];
+        let end = rest
+            .find("\n}")
+            .expect("the RepositoryDeleteProof body must terminate");
+        rest[..end]
+            .lines()
+            .skip(1)
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("///") && !line.starts_with("//"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        proof_variants,
+        vec!["Unfrozen,"],
+        "RepositoryDeleteProof must carry exactly the one unfrozen variant \
+         until CR-029 freezes a delete_proof preimage with golden vectors on \
+         both sides; adding any variant here opens the governed delete path"
+    );
 }
 
 #[test]

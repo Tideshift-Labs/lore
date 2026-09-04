@@ -666,11 +666,11 @@ async fn repository_delete_not_found_rejection_leaves_no_row() {
         expected_generation: None,
         delete_proof: rand::random::<[u8; 32]>().to_vec(),
         projection: Vec::new(),
-        event: Some(pending_event(
+        events: vec![pending_event(
             repository_id.clone(),
             CommittedOrdinal::RepositoryGeneration,
             Vec::new(),
-        )),
+        )],
     };
     let result = store
         .repository_delete(&operation, &input)
@@ -716,7 +716,7 @@ async fn repository_delete_commits_exactly_one_row_at_the_tombstone_generation()
         expected_generation: Some(1),
         delete_proof: rand::random::<[u8; 32]>().to_vec(),
         projection: Vec::new(),
-        event: Some({
+        events: vec![{
             let mut e = pending_event(
                 repository_id.clone(),
                 CommittedOrdinal::RepositoryGeneration,
@@ -724,7 +724,7 @@ async fn repository_delete_commits_exactly_one_row_at_the_tombstone_generation()
             );
             e.event_kind = "repository.tombstoned".to_string();
             e
-        }),
+        }],
     };
     let result = store
         .repository_delete(&delete_op, &delete_input)
@@ -774,11 +774,11 @@ async fn repository_delete_retry_on_an_already_tombstoned_repository_leaves_no_s
         expected_generation: None,
         delete_proof: delete_proof.clone(),
         projection: Vec::new(),
-        event: Some(pending_event(
+        events: vec![pending_event(
             repository_id.clone(),
             CommittedOrdinal::RepositoryGeneration,
             Vec::new(),
-        )),
+        )],
     };
     let first = store
         .repository_delete(&first_delete_op, &first_delete)
@@ -798,11 +798,11 @@ async fn repository_delete_retry_on_an_already_tombstoned_repository_leaves_no_s
         expected_generation: None,
         delete_proof,
         projection: Vec::new(),
-        event: Some(pending_event(
+        events: vec![pending_event(
             repository_id.clone(),
             CommittedOrdinal::RepositoryGeneration,
             Vec::new(),
-        )),
+        )],
     };
     let second = store
         .repository_delete(&second_delete_op, &second_delete)
@@ -814,6 +814,161 @@ async fn repository_delete_retry_on_an_already_tombstoned_repository_leaves_no_s
         outbox_row_count_for_repository(&db, &repository_id).await,
         1,
         "a delete retry against an already-tombstoned repository must not add a second row"
+    );
+}
+
+/// Seed a live branch row directly, bypassing the coordinator: there is no
+/// governed branch-create method (WP-119 writer inventory section 2, B1-B3 are
+/// all direct store calls), so a repository with more than its one default
+/// branch has to be built with SQL, matching `domain_schema.rs`'s
+/// `insert_branch` pattern.
+async fn insert_live_branch(client: &Client, repository_id: &[u8], branch_id: &[u8], name: &str) {
+    let metadata_hash: [u8; 32] = rand::random();
+    let latest_hash: [u8; 32] = rand::random();
+    let creation_fingerprint: [u8; 32] = rand::random();
+    client
+        .execute(
+            "INSERT INTO lore_domain_branches (
+                repository_id, branch_id, repository_generation, state, generation, name,
+                metadata_hash, latest_hash, creation_fingerprint_version, creation_fingerprint,
+                delete_proof, created_at, deleted_at
+            ) VALUES ($1, $2, 1, 0, 1, $3, $4, $5, 1, $6, NULL, clock_timestamp(), NULL)",
+            &[
+                &repository_id,
+                &branch_id,
+                &name,
+                &metadata_hash.as_slice(),
+                &latest_hash.as_slice(),
+                &creation_fingerprint.as_slice(),
+            ],
+        )
+        .await
+        .expect("seed live branch row");
+}
+
+/// CR-032 classifies a repository tombstone as "One repository-generation
+/// event, not one row per hidden association", and F-032-2's amendment
+/// (`RepositoryDeleteInput::events`, 2026-09-04) applies the same rule to the
+/// branches a tombstone hides: the transition is one bounded generation event,
+/// not one `branch.deleted` row per tombstoned branch. A repository with three
+/// live branches beyond its default (four total) still commits exactly one
+/// `repository.tombstoned` row when tombstoned, and an exact retry appends
+/// zero more.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn repository_delete_with_three_extra_live_branches_still_commits_exactly_one_row() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let repository_id = rand_repo_id();
+
+    let (create_op, _w) = admitted_operation(&store, "repository_create").await;
+    store
+        .repository_create(
+            &create_op,
+            &repository_create_input(repository_id.clone(), rand_name(), None),
+        )
+        .await
+        .expect("create must succeed");
+    for n in 0..3u8 {
+        let branch_id = rand::random::<[u8; 16]>().to_vec();
+        insert_live_branch(
+            &db,
+            &repository_id,
+            &branch_id,
+            &format!("wp119-extra-branch-{n}"),
+        )
+        .await;
+    }
+
+    let delete_proof = rand::random::<[u8; 32]>().to_vec();
+    let (delete_op, _w) = admitted_operation(&store, "repository_delete").await;
+    let delete_input = RepositoryDeleteInput {
+        repository_id: repository_id.clone(),
+        expected_generation: None,
+        delete_proof: delete_proof.clone(),
+        projection: Vec::new(),
+        events: vec![{
+            let mut e = pending_event(
+                repository_id.clone(),
+                CommittedOrdinal::RepositoryGeneration,
+                Vec::new(),
+            );
+            e.event_kind = "repository.tombstoned".to_string();
+            e
+        }],
+    };
+    let result = store
+        .repository_delete(&delete_op, &delete_input)
+        .await
+        .expect("delete with extra branches must succeed");
+    assert!(matches!(result.outcome, DomainOutcome::Applied));
+    let repository_generation = result
+        .repository_generation
+        .expect("delete must report a committed repository generation");
+
+    // Sanity: all four branches (the default plus the three seeded above)
+    // were actually hidden by the one `UPDATE`, so the "exactly one row"
+    // assertion below is proving the summary rule, not a fixture that never
+    // exercised more than one branch.
+    let live_branch_count: i64 = db
+        .query_one(
+            "SELECT count(*) FROM lore_domain_branches \
+             WHERE repository_id = $1 AND deleted_at IS NULL",
+            &[&repository_id],
+        )
+        .await
+        .expect("count remaining live branches")
+        .get(0);
+    assert_eq!(
+        live_branch_count, 0,
+        "test fixture sanity: the tombstone must hide every branch, including the three \
+         seeded ones, for the row-count assertion below to mean anything"
+    );
+
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        1,
+        "a repository with three extra live branches must still commit exactly one \
+         repository.tombstoned row, not one per hidden branch"
+    );
+    let row = one_outbox_row_for_repository(&db, &repository_id).await;
+    assert_eq!(row.event_kind, "repository.tombstoned");
+    let decoded = AggregateVersion::decode(&row.aggregate_version).expect("decode");
+    assert_eq!(
+        decoded.ordinal,
+        u64::try_from(repository_generation).expect("generation fits u64")
+    );
+
+    // An exact retry against the now-tombstoned repository appends nothing.
+    let (retry_op, _w) = admitted_operation(&store, "repository_delete").await;
+    let retry_input = RepositoryDeleteInput {
+        repository_id: repository_id.clone(),
+        expected_generation: None,
+        delete_proof,
+        projection: Vec::new(),
+        events: vec![{
+            let mut e = pending_event(
+                repository_id.clone(),
+                CommittedOrdinal::RepositoryGeneration,
+                Vec::new(),
+            );
+            e.event_kind = "repository.tombstoned".to_string();
+            e
+        }],
+    };
+    let retried = store
+        .repository_delete(&retry_op, &retry_input)
+        .await
+        .expect("exact retry delete must succeed idempotently");
+    assert!(matches!(retried.outcome, DomainOutcome::Applied));
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        1,
+        "an exact retry against an already-tombstoned repository must append zero more rows"
     );
 }
 
@@ -1322,7 +1477,7 @@ async fn begin_obliterate_on_a_tombstoned_repository_leaves_no_row() {
                 expected_generation: None,
                 delete_proof: rand::random::<[u8; 32]>().to_vec(),
                 projection: Vec::new(),
-                event: None,
+                events: Vec::new(),
             },
         )
         .await

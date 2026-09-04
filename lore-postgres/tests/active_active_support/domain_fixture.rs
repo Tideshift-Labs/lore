@@ -183,7 +183,7 @@ pub fn delete_input(repository_id: [u8; 16], ids: &mut Identities) -> Repository
         expected_generation: None,
         delete_proof: ids.id32().to_vec(),
         projection: Vec::new(),
-        event: None,
+        events: Vec::new(),
     }
 }
 

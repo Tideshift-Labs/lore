@@ -636,6 +636,8 @@ impl DomainTransactionStore for PostgresDomainStore {
         let _t = self
             .instruments()
             .start("repository_delete", self.pool().status());
+        // Before the pool checkout, for the same reason create checks there.
+        validate_pending_events(&input.events, "repository_delete")?;
         let mut client = self.checkout().await?;
         let mut sequence = LockSequence::new();
         let (tx, clock) = match self
@@ -736,7 +738,12 @@ impl DomainTransactionStore for PostgresDomainStore {
         .map_err(|e| DomainError::from_pg("branch tombstone", e))?;
 
         apply_projection(&tx, &input.projection).await?;
-        append_event(
+        // One bounded generation event for the whole tombstone, including every
+        // branch this transaction's single `UPDATE` just hid. The exact-retry
+        // arm above returns before reaching here, which is CR-032's "exact
+        // create/delete retry: No new event" enforced in the coordinator rather
+        // than trusted to the caller.
+        append_events(
             &tx,
             &mut sequence,
             &input.repository_id,
@@ -744,7 +751,7 @@ impl DomainTransactionStore for PostgresDomainStore {
                 repository_generation: generation,
                 branch_generation: None,
             },
-            input.event.as_ref(),
+            &input.events,
         )
         .await?;
 

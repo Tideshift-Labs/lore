@@ -48,6 +48,7 @@ use lore_postgres::domain::coordinator::MetadataCasInput;
 use lore_postgres::domain::coordinator::PendingEvent;
 use lore_postgres::domain::coordinator::ProjectionWrite;
 use lore_postgres::domain::coordinator::RepositoryCreateInput;
+use lore_postgres::domain::coordinator::RepositoryDeleteInput;
 use lore_postgres::domain::errors::DomainOutcome;
 use lore_postgres::domain::fragments::PostgresFragmentCoordinator;
 use lore_postgres::domain::locks::LockFencingReadiness;
@@ -900,6 +901,342 @@ impl GovernedRepositoryCreate {
 /// Fingerprint schema version for a create fingerprint that is the v1
 /// canonical-intent digest.
 const CREATION_FINGERPRINT_VERSION_V1: i32 = 1;
+
+/// The 32-byte attempt-compatible delete proof CR-029 records on a tombstone.
+///
+/// BLOCKED(WP-116): delete_proof derivation unfrozen in CR-029.
+///
+/// A typed placeholder rather than a `Vec<u8>` with a comment, because the
+/// difference between "the bytes are missing" and "the bytes are wrong" has to
+/// survive review. `lore_domain_repositories` carries a `NOT NULL` `CHECK` of
+/// exactly 32 bytes on any tombstoned row, CR-029 names the field three times
+/// only as an "attempt-compatible immutable delete proof", and it freezes no
+/// preimage, no field order, no framing, and no domain separator. Nothing in
+/// either repository computes one.
+///
+/// Minting 32 bytes here would be CR-029's own MISSING-2 failure verbatim: one
+/// side invents a value, the other cannot reproduce it, and the divergence is
+/// silent. Worse than silent here, because the proof is committed into the
+/// principal-scoped receipt and returned by receipt lookup, so a wrong shape
+/// becomes permanent evidence.
+///
+/// Missing artefact: a frozen `delete_proof` derivation in CR-029 on the same
+/// terms as its canonical-intent digest contract — one canonical preimage, its
+/// exact field order and framing, and independently computed golden vectors on
+/// both sides. Adding the variant that carries real bytes is the whole of the
+/// remaining work; every other input this seam needs is built below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryDeleteProof {
+    /// No derivation exists. [`GovernedRepositoryDelete::commit`] refuses.
+    Unfrozen,
+}
+
+impl RepositoryDeleteProof {
+    /// The 32 proof bytes the tombstone row requires, or `None` while CR-029
+    /// freezes no derivation.
+    ///
+    /// The `match` is exhaustive on purpose and has no `_` arm: adding the
+    /// variant that carries real bytes must be a compile error here until it is
+    /// handled, rather than silently falling through to a refusal that now
+    /// looks like a bug.
+    fn bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Unfrozen => None,
+        }
+    }
+}
+
+/// One branch a repository delete tombstones, as the handler enumerated it.
+///
+/// The name is what the projection needs: the branch name-to-id row is keyed on
+/// the **lowercase** name, unlike the repository name row, which is keyed on the
+/// exact name. Both rules are reproduced from their own module rather than from
+/// each other; see [`RepositoryCreatePublication::projection`].
+#[derive(Debug, Clone)]
+pub struct RepositoryDeleteBranch {
+    /// 16-byte branch identity.
+    pub branch_id: Vec<u8>,
+    /// Branch name as authored. Empty where the legacy path found none, in
+    /// which case no name row is retired, exactly as `delete_name_to_id` is
+    /// skipped there.
+    pub name: String,
+}
+
+/// Everything one repository delete retires, as the handler observed it.
+pub struct RepositoryDeletePublication<'a> {
+    /// Repository-format salt, from the target `RepositoryContext`.
+    pub salt: &'a [u8],
+    /// 16-byte repository identity.
+    pub repository_id: &'a [u8],
+    /// Exact repository name. Repository names do not fold case.
+    pub name: &'a str,
+    /// Generation the caller expects to be tombstoning, when it read one.
+    pub expected_generation: Option<i64>,
+    /// Every live branch, as `branch::list` enumerated it.
+    pub branches: &'a [RepositoryDeleteBranch],
+    /// BLOCKED(WP-116): delete_proof derivation unfrozen in CR-029.
+    pub delete_proof: RepositoryDeleteProof,
+}
+
+impl RepositoryDeletePublication<'_> {
+    /// The `lore_mutable` rows a delete removes today, rebuilt exactly.
+    ///
+    /// The mirror image of [`RepositoryCreatePublication::projection`], and
+    /// derived from the same two legacy primitives. Every row here is a
+    /// **delete**, expressed as `value: None`, because that is what the legacy
+    /// path's own calls amount to: `store_name_to_id(name, RepositoryId::default())`
+    /// and `metadata_store_hash(Hash::default())` both reach `MutableStore::store`
+    /// with a null hash, which that primitive treats as a delete, and both
+    /// per-branch pointers go through `branch::mutable_delete` outright.
+    ///
+    /// The branch **latest** pointer is a delete here even though create writes
+    /// it as an explicit zero-valued row. That asymmetry is in the legacy path,
+    /// not introduced here: create reaches `compare_and_swap`, which retains a
+    /// zero-valued row so a later zero-expected CAS has a predecessor, while
+    /// delete reaches `mutable_delete`, which removes the row. Writing a
+    /// zero-valued row here instead would leave the governed and legacy deletes
+    /// with different table contents for the same operation.
+    ///
+    /// Unlike create's five fixed rows, this count is 2 + 3N. That is fine for
+    /// the projection, which has never been bounded, and is exactly why the
+    /// event carriage is **not** allowed to grow the same way: see
+    /// `RepositoryDeleteInput::events`.
+    fn projection(&self) -> Vec<ProjectionWrite> {
+        let repository_hex = hex::encode(self.repository_id);
+        let repository_partition = self.repository_id.to_vec();
+        // The repository name index is global, not per-repository, matching the
+        // partition the legacy writer stores it under.
+        let global_partition = RepositoryId::default().data().to_vec();
+        let removed = |key: Hash, key_type: KeyType, partition: Vec<u8>| ProjectionWrite {
+            partition,
+            key_type: key_type as i16,
+            key: key.as_ref().to_vec(),
+            value: None,
+        };
+        let mut rows = vec![
+            removed(
+                hash::hash_function_arg(self.salt, repository::METADATA, &repository_hex),
+                KeyType::RepositoryMetadata,
+                repository_partition.clone(),
+            ),
+            removed(
+                hash::hash_function_arg(self.salt, repository::ID, self.name),
+                KeyType::RepositoryId,
+                global_partition,
+            ),
+        ];
+        for branch_entry in self.branches {
+            let branch_hex = hex::encode(&branch_entry.branch_id);
+            rows.push(removed(
+                hash::hash_function_args(self.salt, branch::METADATA, &repository_hex, &branch_hex),
+                KeyType::BranchMetadata,
+                repository_partition.clone(),
+            ));
+            rows.push(removed(
+                hash::hash_function_args(self.salt, branch::LATEST, &repository_hex, &branch_hex),
+                KeyType::BranchLatestPointer,
+                repository_partition.clone(),
+            ));
+            // The legacy path skips `delete_name_to_id` outright on an empty
+            // name, so an empty name retires no row here either. Retiring the
+            // hash of the empty string would delete a key the create path never
+            // wrote.
+            if !branch_entry.name.is_empty() {
+                rows.push(removed(
+                    hash::hash_function_arg(
+                        self.salt,
+                        branch::ID,
+                        &branch_entry.name.to_lowercase(),
+                    ),
+                    KeyType::BranchId,
+                    repository_partition.clone(),
+                ));
+            }
+        }
+        rows
+    }
+}
+
+/// Refuse an identity that is not the 16 bytes every domain id is.
+fn checked_id_16(id: &[u8], field: &'static str) -> Result<(), Status> {
+    if id.len() != 16 {
+        return Err(Status::invalid_argument(format!(
+            "{field} must be 16 bytes, got {}",
+            id.len()
+        )));
+    }
+    Ok(())
+}
+
+/// What a governed repository delete committed.
+pub struct RepositoryDeleteOutcome {
+    /// Repository generation this transaction committed, or the existing one an
+    /// exact retry found.
+    pub repository_generation: Option<i64>,
+}
+
+/// The governed repository-delete seam, shared by the v0 and v1 delete sites.
+///
+/// Built for the same reason [`GovernedRepositoryCreate`] is: repository delete
+/// exists twice on the wire, the two handlers differ only in their request and
+/// response shapes, and everything between admission and the coordinator is
+/// identical. Two copies of a governed mutation path is how the two come to
+/// mean different things, which is the divergence CR-029 exists to end.
+///
+/// # Fenced by one missing value, not by missing plumbing
+///
+/// The projection rows, the classified event, the coordinator input, and the
+/// outcome mapping are all here and complete. [`RepositoryDeleteProof`] is the
+/// only input with no derivation, and [`Self::commit`] refuses on it before it
+/// touches the coordinator.
+///
+/// **[`Self::prepare`] has no caller today.** Both delete handlers still refuse
+/// at entry through `reject_unwired_governed_operation`, so the entry check is
+/// the only fence that actually runs and this seam's refusal is the one that
+/// will run once the handlers are wired — not a second fence standing behind
+/// the first right now. The entry refusal is what keeps a delete that will
+/// certainly refuse from first performing the ReBAC `DeleteResource` callback,
+/// and it stays there for that reason when the wiring lands.
+/// `lore-server/tests/p12_governed_wiring.rs` pins both facts: that the sites
+/// stay fenced, and that this seam is otherwise complete.
+pub struct GovernedRepositoryDelete {
+    domain: Arc<DomainContext>,
+    operation: GovernedOperation,
+}
+
+impl GovernedRepositoryDelete {
+    /// Prepare the governed call, or `Ok(None)` for the ungoverned path.
+    ///
+    /// Identical admission rules to [`GovernedRepositoryCreate::prepare`],
+    /// including the refusal on a cell that is not enforcing: an unenforcing
+    /// cell still writes the generic mutable path unfenced, so admitting a
+    /// governed delete there would put two writers on the same rows under two
+    /// lock disciplines.
+    pub fn prepare(
+        domain: Option<&Arc<DomainContext>>,
+        admitted: Option<AdmittedOperation>,
+        method: &'static str,
+        digest: Vec<u8>,
+    ) -> Result<Option<Self>, Status> {
+        let Some(admitted) = admitted else {
+            return Ok(None);
+        };
+        let Some(domain) = domain else {
+            return Err(Status::failed_precondition(
+                "Domain coordinator is unavailable",
+            ));
+        };
+        if !domain.enforcement_enabled() {
+            warn!(
+                method,
+                operation_id = %admitted.key.operation_id,
+                "Refusing a governed repository delete on a cell that is not enforcing"
+            );
+            return Err(Status::failed_precondition(
+                "Governed repository delete requires domain enforcement on this cell",
+            ));
+        }
+        Ok(Some(Self {
+            domain: domain.clone(),
+            operation: admitted.into_governed(method, digest),
+        }))
+    }
+
+    /// Commit the tombstone, every projection row, and the classified event in
+    /// one transaction.
+    pub async fn commit(
+        &self,
+        publication: &RepositoryDeletePublication<'_>,
+    ) -> Result<RepositoryDeleteOutcome, Status> {
+        // BLOCKED(WP-116): delete_proof derivation unfrozen in CR-029.
+        //
+        // Fails closed, first, before the projection is built and before the
+        // coordinator is reached. Everything past this line is the rest of the
+        // wiring and runs unchanged the moment the proof has a derivation.
+        let Some(delete_proof) = publication.delete_proof.bytes() else {
+            warn!(
+                operation_id = %self.operation.key.operation_id,
+                "Refusing a governed repository delete: CR-029 freezes no delete_proof \
+                 derivation, and a minted proof would become permanent receipt evidence"
+            );
+            return Err(Status::unimplemented(
+                "Governed repository delete requires a frozen CR-029 delete_proof derivation",
+            ));
+        };
+        // Every id that becomes a `lore_mutable` key is checked for width here,
+        // before the first key is derived. `hash_function_arg` hashes whatever
+        // it is handed, so a short or long id produces a plausible key for a row
+        // that does not exist and the delete silently retires nothing. The
+        // event's own repository id is checked again by the pinned builder;
+        // branch ids never reach the event, so this is the only place they can
+        // be checked at all.
+        checked_id_16(publication.repository_id, "repository_id")?;
+        for branch_entry in publication.branches {
+            checked_id_16(&branch_entry.branch_id, "branch_id")?;
+        }
+        let input = self.input(publication, delete_proof)?;
+        self.publish(&input).await
+    }
+
+    /// The classified event this transition owes, and the coordinator input it
+    /// commits with.
+    ///
+    /// Split out of [`Self::commit`] so the carriage is real, reviewable code
+    /// rather than a promise inside a branch nothing reaches. `commit` calls it
+    /// today; what nothing reaches today is `commit` itself, because
+    /// [`RepositoryDeleteProof`] has no derivable variant.
+    fn input(
+        &self,
+        publication: &RepositoryDeletePublication<'_>,
+        delete_proof: Vec<u8>,
+    ) -> Result<RepositoryDeleteInput, Status> {
+        // CR-032 classifies a repository tombstone as ONE bounded generation
+        // event covering everything it hides, not one row per branch and not
+        // one row per association. `None` when this cell has no configured
+        // identity, exactly as the create seam does.
+        let events = match self.domain.cell_id() {
+            Some(cell_id) => {
+                vec![
+                    outbox_builders::repository_tombstoned(cell_id, publication.repository_id)
+                        .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?,
+                ]
+            }
+            None => Vec::new(),
+        };
+        Ok(RepositoryDeleteInput {
+            repository_id: publication.repository_id.to_vec(),
+            expected_generation: publication.expected_generation,
+            delete_proof,
+            projection: publication.projection(),
+            events,
+        })
+    }
+
+    /// Hand the built input to the coordinator and map its outcome.
+    ///
+    /// Separated from [`Self::input`] for the same reason: the coordinator call
+    /// and its outcome mapping are the rest of the wiring, and they are written
+    /// once here rather than twice in the two handlers.
+    async fn publish(
+        &self,
+        input: &RepositoryDeleteInput,
+    ) -> Result<RepositoryDeleteOutcome, Status> {
+        let result = self
+            .domain
+            .store()
+            .repository_delete(&self.operation, input)
+            .await
+            .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?;
+        match result.outcome {
+            DomainOutcome::Applied => Ok(RepositoryDeleteOutcome {
+                repository_generation: result.repository_generation,
+            }),
+            DomainOutcome::NotApplied { reason, .. } => {
+                Err(crate::grpc::map_domain_rejection_to_status(reason.as_str()))
+            }
+        }
+    }
+}
 
 /// Map a create-specific rejection, deferring to the shared mapper elsewhere.
 ///

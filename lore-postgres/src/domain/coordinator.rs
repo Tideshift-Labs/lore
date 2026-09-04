@@ -314,31 +314,42 @@ pub struct RepositoryDeleteInput {
     pub delete_proof: Vec<u8>,
     /// Projection rows to remove in step.
     pub projection: Vec<ProjectionWrite>,
-    /// Classified event to append last, if any.
+    /// Classified events to append last, in the order given.
     ///
-    /// BLOCKED(WP-116): the create carriage was widened to a bounded
-    /// [`Vec<PendingEvent>`](RepositoryCreateInput::events) on 2026-09-03, and
-    /// that answer deliberately does **not** carry across to delete. A cap of
-    /// [`MAX_PENDING_EVENTS`] cannot express this transition, because the count
-    /// here is unbounded rather than merely greater than one: widening the
-    /// field to the same bounded `Vec` would look like the same fix while still
-    /// dropping every branch past the cap. This transaction tombstones every
-    /// live branch of the repository in one `UPDATE`, and CR-032 classifies a
-    /// branch tombstone as "Yes, once per real committed transition". N
-    /// branches owe N `branch.deleted` rows; one slot expresses one.
+    /// The same bounded `Vec` as
+    /// [`RepositoryCreateInput::events`](RepositoryCreateInput::events),
+    /// checked by [`validate_pending_events`] before the transaction opens.
     ///
-    /// CR-032 does give the shape of an answer for the adjacent case — a
-    /// repository tombstone hiding all associations emits "One
-    /// repository-generation event, not one row per hidden association" — but
-    /// it says that about associations, not branches, and WP-119's inventory
-    /// (disagreement C3) already records that the summary has no single writer
-    /// to hang off. Reading the association rule across to branches is a
-    /// contract decision, not an implementation one.
+    /// This field previously carried a single `Option` with a recorded
+    /// `BLOCKED(WP-116)` reasoning that a repository tombstone owes N
+    /// `branch.deleted` rows for its N tombstoned branches, which one slot
+    /// cannot express and a cap of [`MAX_PENDING_EVENTS`] cannot either. **That
+    /// reasoning is superseded.** CR-032's classification table answers this
+    /// transition directly: a repository tombstone emits "One
+    /// repository-generation event, not one row per hidden association", and
+    /// the same rule governs the branches it hides. The transition is one
+    /// bounded generation event, `repository.tombstoned`, keyed on the
+    /// committed repository generation — not one event per branch. A consumer
+    /// that tracks branches invalidates the whole repository on that row; it
+    /// does not need N rows to learn that N branches went away together, and
+    /// producing them would make an unbounded outbox write out of one bounded
+    /// mutation.
     ///
-    /// Unresolved for the same reason as create: no production caller, both
-    /// delete sites still fenced. Also still blocked on `delete_proof`, which
-    /// CR-029 names but derives nowhere.
-    pub event: Option<PendingEvent>,
+    /// The `Vec` rather than a single slot is kept for symmetry with create and
+    /// because the cap is what makes "bounded" a checked property rather than a
+    /// claim; a delete carries one event today.
+    ///
+    /// PIN(WP-119): one consequence of the bounded answer is worth naming
+    /// rather than discovering. This transaction bumps `generation` on every
+    /// live branch row it tombstones, and publishes no `branch` event for any
+    /// of them, so a consumer that checks the **branch** aggregate ordinal for
+    /// contiguity sees each branch's ordinal stop one short, permanently. That
+    /// is a gap in CR-032's consumer rules, not a reason to emit N rows: the
+    /// repository event is what tells a consumer the whole repository is gone,
+    /// and a branch of a tombstoned repository has no further transitions to be
+    /// contiguous with. Raise it with the CR owner before a consumer relies on
+    /// per-branch contiguity across a repository tombstone.
+    pub events: Vec<PendingEvent>,
 }
 
 /// Compare-and-swap one metadata pointer.
