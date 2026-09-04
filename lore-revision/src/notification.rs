@@ -136,7 +136,97 @@ pub trait NotificationClient {
     async fn subscribe_repository(
         self: Arc<Self>,
         repository: RepositoryId,
+        route: NotificationRoute,
     ) -> Result<NotificationSubscription, NotificationError>;
+}
+
+/// Where one repository's notification subscription connects, and what additive
+/// request metadata it carries.
+///
+/// A repository's notification endpoint is normally derived from its own remote
+/// ([`Environment::notification_url`](lore_transport::Environment::notification_url)),
+/// which assumes notifications are served by the same host that stores the
+/// repository. An embedder that serves them from a separate address supplies that
+/// address here instead. Nothing else about the call changes: the authorization
+/// exchange still runs against the repository's own auth URL, and the token is
+/// still scoped to this repository.
+///
+/// `metadata` is ADDITIVE. It is applied on top of the metadata the authorization
+/// interceptor already injects and may not replace those keys. Values travel as
+/// ordinary (non-binary) gRPC metadata, so they must be printable ASCII.
+#[derive(Debug, Clone, Default)]
+pub struct NotificationRoute {
+    /// Endpoint to dial instead of the repository-derived one. `None` keeps the
+    /// derived endpoint, which is the stock behaviour.
+    pub endpoint: Option<String>,
+    /// Additive request metadata sent with `Subscribe`.
+    pub metadata: Vec<(String, String)>,
+}
+
+/// A host-supplied policy for notification subscriptions.
+///
+/// Registered process-wide, the same shape [`register_notification_service`] uses,
+/// because a subscription is established deep inside a repository call that has no
+/// place to thread per-call options through. Both methods have defaults, so an
+/// embedder implements only the half it needs.
+pub trait NotificationRouter: Send + Sync {
+    /// Where this repository's subscription connects, and what extra request
+    /// metadata it carries. The default routes nothing, which is stock behaviour.
+    fn route(&self, _repository: RepositoryId) -> NotificationRoute {
+        NotificationRoute::default()
+    }
+
+    /// How the stream ended, delivered exactly once when it closes for any reason:
+    /// a clean end, a transport error, or a server status.
+    ///
+    /// Trailers and the closing status are the only channels a server has to say
+    /// something after it has begun streaming, and a client that reconnects needs
+    /// whatever the server said on the way out.
+    fn on_stream_close(&self, _repository: RepositoryId, _close: NotificationStreamClose) {}
+}
+
+/// What a notification stream said on the way out.
+///
+/// Both halves matter and neither substitutes for the other: a server states its
+/// reason in the status while carrying resume state in the trailers, so a client
+/// that read only one of them would either know where it got to without knowing
+/// whether that position is still usable, or the reverse.
+#[derive(Debug, Clone, Default)]
+pub struct NotificationStreamClose {
+    /// The numeric gRPC status code the server closed with, or `None` when the
+    /// stream ended without one — a clean end of stream, or a local cancellation.
+    ///
+    /// Numeric rather than a transport enum so this crate's public surface does
+    /// not commit to one gRPC library's type.
+    pub status_code: Option<i32>,
+    /// The status message. Servers use it as a diagnostic; it is advisory, and a
+    /// client must not require it to be present or to take any particular form.
+    pub message: String,
+    /// The stream's TRAILING metadata, printable-ASCII pairs with lowercase keys.
+    ///
+    /// Binary (`-bin`) keys are skipped rather than decoded: their bytes are not
+    /// text, and handing a caller a lossy string of them invites it to be compared
+    /// or logged as though it were the value.
+    pub trailers: Vec<(String, String)>,
+}
+
+static NOTIFICATION_ROUTER: std::sync::RwLock<Option<Arc<dyn NotificationRouter>>> =
+    std::sync::RwLock::new(None);
+
+/// Install the process-wide notification router, replacing any previous one.
+pub fn set_notification_router(router: Arc<dyn NotificationRouter>) {
+    let mut slot = NOTIFICATION_ROUTER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(router);
+}
+
+/// The installed notification router, if any.
+pub fn notification_router() -> Option<Arc<dyn NotificationRouter>> {
+    NOTIFICATION_ROUTER
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 pub struct NotificationSubscription {
@@ -199,7 +289,14 @@ pub async fn subscribe(repository: Arc<RepositoryContext>) -> Result<(), Notific
     };
 
     let remote_url = remote.remote_url.to_string();
-    let endpoint = remote.environment.notification_url(&remote_url).to_string();
+    // The endpoint this repository's own remote implies. An installed router may
+    // point the subscription elsewhere; when none is installed the derived value
+    // stands, which is the stock behaviour.
+    let derived = remote.environment.notification_url(&remote_url).to_string();
+    let route = notification_router()
+        .map(|router| router.route(repository.id))
+        .unwrap_or_default();
+    let endpoint = route.endpoint.clone().unwrap_or(derived);
 
     lore_debug!("Creating notification client");
     let client = create_client(remote, &endpoint).await?;
@@ -208,7 +305,7 @@ pub async fn subscribe(repository: Arc<RepositoryContext>) -> Result<(), Notific
         "Subscribe to repository notifications for {}",
         repository.id
     );
-    let subscriber = client.subscribe_repository(repository.id).await?;
+    let subscriber = client.subscribe_repository(repository.id, route).await?;
     // A concurrent subscribe may have won the race; stop its task rather than
     // detaching it by dropping the join handle.
     if let Some(previous) = notification_subscribers().insert(repository.id, subscriber) {
@@ -316,4 +413,156 @@ where
         revision_number: u64,
         ip_addr: Option<String>,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use serial_test::serial;
+
+    use super::*;
+
+    // ── NotificationRoute / NotificationStreamClose: defaults are the stock,
+    // no-router behaviour ───────────────────────────────────────────────────
+
+    #[test]
+    fn notification_route_default_routes_nothing_and_carries_no_metadata() {
+        let route = NotificationRoute::default();
+        assert!(route.endpoint.is_none());
+        assert!(route.metadata.is_empty());
+    }
+
+    #[test]
+    fn notification_stream_close_default_carries_no_status_message_or_trailers() {
+        let close = NotificationStreamClose::default();
+        assert!(close.status_code.is_none());
+        assert_eq!(close.message, "");
+        assert!(close.trailers.is_empty());
+    }
+
+    /// A `NotificationRouter` that overrides neither method — the shape every
+    /// embedder that only wants ONE half (route vs. close observation) is
+    /// expected to write.
+    struct NoopRouter;
+    impl NotificationRouter for NoopRouter {}
+
+    #[test]
+    fn notification_router_default_route_method_is_the_stock_default() {
+        let router = NoopRouter;
+        let route = router.route(RepositoryId::default());
+        assert!(route.endpoint.is_none());
+        assert!(route.metadata.is_empty());
+    }
+
+    #[test]
+    fn notification_router_default_on_stream_close_method_is_a_silent_no_op() {
+        // Must not panic — the whole point of a default is that an embedder
+        // implementing only `route()` can ignore stream-close entirely.
+        let router = NoopRouter;
+        router.on_stream_close(RepositoryId::default(), NotificationStreamClose::default());
+    }
+
+    /// A router that routes every repository to a fixed endpoint with fixed
+    /// additive metadata, and records every `on_stream_close` call it receives.
+    struct RecordingRouter {
+        route: NotificationRoute,
+        closes: Mutex<Vec<(RepositoryId, NotificationStreamClose)>>,
+    }
+
+    impl NotificationRouter for RecordingRouter {
+        fn route(&self, _repository: RepositoryId) -> NotificationRoute {
+            self.route.clone()
+        }
+
+        fn on_stream_close(&self, repository: RepositoryId, close: NotificationStreamClose) {
+            self.closes.lock().unwrap().push((repository, close));
+        }
+    }
+
+    // `#[serial]`: `NOTIFICATION_ROUTER` is one process-wide slot. Two of these
+    // tests running concurrently would each observe whichever router the other
+    // last installed.
+
+    #[test]
+    #[serial]
+    fn set_notification_router_then_notification_router_returns_the_installed_router() {
+        let router = Arc::new(RecordingRouter {
+            route: NotificationRoute {
+                endpoint: Some("grpc://gateway.example.com".to_string()),
+                metadata: vec![("authorization".to_string(), "Bearer test-jwt".to_string())],
+            },
+            closes: Mutex::new(Vec::new()),
+        });
+        set_notification_router(router.clone());
+
+        let installed = notification_router().expect("a router was just installed");
+        let route = installed.route(RepositoryId::default());
+
+        assert_eq!(
+            route.endpoint.as_deref(),
+            Some("grpc://gateway.example.com")
+        );
+        assert_eq!(
+            route.metadata,
+            vec![("authorization".to_string(), "Bearer test-jwt".to_string())]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn set_notification_router_replaces_a_previously_installed_router() {
+        let first = Arc::new(RecordingRouter {
+            route: NotificationRoute {
+                endpoint: Some("grpc://first.example.com".to_string()),
+                metadata: vec![],
+            },
+            closes: Mutex::new(Vec::new()),
+        });
+        set_notification_router(first);
+
+        let second = Arc::new(RecordingRouter {
+            route: NotificationRoute {
+                endpoint: Some("grpc://second.example.com".to_string()),
+                metadata: vec![],
+            },
+            closes: Mutex::new(Vec::new()),
+        });
+        set_notification_router(second);
+
+        let installed = notification_router().expect("a router was just installed");
+        let route = installed.route(RepositoryId::default());
+        assert_eq!(route.endpoint.as_deref(), Some("grpc://second.example.com"));
+    }
+
+    #[test]
+    #[serial]
+    fn on_stream_close_delivers_the_full_close_shape_to_the_installed_router() {
+        let router = Arc::new(RecordingRouter {
+            route: NotificationRoute::default(),
+            closes: Mutex::new(Vec::new()),
+        });
+        set_notification_router(router.clone());
+
+        let repository = RepositoryId::default();
+        let close = NotificationStreamClose {
+            status_code: Some(16), // UNAUTHENTICATED
+            message: "replay_truncation".to_string(),
+            trailers: vec![(
+                "lorehub-live-resume".to_string(),
+                "lhrc1.deadbeef.cell-a.1.1234.cafebabe".to_string(),
+            )],
+        };
+
+        notification_router()
+            .expect("a router was just installed")
+            .on_stream_close(repository, close.clone());
+
+        let recorded = router.closes.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, repository);
+        assert_eq!(recorded[0].1.status_code, close.status_code);
+        assert_eq!(recorded[0].1.message, close.message);
+        assert_eq!(recorded[0].1.trailers, close.trailers);
+    }
 }
