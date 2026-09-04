@@ -158,6 +158,15 @@ pub trait NotificationClient {
 pub struct NotificationRoute {
     /// Endpoint to dial instead of the repository-derived one. `None` keeps the
     /// derived endpoint, which is the stock behaviour.
+    ///
+    /// Must carry a scheme that a notification service is registered for
+    /// (`lores`/`grpcs`/`https` for TLS, their unsuffixed forms for plaintext);
+    /// the scheme also selects TLS, and an unregistered one fails the subscribe.
+    ///
+    /// ⚠️ `LORE_GRPC_PORT` overrides the port of EVERY gRPC dial, including this
+    /// one. An environment that sets it to reach a TLS-terminating load balancer
+    /// will silently redirect a routed endpoint to that same port, so a separately
+    /// hosted notification service and that variable cannot both be used.
     pub endpoint: Option<String>,
     /// Additive request metadata sent with `Subscribe`.
     pub metadata: Vec<(String, String)>,
@@ -169,6 +178,14 @@ pub struct NotificationRoute {
 /// because a subscription is established deep inside a repository call that has no
 /// place to thread per-call options through. Both methods have defaults, so an
 /// embedder implements only the half it needs.
+///
+/// # Contract
+///
+/// Both methods are called synchronously from inside the subscription's own task,
+/// on the async runtime. An implementation MUST NOT block and MUST NOT panic: it
+/// runs on a runtime worker, so blocking stalls unrelated work, and it runs on a
+/// task the subscription owns, so a panic aborts that task partway. Do the work a
+/// lookup and a map write take, and nothing more.
 pub trait NotificationRouter: Send + Sync {
     /// Where this repository's subscription connects, and what extra request
     /// metadata it carries. The default routes nothing, which is stock behaviour.
@@ -219,6 +236,18 @@ pub fn set_notification_router(router: Arc<dyn NotificationRouter>) {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *slot = Some(router);
+}
+
+/// Remove the process-wide notification router, returning it if there was one.
+///
+/// The slot is process-global, so without this a test that installs a router
+/// silently governs every later subscription in the same test binary, and a host
+/// that stops routing has no way to say so. Restores stock behaviour exactly.
+pub fn clear_notification_router() -> Option<Arc<dyn NotificationRouter>> {
+    NOTIFICATION_ROUTER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
 }
 
 /// The installed notification router, if any.

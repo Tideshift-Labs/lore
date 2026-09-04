@@ -211,6 +211,17 @@ impl lore_revision::notification::NotificationClient for NotificationClient {
 
             let close = event_loop(repository, stream, stop.clone()).await;
 
+            // The loop may have exited on its own, for example because the
+            // stream broke. Cancel so the subscription reads as inactive.
+            //
+            // BEFORE the router callback, deliberately. `shutdown()` waits on this
+            // task, so a router that blocks would otherwise hold the subscription
+            // in a state that still reads as active, and a router that panics would
+            // skip the cancel entirely and leave a dead stream reporting itself
+            // alive forever. Cancelling first makes the callback unable to damage
+            // the subscription's own bookkeeping, whatever it does.
+            stop.cancel();
+
             // Whatever the server said on the way out, delivered exactly once and
             // BEFORE the unsubscribed event, so a router that stores a resume
             // position has it recorded by the time the embedder reacts to the end
@@ -219,10 +230,6 @@ impl lore_revision::notification::NotificationClient for NotificationClient {
             if let Some(router) = lore_revision::notification::notification_router() {
                 router.on_stream_close(repository, close);
             }
-
-            // The loop may have exited on its own, for example because the
-            // stream broke. Cancel so the subscription reads as inactive.
-            stop.cancel();
 
             LoreEvent::NotificationUnsubscribed(LoreNotificationUnsubscribedEventData {
                 repository,
@@ -277,7 +284,7 @@ async fn event_loop(
                     }
                     Err(status) => {
                         lore_debug!("Failed to receive notification event: {status:?}");
-                        close.status_code = Some(i32::from(status.code() as u8));
+                        close.status_code = Some(status.code().into());
                         close.message = status.message().to_string();
                         close.trailers = ascii_pairs(status.metadata());
                         break;
@@ -291,6 +298,17 @@ async fn event_loop(
     close
 }
 
+/// The status keys the transport carries in the trailer frame, which a caller must
+/// never see as trailers.
+///
+/// A stream that ends cleanly hands back the RAW trailer map, which still contains
+/// these; a stream the server terminates with a status hands back a map tonic has
+/// already stripped them from. Removing them here makes the two paths deliver the
+/// same shape, so a caller cannot come to depend on a key that is present only on
+/// one of them. The status itself already reaches the caller as
+/// `NotificationStreamClose`'s own fields.
+const TRANSPORT_STATUS_KEYS: [&str; 2] = ["grpc-status", "grpc-message"];
+
 /// The printable-ASCII entries of a metadata map, lowercase keys.
 ///
 /// Binary (`-bin`) keys are skipped rather than decoded: their bytes are not text,
@@ -299,10 +317,16 @@ async fn event_loop(
 fn ascii_pairs(map: &tonic::metadata::MetadataMap) -> Vec<(String, String)> {
     map.iter()
         .filter_map(|entry| match entry {
-            tonic::metadata::KeyAndValueRef::Ascii(key, value) => value
-                .to_str()
-                .ok()
-                .map(|value| (key.as_str().to_string(), value.to_string())),
+            tonic::metadata::KeyAndValueRef::Ascii(key, value) => {
+                let key = key.as_str();
+                if TRANSPORT_STATUS_KEYS.contains(&key) {
+                    return None;
+                }
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (key.to_string(), value.to_string()))
+            }
             tonic::metadata::KeyAndValueRef::Binary(_, _) => None,
         })
         .collect()
@@ -428,6 +452,32 @@ mod tests {
         // decoded lossily as though its bytes were text.
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "lorehub-live-resume");
+    }
+
+    /// A clean end of stream hands back the RAW trailer frame, which still carries
+    /// the transport's own status keys; a server-terminated stream hands back a map
+    /// tonic has already stripped them from. Both paths must deliver the same shape,
+    /// or a caller comes to depend on a key present on only one of them.
+    #[test]
+    fn ascii_pairs_strips_the_transport_status_keys_so_both_close_paths_agree() {
+        let mut map = MetadataMap::new();
+        map.insert("grpc-status", MetadataValue::from_static("14"));
+        map.insert("grpc-message", MetadataValue::from_static("lag"));
+        map.insert(
+            "lorehub-live-resume",
+            MetadataValue::from_static("lhrc1.deadbeef.cell-a.1.1234.cafebabe"),
+        );
+
+        let pairs = ascii_pairs(&map);
+
+        assert_eq!(
+            pairs,
+            vec![(
+                "lorehub-live-resume".to_string(),
+                "lhrc1.deadbeef.cell-a.1.1234.cafebabe".to_string()
+            )],
+            "the status reaches the caller as NotificationStreamClose's own fields"
+        );
     }
 
     #[test]
