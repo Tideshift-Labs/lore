@@ -156,6 +156,11 @@ mod replication_service_tests {
                 notification,
                 hooks,
                 lore_revision::environment::EnvironmentConfig::default(),
+                // No domain context: this suite exercises the replication store service over
+                // the wire and never reaches a governed domain operation. `server.rs` passes a
+                // real one; the builder takes an `Option` precisely so a harness that needs
+                // none can say so rather than construct a coordinator it will not use.
+                None,
             )?
             .with_tls_config(
                 Some(certs.server_cert_path.clone()),

@@ -35,6 +35,9 @@ mod grpc_mutation_dispatch_loss_tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use lore_proto::lore::environment::v1 as environment_v1;
+    use lore_proto::lore::environment::v1::environment_service_server::EnvironmentService as EnvironmentServiceV1;
+    use lore_proto::lore::environment::v1::environment_service_server::EnvironmentServiceServer;
     use lore_proto::lore::model::v1 as model_v1;
     use lore_proto::lore::repository::v1 as repository_v1;
     use lore_proto::lore::repository::v1::repository_service_server::RepositoryService as RepositoryServiceV1;
@@ -53,6 +56,81 @@ mod grpc_mutation_dispatch_loss_tests {
     type ResponseStream<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
 
     const SIGNAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+    // ---------------------------------------------------------------------------------------
+    // Connect-time scaffolding, required by both servers below.
+    // ---------------------------------------------------------------------------------------
+
+    /// `lore_transport::connect` calls `EnvironmentService::EnvironmentGet` before it hands back
+    /// a connection, to learn the auth URL. A server that does not implement it answers
+    /// `Unimplemented`, which the client classifies as `NotSupported` and fails the connect on —
+    /// so without this stub neither test below ever reaches its own assertions, and both fail
+    /// during setup for a reason that has nothing to do with what they are testing.
+    ///
+    /// An empty `Environment` is exactly what these tests want: it leaves the auth URL blank, so
+    /// `connect` skips the token exchange and goes straight to the storage or repository RPC
+    /// under test.
+    struct MinimalEnvironmentServer;
+
+    #[tonic::async_trait]
+    impl EnvironmentServiceV1 for MinimalEnvironmentServer {
+        async fn environment_get(
+            &self,
+            _request: Request<environment_v1::EnvironmentGetRequest>,
+        ) -> Result<Response<environment_v1::EnvironmentGetResponse>, Status> {
+            Ok(Response::new(environment_v1::EnvironmentGetResponse {
+                environment: Some(environment_v1::Environment::default()),
+            }))
+        }
+    }
+
+    /// A byte-level proxy the test can sever, sitting between the client and the server.
+    ///
+    /// The obvious severing mechanism — abort the task running `serve_with_incoming` — does not
+    /// work, and the failure is silent rather than loud. Measured on this rig: with the server
+    /// task aborted, the client's `delete` call was still pending 90 seconds later. Aborting the
+    /// accept loop does not reach connections tonic has already accepted, so the hanging handler
+    /// stays alive and the client waits on a socket nobody closed.
+    ///
+    /// Severing the socket is both what actually works and what a real network failure does. The
+    /// client's request has already been dispatched and read by the handler when the halves are
+    /// dropped, which is exactly the case under test: an answer that will never arrive.
+    async fn spawn_severable_proxy(
+        upstream: std::net::SocketAddr,
+    ) -> (std::net::SocketAddr, tokio::sync::watch::Sender<bool>) {
+        let (sever, _) = tokio::sync::watch::channel(false);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let accept_sever = sever.clone();
+        #[allow(clippy::disallowed_methods)] // Test-local proxy task.
+        tokio::spawn(async move {
+            loop {
+                let mut accept_signal = accept_sever.subscribe();
+                let accepted = tokio::select! {
+                    _ = accept_signal.wait_for(|severed| *severed) => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((mut downstream, _)) = accepted else {
+                    break;
+                };
+                let Ok(mut origin) = tokio::net::TcpStream::connect(upstream).await else {
+                    break;
+                };
+                let mut conn_signal = accept_sever.subscribe();
+                #[allow(clippy::disallowed_methods)] // Test-local proxy task.
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = conn_signal.wait_for(|severed| *severed) => {}
+                        _ = tokio::io::copy_bidirectional(&mut downstream, &mut origin) => {}
+                    }
+                    // Both halves drop here. That is the sever.
+                });
+            }
+        });
+
+        (addr, sever)
+    }
 
     // ---------------------------------------------------------------------------------------
     // Streaming: `StorageService::Put` loses its response after the server has already read it.
@@ -186,6 +264,7 @@ mod grpc_mutation_dispatch_loss_tests {
         let handle = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(StorageServiceServer::new(server))
+                .add_service(EnvironmentServiceServer::new(MinimalEnvironmentServer))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -346,10 +425,11 @@ mod grpc_mutation_dispatch_loss_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
 
-        #[allow(clippy::disallowed_methods)] // Test-local server task, deliberately aborted below.
-        let server_task = tokio::spawn(async move {
+        #[allow(clippy::disallowed_methods)] // Test-local server task.
+        let _server_task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(RepositoryServiceServer::new(server))
+                .add_service(EnvironmentServiceServer::new(MinimalEnvironmentServer))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
         });
@@ -361,8 +441,13 @@ mod grpc_mutation_dispatch_loss_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
+        // The client talks to the proxy, not to the server, so the test can cut the socket
+        // underneath a dispatched request. See `spawn_severable_proxy` for why aborting the
+        // server task is not enough.
+        let (proxy_addr, sever) = spawn_severable_proxy(addr).await;
+
         let connection = lore_transport::connect(
-            &format!("grpc://{addr}"),
+            &format!("grpc://{proxy_addr}"),
             "",
             RepositoryId::default(),
             1,
@@ -385,9 +470,9 @@ mod grpc_mutation_dispatch_loss_tests {
             "exactly one delete must have reached the server before the connection is severed"
         );
 
-        // Sever the connection: abort the whole server task, which drops its listener and every
-        // accepted connection, exactly as a real process death would from the client's view.
-        server_task.abort();
+        // Sever the connection at the socket, with the delete already dispatched and read by the
+        // handler and no answer on the way back.
+        sever.send_replace(true);
 
         let result = tokio::time::timeout(SIGNAL_TIMEOUT, delete_task)
             .await
