@@ -34,9 +34,25 @@ pub const DURABLE_PAYLOAD_VERSION: u32 = 1;
 pub const PRIVATE_NOTIFICATION_SERVICE: &str =
     "lorehub.notification.internal.v1.PrivateNotificationService";
 
-/// The one pinned method path this component calls.
+/// The pinned publication method path.
 pub const PUBLISH_METHOD_PATH: &str =
     "/lorehub.notification.internal.v1.PrivateNotificationService/Publish";
+
+/// The pinned durable receiver stream, frozen by contract amendment A-24.
+pub const CONSUME_METHOD_PATH: &str =
+    "/lorehub.notification.internal.v1.PrivateNotificationService/Consume";
+
+/// The pinned durable acknowledgement path, frozen by contract amendment A-24.
+pub const ACK_METHOD_PATH: &str =
+    "/lorehub.notification.internal.v1.PrivateNotificationService/Ack";
+
+/// Most sequences one [`AckV1`] may carry, from A-24.
+pub const MAX_ACKED_SEQUENCES: usize = 1024;
+
+/// Longest `durable_consumer_name` the gateway derives. Exactly 44 ASCII
+/// characters by A-24's byte-exact derivation, so this is an equality, not a
+/// ceiling.
+pub const DURABLE_CONSUMER_NAME_LEN: usize = 44;
 
 /// Delivery class of one private envelope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -165,6 +181,216 @@ pub struct PublishResultV1 {
     pub failure_class: i32,
 }
 
+// ---------------------------------------------------------------------------
+// The private receiver stream (contract amendment A-24)
+// ---------------------------------------------------------------------------
+
+/// Resume from a position a previous generation already captured.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CapturedPositionV1 {
+    #[prost(uint64, tag = "1")]
+    pub start_sequence: u64,
+}
+
+/// Capture a new durable consumer at the current edge of the request's
+/// placement. Empty by construction.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CaptureNewV1 {}
+
+/// Open one durable receiver stream.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConsumeRequestV1 {
+    #[prost(uint32, tag = "1")]
+    pub transport_version: u32,
+    #[prost(string, tag = "2")]
+    pub cell_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub receiver_identity: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub membership_generation: u64,
+    #[prost(string, tag = "5")]
+    pub stream_identity: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "6")]
+    pub stream_epoch: u64,
+    #[prost(uint64, tag = "7")]
+    pub placement_revision: u64,
+    #[prost(oneof = "consume_request_v1::Start", tags = "8, 9")]
+    pub start: ::core::option::Option<consume_request_v1::Start>,
+}
+
+/// Nested items of [`ConsumeRequestV1`].
+pub mod consume_request_v1 {
+    /// Exactly one start mode. An unset oneof is a malformed request.
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Start {
+        #[prost(message, tag = "8")]
+        CapturedPosition(super::CapturedPositionV1),
+        #[prost(message, tag = "9")]
+        CaptureNew(super::CaptureNewV1),
+    }
+}
+
+/// The first message on every Consume stream, in both start modes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConsumeCaptureV1 {
+    #[prost(string, tag = "1")]
+    pub stream_identity: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub stream_epoch: u64,
+    #[prost(uint64, tag = "3")]
+    pub start_sequence: u64,
+    #[prost(string, tag = "4")]
+    pub durable_consumer_name: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
+    pub placement_revision: u64,
+}
+
+/// One durable event delivered in broker order.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConsumeDeliveryV1 {
+    #[prost(message, optional, tag = "1")]
+    pub envelope: ::core::option::Option<PrivateEnvelopeV1>,
+    #[prost(uint64, tag = "2")]
+    pub broker_sequence: u64,
+    #[prost(string, tag = "3")]
+    pub stream_identity: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub stream_epoch: u64,
+    #[prost(uint32, tag = "5")]
+    pub redelivery_count: u32,
+}
+
+/// Nothing pending at or before the current edge.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConsumeCaughtUpV1 {
+    #[prost(uint64, tag = "1")]
+    pub edge_sequence: u64,
+}
+
+/// One message on the Consume stream.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConsumeEventV1 {
+    #[prost(uint32, tag = "1")]
+    pub transport_version: u32,
+    #[prost(oneof = "consume_event_v1::Event", tags = "2, 3, 4")]
+    pub event: ::core::option::Option<consume_event_v1::Event>,
+}
+
+/// Nested items of [`ConsumeEventV1`].
+pub mod consume_event_v1 {
+    /// Exactly one arm. An unset oneof is a malformed server response.
+    ///
+    /// The `Delivery` arm carries a whole `PrivateEnvelopeV1` and the other two
+    /// are a handful of scalars, so clippy reads the size difference as a
+    /// mistake. Boxing it would fix the lint and break the file's purpose: this
+    /// module is a verbatim transcription of what `tonic-prost-build` emits for
+    /// the schema of record, and a boxed variant is not that shape. The
+    /// receiver already boxes the value it keeps, in
+    /// [`super::super::stream::StreamDelivery`], which is where the size
+    /// actually matters.
+    #[allow(
+        clippy::large_enum_variant,
+        reason = "a hand transcription of generated prost output; boxing would diverge from the \
+                  vendored schema this module exists to mirror"
+    )]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "2")]
+        Capture(super::ConsumeCaptureV1),
+        #[prost(message, tag = "3")]
+        Delivery(super::ConsumeDeliveryV1),
+        #[prost(message, tag = "4")]
+        CaughtUp(super::ConsumeCaughtUpV1),
+    }
+}
+
+/// One unresolved sequence range, inclusive at both ends.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SequenceGapV1 {
+    #[prost(uint64, tag = "1")]
+    pub from: u64,
+    #[prost(uint64, tag = "2")]
+    pub to: u64,
+}
+
+/// One parked poison disposition.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PoisonEntryV1 {
+    #[prost(uint64, tag = "1")]
+    pub broker_sequence: u64,
+    #[prost(string, tag = "2")]
+    pub poison_class: ::prost::alloc::string::String,
+}
+
+/// Acknowledge applied sequences and report this generation's frontier.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AckV1 {
+    #[prost(uint32, tag = "1")]
+    pub transport_version: u32,
+    #[prost(string, tag = "2")]
+    pub cell_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub receiver_identity: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub membership_generation: u64,
+    #[prost(string, tag = "5")]
+    pub stream_identity: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "6")]
+    pub stream_epoch: u64,
+    #[prost(uint64, repeated, tag = "7")]
+    pub acked_sequences: ::prost::alloc::vec::Vec<u64>,
+    #[prost(uint64, tag = "8")]
+    pub contiguous_frontier: u64,
+    #[prost(message, repeated, tag = "9")]
+    pub gaps: ::prost::alloc::vec::Vec<SequenceGapV1>,
+    #[prost(message, repeated, tag = "10")]
+    pub poison: ::prost::alloc::vec::Vec<PoisonEntryV1>,
+}
+
+/// Outcome class of one Ack call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AckOutcomeV1 {
+    Unspecified = 0,
+    AllAccepted = 1,
+    PartiallyAccepted = 2,
+    Retryable = 3,
+    Terminal = 4,
+}
+
+/// Why a receiver request was refused. Shared by Consume and Ack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ReceiverErrorV1 {
+    Unspecified = 0,
+    MalformedReceiverRequest = 1,
+    UnsupportedReceiverSchema = 2,
+    UnauthenticatedReceiver = 3,
+    UnauthorizedReceiverRole = 4,
+    CrossCellReceiver = 5,
+    ReceiverScopeMismatch = 6,
+    ReceiverPlacementMismatch = 7,
+    ReceiverEpochMismatch = 8,
+    StaleMembershipGeneration = 9,
+    UnknownDurableConsumer = 10,
+    ReceiverBrokerUnavailable = 11,
+}
+
+/// Result of one Ack call.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AckResultV1 {
+    #[prost(uint32, tag = "1")]
+    pub transport_version: u32,
+    #[prost(enumeration = "AckOutcomeV1", tag = "2")]
+    pub outcome: i32,
+    #[prost(uint64, repeated, tag = "3")]
+    pub accepted_sequences: ::prost::alloc::vec::Vec<u64>,
+    #[prost(uint64, repeated, tag = "4")]
+    pub rejected_sequences: ::prost::alloc::vec::Vec<u64>,
+    #[prost(enumeration = "ReceiverErrorV1", tag = "5")]
+    pub failure_class: i32,
+}
+
 /// Client for the private publication service, in the shape
 /// `tonic-prost-build` generates for a single unary method.
 #[derive(Debug, Clone)]
@@ -208,6 +434,63 @@ where
             .insert(tonic::codegen::GrpcMethod::new(
                 PRIVATE_NOTIFICATION_SERVICE,
                 "Publish",
+            ));
+        self.inner.unary(request, path, codec).await
+    }
+
+    /// Opens one durable receiver stream.
+    ///
+    /// The first message is always a `ConsumeCaptureV1`; deliveries and
+    /// caught-up answers follow. Caller role is `receiver`.
+    ///
+    /// # Errors
+    /// Returns the transport or application [`tonic::Status`] verbatim. A
+    /// receiver classifies it differently from a publisher, so this method
+    /// never interprets it — see `super::stream`'s status mapping.
+    pub async fn consume(
+        &mut self,
+        request: tonic::Request<ConsumeRequestV1>,
+    ) -> Result<tonic::Response<tonic::codec::Streaming<ConsumeEventV1>>, tonic::Status> {
+        self.inner.ready().await.map_err(|e| {
+            tonic::Status::unavailable(format!(
+                "private notification gateway not ready: {}",
+                e.into()
+            ))
+        })?;
+        let codec = tonic_prost::ProstCodec::default();
+        let path = http::uri::PathAndQuery::from_static(CONSUME_METHOD_PATH);
+        let mut request = request;
+        request
+            .extensions_mut()
+            .insert(tonic::codegen::GrpcMethod::new(
+                PRIVATE_NOTIFICATION_SERVICE,
+                "Consume",
+            ));
+        self.inner.server_streaming(request, path, codec).await
+    }
+
+    /// Acknowledges applied sequences and reports the generation's frontier.
+    ///
+    /// # Errors
+    /// Returns the transport or application [`tonic::Status`] verbatim.
+    pub async fn ack(
+        &mut self,
+        request: tonic::Request<AckV1>,
+    ) -> Result<tonic::Response<AckResultV1>, tonic::Status> {
+        self.inner.ready().await.map_err(|e| {
+            tonic::Status::unavailable(format!(
+                "private notification gateway not ready: {}",
+                e.into()
+            ))
+        })?;
+        let codec = tonic_prost::ProstCodec::default();
+        let path = http::uri::PathAndQuery::from_static(ACK_METHOD_PATH);
+        let mut request = request;
+        request
+            .extensions_mut()
+            .insert(tonic::codegen::GrpcMethod::new(
+                PRIVATE_NOTIFICATION_SERVICE,
+                "Ack",
             ));
         self.inner.unary(request, path, codec).await
     }
@@ -576,6 +859,201 @@ mod tests {
             .rsplit_once("= ")
             .and_then(|(_, tail)| tail.trim_end_matches(';').parse().ok())
             .unwrap_or_else(|| panic!("`{declaration}` is not a `NAME = N;` declaration"))
+    }
+
+    /// Every receiver-stream field, pinned against the vendored `.proto`.
+    ///
+    /// A-24 numbers each of these explicitly, and the two copies of the schema
+    /// are byte-identical below their headers by contract. So a renumbering
+    /// that compiles here has to fail somewhere, and this is that somewhere.
+    #[test]
+    fn every_receiver_field_matches_the_vendored_proto() {
+        let fields: [(&str, &str, &str); 34] = [
+            ("CapturedPositionV1", "uint64 start_sequence = 1;", "1"),
+            ("ConsumeRequestV1", "uint32 transport_version = 1;", "1"),
+            ("ConsumeRequestV1", "string cell_id = 2;", "2"),
+            ("ConsumeRequestV1", "string receiver_identity = 3;", "3"),
+            ("ConsumeRequestV1", "uint64 membership_generation = 4;", "4"),
+            ("ConsumeRequestV1", "string stream_identity = 5;", "5"),
+            ("ConsumeRequestV1", "uint64 stream_epoch = 6;", "6"),
+            ("ConsumeRequestV1", "uint64 placement_revision = 7;", "7"),
+            (
+                "ConsumeRequestV1",
+                "CapturedPositionV1 captured_position = 8;",
+                "8",
+            ),
+            ("ConsumeRequestV1", "CaptureNewV1 capture_new = 9;", "9"),
+            ("ConsumeCaptureV1", "string stream_identity = 1;", "1"),
+            ("ConsumeCaptureV1", "uint64 stream_epoch = 2;", "2"),
+            ("ConsumeCaptureV1", "uint64 start_sequence = 3;", "3"),
+            ("ConsumeCaptureV1", "string durable_consumer_name = 4;", "4"),
+            ("ConsumeCaptureV1", "uint64 placement_revision = 5;", "5"),
+            ("ConsumeDeliveryV1", "PrivateEnvelopeV1 envelope = 1;", "1"),
+            ("ConsumeDeliveryV1", "uint64 broker_sequence = 2;", "2"),
+            ("ConsumeDeliveryV1", "string stream_identity = 3;", "3"),
+            ("ConsumeDeliveryV1", "uint64 stream_epoch = 4;", "4"),
+            ("ConsumeDeliveryV1", "uint32 redelivery_count = 5;", "5"),
+            ("ConsumeCaughtUpV1", "uint64 edge_sequence = 1;", "1"),
+            ("ConsumeEventV1", "uint32 transport_version = 1;", "1"),
+            ("ConsumeEventV1", "ConsumeCaptureV1 capture = 2;", "2"),
+            ("ConsumeEventV1", "ConsumeDeliveryV1 delivery = 3;", "3"),
+            ("ConsumeEventV1", "ConsumeCaughtUpV1 caught_up = 4;", "4"),
+            ("SequenceGapV1", "uint64 from = 1;", "1"),
+            ("SequenceGapV1", "uint64 to = 2;", "2"),
+            ("PoisonEntryV1", "uint64 broker_sequence = 1;", "1"),
+            ("PoisonEntryV1", "string poison_class = 2;", "2"),
+            ("AckV1", "repeated uint64 acked_sequences = 7;", "7"),
+            ("AckV1", "uint64 contiguous_frontier = 8;", "8"),
+            ("AckResultV1", "AckOutcomeV1 outcome = 2;", "2"),
+            (
+                "AckResultV1",
+                "repeated uint64 accepted_sequences = 3;",
+                "3",
+            ),
+            ("AckResultV1", "ReceiverErrorV1 failure_class = 5;", "5"),
+        ];
+        for (message, declaration, number) in fields {
+            assert_declares("message", message, declaration);
+            assert!(
+                declaration.ends_with(&format!("= {number};")),
+                "{declaration} does not carry field number {number}"
+            );
+        }
+    }
+
+    /// The two new enums, value by value. `ReceiverErrorV1` in particular is
+    /// what the gateway's status mapping is derived from, so an off-by-one
+    /// here would silently reclassify a refusal as a retry.
+    #[test]
+    fn every_receiver_enum_value_matches_the_vendored_proto() {
+        let outcomes: [(&str, AckOutcomeV1); 5] = [
+            ("ACK_OUTCOME_V1_UNSPECIFIED = 0;", AckOutcomeV1::Unspecified),
+            ("ACK_ALL_ACCEPTED = 1;", AckOutcomeV1::AllAccepted),
+            (
+                "ACK_PARTIALLY_ACCEPTED = 2;",
+                AckOutcomeV1::PartiallyAccepted,
+            ),
+            ("ACK_RETRYABLE = 3;", AckOutcomeV1::Retryable),
+            ("ACK_TERMINAL = 4;", AckOutcomeV1::Terminal),
+        ];
+        for (declaration, value) in outcomes {
+            assert_declares("enum", "AckOutcomeV1", declaration);
+            assert_eq!(declared_value(declaration), value as i32, "{declaration}");
+            assert_eq!(AckOutcomeV1::try_from(value as i32), Ok(value));
+        }
+
+        let errors: [(&str, ReceiverErrorV1); 12] = [
+            (
+                "RECEIVER_ERROR_V1_UNSPECIFIED = 0;",
+                ReceiverErrorV1::Unspecified,
+            ),
+            (
+                "MALFORMED_RECEIVER_REQUEST_V1 = 1;",
+                ReceiverErrorV1::MalformedReceiverRequest,
+            ),
+            (
+                "UNSUPPORTED_RECEIVER_SCHEMA_V1 = 2;",
+                ReceiverErrorV1::UnsupportedReceiverSchema,
+            ),
+            (
+                "UNAUTHENTICATED_RECEIVER_V1 = 3;",
+                ReceiverErrorV1::UnauthenticatedReceiver,
+            ),
+            (
+                "UNAUTHORIZED_RECEIVER_ROLE_V1 = 4;",
+                ReceiverErrorV1::UnauthorizedReceiverRole,
+            ),
+            (
+                "CROSS_CELL_RECEIVER_V1 = 5;",
+                ReceiverErrorV1::CrossCellReceiver,
+            ),
+            (
+                "RECEIVER_SCOPE_MISMATCH_V1 = 6;",
+                ReceiverErrorV1::ReceiverScopeMismatch,
+            ),
+            (
+                "RECEIVER_PLACEMENT_MISMATCH_V1 = 7;",
+                ReceiverErrorV1::ReceiverPlacementMismatch,
+            ),
+            (
+                "RECEIVER_EPOCH_MISMATCH_V1 = 8;",
+                ReceiverErrorV1::ReceiverEpochMismatch,
+            ),
+            (
+                "STALE_MEMBERSHIP_GENERATION_V1 = 9;",
+                ReceiverErrorV1::StaleMembershipGeneration,
+            ),
+            (
+                "UNKNOWN_DURABLE_CONSUMER_V1 = 10;",
+                ReceiverErrorV1::UnknownDurableConsumer,
+            ),
+            (
+                "RECEIVER_BROKER_UNAVAILABLE_V1 = 11;",
+                ReceiverErrorV1::ReceiverBrokerUnavailable,
+            ),
+        ];
+        for (declaration, value) in errors {
+            assert_declares("enum", "ReceiverErrorV1", declaration);
+            assert_eq!(declared_value(declaration), value as i32, "{declaration}");
+            assert_eq!(ReceiverErrorV1::try_from(value as i32), Ok(value));
+        }
+    }
+
+    #[test]
+    fn the_vendored_proto_pins_both_receiver_method_paths() {
+        assert!(
+            VENDORED_PROTO
+                .contains("rpc Consume (ConsumeRequestV1) returns (stream ConsumeEventV1);")
+        );
+        assert!(VENDORED_PROTO.contains("rpc Ack (AckV1) returns (AckResultV1);"));
+        assert_eq!(
+            CONSUME_METHOD_PATH,
+            "/lorehub.notification.internal.v1.PrivateNotificationService/Consume"
+        );
+        assert_eq!(
+            ACK_METHOD_PATH,
+            "/lorehub.notification.internal.v1.PrivateNotificationService/Ack"
+        );
+        assert!(VENDORED_PROTO.contains(CONSUME_METHOD_PATH));
+        assert!(VENDORED_PROTO.contains(ACK_METHOD_PATH));
+
+        // The two bounds this module names as constants, against the schema's
+        // own prose. Neither is a field number, so nothing else would catch a
+        // change to them.
+        assert_eq!(MAX_ACKED_SEQUENCES, 1024);
+        assert!(
+            declaration_block(VENDORED_PROTO, "message", "AckV1").contains("1 to 1024 entries"),
+            "the acknowledgement batch bound moved; MAX_ACKED_SEQUENCES is stale"
+        );
+        assert_eq!(DURABLE_CONSUMER_NAME_LEN, 44);
+        assert!(
+            declaration_block(VENDORED_PROTO, "message", "ConsumeCaptureV1")
+                .contains("Exactly 44 ASCII"),
+            "the durable consumer name width moved; DURABLE_CONSUMER_NAME_LEN is stale"
+        );
+    }
+
+    /// A `ConsumeEventV1` round trips, including the oneof arm that carries a
+    /// whole envelope. This is the message the receiver decodes on every
+    /// delivery, so a tag error here is a decode failure in production.
+    #[test]
+    fn a_consume_delivery_round_trips_through_protobuf() {
+        let event = ConsumeEventV1 {
+            transport_version: TRANSPORT_VERSION,
+            event: Some(consume_event_v1::Event::Delivery(ConsumeDeliveryV1 {
+                envelope: Some(PrivateEnvelopeV1 {
+                    transport_version: TRANSPORT_VERSION,
+                    cell_id: "sfo3-cell-a".to_string(),
+                    ..Default::default()
+                }),
+                broker_sequence: 918,
+                stream_identity: "DURABLE-sfo3-cell-a".to_string(),
+                stream_epoch: 8,
+                redelivery_count: 1,
+            })),
+        };
+        let decoded = ConsumeEventV1::decode(encode(&event)).expect("a consume event round trips");
+        assert_eq!(decoded, event);
     }
 
     /// A guard for the guards: the block extractor must actually scope, or

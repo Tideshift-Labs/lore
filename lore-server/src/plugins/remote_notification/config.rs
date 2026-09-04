@@ -110,15 +110,30 @@ pub const PRODUCER_INSTANCE_ID_MAX_BYTES: usize = 128;
 /// fenced transaction against the membership counter that every other writer
 /// also serialises on. The defaults report at most once a second and at least
 /// once every 256 applied events.
-const CHECKPOINT_INTERVAL_MIN_MS: u64 = 100;
+///
+/// The floor is one millisecond rather than a sensible production minimum, for
+/// the reason [`IDLE_POLL_MIN_MS`] gives: a bound that doubles as a
+/// recommendation blocks the component tests that exercise the time-based
+/// cadence, and the recommendation belongs in the default and the diagnostics
+/// instead. Zero remains rejected, because a zero interval checkpoints on
+/// every single event and turns the projection into the hot path.
+const CHECKPOINT_INTERVAL_MIN_MS: u64 = 1;
 const CHECKPOINT_INTERVAL_MAX_MS: u64 = 300_000;
 const CHECKPOINT_INTERVAL_DEFAULT_MS: u64 = 1_000;
 const CHECKPOINT_EVERY_EVENTS_MIN: u64 = 1;
 const CHECKPOINT_EVERY_EVENTS_MAX: u64 = 100_000;
 const CHECKPOINT_EVERY_EVENTS_DEFAULT: u64 = 256;
 
-/// Bounds on the idle poll interval. A zero poll would spin.
-const IDLE_POLL_MIN_MS: u64 = 10;
+/// Bounds on the idle poll interval.
+///
+/// The floor exists to stop a busy loop, and only zero is one: at one
+/// millisecond the receiver still yields between reads. It is deliberately not
+/// set to a "sensible production minimum", because a floor that also has to be
+/// a recommendation ends up blocking component tests that want a tight loop,
+/// and a test that cannot run fast gets deleted rather than tuned. The
+/// production guidance is the default, 250 ms; an operator who sets 1 ms is
+/// asking for a thousand reads a second per replica and the diagnostics say so.
+const IDLE_POLL_MIN_MS: u64 = 1;
 const IDLE_POLL_MAX_MS: u64 = 60_000;
 const IDLE_POLL_DEFAULT_MS: u64 = 250;
 

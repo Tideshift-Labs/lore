@@ -82,11 +82,13 @@ use super::config::ReceiverConfig;
 use super::config::RemoteNotificationConfig;
 use super::frontier::AckFrontier;
 use super::metrics;
+use super::stream::CaptureRequest;
 use super::stream::CapturedStreamPosition;
 use super::stream::DeliveredEnvelope;
 use super::stream::DurableStreamSource;
 use super::stream::StreamDelivery;
 use super::stream::StreamError;
+use super::stream::StreamPlacement;
 use crate::plugins::PluginError;
 
 /// The closed readiness-reason set.
@@ -107,6 +109,8 @@ pub const REASON_STORE_UNAVAILABLE: &str = "store_unavailable";
 pub const REASON_POISON_PARKED: &str = "poison_parked";
 /// The authoritative placement moved; this generation is retired.
 pub const REASON_PLACEMENT_MOVED: &str = "placement_moved";
+/// The cell has no authoritative placement recorded yet.
+pub const REASON_NO_CURRENT_PLACEMENT: &str = "no_current_placement";
 /// The configuration was rejected by the durable store.
 pub const REASON_CONFIGURATION_REJECTED: &str = "configuration_rejected";
 /// The task was cancelled.
@@ -515,6 +519,29 @@ impl DurableReceiver {
         }
         let cell_membership_version = snapshot.state.membership_version;
 
+        // The placement this receiver will assert to the gateway. Both are
+        // required: A-24's `ConsumeRequestV1` carries the identity, epoch, and
+        // revision the receiver believes authoritative, so a disagreement is
+        // refused at the capture rather than discovered at the readiness
+        // compare-and-set several steps later. A cell whose placement is not
+        // set yet has not finished its own install, which resolves without
+        // this receiver doing anything, so it waits rather than failing.
+        let (Some(stream_identity), Some(stream_epoch)) = (
+            snapshot.state.current_stream_identity.clone(),
+            snapshot.state.current_stream_epoch,
+        ) else {
+            debug!(
+                cell_id = %self.cell_id,
+                "the cell has no current placement yet; waiting rather than capturing"
+            );
+            return Err(BootstrapFailure::Transient(REASON_NO_CURRENT_PLACEMENT));
+        };
+        let placement = StreamPlacement {
+            stream_identity,
+            stream_epoch,
+        };
+        let placement_revision = snapshot.state.current_placement_revision;
+
         // 2. Take this generation. Reusing an uncaptured one is not an
         //    optimisation.
         //
@@ -605,10 +632,29 @@ impl DurableReceiver {
         }
 
         // 3. Capture the durable consumer's position, BEFORE the baseline.
+        //
+        //    Always `capture_new`. Resuming a captured position is the
+        //    contract's crash/retry case and the wire supports it, but doing it
+        //    correctly needs this generation's PERSISTED frontier read back:
+        //    the broker does not redeliver a sequence this generation already
+        //    acknowledged, so a resume that rebuilt its frontier from the
+        //    capture would stall at the first such sequence and never advance
+        //    again. The reuse above is therefore restricted to generations that
+        //    never captured, where there is no frontier to lose.
+        //
+        //    TODO(WP-111): add `read_checkpoint` to `ReceiverStore` and resume
+        //    a captured generation from its persisted frontier, using
+        //    `CaptureRequest::resume_from`.
         let captured = self
             .runtime
             .stream
-            .capture(identity, membership_generation)
+            .capture(&CaptureRequest {
+                receiver_identity: identity.to_string(),
+                membership_generation,
+                placement: placement.clone(),
+                placement_revision,
+                resume_from: None,
+            })
             .await
             .map_err(stream_failure)?;
 

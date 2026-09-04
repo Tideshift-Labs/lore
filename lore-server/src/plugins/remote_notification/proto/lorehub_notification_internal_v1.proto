@@ -7,27 +7,29 @@
 // links against it, and it must never be added to `lore-proto`'s public proto
 // set. If upstream ever adds a `lorehub.*` or `*.notification.internal.*`
 // package, reconcile the package name, the message and enum tags, and the
-// pinned method path below before regenerating.
+// pinned method paths below before regenerating.
 //
-// Pinned method path:
+// Pinned method paths:
 //   /lorehub.notification.internal.v1.PrivateNotificationService/Publish
+//   /lorehub.notification.internal.v1.PrivateNotificationService/Consume
+//   /lorehub.notification.internal.v1.PrivateNotificationService/Ack
 //
-// PIN(WP-111): the notification-plane contract
-// (lorehub/docs/contracts/lore-notification-plane.md) freezes the private
-// envelope's FIELD SEMANTICS and BOUNDS, but its conformance fixtures state
-// that "the private envelope's concrete schema artifact and field numbering are
-// WP-110 Phase 1 work"; only the Phase 0 StreamReset messages carry pinned
-// field numbers today. Everything below is therefore this component's
-// conservative reading, chosen to mirror the frozen StreamReset schema's
-// conventions: package `lorehub.notification.internal.v1`, `V1`-suffixed
-// message names, an explicit `*_UNSPECIFIED = 0` on every enum, and field order
-// following the contract's own field tables. WP-110 Phase 1 supersedes it.
+// THIS FILE IS A MIRROR, NOT A SOURCE. The authoritative copy is
+// `lorehub/apps/notification-gateway/proto/lorehub_notification_internal_v1.proto`,
+// and everything below this header is byte-identical to it. Contract amendment
+// A-20 froze the envelope and Publish; A-24 froze the receiver stream. Both
+// make divergence between the two copies a contract amendment plus a
+// coordinated change on BOTH sides, never a local edit: field numbers here are
+// the wire, and a renumbering that compiles on one side silently misparses on
+// the other.
 //
-// This file is a reviewed source-of-record artifact. It is NOT compiled by
-// `build.rs`: `protoc` is optional in this workspace, and `lore-server`'s build
-// script is common WP-119 territory. `wire.rs` is the hand-maintained
-// prost/tonic transcription of exactly this schema, and the tests in that
-// module pin the two together.
+// To re-mirror after an amendment, replace everything from `syntax` down with
+// the gateway copy's, verbatim, and leave this header alone.
+//
+// This file is not compiled by `build.rs`: `protoc` is optional in this
+// workspace, and `lore-server`'s build script is common WP-119 territory.
+// `wire.rs` is the hand-maintained prost/tonic transcription of exactly this
+// schema, and the tests in that module pin the two together.
 
 syntax = "proto3";
 
@@ -161,16 +163,239 @@ message PublishResultV1 {
   PublishFailureClassV1 failure_class = 9;
 }
 
+// ---------------------------------------------------------------------------
+// The private receiver stream, frozen by contract amendment A-24 (2026-09-03).
+//
+// Two pinned method paths:
+//   /lorehub.notification.internal.v1.PrivateNotificationService/Consume
+//   /lorehub.notification.internal.v1.PrivateNotificationService/Ack
+//
+// The durable consumer is CELL-WIDE over the cell's `.durable` subjects, not
+// per repository. That is what makes `broker_sequence` dense over one
+// receiver's responsibility, and therefore what makes the contiguous frontier
+// a real statement rather than an artefact of subject filtering.
+//
+// EVERY uint64 on this surface is bounded above by i64::MAX. The Lore-side
+// receiver stores each of them in an `i64` (lore-postgres
+// `domain/outbox/{membership,checkpoint}.rs`), so a value above i64::MAX is
+// MALFORMED_RECEIVER_REQUEST_V1 rather than a silently wrapped number.
+// ---------------------------------------------------------------------------
+
+// Resume from a position a previous generation already captured. The stream
+// identity and epoch are the request's own; only the sequence lives here,
+// because a captured position that disagreed with the request's placement
+// would be two facts pretending to be one.
+message CapturedPositionV1 {
+  // The first broker sequence this generation is responsible for. >= 1.
+  uint64 start_sequence = 1;
+}
+
+// Capture a new durable consumer at the current edge of the request's
+// placement. Deliberately empty: the placement is already on the request, and
+// the captured sequence is the gateway's answer, never the caller's claim.
+message CaptureNewV1 {}
+
+// Open one durable receiver stream.
+message ConsumeRequestV1 {
+  // Exactly 1 for this contract version.
+  uint32 transport_version = 1;
+  // Matches ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$, at most 63 bytes. Compared against
+  // the mTLS-derived cell; a disagreement is CROSS_CELL_RECEIVER_V1.
+  string cell_id = 2;
+  // Stable configured receiver identity, 1 to 128 UTF-8 bytes. Caller-supplied
+  // and never authority on its own: authority is the mTLS cell plus the
+  // `receiver` role.
+  string receiver_identity = 3;
+  // Monotonic receiver lifecycle generation. >= 1; 0 is the reset fence's
+  // placeholder and is never consumable.
+  uint64 membership_generation = 4;
+  // The stream this generation believes is authoritative, 1 to 128 UTF-8
+  // bytes. Must be the cell's DURABLE stream.
+  string stream_identity = 5;
+  // The epoch this generation believes is authoritative. >= 1.
+  uint64 stream_epoch = 6;
+  // The placement record version the receiver read. >= 1.
+  uint64 placement_revision = 7;
+
+  // Exactly one start mode. An unset oneof is MALFORMED_RECEIVER_REQUEST_V1.
+  oneof start {
+    CapturedPositionV1 captured_position = 8;
+    CaptureNewV1 capture_new = 9;
+  }
+}
+
+// The first message on EVERY Consume stream, in both start modes, before any
+// delivery. On `captured_position` it echoes the requested triple verbatim; a
+// gateway that cannot echo it exactly fails the stream instead.
+message ConsumeCaptureV1 {
+  string stream_identity = 1;
+  uint64 stream_epoch = 2;
+  // The first sequence this generation is responsible for. >= 1.
+  uint64 start_sequence = 3;
+  // The JetStream durable name the gateway derived. Exactly 44 ASCII
+  // characters; see the contract's "Private receiver stream" section for the
+  // byte-exact derivation.
+  string durable_consumer_name = 4;
+  // The placement revision the gateway validated the request against.
+  uint64 placement_revision = 5;
+}
+
+// One durable event delivered in broker order.
+message ConsumeDeliveryV1 {
+  PrivateEnvelopeV1 envelope = 1;
+  // The JetStream sequence assigned within (stream_identity, stream_epoch).
+  uint64 broker_sequence = 2;
+  // The placement this message was served from. Carried per message so a
+  // silent epoch change cannot be applied as ordinary traffic. A receiver that
+  // sees either differ from its capture applies nothing and retires.
+  string stream_identity = 3;
+  uint64 stream_epoch = 4;
+  // JetStream's delivery count MINUS ONE: 0 on a first delivery, 1 on the
+  // first redelivery. Diagnostic only; never an ordering or poison decision.
+  uint32 redelivery_count = 5;
+}
+
+// Nothing pending at or before the current edge. During a bootstrap drain this
+// is the terminating condition; in steady state it means idle.
+message ConsumeCaughtUpV1 {
+  // The stream's current last sequence, or 0 when the stream is empty.
+  // Diagnostic: a receiver never advances a frontier from this value.
+  uint64 edge_sequence = 1;
+}
+
+// One message on the Consume stream.
+message ConsumeEventV1 {
+  // Exactly 1.
+  uint32 transport_version = 1;
+
+  // Exactly one arm. An unset oneof is a malformed server response and is
+  // never applied.
+  oneof event {
+    ConsumeCaptureV1 capture = 2;
+    ConsumeDeliveryV1 delivery = 3;
+    ConsumeCaughtUpV1 caught_up = 4;
+  }
+}
+
+// One unresolved sequence range, inclusive at both ends, with from <= to.
+message SequenceGapV1 {
+  uint64 from = 1;
+  uint64 to = 2;
+}
+
+// One parked poison disposition.
+message PoisonEntryV1 {
+  uint64 broker_sequence = 1;
+  // Bounded classification, at most 64 UTF-8 bytes: `UNSUPPORTED_SCHEMA`,
+  // `INVALID_SCOPE`, and the like. Never a message, never operator prose,
+  // never an identifier.
+  string poison_class = 2;
+}
+
+// Acknowledge applied sequences and report this generation's frontier.
+//
+// The gateway is an ACK relay, not a checkpoint authority: `contiguous_frontier`,
+// `gaps`, and `poison` are reported state it may use for lag and readiness
+// signals, and the authoritative checkpoint vector remains the cell Postgres
+// projection the receiver writes in its own transaction.
+message AckV1 {
+  // Exactly 1.
+  uint32 transport_version = 1;
+  string cell_id = 2;
+  string receiver_identity = 3;
+  uint64 membership_generation = 4;
+  string stream_identity = 5;
+  uint64 stream_epoch = 6;
+  // Sequences to acknowledge on the durable consumer. 1 to 1024 entries, each
+  // >= 1. Re-acknowledging an already-acknowledged sequence is normal under
+  // at-least-once delivery and is accepted, never an error.
+  repeated uint64 acked_sequences = 7;
+  // The highest sequence at or below which every event is applied or refetched.
+  // It never advances across an unresolved gap. 0 means none yet.
+  uint64 contiguous_frontier = 8;
+  // Unresolved ranges. At most 256 entries.
+  repeated SequenceGapV1 gaps = 9;
+  // Unresolved poison dispositions. At most 256 entries.
+  repeated PoisonEntryV1 poison = 10;
+}
+
+// Outcome class of one Ack call.
+enum AckOutcomeV1 {
+  ACK_OUTCOME_V1_UNSPECIFIED = 0;
+  // Every sequence in the call was acknowledged on the broker.
+  ACK_ALL_ACCEPTED = 1;
+  // Some were acknowledged; `rejected_sequences` names the rest. The caller
+  // retains the rejected ones and retries them.
+  ACK_PARTIALLY_ACCEPTED = 2;
+  // Nothing was acknowledged; retry the whole call with backoff.
+  ACK_RETRYABLE = 3;
+  // Nothing was acknowledged and retrying this call cannot succeed.
+  ACK_TERMINAL = 4;
+}
+
+// Why a receiver request was refused. Shared by Consume and Ack so one mapping
+// table serves both. The zero value is never returned; its presence in a
+// response is itself a malformed-response signal.
+enum ReceiverErrorV1 {
+  RECEIVER_ERROR_V1_UNSPECIFIED = 0;
+  // -> INVALID_ARGUMENT
+  MALFORMED_RECEIVER_REQUEST_V1 = 1;
+  // -> INVALID_ARGUMENT
+  UNSUPPORTED_RECEIVER_SCHEMA_V1 = 2;
+  // -> UNAUTHENTICATED
+  UNAUTHENTICATED_RECEIVER_V1 = 3;
+  // -> PERMISSION_DENIED
+  UNAUTHORIZED_RECEIVER_ROLE_V1 = 4;
+  // -> PERMISSION_DENIED
+  CROSS_CELL_RECEIVER_V1 = 5;
+  // -> PERMISSION_DENIED
+  RECEIVER_SCOPE_MISMATCH_V1 = 6;
+  // -> FAILED_PRECONDITION
+  RECEIVER_PLACEMENT_MISMATCH_V1 = 7;
+  // -> FAILED_PRECONDITION
+  RECEIVER_EPOCH_MISMATCH_V1 = 8;
+  // -> FAILED_PRECONDITION
+  STALE_MEMBERSHIP_GENERATION_V1 = 9;
+  // -> FAILED_PRECONDITION
+  UNKNOWN_DURABLE_CONSUMER_V1 = 10;
+  // -> UNAVAILABLE
+  RECEIVER_BROKER_UNAVAILABLE_V1 = 11;
+}
+
+// Result of one Ack call.
+message AckResultV1 {
+  // Exactly 1.
+  uint32 transport_version = 1;
+  AckOutcomeV1 outcome = 2;
+  // The subset of `acked_sequences` the broker acknowledged.
+  repeated uint64 accepted_sequences = 3;
+  // The subset it did not. The caller retains these.
+  repeated uint64 rejected_sequences = 4;
+  // Set only when outcome is not ACK_ALL_ACCEPTED.
+  ReceiverErrorV1 failure_class = 5;
+}
+
 // The private gateway's publication service. Authenticated by the cell's
 // private mTLS identity; the gateway maps that identity to exactly one cell and
 // role. Never exposed to a desktop client.
 service PrivateNotificationService {
   // Publishes one private envelope. The gateway waits for JetStream
   // acknowledgement before returning ACCEPTED.
+  //
+  // Caller role: `relay` or `gateway`.
   rpc Publish (PrivateEnvelopeV1) returns (PublishResultV1);
+
+  // Opens one durable receiver stream. The first message is always a
+  // ConsumeCaptureV1; deliveries and caught-up answers follow.
+  //
+  // Caller role: `receiver`.
+  rpc Consume (ConsumeRequestV1) returns (stream ConsumeEventV1);
+
+  // Acknowledges applied sequences and reports the generation's frontier.
+  //
+  // Caller role: `receiver`.
+  rpc Ack (AckV1) returns (AckResultV1);
 }
 
-// TODO(WP-111 Phase 3): the durable receiver attaches here. WP-110 owns the
-// receiver-side stream (subscription, delivery, acknowledgement) and WP-119
-// owns /lorehub.notification.internal.v1.StreamResetService, which this
-// component consumes but does not host. Neither is vendored this round.
+// WP-119 owns /lorehub.notification.internal.v1.StreamResetService, which this
+// component consumes but does not host. It is not vendored here.
