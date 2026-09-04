@@ -32,6 +32,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use lore_base::types::Context;
+use lore_base::types::Hash;
+use lore_base::types::KeyType;
+use lore_base::types::RepositoryId;
 use lore_postgres::domain::DatabaseIdentity;
 use lore_postgres::domain::DomainSchemaState;
 use lore_postgres::domain::bypass::DomainEnforcement;
@@ -42,12 +46,17 @@ use lore_postgres::domain::coordinator::GovernedOperation;
 use lore_postgres::domain::coordinator::MetadataCasInput;
 use lore_postgres::domain::coordinator::PendingEvent;
 use lore_postgres::domain::coordinator::ProjectionWrite;
+use lore_postgres::domain::coordinator::RepositoryCreateInput;
 use lore_postgres::domain::errors::DomainOutcome;
 use lore_postgres::domain::fragments::PostgresFragmentCoordinator;
 use lore_postgres::domain::locks::LockFencingReadiness;
 use lore_postgres::domain::locks::PostgresLockCoordinator;
+use lore_postgres::domain::outbox::builders as outbox_builders;
 use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::ReceiptKey;
+use lore_revision::branch;
+use lore_revision::repository;
+use lore_storage::hash;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
 use tracing::debug;
@@ -497,6 +506,371 @@ impl GovernedMetadataCas {
                 other => Err(crate::grpc::map_domain_rejection_to_status(other)),
             },
         }
+    }
+}
+
+/// Everything one repository create publishes, as the handler validated it.
+///
+/// Both blobs this names are already in the immutable store by the time a
+/// [`GovernedRepositoryCreate::commit`] call is made. That ordering is the
+/// whole point of taking hashes here rather than metadata: the transaction
+/// commits pointers to content that already exists, so it can never publish a
+/// pointer to a blob a later failure prevented from being written. The reverse
+/// failure — a blob written, then the transaction refused — leaves an orphan
+/// blob in a content-addressed store, which is unreferenced, harmless, and the
+/// side of the trade CR-029's side-effect boundary deliberately chooses.
+pub struct RepositoryCreatePublication<'a> {
+    /// Repository-format salt, from the target `RepositoryContext`.
+    ///
+    /// Taken from the context rather than hardcoded to `SALT_LORE`, so the
+    /// governed projection rows are byte-identical to the keys the legacy
+    /// writers derive on the same repository.
+    pub salt: &'a [u8],
+    /// 16-byte repository identity.
+    pub repository_id: &'a [u8],
+    /// Exact repository name. Repository names do not fold case.
+    pub name: &'a str,
+    /// 32-byte repository metadata pointer, already published.
+    pub metadata_hash: &'a [u8],
+    /// 16-byte default-branch identity.
+    pub default_branch_id: &'a [u8],
+    /// Default branch name, as authored. The live-name key folds case.
+    pub default_branch_name: &'a str,
+    /// 32-byte default-branch metadata pointer, already published.
+    pub default_branch_metadata_hash: &'a [u8],
+    /// 32-byte default-branch tip. The zero hash on a fresh create.
+    pub default_branch_latest_hash: &'a [u8],
+}
+
+impl RepositoryCreatePublication<'_> {
+    /// The five `lore_mutable` rows a create writes today, rebuilt exactly.
+    ///
+    /// The legacy path writes these through four separate unsynchronised store
+    /// calls (`repository::metadata_store_hash`, `repository::store_name_to_id`,
+    /// and two inside `branch::create`), which is WP-119 inventory rows R1/R2
+    /// and disagreement D3: the repository metadata pointer is published with a
+    /// blind store rather than a compare-and-swap, so two concurrent creates
+    /// race and the loser's pointer can survive. Handing the same rows to the
+    /// coordinator is what removes that second unfenced writer — the rows now
+    /// commit with the domain rows or not at all.
+    ///
+    /// The two name keys normalize **differently** and that is not an
+    /// oversight: `repository::mutable_name_key` hashes the exact name while
+    /// `branch::mutable_name_key` hashes its lowercase form. Two
+    /// identically-shaped private helpers with different normalization is a
+    /// recorded fork hazard; both are reproduced here from their own module's
+    /// rule rather than from the other's.
+    ///
+    /// The two legacy primitives disagree about a zero value, so this cannot
+    /// use one rule for all five rows. `MutableStore::store` treats the null
+    /// hash as a delete, while `compare_and_swap` **retains a zero-valued
+    /// row** — the Postgres store says so at its own INSERT, and the local
+    /// store matches it — because a later zero-expected CAS uses that row as
+    /// its predecessor. Four of these rows are written by `store` and the
+    /// branch tip is written by `compare_and_swap`, which is the one that is
+    /// actually zero on a fresh create. So the tip row is an explicit
+    /// zero-valued row, not a delete.
+    fn projection(&self) -> Vec<ProjectionWrite> {
+        let repository_hex = hex::encode(self.repository_id);
+        let branch_hex = hex::encode(self.default_branch_id);
+        // The four `store`-backed rows. A zero value here would be a delete,
+        // matching `store`'s null-hash contract; none of them is reachable with
+        // a zero value on a real create, since a metadata pointer is a content
+        // hash and both identities are non-zero.
+        let stored =
+            |key: Hash, key_type: KeyType, value: &[u8], partition: Vec<u8>| ProjectionWrite {
+                partition,
+                key_type: key_type as i16,
+                key: key.as_ref().to_vec(),
+                value: if value.iter().all(|byte| *byte == 0) {
+                    None
+                } else {
+                    Some(value.to_vec())
+                },
+            };
+        let repository_partition = self.repository_id.to_vec();
+        // The repository name index is global, not per-repository: the legacy
+        // writer stores it under the zero partition so a name can be resolved
+        // to an ID without already knowing the ID.
+        let global_partition = RepositoryId::default().data().to_vec();
+        vec![
+            stored(
+                hash::hash_function_arg(self.salt, repository::METADATA, &repository_hex),
+                KeyType::RepositoryMetadata,
+                self.metadata_hash,
+                repository_partition.clone(),
+            ),
+            stored(
+                hash::hash_function_arg(self.salt, repository::ID, self.name),
+                KeyType::RepositoryId,
+                Hash::from_context(Context::from(self.repository_id)).as_ref(),
+                global_partition,
+            ),
+            stored(
+                hash::hash_function_args(self.salt, branch::METADATA, &repository_hex, &branch_hex),
+                KeyType::BranchMetadata,
+                self.default_branch_metadata_hash,
+                repository_partition.clone(),
+            ),
+            stored(
+                hash::hash_function_arg(
+                    self.salt,
+                    branch::ID,
+                    &self.default_branch_name.to_lowercase(),
+                ),
+                KeyType::BranchId,
+                Hash::from_context(Context::from(self.default_branch_id)).as_ref(),
+                repository_partition.clone(),
+            ),
+            // The compare-and-swap-backed row. `branch::store_latest` reaches
+            // `compare_and_swap`, which writes the value verbatim even when it
+            // is the null hash, so a fresh create leaves a zero-valued row
+            // rather than no row. `load` reads the two identically and a
+            // zero-expected CAS accepts either, but writing a delete here would
+            // still leave the governed and legacy paths with different table
+            // contents for the same create.
+            ProjectionWrite {
+                partition: repository_partition,
+                key_type: KeyType::BranchLatestPointer as i16,
+                key: hash::hash_function_args(
+                    self.salt,
+                    branch::LATEST,
+                    &repository_hex,
+                    &branch_hex,
+                )
+                .as_ref()
+                .to_vec(),
+                value: Some(self.default_branch_latest_hash.to_vec()),
+            },
+        ]
+    }
+}
+
+/// What a governed repository create committed.
+pub struct RepositoryCreateOutcome {
+    /// Repository generation this transaction committed, or the existing one an
+    /// exact retry found. `None` only when the coordinator reported an already
+    /// committed receipt whose generation it does not retain.
+    pub repository_generation: Option<i64>,
+    /// The committed metadata pointer, read back from the domain row rather
+    /// than assumed to be the one this call published.
+    ///
+    /// On a fresh create the two are the same. On an exact retry they can
+    /// differ, because a metadata compare-and-swap may have moved the pointer
+    /// between the original create and this retry — and the caller is owed the
+    /// repository that exists, not a pointer that was current once.
+    pub metadata_hash: Hash,
+}
+
+/// The governed repository-create seam, shared by the v0 and v1 create sites.
+///
+/// Repository create exists twice on the wire and the two handlers differ only
+/// in their request and response shapes: v0 takes a caller-supplied `created`
+/// timestamp and a plain `creator` string, v1 assigns the timestamp and treats
+/// `creator` as optional. Everything between admission and the coordinator —
+/// the projection rows, both classified events, the input, and the outcome
+/// mapping — is identical, so it lives here once, for the same reason
+/// [`GovernedMetadataCas`] does: two copies of a governed mutation path is how
+/// the two come to mean different things.
+pub struct GovernedRepositoryCreate {
+    domain: Arc<DomainContext>,
+    operation: GovernedOperation,
+}
+
+impl GovernedRepositoryCreate {
+    /// Prepare the governed call, or `Ok(None)` for the ungoverned path.
+    ///
+    /// `digest` is the 32 bytes `canonical_intent_digest` returns for
+    /// `CanonicalIntent::RepositoryCreate`, computed by the handler from its
+    /// own validated wire values. Lore never accepts a body- or
+    /// handler-supplied digest.
+    ///
+    /// # Carriage with enforcement off is refused
+    ///
+    /// A cell whose coordinator exists but is not enforcing still writes the
+    /// generic mutable path unfenced (`reject_domain_key` only refuses a
+    /// domain-owned key while enforcement is on). Admitting a governed create
+    /// there would put two writers on the same five keys under two different
+    /// lock disciplines — the coordinator's row locks and the mutable store's
+    /// per-key advisory lock — and `lore_mutable` could keep the loser's value.
+    /// The owner's 2026-09-03 ruling closes that at the gate rather than by
+    /// adding a lock: a cell that is not enforcing does not admit a governed
+    /// create at all. `FAILED_PRECONDITION` rather than a silent downgrade to
+    /// the legacy path, because the caller asked for governed semantics and
+    /// would otherwise get today's unsynchronised writes while believing its
+    /// operation had been receipted.
+    pub fn prepare(
+        domain: Option<&Arc<DomainContext>>,
+        admitted: Option<AdmittedOperation>,
+        method: &'static str,
+        digest: Vec<u8>,
+    ) -> Result<Option<Self>, Status> {
+        let Some(admitted) = admitted else {
+            return Ok(None);
+        };
+        let Some(domain) = domain else {
+            // Unreachable in practice: `admit_at_entry` returns `None` when
+            // there is no coordinator. Refusing rather than asserting keeps
+            // that an enforced property instead of an assumed one.
+            return Err(Status::failed_precondition(
+                "Domain coordinator is unavailable",
+            ));
+        };
+        if !domain.enforcement_enabled() {
+            warn!(
+                method,
+                operation_id = %admitted.key.operation_id,
+                "Refusing a governed repository create on a cell that is not enforcing"
+            );
+            return Err(Status::failed_precondition(
+                "Governed repository create requires domain enforcement on this cell",
+            ));
+        }
+        Ok(Some(Self {
+            domain: domain.clone(),
+            operation: admitted.into_governed(method, digest),
+        }))
+    }
+
+    /// Commit the domain rows, every projection row, and both classified
+    /// events in one transaction.
+    ///
+    /// The immutable-store blob writes and the ReBAC `CreateResource` callback
+    /// have already happened by the time this is called, and neither is
+    /// reachable from inside the transaction: the coordinator's methods take
+    /// plain data and a transaction, with no store handle, auth client, or
+    /// network client (CR-029 R-SHOULD-4).
+    pub async fn commit(
+        &self,
+        publication: &RepositoryCreatePublication<'_>,
+    ) -> Result<RepositoryCreateOutcome, Status> {
+        // CR-032 classifies a repository create as two committed transitions,
+        // not one: "Repository live publication" and "Branch create". The
+        // reservation and verification work that precedes it — the private
+        // claim, the authorization ticket, the active-only catalog row — emits
+        // no Lore outbox row at all, so nothing here represents it.
+        //
+        // `None` when this cell has no configured identity; see
+        // `DomainContext::cell_id`. A cell with no `cell_id` still mutates and
+        // simply produces no outbox rows.
+        let events = match self.domain.cell_id() {
+            Some(cell_id) => vec![
+                outbox_builders::repository_published(
+                    cell_id,
+                    publication.repository_id,
+                    publication.name,
+                    publication.default_branch_id,
+                    publication.default_branch_name,
+                )
+                .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?,
+                outbox_builders::branch_created(
+                    cell_id,
+                    publication.repository_id,
+                    publication.default_branch_id,
+                    publication.default_branch_name,
+                    publication.default_branch_latest_hash,
+                )
+                .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?,
+            ],
+            None => Vec::new(),
+        };
+        let input = RepositoryCreateInput {
+            repository_id: publication.repository_id.to_vec(),
+            name: publication.name.to_owned(),
+            metadata_hash: publication.metadata_hash.to_vec(),
+            default_branch_id: publication.default_branch_id.to_vec(),
+            default_branch_name: publication.default_branch_name.to_owned(),
+            default_branch_metadata_hash: publication.default_branch_metadata_hash.to_vec(),
+            default_branch_latest_hash: publication.default_branch_latest_hash.to_vec(),
+            // The canonical intent digest *is* the creation fingerprint. It is
+            // exactly the 32 bytes the domain row's CHECK requires, and it is
+            // already the one frozen definition of "the caller-known create
+            // intent" shared with the control plane — so an exact retry matches
+            // by construction and a same-ID create with different intent cannot
+            // match by accident. Minting a second fingerprint here would be a
+            // second definition of the same thing.
+            creation_fingerprint: self.operation.binding.canonical_intent_digest.clone(),
+            creation_fingerprint_version: CREATION_FINGERPRINT_VERSION_V1,
+            projection: publication.projection(),
+            events,
+        };
+        let result = self
+            .domain
+            .store()
+            .repository_create(&self.operation, &input)
+            .await
+            .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?;
+        match result.outcome {
+            DomainOutcome::Applied => {}
+            DomainOutcome::NotApplied { reason, .. } => {
+                return Err(map_repository_create_rejection(reason.as_str()));
+            }
+        }
+
+        // Read the committed pointer back rather than reporting the one this
+        // call published. They are the same on a fresh create; on an exact
+        // retry of a create whose metadata has since moved, the domain row is
+        // the repository that exists and the published hash is stale.
+        //
+        // Deliberately best-effort. The transaction has already committed, so a
+        // failure here says nothing about the mutation, and turning it into an
+        // error would report a durable success as a failure — the one thing
+        // CR-029's outcome rules never permit. A read failure or a missing row
+        // falls back to the pointer this call published, which is exactly right
+        // on the fresh-create path and at worst stale on a retry.
+        let metadata_hash = match self
+            .domain
+            .store()
+            .repository_snapshot(publication.repository_id)
+            .await
+        {
+            Ok(Some(snapshot)) => Hash::from(snapshot.metadata_hash.as_slice()),
+            Ok(None) => Hash::from(publication.metadata_hash),
+            Err(error) => {
+                warn!(
+                    %error,
+                    "Governed repository create committed, but reading its metadata pointer back \
+                     failed; reporting the published pointer"
+                );
+                Hash::from(publication.metadata_hash)
+            }
+        };
+        Ok(RepositoryCreateOutcome {
+            repository_generation: result.repository_generation,
+            metadata_hash,
+        })
+    }
+}
+
+/// Fingerprint schema version for a create fingerprint that is the v1
+/// canonical-intent digest.
+const CREATION_FINGERPRINT_VERSION_V1: i32 = 1;
+
+/// Map a create-specific rejection, deferring to the shared mapper elsewhere.
+///
+/// Exactly one reason is answered here rather than by
+/// [`crate::grpc::map_domain_rejection_to_status`], because create is the one
+/// operation whose contract for it differs. Everything else — `NAME_TAKEN_V1`
+/// and `FINGERPRINT_MISMATCH_V1` to `ALREADY_EXISTS`, `ADMISSION_REJECTED_V1`
+/// to `FAILED_PRECONDITION`, and an unrecognised reason to `INTERNAL` rather
+/// than a guess — already matches CR-029's create outcomes, and duplicating it
+/// here is how the two mappers would come to disagree.
+///
+/// `TOMBSTONED_V1` is `ALREADY_EXISTS`, not the shared `NOT_FOUND`. CR-029's
+/// repository-create outcome list is explicit — "same ID after tombstone:
+/// `ALREADY_EXISTS`; IDs are permanent" — and the non-disclosure rule the
+/// shared mapper implements is about an operation on a repository the caller
+/// may not know exists. Here the caller chose the identity itself, so the
+/// answer discloses only that its own 128-bit identity is already spent, and
+/// reporting `NOT_FOUND` for a create would be an answer to a question nobody
+/// asked.
+///
+fn map_repository_create_rejection(reason: &str) -> Status {
+    use lore_postgres::domain::coordinator;
+
+    match reason {
+        coordinator::TOMBSTONED_V1 => Status::already_exists(reason.to_owned()),
+        other => crate::grpc::map_domain_rejection_to_status(other),
     }
 }
 
@@ -1874,7 +2248,7 @@ mod tests {
                 creation_fingerprint: binding.fingerprint.clone(),
                 creation_fingerprint_version: binding.fingerprint_version,
                 projection: Vec::new(),
-                event: None,
+                events: Vec::new(),
             };
 
             let result = store.repository_create(&governed, &input).await.expect(

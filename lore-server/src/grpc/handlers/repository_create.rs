@@ -12,6 +12,7 @@ use lore_proto::rebac::CreateResourceRequest;
 use lore_revision::branch;
 use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
+use lore_revision::metadata::Metadata;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
@@ -31,9 +32,12 @@ use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
 use crate::domain::DomainContext;
+use crate::domain::GovernedRepositoryCreate;
 use crate::domain::GovernedScope;
+use crate::domain::RepositoryCreatePublication;
 use crate::domain::admit_at_entry;
-use crate::domain::reject_unwired_governed_operation;
+use crate::domain_intent::CanonicalIntent;
+use crate::domain_intent::canonical_intent_digest;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -68,26 +72,53 @@ pub async fn handler(
 
     // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
     // at handler entry, before any handler logic or authorization side effect.
-    if let Some(admitted) = admit_at_entry(
+    let admitted = admit_at_entry(
         domain_context,
         &request_metadata,
         request_authorization.as_ref(),
         GovernedScope::RepositoryCreate {
             repository_id: &req.id,
         },
-    )? {
-        // WP-116 Part 3 wires this site. It is not blocked on a contract: it
-        // needs the create write set moved off the direct store path and into
-        // `RepositoryCreateInput`'s projection rows, which is WP-116 Phase 4's
-        // "move repository operations" in full. See also the BLOCKED note on
-        // `RepositoryCreateInput::event`, which one `Option` cannot satisfy
-        // because a create commits both a repository publication and a branch
-        // creation.
-        return Err(reject_unwired_governed_operation(
-            &admitted,
-            "lore.RepositoryService/RepositoryCreate",
-        ));
-    }
+    )?;
+
+    // WP-116 Part 3 wires this site through the shared governed create seam.
+    //
+    // The digest is derived here, from this handler's own validated wire
+    // values, through the one shared canonical-intent definition. v0 is
+    // `created_mode = 1`: the caller supplies the timestamp, and its exact
+    // `u64` is bound so two v0 requests differing only in caller time cannot
+    // alias. The handler's frozen size checks run first, because CR-029's
+    // canonical-intent contract hashes only a request that has already
+    // passed them. The name-charset checks stay inside the shared governed
+    // body: they do not change the digest bytes, and a request that fails
+    // them is refused before any receipt is consumed.
+    let governed = match admitted {
+        Some(admitted) => {
+            validate_create_input(
+                req.name.as_str(),
+                req.description.as_str(),
+                req.default_branch_name.as_str(),
+                req.creator.as_str(),
+            )?;
+            let digest = canonical_intent_digest(&CanonicalIntent::RepositoryCreate {
+                repository_id: &req.id,
+                name: req.name.as_str(),
+                description: req.description.as_str(),
+                default_branch_id: &req.default_branch_id,
+                default_branch_name: req.default_branch_name.as_str(),
+                creator: Some(req.creator.as_str()).filter(|creator| !creator.is_empty()),
+                caller_created: Some(req.created),
+            })
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            GovernedRepositoryCreate::prepare(
+                domain_context,
+                Some(admitted),
+                "lore.RepositoryService/RepositoryCreate",
+                digest,
+            )?
+        }
+        None => None,
+    };
 
     let id: RepositoryId = Context::from(req.id).into();
 
@@ -114,19 +145,53 @@ pub async fn handler(
                 .map_err(hook_error_to_status)?;
 
             let default_branch_id = req.default_branch_id.into();
-            let repository = repository_create(
-                repository,
-                req.name.as_str(),
-                req.description.as_str(),
-                default_branch_id,
-                req.default_branch_name.as_str(),
-                req.creator.as_str(),
-                req.created,
-                auth_url,
-                authorization,
-            )
-            .await
-            .inspect_err(|err| warn!(error = ?err, "Repository create failed"))?;
+            let repository = match &governed {
+                Some(governed) => {
+                    // v0 resolves an empty wire creator to the authenticated
+                    // identity for the *repository* metadata only; the branch
+                    // metadata keeps the raw value, because that is exactly
+                    // what this handler passes `branch::create` today and the
+                    // governed path must publish the same blob bytes.
+                    let repository_creator = if req.creator.is_empty() {
+                        execution_context().user_id().await
+                    } else {
+                        req.creator.clone()
+                    };
+                    let (metadata, metadata_hash) = governed_repository_create(
+                        governed,
+                        repository,
+                        req.name.as_str(),
+                        req.description.as_str(),
+                        default_branch_id,
+                        req.default_branch_name.as_str(),
+                        repository_creator.as_str(),
+                        req.creator.as_str(),
+                        req.created,
+                        auth_url,
+                        authorization,
+                    )
+                    .await
+                    .inspect_err(|err| warn!(error = ?err, "Governed repository create failed"))?;
+                    RepositoryData {
+                        id,
+                        name: metadata.name,
+                        metadata: metadata_hash,
+                    }
+                }
+                None => repository_create(
+                    repository,
+                    req.name.as_str(),
+                    req.description.as_str(),
+                    default_branch_id,
+                    req.default_branch_name.as_str(),
+                    req.creator.as_str(),
+                    req.created,
+                    auth_url,
+                    authorization,
+                )
+                .await
+                .inspect_err(|err| warn!(error = ?err, "Repository create failed"))?,
+            };
 
             hook_dispatcher.spawn_post(HookPoint::RepositoryCreate, hook_ctx);
 
@@ -347,6 +412,185 @@ async fn repository_create(
         name: name.to_string(),
         metadata,
     })
+}
+
+/// The governed repository-create body, shared by the v0 and v1 handlers.
+///
+/// This is the CR-029 Phase 4 "move repository operations" path: the same
+/// publication the legacy `repository_create` performs with four unsynchronised
+/// store writes, done as one domain transaction.
+///
+/// # The transaction boundary
+///
+/// Everything with a side effect outside Postgres happens **before** the
+/// transaction opens, in this order:
+///
+/// 1. the frozen size, repository-name, and branch-name checks;
+/// 2. the ReBAC `CreateResource` callback, when auth is on;
+/// 3. both metadata blobs, serialized into the immutable store.
+///
+/// Only then does the coordinator open its transaction, which writes the
+/// repository row, the default-branch row, both name rows, all five
+/// `lore_mutable` projection rows, and both classified outbox events — or none
+/// of them.
+///
+/// The blob writes are before rather than after on purpose: the transaction
+/// then only ever commits pointers to content that already exists. The cost is
+/// two orphan blobs, and it is paid in two places, not one. A create refused or
+/// lost after step 3 leaves them, as expected — but so does every **successful
+/// exact retry on v1**, because v1 assigns `created` itself and the timestamp
+/// is excluded from the canonical intent, so a retry rebuilds both blobs at a
+/// new time, writes them, and then finds the original pointers already
+/// committed. That is accepted and deliberate: an orphan blob in a
+/// content-addressed store is unreferenced and unreachable, whereas a committed
+/// pointer to a blob that was never written is a repository that cannot be
+/// read.
+///
+/// # What is deliberately not done here
+///
+/// The legacy path's four existence early-outs are absent. They read the
+/// mutable projection and answer before any receipt is consumed, which on the
+/// governed rail is the wrong authority and the wrong moment: an exact retry
+/// must reach the coordinator so `begin_admitted` replays its committed
+/// receipt, and a same-ID-different-intent create must be refused by the
+/// creation fingerprint rather than by a name comparison. The coordinator
+/// answers both under the repository row lock.
+///
+/// # Two creator arguments
+///
+/// `repository_creator` is recorded in the repository metadata blob and
+/// `branch_creator` in the default branch's. They are separate because the
+/// legacy path already treats them separately: v0 resolves an empty wire
+/// creator to the authenticated identity for the repository metadata, but hands
+/// `branch::create` the raw wire value. Collapsing them into one argument would
+/// change the branch blob's bytes on exactly the requests where the wire
+/// creator is empty. v1 passes its resolved value to both.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn governed_repository_create(
+    governed: &GovernedRepositoryCreate,
+    repository: Arc<RepositoryContext>,
+    name: &str,
+    description: &str,
+    default_branch_id: Context,
+    default_branch_name: &str,
+    repository_creator: &str,
+    branch_creator: &str,
+    created: u64,
+    auth_url: Option<String>,
+    authorization: Option<String>,
+) -> Result<(RepositoryMetadata, lore_storage::Hash), Status> {
+    // `branch_creator` rather than `repository_creator` is the value the legacy
+    // path checks on both versions: v0 validates its raw wire creator and v1
+    // its resolved one, which is exactly what this argument carries in each
+    // case. Checking the other one would tighten v0 and loosen nothing.
+    validate_create_input(name, description, default_branch_name, branch_creator)?;
+
+    if !repository::is_valid_name(name) {
+        return Err(Status::invalid_argument("Invalid repository name"));
+    }
+
+    // A name that parses as a non-zero ID must be this repository's own ID, or
+    // it would alias one identity under another's name.
+    if let Ok(name_id) = Context::from_str(name)
+        && !name_id.is_zero()
+        && RepositoryId::from(name_id) != repository.id
+    {
+        return Err(Status::invalid_argument("Invalid repository name"));
+    }
+
+    // `branch::create` makes this the first thing it checks. The governed path
+    // does not call it, so the check has to be repeated rather than inherited —
+    // and it must run before the ReBAC callback, since a refused branch name
+    // would otherwise leave an auth resource for a repository that was never
+    // published.
+    if !branch::is_valid_name(default_branch_name) {
+        return Err(Status::invalid_argument("Invalid branch name"));
+    }
+
+    if let Some(auth_url) = auth_url {
+        let client = Box::new(grpc_get_rebac_client(auth_url).await?);
+        repository_create_auth_resource(client, authorization, repository.id, name).await?;
+    }
+
+    let metadata = RepositoryMetadata {
+        name: name.to_string(),
+        description: description.to_string(),
+        default_branch: default_branch_id,
+        default_branch_name: default_branch_name.to_string(),
+        creator: repository_creator.to_string(),
+        created,
+    };
+    let metadata_hash = repository::metadata_store(repository.clone(), metadata.clone())
+        .await
+        .warn_map_err(|err| {
+            Status::internal(format!("Failed to serialize repository metadata: {err}"))
+        })?;
+
+    // The default branch's own metadata blob. `branch::create` builds this and
+    // then writes the mutable pointer itself; the governed path builds the same
+    // blob and hands the pointer to the coordinator instead.
+    let mut branch_metadata = Metadata::new();
+    branch::metadata_populate(
+        &mut branch_metadata,
+        default_branch_id,
+        default_branch_name,
+        branch::default_category(),
+        branch_creator,
+        created,
+        Vec::new(),
+    )
+    .map_err(|err| {
+        warn_error_to_status(&err, |err| {
+            Status::internal(format!("Failed to populate default branch metadata: {err}"))
+        })
+    })?;
+    let branch_metadata_hash = branch_metadata
+        .serialize(repository.clone())
+        .await
+        .warn_map_err(|err| {
+            Status::internal(format!(
+                "Failed to serialize default branch metadata: {err}"
+            ))
+        })?;
+
+    // A repository create has no branch point, so `branch::create` publishes
+    // the default branch at the zero tip. The zero hash is the store's delete
+    // sentinel, which is why the projection row for it is a delete rather than
+    // a row of zero bytes.
+    let default_branch_latest_hash = lore_storage::Hash::default();
+
+    let outcome = governed
+        .commit(&RepositoryCreatePublication {
+            salt: repository.salt(),
+            repository_id: repository.id.data(),
+            name,
+            metadata_hash: metadata_hash.as_ref(),
+            default_branch_id: default_branch_id.data(),
+            default_branch_name,
+            default_branch_metadata_hash: branch_metadata_hash.as_ref(),
+            default_branch_latest_hash: default_branch_latest_hash.as_ref(),
+        })
+        .await?;
+
+    info!(
+        "Created repository {} with ID {} (governed, generation {:?})",
+        name, repository.id, outcome.repository_generation
+    );
+
+    if outcome.metadata_hash == metadata_hash {
+        return Ok((metadata, metadata_hash));
+    }
+    // An exact retry of a create whose metadata has since moved. The caller is
+    // owed the repository that exists, so load the committed pointer's blob
+    // rather than reporting the one this call rebuilt.
+    let committed = repository::metadata(repository, outcome.metadata_hash)
+        .await
+        .warn_map_err(|err| {
+            Status::internal(format!(
+                "Failed to load committed repository metadata: {err}"
+            ))
+        })?;
+    Ok((committed, outcome.metadata_hash))
 }
 
 pub(crate) async fn repository_create_auth_resource(

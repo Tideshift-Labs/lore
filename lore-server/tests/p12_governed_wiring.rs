@@ -14,24 +14,25 @@ struct Site {
     family: &'static str,
 }
 
-/// The sites that still refuse governed carriage, after WP-116 Part 2 wired the
-/// four metadata-CAS sites. Five, not nine.
+/// The sites that still refuse governed carriage, after WP-116 Part 3 wired the
+/// two authenticated repository-create sites. Three, not five.
 ///
 /// Each is guarded for a different reason and they must not be collapsed into
 /// one "not done yet" bucket: forwarded v1 create is fenced by CR-029's
-/// CARRIAGE-02-LORE until a frozen authenticated forwarding contract exists,
-/// both deletes are blocked on an unfrozen `delete_proof` derivation, and both
-/// creates are Part 3's projection move. Every one carries its reason at the
-/// call site.
-const GUARDED_SITES: [&str; 5] = [
-    include_str!("../src/grpc/handlers/repository_create.rs"),
-    include_str!("../src/grpc/repository/v1/repository_create.rs"),
+/// CARRIAGE-02-LORE until a frozen authenticated forwarding contract exists and
+/// has no verified principal to admit against at all, while both deletes are
+/// blocked on an unfrozen `delete_proof` derivation. Every one carries its
+/// reason at the call site.
+const GUARDED_SITES: [&str; 3] = [
     include_str!("../src/grpc/forwarded_repository/v1/repository_create.rs"),
     include_str!("../src/grpc/handlers/repository_delete.rs"),
     include_str!("../src/grpc/repository/v1/repository_delete.rs"),
 ];
 
-const WIRED_SITES: [Site; 6] = [
+/// The shared governed seam both create sites commit through.
+const GOVERNED_SEAM: &str = include_str!("../src/domain.rs");
+
+const WIRED_SITES: [Site; 8] = [
     Site {
         label: "v0/v1 shared branch push",
         source: include_str!("../src/grpc/handlers/branch_push.rs"),
@@ -61,6 +62,16 @@ const WIRED_SITES: [Site; 6] = [
         label: "v1 branch metadata CAS",
         source: include_str!("../src/grpc/revision/v1/branch_metadata_set.rs"),
         family: "CanonicalIntent::BranchMetadataCas",
+    },
+    Site {
+        label: "v0 repository create",
+        source: include_str!("../src/grpc/handlers/repository_create.rs"),
+        family: "CanonicalIntent::RepositoryCreate",
+    },
+    Site {
+        label: "v1 repository create",
+        source: include_str!("../src/grpc/repository/v1/repository_create.rs"),
+        family: "CanonicalIntent::RepositoryCreate",
     },
 ];
 
@@ -168,16 +179,114 @@ fn every_authenticated_site_uses_the_one_canonical_intent_definition() {
     );
 }
 
+/// WP-116 Part 3: both authenticated repository-create sites commit through the
+/// one shared governed seam, and that seam emits the pair CR-032 classifies.
 #[test]
-fn the_five_still_unwired_sites_remain_explicitly_guarded() {
+fn both_repository_create_sites_publish_through_the_shared_governed_seam() {
+    let mut checked = 0usize;
+    for site in WIRED_SITES
+        .iter()
+        .filter(|site| site.family.ends_with("RepositoryCreate"))
+    {
+        checked += 1;
+        assert!(
+            site.source.contains("GovernedRepositoryCreate::prepare("),
+            "{} must admit through the shared governed create seam",
+            site.label
+        );
+        assert!(
+            site.source.contains("governed_repository_create("),
+            "{} must publish through the one shared governed create body, not \
+             a second copy of it",
+            site.label
+        );
+    }
+    assert_eq!(
+        checked, 2,
+        "both create sites must be selected; a filter matching none would let \
+         this loop pass by checking nothing"
+    );
+
+    // The v0 site is wired outright. The v1 site keeps exactly one refusal, for
+    // its forwarding branch: a cell that forwards has no local coordinator call
+    // site, and CARRIAGE-02-LORE fences the forwarded entry point. More than
+    // one occurrence means the direct path has regressed to refusing too.
+    //
+    // Selected by label rather than by index into `WIRED_SITES`: a site added
+    // or reordered above these two would silently retarget both assertions at
+    // the wrong file and leave the test passing.
+    let site = |label: &str| {
+        WIRED_SITES
+            .iter()
+            .find(|site| site.label == label)
+            .unwrap_or_else(|| panic!("{label} must be a wired site"))
+            .source
+    };
+    let v0 = site("v0 repository create");
+    let v1 = site("v1 repository create");
+    assert!(
+        !v0.contains("reject_unwired_governed_operation("),
+        "v0 repository create is wired and must not still refuse governed carriage"
+    );
+    assert_eq!(
+        v1.matches("reject_unwired_governed_operation(").count(),
+        1,
+        "v1 repository create must refuse governed carriage only on its \
+         forwarding branch"
+    );
+
+    // CR-032 classifies a repository create as two committed transitions, and
+    // both must come from the shared pinned builders rather than a second,
+    // seam-local definition of the same classification. Scoped to the seam
+    // because that is where the pair is built once for both sites.
+    for builder in [
+        "outbox_builders::repository_published(",
+        "outbox_builders::branch_created(",
+    ] {
+        assert_eq!(
+            GOVERNED_SEAM.matches(builder).count(),
+            1,
+            "the governed create seam must build {builder} through exactly one \
+             call to the shared pinned builder"
+        );
+    }
+
+    // The events must actually reach the coordinator. Scoped to the
+    // `RepositoryCreateInput` literal for the same reason the branch-push pin
+    // is scoped to its own: a file-wide check is both unsound and too weak.
+    let literal = {
+        let start = GOVERNED_SEAM
+            .find("let input = RepositoryCreateInput {")
+            .expect("the governed create seam must build its coordinator input as a literal");
+        let rest = &GOVERNED_SEAM[start..];
+        let end = rest
+            .find("\n        };")
+            .expect("the RepositoryCreateInput literal must terminate");
+        &rest[..end]
+    };
+    assert!(
+        literal.contains("\n            events,"),
+        "the governed create must pass its built events to the coordinator; a \
+         literal that sets `events: Vec::new()`, or omits the field, has \
+         regressed to an unfed outbox"
+    );
+    assert!(
+        !literal.contains("events: Vec::new()"),
+        "the governed create must not regress to an unfed outbox"
+    );
+}
+
+#[test]
+fn the_three_still_unwired_sites_remain_explicitly_guarded() {
     for source in GUARDED_SITES {
         assert!(source.contains("reject_unwired_governed_operation("));
         // A guard without a recorded reason is how "not yet" becomes "nobody
-        // remembers". Each of the five carries either a BLOCKED marker naming
-        // its exact missing artefact or a note pointing at the part that wires
-        // it.
+        // remembers". Each of the three carries a BLOCKED marker naming its
+        // exact missing artefact. The looser "points at the part that wires it"
+        // alternative is gone with Part 3: every remaining guard is blocked on
+        // a contract, not on effort.
         assert!(
-            source.contains("BLOCKED(WP-116)") || source.contains("WP-116 Part 3"),
+            source.contains("BLOCKED(WP-116)"),
             "a guarded governed site must record why it is guarded"
         );
     }

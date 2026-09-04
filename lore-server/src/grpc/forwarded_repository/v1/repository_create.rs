@@ -80,6 +80,10 @@ pub async fn handler(
         mutable_store,
         hook_dispatcher,
         instrument_provider,
+        // Always ungoverned: the guard above refuses every carriage that
+        // reaches this entry point, so there is never an admitted operation to
+        // pass on.
+        None,
     )
     .await
 }

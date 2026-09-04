@@ -1,7 +1,10 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
+use std::sync::Mutex;
+
 use async_trait::async_trait;
+use lore_postgres::domain::coordinator::ADMISSION_REJECTED_V1;
 use lore_postgres::domain::coordinator::BranchPushCommitInput;
 use lore_postgres::domain::coordinator::MutationResult;
 use lore_postgres::domain::coordinator::RepositoryCreateInput;
@@ -26,6 +29,7 @@ use uuid::Uuid;
 
 use super::test_support::context;
 use super::*;
+use crate::grpc::domain_operation_metadata::DomainOperationMetadata;
 use crate::grpc::domain_operation_metadata::FINGERPRINT_KEY;
 use crate::grpc::domain_operation_metadata::FINGERPRINT_V1_LEN;
 use crate::grpc::domain_operation_metadata::FINGERPRINT_VERSION_V1;
@@ -431,4 +435,471 @@ async fn commit_maps_a_non_cas_mismatch_rejection_through_the_ordinary_status_ma
         panic!("a tombstoned target must not be reported as a CAS loss");
     };
     assert_eq!(error.code(), Code::NotFound);
+}
+
+// ---------------------------------------------------------------------------
+// WP-116 Part 3: `GovernedRepositoryCreate`'s own seam.
+//
+// `prepare`'s enforcement-off refusal (the 2026-09-03 ruling: a cell whose
+// coordinator exists but is not enforcing must refuse governed create
+// carriage with `FAILED_PRECONDITION` rather than silently downgrade to the
+// legacy path) and `commit`'s outcome/rejection mapping, readback-not-
+// published metadata pointer, and its own construction of the two CR-032
+// events it owes.
+//
+// Another standalone scripted store, for the same reason
+// `MetadataCasScriptedStore` is standalone rather than
+// `test_support::ScriptedDomainStore`: this seam needs `repository_create`
+// AND `repository_snapshot` scripted together, and capturing the exact
+// `RepositoryCreateInput` the seam builds -- proving what `commit()` itself
+// constructs (event count, order, and fields), complementary to
+// `lore-postgres/tests/domain_outbox_producers.rs`'s proof that the
+// COORDINATOR commits whatever `events` it is given correctly. Neither file
+// alone proves the full path: this one proves the seam builds the right
+// input; that one proves the coordinator commits it right.
+// ---------------------------------------------------------------------------
+
+struct RepositoryCreateScriptedStore {
+    result: MutationResult,
+    snapshot: Option<RepositorySnapshot>,
+    captured_input: Arc<Mutex<Option<RepositoryCreateInput>>>,
+}
+
+#[async_trait]
+impl DomainTransactionStore for RepositoryCreateScriptedStore {
+    async fn domain_operation_clock_get(&self) -> Result<std::time::SystemTime, DomainError> {
+        unreachable!(
+            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
+        )
+    }
+
+    async fn domain_operation_prepare(
+        &self,
+        _key: &ReceiptKey,
+        _binding: &OperationBinding,
+        _witness: Option<&AuthorizationWitness>,
+    ) -> Result<PrepareResult, DomainError> {
+        unreachable!(
+            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
+        )
+    }
+
+    async fn domain_operation_receipt_get(
+        &self,
+        _key: &ReceiptKey,
+        _binding: &OperationBinding,
+    ) -> Result<ReceiptLookup, DomainError> {
+        unreachable!(
+            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
+        )
+    }
+
+    async fn domain_operation_verified_stale_finalize(
+        &self,
+        _input: &VerifiedStaleFinalizeInput,
+    ) -> Result<VerifiedStaleFinalizeResult, DomainError> {
+        unreachable!(
+            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
+        )
+    }
+
+    async fn domain_operation_terminal_status_attach(
+        &self,
+        _input: &TerminalStatusAttachInput,
+    ) -> Result<TerminalStatusAttachmentAck, DomainError> {
+        unreachable!(
+            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
+        )
+    }
+
+    async fn domain_operation_proof_namespace_materialize(
+        &self,
+        _input: &ProofNamespaceMaterializeInput,
+    ) -> Result<ProofNamespaceMaterializeReceipt, DomainError> {
+        unreachable!(
+            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
+        )
+    }
+
+    async fn domain_operation_proof_namespace_retire(
+        &self,
+        _input: &ProofNamespaceRetireInput,
+    ) -> Result<ProofNamespaceRetireAck, DomainError> {
+        unreachable!(
+            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
+        )
+    }
+
+    async fn repository_snapshot(
+        &self,
+        _repository_id: &[u8],
+    ) -> Result<Option<RepositorySnapshot>, DomainError> {
+        Ok(self.snapshot.clone())
+    }
+
+    async fn branch_snapshot(
+        &self,
+        _repository_id: &[u8],
+        _branch_id: &[u8],
+    ) -> Result<Option<BranchSnapshot>, DomainError> {
+        unreachable!(
+            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
+        )
+    }
+
+    async fn repository_create(
+        &self,
+        _operation: &GovernedOperation,
+        input: &RepositoryCreateInput,
+    ) -> Result<MutationResult, DomainError> {
+        *self.captured_input.lock().unwrap() = Some(input.clone());
+        Ok(self.result.clone())
+    }
+
+    async fn repository_delete(
+        &self,
+        _operation: &GovernedOperation,
+        _input: &RepositoryDeleteInput,
+    ) -> Result<MutationResult, DomainError> {
+        unreachable!(
+            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
+        )
+    }
+
+    async fn metadata_compare_and_swap(
+        &self,
+        _operation: &GovernedOperation,
+        _input: &MetadataCasInput,
+    ) -> Result<MutationResult, DomainError> {
+        unreachable!(
+            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
+        )
+    }
+
+    async fn branch_push_commit(
+        &self,
+        _operation: &GovernedOperation,
+        _input: &BranchPushCommitInput,
+    ) -> Result<MutationResult, DomainError> {
+        unreachable!(
+            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
+        )
+    }
+
+    async fn begin_obliterate(
+        &self,
+        _operation: &GovernedOperation,
+        _repository_id: &[u8],
+        _event: Option<&PendingEvent>,
+    ) -> Result<MutationResult, DomainError> {
+        unreachable!(
+            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
+        )
+    }
+}
+
+fn dummy_create_operation() -> GovernedOperation {
+    GovernedOperation {
+        key: ReceiptKey {
+            verified_issuer: "https://issuer.example".to_owned(),
+            authenticated_subject: "repository-create-scripted-test".to_owned(),
+            tenant_scope_key: vec![7; 16],
+            operation_id: Uuid::now_v7(),
+        },
+        binding: OperationBinding {
+            method: "repository_create".to_owned(),
+            scope: vec![7; 16],
+            fingerprint_version: 1,
+            fingerprint: vec![8; 32],
+            canonical_intent_digest: vec![9; 32],
+        },
+        prepare_token: [0u8; 32],
+    }
+}
+
+/// Build a `GovernedRepositoryCreate` directly, bypassing `prepare`/admission
+/// entirely -- nothing under test in `commit()` is admission logic. Returns
+/// the handle plus the shared cell the scripted store records its captured
+/// `RepositoryCreateInput` into.
+fn build_governed_repository_create(
+    result: MutationResult,
+    snapshot: Option<RepositorySnapshot>,
+    cell_id: Option<&str>,
+) -> (
+    GovernedRepositoryCreate,
+    Arc<Mutex<Option<RepositoryCreateInput>>>,
+) {
+    let captured_input = Arc::new(Mutex::new(None));
+    let store: Arc<dyn DomainTransactionStore> = Arc::new(RepositoryCreateScriptedStore {
+        result,
+        snapshot,
+        captured_input: Arc::clone(&captured_input),
+    });
+    let domain = Arc::new(DomainContext::new(store, true).with_cell_id(cell_id.map(str::to_owned)));
+    let governed = GovernedRepositoryCreate {
+        domain,
+        operation: dummy_create_operation(),
+    };
+    (governed, captured_input)
+}
+
+struct DummyPublicationBytes {
+    repository_id: [u8; 16],
+    metadata_hash: [u8; 32],
+    default_branch_id: [u8; 16],
+    default_branch_metadata_hash: [u8; 32],
+    default_branch_latest_hash: [u8; 32],
+}
+
+fn dummy_publication_bytes() -> DummyPublicationBytes {
+    DummyPublicationBytes {
+        repository_id: [7u8; 16],
+        metadata_hash: [8u8; 32],
+        default_branch_id: [9u8; 16],
+        default_branch_metadata_hash: [10u8; 32],
+        default_branch_latest_hash: [11u8; 32],
+    }
+}
+
+impl DummyPublicationBytes {
+    fn publication(&self) -> RepositoryCreatePublication<'_> {
+        RepositoryCreatePublication {
+            salt: b"test-salt",
+            repository_id: &self.repository_id,
+            name: "my-repo",
+            metadata_hash: &self.metadata_hash,
+            default_branch_id: &self.default_branch_id,
+            default_branch_name: "main",
+            default_branch_metadata_hash: &self.default_branch_metadata_hash,
+            default_branch_latest_hash: &self.default_branch_latest_hash,
+        }
+    }
+
+    fn snapshot(&self, generation: i64) -> RepositorySnapshot {
+        RepositorySnapshot {
+            repository_id: self.repository_id.to_vec(),
+            live: true,
+            generation,
+            name: "my-repo".to_string(),
+            metadata_hash: self.metadata_hash.to_vec(),
+            default_branch_id: self.default_branch_id.to_vec(),
+        }
+    }
+
+    fn applied_result(&self, repository_generation: i64) -> MutationResult {
+        MutationResult {
+            outcome: DomainOutcome::Applied,
+            repository_generation: Some(repository_generation),
+            branch_generation: Some(1),
+            observed_pointer: None,
+        }
+    }
+}
+
+/// `GovernedRepositoryCreate::prepare` with no admitted operation is the
+/// legacy carve-out, exactly like every other governed seam's `Ok(None)`
+/// path -- proven here independent of `domain` (never inspected before the
+/// early return).
+#[test]
+fn prepare_with_no_admitted_operation_is_the_legacy_path() {
+    let result = GovernedRepositoryCreate::prepare(None, None, "repository_create", vec![0u8; 32]);
+    assert!(matches!(result, Ok(None)));
+}
+
+/// The 2026-09-03 ruling: an admitted operation against a cell whose
+/// coordinator exists but is not enforcing is refused `FAILED_PRECONDITION`,
+/// never silently downgraded to the legacy path.
+#[test]
+fn prepare_refuses_carriage_when_enforcement_is_off() {
+    let domain = Arc::new(context(false));
+    let admitted = AdmittedOperation {
+        key: ReceiptKey {
+            verified_issuer: "https://issuer.example".to_owned(),
+            authenticated_subject: "prepare-enforcement-off-test".to_owned(),
+            tenant_scope_key: vec![7; 16],
+            operation_id: Uuid::now_v7(),
+        },
+        carried: DomainOperationMetadata {
+            operation_id: Uuid::now_v7(),
+            fingerprint_version: i32::from(FINGERPRINT_VERSION_V1),
+            fingerprint: vec![0x42; FINGERPRINT_V1_LEN],
+            prepare_token: [0x53; PREPARE_TOKEN_LEN],
+            mediated_scope: None,
+        },
+    };
+    // `GovernedRepositoryCreate` has no `Debug` impl, so `Result::expect_err`
+    // (which requires the `Ok` side to be `Debug`) can't be used here -- match
+    // explicitly instead, matching this file's other `Debug`-less-type
+    // convention (see `commit_maps_cas_mismatch_without_observed_pointer_to_status_internal`
+    // above).
+    let result = GovernedRepositoryCreate::prepare(
+        Some(&domain),
+        Some(admitted),
+        "repository_create",
+        vec![0u8; 32],
+    );
+    let Err(error) = result else {
+        panic!("carriage with enforcement off must be refused, not admitted");
+    };
+    assert_eq!(error.code(), Code::FailedPrecondition);
+}
+
+/// The mirror case: the same admitted operation against a cell that IS
+/// enforcing is accepted.
+#[test]
+fn prepare_admits_carriage_when_enforcement_is_on() {
+    let domain = Arc::new(context(true));
+    let admitted = AdmittedOperation {
+        key: ReceiptKey {
+            verified_issuer: "https://issuer.example".to_owned(),
+            authenticated_subject: "prepare-enforcement-on-test".to_owned(),
+            tenant_scope_key: vec![7; 16],
+            operation_id: Uuid::now_v7(),
+        },
+        carried: DomainOperationMetadata {
+            operation_id: Uuid::now_v7(),
+            fingerprint_version: i32::from(FINGERPRINT_VERSION_V1),
+            fingerprint: vec![0x42; FINGERPRINT_V1_LEN],
+            prepare_token: [0x53; PREPARE_TOKEN_LEN],
+            mediated_scope: None,
+        },
+    };
+    let result = GovernedRepositoryCreate::prepare(
+        Some(&domain),
+        Some(admitted),
+        "repository_create",
+        vec![0u8; 32],
+    )
+    .expect("carriage with enforcement on must be admitted");
+    assert!(result.is_some());
+}
+
+/// `commit()` with a cell identity configured builds exactly the two CR-032
+/// rows a create owes -- `repository.published` then `branch.created`, per
+/// `event-kinds.json` -- and passes them to the coordinator in that order.
+#[tokio::test]
+async fn commit_with_cell_id_configured_builds_both_pinned_events_in_order() {
+    let bytes = dummy_publication_bytes();
+    let (governed, captured) = build_governed_repository_create(
+        bytes.applied_result(1),
+        Some(bytes.snapshot(1)),
+        Some("cell-a"),
+    );
+
+    let outcome = governed
+        .commit(&bytes.publication())
+        .await
+        .expect("an Applied result must not error");
+    assert_eq!(outcome.repository_generation, Some(1));
+
+    let input = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("repository_create must have been called");
+    assert_eq!(
+        input.events.len(),
+        2,
+        "a create with a configured cell_id must build exactly two events"
+    );
+    assert_eq!(input.events[0].event_kind, "repository.published");
+    assert_eq!(input.events[0].aggregate_kind, "repository");
+    assert_eq!(input.events[0].aggregate_id, bytes.repository_id);
+    assert_eq!(input.events[1].event_kind, "branch.created");
+    assert_eq!(input.events[1].aggregate_kind, "branch");
+    assert_eq!(input.events[1].aggregate_id, bytes.default_branch_id);
+}
+
+/// The companion negative: no configured cell identity builds no events at
+/// all, per `DomainContext::cell_id`'s own contract (a cell with no `cell_id`
+/// still mutates and simply produces no outbox rows).
+#[tokio::test]
+async fn commit_with_no_cell_id_configured_builds_no_events() {
+    let bytes = dummy_publication_bytes();
+    let (governed, captured) =
+        build_governed_repository_create(bytes.applied_result(1), Some(bytes.snapshot(1)), None);
+
+    governed
+        .commit(&bytes.publication())
+        .await
+        .expect("an Applied result must not error");
+
+    let input = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("repository_create must have been called");
+    assert!(
+        input.events.is_empty(),
+        "a cell with no configured cell_id must build no events"
+    );
+}
+
+/// `commit()` reports the domain row's actually-committed metadata pointer,
+/// not the one this call published -- they differ on an exact retry whose
+/// metadata moved between the original create and the retry.
+#[tokio::test]
+async fn commit_reads_back_the_committed_metadata_pointer_rather_than_the_published_one() {
+    let bytes = dummy_publication_bytes();
+    let committed_metadata_hash = [99u8; 32];
+    let mut snapshot = bytes.snapshot(3);
+    snapshot.metadata_hash = committed_metadata_hash.to_vec();
+    let (governed, _captured) =
+        build_governed_repository_create(bytes.applied_result(3), Some(snapshot), Some("cell-a"));
+
+    let outcome = governed
+        .commit(&bytes.publication())
+        .await
+        .expect("an Applied result must not error");
+    assert_eq!(
+        outcome.metadata_hash,
+        Hash::from(committed_metadata_hash.as_slice()),
+        "the outcome must report the domain row's actually-committed pointer"
+    );
+    assert_ne!(
+        outcome.metadata_hash,
+        Hash::from(bytes.metadata_hash.as_slice()),
+        "the outcome must not report the hash this call merely published"
+    );
+}
+
+/// `TOMBSTONED_V1` is overridden to `ALREADY_EXISTS` for create specifically
+/// -- the shared mapper's `NOT_FOUND` (non-disclosure for an operation on a
+/// repository the caller may not know exists) is the wrong contract here: the
+/// caller chose the identity itself, so the answer discloses only that its
+/// own id is already spent.
+#[tokio::test]
+async fn commit_maps_tombstoned_v1_to_already_exists_not_the_shared_not_found() {
+    let bytes = dummy_publication_bytes();
+    let (governed, _captured) = build_governed_repository_create(
+        MutationResult::rejected(TOMBSTONED_V1),
+        None,
+        Some("cell-a"),
+    );
+
+    // `RepositoryCreateOutcome` has no `Debug` impl either -- same pattern.
+    let result = governed.commit(&bytes.publication()).await;
+    let Err(error) = result else {
+        panic!("a tombstoned repository id must be refused");
+    };
+    assert_eq!(error.code(), Code::AlreadyExists);
+}
+
+/// A rejection create does not specially handle (an admission-rail failure,
+/// not a statement about the repository) still goes through the shared
+/// mapper unchanged.
+#[tokio::test]
+async fn commit_maps_a_non_tombstoned_rejection_through_the_shared_mapper() {
+    let bytes = dummy_publication_bytes();
+    let (governed, _captured) = build_governed_repository_create(
+        MutationResult::rejected(ADMISSION_REJECTED_V1),
+        None,
+        Some("cell-a"),
+    );
+
+    let result = governed.commit(&bytes.publication()).await;
+    let Err(error) = result else {
+        panic!("an admission rejection must be refused");
+    };
+    assert_eq!(error.code(), Code::FailedPrecondition);
 }

@@ -59,7 +59,9 @@ $cases = @(
     'metadata_cas_success_commits_exactly_one_row_with_the_new_generation',
     'repository_create_exact_fingerprint_retry_leaves_no_second_row',
     'repository_create_name_taken_rejection_leaves_no_row_even_with_event_supplied',
+    'repository_create_over_cap_events_is_rejected_at_validation_with_zero_rows',
     'repository_create_wired_event_commits_exactly_one_row_with_pinned_fields',
+    'repository_create_wired_two_events_commits_both_rows_with_pinned_fields_in_order',
     'repository_delete_commits_exactly_one_row_at_the_tombstone_generation',
     'repository_delete_not_found_rejection_leaves_no_row',
     'repository_delete_retry_on_an_already_tombstoned_repository_leaves_no_second_row'

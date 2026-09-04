@@ -65,8 +65,12 @@ use crate::domain::store::PostgresDomainStore;
 /// production caller while `PLATFORM-REPOSITORY-CLAIM-READY` is withheld.
 ///
 /// The real question for the owner is narrower than the lock: should a cell
-/// with enforcement off admit governed mutations at all? If the answer is no,
-/// this disappears without a lock change.
+/// with enforcement off admit governed mutations at all? The owner answered no
+/// for repository create on 2026-09-03, and that site now refuses carriage with
+/// enforcement off (`GovernedRepositoryCreate::prepare` in `lore-server`). The
+/// four metadata-CAS sites and the push still admit it, so the exposure is
+/// narrowed rather than closed; closing it everywhere is the same one-line
+/// answer applied at the shared gate, still not a lock change.
 async fn apply_projection(
     tx: &Transaction<'_>,
     writes: &[ProjectionWrite],
@@ -143,6 +147,31 @@ async fn append_event(
         },
     )
     .await?;
+    Ok(())
+}
+
+/// Append several classified events, in the order the caller gave them.
+///
+/// The whole group is still the transaction's last write: every append is
+/// `LockClass::OutboxInsert`, and `LockSequence` permits repeated entries of one
+/// class because within-class ordering is the primary-key sort rather than this
+/// ordinal. What it will not permit is a domain lock taken after the first
+/// append, which is the property F-032-3 actually fixes.
+///
+/// Caller order is preserved rather than sorted. Repository create publishes
+/// `repository.published` before `branch.created`, matching the order the rows
+/// it describes are written in, and a consumer reading the outbox in insertion
+/// order sees the repository exist before its default branch does.
+async fn append_events(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    repository_id: &[u8],
+    committed: CommittedVersions,
+    events: &[PendingEvent],
+) -> Result<(), DomainError> {
+    for event in events {
+        append_event(tx, sequence, repository_id, committed, Some(event)).await?;
+    }
     Ok(())
 }
 
@@ -431,6 +460,9 @@ impl DomainTransactionStore for PostgresDomainStore {
         let _t = self
             .instruments()
             .start("repository_create", self.pool().status());
+        // Before the pool checkout, so an over-long carriage costs no
+        // connection and cannot leave a partial write.
+        validate_pending_events(&input.events, "repository_create")?;
         let mut client = self.checkout().await?;
         let mut sequence = LockSequence::new();
         let (tx, clock) = match self
@@ -572,7 +604,7 @@ impl DomainTransactionStore for PostgresDomainStore {
         .map_err(|e| DomainError::from_pg("default branch name insert", e))?;
 
         apply_projection(&tx, &input.projection).await?;
-        append_event(
+        append_events(
             &tx,
             &mut sequence,
             &input.repository_id,
@@ -580,7 +612,7 @@ impl DomainTransactionStore for PostgresDomainStore {
                 repository_generation: 1,
                 branch_generation: Some(1),
             },
-            input.event.as_ref(),
+            &input.events,
         )
         .await?;
 

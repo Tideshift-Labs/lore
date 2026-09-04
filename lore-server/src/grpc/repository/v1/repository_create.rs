@@ -25,9 +25,12 @@ use super::record::build_repository;
 use super::repository_get::repository_load_id;
 use super::repository_get::repository_load_name;
 use crate::domain::DomainContext;
+use crate::domain::GovernedRepositoryCreate;
 use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
 use crate::domain::reject_unwired_governed_operation;
+use crate::domain_intent::CanonicalIntent;
+use crate::domain_intent::canonical_intent_digest;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -36,6 +39,7 @@ use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::get_authorization_optional;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
+use crate::grpc::handlers::repository_create::governed_repository_create;
 use crate::grpc::handlers::repository_create::repository_create_auth_resource;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::warn_error_to_status;
@@ -81,21 +85,66 @@ pub async fn handler(
 
     // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
     // at handler entry, before any handler logic or authorization side effect.
-    if let Some(admitted) = admit_at_entry(
+    let admitted = admit_at_entry(
         domain_context,
         &request_metadata,
         request_authorization.as_ref(),
         GovernedScope::RepositoryCreate {
             repository_id: &req.id,
         },
-    )? {
-        // WP-116 Part 3 wires this site, alongside its v0 sibling. Not blocked
-        // on a contract; blocked on the projection move. See the v0 handler.
+    )?;
+
+    let forwarding = forwarded_requests
+        .as_ref()
+        .is_some_and(|forwarded| forwarded.rpc_flags().repository_create);
+    if forwarding && let Some(admitted) = admitted.as_ref() {
+        // BLOCKED(WP-116): a forwarded create has no local coordinator call
+        // site, and CR-029's CARRIAGE-02-LORE fences the forwarded entry point
+        // until a frozen authenticated forwarding contract exists. This cell
+        // would forward, so admitting the operation here would receipt it
+        // against a transaction that happens somewhere else, or nowhere.
         return Err(reject_unwired_governed_operation(
-            &admitted,
-            "lore.repository.v1.RepositoryService/RepositoryCreate",
+            admitted,
+            "lore.repository.v1.RepositoryService/RepositoryCreate (forwarded)",
         ));
     }
+
+    // WP-116 Part 3 wires this site through the shared governed create seam.
+    //
+    // v1 is `created_mode = 0`: the server assigns the timestamp, so no caller
+    // time is bound, and `creator` is optional on the wire rather than an empty
+    // string. The handler's frozen size checks run first, because CR-029's
+    // canonical-intent contract hashes only a request that has already passed
+    // them.
+    let wire_creator = req.creator.clone().filter(|creator| !creator.is_empty());
+    let governed = match admitted {
+        Some(admitted) => {
+            validate_create_input(
+                req.name.as_str(),
+                req.description.as_str(),
+                req.default_branch_name.as_str(),
+                wire_creator.as_deref().unwrap_or_default(),
+            )?;
+            let digest = canonical_intent_digest(&CanonicalIntent::RepositoryCreate {
+                repository_id: &req.id,
+                name: req.name.as_str(),
+                description: req.description.as_str(),
+                default_branch_id: &req.default_branch_id,
+                default_branch_name: req.default_branch_name.as_str(),
+                creator: wire_creator.as_deref(),
+                caller_created: None,
+            })
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            GovernedRepositoryCreate::prepare(
+                domain_context,
+                Some(admitted),
+                "lore.repository.v1.RepositoryService/RepositoryCreate",
+                digest,
+            )?
+        }
+        None => None,
+    };
+
     let caller_context = CallerContext {
         repository_id: RepositoryId::default(), // RepositoryCreate has no pre-existing repository
         user_id,
@@ -103,9 +152,7 @@ pub async fn handler(
         authorization,
     };
 
-    if let Some(forwarded_requests) = forwarded_requests
-        && forwarded_requests.rpc_flags().repository_create
-    {
+    if forwarding && let Some(forwarded_requests) = forwarded_requests {
         forward_repository_create(req, caller_context, forwarded_requests).await
     } else {
         repository_create_implementation(
@@ -116,6 +163,7 @@ pub async fn handler(
             mutable_store,
             hook_dispatcher,
             instrument_provider,
+            governed,
         )
         .await
     }
@@ -142,6 +190,14 @@ async fn forward_repository_create(
 }
 
 /// This `RepositoryCreateRequest` should be fulfilled by this server.
+///
+/// `governed` is `Some` only when this handler admitted domain-operation
+/// carriage; the forwarded v1 entry point in `forwarded_repository/` calls this
+/// with `None` and keeps its own CARRIAGE-02-LORE fence, so a shared
+/// implementation cannot open a second, ungated way in (the exact hazard
+/// `gating-a-front-door-handler-leaves-a-shared-implementation-s-other-entry-point-open`
+/// records).
+#[allow(clippy::too_many_arguments)]
 pub async fn repository_create_implementation(
     req: RepositoryCreateRequest,
     caller_context: CallerContext,
@@ -150,6 +206,7 @@ pub async fn repository_create_implementation(
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
+    governed: Option<GovernedRepositoryCreate>,
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
     let user_id = caller_context.user_id;
     let correlation_id = caller_context.correlation_id;
@@ -188,19 +245,38 @@ pub async fn repository_create_implementation(
                 .dispatch_pre(HookPoint::RepositoryCreate, &hook_ctx)
                 .map_err(hook_error_to_status)?;
 
-            let (created_metadata, metadata_hash) = repository_create_inner(
-                repository.clone(),
-                &name,
-                &description,
-                default_branch_id,
-                &default_branch_name,
-                &creator,
-                created,
-                auth_url,
-                authorization,
-            )
-            .await
-            .inspect_err(|err| warn!(error = ?err, "Repository create failed"))?;
+            let (created_metadata, metadata_hash) = match &governed {
+                Some(governed) => governed_repository_create(
+                    governed,
+                    repository.clone(),
+                    &name,
+                    &description,
+                    default_branch_id,
+                    &default_branch_name,
+                    // v1 resolves the creator once, before this point, and
+                    // passes the same value to both metadata blobs.
+                    &creator,
+                    &creator,
+                    created,
+                    auth_url,
+                    authorization,
+                )
+                .await
+                .inspect_err(|err| warn!(error = ?err, "Governed repository create failed"))?,
+                None => repository_create_inner(
+                    repository.clone(),
+                    &name,
+                    &description,
+                    default_branch_id,
+                    &default_branch_name,
+                    &creator,
+                    created,
+                    auth_url,
+                    authorization,
+                )
+                .await
+                .inspect_err(|err| warn!(error = ?err, "Repository create failed"))?,
+            };
 
             hook_dispatcher.spawn_post(HookPoint::RepositoryCreate, hook_ctx);
 

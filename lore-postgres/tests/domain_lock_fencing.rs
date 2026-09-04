@@ -191,7 +191,7 @@ async fn create_repository(store: &PostgresDomainStore) -> ([u8; 16], [u8; 16]) 
         creation_fingerprint: rand::random::<[u8; 32]>().to_vec(),
         creation_fingerprint_version: 1,
         projection: Vec::new(),
-        event: None,
+        events: Vec::new(),
     };
     let result = store
         .repository_create(&operation, &input)

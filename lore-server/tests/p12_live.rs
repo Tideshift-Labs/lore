@@ -14,11 +14,22 @@ use lore_postgres::domain::receipts::ReceiptKey;
 use lore_postgres::domain::receipts::ReceiptLookup;
 use lore_postgres::domain::store::PostgresDomainStore;
 use lore_postgres::pool::TlsConfig;
+use lore_postgres::store::mutable_store::PostgresMutableStore;
+use lore_revision::branch;
+use lore_revision::lore::RepositoryId;
+use lore_revision::metadata::Metadata;
+use lore_revision::repository;
+use lore_revision::repository::RepositoryContext;
+use lore_revision::repository::RepositoryMetadata;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::domain::AdmittedOperation;
 use lore_server::domain::DomainContext;
+use lore_server::domain::GovernedRepositoryCreate;
 use lore_server::domain::GovernedScope;
+use lore_server::domain::RepositoryCreatePublication;
 use lore_server::domain_intent::CanonicalIntent;
 use lore_server::domain_intent::canonical_intent_digest;
+use lore_server::grpc::domain_operation_metadata::DomainOperationMetadata;
 use lore_server::grpc::domain_operation_metadata::FINGERPRINT_KEY;
 use lore_server::grpc::domain_operation_metadata::FINGERPRINT_V1_LEN;
 use lore_server::grpc::domain_operation_metadata::FINGERPRINT_VERSION_V1;
@@ -137,7 +148,7 @@ async fn create_repository(
         creation_fingerprint: fingerprint,
         creation_fingerprint_version: 1,
         projection: Vec::new(),
-        event: None,
+        events: Vec::new(),
     };
     let result = store
         .repository_create(&operation, &input)
@@ -255,4 +266,307 @@ async fn exact_mediated_obliterate_consumes_while_tuple_tamper_preserves_prepare
             ));
         }
     }
+}
+
+/// One `lore_mutable` row, for comparing the legacy and governed writers'
+/// output exactly.
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct MutableRow {
+    partition: Vec<u8>,
+    key_type: i16,
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
+
+/// Every row under either partition, sorted for a stable comparison. Run
+/// against a fresh, otherwise-empty database (this crate's live-test
+/// convention), so `global_partition` returning exactly this test's own
+/// repository-name-index row is a property of the fixture, not an assumption
+/// this helper makes.
+async fn mutable_rows(
+    client: &tokio_postgres::Client,
+    repository_partition: &[u8],
+    global_partition: &[u8],
+) -> Vec<MutableRow> {
+    let mut rows: Vec<MutableRow> = client
+        .query(
+            "SELECT partition, key_type, key, value FROM lore_mutable \
+             WHERE partition = $1 OR partition = $2",
+            &[&repository_partition, &global_partition],
+        )
+        .await
+        .expect("query lore_mutable rows")
+        .into_iter()
+        .map(|row| MutableRow {
+            partition: row.get("partition"),
+            key_type: row.get("key_type"),
+            key: row.get("key"),
+            value: row.get("value"),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        (&a.partition, a.key_type, &a.key).cmp(&(&b.partition, b.key_type, &b.key))
+    });
+    rows
+}
+
+/// WP-116 Part 3 cold-review gap: nothing else asserts the five
+/// `lore_mutable` projection rows a governed create writes
+/// (`RepositoryCreatePublication::projection`, `lore-server/src/domain.rs`)
+/// against what the four legacy writers actually leave in real Postgres. The
+/// legacy path itself is not directly callable from here -- `repository_create`
+/// (`lore-server/src/grpc/handlers/repository_create.rs`) is module-private --
+/// so this test drives the same public `lore_revision::repository`/`branch`
+/// primitives that private function calls, in the same order and with the
+/// same arguments, as an independent oracle. That is not circular: the
+/// property under test is agreement between two INDEPENDENT call chains
+/// (`repository`/`branch`'s direct `store`/`compare_and_swap` writes versus
+/// `RepositoryCreatePublication::projection`'s hand-rebuilt rows), not
+/// agreement between this test and itself.
+///
+/// Both writers target the SAME repository id, name, branch id, branch name,
+/// and content-derived metadata hashes, so `projection()`'s hash-derived keys
+/// land on the exact same five rows the legacy writers already wrote. That
+/// row set is captured once after the legacy write (the "before" snapshot,
+/// asserted to be exactly five rows), then deleted from `lore_mutable`
+/// directly -- the legacy writers never touch the domain tables, so this has
+/// no effect on the governed create's own coordinator path -- and captured
+/// again after the governed `commit()` call (the "after" snapshot). Deleting
+/// between the two closes a vacuity hole an earlier revision of this test had
+/// (INV, cold review 2026-09-03): landing on the same keys with the same
+/// values also makes `after_rows == legacy_rows` hold if `projection()`
+/// returned nothing at all, since a governed create that writes zero
+/// projection rows simply leaves the pre-existing legacy rows untouched.
+/// Deleting first means the "after" snapshot exists only if the governed path
+/// actually recreated it. If `projection()` disagrees with the legacy writer
+/// on any partition, key_type, key, or value -- most notably the
+/// branch-latest row, which the legacy `compare_and_swap` writer leaves as an
+/// explicit zero-valued row rather than deleting, unlike the other four
+/// `store`-backed rows -- the second snapshot diverges from the first (or is
+/// simply incomplete) and the comparison catches it. This is what a live
+/// Postgres run and only a live Postgres run can prove: an offline test can
+/// pin `projection()`'s own output but cannot prove it agrees with what the
+/// real legacy `MutableStore` implementation actually persists.
+#[tokio::test]
+#[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
+async fn governed_create_projection_rows_match_the_legacy_writers_exactly() {
+    let url = std::env::var("LORE_TEST_PG_URL")
+        .expect("LORE_TEST_PG_URL must be set; an unconfigured live case is NOT RUN");
+
+    let mutable_store: Arc<dyn lore_storage::MutableStore> = Arc::new(
+        PostgresMutableStore::connect(&url, 4, &TlsConfig::default())
+            .await
+            .expect("real Postgres mutable store must connect"),
+    );
+    let immutable_store: Arc<dyn lore_storage::ImmutableStore> =
+        lore_storage::local::immutable_store::create(
+            None::<&str>,
+            lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
+            false,
+            lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("in-memory immutable store must construct");
+    let (raw_client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("direct assertion client must connect");
+    lore_base::lore_spawn!(async move {
+        if let Err(error) = connection.await {
+            eprintln!("direct postgres connection error: {error}");
+        }
+    });
+
+    let repository_id: RepositoryId = rand::random();
+    let name = format!("p12-live-proj-{}", Uuid::new_v4());
+    let default_branch_id_context: lore_base::types::Context = Uuid::new_v4().into();
+    let default_branch_id_bytes = *default_branch_id_context.data();
+    let default_branch_name = "main";
+    let creator = "p12-live-projection-tester";
+    let created = 1_700_000_000u64;
+
+    let execution = lore_server::util::setup_execution(
+        "p12-live-projection",
+        String::default(),
+        String::default(),
+    );
+    lore_base::runtime::LORE_CONTEXT
+        .scope(execution, async move {
+            // --- Legacy write: the oracle. ---
+            let legacy_repo = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                repository_id,
+            ));
+            let metadata = RepositoryMetadata {
+                name: name.clone(),
+                description: String::new(),
+                default_branch: default_branch_id_context,
+                default_branch_name: default_branch_name.to_string(),
+                creator: creator.to_string(),
+                created,
+            };
+            let metadata_hash = repository::metadata_store(legacy_repo.clone(), metadata)
+                .await
+                .expect("legacy metadata store");
+            let write_token = lore_server::grpc::get_write_token();
+            branch::create(
+                legacy_repo.clone(),
+                &write_token,
+                default_branch_id_context,
+                default_branch_name,
+                branch::default_category(),
+                creator,
+                created,
+                Vec::new(),
+                false,
+                false,
+            )
+            .await
+            .expect("legacy branch create");
+            repository::metadata_store_hash(legacy_repo.clone(), metadata_hash)
+                .await
+                .expect("legacy metadata pointer store");
+            repository::store_name_to_id(legacy_repo.clone(), &name, repository_id)
+                .await
+                .expect("legacy name index store");
+
+            let repository_partition = repository_id.data().to_vec();
+            let global_partition = RepositoryId::default().data().to_vec();
+            let legacy_rows =
+                mutable_rows(&raw_client, &repository_partition, &global_partition).await;
+            assert_eq!(
+                legacy_rows.len(),
+                5,
+                "the legacy writers must leave exactly five lore_mutable rows, got {legacy_rows:?}"
+            );
+
+            // Delete the legacy rows before the governed write, so the
+            // comparison below proves the governed create RECREATES exactly
+            // these five rows, not merely that it leaves pre-existing ones
+            // untouched. Without this, an empty `projection()` (writing
+            // nothing at all) would pass the same `after_rows == legacy_rows`
+            // assertion vacuously -- the legacy writers never touch the
+            // domain tables, so deleting only their `lore_mutable` rows here
+            // has no effect on the governed create's own coordinator path.
+            for row in &legacy_rows {
+                let deleted = raw_client
+                    .execute(
+                        "DELETE FROM lore_mutable WHERE partition = $1 AND key_type = $2 AND \
+                         key = $3",
+                        &[&row.partition, &row.key_type, &row.key],
+                    )
+                    .await
+                    .expect("delete legacy row before governed write");
+                assert_eq!(deleted, 1, "each legacy row must delete exactly once");
+            }
+            let cleared_rows =
+                mutable_rows(&raw_client, &repository_partition, &global_partition).await;
+            assert!(
+                cleared_rows.is_empty(),
+                "the five legacy rows must be gone before the governed write runs, got \
+                 {cleared_rows:?}"
+            );
+
+            // --- Governed write: an independent path to the same rows. ---
+            let mut branch_metadata = Metadata::new();
+            branch::metadata_populate(
+                &mut branch_metadata,
+                default_branch_id_context,
+                default_branch_name,
+                branch::default_category(),
+                creator,
+                created,
+                Vec::new(),
+            )
+            .expect("branch metadata populate");
+            let branch_metadata_hash = branch_metadata
+                .serialize(legacy_repo.clone())
+                .await
+                .expect("branch metadata serialize");
+
+            let domain_store = PostgresDomainStore::connect(&url, 4, &TlsConfig::default())
+                .await
+                .expect("real Postgres domain store must connect");
+            let domain = Arc::new(DomainContext::new(Arc::new(domain_store), true));
+            let store = domain.store().clone();
+
+            let operation_id = Uuid::now_v7();
+            let key = ReceiptKey {
+                verified_issuer: "https://issuer.example/p12-live-projection".to_string(),
+                authenticated_subject: "p12-live-projection-tester".to_string(),
+                tenant_scope_key: rand::random::<[u8; 16]>().to_vec(),
+                operation_id,
+            };
+            let digest = canonical_intent_digest(&CanonicalIntent::RepositoryCreate {
+                repository_id: repository_id.data(),
+                name: &name,
+                description: "",
+                default_branch_id: &default_branch_id_bytes,
+                default_branch_name,
+                creator: Some(creator),
+                caller_created: Some(created),
+            })
+            .expect("create intent must hash");
+            let binding = OperationBinding {
+                method: "repository_create".to_string(),
+                scope: key.tenant_scope_key.clone(),
+                fingerprint_version: 1,
+                fingerprint: rand::random::<[u8; 32]>().to_vec(),
+                canonical_intent_digest: digest.clone(),
+            };
+            let prepared = store
+                .domain_operation_prepare(&key, &binding, None)
+                .await
+                .expect("prepare must succeed");
+            let PrepareResult::Prepared { token, .. } = prepared else {
+                panic!("must prepare, got {prepared:?}");
+            };
+            let admitted = AdmittedOperation {
+                key: key.clone(),
+                carried: DomainOperationMetadata {
+                    operation_id,
+                    fingerprint_version: 1,
+                    fingerprint: binding.fingerprint.clone(),
+                    prepare_token: token,
+                    mediated_scope: None,
+                },
+            };
+            let governed = GovernedRepositoryCreate::prepare(
+                Some(&domain),
+                Some(admitted),
+                "repository_create",
+                digest,
+            )
+            .expect("prepare must not error")
+            .expect("enforcement is on; must admit");
+
+            let default_branch_latest_hash = lore_storage::Hash::default();
+            let publication = RepositoryCreatePublication {
+                salt: legacy_repo.salt(),
+                repository_id: repository_id.data(),
+                name: &name,
+                metadata_hash: metadata_hash.as_ref(),
+                default_branch_id: &default_branch_id_bytes,
+                default_branch_name,
+                default_branch_metadata_hash: branch_metadata_hash.as_ref(),
+                default_branch_latest_hash: default_branch_latest_hash.as_ref(),
+            };
+            governed
+                .commit(&publication)
+                .await
+                .expect("governed create must succeed");
+
+            let after_rows =
+                mutable_rows(&raw_client, &repository_partition, &global_partition).await;
+            assert_eq!(
+                after_rows, legacy_rows,
+                "the governed create's projection() must RECREATE byte-identical lore_mutable \
+                 rows to the ones the legacy writers left (deleted above, so this proves the \
+                 governed path actually wrote them, not merely that it left pre-existing rows \
+                 untouched) -- same partition, key_type, key, and value for all five rows, \
+                 including the branch-latest row's explicit zero value (a delete there would \
+                 silently diverge from the legacy compare-and-swap writer's own contract)"
+            );
+        })
+        .await;
 }

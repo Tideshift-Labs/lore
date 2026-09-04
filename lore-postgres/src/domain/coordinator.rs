@@ -144,27 +144,52 @@ pub struct RepositoryCreateInput {
     pub creation_fingerprint_version: i32,
     /// `lore_mutable` projection rows this transaction must write in step.
     pub projection: Vec<ProjectionWrite>,
-    /// Classified event to append last, if any.
+    /// Classified events to append last, in the order given.
     ///
-    /// BLOCKED(WP-116): one `Option` cannot carry the two events this
-    /// transition owes. CR-032's classification table requires a row for
+    /// A bounded `Vec` rather than one slot because this transition owes two
+    /// rows, not one. CR-032's classification table requires a row for
     /// "Repository live publication" **and** a row for "Branch create", and
     /// this method commits both in one transaction: the repository row at
-    /// generation 1 and its default branch at generation 1. A single slot can
+    /// generation 1 and its default branch at generation 1. One `Option` can
     /// express `repository.published` or `branch.created`, never both.
     ///
-    /// Not resolved in Part 1 because this method has no production caller:
-    /// `RepositoryCreateInput` is constructed only in tests, and the two
-    /// repository-create handler sites are still fenced by
-    /// `reject_unwired_governed_operation`. It must be resolved before those
-    /// sites are wired.
+    /// The owner resolved that choice on 2026-09-03 in favour of the `Vec`
+    /// over a CR-032 amendment folding the default branch into
+    /// `repository.published`: a consumer that tracks branches must see the
+    /// default branch appear the same way every other branch does.
     ///
-    /// Missing artefact: an owner decision between widening this field to a
-    /// bounded `Vec<PendingEvent>` and a CR-032 amendment saying a repository
-    /// publication's default branch is covered by `repository.published`
-    /// alone. The `Vec` is the safer default, but it changes the shape
-    /// WP-117 and WP-118 consume, so it is not an implementation-time call.
-    pub event: Option<PendingEvent>,
+    /// Bounded by [`MAX_PENDING_EVENTS`] and checked by
+    /// [`validate_pending_events`] before the transaction opens, so one
+    /// mutation can never turn into an unbounded outbox write.
+    pub events: Vec<PendingEvent>,
+}
+
+/// The most classified events one governed mutation may append.
+///
+/// Repository create is the only method that needs more than one today, and it
+/// needs exactly two. The cap is deliberately a small constant rather than the
+/// exact current count: CR-032's classification table is what decides how many
+/// rows a transition owes, and a table change should not have to move a bound
+/// as well. It is not a `Vec` with no ceiling, because the ceiling is the
+/// property that keeps an outbox append bounded by the mutation that caused it.
+pub const MAX_PENDING_EVENTS: usize = 4;
+
+/// Reject an over-long event carriage before the transaction opens.
+///
+/// Checked at the top of the coordinator method rather than at the append step:
+/// an overrun discovered mid-transaction would roll back domain work that was
+/// already correct, while an overrun discovered here costs no transaction at
+/// all. This mirrors the same before-the-transaction placement the outbox
+/// builders use for their own width checks.
+pub fn validate_pending_events(events: &[PendingEvent], method: &str) -> Result<(), DomainError> {
+    if events.len() > MAX_PENDING_EVENTS {
+        return Err(DomainError::InvalidInput(format!(
+            "{method} carries {} outbox events, but one governed mutation may append at most \
+             {MAX_PENDING_EVENTS}",
+            events.len()
+        )));
+    }
+    Ok(())
 }
 
 /// One `lore_mutable` row a domain transaction must write alongside its domain
@@ -291,12 +316,16 @@ pub struct RepositoryDeleteInput {
     pub projection: Vec<ProjectionWrite>,
     /// Classified event to append last, if any.
     ///
-    /// BLOCKED(WP-116): same one-slot ceiling as
-    /// [`RepositoryCreateInput::event`], and worse here because the count is
-    /// unbounded. This transaction tombstones every live branch of the
-    /// repository in one `UPDATE`, and CR-032 classifies a branch tombstone as
-    /// "Yes, once per real committed transition". N branches owe N
-    /// `branch.deleted` rows; one slot expresses one.
+    /// BLOCKED(WP-116): the create carriage was widened to a bounded
+    /// [`Vec<PendingEvent>`](RepositoryCreateInput::events) on 2026-09-03, and
+    /// that answer deliberately does **not** carry across to delete. A cap of
+    /// [`MAX_PENDING_EVENTS`] cannot express this transition, because the count
+    /// here is unbounded rather than merely greater than one: widening the
+    /// field to the same bounded `Vec` would look like the same fix while still
+    /// dropping every branch past the cap. This transaction tombstones every
+    /// live branch of the repository in one `UPDATE`, and CR-032 classifies a
+    /// branch tombstone as "Yes, once per real committed transition". N
+    /// branches owe N `branch.deleted` rows; one slot expresses one.
     ///
     /// CR-032 does give the shape of an answer for the adjacent case — a
     /// repository tombstone hiding all associations emits "One

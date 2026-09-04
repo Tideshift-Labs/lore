@@ -43,11 +43,13 @@ use lore_postgres::domain::coordinator::BranchPushCommitInput;
 use lore_postgres::domain::coordinator::CommittedOrdinal;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
+use lore_postgres::domain::coordinator::MAX_PENDING_EVENTS;
 use lore_postgres::domain::coordinator::MetadataCasInput;
 use lore_postgres::domain::coordinator::PendingEvent;
 use lore_postgres::domain::coordinator::ProjectionWrite;
 use lore_postgres::domain::coordinator::RepositoryCreateInput;
 use lore_postgres::domain::coordinator::RepositoryDeleteInput;
+use lore_postgres::domain::errors::DomainError;
 use lore_postgres::domain::errors::DomainOutcome;
 use lore_postgres::domain::outbox::version::AggregateVersion;
 use lore_postgres::domain::receipts::AuthorizationWitness;
@@ -236,6 +238,39 @@ async fn one_outbox_row_for_repository(client: &Client, repository_id: &[u8]) ->
     }
 }
 
+/// All outbox rows for a repository, ordered by `created_at` ascending.
+///
+/// `event_id` is a random `Uuid::new_v4()` (see `outbox::append`), so it
+/// carries no ordering signal; `created_at` is `clock_timestamp()`, read fresh
+/// per `INSERT` rather than frozen at transaction start, so two sequential
+/// appends inside one transaction get two distinct, increasing values -- this
+/// is the "if observable" evidence for F-032-3's outbox-last ordering. Field
+/// correctness assertions below still look each row up by `aggregate_kind`
+/// rather than trusting vector position, so a tie (if one somehow occurred)
+/// would only weaken the ordering assertion, not produce a false field match.
+async fn all_outbox_rows_for_repository(client: &Client, repository_id: &[u8]) -> Vec<OutboxRow> {
+    client
+        .query(
+            "SELECT event_kind, aggregate_kind, aggregate_id, aggregate_version, \
+                    repository_generation, idempotency_key, cell_id \
+             FROM lore_outbox_events WHERE repository_id = $1 ORDER BY created_at ASC",
+            &[&repository_id],
+        )
+        .await
+        .expect("query outbox rows for repository")
+        .into_iter()
+        .map(|row| OutboxRow {
+            event_kind: row.get("event_kind"),
+            aggregate_kind: row.get("aggregate_kind"),
+            aggregate_id: row.get("aggregate_id"),
+            aggregate_version: row.get("aggregate_version"),
+            repository_generation: row.get("repository_generation"),
+            idempotency_key: row.get("idempotency_key"),
+            cell_id: row.get("cell_id"),
+        })
+        .collect()
+}
+
 fn repository_create_input(
     repository_id: Vec<u8>,
     name: String,
@@ -252,7 +287,11 @@ fn repository_create_input(
         creation_fingerprint: rand::random::<[u8; 32]>().to_vec(),
         creation_fingerprint_version: 1,
         projection: Vec::new(),
-        event,
+        // WP-116 Part 3 widened the create carriage to a bounded `Vec`. This
+        // helper keeps its one-event parameter so every existing caller reads
+        // the same; a case that needs the two-event pair builds the input
+        // directly.
+        events: event.into_iter().collect(),
     }
 }
 
@@ -414,11 +453,11 @@ async fn repository_create_exact_fingerprint_retry_leaves_no_second_row() {
     // coordinator's own rule (not the outbox's ON CONFLICT dedupe -- a
     // different mechanism entirely; see the module docs).
     let (second_op, _w) = admitted_operation(&store, "repository_create").await;
-    input.event = Some(pending_event(
+    input.events = vec![pending_event(
         repository_id.clone(),
         CommittedOrdinal::RepositoryGeneration,
         Vec::new(),
-    ));
+    )];
     let second = store
         .repository_create(&second_op, &input)
         .await
@@ -430,6 +469,177 @@ async fn repository_create_exact_fingerprint_retry_leaves_no_second_row() {
         outbox_row_count_for_repository(&db, &repository_id).await,
         1,
         "an exact fingerprint retry must not create a second outbox row"
+    );
+}
+
+/// WP-116 Part 3: `RepositoryCreateInput.events` widened from one `Option` to
+/// a bounded `Vec<PendingEvent>` so one create transaction can commit both
+/// CR-032 rows it owes -- the repository publication and its default branch
+/// creation -- in a single transaction. A supplied two-event pair
+/// (`repository.published` then `branch.created`) must commit exactly two
+/// outbox rows, each with the pinned fields, and (F-032-3: outbox insert is
+/// the transaction's last write, in caller order) the repository row's
+/// `created_at` must not be later than the branch row's.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn repository_create_wired_two_events_commits_both_rows_with_pinned_fields_in_order() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let repository_id = rand_repo_id();
+    let (operation, _witness) = admitted_operation(&store, "repository_create").await;
+
+    let mut input = repository_create_input(repository_id.clone(), rand_name(), None);
+    let branch_id = input.default_branch_id.clone();
+    let default_branch_latest_hash = input.default_branch_latest_hash.clone();
+    let repository_event = pending_event(
+        repository_id.clone(),
+        CommittedOrdinal::RepositoryGeneration,
+        Vec::new(),
+    );
+    let branch_event = {
+        let mut e = pending_event(
+            branch_id.clone(),
+            CommittedOrdinal::BranchGeneration,
+            default_branch_latest_hash.clone(),
+        );
+        e.event_kind = "branch.created".to_string();
+        e.aggregate_kind = "branch".to_string();
+        e
+    };
+    input.events = vec![repository_event, branch_event];
+
+    let result = store
+        .repository_create(&operation, &input)
+        .await
+        .expect("two-event repository create must succeed");
+    assert!(matches!(result.outcome, DomainOutcome::Applied));
+    assert_eq!(result.repository_generation, Some(1));
+    assert_eq!(result.branch_generation, Some(1));
+
+    let rows = all_outbox_rows_for_repository(&db, &repository_id).await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "a committed create with two supplied events must leave exactly two rows, got {} \
+         (kinds: {:?})",
+        rows.len(),
+        rows.iter().map(|r| &r.event_kind).collect::<Vec<_>>()
+    );
+
+    let repository_position = rows
+        .iter()
+        .position(|r| r.aggregate_kind == "repository")
+        .expect("a repository.published row must be present");
+    let branch_position = rows
+        .iter()
+        .position(|r| r.aggregate_kind == "branch")
+        .expect("a branch.created row must be present");
+
+    let repo_row = &rows[repository_position];
+    assert_eq!(repo_row.event_kind, "repository.published");
+    assert_eq!(repo_row.aggregate_id, repository_id);
+    assert_eq!(repo_row.repository_generation, 1);
+    let repo_decoded =
+        AggregateVersion::decode(&repo_row.aggregate_version).expect("decode repository version");
+    assert_eq!(repo_decoded.ordinal, 1);
+    assert!(
+        repo_decoded.identity.is_empty(),
+        "repository-kind identity is empty per PIN-4"
+    );
+
+    let branch_row = &rows[branch_position];
+    assert_eq!(branch_row.event_kind, "branch.created");
+    assert_eq!(branch_row.aggregate_id, branch_id);
+    assert_eq!(
+        branch_row.repository_generation, 1,
+        "the outer repository_generation column is the repository row's generation at commit \
+         time for both rows, independent of the branch generation encoded inside its own \
+         aggregate_version"
+    );
+    let branch_decoded =
+        AggregateVersion::decode(&branch_row.aggregate_version).expect("decode branch version");
+    assert_eq!(branch_decoded.ordinal, 1, "committed branch generation");
+    assert_eq!(
+        branch_decoded.identity, default_branch_latest_hash,
+        "branch.created's identity is the exact initial tip, per event-kinds.json"
+    );
+
+    assert!(
+        repository_position < branch_position,
+        "F-032-3: repository.published must be appended before branch.created (caller order is \
+         preserved by append_events); observed insertion order was {:?}",
+        rows.iter().map(|r| &r.aggregate_kind).collect::<Vec<_>>()
+    );
+}
+
+/// The bounded `Vec<PendingEvent>` is checked before the transaction opens
+/// (`validate_pending_events`, called ahead of the pool checkout): a carriage
+/// over [`MAX_PENDING_EVENTS`] is refused at validation, with no repository
+/// row, no branch row, and no outbox row -- not a decisive `NOT_APPLIED`
+/// result, since this is a caller-shape defect the coordinator never admits
+/// far enough to evaluate against repository state.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn repository_create_over_cap_events_is_rejected_at_validation_with_zero_rows() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    let repository_id = rand_repo_id();
+    let (operation, _witness) = admitted_operation(&store, "repository_create").await;
+
+    let mut input = repository_create_input(repository_id.clone(), rand_name(), None);
+    input.events = (0..=MAX_PENDING_EVENTS)
+        .map(|_| {
+            pending_event(
+                repository_id.clone(),
+                CommittedOrdinal::RepositoryGeneration,
+                Vec::new(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        input.events.len(),
+        MAX_PENDING_EVENTS + 1,
+        "test fixture sanity: exactly one event over the cap"
+    );
+
+    let result = store.repository_create(&operation, &input).await;
+    match result {
+        Err(DomainError::InvalidInput(message)) => {
+            assert!(
+                message.contains("repository_create"),
+                "the validation error should name the offending method, got: {message}"
+            );
+        }
+        other => panic!(
+            "an over-cap event carriage must be refused as DomainError::InvalidInput before the \
+             transaction opens, got {other:?}"
+        ),
+    }
+
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        0
+    );
+    let repository_row_exists: bool = db
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM lore_domain_repositories WHERE repository_id = $1)",
+            &[&repository_id],
+        )
+        .await
+        .expect("query repository existence")
+        .get(0);
+    assert!(
+        !repository_row_exists,
+        "an over-cap carriage must be refused before any transaction opens, leaving no \
+         repository row at all -- not merely no outbox row"
     );
 }
 
