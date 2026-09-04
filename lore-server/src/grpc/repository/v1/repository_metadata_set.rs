@@ -25,6 +25,7 @@ use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::domain::DomainContext;
 use crate::domain::GovernedMetadataCas;
 use crate::domain::GovernedScope;
+use crate::domain::MetadataCasFamily;
 use crate::domain::MetadataCasOutcome;
 use crate::domain::admit_at_entry;
 use crate::domain_intent::CanonicalIntent;
@@ -98,7 +99,7 @@ pub async fn handler(
             GovernedMetadataCas::prepare(
                 domain_context,
                 Some(admitted),
-                "lore.repository.v1.RepositoryService/RepositoryMetadataSet",
+                MetadataCasFamily::Repository,
                 digest,
             )?
         }

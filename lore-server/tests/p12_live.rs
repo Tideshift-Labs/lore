@@ -30,6 +30,7 @@ use lore_server::domain::DomainContext;
 use lore_server::domain::GovernedRepositoryCreate;
 use lore_server::domain::GovernedScope;
 use lore_server::domain::PLATFORM_METHOD_REPOSITORY_CREATE;
+use lore_server::domain::PLATFORM_METHOD_REPOSITORY_OBLITERATE;
 use lore_server::domain::RepositoryCreatePublication;
 use lore_server::domain_intent::CanonicalIntent;
 use lore_server::domain_intent::canonical_intent_digest;
@@ -198,7 +199,7 @@ async fn exact_mediated_obliterate_consumes_while_tuple_tamper_preserves_prepare
         .expect("obliterate intent must hash");
         let key = mediated_key(operation_id, &org_uuid, &principal);
         let binding = OperationBinding {
-            method: "begin_obliterate".to_string(),
+            method: PLATFORM_METHOD_REPOSITORY_OBLITERATE.to_string(),
             scope: key.tenant_scope_key.clone(),
             fingerprint_version: 1,
             fingerprint: fingerprint.to_vec(),
@@ -236,7 +237,7 @@ async fn exact_mediated_obliterate_consumes_while_tuple_tamper_preserves_prepare
             )
             .expect("canonical carriage must pass the entry gate")
             .expect("enforced carriage must govern");
-        let operation = admitted.into_governed("begin_obliterate", digest);
+        let operation = admitted.into_governed(PLATFORM_METHOD_REPOSITORY_OBLITERATE, digest);
         let result = store
             .begin_obliterate(&operation, &repository_id, None)
             .await

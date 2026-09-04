@@ -475,10 +475,20 @@ impl GovernedMetadataCas {
     /// body- or handler-supplied digest (CR-029's canonical-intent contract),
     /// which is why this takes the bytes rather than the request. It is the
     /// 32 bytes `canonical_intent_digest` returns.
+    ///
+    /// # A family, never a method string
+    ///
+    /// This seam serves two families across four handlers, so unlike the create
+    /// and delete seams it cannot simply drop the argument. It takes a
+    /// [`MetadataCasFamily`] instead, which buys the same guarantee: v0 and v1
+    /// of one family resolve to one constant by construction, and no handler can
+    /// spell a method of its own. Before this, each of the four bound its own
+    /// gRPC path, so one operation id was consumable only by whichever wire
+    /// version the caller happened to reach.
     pub fn prepare(
         domain: Option<&Arc<DomainContext>>,
         admitted: Option<AdmittedOperation>,
-        method: &'static str,
+        family: MetadataCasFamily,
         digest: Vec<u8>,
     ) -> Result<Option<Self>, Status> {
         let Some(admitted) = admitted else {
@@ -494,7 +504,7 @@ impl GovernedMetadataCas {
         };
         Ok(Some(Self {
             domain: domain.clone(),
-            operation: admitted.into_governed(method, digest),
+            operation: admitted.into_governed(family.platform_method(), digest),
         }))
     }
 
@@ -770,6 +780,56 @@ pub const PLATFORM_METHOD_REPOSITORY_CREATE: &str = "repository.create";
 /// nothing left to discover and no reason to leave a `method` argument for a
 /// future handler to fill in wrongly.
 pub const PLATFORM_METHOD_REPOSITORY_DELETE: &str = "repository.delete";
+
+// PIN(WP-116, 2026-09-04): reserved name, no platform producer yet; CR-029
+// amendment owed.
+//
+// The four families below have no authorization producer on the platform:
+// `issueRepositoryOperationAuthorization` has one production caller and only the
+// create family reaches it, so no row has ever held any of these strings. They
+// are the control-plane lane's proposed dotted, family-scoped names, frozen here
+// by owner ruling on 2026-09-04 so the binding shape is settled before each
+// family's wiring lands rather than after the create defect repeats.
+//
+// Reserved is not observed. The first real producer for a family is what turns
+// its name into a fact, and the CR-029 amendment naming all six is owed. If a
+// producer lands writing something else, that is a conflict to resolve
+// deliberately, not a Lore-side value to quietly follow.
+/// Reserved method name for a governed repository metadata compare-and-swap.
+pub const PLATFORM_METHOD_REPOSITORY_METADATA_SET: &str = "repository.metadata-set";
+/// Reserved method name for a governed branch metadata compare-and-swap.
+pub const PLATFORM_METHOD_BRANCH_METADATA_SET: &str = "branch.metadata-set";
+/// Reserved method name for a governed branch push.
+pub const PLATFORM_METHOD_BRANCH_PUSH: &str = "branch.push";
+/// Reserved method name for a governed obliterate.
+pub const PLATFORM_METHOD_REPOSITORY_OBLITERATE: &str = "repository.obliterate";
+
+/// Which metadata compare-and-swap family a governed CAS belongs to.
+///
+/// [`GovernedMetadataCas`] serves two genuinely different families across four
+/// handlers, so it cannot drop its method argument the way the single-family
+/// create and delete seams did. This is the next best thing and gets the same
+/// guarantee: a handler picks a **family**, never a string, so v0 and v1 of one
+/// family map to one constant by construction and no handler can invent a method
+/// or drift from its sibling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataCasFamily {
+    /// Repository metadata pointer CAS, on either wire version.
+    Repository,
+    /// Branch metadata pointer CAS, on either wire version.
+    Branch,
+}
+
+impl MetadataCasFamily {
+    /// The reserved platform method name for this family.
+    #[must_use]
+    pub fn platform_method(self) -> &'static str {
+        match self {
+            Self::Repository => PLATFORM_METHOD_REPOSITORY_METADATA_SET,
+            Self::Branch => PLATFORM_METHOD_BRANCH_METADATA_SET,
+        }
+    }
+}
 
 /// The complete attached platform claim a governed create hands the ReBAC
 /// `CreateResource` callback.

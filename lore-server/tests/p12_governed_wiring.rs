@@ -1030,83 +1030,238 @@ fn the_governed_delete_seam_binds_its_method_by_construction_too() {
     );
 }
 
-/// The four metadata-CAS sites still bind their own gRPC path, and this test
-/// exists to make that state impossible to forget.
+/// Every governed family's method comes from one table, and no handler spells
+/// one.
 ///
-/// It is a **tracking** pin, so it is written to fail the moment the gap closes
-/// rather than to bless the gap. Two things trip it: a site that stops passing a
-/// gRPC-path literal, and a Lore-side platform method constant appearing for
-/// either family. Whoever does the fix updates this test as part of it, which is
-/// the point.
+/// This replaces a tracking pin that recorded four sites binding their own gRPC
+/// path. That pin was written to fail when the gap closed, and it did: the owner
+/// froze the remaining names on 2026-09-04 and all eight sites now bind by
+/// construction.
 ///
-/// # Why these four were not fixed with create and delete
+/// # What went wrong, so the shape is not mistaken for tidiness
 ///
-/// The defect is identical — `repository_metadata_set` and `branch_metadata_set`
-/// each bind one method on v0 and a different one on v1, so one operation id is
-/// consumable only by whichever wire version the caller reaches. The value is
-/// not. The platform names a method constant per family and today it has exactly
-/// two, `repository.create` and `repository.delete`
-/// (`packages/control-plane/src/repository-operation-dispatch.ts`). Nothing
-/// names a metadata-CAS method, and the intent families in
-/// `repository-operation-intent.ts` are canonical-digest domain separators in a
-/// different vocabulary, not method strings. Guessing one would produce a
-/// mismatch that looks fixed and fails identically at the coordinator, after the
-/// authorization side effect — which is exactly how the create defect presented.
+/// The create seam bound the handler's gRPC path into the receipt while sending
+/// the platform's family constant on the ReBAC callback. The platform stores one
+/// method per authorization row and three separate comparisons read it, so no
+/// value satisfied both: a live create passed carriage, passed the callback,
+/// then died at the coordinator with `ADMISSION_REJECTED_V1` after the
+/// authorization side effect had already run. The two wire versions also bound
+/// different paths from each other, so one operation id was consumable only by
+/// whichever version the caller reached — the v0/v1 divergence CR-029 exists to
+/// end, inside CR-029's own seam.
 ///
-/// Their shared seam, `GovernedMetadataCas`, genuinely serves two families, so
-/// its fix is a constant per family rather than the deleted parameter the
-/// single-family seams could take.
+/// # Reserved is not observed
 ///
-/// `branch_push` (`branch_push_commit`) and `obliterate` (`begin_obliterate`)
-/// are deliberately NOT listed: each binds one string across both wire versions,
-/// so neither carries the divergence. Whether those two strings match the
-/// platform's authorization rows is a separate, unverified question and not
-/// something a source-level pin can answer.
+/// Only `repository.create` is a fact: it is stored, enforced by
+/// `acknowledgeCreateClaim`, and exercised by a live round trip. The other five
+/// have no platform producer at all —
+/// `issueRepositoryOperationAuthorization` has one production caller and only
+/// the create family reaches it, so no authorization row has ever held them.
+/// They are frozen names, by owner ruling, so each family's binding shape is
+/// settled before its wiring lands rather than after the create defect repeats.
+/// The CR-029 amendment naming all six is owed. A producer that lands writing
+/// something else is a conflict to resolve deliberately, not a value for Lore to
+/// quietly follow.
+///
+/// # "Wired" does not mean "exercisable"
+///
+/// Mediated carriage is minted in that same single place, so `branch_push` and
+/// `obliterate` — the only governed sites besides create that are wired — are
+/// reachable from nowhere: no platform caller can prepare an operation for
+/// either family. They are not an unverified risk, they are unexercisable until
+/// the platform mints carriage for the family. Confirmed by the control-plane
+/// lane on 2026-09-04, correcting an earlier reading of this file that treated
+/// them as live.
 #[test]
-fn the_four_metadata_cas_sites_still_bind_a_per_handler_grpc_path() {
-    let divergent: [(&str, &str, &str); 4] = [
+fn every_governed_family_binds_its_method_from_the_one_reserved_table() {
+    // (constant name, frozen value, whether a platform producer writes it)
+    let table: [(&str, &str, bool); 6] = [
         (
-            "v0 repository metadata set",
-            include_str!("../src/grpc/handlers/repository_metadata_set.rs"),
-            "\"lore.RepositoryService/RepositoryMetadataSet\"",
+            "PLATFORM_METHOD_REPOSITORY_CREATE",
+            "repository.create",
+            true,
         ),
         (
-            "v1 repository metadata set",
-            include_str!("../src/grpc/repository/v1/repository_metadata_set.rs"),
-            "\"lore.repository.v1.RepositoryService/RepositoryMetadataSet\"",
+            "PLATFORM_METHOD_REPOSITORY_DELETE",
+            "repository.delete",
+            false,
         ),
         (
-            "v0 branch metadata set",
-            include_str!("../src/grpc/handlers/branch_metadata_set.rs"),
-            "\"lore.RevisionService/BranchMetadataSet\"",
+            "PLATFORM_METHOD_REPOSITORY_METADATA_SET",
+            "repository.metadata-set",
+            false,
         ),
         (
-            "v1 branch metadata set",
-            include_str!("../src/grpc/revision/v1/branch_metadata_set.rs"),
-            "\"lore.revision.v1.RevisionService/BranchMetadataSet\"",
+            "PLATFORM_METHOD_BRANCH_METADATA_SET",
+            "branch.metadata-set",
+            false,
+        ),
+        ("PLATFORM_METHOD_BRANCH_PUSH", "branch.push", false),
+        (
+            "PLATFORM_METHOD_REPOSITORY_OBLITERATE",
+            "repository.obliterate",
+            false,
         ),
     ];
-    for (label, source, literal) in divergent {
+    for (name, value, _) in table {
         assert!(
-            source.contains(literal),
-            "{label} no longer binds {literal}. If you fixed the v0/v1 method \
-             divergence, that is the intended outcome and this tracking pin is \
-             now stale: update it, and check that its sibling version was fixed \
-             in the same change rather than left behind."
+            GOVERNED_SEAM.contains(&format!("pub const {name}: &str = \"{value}\";")),
+            "{name} must be declared in the governed seam as \"{value}\"; the \
+             platform compares this string against the authorization row and \
+             has no second value to fall back on"
+        );
+    }
+    assert_eq!(
+        GOVERNED_SEAM.matches("pub const PLATFORM_METHOD_").count(),
+        table.len(),
+        "the reserved-method table is closed; a seventh constant means a family \
+         was added without being recorded here, and this test is where the \
+         reserved-versus-observed distinction is written down"
+    );
+
+    // The one observed value. `apps/auth-grpc/src/service-rebac.ts` hardcodes it
+    // and refuses the governed acknowledgement on anything else, so unlike the
+    // other five it cannot be renamed on this side alone.
+    let observed: Vec<&str> = table
+        .iter()
+        .filter(|(_, _, produced)| *produced)
+        .map(|(_, value, _)| *value)
+        .collect();
+    assert_eq!(
+        observed,
+        vec!["repository.create"],
+        "exactly one family has a platform producer today; if that changed, the \
+         reserved-name reasoning above changed with it"
+    );
+}
+
+/// No governed handler passes a method string to its seam.
+///
+/// The values are pinned above; this pins the mechanism, which is the part that
+/// actually prevents recurrence. A correct constant reached through a free-form
+/// argument is one edit away from the defect again.
+#[test]
+fn no_governed_handler_can_spell_its_own_method() {
+    // The single-family seams took the strongest form available: the argument is
+    // gone, so there is nothing to pass.
+    for seam in [
+        "impl GovernedRepositoryCreate {",
+        "impl GovernedRepositoryDelete {",
+    ] {
+        let body = rust_fn_body(GOVERNED_SEAM, seam);
+        let signature = {
+            let start = body
+                .find("pub fn prepare(")
+                .unwrap_or_else(|| panic!("{seam} must expose `prepare`"));
+            let rest = &body[start..];
+            let end = rest
+                .find(") -> Result<Option<Self>, Status> {")
+                .unwrap_or_else(|| panic!("{seam}'s `prepare` signature must terminate"));
+            &rest[..end]
+        };
+        assert!(
+            !signature.contains("method"),
+            "{seam}'s `prepare` must take no method argument"
         );
     }
 
-    // A Lore-side constant for either family means the platform named the
-    // value, which is the one thing that was missing.
-    for absent in [
-        "PLATFORM_METHOD_REPOSITORY_METADATA",
-        "PLATFORM_METHOD_BRANCH_METADATA",
-    ] {
+    // The CAS seam serves two real families, so it cannot drop the argument. It
+    // takes a closed family instead, which buys the same guarantee: v0 and v1 of
+    // one family resolve to one constant and a handler cannot spell a third.
+    let cas = rust_fn_body(GOVERNED_SEAM, "impl GovernedMetadataCas {");
+    assert!(
+        cas.contains("family: MetadataCasFamily,"),
+        "the CAS seam must take a closed family, not a method string"
+    );
+    assert!(
+        cas.contains("admitted.into_governed(family.platform_method(), digest)"),
+        "the CAS seam must resolve its method from the family"
+    );
+
+    // Every governed call site, across both wire versions of every family.
+    let call_sites: [(&str, &str, &str); 8] = [
+        (
+            "v0 repository create",
+            include_str!("../src/grpc/handlers/repository_create.rs"),
+            "GovernedRepositoryCreate::prepare(",
+        ),
+        (
+            "v1 repository create",
+            include_str!("../src/grpc/repository/v1/repository_create.rs"),
+            "GovernedRepositoryCreate::prepare(",
+        ),
+        (
+            "v0 repository metadata CAS",
+            include_str!("../src/grpc/handlers/repository_metadata_set.rs"),
+            "GovernedMetadataCas::prepare(",
+        ),
+        (
+            "v1 repository metadata CAS",
+            include_str!("../src/grpc/repository/v1/repository_metadata_set.rs"),
+            "GovernedMetadataCas::prepare(",
+        ),
+        (
+            "v0 branch metadata CAS",
+            include_str!("../src/grpc/handlers/branch_metadata_set.rs"),
+            "GovernedMetadataCas::prepare(",
+        ),
+        (
+            "v1 branch metadata CAS",
+            include_str!("../src/grpc/revision/v1/branch_metadata_set.rs"),
+            "GovernedMetadataCas::prepare(",
+        ),
+        (
+            "v0/v1 shared branch push",
+            include_str!("../src/grpc/handlers/branch_push.rs"),
+            "into_governed(",
+        ),
+        (
+            "v0 obliterate",
+            include_str!("../src/grpc/handlers/obliterate.rs"),
+            "into_governed(",
+        ),
+    ];
+    for (label, source, call) in call_sites {
+        let start = source
+            .find(call)
+            .unwrap_or_else(|| panic!("{label} must call {call}"));
+        let rest = &source[start + call.len()..];
+        let end = rest
+            .find(')')
+            .unwrap_or_else(|| panic!("{label}'s call to {call} must terminate"));
+        let args = &rest[..end];
         assert!(
-            !GOVERNED_SEAM.contains(absent),
-            "{absent} exists, so the platform has named this family's method. \
-             Bind it at both wire versions and retire this pin; leaving one \
-             version on its gRPC path is the defect, not half of a fix."
+            !args.contains('"'),
+            "{label} passes a string literal to {call}: {args}. Methods come \
+             from the reserved table, never from a handler."
         );
     }
+
+    // Push and obliterate bind once each, which is what makes one constant cover
+    // both wire versions rather than only v0.
+    for (family, binding) in [
+        ("branch push", "into_governed(PLATFORM_METHOD_BRANCH_PUSH"),
+        (
+            "obliterate",
+            "into_governed(PLATFORM_METHOD_REPOSITORY_OBLITERATE",
+        ),
+    ] {
+        let bindings: usize = call_sites
+            .iter()
+            .map(|(_, source, _)| source.matches(binding).count())
+            .sum::<usize>()
+            + GOVERNED_SEAM.matches(binding).count();
+        assert_eq!(
+            bindings, 1,
+            "{family} must bind its method exactly once; a second binding is how \
+             two wire versions come to mean different operations for one \
+             operation id"
+        );
+    }
+    assert!(
+        include_str!("../src/grpc/revision/v1/branch_push.rs")
+            .contains("use crate::grpc::handlers::branch_push::prepare_governed_push;"),
+        "v1 branch push must admit through v0's shared seam; preparing its own \
+         would give it a second method to diverge with"
+    );
 }

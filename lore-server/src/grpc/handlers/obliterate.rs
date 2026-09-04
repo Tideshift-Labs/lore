@@ -23,6 +23,7 @@ use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_interceptor::extract_bearer_token;
 use crate::domain::DomainContext;
 use crate::domain::GovernedScope;
+use crate::domain::PLATFORM_METHOD_REPOSITORY_OBLITERATE;
 use crate::domain::admit_at_entry;
 use crate::domain_intent::CanonicalIntent;
 use crate::domain_intent::canonical_intent_digest;
@@ -120,7 +121,7 @@ pub async fn handler(
             };
             Some((
                 domain.clone(),
-                admitted.into_governed("begin_obliterate", digest),
+                admitted.into_governed(PLATFORM_METHOD_REPOSITORY_OBLITERATE, digest),
                 event,
             ))
         }

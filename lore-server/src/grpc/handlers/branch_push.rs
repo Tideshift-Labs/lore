@@ -54,6 +54,7 @@ use crate::cache;
 use crate::domain::AdmittedOperation;
 use crate::domain::DomainContext;
 use crate::domain::GovernedScope;
+use crate::domain::PLATFORM_METHOD_BRANCH_PUSH;
 use crate::domain::admit_at_entry;
 use crate::domain::reject_unwired_governed_operation;
 use crate::domain_intent::CanonicalIntent;
@@ -448,7 +449,7 @@ pub(crate) async fn prepare_governed_push(
     };
     Ok(Some(GovernedPushCommit {
         domain: domain.clone(),
-        operation: admitted.into_governed("branch_push_commit", digest),
+        operation: admitted.into_governed(PLATFORM_METHOD_BRANCH_PUSH, digest),
         repository_generation: repository.generation,
         branch_generation: branch.generation,
         expected_latest_hash: branch.latest_hash,
