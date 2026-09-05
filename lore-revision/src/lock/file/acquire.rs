@@ -415,6 +415,20 @@ async fn record_batch_ownership(
         // reconciler must either have the transport return the id it stamped, or scope an id
         // around the dispatch here and record that one; until then nothing may treat this field
         // as a receipt key. It identifies which local acquire took the lock, and no more.
+        //
+        // **Read this before closing that PIN.** The obvious fix — making the acquire adopt the
+        // transport's dispatch attempt so the ids agree — is also what arms a trap.
+        // [`AttemptStore::resolve`] settles a record *and* drops every ownership row held by that
+        // attempt id; both implementations do it, because the trait says so. Today no lock id is
+        // ever passed to `resolve`, because this one is minted here and nothing else sees it. The
+        // moment a lock acquire shares an id with an attempt something resolves — and the receipt
+        // rail resolves a decisive failure as `NotApplied` — that call silently deletes the token
+        // for a lock the caller still holds, leaving a row only an administrator can release.
+        // That is the exact failure CR-030's token exists to prevent, reached from the side.
+        //
+        // So closing this PIN means also doing one of: stop `resolve` dropping ownership, or keep
+        // lock ownership under an id nothing resolves. Sharing the id without deciding that is a
+        // silent, unreproducible lock leak.
         let record = LockOwnership {
             attempt_id: AttemptId::new(),
             branch: acquired.lock.resource.branch,
