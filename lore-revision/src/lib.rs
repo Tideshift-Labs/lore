@@ -9,6 +9,7 @@ pub mod cluster;
 pub mod commit;
 pub mod dependency;
 pub mod diff;
+pub(crate) mod dispatch;
 pub mod environment;
 pub mod errors;
 pub mod event;

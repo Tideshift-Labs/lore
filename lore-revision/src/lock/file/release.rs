@@ -12,6 +12,7 @@ use lore_error_set::prelude::*;
 use lore_transport::attempt_store::AttemptStore;
 use lore_transport::attempt_store::FencedLockResource;
 use lore_transport::connection::Connection;
+use lore_transport::outcome::GrpcRpc;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
@@ -19,6 +20,7 @@ use tokio::task::JoinSet;
 use crate::attempt_store::held_tokens;
 use crate::auth;
 use crate::branch;
+use crate::dispatch::under_own_attempt;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
@@ -148,6 +150,7 @@ pub async fn release(
     repository: Arc<RepositoryContext>,
     options: ReleaseOptions,
     ownership: Arc<dyn AttemptStore>,
+    attempts: Option<&Arc<dyn AttemptStore>>,
 ) -> Result<(), ReleaseError> {
     let remote = repository
         .remote()
@@ -327,7 +330,8 @@ pub async fn release(
     let mut first_failure: Option<ReleaseError> = None;
 
     if !held.is_empty()
-        && let Err(error) = unlock_batches(&remote, repository.id, &held, &mut unlocks).await
+        && let Err(error) =
+            unlock_batches(&remote, repository.id, &held, &mut unlocks, attempts).await
     {
         first_failure = Some(error);
     }
@@ -338,7 +342,7 @@ pub async fn release(
         // them before it mutates anything, which makes the retry safe. Escalating first would
         // instead break every unfenced cell, because `ForceUnlock` does not exist there.
         && let Err(unlock_error) =
-            unlock_batches(&remote, repository.id, &unheld, &mut unlocks).await
+            unlock_batches(&remote, repository.id, &unheld, &mut unlocks, attempts).await
         && let Err(error) = force_release(
             &remote,
             repository.id,
@@ -346,6 +350,7 @@ pub async fn release(
             &queried_owners,
             unlock_error,
             &mut unlocks,
+            attempts,
         )
         .await
     {
@@ -411,6 +416,7 @@ async fn unlock_batches(
     repository_id: crate::lore::RepositoryId,
     resources: &[FencedLockResource],
     released: &mut Vec<LockResource>,
+    attempts: Option<&Arc<dyn AttemptStore>>,
 ) -> Result<(), ReleaseError> {
     let batch_iterator = resources.chunks(LOCK_BATCH_SIZE);
     let num_batches = batch_iterator.len();
@@ -419,16 +425,29 @@ async fn unlock_batches(
     for batch_resources in batch_iterator {
         let batch_resources = batch_resources.to_vec();
         let remote = remote.clone();
+        let attempts = attempts.cloned();
         lore_spawn!(batches, async move {
-            let response = remote
+            let connection = remote
                 .lock(repository_id)
                 .await
                 .forward_with::<ReleaseError, _>(|| {
                     format!("Failed to connect to remote {}", remote.remote_url())
-                })?
-                .unlock(&batch_resources)
-                .await
-                .forward::<ReleaseError>("Failed to release the lock")?;
+                })?;
+
+            // Entered inside the spawned task, and that placement is load-bearing. `lore_spawn!`
+            // re-scopes `LORE_CONTEXT` and nothing else, so the attempt task-local does not cross
+            // the spawn: a scope opened around this loop would be invisible in here, every batch
+            // would mint its own id anyway, and the caller's store would record none of them.
+            // Each batch is a separate irreversible dispatch and takes a separate id, for the
+            // same reason a push's several dispatches do.
+            let response = under_own_attempt(
+                attempts.as_ref(),
+                repository_id,
+                GrpcRpc::LockUnlock,
+                connection.unlock(&batch_resources),
+            )
+            .await
+            .forward::<ReleaseError>("Failed to release the lock")?;
 
             Ok(response)
         });
@@ -501,6 +520,7 @@ async fn force_release(
     owners: &HashMap<lock::LockResource, String>,
     unlock_error: ReleaseError,
     released: &mut Vec<LockResource>,
+    attempts: Option<&Arc<dyn AttemptStore>>,
 ) -> Result<(), ReleaseError> {
     // Grouped by owner because one `ForceUnlock` names exactly one. A rebuilt set spans several
     // when `--owner` was not given and the branch holds other people's locks.
@@ -530,7 +550,17 @@ async fn force_release(
                 Ok(connection) => connection,
                 Err(_) => return Err(unlock_error),
             };
-            match connection.force_unlock(batch, owner).await {
+            // Journalled like any other irreversible dispatch. A takeover is the most consequential
+            // call in this file — it removes a row from whoever holds it — so a caller that
+            // reconciles a lost response needs this one recorded most of all.
+            match under_own_attempt(
+                attempts,
+                repository_id,
+                GrpcRpc::LockForceUnlock,
+                connection.force_unlock(batch, owner),
+            )
+            .await
+            {
                 Ok(mut resources) => released.append(&mut resources),
                 Err(_) => return Err(unlock_error),
             }

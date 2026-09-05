@@ -250,6 +250,31 @@ pub enum AttemptResolution {
 /// Every method is fallible because every implementation of consequence touches a disk. A caller
 /// that cannot record an attempt must not dispatch it: dispatching first and recording second is
 /// the ordering that produces exactly the unreconcilable mutation this exists to prevent.
+///
+/// # Two jobs, and an embedder is only given one of them
+///
+/// This trait carries attempt records *and* lock ownership tokens, and for locks those two jobs
+/// belong to two different stores. A store an embedder supplies through an entry point such as
+/// `lore::lock::file_acquire_with_attempt_store` is used for attempt records only:
+/// [`record`](AttemptStore::record), [`lookup`](AttemptStore::lookup),
+/// [`unresolved`](AttemptStore::unresolved) and [`resolve`](AttemptStore::resolve). Lore never
+/// calls [`record_ownership`](AttemptStore::record_ownership),
+/// [`ownership_for`](AttemptStore::ownership_for) or
+/// [`clear_ownership`](AttemptStore::clear_ownership) on it, so an embedder that implements those
+/// three as `unimplemented!()` would never find out, and one that implements them faithfully will
+/// see them stay empty.
+///
+/// The reason is that the two jobs have opposite requirements. An attempt record must live in the
+/// caller's own journal, or the caller cannot reconcile what it dispatched. An ownership token must
+/// live in the repository's `.lore/` store, because a direct call and a call delegated under
+/// `LORE_USE_SERVICE` both derive that same store from the same repository path, and a token
+/// written by one has to be readable by the other. Put ownership in an embedder's store and a
+/// delegated acquire writes its token somewhere the later release will not look, which strands a
+/// lock that only an administrator can then clear.
+///
+/// So lore derives its own ownership store from the repository regardless of what the embedder
+/// supplies, and the embedder's store holds records. A single implementation still serves the CLI,
+/// which uses one store for both jobs because it has no second party to disagree with.
 #[async_trait]
 pub trait AttemptStore: Send + Sync {
     /// Durably record an attempt. Returns only once the record would survive a crash.

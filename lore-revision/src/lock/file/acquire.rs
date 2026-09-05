@@ -11,12 +11,14 @@ use lore_transport::attempt_store::AttemptStore;
 use lore_transport::attempt_store::FencedLockResource;
 use lore_transport::attempt_store::LockOwnership;
 use lore_transport::outcome::AttemptId;
+use lore_transport::outcome::GrpcRpc;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
 use crate::attempt_store::held_tokens;
 use crate::branch;
+use crate::dispatch::under_own_attempt;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
@@ -153,6 +155,7 @@ pub async fn acquire(
     repository: Arc<RepositoryContext>,
     options: AcquireOptions,
     ownership: Arc<dyn AttemptStore>,
+    attempts: Option<&Arc<dyn AttemptStore>>,
 ) -> Result<(), AcquireError> {
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
@@ -273,16 +276,29 @@ pub async fn acquire(
         let remote = remote.clone();
         let repository_id = repository.id;
         let ownership = ownership.clone();
+        let attempts = attempts.cloned();
         lore_spawn!(batches, async move {
-            let response = remote
+            let connection = remote
                 .lock(repository_id)
                 .await
                 .forward_with::<AcquireError, _>(|| {
                     format!("Failed to connect to remote {}", remote.remote_url())
-                })?
-                .lock(&batch_resources, owner.as_deref())
-                .await
-                .forward::<AcquireError>("Failed to acquire the lock")?;
+                })?;
+
+            // Entered inside the spawned task, and that placement is load-bearing. `lore_spawn!`
+            // re-scopes `LORE_CONTEXT` and nothing else, so the attempt task-local does not cross
+            // the spawn: a scope opened around this loop would be invisible in here, every batch
+            // would mint its own id anyway, and the caller's store would record none of them.
+            // Each batch is a separate irreversible dispatch and takes a separate id, for the
+            // same reason a push's several dispatches do.
+            let response = under_own_attempt(
+                attempts.as_ref(),
+                repository_id,
+                GrpcRpc::LockLock,
+                connection.lock(&batch_resources, owner.as_deref()),
+            )
+            .await
+            .forward::<AcquireError>("Failed to acquire the lock")?;
 
             // Recorded inside the batch task, before this batch is reported as successful, and
             // deliberately not after the join. A partial acquire rolls back by *releasing* what
@@ -338,7 +354,7 @@ pub async fn acquire(
         // The same store the successful batches just wrote their tokens into, so the rollback
         // presents them. Without this the rollback would release tokenlessly, which a fenced cell
         // refuses — leaving exactly the half-acquired set this branch exists to undo.
-        release(repository.clone(), options, ownership.clone())
+        release(repository.clone(), options, ownership.clone(), attempts)
             .await
             .forward::<AcquireError>("Failed to acquire the lock")?;
 

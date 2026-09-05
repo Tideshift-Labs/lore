@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
+use std::sync::Arc;
+
 use lore_macro::LoreArgs;
 use lore_revision::attempt_store::repository_attempt_store;
 use lore_revision::interface::LoreArray;
@@ -9,11 +11,14 @@ use lore_revision::lock::file::acquire::AcquireOptions;
 use lore_revision::lock::file::query::QueryOptions;
 use lore_revision::lock::file::release::ReleaseOptions;
 use lore_revision::lock::file::status::StatusOptions;
+use lore_transport::attempt_store::AttemptStore;
 use serde::Deserialize;
 use serde::Serialize;
 
 use crate::call::repository_call_read;
 use crate::call_delegation::dispatch_call;
+use crate::call_delegation::reject_undelegatable;
+use crate::call_delegation::service_delegation_requested;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreString;
 
@@ -57,10 +62,50 @@ pub async fn file_acquire(
     dispatch_call(globals, args, callback, file_acquire_local).await
 }
 
+/// Acquire, journalling each lock dispatch in the caller's own attempt store (WP-120).
+///
+/// The store supplied here records attempt identities and nothing else. Ownership tokens stay in
+/// lore's own `.lore/` store, derived from the repository below, and this store's ownership methods
+/// are never called for locks. See [`lore_transport::attempt_store::AttemptStore`] for why the two
+/// jobs are split: token custody has to agree between a direct call and a delegated one, and only a
+/// store derived from the repository does.
+///
+/// One record per lock dispatch, and an acquire batches, so a large set produces several. Refuses
+/// under `LORE_USE_SERVICE` for the same reason
+/// [`crate::branch::push_with_attempt_store`] does.
+pub async fn file_acquire_with_attempt_store(
+    globals: LoreGlobalArgs,
+    args: LoreLockFileAcquireArgs,
+    callback: LoreEventCallback,
+    attempts: Arc<dyn AttemptStore>,
+) -> i32 {
+    if service_delegation_requested() {
+        return reject_undelegatable(
+            globals,
+            callback,
+            "file_acquire_with_attempt_store cannot delegate to a service: the attempt store is \
+             in-process, and a delegated acquire would file receipts under identities the caller \
+             never recorded. Unset LORE_USE_SERVICE, or call file_acquire and keep no journal."
+                .to_owned(),
+        )
+        .await;
+    }
+    file_acquire_journalled(globals, args, callback, Some(attempts)).await
+}
+
 async fn file_acquire_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileAcquireArgs,
     callback: LoreEventCallback,
+) -> i32 {
+    file_acquire_journalled(globals, args, callback, None).await
+}
+
+async fn file_acquire_journalled(
+    globals: LoreGlobalArgs,
+    args: LoreLockFileAcquireArgs,
+    callback: LoreEventCallback,
+    attempts: Option<Arc<dyn AttemptStore>>,
 ) -> i32 {
     repository_call_read(
         globals,
@@ -80,7 +125,15 @@ async fn file_acquire_local(
             // repository path, so it derives the same `.lore/` store and reads the token a direct
             // acquire wrote (WP-120).
             let ownership = repository_attempt_store(&repository);
-            lore_revision::lock::file::acquire::acquire(repository, options, ownership)
+            async move {
+                lore_revision::lock::file::acquire::acquire(
+                    repository,
+                    options,
+                    ownership,
+                    attempts.as_ref(),
+                )
+                .await
+            }
         },
     )
     .await
@@ -105,7 +158,8 @@ pub async fn file_acquire_as_owner(
             };
 
             let ownership = repository_attempt_store(&repository);
-            lore_revision::lock::file::acquire::acquire(repository, options, ownership)
+            // `None`: this shape is reached only through the C ABI, which cannot carry a store.
+            lore_revision::lock::file::acquire::acquire(repository, options, ownership, None)
         },
     )
     .await
@@ -282,10 +336,44 @@ pub async fn file_release(
     dispatch_call(globals, args, callback, file_release_local).await
 }
 
+/// Release, journalling each lock dispatch in the caller's own attempt store (WP-120).
+///
+/// Records attempt identities only; ownership stays in lore's `.lore/` store, exactly as for
+/// [`file_acquire_with_attempt_store`]. A release batches like an acquire, and can additionally
+/// escalate to an administrative force-release, which is journalled too.
+pub async fn file_release_with_attempt_store(
+    globals: LoreGlobalArgs,
+    args: LoreLockFileReleaseArgs,
+    callback: LoreEventCallback,
+    attempts: Arc<dyn AttemptStore>,
+) -> i32 {
+    if service_delegation_requested() {
+        return reject_undelegatable(
+            globals,
+            callback,
+            "file_release_with_attempt_store cannot delegate to a service: the attempt store is \
+             in-process, and a delegated release would file receipts under identities the caller \
+             never recorded. Unset LORE_USE_SERVICE, or call file_release and keep no journal."
+                .to_owned(),
+        )
+        .await;
+    }
+    file_release_journalled(globals, args, callback, Some(attempts)).await
+}
+
 async fn file_release_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileReleaseArgs,
     callback: LoreEventCallback,
+) -> i32 {
+    file_release_journalled(globals, args, callback, None).await
+}
+
+async fn file_release_journalled(
+    globals: LoreGlobalArgs,
+    args: LoreLockFileReleaseArgs,
+    callback: LoreEventCallback,
+    attempts: Option<Arc<dyn AttemptStore>>,
 ) -> i32 {
     repository_call_read(
         globals,
@@ -301,7 +389,15 @@ async fn file_release_local(
             };
 
             let ownership = repository_attempt_store(&repository);
-            lore_revision::lock::file::release::release(repository, options, ownership)
+            async move {
+                lore_revision::lock::file::release::release(
+                    repository,
+                    options,
+                    ownership,
+                    attempts.as_ref(),
+                )
+                .await
+            }
         },
     )
     .await
