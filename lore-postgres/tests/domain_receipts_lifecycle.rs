@@ -508,7 +508,9 @@ async fn prepare_exact_retry_returns_the_same_token() {
     let b = binding("lore.domain.v1.test/ExactRetry");
 
     let tx = client.transaction().await.expect("begin first tx");
-    let first = prepare(&tx, &key, &b, None, None).await.expect("first prepare");
+    let first = prepare(&tx, &key, &b, None, None)
+        .await
+        .expect("first prepare");
     tx.commit().await.expect("commit first");
     let PrepareResult::Prepared {
         token: first_token, ..
@@ -518,7 +520,9 @@ async fn prepare_exact_retry_returns_the_same_token() {
     };
 
     let tx = client.transaction().await.expect("begin retry tx");
-    let retry = prepare(&tx, &key, &b, None, None).await.expect("retry prepare");
+    let retry = prepare(&tx, &key, &b, None, None)
+        .await
+        .expect("retry prepare");
     tx.commit().await.expect("commit retry");
     let PrepareResult::Prepared {
         token: retry_token, ..
@@ -750,7 +754,9 @@ async fn consume_and_receipt_get_reject_changed_canonical_intent() {
     let original = binding("lore.domain.v1.test/CanonicalIntent");
 
     let tx = client.transaction().await.expect("begin prepare tx");
-    let prepared = prepare(&tx, &key, &original, None, None).await.expect("prepare");
+    let prepared = prepare(&tx, &key, &original, None, None)
+        .await
+        .expect("prepare");
     tx.commit().await.expect("commit prepare");
     let PrepareResult::Prepared { token, .. } = prepared else {
         panic!("expected Prepared, got {prepared:?}");
@@ -1116,7 +1122,9 @@ async fn receipt_get_of_a_future_marker_under_a_different_binding_must_return_mi
     let binding_a = binding("lore.domain.v1.test/FutureMarkerGetA");
 
     let tx = client.transaction().await.expect("begin prepare tx");
-    prepare(&tx, &key, &binding_a, None, None).await.expect("prepare");
+    prepare(&tx, &key, &binding_a, None, None)
+        .await
+        .expect("prepare");
     tx.commit().await.expect("commit prepare");
 
     let binding_b = binding("lore.domain.v1.test/FutureMarkerGetB");

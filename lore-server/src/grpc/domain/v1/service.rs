@@ -708,7 +708,9 @@ impl DomainOperationService for LoreDomainOperationV1Service {
             from_future_marker: false,
             prepared_at_unix_millis: None,
             hard_expires_at_unix_millis: None,
-            method: found.method,
+            // Empty on the wire when there is no receipt, because proto3 has no absent string.
+            // The status field is what a caller branches on; this is context for the one it found.
+            method: found.method.unwrap_or_default(),
         };
         match found.lookup {
             ReceiptLookup::Prepared {

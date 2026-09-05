@@ -974,8 +974,14 @@ pub async fn consume(
 pub struct AttemptReceipt {
     /// What the row says. `NotFound` covers both no match and an ambiguous one.
     pub lookup: ReceiptLookup,
-    /// The method the matched receipt was filed under; empty when nothing matched.
-    pub method: String,
+    /// The method the matched receipt was filed under.
+    ///
+    /// `Option` rather than an empty string, so "there is no method" and "the method is empty"
+    /// cannot be confused, and so the invariant holds structurally: this is `Some` exactly when
+    /// [`Self::lookup`] is not `NotFound`. An empty-string sentinel let a method survive
+    /// alongside a `NotFound` in the narrow case where the row disappears between finding its key
+    /// and reading it, which would have contradicted what the wire contract promises.
+    pub method: Option<String>,
 }
 
 /// Find a receipt by the attempt identity its client chose, within one verified principal.
@@ -1022,7 +1028,7 @@ pub async fn attempt_receipt_get(
     if rows.len() != 1 {
         return Ok(AttemptReceipt {
             lookup: ReceiptLookup::NotFound,
-            method: String::new(),
+            method: None,
         });
     }
 
@@ -1048,10 +1054,14 @@ pub async fn attempt_receipt_get(
     };
 
     let lookup = receipt_get(tx, &key, &binding).await?;
-    Ok(AttemptReceipt {
-        method: binding.method,
-        lookup,
-    })
+    // Dropped when the delegated read found nothing after all. The two statements run in one
+    // transaction so this is close to unreachable, but "close to" is not the same as a promise,
+    // and the contract says a caller learns a method only for a receipt that exists.
+    let method = match lookup {
+        ReceiptLookup::NotFound => None,
+        _ => Some(binding.method),
+    };
+    Ok(AttemptReceipt { method, lookup })
 }
 
 pub async fn receipt_get(
