@@ -1114,6 +1114,15 @@ pub async fn domain_operations(
     domain_operations_client(connection, auth_url, identity, repository, credentials).await
 }
 
+/// Counts one in-flight request for as long as the guard is alive.
+///
+/// **Bind it to a name.** `let _ = RequestScopedCounter::new(..)` drops the guard at the end of
+/// that statement, so the counter increments and decrements before the request is even built and
+/// the gauge reads zero for every call. `let _counter = ` is what holds it for the scope. Every
+/// call site in this module but one used the first form until WP-120 — twelve of thirteen, across
+/// the admin, lock and revision clients — so the gauge they fed could only ever read zero. The
+/// single correct one in `revision_client` is why the bug survived: the pattern was there to copy
+/// and the wrong form was the one that got copied.
 struct RequestScopedCounter {
     counter: Arc<AtomicU64>,
 }
