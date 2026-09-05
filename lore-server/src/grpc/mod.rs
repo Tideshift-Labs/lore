@@ -430,6 +430,34 @@ pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool
     has_required_permission(extensions, repository, "migrate")
 }
 
+/// The `ForceUnlock` bar: the `owner` permission, and deliberately not
+/// [`can_admin_lock`]'s `migrate`.
+///
+/// CR-030 P-030-2. The two halves of this authority used to disagree by name:
+/// the wire gate here required `migrate`, while the platform's
+/// direct-authorization table gives `lock.force_release` the permission `owner`
+/// and `lock.admin_acquire` the permission `migrate`. Only the `owner` role
+/// carries both today, so the two agreed in effect and would have diverged the
+/// moment a role carried one but not the other. The ruling names the platform
+/// table as the contract, so `ForceUnlock` gets its own gate and `AdminLock`
+/// keeps [`can_admin_lock`].
+///
+/// `owner` is a first-class scope in the JWT vocabulary this server reads, not a
+/// new name introduced here: [`is_owner_or_admin`] already matches the same
+/// string, and Lorehub's mint emits it for the `owner` role alongside `migrate`.
+///
+/// It resolves that string differently, though, and the difference is worth
+/// naming so nobody reads the two as interchangeable. [`is_owner_or_admin`] goes
+/// through [`user_permissions`], which returns the FIRST resource matching the
+/// repository and does not honour the `urc-*` wildcard. This goes through
+/// [`has_required_permission`], which filters ALL matching resources and does
+/// honour the wildcard. That is deliberate: it makes this gate behave exactly
+/// like [`can_admin_lock`], the sibling it is being split away from, so the two
+/// administrative RPCs differ in which scope they demand and in nothing else.
+pub fn can_force_unlock(extensions: &Extensions, repository: RepositoryId) -> bool {
+    has_required_permission(extensions, repository, "owner")
+}
+
 pub fn get_matching_permissions(
     extensions: &Extensions,
     repository: RepositoryId,

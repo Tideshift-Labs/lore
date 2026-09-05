@@ -1087,7 +1087,8 @@ impl DomainStatusReport {
              \x20 same_database:       {}\n\
              \x20 sequence_headroom:   {}\n\
              \x20 quarantined_rows:    {}\n\
-             \x20 unfenced_rows:       {}\n\n",
+             \x20 unfenced_rows:       {}\n\
+             \x20 never_issued_token_rows: {}\n\n",
             yes_no(self.lock.provisioned),
             self.lock.schema_version,
             lore_postgres::domain::locks::schema::LOCK_SCHEMA_VERSION,
@@ -1099,7 +1100,24 @@ impl DomainStatusReport {
             yes_no(self.lock.sequence_headroom),
             self.lock.quarantined_rows,
             self.lock.unfenced_rows,
+            self.lock.never_issued_token_rows,
         ));
+        if self.lock.never_issued_token_rows > 0 {
+            // CR-030 P-030-3. These rows are well formed and the cell is ready
+            // with them present, so this is a note rather than a warning — but
+            // an operator reading a lock count needs to know which of them
+            // nobody can release except an administrator.
+            // Scoped to the armed case on purpose. While fenced routing is off
+            // the legacy store still serves every lock RPC and matches on the
+            // row's plain owner text, so a converted row is releasable the
+            // ordinary way in that window.
+            out.push_str(&format!(
+                "  note: {} converted lock row(s) record a never-issued ownership token. \
+                 Once this cell is armed their owners cannot release them, and `ForceUnlock` \
+                 by a principal holding the `owner` permission is the only way to clear one.\n\n",
+                self.lock.never_issued_token_rows
+            ));
+        }
         out.push_str(&format!(
             "rows\n\
              \x20 domain repositories: {} live, {} tombstoned\n\
@@ -1156,6 +1174,7 @@ impl DomainStatusReport {
                 "sequence_headroom": self.lock.sequence_headroom,
                 "quarantined_rows": self.lock.quarantined_rows,
                 "unfenced_rows": self.lock.unfenced_rows,
+                "never_issued_token_rows": self.lock.never_issued_token_rows,
             },
             "rows": {
                 "domain_repositories_live": self.rows.repositories_live,
@@ -1548,6 +1567,7 @@ mod tests {
                 sequence_headroom: true,
                 quarantined_rows: 0,
                 unfenced_rows: 0,
+                never_issued_token_rows: 0,
             },
             rows: RowCounts {
                 repositories_live: 1,

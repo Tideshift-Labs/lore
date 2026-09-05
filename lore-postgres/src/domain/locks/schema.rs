@@ -7,8 +7,36 @@
 //! self-bootstrap `SCHEMA`: a legacy-only store stays legacy, while a domain
 //! coordinator can prove the fenced schema and cutover state before use.
 
-/// First server-only lock-fencing schema revision.
-pub const LOCK_SCHEMA_VERSION: i64 = 1;
+/// Current server-only lock-fencing schema revision.
+///
+/// Revision 1 was the WP-117 shape. Revision 2 is CR-030's P-030-3 amendment:
+/// `lore_locks.token_never_issued` plus the `lore_locks_fenced_shape_v2` CHECK
+/// that admits a cutover-converted row whose token was never issued.
+///
+/// [`LOCK_SCHEMA`] rolls a revision-1 cell forward in place, so a cell upgrades
+/// when that DDL next runs rather than needing a second cutover. The literal in
+/// that DDL's seed cannot reference this constant;
+/// `tests/domain_migration_parity.rs` pins the two together.
+///
+/// # Upgrading an ARMED revision-1 cell is a full stop, not a rolling upgrade
+///
+/// The DDL is migration-owned (CR-030 N-7), so it does not run at ordinary boot,
+/// and neither order of operations is safe while both binaries are live:
+///
+/// * Roll the binary first and an armed revision-1 cell refuses to route fenced
+///   traffic, because `resolve_lock_fencing` compares the stored revision to
+///   this constant for equality. That refusal is deliberate — this binary must
+///   not interpret a shape it predates — but it is a refusal.
+/// * Migrate first and the stored revision reads 2, so any revision-1 binary
+///   still running hits the same equality from the other side.
+///
+/// An unarmed cell has neither problem: it routes legacy throughout, and
+/// `readiness` probes for the new column rather than naming it, so a revision-1
+/// database answers instead of failing the statement. Since no production cell
+/// is armed today, that is the path every cell actually takes. An operator
+/// arming a cell that is already armed at revision 1 stops it, migrates, and
+/// starts it.
+pub const LOCK_SCHEMA_VERSION: i64 = 2;
 
 /// Whether WP-120's public lock mutation contract exists on this build.
 ///
@@ -46,32 +74,51 @@ pub const LOCK_SCHEMA_VERSION: i64 = 1;
 /// chooses to arm, not a residual defect: the refusal is decisive, it happens
 /// before any mutation, and it names what to do.
 ///
-/// # The residual this flip does not close
+/// # The cutover residual, and how revision 2 records it
 ///
-/// BLOCKED(WP-120): a **cutover-converted** row is not releasable by its own
-/// owner even once the client can present tokens.
-/// [`crate::domain::locks::PostgresLockCoordinator::backfill`] mints a random
-/// `ownership_token` for every legacy row it converts and discards it, so the
-/// owner holds nothing to present, and `acquire_or_renew` refuses a tokenless
-/// re-acquire over a current row even to that row's own owner. Such a lock can
-/// only be cleared through `ForceUnlock` by a principal holding the `migrate`
-/// permission.
+/// A **cutover-converted** row was never releasable by its own owner, even once
+/// the client could present tokens.
+/// [`crate::domain::locks::PostgresLockCoordinator::backfill`] used to mint a
+/// random `ownership_token` for every legacy row it converted and then discard
+/// it, so the owner held nothing to present, and `acquire_or_renew` refuses a
+/// tokenless re-acquire over a current row even to that row's own owner. Nobody
+/// at all held those tokens.
 ///
-/// The operator precondition for cutover is therefore: **drain live legacy locks
-/// first, or expect to force-release them.** `BackfillReport.converted` is the
-/// count to watch — a cutover that converted zero rows has no residual at all.
+/// PIN(CR-030 P-030-3, 2026-09-05): that is now recorded as an **explicit
+/// absence** rather than as a value nobody holds. `backfill` writes
+/// `ownership_token = NULL` together with `token_never_issued = true`, a
+/// combination `lore_locks_fenced_shape_v2` below admits and admits only in that
+/// pairing: a fenced row is either a 32-byte token with the flag false, or a
+/// NULL token with the flag true, never anything else. `token_matches` refuses
+/// **every** caller on such a row, so it stays unreleasable by possession, and
+/// `acquire_or_renew` refuses a re-acquire over it whether or not the caller
+/// offers a token. On an ARMED cell the tokenless, `owner`-gated `ForceUnlock`
+/// is then the only way to clear one, which is what it was before — the change
+/// is that the row now says so instead of implying it through a token that
+/// exists and matches nothing.
 ///
-/// PIN(WP-120, 2026-09-04): closing it needs a way to record that a converted
-/// row's token was never issued, which the `lore_locks_fenced_shape` CHECK below
-/// does not admit (it requires exactly 32 bytes whenever the fenced columns are
-/// set). A sentinel token value is **not** an option: `token_matches` would
-/// accept it from any caller, handing everyone the authority to release every
-/// converted lock. That is a SCHEMA-117 amendment plus a CR-030 amendment, both
-/// on the owner list, neither frozen here.
+/// "On an armed cell" is a real qualifier, not throat-clearing. Between
+/// `backfill` and `arm_fenced_routing` a cell still routes every lock RPC to the
+/// legacy store (`crate::store::lock_store`), which matches on the row's plain
+/// `owner` text and knows nothing about tokens, so in that window a converted
+/// row is releasable the ordinary way. That is unchanged by this amendment and
+/// is not a hole in it — it is the same window in which the legacy store is the
+/// authority for every lock on the cell — but a claim that only an
+/// administrator can *ever* clear such a row would be false there.
 ///
-/// This constant no longer gates that residual, so the operator precondition
-/// above is now a **cutover** precondition an operator has to meet, rather than
-/// something the build refuses on their behalf.
+/// A **sentinel token value** stays refused by design, and this is the reason
+/// the encoding is an absence rather than a reserved constant: `token_matches`
+/// would accept a sentinel from any caller, handing everyone the authority to
+/// release every converted lock.
+///
+/// The operator precondition for cutover is unchanged and is still worth
+/// meeting: **drain live legacy locks first, or expect to force-release them.**
+/// `BackfillReport.converted` is the count to watch, and a cutover that
+/// converted zero rows has no residual at all. What revision 2 adds is that the
+/// residual is now countable after the fact —
+/// `LockFencingReadiness::never_issued_token_rows`, which `loreserver domain
+/// status` prints — rather than being indistinguishable from an ordinary held
+/// lock.
 pub const PUBLIC_MUTATION_CONTRACT_AVAILABLE: bool = true;
 
 /// The reason `enable_fencing` gives while [`PUBLIC_MUTATION_CONTRACT_AVAILABLE`]
@@ -132,7 +179,12 @@ ALTER TABLE lore_locks
     ADD COLUMN IF NOT EXISTS fence bigint,
     ADD COLUMN IF NOT EXISTS acquired_at timestamptz,
     ADD COLUMN IF NOT EXISTS renewed_at timestamptz,
-    ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+    ADD COLUMN IF NOT EXISTS expires_at timestamptz,
+    -- Schema revision 2 (CR-030 P-030-3). True only on a cutover-converted row
+    -- whose ownership token was never issued to anybody. Paired with a NULL
+    -- `ownership_token` by `lore_locks_fenced_shape_v2` below, so the absence is
+    -- recorded rather than encoded as a sentinel value any caller could present.
+    ADD COLUMN IF NOT EXISTS token_never_issued boolean NOT NULL DEFAULT false;
 
 DO $lock_constraints$
 BEGIN
@@ -148,21 +200,53 @@ BEGIN
         ALTER TABLE lore_locks ADD CONSTRAINT lore_locks_branch_width
             CHECK (octet_length(branch) = 16);
     END IF;
-    IF NOT EXISTS (
+    -- Schema revision 2 replaces the revision-1 shape in place. Dropping first
+    -- is what makes an already-armed cell upgrade on its next boot instead of
+    -- keeping a constraint that forbids the very row `backfill` now writes.
+    -- Both statements are guarded on the catalog, so re-running this DDL over an
+    -- already-upgraded cell does nothing, and only the first boot after the
+    -- upgrade pays the ADD CONSTRAINT validation scan. That scan holds ACCESS
+    -- EXCLUSIVE on `lore_locks` for its duration, which is the same cost the
+    -- revision-1 constraint already paid on a fresh cell; `lore_locks` holds one
+    -- row per held lock, not per object, so the scan is bounded by how many
+    -- locks the cell is holding rather than by its content.
+    IF EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'lore_locks_fenced_shape'
     ) THEN
-        ALTER TABLE lore_locks ADD CONSTRAINT lore_locks_fenced_shape CHECK (
+        ALTER TABLE lore_locks DROP CONSTRAINT lore_locks_fenced_shape;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'lore_locks_fenced_shape_v2'
+    ) THEN
+        ALTER TABLE lore_locks ADD CONSTRAINT lore_locks_fenced_shape_v2 CHECK (
             (repository_lock_generation IS NULL
              AND branch_lock_generation IS NULL
              AND owner_issuer IS NULL AND owner_subject IS NULL
              AND acting_issuer IS NULL AND acting_subject IS NULL
              AND ownership_token IS NULL AND fence IS NULL
-             AND acquired_at IS NULL AND renewed_at IS NULL AND expires_at IS NULL)
-         OR (repository_lock_generation >= 1
-             AND branch_lock_generation >= 1
+             AND acquired_at IS NULL AND renewed_at IS NULL AND expires_at IS NULL
+             AND token_never_issued = false)
+         OR (repository_lock_generation IS NOT NULL AND repository_lock_generation >= 1
+             AND branch_lock_generation IS NOT NULL AND branch_lock_generation >= 1
              AND owner_issuer IS NOT NULL AND owner_subject IS NOT NULL
-             AND octet_length(ownership_token) = 32
-             AND fence >= 1
+             -- The explicit IS NOT NULL is load-bearing, not redundant with the
+             -- width test beside it. `octet_length(NULL) = 32` is NULL, not
+             -- false, so without it a row with the flag clear and no token makes
+             -- the whole CHECK evaluate to NULL -- which a CHECK constraint
+             -- ADMITS. The revision-1 shape had the same hole; it only became
+             -- reachable once a NULL token stopped meaning "legacy row".
+             AND ((token_never_issued = false
+                   AND ownership_token IS NOT NULL
+                   AND octet_length(ownership_token) = 32)
+               OR (token_never_issued = true AND ownership_token IS NULL))
+             -- Same three-valued-logic hazard as the token width above, and the
+             -- same fix: `NULL >= 1` is NULL, so a fenced row with a NULL fence
+             -- or a NULL generation made this arm NULL and the CHECK admitted
+             -- it. Every reader fails closed on such a row, so this closes a
+             -- representable-but-unreachable state rather than a live defect --
+             -- which is the point, because CR-030's whole shape argument is that
+             -- an illegal row should be unrepresentable, not merely unreached.
+             AND fence IS NOT NULL AND fence >= 1
              AND acquired_at IS NOT NULL AND renewed_at IS NOT NULL
              AND renewed_at >= acquired_at
              AND (expires_at IS NULL OR expires_at > renewed_at))
@@ -227,14 +311,29 @@ CREATE TABLE IF NOT EXISTS lore_domain_lock_schema_state (
 INSERT INTO lore_domain_lock_schema_state (
     id, schema_version, backfill_state, database_identity, updated_at
 )
-SELECT 1,
-       1,
-       0,
-       control.system_identifier::text || ':' || database.oid::text || ':' || current_database(),
-       clock_timestamp()
+-- The schema_version literal below is aliased so a parity test can pin it
+-- against LOCK_SCHEMA_VERSION. This seed is raw SQL and cannot reference the
+-- constant, and the migration/runtime parity gate compares catalog shape rather
+-- than row contents -- so without that pin a version bump would diverge
+-- silently between the two paths.
+SELECT 1                                                                       AS id,
+       2                                                                       AS schema_version,
+       0                                                                       AS backfill_state,
+       control.system_identifier::text || ':' || database.oid::text || ':' || current_database()
+                                                                               AS database_identity,
+       clock_timestamp()                                                       AS updated_at
   FROM pg_control_system() AS control
   JOIN pg_database AS database ON database.datname = current_database()
 ON CONFLICT (id) DO NOTHING;
+
+-- Roll a revision-1 cell forward in place. The DDL above has already installed
+-- the revision-2 shape by the time this runs, so the row is recording what the
+-- database now is rather than promising a later step. `arm_fenced_routing`
+-- compares this value to the compiled constant for equality, so an already-armed
+-- revision-1 cell would refuse a re-arm without this.
+UPDATE lore_domain_lock_schema_state
+   SET schema_version = 2, updated_at = clock_timestamp()
+ WHERE id = 1 AND schema_version < 2;
 
 -- Dedicated lock generations move only on lock-identity invalidation. A
 -- repository generation-only update is the current obliteration-begin shape;

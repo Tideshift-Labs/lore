@@ -193,7 +193,12 @@ ALTER TABLE lore_locks
     ADD COLUMN IF NOT EXISTS fence bigint,
     ADD COLUMN IF NOT EXISTS acquired_at timestamptz,
     ADD COLUMN IF NOT EXISTS renewed_at timestamptz,
-    ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+    ADD COLUMN IF NOT EXISTS expires_at timestamptz,
+    -- Schema revision 2 (CR-030 P-030-3). True only on a cutover-converted row
+    -- whose ownership token was never issued to anybody. Paired with a NULL
+    -- `ownership_token` by `lore_locks_fenced_shape_v2` below, so the absence is
+    -- recorded rather than encoded as a sentinel value any caller could present.
+    ADD COLUMN IF NOT EXISTS token_never_issued boolean NOT NULL DEFAULT false;
 
 DO $lock_constraints$
 BEGIN
@@ -209,21 +214,53 @@ BEGIN
         ALTER TABLE lore_locks ADD CONSTRAINT lore_locks_branch_width
             CHECK (octet_length(branch) = 16);
     END IF;
-    IF NOT EXISTS (
+    -- Schema revision 2 replaces the revision-1 shape in place. Dropping first
+    -- is what makes an already-armed cell upgrade on its next boot instead of
+    -- keeping a constraint that forbids the very row `backfill` now writes.
+    -- Both statements are guarded on the catalog, so re-running this DDL over an
+    -- already-upgraded cell does nothing, and only the first boot after the
+    -- upgrade pays the ADD CONSTRAINT validation scan. That scan holds ACCESS
+    -- EXCLUSIVE on `lore_locks` for its duration, which is the same cost the
+    -- revision-1 constraint already paid on a fresh cell; `lore_locks` holds one
+    -- row per held lock, not per object, so the scan is bounded by how many
+    -- locks the cell is holding rather than by its content.
+    IF EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'lore_locks_fenced_shape'
     ) THEN
-        ALTER TABLE lore_locks ADD CONSTRAINT lore_locks_fenced_shape CHECK (
+        ALTER TABLE lore_locks DROP CONSTRAINT lore_locks_fenced_shape;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'lore_locks_fenced_shape_v2'
+    ) THEN
+        ALTER TABLE lore_locks ADD CONSTRAINT lore_locks_fenced_shape_v2 CHECK (
             (repository_lock_generation IS NULL
              AND branch_lock_generation IS NULL
              AND owner_issuer IS NULL AND owner_subject IS NULL
              AND acting_issuer IS NULL AND acting_subject IS NULL
              AND ownership_token IS NULL AND fence IS NULL
-             AND acquired_at IS NULL AND renewed_at IS NULL AND expires_at IS NULL)
-         OR (repository_lock_generation >= 1
-             AND branch_lock_generation >= 1
+             AND acquired_at IS NULL AND renewed_at IS NULL AND expires_at IS NULL
+             AND token_never_issued = false)
+         OR (repository_lock_generation IS NOT NULL AND repository_lock_generation >= 1
+             AND branch_lock_generation IS NOT NULL AND branch_lock_generation >= 1
              AND owner_issuer IS NOT NULL AND owner_subject IS NOT NULL
-             AND octet_length(ownership_token) = 32
-             AND fence >= 1
+             -- The explicit IS NOT NULL is load-bearing, not redundant with the
+             -- width test beside it. `octet_length(NULL) = 32` is NULL, not
+             -- false, so without it a row with the flag clear and no token makes
+             -- the whole CHECK evaluate to NULL -- which a CHECK constraint
+             -- ADMITS. The revision-1 shape had the same hole; it only became
+             -- reachable once a NULL token stopped meaning "legacy row".
+             AND ((token_never_issued = false
+                   AND ownership_token IS NOT NULL
+                   AND octet_length(ownership_token) = 32)
+               OR (token_never_issued = true AND ownership_token IS NULL))
+             -- Same three-valued-logic hazard as the token width above, and the
+             -- same fix: `NULL >= 1` is NULL, so a fenced row with a NULL fence
+             -- or a NULL generation made this arm NULL and the CHECK admitted
+             -- it. Every reader fails closed on such a row, so this closes a
+             -- representable-but-unreachable state rather than a live defect --
+             -- which is the point, because CR-030's whole shape argument is that
+             -- an illegal row should be unrepresentable, not merely unreached.
+             AND fence IS NOT NULL AND fence >= 1
              AND acquired_at IS NOT NULL AND renewed_at IS NOT NULL
              AND renewed_at >= acquired_at
              AND (expires_at IS NULL OR expires_at > renewed_at))
@@ -288,14 +325,29 @@ CREATE TABLE IF NOT EXISTS lore_domain_lock_schema_state (
 INSERT INTO lore_domain_lock_schema_state (
     id, schema_version, backfill_state, database_identity, updated_at
 )
-SELECT 1,
-       1,
-       0,
-       control.system_identifier::text || ':' || database.oid::text || ':' || current_database(),
-       clock_timestamp()
+-- The schema_version literal below is aliased so a parity test can pin it
+-- against LOCK_SCHEMA_VERSION. This seed is raw SQL and cannot reference the
+-- constant, and the migration/runtime parity gate compares catalog shape rather
+-- than row contents -- so without that pin a version bump would diverge
+-- silently between the two paths.
+SELECT 1                                                                       AS id,
+       2                                                                       AS schema_version,
+       0                                                                       AS backfill_state,
+       control.system_identifier::text || ':' || database.oid::text || ':' || current_database()
+                                                                               AS database_identity,
+       clock_timestamp()                                                       AS updated_at
   FROM pg_control_system() AS control
   JOIN pg_database AS database ON database.datname = current_database()
 ON CONFLICT (id) DO NOTHING;
+
+-- Roll a revision-1 cell forward in place. The DDL above has already installed
+-- the revision-2 shape by the time this runs, so the row is recording what the
+-- database now is rather than promising a later step. `arm_fenced_routing`
+-- compares this value to the compiled constant for equality, so an already-armed
+-- revision-1 cell would refuse a re-arm without this.
+UPDATE lore_domain_lock_schema_state
+   SET schema_version = 2, updated_at = clock_timestamp()
+ WHERE id = 1 AND schema_version < 2;
 
 CREATE OR REPLACE FUNCTION lore_domain_repository_lock_generation_before_update()
 RETURNS trigger LANGUAGE plpgsql AS $fn$

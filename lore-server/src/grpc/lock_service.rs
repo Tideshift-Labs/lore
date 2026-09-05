@@ -51,6 +51,7 @@ use super::get_user_id;
 use super::is_owner_or_admin;
 use super::timeout_grpc;
 use crate::grpc::can_admin_lock;
+use crate::grpc::can_force_unlock;
 use crate::grpc::require_permission;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -221,8 +222,16 @@ fn fenced_lock_to_wire(lock: FencedLock) -> Result<lore_proto::lock::Lock, Statu
 ///
 /// CR-030's public shape: the token is issued on acquire and required on
 /// release. It is returned only from `Lock` and `AdminLock`, never from a read.
+/// A lock with no issued token cannot reach here: `Lock` and `AdminLock` mint
+/// one for every row they write, and only a cutover-converted row lacks one.
+/// Refusing rather than serving an empty token keeps that assumption visible — a
+/// silently empty token on an acquire response would look to the client exactly
+/// like the read paths' deliberate blank, and it would then be unable to release
+/// what it just took.
 fn fenced_lock_to_wire_with_token(lock: FencedLock) -> Result<lore_proto::lock::Lock, Status> {
-    let token = lock.ownership_token;
+    let token = lock.ownership_token.ok_or_else(|| {
+        Status::internal("Acquired lock carries no ownership token to return to its owner")
+    })?;
     let mut wire = fenced_lock_to_wire(lock)?;
     wire.ownership_token = bytes::Bytes::copy_from_slice(&token);
     Ok(wire)
@@ -1111,7 +1120,9 @@ impl LoreLockService {
         // about the cell. `fenced_call`'s refusals name whether fenced routing
         // is active and whether the cell is wired for it, and a caller with no
         // administrative permission has no business learning either.
-        if !can_admin_lock(&extensions, repository) {
+        //
+        // CR-030 P-030-2: the bar is `owner`, not `AdminLock`'s `migrate`.
+        if !can_force_unlock(&extensions, repository) {
             warn!("Attempt to force unlock, but user does not have the correct permissions");
             return Err(Status::permission_denied("Permission denied"));
         }
@@ -1218,10 +1229,11 @@ impl LockService for LoreLockService {
         &self,
         request: Request<ForceUnlockRequest>,
     ) -> Result<Response<ForceUnlockResponse>, Status> {
-        // The `migrate` permission check lives in the handler, beside
-        // `AdminLock`'s, rather than a `require_permission("write")` here: a
-        // force release is an administrative action and "write" would be the
-        // wrong bar for it.
+        // The `owner` permission check lives in the handler, beside
+        // `AdminLock`'s `migrate`, rather than a `require_permission("write")`
+        // here: a force release is an administrative action and "write" would be
+        // the wrong bar for it. The two administrative RPCs deliberately read
+        // different scopes (CR-030 P-030-2).
         timeout_grpc(self.rpc_timeout, self.handle_force_unlock(request)).await
     }
 }

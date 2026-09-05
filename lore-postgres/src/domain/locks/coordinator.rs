@@ -271,8 +271,16 @@ pub struct FencedLock {
     pub description: String,
     /// Verified owner.
     pub owner: VerifiedLockOwner,
-    /// Opaque release/renew token.
-    pub ownership_token: [u8; 32],
+    /// Opaque release/renew token, or `None` on a cutover-converted row whose
+    /// token was never issued (schema revision 2, CR-030 P-030-3).
+    ///
+    /// A mutation path always produces `Some`: `acquire_or_renew` mints a token
+    /// inside its own transaction for every row it writes. `None` reaches a
+    /// caller only through the read paths, which strip the token on the wire
+    /// anyway, and through [`decode_canonical_result`] never at all — a
+    /// never-issued row is not something a receipt can describe, and
+    /// [`canonical_result`] refuses to encode one.
+    pub ownership_token: Option<[u8; 32]>,
     /// Monotonic internal fence.
     pub fence: i64,
     /// Repository lock generation stamped on the row.
@@ -362,7 +370,19 @@ pub struct LockFencingReadiness {
     /// Quarantine row count.
     pub quarantined_rows: i64,
     /// Legacy rows that still lack fenced authority columns.
+    ///
+    /// A cutover-converted row whose token was never issued is **not** counted
+    /// here. It carries full fenced authority; what it lacks is a token anybody
+    /// holds, which is [`never_issued_token_rows`](Self::never_issued_token_rows).
     pub unfenced_rows: i64,
+    /// Cutover-converted rows recording a never-issued ownership token.
+    ///
+    /// CR-030 P-030-3. Each one is a live lock releasable only through the
+    /// tokenless `ForceUnlock`, so the count is the residual an operator carries
+    /// out of a cutover that did not drain its legacy locks first. It is
+    /// reported rather than refused: these rows are well-formed and the cell is
+    /// ready with them present. `loreserver domain status` prints it.
+    pub never_issued_token_rows: i64,
 }
 
 impl LockFencingReadiness {
@@ -382,6 +402,7 @@ impl LockFencingReadiness {
             sequence_headroom: false,
             quarantined_rows: 0,
             unfenced_rows: 0,
+            never_issued_token_rows: 0,
         }
     }
 }
@@ -642,7 +663,11 @@ impl PostgresLockCoordinator {
                     )
                     .await;
                 };
-                if !token_matches(&row.ownership_token, &expected) {
+                // A never-issued row's stored token is `None`, so this refuses
+                // the caller whether or not it offered one. That is the intended
+                // outcome: a cutover-converted row is cleared administratively,
+                // not re-acquired by guessing.
+                if !token_matches(row.ownership_token.as_deref(), &expected) {
                     return commit_rejection(
                         tx,
                         operation,
@@ -713,7 +738,7 @@ impl PostgresLockCoordinator {
                 resource_hash: resource.resource_hash.clone(),
                 description: resource.description.clone(),
                 owner: input.owner.clone(),
-                ownership_token: token,
+                ownership_token: Some(token),
                 fence,
                 repository_lock_generation: namespace.repository_lock_generation,
                 branch_lock_generation: namespace.branch_lock_generation,
@@ -737,15 +762,27 @@ impl PostgresLockCoordinator {
         // indexed so that a future empty-batch path produces no event instead
         // of an event keyed on `namespace.last_applied_fence` with no token.
         let event = match (input.outbox_cell_id.as_deref(), committed.last()) {
-            (Some(cell_id), Some(last)) => Some(build_lock_event(
-                cell_id,
-                transition,
-                &input.repository_id,
-                &input.branch_id,
-                &input.owner,
-                last_fence,
-                &last.ownership_token,
-            )?),
+            (Some(cell_id), Some(last)) => {
+                // Every row this path wrote had its token minted in this
+                // transaction, so the token is always present. Refusing rather
+                // than defaulting to an empty identity keeps that assumption
+                // legible: an EMPTY lock-event identity means a force-release of
+                // a never-issued row, and an acquire must never mint one.
+                let token = last.ownership_token.as_ref().ok_or_else(|| {
+                    DomainError::Internal(
+                        "a lock this transaction acquired carries no ownership token".to_owned(),
+                    )
+                })?;
+                Some(build_lock_event(
+                    cell_id,
+                    transition,
+                    &input.repository_id,
+                    &input.branch_id,
+                    &input.owner,
+                    last_fence,
+                    token,
+                )?)
+            }
             _ => None,
         };
         append_event(
@@ -878,19 +915,23 @@ impl PostgresLockCoordinator {
         // by the only principal that would ever want it. An administrator holds
         // no other owner's token and has no way to obtain one — no read path
         // returns a token, deliberately, because a token authorizes a release.
-        // Worse, `backfill` mints a random token for every cutover-converted
-        // legacy row and discards it, so nobody at all holds those. With a
-        // token demanded on both paths, a cell that cut over with live legacy
-        // locks had rows that neither their owner nor an administrator could
-        // release — which is exactly the INV-EE P0-2 condition
+        // Worse, a cutover-converted legacy row has no token anybody holds:
+        // `backfill` used to mint one and discard it, and since schema revision
+        // 2 records that absence outright (`token_never_issued`). With a token
+        // demanded on both paths, a cell that cut over with live legacy locks
+        // had rows that neither their owner nor an administrator could release —
+        // which is exactly the INV-EE P0-2 condition
         // `schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE` exists to prevent, and
         // arming would have walked straight back into it.
         //
         // Force-release is therefore matched on `(resource_hash,
         // target_owner)` under the namespace lock. Its authority is the
         // verified acting administrator, checked by `force_release` before this
-        // is reached, and at the wire by the same `migrate` permission
-        // `AdminLock` requires.
+        // is reached, and at the wire by the `owner` permission (CR-030
+        // P-030-2). That is deliberately a different scope from the `migrate`
+        // one `AdminLock` requires: the platform's direct-authorization table
+        // gives `lock.force_release` the permission `owner`, and the two agreed
+        // only by accident of today's role lattice.
         if acting.is_none()
             && resources
                 .iter()
@@ -950,9 +991,12 @@ impl PostgresLockCoordinator {
             //
             // A token supplied on a force release is still checked rather than
             // ignored, so a caller that believes it is naming an exact row is
-            // not silently given a broader operation than it asked for.
+            // not silently given a broader operation than it asked for. On a
+            // never-issued row that check refuses, which is correct even for an
+            // administrator: it asked to release one exact row identified by a
+            // token, and no token identifies that row.
             let token_ok = match resource.expected_ownership_token.as_ref() {
-                Some(expected) => token_matches(&row.ownership_token, expected),
+                Some(expected) => token_matches(row.ownership_token.as_deref(), expected),
                 None => acting.is_some(),
             };
             if !row.owner.ct_matches(target) || !token_ok {
@@ -1006,9 +1050,18 @@ impl PostgresLockCoordinator {
         // force-release on a cell with an outbox configured fail
         // `Internal("release token vanished after validation")`, which is to say
         // every real `ForceUnlock` on exactly the cells arming exists to serve.
-        // The stored row's `ownership_token` is populated unconditionally by the
-        // rows loaded above and is the same value on both paths, so it is the
-        // field this always meant to name.
+        // The stored row's `ownership_token` is read from the rows loaded above
+        // and is the same field on both paths, so it is the one this always
+        // meant to name.
+        //
+        // One row shape has no token to name at all: a cutover-converted row
+        // whose token was never issued (schema revision 2). Its event carries an
+        // EMPTY identity half, which `AggregateVersion` documents as the shape
+        // for an event kind that has none. That is honest rather than lossy —
+        // the fence still names what the namespace advanced to, and there is no
+        // authority value to report because none was ever minted. It is also the
+        // only way a lock event's identity is ever empty, so a consumer seeing
+        // one is seeing a force-release of a converted row.
         let event = match (outbox_cell_id, ordered.last()) {
             (Some(cell_id), Some(last)) => {
                 let row = by_hash.get(&last.resource_hash).ok_or_else(|| {
@@ -1016,9 +1069,15 @@ impl PostgresLockCoordinator {
                     // rejection for any resource with no row.
                     DomainError::Internal("released row vanished after validation".to_owned())
                 })?;
-                let token: [u8; 32] = row.ownership_token.as_slice().try_into().map_err(|_| {
-                    DomainError::Internal("stored lock ownership token is not 32 bytes".to_owned())
-                })?;
+                let token: Vec<u8> = match row.ownership_token.as_deref() {
+                    Some(token) if token.len() == 32 => token.to_vec(),
+                    Some(_) => {
+                        return Err(DomainError::Internal(
+                            "stored lock ownership token is not 32 bytes".to_owned(),
+                        ));
+                    }
+                    None => Vec::new(),
+                };
                 Some(build_lock_event(
                     cell_id,
                     transition,
@@ -1086,8 +1145,13 @@ impl PostgresLockCoordinator {
         let client = self.checkout().await?;
         let rows = client
             .query(
+                // The token predicate admits schema revision 2's never-issued
+                // shape. A cutover-converted row is a real, currently held lock
+                // that a reader must see; dropping it here would report a locked
+                // resource as free to every client on an upgraded cell.
                 "SELECT locks.branch, locks.hash, locks.description, locks.owner_issuer, \
-                        locks.owner_subject, locks.ownership_token, locks.acquired_at, \
+                        locks.owner_subject, locks.ownership_token, locks.token_never_issued, \
+                        locks.acquired_at, \
                         locks.fence, locks.repository_lock_generation, locks.branch_lock_generation, \
                         locks.expires_at \
                    FROM lore_locks AS locks \
@@ -1102,7 +1166,8 @@ impl PostgresLockCoordinator {
                     AND locks.repository_lock_generation = namespace.repository_lock_generation \
                     AND locks.branch_lock_generation = namespace.branch_lock_generation \
                     AND locks.owner_issuer IS NOT NULL AND locks.owner_subject IS NOT NULL \
-                    AND locks.ownership_token IS NOT NULL AND locks.fence IS NOT NULL \
+                    AND (locks.ownership_token IS NOT NULL OR locks.token_never_issued) \
+                    AND locks.fence IS NOT NULL \
                     AND locks.acquired_at IS NOT NULL AND locks.renewed_at IS NOT NULL \
                     AND (locks.expires_at IS NULL OR locks.expires_at > clock_timestamp()) \
                   ORDER BY locks.branch, locks.hash",
@@ -1170,8 +1235,11 @@ impl PostgresLockCoordinator {
         let client = self.checkout().await?;
         let rows = client
             .query(
+                // Same never-issued admission as `query_filtered`; see the note
+                // there.
                 "SELECT locks.branch, locks.hash, locks.description, locks.owner_issuer, \
-                        locks.owner_subject, locks.ownership_token, locks.acquired_at, \
+                        locks.owner_subject, locks.ownership_token, locks.token_never_issued, \
+                        locks.acquired_at, \
                         locks.fence, locks.repository_lock_generation, locks.branch_lock_generation, \
                         locks.expires_at \
                    FROM unnest($2::bytea[], $3::bytea[]) AS requested(branch, hash) \
@@ -1184,7 +1252,8 @@ impl PostgresLockCoordinator {
                     AND locks.repository_lock_generation = namespace.repository_lock_generation \
                     AND locks.branch_lock_generation = namespace.branch_lock_generation \
                     AND locks.owner_issuer IS NOT NULL AND locks.owner_subject IS NOT NULL \
-                    AND locks.ownership_token IS NOT NULL AND locks.fence IS NOT NULL \
+                    AND (locks.ownership_token IS NOT NULL OR locks.token_never_issued) \
+                    AND locks.fence IS NOT NULL \
                     AND locks.acquired_at IS NOT NULL AND locks.renewed_at IS NOT NULL \
                     AND (locks.expires_at IS NULL OR locks.expires_at > clock_timestamp()) \
                   ORDER BY locks.branch, locks.hash",
@@ -1394,12 +1463,19 @@ impl PostgresLockCoordinator {
                 continue;
             }
             let fence = next_fence(&tx).await?;
-            let mut token = [0u8; 32];
-            rand::rng().fill_bytes(&mut token);
+            // CR-030 P-030-3: no token is minted here, and none was ever
+            // holdable. This used to mint a random 32 bytes and discard them,
+            // which left a row whose token existed, matched nothing, and was
+            // indistinguishable from an ordinary held lock. Schema revision 2
+            // records the absence instead: `token_never_issued = true` with a
+            // NULL token, which `lore_locks_fenced_shape_v2` admits only as that
+            // pair, `token_matches` refuses for every caller, and
+            // `readiness().never_issued_token_rows` counts.
             tx.execute(
                 "UPDATE lore_locks SET \
                      repository_lock_generation = $4, branch_lock_generation = $5, \
-                     owner_issuer = $6, owner_subject = owner, ownership_token = $7, fence = $8, \
+                     owner_issuer = $6, owner_subject = owner, \
+                     ownership_token = NULL, token_never_issued = true, fence = $7, \
                      acquired_at = to_timestamp(locked_at::double precision / 1000.0), \
                      renewed_at = to_timestamp(locked_at::double precision / 1000.0), expires_at = NULL \
                   WHERE repository = $1 AND branch = $2 AND hash = $3 AND owner_issuer IS NULL",
@@ -1410,7 +1486,6 @@ impl PostgresLockCoordinator {
                     &repository_generation,
                     &branch_generation,
                     &issuer,
-                    &token.as_slice(),
                     &fence,
                 ],
             )
@@ -1652,19 +1727,58 @@ impl PostgresLockCoordinator {
             .await
             .map_err(|error| DomainError::from_pg("lock quarantine readiness", error))?
             .get(0);
-        let unfenced_rows: i64 = client
+        // The token clause admits schema revision 2's never-issued shape. A
+        // converted row is fully fenced; counting it as unfenced would make an
+        // upgraded cell look like it had never finished its backfill, and
+        // `arm_fenced_routing` refuses on a non-zero unfenced count.
+        //
+        // `token_never_issued` is probed rather than named unconditionally, and
+        // this runs on the mandatory startup path, so getting it wrong is a boot
+        // failure rather than a bad answer. A cell migrated at revision 1 has
+        // every SCHEMA-117 relation and none of this column, so naming it makes
+        // Postgres refuse the statement outright — `column ... does not exist` —
+        // and startup aborts on a cell that is simply a revision behind. That is
+        // the INV-EE P0-1 shape again, and `legacy_lock_scope` in the operator
+        // already defends the sibling case the same way: probe the column, don't
+        // assume the migration ran.
+        //
+        // A revision-1 cell answers `never_issued_token_rows = 0`, which is
+        // true — it cannot hold such a row — and keeps the revision-1 unfenced
+        // predicate. If it is ARMED, `resolve_lock_fencing` then refuses on the
+        // `schema_version` mismatch with a named error, which is the honest
+        // outcome: this binary must not route fenced traffic over a shape it
+        // cannot interpret. If it is unarmed, it boots legacy as before.
+        let never_issued_present =
+            column_present(&client, "lore_locks", "token_never_issued").await?;
+        let rows = client
             .query_one(
-                "SELECT count(*)::bigint FROM lore_locks \
-                  WHERE repository_lock_generation IS NULL \
-                     OR branch_lock_generation IS NULL \
-                     OR owner_issuer IS NULL OR owner_subject IS NULL \
-                     OR ownership_token IS NULL OR fence IS NULL \
-                     OR acquired_at IS NULL OR renewed_at IS NULL",
+                if never_issued_present {
+                    "SELECT count(*) FILTER ( \
+                         WHERE repository_lock_generation IS NULL \
+                            OR branch_lock_generation IS NULL \
+                            OR owner_issuer IS NULL OR owner_subject IS NULL \
+                            OR (ownership_token IS NULL AND NOT token_never_issued) \
+                            OR fence IS NULL \
+                            OR acquired_at IS NULL OR renewed_at IS NULL)::bigint AS unfenced, \
+                            count(*) FILTER (WHERE token_never_issued)::bigint AS never_issued \
+                       FROM lore_locks"
+                } else {
+                    "SELECT count(*) FILTER ( \
+                         WHERE repository_lock_generation IS NULL \
+                            OR branch_lock_generation IS NULL \
+                            OR owner_issuer IS NULL OR owner_subject IS NULL \
+                            OR ownership_token IS NULL \
+                            OR fence IS NULL \
+                            OR acquired_at IS NULL OR renewed_at IS NULL)::bigint AS unfenced, \
+                            0::bigint AS never_issued \
+                       FROM lore_locks"
+                },
                 &[],
             )
             .await
-            .map_err(|error| DomainError::from_pg("unfenced lock readiness", error))?
-            .get(0);
+            .map_err(|error| DomainError::from_pg("unfenced lock readiness", error))?;
+        let unfenced_rows: i64 = rows.get("unfenced");
+        let never_issued_token_rows: i64 = rows.get("never_issued");
         let evidence: Option<i64> = row.get("sequence_headroom_fence");
         let sequence = client
             .query_one(
@@ -1691,6 +1805,7 @@ impl PostgresLockCoordinator {
                 && next_value.is_some_and(|value| value > max_fence),
             quarantined_rows,
             unfenced_rows,
+            never_issued_token_rows,
         })
     }
 
@@ -1724,6 +1839,31 @@ async fn relation_present(
         .query_one("SELECT to_regclass($1) IS NOT NULL", &[&relation])
         .await
         .map_err(|error| DomainError::from_pg("lock relation probe", error))
+        .map(|row| row.get(0))
+}
+
+/// Whether one column of an existing relation is present on this cell.
+///
+/// Scoped to `current_schemas(false)` so it answers about the relation the rest
+/// of this crate's unqualified DDL and queries actually reach — the per-case
+/// `search_path` namespacing in `tests/common/case_namespace.rs` depends on
+/// that, and a probe against the catalog at large would answer about somebody
+/// else's schema.
+async fn column_present(
+    client: &deadpool_postgres::Client,
+    relation: &str,
+    column: &str,
+) -> Result<bool, DomainError> {
+    client
+        .query_one(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM information_schema.columns \
+                  WHERE table_name = $1 AND column_name = $2 \
+                    AND table_schema = ANY(current_schemas(false)))",
+            &[&relation, &column],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("lock column probe", error))
         .map(|row| row.get(0))
 }
 
@@ -1847,7 +1987,14 @@ async fn lock_namespace(
 struct LockRow {
     resource_hash: Vec<u8>,
     owner: VerifiedLockOwner,
-    ownership_token: Vec<u8>,
+    /// The stored token, or `None` for the schema revision 2 never-issued shape.
+    ///
+    /// This is deliberately not the same absence as a legacy unfenced row's NULL
+    /// token: that one is refused with `NotReady` while loading, because a
+    /// legacy row must never reach fenced routing at all. `token_never_issued`
+    /// is what separates the two, and the `lore_locks_fenced_shape_v2` CHECK is
+    /// what guarantees the flag and the column agree.
+    ownership_token: Option<Vec<u8>>,
     fence: i64,
     repository_lock_generation: i64,
     branch_lock_generation: i64,
@@ -1863,7 +2010,8 @@ async fn load_resource_rows(
 ) -> Result<Vec<LockRow>, DomainError> {
     let rows = tx
         .query(
-            "SELECT hash, owner_issuer, owner_subject, ownership_token, fence, \
+            "SELECT hash, owner_issuer, owner_subject, ownership_token, token_never_issued, \
+                    fence, \
                     repository_lock_generation, branch_lock_generation, acquired_at, expires_at \
                FROM lore_locks \
               WHERE repository = $1 AND branch = $2 AND hash = ANY($3) \
@@ -1877,6 +2025,7 @@ async fn load_resource_rows(
             let issuer: Option<String> = row.get("owner_issuer");
             let subject: Option<String> = row.get("owner_subject");
             let token: Option<Vec<u8>> = row.get("ownership_token");
+            let token_never_issued: bool = row.get("token_never_issued");
             let repository_generation: Option<i64> = row.get("repository_lock_generation");
             let branch_generation: Option<i64> = row.get("branch_lock_generation");
             let acquired_at: Option<SystemTime> = row.get("acquired_at");
@@ -1894,11 +2043,21 @@ async fn load_resource_rows(
                         )
                     })?,
                 },
-                ownership_token: token.ok_or_else(|| {
-                    DomainError::NotReady(
-                        "legacy unfenced lock row reached fenced routing".to_owned(),
-                    )
-                })?,
+                // A NULL token means one of two very different things, and the
+                // flag is the only thing that separates them. With the flag set
+                // it is schema revision 2's never-issued shape, which is a
+                // legitimate fenced row that simply refuses every token. Without
+                // it, a NULL token on a row that got this far is a legacy
+                // unfenced row, and those must not reach fenced routing.
+                ownership_token: match (token, token_never_issued) {
+                    (None, true) => None,
+                    (Some(token), false) => Some(token),
+                    _ => {
+                        return Err(DomainError::NotReady(
+                            "legacy unfenced lock row reached fenced routing".to_owned(),
+                        ));
+                    }
+                },
                 fence: row.get::<_, Option<i64>>("fence").ok_or_else(|| {
                     DomainError::NotReady(
                         "legacy unfenced lock row reached fenced routing".to_owned(),
@@ -2419,8 +2578,18 @@ fn sorted_resources_allow_empty(
     }
 }
 
-fn token_matches(stored: &[u8], expected: &[u8; 32]) -> bool {
-    stored.len() == 32 && bool::from(stored.ct_eq(expected.as_slice()))
+/// Whether a caller's presented token proves possession of the stored row.
+///
+/// `None` — the schema revision 2 never-issued shape — refuses **every** caller,
+/// which is the whole point of recording the absence rather than a sentinel: a
+/// sentinel would match whoever presented it, handing everybody the authority to
+/// release every cutover-converted lock. A never-issued row is releasable only
+/// through the tokenless administrative path.
+fn token_matches(stored: Option<&[u8]>, expected: &[u8; 32]) -> bool {
+    match stored {
+        Some(stored) => stored.len() == 32 && bool::from(stored.ct_eq(expected.as_slice())),
+        None => false,
+    }
 }
 
 fn canonical_result(locks: &[FencedLock]) -> Result<Vec<u8>, DomainError> {
@@ -2433,7 +2602,20 @@ fn canonical_result(locks: &[FencedLock]) -> Result<Vec<u8>, DomainError> {
         append_result_field(&mut bytes, lock.description.as_bytes());
         append_result_field(&mut bytes, lock.owner.verified_issuer.as_bytes());
         append_result_field(&mut bytes, lock.owner.authenticated_subject.as_bytes());
-        bytes.extend_from_slice(&lock.ownership_token);
+        // `lock-result-v1` is a fixed-width 32-byte token field and stays that
+        // way: receipts already committed under it are replayed by
+        // `decode_canonical_result`, so widening the format would strand them.
+        // Nothing needs widening, because only `acquire_or_renew` encodes a
+        // result and every row it writes carries a token it just minted. A
+        // never-issued row can therefore never reach here, and saying so out
+        // loud beats silently encoding 32 zero bytes for it.
+        let token = lock.ownership_token.ok_or_else(|| {
+            DomainError::Internal(
+                "a lock with no issued ownership token cannot be encoded into a receipt result"
+                    .to_owned(),
+            )
+        })?;
+        bytes.extend_from_slice(&token);
         bytes.extend_from_slice(&lock.fence.to_be_bytes());
         bytes.extend_from_slice(&lock.repository_lock_generation.to_be_bytes());
         bytes.extend_from_slice(&lock.branch_lock_generation.to_be_bytes());
@@ -2486,7 +2668,7 @@ fn decode_canonical_result(bytes: &[u8]) -> Result<Vec<FencedLock>, DomainError>
         let description = reader.string(MAX_DESCRIPTION_BYTES)?;
         let verified_issuer = reader.string(MAX_IDENTITY_BYTES)?;
         let authenticated_subject = reader.string(MAX_IDENTITY_BYTES)?;
-        let ownership_token = reader
+        let ownership_token: [u8; 32] = reader
             .exact(32)?
             .try_into()
             .map_err(|_| DomainError::Internal("stored lock token width changed".to_owned()))?;
@@ -2511,7 +2693,9 @@ fn decode_canonical_result(bytes: &[u8]) -> Result<Vec<FencedLock>, DomainError>
                 verified_issuer,
                 authenticated_subject,
             },
-            ownership_token,
+            // A receipt result only ever describes rows an acquire minted a
+            // token for; `canonical_result` refuses to encode anything else.
+            ownership_token: Some(ownership_token),
             fence,
             repository_lock_generation,
             branch_lock_generation,
@@ -2619,13 +2803,28 @@ fn witness_from_row(row: &tokio_postgres::Row) -> PushLockWitness {
 }
 
 fn fenced_lock_from_row(row: tokio_postgres::Row) -> Result<FencedLock, DomainError> {
-    let token: Vec<u8> = row.get("ownership_token");
-    let ownership_token: [u8; 32] = token.try_into().map_err(|value: Vec<u8>| {
-        DomainError::Internal(format!(
-            "stored ownership token is {} bytes, expected 32",
-            value.len()
-        ))
-    })?;
+    let token: Option<Vec<u8>> = row.get("ownership_token");
+    let token_never_issued: bool = row.get("token_never_issued");
+    // The two selecting queries already admit only the two legal shapes, and
+    // `lore_locks_fenced_shape_v2` is what makes them the only two. This maps
+    // rather than re-litigates: a set flag is the never-issued row, and anything
+    // else must be a well-formed 32-byte token.
+    let ownership_token: Option<[u8; 32]> = if token_never_issued {
+        None
+    } else {
+        let token = token.ok_or_else(|| {
+            DomainError::Internal(
+                "stored ownership token is absent on a row that is not marked never-issued"
+                    .to_owned(),
+            )
+        })?;
+        Some(token.try_into().map_err(|value: Vec<u8>| {
+            DomainError::Internal(format!(
+                "stored ownership token is {} bytes, expected 32",
+                value.len()
+            ))
+        })?)
+    };
     Ok(FencedLock {
         branch_id: row.get("branch"),
         resource_hash: row.get("hash"),

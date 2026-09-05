@@ -4671,6 +4671,7 @@ mod tests {
             sequence_headroom: true,
             quarantined_rows: 0,
             unfenced_rows: 0,
+            never_issued_token_rows: 0,
         }
     }
 
