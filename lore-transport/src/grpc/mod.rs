@@ -2,6 +2,7 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 mod admin_client;
+mod domain_operation_client;
 mod environment_client;
 mod lock_client;
 mod repository_client;
@@ -54,6 +55,8 @@ use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
 use crate::connection::SuppliedCredentials;
+use crate::domain_receipt::DomainReceipt;
+use crate::domain_receipt::DomainReceiptQuery;
 use crate::error::ProtocolError;
 use crate::outcome::AttemptId;
 use crate::outcome::GrpcRpc;
@@ -980,6 +983,37 @@ pub async fn lock_client(
     Ok(Arc::new(lock))
 }
 
+pub async fn domain_operations_client(
+    connection: Arc<GRPCConnection>,
+    auth_url: &str,
+    identity: &str,
+    repository: RepositoryId,
+    credentials: &Arc<SuppliedCredentials>,
+) -> Result<Arc<dyn DomainOperations>, ProtocolError> {
+    lore_trace!("Connecting gRPC domain-operation receipt client");
+
+    let receipt_client = domain_operation_client::DomainOperationService::new(
+        connection.channel(),
+        repository,
+        connection
+            .repository_authz(auth_url, identity, repository, credentials)
+            .await,
+    );
+
+    let domain_operations = GRPCDomainOperations {
+        connection,
+        client: RwLock::new(receipt_client),
+        auth_url: auth_url.to_string(),
+        identity: identity.to_string(),
+        credentials: credentials.clone(),
+        repository,
+    };
+
+    lore_trace!("Connecting gRPC domain-operation receipt client complete");
+
+    Ok(Arc::new(domain_operations))
+}
+
 pub fn environment_client(
     connection: Arc<GRPCConnection>,
 ) -> Result<Arc<dyn Environment>, ProtocolError> {
@@ -1068,6 +1102,18 @@ pub async fn environment(
     environment_client(connection)
 }
 
+pub async fn domain_operations(
+    connection: Weak<Connection>,
+    remote_url: &str,
+    auth_url: &str,
+    identity: &str,
+    repository: RepositoryId,
+    credentials: &Arc<SuppliedCredentials>,
+) -> Result<Arc<dyn DomainOperations>, ProtocolError> {
+    let connection = connect(connection, remote_url, true).await?;
+    domain_operations_client(connection, auth_url, identity, repository, credentials).await
+}
+
 struct RequestScopedCounter {
     counter: Arc<AtomicU64>,
 }
@@ -1124,6 +1170,59 @@ impl Admin for GRPCAdmin {
             &self.connection,
             GrpcRpc::AdminObliterate,
             || async { self.client.read().await.obliterate(address).await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
+    }
+}
+
+/// Domain-operation receipt rail over gRPC (CR-029, WP-120).
+struct GRPCDomainOperations {
+    connection: Arc<GRPCConnection>,
+    client: RwLock<domain_operation_client::DomainOperationService>,
+    auth_url: String,
+    identity: String,
+    credentials: Arc<SuppliedCredentials>,
+    repository: RepositoryId,
+}
+
+impl GRPCDomainOperations {
+    async fn reconnect(&self, reconnect_id: u32) -> Result<(), ProtocolError> {
+        let channel = self.connection.reconnect(reconnect_id).await?;
+
+        let mut lock = self.client.write().await;
+        *lock = domain_operation_client::DomainOperationService::new(
+            channel,
+            self.repository,
+            self.connection
+                .repository_authz(
+                    self.auth_url.as_str(),
+                    self.identity.as_str(),
+                    self.repository,
+                    &self.credentials,
+                )
+                .await,
+        );
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DomainOperations for GRPCDomainOperations {
+    /// Reconnects and reissues, which is safe here for a reason it is not safe for the mutation
+    /// this lookup asks about. Not because the lookup writes nothing — one that finds an expired
+    /// `PREPARED` row terminalizes it — but because whatever it settles, it settles the same way
+    /// every time. A second lookup after a lost channel finds the row already committed and
+    /// returns the first one's answer.
+    async fn receipt_get(
+        &self,
+        query: &DomainReceiptQuery,
+    ) -> Result<DomainReceipt, ProtocolError> {
+        with_reconnect_classified(
+            &self.connection,
+            GrpcRpc::DomainOperationReceiptGet,
+            || async { self.client.read().await.receipt_get(query).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await

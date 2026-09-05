@@ -161,6 +161,7 @@ pub enum GrpcRpc {
     LockQuery,
     LockStatus,
     EnvironmentGet,
+    DomainOperationReceiptGet,
 }
 
 impl GrpcRpc {
@@ -201,6 +202,7 @@ impl GrpcRpc {
             Self::LockQuery => "LockService.Query",
             Self::LockStatus => "LockService.Status",
             Self::EnvironmentGet => "EnvironmentService.Get",
+            Self::DomainOperationReceiptGet => "DomainOperationService.DomainOperationReceiptGet",
         }
     }
 }
@@ -228,7 +230,19 @@ pub fn grpc_replay_class(rpc: GrpcRpc) -> ReplayClass {
         | GrpcRpc::RepositoryMetadataGet
         | GrpcRpc::LockQuery
         | GrpcRpc::LockStatus
-        | GrpcRpc::EnvironmentGet => ReplayClass::ReadRetryable,
+        | GrpcRpc::EnvironmentGet
+        // The receipt lookup is the read a caller makes *because* a mutation's outcome is
+        // unknown.
+        //
+        // It is not side-effect-free, and the classification does not rest on pretending it is:
+        // a lookup that finds a PREPARED row past its hard TTL terminalizes that row and commits
+        // the transition (`lore-postgres/src/domain/receipts.rs`'s `receipt_get`, via
+        // `expire_prepared`). What makes it retryable is that the transition is convergent
+        // rather than absent — the second lookup finds the row already committed and returns the
+        // same answer as the first, so reissuing after a lost channel cannot produce a different
+        // verdict. That is the property `ReadRetryable` actually needs, and it is why this sits
+        // here while the mutation it asks about cannot.
+        | GrpcRpc::DomainOperationReceiptGet => ReplayClass::ReadRetryable,
 
         // Publishes or revives a repository/context lifecycle association, even where the
         // payload's address is content-derived.

@@ -1232,6 +1232,30 @@ impl Connection {
         Ok(admin)
     }
 
+    /// The domain-operation receipt rail for a repository (CR-029, WP-120).
+    ///
+    /// Unlike [`Self::admin`] and [`Self::lock`] this keeps no per-repository cache. The two
+    /// costs a cache would avoid are already avoided underneath it: the channel is reused by
+    /// `connect(reuse = true)`, and the authorization exchange is memoised per
+    /// `(auth_url, identity, repository)` inside the gRPC connection. What is left is building a
+    /// client struct, which is cheaper than another field on this type — and a reconciler asks
+    /// on a bounded backoff, not in a loop.
+    pub async fn domain_operations(
+        self: &Arc<Self>,
+        repository: RepositoryId,
+    ) -> Result<Arc<dyn DomainOperations>, ProtocolError> {
+        self.protocol
+            .domain_operations(
+                Arc::downgrade(self),
+                self.remote_url.as_str(),
+                self.auth_url.as_str(),
+                self.identity.as_str(),
+                repository,
+                &self.credentials,
+            )
+            .await
+    }
+
     pub async fn lock(
         self: &Arc<Self>,
         repository: RepositoryId,

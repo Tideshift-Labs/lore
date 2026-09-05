@@ -10,6 +10,8 @@ use lore_base::types::*;
 
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
+use crate::domain_receipt::DomainReceipt;
+use crate::domain_receipt::DomainReceiptQuery;
 use crate::error::ProtocolError;
 use crate::replay::MutableOutcome;
 use crate::types::*;
@@ -82,6 +84,34 @@ pub trait Protocol: Send + Sync {
         connection: Weak<Connection>,
         remote_url: &str,
     ) -> Result<Arc<dyn Environment>, ProtocolError>;
+
+    /// Connect to the domain-operation receipt rail (CR-029, WP-120).
+    ///
+    /// Defaulted to the gRPC binding because the rail has no other transport: the receipt
+    /// service is a gRPC service, and both protocols in this crate already reach the other
+    /// authenticated unary services the same way. A protocol that ever serves it differently
+    /// overrides this; none does today, and defaulting keeps the ones that do not from
+    /// restating the same call.
+    #[allow(clippy::too_many_arguments)]
+    async fn domain_operations(
+        &self,
+        connection: Weak<Connection>,
+        remote_url: &str,
+        auth_url: &str,
+        identity: &str,
+        repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
+    ) -> Result<Arc<dyn DomainOperations>, ProtocolError> {
+        crate::grpc::domain_operations(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
+    }
 }
 
 /// Storage protocol
@@ -488,6 +518,29 @@ pub trait Repository: Send + Sync {
 pub trait Admin: Send + Sync {
     /// Obliterate the payloads and fragments for an address
     async fn obliterate(&self, address: Address) -> Result<(), ProtocolError>;
+}
+
+/// Domain-operation receipt protocol (CR-029, WP-120).
+///
+/// One lookup, deliberately. This trait is what a caller reaches for after a domain mutation's
+/// answer was lost, and all it can do is ask what the server recorded about that one attempt.
+/// There is no method here that touches the mutation itself and there should not be: the whole
+/// point of the receipt is that it is the alternative to trying the mutation again.
+///
+/// "Read-only" would overstate it. A lookup that finds the attempt still `PREPARED` past its
+/// hard expiry commits that row to a terminal `NOT_APPLIED` on the way to answering, so a
+/// reconciler's first call can be what finally settles the attempt. That is the rail working as
+/// designed — an operation whose caller only ever polls must still reach a terminal answer —
+/// and it is why this trait is a lookup rather than a mutation, not why it is harmless.
+#[async_trait]
+pub trait DomainOperations: Send + Sync {
+    /// Read the receipt for one exact attempt.
+    ///
+    /// A returned [`DomainReceipt`] whose state is not `Committed` is an answer, not a failure:
+    /// the server is saying it cannot attribute an outcome to this attempt. The caller keeps its
+    /// durable record and asks again later. An `Err` means the lookup itself did not happen.
+    async fn receipt_get(&self, query: &DomainReceiptQuery)
+    -> Result<DomainReceipt, ProtocolError>;
 }
 
 /// Lock protocol
