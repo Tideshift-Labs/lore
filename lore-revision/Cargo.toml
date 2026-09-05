@@ -38,6 +38,11 @@ rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
+# The attempt store's on-disk body (WP-120). JSON rather than TOML because the document is two
+# arrays of flat records, which TOML renders as a table-array wall, and because a self-describing
+# body keeps the format's compatibility rules in one place: unknown fields and a missing optional
+# both read the way serde already defines them.
+serde_json = { workspace = true }
 serde_with = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
@@ -71,6 +76,11 @@ windows-sys = { workspace = true, features = ["Win32_Storage_ProjectedFileSystem
 bitcode = { workspace = true }
 ctor = { workspace = true }
 lore-storage = { workspace = true }
+# `VolatileAttemptStore` (CR-030, WP-120), for tests exercising `lock::file::acquire`/`release`'s
+# ownership-token threading without a durable `RepositoryAttemptStore`. Unifies with the plain
+# `lore-transport` dependency above for `cargo test`, the same way `lore` and `loreserver` already
+# pick the feature up on a workspace-wide `--all-targets` build (see the type's own doc comment).
+lore-transport = { workspace = true, features = ["test_seams"] }
 serde_json = { workspace = true }
 serde = { workspace = true }
 tempfile = "3"

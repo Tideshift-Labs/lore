@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use lore_macro::LoreArgs;
+use lore_revision::attempt_store::repository_attempt_store;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lock::file::acquire::AcquireOptions;
@@ -72,7 +73,13 @@ async fn file_acquire_local(
                 owner: String::default(),
             };
 
-            lore_revision::lock::file::acquire::acquire(repository, options)
+            // Built here, from the repository this call already resolved, and never sent as an
+            // argument. That is what keeps the ownership token off the delegation wire: under
+            // `LORE_USE_SERVICE` the service process runs this same handler against the same
+            // repository path, so it derives the same `.lore/` store and reads the token a direct
+            // acquire wrote (WP-120).
+            let ownership = repository_attempt_store(&repository);
+            lore_revision::lock::file::acquire::acquire(repository, options, ownership)
         },
     )
     .await
@@ -96,7 +103,8 @@ pub async fn file_acquire_as_owner(
                 owner: owner.to_string(),
             };
 
-            lore_revision::lock::file::acquire::acquire(repository, options)
+            let ownership = repository_attempt_store(&repository);
+            lore_revision::lock::file::acquire::acquire(repository, options, ownership)
         },
     )
     .await
@@ -291,7 +299,8 @@ async fn file_release_local(
                 owner_id: args.owner_id.to_string(),
             };
 
-            lore_revision::lock::file::release::release(repository, options)
+            let ownership = repository_attempt_store(&repository);
+            lore_revision::lock::file::release::release(repository, options, ownership)
         },
     )
     .await

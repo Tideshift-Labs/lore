@@ -8,6 +8,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::types::*;
 
+use crate::attempt_store::AcquiredLock;
+use crate::attempt_store::FencedLockResource;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::domain_receipt::DomainAttemptReceipt;
@@ -563,12 +565,17 @@ pub trait DomainOperations: Send + Sync {
 /// Lock protocol
 #[async_trait]
 pub trait Lock: Send + Sync {
-    /// Acquire the lock over the resource(s)
+    /// Acquire (or renew) the lock over the resource(s).
+    ///
+    /// Takes [`FencedLockResource`] rather than a bare [`LockResource`] so a renewal of a row the
+    /// caller already holds can present the token it was issued. Returns [`AcquiredLock`] for the
+    /// mirror reason: a fenced cell mints a token per granted row and it reaches the caller only
+    /// here, so a return type that could not carry one would drop it (CR-030, WP-120).
     async fn lock(
         &self,
-        resources: &[LockResource],
+        resources: &[FencedLockResource],
         owner: Option<&str>,
-    ) -> Result<Vec<LockData>, ProtocolError>;
+    ) -> Result<Vec<AcquiredLock>, ProtocolError>;
 
     /// Query the lock(s) on a branch, by an owner or by a description
     async fn query(
@@ -581,8 +588,28 @@ pub trait Lock: Send + Sync {
     /// Get the locking status of the resource(s)
     async fn status(&self, resources: &[LockResource]) -> Result<Vec<LockData>, ProtocolError>;
 
-    /// Remove the lock over the resource(s)
-    async fn unlock(&self, resources: &[LockResource]) -> Result<Vec<LockResource>, ProtocolError>;
+    /// Remove the lock over the resource(s), presenting the caller's own ownership.
+    ///
+    /// A tokenless resource is still sent. An unfenced cell issues no tokens at all, so a client
+    /// that withheld tokenless resources here would be unable to release anything on one.
+    async fn unlock(
+        &self,
+        resources: &[FencedLockResource],
+    ) -> Result<Vec<LockResource>, ProtocolError>;
+
+    /// Administratively release locks held by `owner` (CR-030, WP-120).
+    ///
+    /// A separate verb rather than a flag, matching the RPC: [`Self::unlock`] releases what the
+    /// caller itself holds under its own tokens, this takes a row away from someone else and is
+    /// recorded as a different transition. It needs no ownership token, because no read path ever
+    /// issues one to an administrator. A cell that is not routing through the fenced authority
+    /// refuses it with `FAILED_PRECONDITION`, which is a caller's cue to fall back rather than a
+    /// fault.
+    async fn force_unlock(
+        &self,
+        resources: &[LockResource],
+        owner: &str,
+    ) -> Result<Vec<LockResource>, ProtocolError>;
 }
 
 /// Environment protocol

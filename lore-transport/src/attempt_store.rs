@@ -30,11 +30,106 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_base::types::LockData;
+use lore_base::types::LockResource;
 use lore_base::types::RepositoryId;
 
 use crate::domain_receipt::DomainReceiptQuery;
 use crate::error::ProtocolError;
 use crate::outcome::AttemptId;
+
+/// A CR-030 ownership token: the bearer secret a fenced cell issues on acquire.
+///
+/// A newtype rather than a bare `Bytes` for one reason that is not tidiness. Possession of these
+/// 32 bytes is the whole authority to release the lock they were issued for, so a derived `Debug`
+/// on any struct holding one would print a live credential into whatever formatted it. The
+/// [`std::fmt::Debug`] here redacts, and every type in this crate that carries a token holds it
+/// through this newtype so that redaction cannot be forgotten at a new call site.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OwnershipToken(Bytes);
+
+impl OwnershipToken {
+    /// The exact width CR-030 mints and the server's request normalisation admits.
+    pub const LEN: usize = 32;
+
+    /// Read a token off the wire, or off a durable record written from the wire.
+    ///
+    /// Three answers, and the third is the point:
+    ///
+    /// * empty is `Ok(None)` — a cell that is not routing through the fenced authority returns
+    ///   an empty token on every acquire, and that is not an error;
+    /// * exactly [`Self::LEN`] is `Ok(Some)`;
+    /// * any other width is an error rather than a silently dropped token. A token this client
+    ///   cannot hold is a lock this client cannot release, and answering `None` there would hide
+    ///   that behind an ordinary-looking acquire.
+    pub fn from_wire(bytes: &[u8]) -> Result<Option<Self>, ProtocolError> {
+        match bytes.len() {
+            0 => Ok(None),
+            Self::LEN => Ok(Some(Self(Bytes::copy_from_slice(bytes)))),
+            other => Err(ProtocolError::internal(format!(
+                "lock ownership token must be {} bytes, got {other}",
+                Self::LEN
+            ))),
+        }
+    }
+
+    /// The raw token, for the one place that has to put it on the wire or in the store.
+    pub fn as_bytes(&self) -> &Bytes {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for OwnershipToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnershipToken(<redacted>)")
+    }
+}
+
+/// One resource of a lock request, carrying whatever ownership this client holds for it.
+///
+/// `None` is deliberately not an error on the request path. An unfenced cell issues no token, so
+/// the token this client holds for a lock it acquired there is legitimately absent, and a client
+/// that refused to send a tokenless resource could release nothing on such a cell. The server
+/// decides whether a token was required; this type only reports what the client has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FencedLockResource {
+    /// The resource being locked, renewed, or released.
+    pub resource: LockResource,
+    /// The token issued for this exact resource, if this client holds one.
+    pub expected_ownership_token: Option<OwnershipToken>,
+}
+
+impl FencedLockResource {
+    /// A resource this client holds no ownership for: a first acquire, or any resource on a cell
+    /// that issues no tokens.
+    pub fn tokenless(resource: LockResource) -> Self {
+        Self {
+            resource,
+            expected_ownership_token: None,
+        }
+    }
+
+    /// A resource carrying the ownership this client holds for it, if any.
+    pub fn with_token(resource: LockResource, token: Option<OwnershipToken>) -> Self {
+        Self {
+            resource,
+            expected_ownership_token: token,
+        }
+    }
+}
+
+/// One lock the server just granted, with the token it minted for it.
+///
+/// Separate from [`LockData`] rather than a field on it, because `LockData` is also what the read
+/// paths return and what the server's own stores project. A token field there would be empty on
+/// every read and would invite a caller to look for one where the contract guarantees none.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AcquiredLock {
+    /// The lock as the read paths would also describe it.
+    pub lock: LockData,
+    /// The ownership token, present only from `Lock` and `AdminLock` on a fenced cell.
+    pub ownership_token: Option<OwnershipToken>,
+}
 
 /// Where an attempt stands.
 ///
@@ -102,7 +197,7 @@ pub struct AttemptRecord {
 ///
 /// The token is a credential. An implementation that persists one is storing a secret at rest and
 /// owes the same care as any other credential store.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LockOwnership {
     /// The attempt that acquired this lock.
     ///
@@ -116,7 +211,20 @@ pub struct LockOwnership {
     /// The locked resource.
     pub resource_hash: Hash,
     /// The opaque ownership token the server issued. Never logged.
-    pub token: Bytes,
+    pub token: OwnershipToken,
+}
+
+/// Written out rather than derived so that the token's own redaction cannot be bypassed by
+/// formatting the struct that holds it.
+impl std::fmt::Debug for LockOwnership {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockOwnership")
+            .field("attempt_id", &self.attempt_id)
+            .field("branch", &self.branch)
+            .field("resource_hash", &self.resource_hash)
+            .field("token", &self.token)
+            .finish()
+    }
 }
 
 /// How an attempt stopped being unresolved.
@@ -181,6 +289,23 @@ pub trait AttemptStore: Send + Sync {
         branch: &Context,
         resource_hash: &Hash,
     ) -> Result<Option<LockOwnership>, ProtocolError>;
+
+    /// The tokens held for a batch of resources, one answer per request, in order.
+    ///
+    /// Defaulted to a loop over [`Self::ownership_for`], so an implementation with no cheaper
+    /// bulk read needs nothing here. An implementation whose single read touches a disk should
+    /// override it: `lore lock release --force` rebuilds its set from a `Query` over the whole
+    /// branch, and asking one resource at a time turns one read into thousands.
+    async fn ownership_for_batch(
+        &self,
+        resources: &[(Context, Hash)],
+    ) -> Result<Vec<Option<LockOwnership>>, ProtocolError> {
+        let mut held = Vec::with_capacity(resources.len());
+        for (branch, resource_hash) in resources {
+            held.push(self.ownership_for(branch, resource_hash).await?);
+        }
+        Ok(held)
+    }
 
     /// Forget the token for one resource, once the server has confirmed the lock is gone.
     ///
@@ -331,5 +456,89 @@ impl AttemptStore for VolatileAttemptStore {
             .lock()
             .retain(|held| held.attempt_id.as_uuid() != attempt.as_uuid());
         Ok(())
+    }
+}
+
+/// CR-030: [`OwnershipToken`]'s three-way wire decode, and the redaction every type carrying one
+/// promises. Independent of any [`AttemptStore`] implementation -- these are pure, offline
+/// properties of the newtype itself.
+#[cfg(test)]
+mod ownership_token_tests {
+    use super::*;
+
+    fn token(fill: u8) -> OwnershipToken {
+        OwnershipToken::from_wire(&[fill; OwnershipToken::LEN])
+            .expect("32 bytes must decode without error")
+            .expect("32 bytes must produce a token, not None")
+    }
+
+    /// An unfenced cell (or a legacy read path) returns an empty token, and that is not an
+    /// error -- it is the "no fenced authority here" answer.
+    #[test]
+    fn from_wire_empty_is_ok_none() {
+        assert_eq!(
+            OwnershipToken::from_wire(&[]).expect("empty must not error"),
+            None
+        );
+    }
+
+    /// The exact width CR-030 mints round-trips byte for byte.
+    #[test]
+    fn from_wire_exact_width_is_some_and_preserves_the_bytes() {
+        let bytes = [0x42u8; OwnershipToken::LEN];
+        let decoded = OwnershipToken::from_wire(&bytes)
+            .expect("exact width must not error")
+            .expect("exact width must produce a token");
+        assert_eq!(decoded.as_bytes().as_ref(), bytes.as_slice());
+    }
+
+    /// Any width other than 0 or exactly 32 is an error, never a silently dropped token -- a
+    /// token this client cannot hold onto is a lock it cannot release, and `Ok(None)` here would
+    /// make that failure indistinguishable from an ordinary unfenced acquire.
+    #[test]
+    fn from_wire_wrong_width_is_an_error_not_a_silently_dropped_token() {
+        for bad_len in [1usize, OwnershipToken::LEN - 1, OwnershipToken::LEN + 1, 64] {
+            let bytes = vec![0x11u8; bad_len];
+            let error = OwnershipToken::from_wire(&bytes)
+                .expect_err(&format!("width {bad_len} must be refused"));
+            assert!(
+                error.is_internal(),
+                "a malformed token width must surface as an ordinary internal error, not a \
+                 retryable/disconnect-shaped one a caller might treat as safe to retry: {error:?}"
+            );
+        }
+    }
+
+    /// The whole reason for the newtype: formatting it never prints the bearer secret.
+    #[test]
+    fn debug_never_prints_the_token_bytes() {
+        let formatted = format!("{:?}", token(0xAB));
+        assert_eq!(formatted, "OwnershipToken(<redacted>)");
+    }
+
+    /// [`LockOwnership`]'s hand-written `Debug` must redact the token while leaving the other
+    /// fields legible -- the whole point of writing it by hand instead of deriving it.
+    #[test]
+    fn lock_ownership_debug_redacts_the_token_but_keeps_the_other_fields_readable() {
+        let ownership = LockOwnership {
+            attempt_id: AttemptId::new(),
+            branch: Context::from([0x11u8; 16]),
+            resource_hash: Hash::from([0x22u8; 32]),
+            token: token(0xAB),
+        };
+        let formatted = format!("{ownership:?}");
+
+        assert!(
+            formatted.contains("OwnershipToken(<redacted>)"),
+            "the token field must redact: {formatted}"
+        );
+        assert!(
+            !formatted.contains("\\xab\\xab\\xab\\xab"),
+            "the raw token bytes must never leak through the struct's own Debug: {formatted}"
+        );
+        assert!(
+            formatted.contains("attempt_id") && formatted.contains("resource_hash"),
+            "redacting the token must not swallow the struct's other fields: {formatted}"
+        );
     }
 }

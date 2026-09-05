@@ -29,11 +29,20 @@ use lore_transport::AttemptState;
 use lore_transport::AttemptStore;
 use lore_transport::DomainReceiptQuery;
 use lore_transport::LockOwnership;
+use lore_transport::OwnershipToken;
 use lore_transport::VolatileAttemptStore;
 use uuid::Uuid;
 
 fn digest(fill: u8) -> Bytes {
     Bytes::from(vec![fill; 32])
+}
+
+/// A distinct, well-formed ownership token. The width is checked on construction now, so a token
+/// has to be exactly OwnershipToken::LEN bytes rather than a readable label.
+fn token(fill: u8) -> OwnershipToken {
+    OwnershipToken::from_wire(&[fill; OwnershipToken::LEN])
+        .expect("a token of the declared width is well formed")
+        .expect("a non-empty token is present")
 }
 
 fn sample_receipt_query() -> DomainReceiptQuery {
@@ -253,7 +262,7 @@ async fn resolve_clears_the_lock_ownership_that_attempt_held_and_leaves_others_a
             attempt_id: resolved_attempt,
             branch,
             resource_hash: resolved_resource,
-            token: Bytes::from_static(b"resolved-attempt-token"),
+            token: token(0xA1),
         })
         .await
         .unwrap();
@@ -262,7 +271,7 @@ async fn resolve_clears_the_lock_ownership_that_attempt_held_and_leaves_others_a
             attempt_id: other_attempt,
             branch,
             resource_hash: other_resource,
-            token: Bytes::from_static(b"other-attempt-token"),
+            token: token(0xA2),
         })
         .await
         .unwrap();
@@ -450,7 +459,7 @@ async fn ownership_is_keyed_by_branch_and_resource_not_by_attempt() {
             attempt_id: first_attempt,
             branch,
             resource_hash: resource,
-            token: Bytes::from_static(b"token-from-first-attempt"),
+            token: token(0xB1),
         })
         .await
         .unwrap();
@@ -459,7 +468,7 @@ async fn ownership_is_keyed_by_branch_and_resource_not_by_attempt() {
             attempt_id: second_attempt,
             branch,
             resource_hash: resource,
-            token: Bytes::from_static(b"token-from-second-attempt"),
+            token: token(0xB2),
         })
         .await
         .unwrap();
@@ -471,7 +480,7 @@ async fn ownership_is_keyed_by_branch_and_resource_not_by_attempt() {
         .expect("a token must be held for this resource");
     assert_eq!(
         held.token,
-        Bytes::from_static(b"token-from-second-attempt"),
+        token(0xB2),
         "the later write must win regardless of which attempt id issued it"
     );
 
@@ -481,7 +490,7 @@ async fn ownership_is_keyed_by_branch_and_resource_not_by_attempt() {
             attempt_id: first_attempt,
             branch,
             resource_hash: other_resource,
-            token: Bytes::from_static(b"token-for-other-resource"),
+            token: token(0xB3),
         })
         .await
         .unwrap();
@@ -491,7 +500,7 @@ async fn ownership_is_keyed_by_branch_and_resource_not_by_attempt() {
             .await
             .unwrap()
             .map(|o| o.token),
-        Some(Bytes::from_static(b"token-for-other-resource"))
+        Some(token(0xB3))
     );
     assert_eq!(
         store
@@ -499,7 +508,7 @@ async fn ownership_is_keyed_by_branch_and_resource_not_by_attempt() {
             .await
             .unwrap()
             .map(|o| o.token),
-        Some(Bytes::from_static(b"token-from-second-attempt")),
+        Some(token(0xB2)),
         "writing ownership for a different resource must not disturb the first one"
     );
 
@@ -553,7 +562,7 @@ async fn clear_ownership_removes_only_the_named_resource() {
                 attempt_id: attempt,
                 branch,
                 resource_hash,
-                token: Bytes::from_static(b"token"),
+                token: token(0xC1),
             })
             .await
             .unwrap();

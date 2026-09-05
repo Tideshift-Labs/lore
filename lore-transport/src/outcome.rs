@@ -106,6 +106,17 @@ impl AttemptId {
     pub fn as_uuid(&self) -> Uuid {
         self.0
     }
+
+    /// Rebuild an id that was already minted, from a durable record of it.
+    ///
+    /// Deliberately named apart from [`Self::new`] so the two cannot be confused at a call site:
+    /// minting is an event that happens once, before a dispatch, and this is the read-back that
+    /// must never be mistaken for one. Nothing here validates the UUID version — a record written
+    /// by an older client is still that attempt's identity, and refusing to read it back would
+    /// lose the only handle on an unresolved mutation.
+    pub fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
 }
 
 impl fmt::Display for AttemptId {
@@ -200,6 +211,7 @@ pub enum GrpcRpc {
     RepositoryMetadataSet,
     LockLock,
     LockUnlock,
+    LockForceUnlock,
     LockQuery,
     LockStatus,
     EnvironmentGet,
@@ -242,6 +254,7 @@ impl GrpcRpc {
             Self::RepositoryMetadataSet => "RepositoryService.MetadataSet",
             Self::LockLock => "LockService.Lock",
             Self::LockUnlock => "LockService.Unlock",
+            Self::LockForceUnlock => "LockService.ForceUnlock",
             Self::LockQuery => "LockService.Query",
             Self::LockStatus => "LockService.Status",
             Self::EnvironmentGet => "EnvironmentService.Get",
@@ -316,7 +329,11 @@ pub fn grpc_replay_class(rpc: GrpcRpc) -> ReplayClass {
         | GrpcRpc::RepositoryDelete
         | GrpcRpc::RepositoryMetadataSet
         | GrpcRpc::LockLock
-        | GrpcRpc::LockUnlock => ReplayClass::MutableNoReplay,
+        | GrpcRpc::LockUnlock
+        // Takes a row away from its owner and records `lock.force_released`. A replay after a
+        // lost answer could release a lock the owner re-acquired in between, which is precisely
+        // the transition an administrator would want to have made once.
+        | GrpcRpc::LockForceUnlock => ReplayClass::MutableNoReplay,
     }
 }
 
@@ -459,10 +476,30 @@ mod tests {
         GrpcRpc::RepositoryMetadataSet,
         GrpcRpc::LockLock,
         GrpcRpc::LockUnlock,
+        GrpcRpc::LockForceUnlock,
         GrpcRpc::LockQuery,
         GrpcRpc::LockStatus,
         GrpcRpc::EnvironmentGet,
     ];
+
+    /// CR-030: `ForceUnlock` is an administrative takeover, not a caller releasing its own lock,
+    /// and it is the only lock mutation not gated by [`crate::attempt_store::FencedLockResource`]
+    /// possession -- so it earns its own classification pin rather than relying on
+    /// `every_rpc_is_classified_and_named`'s loop, which proves only that the match is
+    /// exhaustive, not which arm a given RPC lands in.
+    #[test]
+    fn force_unlock_is_named_and_classified_as_a_no_replay_mutation() {
+        assert_eq!(
+            GrpcRpc::LockForceUnlock.wire_name(),
+            "LockService.ForceUnlock"
+        );
+        assert_eq!(
+            grpc_replay_class(GrpcRpc::LockForceUnlock),
+            ReplayClass::MutableNoReplay,
+            "a lost ForceUnlock must never be silently retried: the caller cannot tell whether \
+             the administrative takeover it asked for already happened"
+        );
+    }
 
     /// The capability is what a caller declares; linking the crate is not.
     #[test]

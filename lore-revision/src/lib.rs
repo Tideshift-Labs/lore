@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 pub mod anchor;
+pub mod attempt_store;
 pub mod auth;
 pub mod branch;
 pub mod change;
