@@ -773,6 +773,25 @@ pub struct LoreGlobalArgs {
     /// Supplying either token puts the call in external-credential mode: `identity`
     /// must be left empty, since it is read from the token.
     pub access_token: LoreString,
+    /// The attempt identity this call's mutations are dispatched under, as a
+    /// hyphenated lowercase UUIDv7. Empty for every caller that does not track
+    /// attempts, which is the CLI and every embedder that has not opted in.
+    /// PIN(WP-120, 2026-09-05).
+    ///
+    /// Supply it when the caller keeps its own durable record of what it
+    /// dispatched and intends to reconcile a lost response against an
+    /// authoritative receipt later. The value travels to the server, which files
+    /// the receipt under it, so the caller can find that receipt again using an
+    /// identity it wrote down before dispatching rather than one it could only
+    /// have learned from the response that went missing.
+    ///
+    /// It must be the id the caller already recorded, never a fresh one minted
+    /// for the call. An id minted here would name an attempt the caller's own
+    /// journal has no row for, and the resulting lookup would answer "no such
+    /// receipt" forever while appearing to work.
+    ///
+    /// Appended to this struct rather than inserted, so the layout only grows.
+    pub attempt_id: LoreString,
 }
 
 impl LoreGlobalArgs {
@@ -792,6 +811,17 @@ impl LoreGlobalArgs {
     /// the credential comes from the token store as usual.
     pub fn identity_token(&self) -> &str {
         self.identity_token.as_str()
+    }
+
+    /// The attempt identity supplied for this call, or `None` when the caller
+    /// tracks no attempts.
+    ///
+    /// Returns the raw text without parsing it. The value crosses an FFI
+    /// boundary as a string and this crate has no reason to hold an opinion
+    /// about UUID versions; whoever enters the dispatch scope with it does the
+    /// parsing and decides what an unreadable value means.
+    pub fn attempt_id(&self) -> Option<&str> {
+        (&self.attempt_id).into()
     }
 
     /// The authorization token supplied for this call, or an empty string when
