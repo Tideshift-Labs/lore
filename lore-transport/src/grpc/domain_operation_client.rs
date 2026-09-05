@@ -15,6 +15,7 @@ use std::sync::atomic::AtomicU64;
 use bytes::Bytes;
 use lore_base::lore_debug;
 use lore_base::types::RepositoryId;
+use lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetRequest;
 use lore_proto::lore::domain::v1::DomainOperationOutcome;
 use lore_proto::lore::domain::v1::DomainOperationReceiptGetRequest;
 use lore_proto::lore::domain::v1::DomainOperationReceiptGetResponse;
@@ -28,11 +29,13 @@ use super::GRPCAuthRef;
 use super::RequestScopedCounter;
 use super::grpc_retry;
 use super::handle_error;
+use crate::domain_receipt::DomainAttemptReceipt;
 use crate::domain_receipt::DomainReceipt;
 use crate::domain_receipt::DomainReceiptOutcome;
 use crate::domain_receipt::DomainReceiptQuery;
 use crate::domain_receipt::DomainReceiptState;
 use crate::error::ProtocolError;
+use crate::outcome::AttemptId;
 
 #[derive(Clone)]
 pub struct DomainOperationService {
@@ -94,6 +97,57 @@ impl DomainOperationService {
 
         decode_receipt(response)
     }
+
+    /// Look up the receipt for one attempt by the identity this client minted.
+    pub async fn attempt_receipt_get(
+        &self,
+        attempt: &AttemptId,
+    ) -> Result<DomainAttemptReceipt, ProtocolError> {
+        attempt_receipt_get_impl(&self.client, &self.request_inflight, attempt).await
+    }
+}
+
+/// Look up the receipt for one attempt by the identity this client minted.
+///
+/// One argument, because the server takes the namespace from the verified token rather than from
+/// the request. That is the whole reason a released client can call this at all: it has to prove
+/// who it is, which it can, and nothing about what it did, which it cannot.
+async fn attempt_receipt_get_impl(
+    client: &DomainOperationServiceClient<AuthorizedService>,
+    request_inflight: &Arc<AtomicU64>,
+    attempt: &AttemptId,
+) -> Result<DomainAttemptReceipt, ProtocolError> {
+    lore_debug!("Looking up the domain receipt for attempt {attempt}");
+
+    let mut retry = grpc_retry();
+    let response = loop {
+        let _counter = RequestScopedCounter::new(request_inflight.clone());
+        let mut client = client.clone();
+        let request = DomainOperationAttemptReceiptGetRequest {
+            client_attempt_id: Bytes::copy_from_slice(attempt.as_uuid().as_bytes()),
+        };
+        match client.domain_operation_attempt_receipt_get(request).await {
+            Ok(response) => break response.into_inner(),
+            Err(status) => handle_error(&mut retry, status).await?,
+        }
+    };
+
+    // Decoded through the same rules the keyed lookup uses, deliberately. The two answers mean
+    // the same things and a caller branches on them the same way; a second decode with its own
+    // idea of what COMMITTED implies is how two paths come to disagree about one receipt.
+    let state = decode_state(
+        response.status,
+        response.outcome,
+        response.reason_version,
+        &response.reason,
+        response.from_future_marker,
+        response.prepared_at_unix_millis,
+        response.hard_expires_at_unix_millis,
+    )?;
+    Ok(DomainAttemptReceipt {
+        state,
+        method: response.method,
+    })
 }
 
 /// CR-029 v1 requires `authorization_id` to equal the operation id, and the server refuses a
@@ -128,10 +182,43 @@ fn build_request(query: &DomainReceiptQuery) -> DomainOperationReceiptGetRequest
 fn decode_receipt(
     response: DomainOperationReceiptGetResponse,
 ) -> Result<DomainReceipt, ProtocolError> {
-    let status = DomainOperationReceiptStatus::try_from(response.status).map_err(|_| {
+    let state = decode_state(
+        response.status,
+        response.outcome,
+        response.reason_version,
+        &response.reason,
+        response.from_future_marker,
+        response.prepared_at_unix_millis,
+        response.hard_expires_at_unix_millis,
+    )?;
+
+    Ok(DomainReceipt {
+        state,
+        verification_nonce: response.verification_nonce,
+        bound_fields_digest: response.bound_fields_digest,
+        consumed_ticket_sha256: response.consumed_ticket_sha256,
+        authorization_revision: response.authorization_revision,
+    })
+}
+
+/// The one place a wire status becomes a [`DomainReceiptState`].
+///
+/// Shared by both lookups on purpose. They ask different questions and are answered by different
+/// RPCs, but a `COMMITTED` means the same thing to each, and two decoders with their own reading
+/// of that is how one receipt comes to have two verdicts.
+#[allow(clippy::too_many_arguments)]
+fn decode_state(
+    status: i32,
+    outcome: i32,
+    reason_version: Option<u32>,
+    reason: &str,
+    from_future_marker: bool,
+    prepared_at_unix_millis: Option<i64>,
+    hard_expires_at_unix_millis: Option<i64>,
+) -> Result<DomainReceiptState, ProtocolError> {
+    let status = DomainOperationReceiptStatus::try_from(status).map_err(|_| {
         ProtocolError::internal(format!(
-            "receipt lookup returned unrecognised status {}",
-            response.status
+            "receipt lookup returned unrecognised status {status}"
         ))
     })?;
 
@@ -144,10 +231,9 @@ fn decode_receipt(
             ));
         }
         DomainOperationReceiptStatus::Prepared => {
-            let (Some(prepared_at_unix_millis), Some(hard_expires_at_unix_millis)) = (
-                response.prepared_at_unix_millis,
-                response.hard_expires_at_unix_millis,
-            ) else {
+            let (Some(prepared_at_unix_millis), Some(hard_expires_at_unix_millis)) =
+                (prepared_at_unix_millis, hard_expires_at_unix_millis)
+            else {
                 return Err(ProtocolError::internal(
                     "receipt lookup reported PREPARED without both of its timestamps",
                 ));
@@ -158,8 +244,8 @@ fn decode_receipt(
             }
         }
         DomainOperationReceiptStatus::Committed => DomainReceiptState::Committed {
-            outcome: decode_outcome(&response)?,
-            from_future_marker: response.from_future_marker,
+            outcome: decode_outcome(outcome, reason_version, reason)?,
+            from_future_marker,
         },
         DomainOperationReceiptStatus::Mismatch => DomainReceiptState::Mismatch,
         DomainOperationReceiptStatus::Expired => DomainReceiptState::Expired,
@@ -167,13 +253,7 @@ fn decode_receipt(
         DomainOperationReceiptStatus::NotFound => DomainReceiptState::NotFound,
     };
 
-    Ok(DomainReceipt {
-        state,
-        verification_nonce: response.verification_nonce,
-        bound_fields_digest: response.bound_fields_digest,
-        consumed_ticket_sha256: response.consumed_ticket_sha256,
-        authorization_revision: response.authorization_revision,
-    })
+    Ok(state)
 }
 
 /// Read the outcome of a committed receipt.
@@ -182,12 +262,13 @@ fn decode_receipt(
 /// caller's whole reason for asking is that it does not know what happened, so an outcome it has
 /// to guess at is worth less than no answer at all.
 fn decode_outcome(
-    response: &DomainOperationReceiptGetResponse,
+    outcome: i32,
+    reason_version: Option<u32>,
+    reason: &str,
 ) -> Result<DomainReceiptOutcome, ProtocolError> {
-    let outcome = DomainOperationOutcome::try_from(response.outcome).map_err(|_| {
+    let outcome = DomainOperationOutcome::try_from(outcome).map_err(|_| {
         ProtocolError::internal(format!(
-            "committed receipt carried unrecognised outcome {}",
-            response.outcome
+            "committed receipt carried unrecognised outcome {outcome}"
         ))
     })?;
 
@@ -200,14 +281,14 @@ fn decode_outcome(
         // contract never promised. Refused for the same reason a `PREPARED` missing its
         // timestamps is.
         DomainOperationOutcome::NotApplied => {
-            let Some(reason_version) = response.reason_version else {
+            let Some(reason_version) = reason_version else {
                 return Err(ProtocolError::internal(
                     "committed NOT_APPLIED receipt carried no reason version",
                 ));
             };
             Ok(DomainReceiptOutcome::NotApplied {
                 reason_version,
-                reason: response.reason.clone(),
+                reason: reason.to_owned(),
             })
         }
         DomainOperationOutcome::Unspecified => Err(ProtocolError::internal(

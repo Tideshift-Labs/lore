@@ -55,6 +55,7 @@ use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
 use crate::connection::SuppliedCredentials;
+use crate::domain_receipt::DomainAttemptReceipt;
 use crate::domain_receipt::DomainReceipt;
 use crate::domain_receipt::DomainReceiptQuery;
 use crate::error::ProtocolError;
@@ -1255,6 +1256,21 @@ impl DomainOperations for GRPCDomainOperations {
             &self.connection,
             GrpcRpc::DomainOperationReceiptGet,
             || async { self.client.read().await.receipt_get(query).await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
+    }
+
+    /// Retryable for the same reason its sibling is: whatever the lookup settles, it settles the
+    /// same way every time.
+    async fn attempt_receipt_get(
+        &self,
+        attempt: &AttemptId,
+    ) -> Result<DomainAttemptReceipt, ProtocolError> {
+        with_reconnect_classified(
+            &self.connection,
+            GrpcRpc::DomainOperationAttemptReceiptGet,
+            || async { self.client.read().await.attempt_receipt_get(attempt).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await

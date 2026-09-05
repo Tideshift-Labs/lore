@@ -10,9 +10,11 @@ use lore_base::types::*;
 
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
+use crate::domain_receipt::DomainAttemptReceipt;
 use crate::domain_receipt::DomainReceipt;
 use crate::domain_receipt::DomainReceiptQuery;
 use crate::error::ProtocolError;
+use crate::outcome::AttemptId;
 use crate::replay::MutableOutcome;
 use crate::types::*;
 
@@ -541,6 +543,21 @@ pub trait DomainOperations: Send + Sync {
     /// durable record and asks again later. An `Err` means the lookup itself did not happen.
     async fn receipt_get(&self, query: &DomainReceiptQuery)
     -> Result<DomainReceipt, ProtocolError>;
+
+    /// Read the receipt for one attempt by the identity this client minted before dispatch.
+    ///
+    /// The lookup a released client can actually make. [`Self::receipt_get`] wants the whole
+    /// intent restated, which only a caller that saw the prepare response can do; this wants an
+    /// identity the caller chose itself, which is what survives a lost response.
+    ///
+    /// A `NotFound` here is an answer, not a failure, and specifically it is NOT proof the
+    /// mutation did not happen. It means no receipt is filed under this principal and this
+    /// attempt, which an older server, an unrecorded id, or a genuinely absent attempt all
+    /// produce alike.
+    async fn attempt_receipt_get(
+        &self,
+        attempt: &AttemptId,
+    ) -> Result<DomainAttemptReceipt, ProtocolError>;
 }
 
 /// Lock protocol

@@ -167,6 +167,24 @@ impl DomainReceiptState {
     }
 }
 
+/// A receipt found by the attempt identity this client minted (WP-120).
+///
+/// The answer to the question a reconciler actually has. [`DomainReceipt`] answers "what happened
+/// to the operation whose full intent I can restate", which a client that lost a response cannot
+/// ask; this answers "what happened to the attempt I named before I dispatched it", which is the
+/// only thing such a client still holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DomainAttemptReceipt {
+    /// What the server knows about the attempt. Read exactly as [`DomainReceipt::state`] is.
+    pub state: DomainReceiptState,
+    /// The method the receipt was filed under, empty when nothing matched.
+    ///
+    /// A caller that journalled the method before dispatch can check this against it. Doing so is
+    /// worth the trouble: a client reconciling several unresolved attempts at once has no other
+    /// way to notice that it asked about one and was answered about another.
+    pub method: String,
+}
+
 /// A receipt lookup's answer, with the witness the server echoed back.
 ///
 /// The witness fields are evidence a caller persists next to the resolved record. Two of them

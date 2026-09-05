@@ -204,6 +204,7 @@ pub enum GrpcRpc {
     LockStatus,
     EnvironmentGet,
     DomainOperationReceiptGet,
+    DomainOperationAttemptReceiptGet,
 }
 
 impl GrpcRpc {
@@ -245,6 +246,9 @@ impl GrpcRpc {
             Self::LockStatus => "LockService.Status",
             Self::EnvironmentGet => "EnvironmentService.Get",
             Self::DomainOperationReceiptGet => "DomainOperationService.DomainOperationReceiptGet",
+            Self::DomainOperationAttemptReceiptGet => {
+                "DomainOperationService.DomainOperationAttemptReceiptGet"
+            }
         }
     }
 }
@@ -284,7 +288,8 @@ pub fn grpc_replay_class(rpc: GrpcRpc) -> ReplayClass {
         // same answer as the first, so reissuing after a lost channel cannot produce a different
         // verdict. That is the property `ReadRetryable` actually needs, and it is why this sits
         // here while the mutation it asks about cannot.
-        | GrpcRpc::DomainOperationReceiptGet => ReplayClass::ReadRetryable,
+        | GrpcRpc::DomainOperationReceiptGet
+        | GrpcRpc::DomainOperationAttemptReceiptGet => ReplayClass::ReadRetryable,
 
         // Publishes or revives a repository/context lifecycle association, even where the
         // payload's address is content-derived.
