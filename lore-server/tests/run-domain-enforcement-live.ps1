@@ -3,12 +3,16 @@
 
 <#
 .SYNOPSIS
-Runs the eight WP-116 real-construction enforcement regressions on disposable PostgreSQL 16 databases.
+Runs the WP-116 real-construction enforcement regressions, plus the P12 obliterate-witness
+integration case and the receipt lane's client-attempt-id case, on disposable PostgreSQL 16
+databases.
 
 .DESCRIPTION
-The Rust cases remain `#[ignore]`. This runner verifies the fixed fully-qualified inventory, runs
-each exact case in its own fresh database, and reports PASS, FAIL, and NOT RUN distinctly. The
-container and anonymous volume are removed only after their exact random ownership label is checked.
+The Rust cases remain `#[ignore]`. This runner verifies the fixed fully-qualified inventory across
+two packages (`lore-server`'s `lib` and `p12_live` targets, and `lore-postgres`'s
+`domain_receipts_lifecycle` target), runs each exact case in its own fresh database, and reports
+PASS, FAIL, and NOT RUN distinctly. The container and anonymous volume are removed only after their
+exact random ownership label is checked.
 #>
 
 [CmdletBinding()]
@@ -41,16 +45,25 @@ $expectedTests = @(
     'domain::tests::a_mediated_prepare_key_cannot_be_consumed_by_a_repository_scoped_governed_mutation'
 )
 $p12IntegrationTest = 'exact_mediated_obliterate_consumes_while_tuple_tamper_preserves_prepared'
+# The receipt lane's `client_attempt_id` half (Lore afaf928/611a031/dc6f895): a
+# released client's prepare persists the attempt id it sent, and the lookup
+# finds it only under its own (issuer, subject). Lives in lore-postgres, not
+# lore-server, since it exercises the receipts state machine directly through
+# `PostgresDomainStore`'s coordinator trait -- no gRPC handler involved.
+$domainReceiptsTest = 'attempt_receipt_get_finds_a_persisted_client_attempt_id_only_under_its_own_subject'
 
 $results = @(
-    foreach ($name in @($expectedTests) + @($p12IntegrationTest)) {
+    foreach ($name in @($expectedTests) + @($p12IntegrationTest) + @($domainReceiptsTest)) {
         [pscustomobject]@{
-            Test   = $name
-            Target = if ($name -eq $p12IntegrationTest) { 'p12_live' } else { 'lib' }
-            Status = 'NOT RUN'
-            Passed = 0
-            Failed = 0
-            Ran    = 0
+            Test    = $name
+            Package = if ($name -eq $domainReceiptsTest) { 'lore-postgres' } else { 'lore-server' }
+            Target  = if ($name -eq $p12IntegrationTest) { 'p12_live' }
+            elseif ($name -eq $domainReceiptsTest) { 'domain_receipts_lifecycle' }
+            else { 'lib' }
+            Status  = 'NOT RUN'
+            Passed  = 0
+            Failed  = 0
+            Ran     = 0
         }
     }
 )
@@ -74,12 +87,13 @@ function Invoke-Checked {
 function Get-EnforcementTestCatalog {
     param(
         [Parameter(Mandatory)]
-        [string]$Target
+        [string]$Target,
+        [string]$Package = 'lore-server'
     )
     Push-Location $loreRoot
     try {
         $targetArgs = if ($Target -eq 'lib') { @('--lib') } else { @('--test', $Target) }
-        $catalogArgs = @('test', '-p', 'lore-server') + $targetArgs + @('--', '--ignored', '--list')
+        $catalogArgs = @('test', '-p', $Package) + $targetArgs + @('--', '--ignored', '--list')
         $output = & cargo @catalogArgs 2>&1 | Out-String
         $exitCode = $LASTEXITCODE
     }
@@ -102,9 +116,13 @@ function Get-EnforcementTestCatalog {
 function Assert-ExpectedCatalog {
     $libCatalog = @(Get-EnforcementTestCatalog -Target 'lib')
     $p12Catalog = @(Get-EnforcementTestCatalog -Target 'p12_live')
+    $receiptsCatalog = @(Get-EnforcementTestCatalog -Package 'lore-postgres' -Target 'domain_receipts_lifecycle')
     $missing = @($expectedTests | Where-Object { $_ -notin $libCatalog })
-    if ($expectedTests.Count -ne 9 -or $missing.Count -ne 0 -or $p12IntegrationTest -notin $p12Catalog) {
-        throw "expected nine library tests plus the P12 integration test; missing=[$($missing -join ', ')]; p12Present=$($p12IntegrationTest -in $p12Catalog)"
+    if ($expectedTests.Count -ne 9 -or $missing.Count -ne 0 -or $p12IntegrationTest -notin $p12Catalog -or
+        $domainReceiptsTest -notin $receiptsCatalog) {
+        throw ("expected nine library tests plus the P12 integration test plus the domain-receipts " +
+            "attempt-id test; missing=[$($missing -join ', ')]; p12Present=$($p12IntegrationTest -in $p12Catalog); " +
+            "receiptsPresent=$($domainReceiptsTest -in $receiptsCatalog)")
     }
 }
 
@@ -181,7 +199,7 @@ try {
             Write-Host "Running $($result.Test)..."
             try {
                 $targetArgs = if ($result.Target -eq 'lib') { @('--lib') } else { @('--test', $result.Target) }
-                $cargoArgs = @('test', '-p', 'lore-server') + $targetArgs + @('--', '--ignored', '--exact', $result.Test, '--test-threads=1')
+                $cargoArgs = @('test', '-p', $result.Package) + $targetArgs + @('--', '--ignored', '--exact', $result.Test, '--test-threads=1')
                 $output = & cargo @cargoArgs 2>&1 | Out-String
                 $exitCode = $LASTEXITCODE
             }

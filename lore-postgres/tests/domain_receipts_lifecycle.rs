@@ -22,6 +22,7 @@ use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::errors::DomainError;
 use lore_postgres::domain::errors::DomainOutcome;
+use lore_postgres::domain::receipts::AttemptReceipt;
 use lore_postgres::domain::receipts::AuthorizationWitness;
 use lore_postgres::domain::receipts::ConsumeResult;
 use lore_postgres::domain::receipts::OperationBinding;
@@ -332,6 +333,96 @@ async fn coordinator_prepare_commit_is_visible_and_receipt_get_replays_it() {
     assert_eq!(mismatch, PrepareResult::Mismatch);
     let unchanged = fetch_receipt(&client, &key).await;
     assert_eq!(unchanged.consume_token, persisted.consume_token);
+}
+
+/// A released client's prepare persists the `client_attempt_id` it sent
+/// (`9a6d5e0`/`afaf928`), and
+/// [`DomainTransactionStore::domain_operation_attempt_receipt_get`] finds the
+/// resulting receipt by `(verified_issuer, authenticated_subject,
+/// client_attempt_id)` alone. A caller presenting the same attempt id under a
+/// different authenticated subject (the same issuer) must get `NotFound`,
+/// identical to a caller quoting an id that was never prepared -- the
+/// principal is the whole of the access control
+/// (`receipts::attempt_receipt_get`'s own doc comment).
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn attempt_receipt_get_finds_a_persisted_client_attempt_id_only_under_its_own_subject() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping attempt-receipt lookup test");
+        return;
+    };
+    let store = connect_domain_store(&url).await;
+    let mut client = pg_client(&url).await;
+    let clock = capture_clock(&mut client).await;
+    let key = isolated_key(uuid_v7_at(clock));
+    let original = binding("lore.domain.v1.test/AttemptReceiptLookup");
+    let attempt_id = Uuid::new_v4();
+
+    let prepared = store
+        .domain_operation_prepare(&key, &original, None, Some(attempt_id))
+        .await
+        .expect("prepare with a client attempt id");
+    assert!(
+        matches!(prepared, PrepareResult::Prepared { .. }),
+        "expected Prepared, got {prepared:?}"
+    );
+
+    let persisted_attempt_id: Vec<u8> = client
+        .query_one(
+            "SELECT client_attempt_id FROM lore_domain_operation_receipts
+              WHERE verified_issuer = $1 AND authenticated_subject = $2
+                AND tenant_scope_key = $3 AND operation_id = $4",
+            &[
+                &key.verified_issuer,
+                &key.authenticated_subject,
+                &key.tenant_scope_key,
+                &key.operation_id.as_bytes().as_slice(),
+            ],
+        )
+        .await
+        .expect("fetch the persisted client_attempt_id")
+        .get(0);
+    assert_eq!(
+        persisted_attempt_id,
+        attempt_id.as_bytes().as_slice(),
+        "the exact bytes the client sent must be what is stored, not re-derived"
+    );
+
+    let found = store
+        .domain_operation_attempt_receipt_get(
+            &key.verified_issuer,
+            &key.authenticated_subject,
+            &attempt_id,
+        )
+        .await
+        .expect("attempt receipt lookup under the owning subject");
+    assert_eq!(
+        found.method.as_deref(),
+        Some(original.method.as_str()),
+        "the method the receipt was filed under must come back"
+    );
+    assert!(
+        matches!(found.lookup, ReceiptLookup::Prepared { .. }),
+        "expected Prepared, got {:?}",
+        found.lookup
+    );
+
+    let wrong_subject = store
+        .domain_operation_attempt_receipt_get(
+            &key.verified_issuer,
+            "svc:a-different-subject-entirely",
+            &attempt_id,
+        )
+        .await
+        .expect("attempt receipt lookup under a different subject");
+    assert_eq!(
+        wrong_subject,
+        AttemptReceipt {
+            lookup: ReceiptLookup::NotFound,
+            method: None,
+        },
+        "the same attempt id under a different subject must not be found"
+    );
 }
 
 // ─── the five temporal classes ──────────────────────────────────────────────
