@@ -108,6 +108,11 @@ struct RecordingStore {
     prepare_result: Mutex<PrepareResult>,
     receipt_result: Mutex<ReceiptLookup>,
     attempt_receipt_result: Mutex<AttemptReceipt>,
+    /// If set, `attempt_receipt_result` is only returned to a caller whose (verified_issuer,
+    /// authenticated_subject) matches exactly this pair; every other caller reads `NotFound`.
+    /// `None` (the default) answers every caller identically, which is what every test not
+    /// concerned with cross-subject isolation wants.
+    attempt_receipt_owner: Mutex<Option<(String, String)>>,
     /// What the handler actually passed to the store on the most recent call: the isolation
     /// property this whole method rests on (the verified issuer/subject, never anything the
     /// request itself could name) is only checkable if the double records what it received.
@@ -141,6 +146,7 @@ impl RecordingStore {
                 lookup: ReceiptLookup::NotFound,
                 method: None,
             }),
+            attempt_receipt_owner: Mutex::new(None),
             last_attempt_receipt_call: Mutex::new(None),
             recorded_prepare: Mutex::new(None),
         }
@@ -174,6 +180,20 @@ impl DomainTransactionStore for RecordingStore {
             authenticated_subject.to_string(),
             *client_attempt_id,
         ));
+
+        if let Some((owner_issuer, owner_subject)) = self
+            .attempt_receipt_owner
+            .lock()
+            .expect("attempt receipt owner")
+            .clone()
+            && (owner_issuer != verified_issuer || owner_subject != authenticated_subject)
+        {
+            return Ok(AttemptReceipt {
+                lookup: ReceiptLookup::NotFound,
+                method: None,
+            });
+        }
+
         Ok(self
             .attempt_receipt_result
             .lock()
@@ -1811,6 +1831,63 @@ async fn attempt_receipt_get_two_different_callers_pass_two_different_identities
         first_seen, second_seen,
         "two different callers must produce two different store identities"
     );
+}
+
+/// The isolation property end to end, not just as an argument about the request shape: a real
+/// receipt filed under one (issuer, subject) is invisible to a different subject asking for the
+/// exact same attempt id. It reads as plain `NotFound`, not an error and not the owner's data --
+/// an attempt id belonging to someone else must answer exactly as one that never existed does.
+#[tokio::test]
+async fn attempt_receipt_get_another_subjects_attempt_reads_as_absent() {
+    let (service, store, _) = service();
+    *store
+        .attempt_receipt_result
+        .lock()
+        .expect("attempt receipt result") = AttemptReceipt {
+        lookup: ReceiptLookup::Committed {
+            outcome: DomainOutcome::Applied,
+            from_future_marker: false,
+        },
+        method: Some("RevisionService.BranchPush".to_string()),
+    };
+    *store
+        .attempt_receipt_owner
+        .lock()
+        .expect("attempt receipt owner") = Some((
+        "https://issuer-a.example".to_string(),
+        "human-subject-a".to_string(),
+    ));
+
+    let request = valid_attempt_receipt_get();
+
+    let owner_response = service
+        .domain_operation_attempt_receipt_get(authenticated_as(
+            request.clone(),
+            human_token("https://issuer-a.example", "human-subject-a"),
+        ))
+        .await
+        .expect("the owning subject's lookup succeeds")
+        .into_inner();
+    assert_eq!(
+        owner_response.status,
+        DomainOperationReceiptStatus::Committed as i32,
+        "the owning subject must see the real receipt"
+    );
+
+    let other_response = service
+        .domain_operation_attempt_receipt_get(authenticated_as(
+            request,
+            human_token("https://issuer-a.example", "human-subject-b"),
+        ))
+        .await
+        .expect("a different subject's lookup still succeeds, just finds nothing")
+        .into_inner();
+    assert_eq!(
+        other_response.status,
+        DomainOperationReceiptStatus::NotFound as i32,
+        "a different subject asking for the exact same attempt id must read absent"
+    );
+    assert_eq!(other_response.method, "");
 }
 
 /// A service-account-shaped token gets no special treatment: `get_authorization` does not branch
