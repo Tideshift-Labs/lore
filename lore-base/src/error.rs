@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! Consolidated FFI error types for the Lore system.
 //!
@@ -501,6 +502,11 @@ pub struct InefficientCompression;
     "{operation}: dispatched, response lost, outcome unknown (attempt {attempt_id}); read authoritative state before any new attempt"
 )]
 #[ffi_code(193)]
+// Publishes the two fields through `FfiError::outcome_identity`, so a consumer across the C
+// boundary reads them as data rather than parsing them back out of the message above. This is
+// the only error in the registry that names an attempt, and the only one that needs to: the
+// caller's next move after this error is to look that exact attempt up.
+#[ffi_outcome_identity(operation, attempt_id)]
 pub struct OutcomeUnknown {
     /// The operation whose response was lost, named as the wire names it.
     pub operation: String,

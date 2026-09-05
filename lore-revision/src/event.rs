@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 #![allow(non_camel_case_types)]
 #![allow(unused_parens)]
@@ -645,6 +646,26 @@ pub struct LoreErrorDetail {
     /// `track-locations` is off or the error carries no trace.
     #[serde(default)]
     pub trace_locations: LoreArray<LoreTraceLocation>,
+    /// The operation whose outcome is unresolved, for the errors that name one.
+    ///
+    /// Non-empty exactly when `error_code` is `193`, and empty for every other
+    /// error. C has no absent string, so empty is how absence is spelled; a
+    /// consumer decides by the code, not by testing this field. Read it with
+    /// `attempt_id`, never on its own: an operation without the attempt it
+    /// belongs to names a kind of request, not a thing that happened. Spelled
+    /// without a doc link because this comment is copied verbatim into the
+    /// generated C header, where a rustdoc reference resolves to nothing.
+    #[serde(default)]
+    pub operation: LoreString,
+    /// The attempt whose outcome is unresolved, for the errors that name one.
+    ///
+    /// Non-empty exactly when `error_code` is `193`. This is the value a caller
+    /// carries into its durable record and later quotes to an authoritative
+    /// receipt lookup, so it is the field that makes a lost response
+    /// recoverable rather than merely reportable. It is minted before dispatch,
+    /// so it names the attempt rather than the moment the loss was noticed.
+    #[serde(default)]
+    pub attempt_id: LoreString,
 }
 
 impl LoreErrorDetail {
@@ -689,10 +710,22 @@ impl LoreErrorDetail {
             .map(LoreTraceLocation::from_location)
             .collect::<Vec<_>>();
 
+        // Read as data rather than parsed back out of the message. Only the outcome-unknown
+        // error answers with anything; every other error leaves both fields empty.
+        let (operation, attempt_id) = match error.outcome_identity() {
+            Some((operation, attempt_id)) => (
+                LoreString::from(operation.to_string()),
+                LoreString::from(attempt_id.to_string()),
+            ),
+            None => (LoreString::default(), LoreString::default()),
+        };
+
         Self {
             error_code: error.ffi_code(),
             message: LoreString::from(error.to_string()),
             trace_locations: LoreArray::from_vec(trace_locations),
+            operation,
+            attempt_id,
         }
     }
 
@@ -1447,6 +1480,7 @@ mod error_detail_tests {
                     context: LoreString::from("loading"),
                 },
             ]),
+            ..Default::default()
         };
 
         assert_eq!(
@@ -1463,9 +1497,46 @@ mod error_detail_tests {
             error_code: 13,
             message: LoreString::from("boom"),
             trace_locations: Default::default(),
+            ..Default::default()
         };
 
         assert_eq!(detail.message_with_trace(), "boom");
+    }
+
+    /// The outcome-unknown error publishes its identity as data.
+    ///
+    /// This is the property the two fields exist for: a consumer journals the attempt and later
+    /// quotes it to a receipt lookup, and it must get that value as a field rather than by
+    /// parsing the message, whose wording is not a contract.
+    #[test]
+    fn an_outcome_unknown_error_carries_its_operation_and_attempt() {
+        let unknown = lore_base::error::OutcomeUnknown {
+            operation: "RevisionService.BranchCreate".to_string(),
+            attempt_id: "0199aa00-0000-7000-8000-000000000001".to_string(),
+        };
+
+        let detail =
+            LoreErrorDetail::from_error_with_trace(&unknown, &lore_error_set::Trace::new());
+
+        assert_eq!(detail.error_code, 193);
+        assert_eq!(detail.operation.as_str(), "RevisionService.BranchCreate");
+        assert_eq!(
+            detail.attempt_id.as_str(),
+            "0199aa00-0000-7000-8000-000000000001"
+        );
+    }
+
+    /// Every other error leaves both fields empty, which is how absence is spelled in C.
+    #[test]
+    fn an_ordinary_error_names_no_attempt() {
+        let ordinary = lore_base::error::NotFound {};
+
+        let detail =
+            LoreErrorDetail::from_error_with_trace(&ordinary, &lore_error_set::Trace::new());
+
+        assert_ne!(detail.error_code, 193);
+        assert!(detail.operation.as_str().is_empty());
+        assert!(detail.attempt_id.as_str().is_empty());
     }
 }
 
@@ -1491,6 +1562,7 @@ mod complete_event_tests {
             error_code: 13,
             message: LoreString::from("not found"),
             trace_locations: LoreArray::from_vec(vec![location]),
+            ..Default::default()
         }
     }
 

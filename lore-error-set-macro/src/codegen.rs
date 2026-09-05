@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! Code generation for the `#[error_set]` proc-macro.
 //!
@@ -852,12 +853,27 @@ fn generate_ffi_error_impl(enum_name: &Ident, variants: &[&Ident]) -> TokenStrea
         quote! { Self::#v(e) => lore_error_set::FfiError::ffi_code(&**e) }
     });
 
+    // Delegated the same way the code is, so a set that carries a variant naming an attempt
+    // reports it without any per-set code. Forgetting this arm would not fail to compile — the
+    // trait method is defaulted — it would silently answer `None` for every set, which is the
+    // shape of bug that survives a long time.
+    let identity_arms = variants.iter().map(|v| {
+        quote! { Self::#v(e) => lore_error_set::FfiError::outcome_identity(&**e) }
+    });
+
     quote! {
         impl lore_error_set::FfiError for #enum_name {
             fn ffi_code(&self) -> i32 {
                 match self {
                     #(#ffi_arms,)*
                     Self::Internal(_) => lore_error_set::Internal::FFI_CODE,
+                }
+            }
+
+            fn outcome_identity(&self) -> Option<(&str, &str)> {
+                match self {
+                    #(#identity_arms,)*
+                    Self::Internal(_) => None,
                 }
             }
         }

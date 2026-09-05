@@ -335,6 +335,24 @@ typedef struct lore_error_detail_t {
   // The captured trace, one location per trace entry. Empty when
   // `track-locations` is off or the error carries no trace.
   struct lore_trace_location_array_t trace_locations;
+  // The operation whose outcome is unresolved, for the errors that name one.
+  //
+  // Non-empty exactly when `error_code` is `193`, and empty for every other
+  // error. C has no absent string, so empty is how absence is spelled; a
+  // consumer decides by the code, not by testing this field. Read it with
+  // `attempt_id`, never on its own: an operation without the attempt it
+  // belongs to names a kind of request, not a thing that happened. Spelled
+  // without a doc link because this comment is copied verbatim into the
+  // generated C header, where a rustdoc reference resolves to nothing.
+  struct lore_string_t operation;
+  // The attempt whose outcome is unresolved, for the errors that name one.
+  //
+  // Non-empty exactly when `error_code` is `193`. This is the value a caller
+  // carries into its durable record and later quotes to an authoritative
+  // receipt lookup, so it is the field that makes a lost response
+  // recoverable rather than merely reportable. It is minted before dispatch,
+  // so it names the attempt rather than the moment the loss was noticed.
+  struct lore_string_t attempt_id;
 } lore_error_detail_t;
 
 // Data for a completion event, marking the end of an operation.
