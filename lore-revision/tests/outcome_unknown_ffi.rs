@@ -19,11 +19,15 @@
 
 use lore_base::error::Disconnected;
 use lore_base::error::OutcomeUnknown;
+use lore_base::types::Address;
 use lore_error_set::FfiError;
+use lore_revision::branch::BranchError;
 use lore_revision::event::EventError;
 use lore_revision::interface::LoreError;
 use lore_revision::lock::file::acquire::AcquireError;
 use lore_revision::lock::file::release::ReleaseError;
+use lore_storage::error::protocol_error_to_storage;
+use lore_transport::ProtocolError;
 
 /// The code allocated in `lore_base::error`, which everything below has to agree with.
 const OUTCOME_UNKNOWN: i32 = 193;
@@ -34,6 +38,11 @@ fn unknown() -> OutcomeUnknown {
         attempt_id: "0199a0b1-c2d3-7e4f-8a9b-0c1d2e3f4a5b".to_string(),
     }
 }
+
+/// What every rung of the ladder below must report for [`unknown`], via
+/// [`lore_error_set::FfiError::outcome_identity`].
+const EXPECTED_IDENTITY: (&str, &str) =
+    ("LockService.Lock", "0199a0b1-c2d3-7e4f-8a9b-0c1d2e3f4a5b");
 
 #[test]
 fn the_discrete_error_carries_the_allocated_code() {
@@ -95,4 +104,95 @@ fn internal_and_outcome_unknown_stay_distinct() {
         "the whole point of the variant is that it is not the catch-all",
     );
     assert_eq!(LoreError::OutcomeUnknown as i32, OUTCOME_UNKNOWN);
+}
+
+// -------------------------------------------------------------------------------------------
+// The set-ladder pin for `FfiError::outcome_identity`. Every impl above proves the *code*
+// (193) and the *classification* (`translated() == OutcomeUnknown`) survive; none of them
+// proves the operation and attempt id travel with it. `outcome_identity` is defaulted to
+// `None` on the trait, and an `#[error_set]`-generated impl delegates to it automatically
+// (`codegen.rs`'s `identity_arms`) -- but a *hand-written* conversion between sets, such as
+// `protocol_error_to_storage`, has no macro to lean on and can drop the identity on the floor
+// the same way a blanket `_ => Internal` used to drop the code. Three rungs, each a different
+// kind of delegation: an auto-generated `From` (`ProtocolError`), a hand-written mapping
+// function (`StorageError`), and a hand-written `EventError::translated()` at the FFI boundary
+// itself (`BranchError`).
+// -------------------------------------------------------------------------------------------
+
+/// Rung 0, completing the Lock family's own ladder: the code and the classification were
+/// already pinned above; this is the identity.
+#[test]
+fn lock_acquire_and_release_report_the_operation_and_attempt_id() {
+    assert_eq!(
+        AcquireError::from(unknown()).outcome_identity(),
+        Some(EXPECTED_IDENTITY)
+    );
+    assert_eq!(
+        ReleaseError::from(unknown()).outcome_identity(),
+        Some(EXPECTED_IDENTITY)
+    );
+}
+
+/// Rung 1: `lore-transport`'s own error set. `ProtocolError::OutcomeUnknown` is what every
+/// higher rung ultimately converts, so if the identity is lost here nothing above can recover
+/// it.
+#[test]
+fn protocol_error_reports_the_operation_and_attempt_id() {
+    let error = ProtocolError::from(unknown());
+    assert_eq!(error.ffi_code(), OUTCOME_UNKNOWN);
+    assert_eq!(error.outcome_identity(), Some(EXPECTED_IDENTITY));
+}
+
+/// The negative control for rung 1: an ordinary connectivity error carries no identity to
+/// report, and must not be answered with a stale or default one.
+#[test]
+fn protocol_errors_neighbouring_variant_has_no_identity() {
+    let error = ProtocolError::from(Disconnected);
+    assert_eq!(error.outcome_identity(), None);
+}
+
+/// Rung 2: `lore-storage`'s `protocol_error_to_storage`, a hand-written mapping function
+/// rather than a macro-generated `From`. This is exactly the shape of code that dropped the
+/// FFI code into `Internal` before WP-120 -- an early, unconditional match arm ahead of the
+/// explicit `OutcomeUnknown` check would compile cleanly and silently lose the identity too.
+#[test]
+fn storage_error_reports_the_operation_and_attempt_id_through_the_manual_protocol_mapping() {
+    let storage_error =
+        protocol_error_to_storage(ProtocolError::from(unknown()), Address::default());
+    assert_eq!(storage_error.ffi_code(), OUTCOME_UNKNOWN);
+    assert_eq!(storage_error.outcome_identity(), Some(EXPECTED_IDENTITY));
+}
+
+/// The negative control for rung 2: a mapped disconnect carries no identity, proving the
+/// positive case above is not a default that answers `Some` for everything.
+#[test]
+fn storage_errors_neighbouring_mapped_variant_has_no_identity() {
+    let storage_error =
+        protocol_error_to_storage(ProtocolError::from(Disconnected), Address::default());
+    assert_eq!(storage_error.outcome_identity(), None);
+}
+
+/// Rung 3, at the FFI boundary itself: `BranchError` is one of the eleven `EventError` impls
+/// WP-120 had to carve `OutcomeUnknown` out of, and its `translated()` is hand-written, not
+/// macro-generated. Both the classification and the identity have to survive it.
+#[test]
+fn branch_error_reports_the_operation_and_attempt_id_and_translates_to_outcome_unknown() {
+    let error = BranchError::from(unknown());
+    assert_eq!(error.ffi_code(), OUTCOME_UNKNOWN);
+    assert_eq!(error.outcome_identity(), Some(EXPECTED_IDENTITY));
+    assert!(
+        error.translated() == LoreError::OutcomeUnknown,
+        "a dispatched branch mutation whose response was lost must not translate to {:?}",
+        error.translated() as i32,
+    );
+}
+
+/// The negative control for rung 3, mirroring `a_neighbouring_variant_is_not_swept_into_the_unknown`
+/// above: an ordinary `BranchError` variant carries no identity and must not translate to
+/// `OutcomeUnknown` just because the set contains that variant somewhere.
+#[test]
+fn branch_errors_neighbouring_variant_has_no_identity_and_does_not_translate_to_outcome_unknown() {
+    let error = BranchError::from(Disconnected);
+    assert_eq!(error.outcome_identity(), None);
+    assert_ne!(error.translated() as i32, LoreError::OutcomeUnknown as i32);
 }
