@@ -583,16 +583,20 @@ ALTER TABLE lore_domain_operation_receipts
 
 -- Namespaced deliberately, and this is the security-bearing part of the change.
 --
--- The lookup that uses this index resolves the namespace from the caller's verified token and
--- takes only the attempt id from the request. Leading with the three namespace columns means the
--- index itself cannot serve a probe that supplies an attempt id alone, so its shape matches the
--- authority the query is allowed to exercise. An index on client_attempt_id by itself would make
--- a cross-namespace scan the cheap plan, which is exactly the query that must never be cheap.
+-- The lookup that uses this index resolves the principal from the caller's verified token and
+-- takes only the attempt id from the request. Leading with the two identity columns means the
+-- index cannot serve a probe that supplies an attempt id alone, so its shape matches the authority
+-- the query is allowed to exercise. An index on client_attempt_id by itself would make a
+-- cross-principal scan the cheap plan, which is exactly the query that must never be cheap.
+--
+-- tenant_scope_key is deliberately NOT in the prefix. It sub-partitions one principal's own rows
+-- rather than separating principals, so including it would buy no isolation while forcing the
+-- caller to restate a scope it may not be able to reconstruct after losing a response.
 --
 -- Partial, because a row without an attempt id can never be found through it.
 CREATE INDEX IF NOT EXISTS lore_domain_operation_receipts_client_attempt
     ON lore_domain_operation_receipts
-       (verified_issuer, authenticated_subject, tenant_scope_key, client_attempt_id)
+       (verified_issuer, authenticated_subject, client_attempt_id)
     WHERE client_attempt_id IS NOT NULL;
 -- ---------------------------------------------------------------------------
 -- Dispatch-possibility fence

@@ -3045,6 +3045,18 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl DomainTransactionStore for UnreachableDomainStore {
+        // WP-120's public attempt lookup. Stated rather than defaulted: a store that answers
+        // "no receipt" when it simply cannot look one up would report a real attempt as absent,
+        // and absence is what tells a client to stop waiting.
+        async fn domain_operation_attempt_receipt_get(
+            &self,
+            _verified_issuer: &str,
+            _authenticated_subject: &str,
+            _client_attempt_id: &uuid::Uuid,
+        ) -> Result<lore_postgres::domain::receipts::AttemptReceipt, DomainError> {
+            unreachable!("UnreachableDomainStore does not serve attempt receipt lookups")
+        }
+
         async fn domain_operation_clock_get(&self) -> Result<std::time::SystemTime, DomainError> {
             unreachable!("DomainContext::admit tests never call the coordinator")
         }
@@ -3186,6 +3198,18 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl DomainTransactionStore for PreparingDomainStore {
+        // WP-120's public attempt lookup. Stated rather than defaulted: a store that answers
+        // "no receipt" when it simply cannot look one up would report a real attempt as absent,
+        // and absence is what tells a client to stop waiting.
+        async fn domain_operation_attempt_receipt_get(
+            &self,
+            _verified_issuer: &str,
+            _authenticated_subject: &str,
+            _client_attempt_id: &uuid::Uuid,
+        ) -> Result<lore_postgres::domain::receipts::AttemptReceipt, DomainError> {
+            unreachable!("PreparingDomainStore does not serve attempt receipt lookups")
+        }
+
         async fn domain_operation_prepare(
             &self,
             _key: &ReceiptKey,
@@ -3354,6 +3378,18 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl DomainTransactionStore for ScriptedDomainStore {
+        // WP-120's public attempt lookup. Stated rather than defaulted: a store that answers
+        // "no receipt" when it simply cannot look one up would report a real attempt as absent,
+        // and absence is what tells a client to stop waiting.
+        async fn domain_operation_attempt_receipt_get(
+            &self,
+            _verified_issuer: &str,
+            _authenticated_subject: &str,
+            _client_attempt_id: &uuid::Uuid,
+        ) -> Result<lore_postgres::domain::receipts::AttemptReceipt, DomainError> {
+            unreachable!("ScriptedDomainStore does not serve attempt receipt lookups")
+        }
+
         async fn domain_operation_clock_get(&self) -> Result<std::time::SystemTime, DomainError> {
             unreachable!("ScriptedDomainStore only scripts branch_push_commit")
         }

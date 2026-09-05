@@ -174,6 +174,71 @@ impl ::prost::Name for DomainOperationReceiptGetResponse {
         "/lore.domain.v1.DomainOperationReceiptGetResponse".into()
     }
 }
+/// PUBLIC (WP-120). One field, and that is the whole security design.
+///
+/// The caller supplies only its own attempt identity. Everything that decides
+/// WHICH receipts are reachable — the verified issuer and the authenticated
+/// subject — is taken from the JWT the interceptor already verified, never from
+/// this message. A caller cannot name a namespace, so it cannot ask about
+/// another principal's attempt or about the control plane's, and quoting an
+/// attempt id belonging to someone else returns exactly what a nonexistent one
+/// returns.
+///
+/// There is deliberately no consumed_ticket_sha256 and no authorization id here.
+/// Those are what the private rail requires a caller to restate, and a released
+/// client holds neither: they are minted server-side during the internal prepare
+/// that this client never sees the response of.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationAttemptReceiptGetRequest {
+    /// Exactly 16 bytes, and a UUIDv7.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub client_attempt_id: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for DomainOperationAttemptReceiptGetRequest {
+    const NAME: &'static str = "DomainOperationAttemptReceiptGetRequest";
+    const PACKAGE: &'static str = "lore.domain.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.domain.v1.DomainOperationAttemptReceiptGetRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.domain.v1.DomainOperationAttemptReceiptGetRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DomainOperationAttemptReceiptGetResponse {
+    #[prost(enumeration = "DomainOperationReceiptStatus", tag = "1")]
+    pub status: i32,
+    /// Present only for COMMITTED.
+    #[prost(enumeration = "DomainOperationOutcome", tag = "2")]
+    pub outcome: i32,
+    #[prost(uint32, optional, tag = "3")]
+    pub reason_version: ::core::option::Option<u32>,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(bool, tag = "5")]
+    pub from_future_marker: bool,
+    /// Present only for PREPARED.
+    #[prost(int64, optional, tag = "6")]
+    pub prepared_at_unix_millis: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "7")]
+    pub hard_expires_at_unix_millis: ::core::option::Option<i64>,
+    /// The method the receipt was filed under. A client reconciling several
+    /// unresolved attempts needs to know which one an answer belongs to, and it
+    /// recorded the method before dispatch, so this is checkable rather than
+    /// merely informative.
+    #[prost(string, tag = "8")]
+    pub method: ::prost::alloc::string::String,
+}
+impl ::prost::Name for DomainOperationAttemptReceiptGetResponse {
+    const NAME: &'static str = "DomainOperationAttemptReceiptGetResponse";
+    const PACKAGE: &'static str = "lore.domain.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.domain.v1.DomainOperationAttemptReceiptGetResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.domain.v1.DomainOperationAttemptReceiptGetResponse".into()
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DomainOperationVerifiedStaleFinalizeRequest {
     #[prost(string, tag = "1")]
@@ -1023,12 +1088,23 @@ pub mod domain_operation_service_client {
     )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
-    /// FORK-LOCAL (Tideshift, CR-029). This private server-only service is the
-    /// private receipt and proof-namespace maintenance rail for Lorehub's control
-    /// plane. The on-the-wire method paths are:
+    /// FORK-LOCAL (Tideshift, CR-029). Almost all of this service is the private
+    /// receipt and proof-namespace maintenance rail for Lorehub's control plane, and
+    /// every method below except one requires the control-plane service account.
+    ///
+    /// The exception is DomainOperationAttemptReceiptGet (WP-120), which is PUBLIC:
+    /// it is served to an ordinary authenticated human principal, scoped to that
+    /// principal's own receipts and to nothing else. It exists because a released
+    /// client that loses a mutation's response has no other way to learn what
+    /// happened, and the private rail above is not a place a desktop may reach.
+    /// Keep the two apart when editing: a method added here is control-plane-only
+    /// unless it says otherwise in as many words.
+    ///
+    /// The on-the-wire method paths are:
     /// /lore.domain.v1.DomainOperationService/DomainOperationClockGet
     /// /lore.domain.v1.DomainOperationService/DomainOperationPrepare
     /// /lore.domain.v1.DomainOperationService/DomainOperationReceiptGet
+    /// /lore.domain.v1.DomainOperationService/DomainOperationAttemptReceiptGet
     /// /lore.domain.v1.DomainOperationService/DomainOperationVerifiedStaleFinalize
     /// /lore.domain.v1.DomainOperationService/DomainOperationTerminalStatusAttach
     /// /lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceMaterialize
@@ -1205,6 +1281,38 @@ pub mod domain_operation_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// PUBLIC. See the note at the top of this file.
+        pub async fn domain_operation_attempt_receipt_get(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::DomainOperationAttemptReceiptGetRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationAttemptReceiptGetResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = crate::DomainOperationV2StrictCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.domain.v1.DomainOperationService/DomainOperationAttemptReceiptGet",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.domain.v1.DomainOperationService",
+                        "DomainOperationAttemptReceiptGet",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn domain_operation_verified_stale_finalize(
             &mut self,
             request: impl tonic::IntoRequest<
@@ -1365,6 +1473,14 @@ pub mod domain_operation_service_server {
             tonic::Response<super::DomainOperationReceiptGetResponse>,
             tonic::Status,
         >;
+        /// PUBLIC. See the note at the top of this file.
+        async fn domain_operation_attempt_receipt_get(
+            &self,
+            request: tonic::Request<super::DomainOperationAttemptReceiptGetRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DomainOperationAttemptReceiptGetResponse>,
+            tonic::Status,
+        >;
         async fn domain_operation_verified_stale_finalize(
             &self,
             request: tonic::Request<super::DomainOperationVerifiedStaleFinalizeRequest>,
@@ -1396,12 +1512,23 @@ pub mod domain_operation_service_server {
             tonic::Status,
         >;
     }
-    /// FORK-LOCAL (Tideshift, CR-029). This private server-only service is the
-    /// private receipt and proof-namespace maintenance rail for Lorehub's control
-    /// plane. The on-the-wire method paths are:
+    /// FORK-LOCAL (Tideshift, CR-029). Almost all of this service is the private
+    /// receipt and proof-namespace maintenance rail for Lorehub's control plane, and
+    /// every method below except one requires the control-plane service account.
+    ///
+    /// The exception is DomainOperationAttemptReceiptGet (WP-120), which is PUBLIC:
+    /// it is served to an ordinary authenticated human principal, scoped to that
+    /// principal's own receipts and to nothing else. It exists because a released
+    /// client that loses a mutation's response has no other way to learn what
+    /// happened, and the private rail above is not a place a desktop may reach.
+    /// Keep the two apart when editing: a method added here is control-plane-only
+    /// unless it says otherwise in as many words.
+    ///
+    /// The on-the-wire method paths are:
     /// /lore.domain.v1.DomainOperationService/DomainOperationClockGet
     /// /lore.domain.v1.DomainOperationService/DomainOperationPrepare
     /// /lore.domain.v1.DomainOperationService/DomainOperationReceiptGet
+    /// /lore.domain.v1.DomainOperationService/DomainOperationAttemptReceiptGet
     /// /lore.domain.v1.DomainOperationService/DomainOperationVerifiedStaleFinalize
     /// /lore.domain.v1.DomainOperationService/DomainOperationTerminalStatusAttach
     /// /lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceMaterialize
@@ -1629,6 +1756,62 @@ pub mod domain_operation_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DomainOperationReceiptGetSvc(inner);
+                        let codec = crate::DomainOperationV2StrictCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.domain.v1.DomainOperationService/DomainOperationAttemptReceiptGet" => {
+                    #[allow(non_camel_case_types)]
+                    struct DomainOperationAttemptReceiptGetSvc<
+                        T: DomainOperationService,
+                    >(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: DomainOperationService,
+                    > tonic::server::UnaryService<
+                        super::DomainOperationAttemptReceiptGetRequest,
+                    > for DomainOperationAttemptReceiptGetSvc<T> {
+                        type Response = super::DomainOperationAttemptReceiptGetResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::DomainOperationAttemptReceiptGetRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as DomainOperationService>::domain_operation_attempt_receipt_get(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DomainOperationAttemptReceiptGetSvc(inner);
                         let codec = crate::DomainOperationV2StrictCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -969,6 +969,91 @@ pub async fn consume(
 /// consume token and never performs a domain mutation; a later metadata update,
 /// branch advance, delete, obliteration, repair, or re-store cannot erase or
 /// rewrite the receipt it reads.
+/// One receipt found by the client's own attempt identity, with the method it was filed under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptReceipt {
+    /// What the row says. `NotFound` covers both no match and an ambiguous one.
+    pub lookup: ReceiptLookup,
+    /// The method the matched receipt was filed under; empty when nothing matched.
+    pub method: String,
+}
+
+/// Find a receipt by the attempt identity its client chose, within one verified principal.
+///
+/// **The principal is the whole of the access control.** `verified_issuer` and
+/// `authenticated_subject` come from a JWT the caller has already proved; `client_attempt_id` is
+/// the only thing the caller supplies. A caller quoting an attempt id belonging to someone else
+/// matches no row, and gets the same answer as one quoting an id that never existed. That is why
+/// the WHERE clause names all three and never the id alone.
+///
+/// Two rows sharing an attempt id inside one principal's namespace answers `NotFound`, not a
+/// guess. A client that reused an identity has broken its own invariant, and picking one of two
+/// receipts could attribute the wrong outcome to the attempt; refusing to attribute anything is
+/// the only safe answer. It is deliberately indistinguishable from absence on the wire, because
+/// both are equally non-attributive and neither licenses a retry.
+///
+/// The lookup delegates to [`receipt_get`] once it has the key rather than reading the row's
+/// state itself. That is not tidiness: `receipt_get` terminalizes a `PREPARED` row past its hard
+/// expiry, and a second way of reading a receipt that skipped that step would report an expired
+/// prepare as still pending forever.
+pub async fn attempt_receipt_get(
+    tx: &Transaction<'_>,
+    verified_issuer: &str,
+    authenticated_subject: &str,
+    client_attempt_id: &Uuid,
+) -> Result<AttemptReceipt, DomainError> {
+    let attempt_bytes = client_attempt_id.as_bytes().to_vec();
+    // LIMIT 2, not 1: one row is an answer and two is a refusal, and asking for one would make
+    // an ambiguous namespace look like a clean hit.
+    let rows = tx
+        .query(
+            "SELECT tenant_scope_key, operation_id, method, scope, fingerprint_version, \
+                    fingerprint, canonical_intent_digest \
+               FROM lore_domain_operation_receipts \
+              WHERE verified_issuer = $1 \
+                AND authenticated_subject = $2 \
+                AND client_attempt_id = $3 \
+              LIMIT 2",
+            &[&verified_issuer, &authenticated_subject, &attempt_bytes],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("attempt receipt lookup", e))?;
+
+    if rows.len() != 1 {
+        return Ok(AttemptReceipt {
+            lookup: ReceiptLookup::NotFound,
+            method: String::new(),
+        });
+    }
+
+    let row = &rows[0];
+    let operation_id: Vec<u8> = row.get(1);
+    let operation_id = Uuid::from_slice(&operation_id)
+        .map_err(|_| DomainError::Internal("stored operation id is not a UUID".to_owned()))?;
+    let key = ReceiptKey {
+        verified_issuer: verified_issuer.to_owned(),
+        authenticated_subject: authenticated_subject.to_owned(),
+        tenant_scope_key: row.get(0),
+        operation_id,
+    };
+    // Rebuilt from the row this lookup just matched, so the binding check inside `receipt_get`
+    // is satisfied by construction. The caller supplied no intent to check against, which is the
+    // point: it lost the response and cannot restate one.
+    let binding = OperationBinding {
+        method: row.get(2),
+        scope: row.get(3),
+        fingerprint_version: row.get(4),
+        fingerprint: row.get(5),
+        canonical_intent_digest: row.get(6),
+    };
+
+    let lookup = receipt_get(tx, &key, &binding).await?;
+    Ok(AttemptReceipt {
+        method: binding.method,
+        lookup,
+    })
+}
+
 pub async fn receipt_get(
     tx: &Transaction<'_>,
     key: &ReceiptKey,

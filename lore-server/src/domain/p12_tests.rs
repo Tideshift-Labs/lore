@@ -216,6 +216,18 @@ impl MetadataCasScriptedStore {
 
 #[async_trait]
 impl DomainTransactionStore for MetadataCasScriptedStore {
+    // WP-120's public attempt lookup. Stated rather than defaulted: a store that answers
+    // "no receipt" when it simply cannot look one up would report a real attempt as absent,
+    // and absence is what tells a client to stop waiting.
+    async fn domain_operation_attempt_receipt_get(
+        &self,
+        _verified_issuer: &str,
+        _authenticated_subject: &str,
+        _client_attempt_id: &uuid::Uuid,
+    ) -> Result<lore_postgres::domain::receipts::AttemptReceipt, DomainError> {
+        unreachable!("MetadataCasScriptedStore does not serve attempt receipt lookups")
+    }
+
     async fn domain_operation_clock_get(&self) -> Result<std::time::SystemTime, DomainError> {
         unreachable!("MetadataCasScriptedStore only scripts metadata_compare_and_swap")
     }
@@ -499,6 +511,18 @@ struct RepositoryCreateScriptedStore {
 
 #[async_trait]
 impl DomainTransactionStore for RepositoryCreateScriptedStore {
+    // WP-120's public attempt lookup. Stated rather than defaulted: a store that answers
+    // "no receipt" when it simply cannot look one up would report a real attempt as absent,
+    // and absence is what tells a client to stop waiting.
+    async fn domain_operation_attempt_receipt_get(
+        &self,
+        _verified_issuer: &str,
+        _authenticated_subject: &str,
+        _client_attempt_id: &uuid::Uuid,
+    ) -> Result<lore_postgres::domain::receipts::AttemptReceipt, DomainError> {
+        unreachable!("RepositoryCreateScriptedStore does not serve attempt receipt lookups")
+    }
+
     async fn domain_operation_clock_get(&self) -> Result<std::time::SystemTime, DomainError> {
         unreachable!(
             "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"

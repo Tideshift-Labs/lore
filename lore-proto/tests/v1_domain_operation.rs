@@ -798,9 +798,16 @@ fn live_prepare_and_receipt_get_reject_noncanonical_keys_and_high_unknown_tags()
     }
 }
 
+/// Seven private maintenance RPCs, and exactly one public one.
+///
+/// The count is the point rather than the list. Every method here except
+/// `DomainOperationAttemptReceiptGet` is served only to the control-plane service account, and
+/// the split is enforced in the handlers rather than by the wire, so an eighth private method
+/// added without noticing would look exactly like the public one from out here. Failing this
+/// assertion is the prompt to decide which side a new method belongs on.
 #[test]
-fn private_service_declares_the_complete_seven_rpc_rail() {
-    let expected = [
+fn the_service_declares_seven_private_rpcs_and_one_public_one() {
+    let private = [
         "rpc DomainOperationClockGet",
         "rpc DomainOperationPrepare",
         "rpc DomainOperationReceiptGet",
@@ -809,8 +816,15 @@ fn private_service_declares_the_complete_seven_rpc_rail() {
         "rpc DomainOperationProofNamespaceMaterialize",
         "rpc DomainOperationProofNamespaceRetire",
     ];
-    assert_eq!(PROTO.matches("rpc DomainOperation").count(), expected.len());
-    for declaration in expected {
+    // WP-120. Served to an authenticated human, scoped to that principal's own receipts.
+    let public = ["rpc DomainOperationAttemptReceiptGet"];
+
+    assert_eq!(
+        PROTO.matches("rpc DomainOperation").count(),
+        private.len() + public.len(),
+        "a method was added or removed; decide whether it is private or public and list it here"
+    );
+    for declaration in private.into_iter().chain(public) {
         assert!(PROTO.contains(declaration), "missing {declaration}");
     }
 }
@@ -868,6 +882,7 @@ fn generated_client_server_and_exact_method_paths_exist() {
         "/lore.domain.v1.DomainOperationService/DomainOperationTerminalStatusAttach",
         "/lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceMaterialize",
         "/lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceRetire",
+        "/lore.domain.v1.DomainOperationService/DomainOperationAttemptReceiptGet",
     ] {
         assert!(
             GENERATED.contains(method),
@@ -876,7 +891,7 @@ fn generated_client_server_and_exact_method_paths_exist() {
     }
     assert_eq!(
         GENERATED.matches("DomainOperationV2StrictCodec").count(),
-        14,
+        16,
         "all seven generated client calls and seven server routes must use the strict codec"
     );
 }
@@ -906,6 +921,18 @@ impl lore_proto::lore::domain::v1::domain_operation_service_server::DomainOperat
         &self,
         _request: tonic::Request<DomainOperationReceiptGetRequest>,
     ) -> Result<tonic::Response<DomainOperationReceiptGetResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("test-only"))
+    }
+
+    async fn domain_operation_attempt_receipt_get(
+        &self,
+        _request: tonic::Request<
+            lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetRequest,
+        >,
+    ) -> Result<
+        tonic::Response<lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetResponse>,
+        tonic::Status,
+    > {
         Err(tonic::Status::unimplemented("test-only"))
     }
 

@@ -306,6 +306,33 @@ impl DomainTransactionStore for PostgresDomainStore {
         Ok(result)
     }
 
+    async fn domain_operation_attempt_receipt_get(
+        &self,
+        verified_issuer: &str,
+        authenticated_subject: &str,
+        client_attempt_id: &uuid::Uuid,
+    ) -> Result<receipts::AttemptReceipt, DomainError> {
+        let _t = self
+            .instruments()
+            .start("domain_operation_attempt_receipt_get", self.pool().status());
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("domain operation attempt receipt transaction", e))?;
+        // Commits for the same reason the keyed lookup does: it delegates to `receipt_get`,
+        // which terminalizes a PREPARED row past its hard TTL, so this read can carry a write.
+        let result = receipts::attempt_receipt_get(
+            &tx,
+            verified_issuer,
+            authenticated_subject,
+            client_attempt_id,
+        )
+        .await?;
+        classify_commit(tx.commit().await, "domain operation attempt receipt commit")?;
+        Ok(result)
+    }
+
     async fn domain_operation_receipt_get(
         &self,
         key: &receipts::ReceiptKey,

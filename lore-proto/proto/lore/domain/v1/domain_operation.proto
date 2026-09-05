@@ -5,12 +5,23 @@ syntax = "proto3";
 
 package lore.domain.v1;
 
-// FORK-LOCAL (Tideshift, CR-029). This private server-only service is the
-// private receipt and proof-namespace maintenance rail for Lorehub's control
-// plane. The on-the-wire method paths are:
+// FORK-LOCAL (Tideshift, CR-029). Almost all of this service is the private
+// receipt and proof-namespace maintenance rail for Lorehub's control plane, and
+// every method below except one requires the control-plane service account.
+//
+// The exception is DomainOperationAttemptReceiptGet (WP-120), which is PUBLIC:
+// it is served to an ordinary authenticated human principal, scoped to that
+// principal's own receipts and to nothing else. It exists because a released
+// client that loses a mutation's response has no other way to learn what
+// happened, and the private rail above is not a place a desktop may reach.
+// Keep the two apart when editing: a method added here is control-plane-only
+// unless it says otherwise in as many words.
+//
+// The on-the-wire method paths are:
 // /lore.domain.v1.DomainOperationService/DomainOperationClockGet
 // /lore.domain.v1.DomainOperationService/DomainOperationPrepare
 // /lore.domain.v1.DomainOperationService/DomainOperationReceiptGet
+// /lore.domain.v1.DomainOperationService/DomainOperationAttemptReceiptGet
 // /lore.domain.v1.DomainOperationService/DomainOperationVerifiedStaleFinalize
 // /lore.domain.v1.DomainOperationService/DomainOperationTerminalStatusAttach
 // /lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceMaterialize
@@ -25,6 +36,9 @@ service DomainOperationService {
       returns (DomainOperationPrepareResponse);
   rpc DomainOperationReceiptGet(DomainOperationReceiptGetRequest)
       returns (DomainOperationReceiptGetResponse);
+  // PUBLIC. See the note at the top of this file.
+  rpc DomainOperationAttemptReceiptGet(DomainOperationAttemptReceiptGetRequest)
+      returns (DomainOperationAttemptReceiptGetResponse);
   rpc DomainOperationVerifiedStaleFinalize(DomainOperationVerifiedStaleFinalizeRequest)
       returns (DomainOperationVerifiedStaleFinalizeResponse);
   rpc DomainOperationTerminalStatusAttach(DomainOperationTerminalStatusAttachRequest)
@@ -128,6 +142,42 @@ message DomainOperationReceiptGetResponse {
   bytes bound_fields_digest = 9;
   bytes consumed_ticket_sha256 = 10;
   uint64 authorization_revision = 11;
+}
+
+// PUBLIC (WP-120). One field, and that is the whole security design.
+//
+// The caller supplies only its own attempt identity. Everything that decides
+// WHICH receipts are reachable — the verified issuer and the authenticated
+// subject — is taken from the JWT the interceptor already verified, never from
+// this message. A caller cannot name a namespace, so it cannot ask about
+// another principal's attempt or about the control plane's, and quoting an
+// attempt id belonging to someone else returns exactly what a nonexistent one
+// returns.
+//
+// There is deliberately no consumed_ticket_sha256 and no authorization id here.
+// Those are what the private rail requires a caller to restate, and a released
+// client holds neither: they are minted server-side during the internal prepare
+// that this client never sees the response of.
+message DomainOperationAttemptReceiptGetRequest {
+  // Exactly 16 bytes, and a UUIDv7.
+  bytes client_attempt_id = 1;
+}
+
+message DomainOperationAttemptReceiptGetResponse {
+  DomainOperationReceiptStatus status = 1;
+  // Present only for COMMITTED.
+  DomainOperationOutcome outcome = 2;
+  optional uint32 reason_version = 3;
+  string reason = 4;
+  bool from_future_marker = 5;
+  // Present only for PREPARED.
+  optional int64 prepared_at_unix_millis = 6;
+  optional int64 hard_expires_at_unix_millis = 7;
+  // The method the receipt was filed under. A client reconciling several
+  // unresolved attempts needs to know which one an answer belongs to, and it
+  // recorded the method before dispatch, so this is checkable rather than
+  // merely informative.
+  string method = 8;
 }
 
 enum DomainOperationVerifiedStaleFinalizeStatus {

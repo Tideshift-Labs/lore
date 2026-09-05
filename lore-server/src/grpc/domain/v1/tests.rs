@@ -141,6 +141,18 @@ impl RecordingStore {
 
 #[async_trait]
 impl DomainTransactionStore for RecordingStore {
+    // WP-120's public attempt lookup. Stated rather than defaulted: a store that answers
+    // "no receipt" when it simply cannot look one up would report a real attempt as absent,
+    // and absence is what tells a client to stop waiting.
+    async fn domain_operation_attempt_receipt_get(
+        &self,
+        _verified_issuer: &str,
+        _authenticated_subject: &str,
+        _client_attempt_id: &uuid::Uuid,
+    ) -> Result<lore_postgres::domain::receipts::AttemptReceipt, DomainError> {
+        unreachable!("RecordingStore does not serve attempt receipt lookups")
+    }
+
     async fn domain_operation_clock_get(&self) -> Result<SystemTime, DomainError> {
         self.clock_calls.fetch_add(1, Ordering::SeqCst);
         Ok(SystemTime::UNIX_EPOCH + Duration::from_millis(CLOCK_MILLIS))

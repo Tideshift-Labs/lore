@@ -523,6 +523,18 @@ mod live_tests {
             Err(Status::unimplemented("not used by this test"))
         }
 
+        async fn domain_operation_attempt_receipt_get(
+            &self,
+            _request: Request<
+                lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetRequest,
+            >,
+        ) -> Result<
+            Response<lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
         async fn domain_operation_receipt_get(
             &self,
             request: Request<DomainOperationReceiptGetRequest>,

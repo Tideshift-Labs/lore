@@ -58,6 +58,7 @@ use crate::domain::maintenance::TerminalStatusAttachInput;
 use crate::domain::maintenance::TerminalStatusAttachmentAck;
 use crate::domain::maintenance::VerifiedStaleFinalizeInput;
 use crate::domain::maintenance::VerifiedStaleFinalizeResult;
+use crate::domain::receipts::AttemptReceipt;
 use crate::domain::receipts::AuthorizationWitness;
 use crate::domain::receipts::OperationBinding;
 use crate::domain::receipts::PrepareResult;
@@ -556,6 +557,24 @@ pub trait DomainTransactionStore: Send + Sync {
         key: &ReceiptKey,
         binding: &OperationBinding,
     ) -> Result<ReceiptLookup, DomainError>;
+
+    /// Find a receipt by the attempt identity its client chose (WP-120).
+    ///
+    /// The public counterpart of [`Self::domain_operation_receipt_get`], and the difference is
+    /// what the caller must already know. That one requires the full intent restated, which only
+    /// a caller that saw the prepare response can do. This one requires an identity the caller
+    /// minted itself before dispatch, which is the only thing a client still holds after losing
+    /// the response.
+    ///
+    /// Access control is the verified principal and nothing else: the two identity arguments come
+    /// from a verified token and the attempt id is the only caller-supplied input, so no caller
+    /// can reach another principal's receipts. It never returns the consume token.
+    async fn domain_operation_attempt_receipt_get(
+        &self,
+        verified_issuer: &str,
+        authenticated_subject: &str,
+        client_attempt_id: &uuid::Uuid,
+    ) -> Result<AttemptReceipt, DomainError>;
 
     /// Terminalize an already-verified stale operation only after auth-grpc
     /// atomically claims its current finalizer permit.

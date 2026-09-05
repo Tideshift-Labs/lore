@@ -3,6 +3,7 @@
 //! Bounded decoded-field and raw protobuf validation for the CR-029 private
 //! receipt-v2 rail.
 
+use lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetRequest;
 use lore_proto::lore::domain::v1::DomainOperationPrepareRequest;
 use lore_proto::lore::domain::v1::DomainOperationProofNamespaceMaterializeRequestV1;
 use lore_proto::lore::domain::v1::DomainOperationProofNamespaceRetireRequestV1;
@@ -470,6 +471,30 @@ pub(super) fn validate_prepare(
         binding,
         preclaim_ticket: request.preclaim_ticket.to_vec(),
     })
+}
+
+/// Validate the public attempt lookup: one field, checked for shape only.
+///
+/// There is nothing here to cross-check against, and that is by design. The private lookup
+/// validates a whole restated intent because its caller has one; this caller has an identity it
+/// minted before dispatch and nothing else, so the only questions worth asking are whether the
+/// value is the right width and the right UUID version.
+///
+/// The v7 check is not cosmetic. The receipt rail orders and classifies attempts by a UUID's
+/// embedded timestamp, so a value of any other version could never have been filed as one and
+/// asking for it is a caller error rather than a miss.
+pub(super) fn validate_attempt_receipt_get(
+    request: &DomainOperationAttemptReceiptGetRequest,
+) -> Result<Uuid, Status> {
+    exact_len("client_attempt_id", &request.client_attempt_id, UUID_LEN)?;
+    let attempt = Uuid::from_slice(&request.client_attempt_id)
+        .map_err(|_| Status::invalid_argument("client_attempt_id is not a UUID"))?;
+    if attempt.get_version_num() != 7 {
+        return Err(Status::invalid_argument(
+            "client_attempt_id must be a UUIDv7",
+        ));
+    }
+    Ok(attempt)
 }
 
 pub(super) fn validate_receipt_get(

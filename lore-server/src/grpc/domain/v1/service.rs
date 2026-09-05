@@ -12,6 +12,8 @@ use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptKey;
 use lore_postgres::domain::receipts::ReceiptLookup;
+use lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetRequest;
+use lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetResponse;
 use lore_proto::lore::domain::v1::DomainOperationClockGetRequest;
 use lore_proto::lore::domain::v1::DomainOperationClockGetResponse;
 use lore_proto::lore::domain::v1::DomainOperationOutcome;
@@ -55,6 +57,7 @@ use tonic::Status;
 use tonic_prost::prost::Message;
 
 use super::strict_codec::ValidatedBinding;
+use super::strict_codec::validate_attempt_receipt_get;
 use super::strict_codec::validate_prepare;
 use super::strict_codec::validate_proof_namespace_materialize;
 use super::strict_codec::validate_proof_namespace_materialize_raw;
@@ -615,6 +618,99 @@ impl DomainOperationService for LoreDomainOperationV1Service {
             authorization_revision: verification.authorization_revision,
         };
         match result {
+            ReceiptLookup::Prepared {
+                prepared_at,
+                hard_expires_at,
+            } => {
+                response.status = DomainOperationReceiptStatus::Prepared as i32;
+                response.prepared_at_unix_millis = Some(unix_millis(prepared_at)?);
+                response.hard_expires_at_unix_millis = Some(unix_millis(hard_expires_at)?);
+            }
+            ReceiptLookup::Committed {
+                outcome,
+                from_future_marker,
+            } => {
+                response.status = DomainOperationReceiptStatus::Committed as i32;
+                response.from_future_marker = from_future_marker;
+                let (outcome, version, reason) = outcome_fields(outcome)?;
+                response.outcome = outcome as i32;
+                response.reason_version = version;
+                response.reason = reason;
+            }
+            ReceiptLookup::Mismatch => {
+                response.status = DomainOperationReceiptStatus::Mismatch as i32;
+            }
+            ReceiptLookup::Expired => {
+                response.status = DomainOperationReceiptStatus::Expired as i32;
+            }
+            ReceiptLookup::ExpiredOrUnknown => {
+                response.status = DomainOperationReceiptStatus::ExpiredOrUnknown as i32;
+            }
+            ReceiptLookup::NotFound => {
+                response.status = DomainOperationReceiptStatus::NotFound as i32;
+            }
+        }
+        Ok(Response::new(response))
+    }
+
+    /// PUBLIC (WP-120). The one method on this service an ordinary human may call.
+    ///
+    /// Every sibling opens with `authenticated_service`, which demands the control-plane service
+    /// account. This one deliberately does not, and the difference is the whole point: a released
+    /// desktop that lost a mutation's response has to be able to ask what happened, and it is not
+    /// and must never become a control-plane principal.
+    ///
+    /// What replaces that gate is narrower rather than weaker. The verified issuer and subject
+    /// come from the JWT the interceptor already checked; the request carries nothing but an
+    /// attempt id. A caller therefore cannot name a namespace at all, so it cannot reach another
+    /// principal's receipts or the control plane's, and an attempt id belonging to someone else
+    /// answers exactly as one that never existed does.
+    ///
+    /// Note what is absent: no authorization header is read and no consumed-ticket digest is
+    /// required. Those are what the private lookup makes a caller restate, and a released client
+    /// holds neither, because both are minted during a prepare whose response it never saw.
+    async fn domain_operation_attempt_receipt_get(
+        &self,
+        request: Request<DomainOperationAttemptReceiptGetRequest>,
+    ) -> Result<Response<DomainOperationAttemptReceiptGetResponse>, Status> {
+        let token = crate::grpc::get_authorization(request.extensions())?;
+        // The same bound the private rail applies. An issuer or subject longer than a receipt
+        // identity can hold could not match a stored row anyway, and refusing here keeps an
+        // oversized value out of the query.
+        if token.issuer.len() > MAX_RECEIPT_IDENTITY_LEN
+            || token.user_id.len() > MAX_RECEIPT_IDENTITY_LEN
+        {
+            return Err(Status::invalid_argument(
+                "Verified JWT issuer or subject exceeds the receipt identity bound",
+            ));
+        }
+        if token.issuer.is_empty() || token.user_id.is_empty() {
+            return Err(Status::unauthenticated(
+                "A receipt lookup needs a verified issuer and subject",
+            ));
+        }
+
+        let request = request.into_inner();
+        let attempt = validate_attempt_receipt_get(&request)?;
+
+        let found = self
+            .domain
+            .store()
+            .domain_operation_attempt_receipt_get(&token.issuer, &token.user_id, &attempt)
+            .await
+            .map_err(|e| map_domain_error_to_status(&e))?;
+
+        let mut response = DomainOperationAttemptReceiptGetResponse {
+            status: DomainOperationReceiptStatus::Unspecified as i32,
+            outcome: DomainOperationOutcome::Unspecified as i32,
+            reason_version: None,
+            reason: String::new(),
+            from_future_marker: false,
+            prepared_at_unix_millis: None,
+            hard_expires_at_unix_millis: None,
+            method: found.method,
+        };
+        match found.lookup {
             ReceiptLookup::Prepared {
                 prepared_at,
                 hard_expires_at,
