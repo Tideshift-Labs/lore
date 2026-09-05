@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 use lore_base::lore_spawn_net;
 use lore_proto::RebacApiClient as RebacApiGrpcClient;
+use lore_proto::rebac::AuthorizeDirectRepositoryOperationRequest;
+use lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse;
 use lore_proto::rebac::CreateResourceRequest;
 use lore_proto::rebac::CreateResourceResponse;
 use lore_proto::rebac::DeleteResourceRequest;
@@ -83,6 +85,28 @@ pub trait RepositoryOperationAuthorizationVerifier: Send + Sync {
         &self,
         request: Request<DomainOperationMaintenanceVerificationRequest>,
     ) -> Result<DomainOperationMaintenanceVerificationResponse, Status>;
+
+    /// WP-120: issue and verify an authorization for a **human** principal
+    /// acting as itself, with no control-plane claim and no preclaim ticket.
+    ///
+    /// This is the callback the loreserver-internal prepare makes on behalf of
+    /// a released client that presented a valid Lore JWT and no carriage. It is
+    /// deliberately a separate port from
+    /// [`Self::verify_repository_operation_authorization`]: that one models a
+    /// control-plane-mediated operation and takes an org, an initiating
+    /// principal namespace, a platform authorization row and a ticket proof,
+    /// none of which a direct human operation has. Folding the two together
+    /// would leave auth-grpc unable to tell a direct request from a mediated one
+    /// by its type alone, which is exactly the distinction the whole rail exists
+    /// to keep.
+    ///
+    /// A refusal is a gRPC error, never an `authorized = false` field. The
+    /// caller fails closed on any non-`Ok` status and on any echo divergence,
+    /// before a receipt row exists.
+    async fn authorize_direct_repository_operation(
+        &self,
+        request: Request<AuthorizeDirectRepositoryOperationRequest>,
+    ) -> Result<AuthorizeDirectRepositoryOperationResponse, Status>;
 }
 
 /// Network implementation of the private CR-029 verifier.
@@ -172,6 +196,25 @@ impl RepositoryOperationAuthorizationVerifier for GrpcRepositoryOperationAuthori
             .verify_repository_operation_proof_namespace_retire(request)
             .await
             .map(Response::into_inner)
+    }
+
+    async fn authorize_direct_repository_operation(
+        &self,
+        request: Request<AuthorizeDirectRepositoryOperationRequest>,
+    ) -> Result<AuthorizeDirectRepositoryOperationResponse, Status> {
+        let mut client = grpc_get_rebac_client(self.auth_url.clone())
+            .await
+            .map_err(|_| Status::unavailable("Repository operation verifier unavailable"))?;
+        timed!(
+            self.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
+            &self.get_labels_for_operation_context("authorize_direct_repository_operation"),
+            client
+                .client
+                .authorize_direct_repository_operation(request)
+                .await
+        )
+        .result
+        .map(Response::into_inner)
     }
 }
 

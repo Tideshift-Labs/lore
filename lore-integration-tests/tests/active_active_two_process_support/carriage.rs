@@ -63,13 +63,16 @@ const REPOSITORY_ID_KEY: &str = "urc-repository-id-bin";
 
 /// The method name the server binds a governed push under.
 ///
-/// It has to match `admitted.into_governed("branch_push_commit", ..)` exactly:
-/// the binding is compared, not merely recorded.
-const PUSH_METHOD: &str = "branch_push_commit";
+/// It has to match `.complete_governed(admitted, PLATFORM_METHOD_BRANCH_PUSH, ..)`
+/// exactly: the binding is compared, not merely recorded. Sourced from the
+/// server's own reserved-method table (fork commit 870e4ca) rather than
+/// retyped here, so it cannot drift a third time.
+const PUSH_METHOD: &str = lore_server::domain::PLATFORM_METHOD_BRANCH_PUSH;
 
-/// The method name the server binds a governed repository create under
-/// (`lore-server/src/grpc/repository/v1/repository_create.rs:141`).
-const CREATE_METHOD: &str = "lore.repository.v1.RepositoryService/RepositoryCreate";
+/// The method name the server binds a governed repository create under.
+/// Sourced from the server's own reserved-method table for the same reason
+/// [`PUSH_METHOD`] is.
+const CREATE_METHOD: &str = lore_server::domain::PLATFORM_METHOD_REPOSITORY_CREATE;
 
 /// A prepared governed operation, ready to be put on the wire.
 #[derive(Debug, Clone)]

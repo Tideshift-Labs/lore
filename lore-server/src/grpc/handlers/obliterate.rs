@@ -119,11 +119,10 @@ pub async fn handler(
                 ),
                 None => None,
             };
-            Some((
-                domain.clone(),
-                admitted.into_governed(PLATFORM_METHOD_REPOSITORY_OBLITERATE, digest),
-                event,
-            ))
+            let operation = domain
+                .complete_governed(admitted, PLATFORM_METHOD_REPOSITORY_OBLITERATE, digest)
+                .await?;
+            Some((domain.clone(), operation, event))
         }
         None => None,
     };

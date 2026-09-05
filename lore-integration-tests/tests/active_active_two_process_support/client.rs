@@ -122,6 +122,9 @@ pub async fn lock_acquire(
             branch: branch_id.to_vec().into(),
             hash: hash.to_vec().into(),
             description: description.to_owned(),
+            // A first acquire presents no token; the server mints one and
+            // returns it on the response's `Lock.ownership_token`.
+            expected_ownership_token: Default::default(),
         }],
     });
     decorate(&mut request, token, Some(repository_id));
@@ -147,6 +150,16 @@ pub async fn lock_release(
             branch: branch_id.to_vec().into(),
             hash: hash.to_vec().into(),
             description: String::new(),
+            // Empty, which is correct for the UNARMED cell these cases run
+            // against: the legacy lock store ignores the field entirely.
+            //
+            // An armed cell REQUIRES it and answers `INVALID_ARGUMENT` without
+            // one. A case that arms fenced routing must take the token off the
+            // acquire response's `Lock.ownership_token` and thread it here,
+            // which means this function needs it as a parameter. Left as a
+            // parameterless default rather than guessed, so the armed case adds
+            // the argument deliberately instead of inheriting a silent empty.
+            expected_ownership_token: Default::default(),
         }],
     });
     decorate(&mut request, token, Some(repository_id));

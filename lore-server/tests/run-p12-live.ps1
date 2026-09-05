@@ -3,7 +3,7 @@
 
 <#
 .SYNOPSIS
-Runs `lore-server/tests/p12_live.rs`'s three real-construction cases on the shared test PostgreSQL,
+Runs `lore-server/tests/p12_live.rs`'s four real-construction cases on the shared test PostgreSQL,
 one fresh database each.
 
 .DESCRIPTION
@@ -44,7 +44,8 @@ $runPassed = $false
 $expectedTests = @(
     'branch_delete_governed_and_real_legacy_delete_agree_on_the_lore_mutable_end_state',
     'exact_mediated_obliterate_consumes_while_tuple_tamper_preserves_prepared',
-    'governed_create_projection_rows_match_the_legacy_writers_exactly'
+    'governed_create_projection_rows_match_the_legacy_writers_exactly',
+    'released_client_push_with_no_carriage_commits_one_branch_pushed_row_via_internal_prepare'
 )
 
 if ($OnlyCase) {

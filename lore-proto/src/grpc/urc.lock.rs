@@ -12,6 +12,16 @@ pub struct Resource {
     /// etc)
     #[prost(string, tag = "3")]
     pub description: ::prost::alloc::string::String,
+    /// FORK-LOCAL (Tideshift, CR-030/WP-120). The 32-byte ownership token this
+    /// caller was issued when it acquired the lock, presented back to renew,
+    /// release, or force-release it. Empty on a first acquire and on every read
+    /// path. A cell that is not routing through the fenced lock authority ignores
+    /// it entirely, so an older client and an older server both keep working.
+    ///
+    /// If upstream adds a field in this slot, reconcile the tag before
+    /// regenerating.
+    #[prost(bytes = "bytes", tag = "4")]
+    pub expected_ownership_token: ::prost::bytes::Bytes,
 }
 impl ::prost::Name for Resource {
     const NAME: &'static str = "Resource";
@@ -36,6 +46,16 @@ pub struct Lock {
     /// Lock timestamp
     #[prost(message, optional, tag = "3")]
     pub locked_at: ::core::option::Option<::prost_types::Timestamp>,
+    /// FORK-LOCAL (Tideshift, CR-030/WP-120). The 32-byte ownership token minted
+    /// for this row, returned ONLY to the caller that just acquired or renewed it
+    /// (Lock and AdminLock responses).
+    ///
+    /// Deliberately empty on Query and Status. Those read every lock in a
+    /// repository, including other people's, and a token is the bearer secret that
+    /// authorizes releasing one — populating it there would hand any reader the
+    /// authority to release every lock it can see.
+    #[prost(bytes = "bytes", tag = "4")]
+    pub ownership_token: ::prost::bytes::Bytes,
 }
 impl ::prost::Name for Lock {
     const NAME: &'static str = "Lock";
@@ -207,6 +227,49 @@ impl ::prost::Name for AdminLockResponse {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/urc.lock.AdminLockResponse".into()
+    }
+}
+/// FORK-LOCAL (Tideshift, CR-030/WP-120).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ForceUnlockRequest {
+    /// Resources to release. Ownership tokens are NOT required and ordinarily
+    /// absent: an administrator holds no other owner's token, and no read path
+    /// issues one. The row is named by its resource hash and by `owner` below, and
+    /// the authority is the caller's administrative permission, not possession of
+    /// a secret. A token supplied here is still checked against the row.
+    #[prost(message, repeated, tag = "1")]
+    pub resources: ::prost::alloc::vec::Vec<Resource>,
+    /// Authenticated subject of the owner being released. Explicit rather than
+    /// inferred from the stored row, so the administrator states which owner it
+    /// believes it is taking the lock from and a raced takeover is refused instead
+    /// of silently releasing a different owner's lock.
+    #[prost(string, tag = "2")]
+    pub owner: ::prost::alloc::string::String,
+}
+impl ::prost::Name for ForceUnlockRequest {
+    const NAME: &'static str = "ForceUnlockRequest";
+    const PACKAGE: &'static str = "urc.lock";
+    fn full_name() -> ::prost::alloc::string::String {
+        "urc.lock.ForceUnlockRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/urc.lock.ForceUnlockRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ForceUnlockResponse {
+    /// Resources released.
+    #[prost(message, repeated, tag = "1")]
+    pub resources: ::prost::alloc::vec::Vec<Resource>,
+}
+impl ::prost::Name for ForceUnlockResponse {
+    const NAME: &'static str = "ForceUnlockResponse";
+    const PACKAGE: &'static str = "urc.lock";
+    fn full_name() -> ::prost::alloc::string::String {
+        "urc.lock.ForceUnlockResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/urc.lock.ForceUnlockResponse".into()
     }
 }
 /// Generated client implementations.
@@ -412,6 +475,42 @@ pub mod lock_service_client {
                 .insert(GrpcMethod::new("urc.lock.LockService", "AdminLock"));
             self.inner.unary(req, path, codec).await
         }
+        /// FORK-LOCAL (Tideshift, CR-030/WP-120). Administrative release of locks held
+        /// by another owner.
+        ///
+        /// A distinct RPC rather than a flag on Unlock, because the two are different
+        /// authorities over different rows: Unlock releases what the caller itself
+        /// holds, ForceUnlock takes a lock away from someone else and is recorded as a
+        /// different transition (`lock.force_released`, not `lock.released`). Folding
+        /// it into Unlock would make the audit trail and the permission check depend on
+        /// a request field rather than on which door the caller came through.
+        ///
+        /// The on-the-wire method path is /urc.lock.LockService/ForceUnlock. If
+        /// upstream adds a force-release RPC, reconcile the path before regenerating.
+        pub async fn force_unlock(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ForceUnlockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ForceUnlockResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/urc.lock.LockService/ForceUnlock",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("urc.lock.LockService", "ForceUnlock"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -453,6 +552,25 @@ pub mod lock_service_server {
             request: tonic::Request<super::AdminLockRequest>,
         ) -> std::result::Result<
             tonic::Response<super::AdminLockResponse>,
+            tonic::Status,
+        >;
+        /// FORK-LOCAL (Tideshift, CR-030/WP-120). Administrative release of locks held
+        /// by another owner.
+        ///
+        /// A distinct RPC rather than a flag on Unlock, because the two are different
+        /// authorities over different rows: Unlock releases what the caller itself
+        /// holds, ForceUnlock takes a lock away from someone else and is recorded as a
+        /// different transition (`lock.force_released`, not `lock.released`). Folding
+        /// it into Unlock would make the audit trail and the permission check depend on
+        /// a request field rather than on which door the caller came through.
+        ///
+        /// The on-the-wire method path is /urc.lock.LockService/ForceUnlock. If
+        /// upstream adds a force-release RPC, reconcile the path before regenerating.
+        async fn force_unlock(
+            &self,
+            request: tonic::Request<super::ForceUnlockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ForceUnlockResponse>,
             tonic::Status,
         >;
     }
@@ -738,6 +856,51 @@ pub mod lock_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = AdminLockSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/urc.lock.LockService/ForceUnlock" => {
+                    #[allow(non_camel_case_types)]
+                    struct ForceUnlockSvc<T: LockService>(pub Arc<T>);
+                    impl<
+                        T: LockService,
+                    > tonic::server::UnaryService<super::ForceUnlockRequest>
+                    for ForceUnlockSvc<T> {
+                        type Response = super::ForceUnlockResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ForceUnlockRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LockService>::force_unlock(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ForceUnlockSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

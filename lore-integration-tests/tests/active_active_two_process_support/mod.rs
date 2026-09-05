@@ -32,21 +32,24 @@
 //!    database over a THIRD connection this harness owns, never through either
 //!    server. A server's own answer about its own write is not authority.
 //!
-//! # Two arming modes, because no single cell can run both paths today
+//! # Two arming modes -- superseded rationale, kept for the legacy-route cases
 //!
 //! A governed branch push — the only mutation that appends an outbox row — is
 //! refused unless the cell has a fenced lock coordinator: `push_governance`
 //! calls `reject_unwired_governed_operation` when `domain.lock_coordinator()`
-//! is `None` (`lore-server/src/grpc/handlers/branch_push.rs:399-407`). But
-//! arming fenced routing makes the **public** lock mutation RPCs refuse
-//! outright, by design, until WP-120's public mutation contract exists
-//! (`lore-server/src/grpc/lock_service.rs:291,460,539`, guarded by
-//! `schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE`).
+//! is `None` (`lore-server/src/grpc/handlers/branch_push.rs:399-407`).
 //!
-//! So a cell can prove cross-process lock ownership through the public service,
-//! or it can prove the governed outbox path, but not both. [`Arming`] is that
-//! choice, made per case, and the runner gives every case its own database so
-//! the two never share a cell.
+//! Before WP-120, arming fenced routing also made the **public** lock mutation
+//! RPCs refuse outright, so a cell could prove cross-process lock ownership
+//! through the public service, or the governed outbox path, but not both --
+//! [`Arming`] was that forced choice. `PUBLIC_MUTATION_CONTRACT_AVAILABLE` is
+//! now `true`: an armed cell serves `Lock`/`Unlock`/`AdminLock`/`ForceUnlock`
+//! from the fenced coordinator with per-resource ownership tokens, in addition
+//! to the governed outbox path, so `Arming::GovernedOutbox` proves both today.
+//! [`Arming`] stays as the choice between the fenced route and the legacy
+//! `PostgresLockStore` route (`Arming::PublicLocks`), which remains real,
+//! distinct coverage of the pre-fencing lock path -- it is no longer the only
+//! way to reach a serving public lock RPC.
 
 #![allow(dead_code)]
 
@@ -60,12 +63,18 @@ use std::path::PathBuf;
 
 /// Which coordination path this case's cell is armed for.
 ///
-/// Not a knob: the two are mutually exclusive in the current tree and the
-/// reason is recorded in this module's documentation.
+/// Superseded by WP-120: the two used to be mutually exclusive (see this
+/// module's documentation for the pre-WP-120 reason). They no longer are --
+/// `GovernedOutbox` now proves both the governed outbox path and served
+/// public fenced lock mutations. `PublicLocks` remains distinct, real
+/// coverage of the legacy (unfenced) lock route, not the only way to reach a
+/// serving public lock RPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arming {
-    /// Fenced lock routing armed. Governed pushes work and append outbox rows;
-    /// the public lock mutation RPCs refuse.
+    /// Fenced lock routing armed. Governed pushes work and append outbox
+    /// rows, and the public lock mutation RPCs (`Lock`/`Unlock`/`AdminLock`/
+    /// `ForceUnlock`) serve from the fenced coordinator with per-resource
+    /// ownership tokens (WP-120).
     GovernedOutbox,
     /// Fenced routing not armed. The public lock service serves acquire and
     /// release against the shared store; a governed push would be refused.

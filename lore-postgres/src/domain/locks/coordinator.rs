@@ -117,7 +117,9 @@ pub struct ReleaseInput {
     pub outbox_cell_id: Option<String>,
 }
 
-/// Dark server-side force release. No current public RPC reaches it.
+/// Administrative release of locks held by another owner.
+///
+/// Reached from the public `ForceUnlock` RPC as of WP-120.
 #[derive(Debug, Clone)]
 pub struct ForceReleaseInput {
     /// 16-byte repository identity.
@@ -128,7 +130,10 @@ pub struct ForceReleaseInput {
     pub target_owner: VerifiedLockOwner,
     /// Verified acting administrator.
     pub acting_owner: VerifiedLockOwner,
-    /// Atomic token-bearing resource batch.
+    /// Atomic resource batch, ordinarily with **no** ownership tokens: an
+    /// administrator holds none and no read path issues one. A token supplied
+    /// here is still checked. See `release_inner` for why demanding one made
+    /// this operation unperformable.
     pub resources: Vec<LockResourceInput>,
     /// Trusted cell identity to stamp on the classified outbox event, or
     /// `None` to append none. See [`LockTransition`].
@@ -467,7 +472,9 @@ pub fn release_binding(input: &ReleaseInput) -> Result<OperationBinding, DomainE
     )
 }
 
-/// Build the exact receipt binding for the dark force-release method.
+/// Build the exact receipt binding for the force-release method.
+///
+/// No longer dark: the public `ForceUnlock` RPC reaches it as of WP-120.
 pub fn force_release_binding(input: &ForceReleaseInput) -> Result<OperationBinding, DomainError> {
     lock_binding(
         "lock.force_release",
@@ -863,9 +870,31 @@ impl PostgresLockCoordinator {
             };
         }
         sorted_resources(resources)?;
-        if resources
-            .iter()
-            .any(|resource| resource.expected_ownership_token.is_none())
+        // An ordinary release proves possession: the caller holds the row's
+        // token. A **force** release proves authority instead, and the two
+        // cannot share this precondition.
+        //
+        // Requiring a token on force-release made the operation unperformable
+        // by the only principal that would ever want it. An administrator holds
+        // no other owner's token and has no way to obtain one — no read path
+        // returns a token, deliberately, because a token authorizes a release.
+        // Worse, `backfill` mints a random token for every cutover-converted
+        // legacy row and discards it, so nobody at all holds those. With a
+        // token demanded on both paths, a cell that cut over with live legacy
+        // locks had rows that neither their owner nor an administrator could
+        // release — which is exactly the INV-EE P0-2 condition
+        // `schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE` exists to prevent, and
+        // arming would have walked straight back into it.
+        //
+        // Force-release is therefore matched on `(resource_hash,
+        // target_owner)` under the namespace lock. Its authority is the
+        // verified acting administrator, checked by `force_release` before this
+        // is reached, and at the wire by the same `migrate` permission
+        // `AdminLock` requires.
+        if acting.is_none()
+            && resources
+                .iter()
+                .any(|resource| resource.expected_ownership_token.is_none())
         {
             return Err(DomainError::InvalidInput(
                 "every release resource requires an ownership token".to_owned(),
@@ -912,10 +941,21 @@ impl PostgresLockCoordinator {
                 return commit_rejection(tx, operation, admission_clock, LockRejection::NotFound)
                     .await;
             }
-            let expected = resource.expected_ownership_token.as_ref().ok_or_else(|| {
-                DomainError::InvalidInput("release token vanished after validation".to_owned())
-            })?;
-            if !row.owner.ct_matches(target) || !token_matches(&row.ownership_token, expected) {
+            // The owner match is unconditional on both paths. The token match
+            // applies only where a token is the proof: on an ordinary release it
+            // is required and checked, and on a force release it is absent by
+            // construction (the precondition above admits `None` only when an
+            // acting administrator is present, and `force_release_binding`
+            // hashes the same absence into the receipt binding).
+            //
+            // A token supplied on a force release is still checked rather than
+            // ignored, so a caller that believes it is naming an exact row is
+            // not silently given a broader operation than it asked for.
+            let token_ok = match resource.expected_ownership_token.as_ref() {
+                Some(expected) => token_matches(&row.ownership_token, expected),
+                None => acting.is_some(),
+            };
+            if !row.owner.ct_matches(target) || !token_ok {
                 return commit_rejection(
                     tx,
                     operation,
@@ -957,15 +997,27 @@ impl PostgresLockCoordinator {
         // A release commits a fresh namespace fence rather than a per-row one,
         // so the identity half names the token this batch retired: the last
         // ordered resource's, matching the acquire path's choice of the last
-        // ordered row. Every release resource carries a token by the check
-        // above, so the `ok_or_else` is a type-level obligation rather than a
-        // reachable state, and the `ordered.last()` arm is defensive for the
-        // same reason the acquire path's is: an empty batch already returned
-        // above, and `sorted_resources` refuses one anyway.
+        // ordered row.
+        //
+        // The token is read from the STORED row, not from the caller's input.
+        // That is not a stylistic preference. A force release carries no
+        // `expected_ownership_token` at all — an administrator holds none and no
+        // read path issues one — so reading the caller's field made every
+        // force-release on a cell with an outbox configured fail
+        // `Internal("release token vanished after validation")`, which is to say
+        // every real `ForceUnlock` on exactly the cells arming exists to serve.
+        // The stored row's `ownership_token` is populated unconditionally by the
+        // rows loaded above and is the same value on both paths, so it is the
+        // field this always meant to name.
         let event = match (outbox_cell_id, ordered.last()) {
             (Some(cell_id), Some(last)) => {
-                let token = last.expected_ownership_token.ok_or_else(|| {
-                    DomainError::Internal("release token vanished after validation".to_owned())
+                let row = by_hash.get(&last.resource_hash).ok_or_else(|| {
+                    // Unreachable: the validation loop above returned a typed
+                    // rejection for any resource with no row.
+                    DomainError::Internal("released row vanished after validation".to_owned())
+                })?;
+                let token: [u8; 32] = row.ownership_token.as_slice().try_into().map_err(|_| {
+                    DomainError::Internal("stored lock ownership token is not 32 bytes".to_owned())
                 })?;
                 Some(build_lock_event(
                     cell_id,

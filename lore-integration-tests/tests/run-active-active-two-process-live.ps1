@@ -525,8 +525,10 @@ Write-Host '    allocates a NEW generation instead of resuming, because DurableS
 Write-Host '    resume-at-position operation that also restores the persisted frontier.'
 Write-Host '    Missing artefact: ReceiverStore::read_checkpoint plus the TODO(WP-111) in'
 Write-Host '    lore-server/src/plugins/remote_notification/receiver.rs.'
-Write-Host '  - fenced public lock mutations. Arming fenced routing makes Lock/Unlock/AdminLock'
-Write-Host '    refuse until WP-120 lands. Missing artefact: schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE.'
+Write-Host '  - cross-process fenced public lock mutation ownership (ARMED Lock/Unlock/AdminLock/'
+Write-Host '    ForceUnlock over real gRPC). WP-120 closed the refusal this line used to name'
+Write-Host '    (schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE is now true and the RPCs serve), but no'
+Write-Host '    case in this harness drives them yet -- a real coverage gap, not the prior gate.'
 
 if ($null -ne $setupError) {
     Write-Warning "Setup failed: $setupError"

@@ -16,25 +16,67 @@ pub const LOCK_SCHEMA_VERSION: i64 = 1;
 /// compile-time constant rather than configuration: no operator action may
 /// reach the armed state before the code that makes it serviceable exists.
 ///
-/// While it is false, fenced routing is a one-way door. Cutover converts every
-/// legacy lock into a live fenced row with `expires_at = NULL`
-/// (`coordinator::backfill`), `resolve_lock_fencing` refuses finite leases
-/// before WP-120, and `cleanup_exact` never deletes a current NULL-expiry row —
-/// so those rows are permanent. Meanwhile fenced `Lock`/`Unlock`/`AdminLock`
-/// return `FAILED_PRECONDITION` (`lore-server/src/grpc/lock_service.rs`) and
-/// `release`/`force_release` have no wire caller, so nothing can release them,
-/// while readiness reports fully green. The result is a cell whose pushes are
-/// blocked by unreleasable locks (INV-EE P0-2).
+/// # What WP-120 built, and why this is still `false`
 ///
-/// WP-120 flips this in the same change that opens the public mutation wire.
+/// WP-120 (2026-09-04) built the whole SERVER half.
+/// `lore-server/src/grpc/lock_service.rs` now routes all three mutations
+/// through [`crate::domain::locks::PostgresLockCoordinator`]: `Lock` and
+/// `AdminLock` return each row's 32-byte ownership token to the caller that
+/// acquired it, `Unlock` requires that token and reaches `release`, and the new
+/// `ForceUnlock` RPC reaches `force_release`, which deliberately does **not**
+/// require a token so an administrator can always clear a row.
+///
+/// It stays `false` because the **client** half does not exist. `lore/src` has
+/// no use of `ownership_token` anywhere: `lore lock acquire` drops the token the
+/// server returns, and `lore lock release` re-derives the resource from its path
+/// with nothing to present. There is no client-side lock record at all to keep a
+/// token in. So on an armed cell the shipped client's `Unlock` sends no token
+/// and is refused, and a re-`Lock` over a row it already holds is refused too —
+/// every lock becomes owner-unreleasable, which is the same INV-EE P0-2 shape
+/// this constant has always guarded, reached by a different road.
+///
+/// PIN(WP-120, 2026-09-04): the lane that lands the client-side ownership-token
+/// handling flips this, in that same change. It is not an increment on the
+/// server work — it needs a new durable artefact under `.lore/` holding a bearer
+/// secret, which wants its own format decision and its own security review, and
+/// it should share a store with CR-029's client receipt rail rather than grow a
+/// second one.
+///
+/// # A second residual, which that flip will not close either
+///
+/// BLOCKED(WP-120): a **cutover-converted** row is not releasable by its own
+/// owner even once the client can present tokens.
+/// [`crate::domain::locks::PostgresLockCoordinator::backfill`] mints a random
+/// `ownership_token` for every legacy row it converts and discards it, so the
+/// owner holds nothing to present, and `acquire_or_renew` refuses a tokenless
+/// re-acquire over a current row even to that row's own owner. Such a lock can
+/// only be cleared through `ForceUnlock` by a principal holding the `migrate`
+/// permission.
+///
+/// The operator precondition for cutover is therefore: **drain live legacy locks
+/// first, or expect to force-release them.** `BackfillReport.converted` is the
+/// count to watch — a cutover that converted zero rows has no residual at all.
+///
+/// PIN(WP-120, 2026-09-04): closing it needs a way to record that a converted
+/// row's token was never issued, which the `lore_locks_fenced_shape` CHECK below
+/// does not admit (it requires exactly 32 bytes whenever the fenced columns are
+/// set). A sentinel token value is **not** an option: `token_matches` would
+/// accept it from any caller, handing everyone the authority to release every
+/// converted lock. That is a SCHEMA-117 amendment plus a CR-030 amendment, both
+/// on the owner list, neither frozen here.
 pub const PUBLIC_MUTATION_CONTRACT_AVAILABLE: bool = false;
 
 /// The reason `enable_fencing` gives while [`PUBLIC_MUTATION_CONTRACT_AVAILABLE`]
 /// is false. Named so a test can assert the refusal rather than match prose.
+///
+/// Reworded by WP-120, because the old text named a cause that no longer holds:
+/// fenced `Lock`/`Unlock`/`AdminLock` no longer return `FAILED_PRECONDITION`,
+/// and `release`/`force_release` now have wire callers. What is missing is the
+/// client half, so the refusal says that instead.
 pub const PUBLIC_MUTATION_CONTRACT_MISSING: &str = concat!(
-    "fenced lock routing cannot be armed until WP-120 publishes the public lock mutation ",
-    "contract: fenced Lock/Unlock/AdminLock return FAILED_PRECONDITION and cutover-converted ",
-    "rows would have no release path"
+    "fenced lock routing cannot be armed until a client that keeps and presents per-resource ",
+    "lock ownership tokens ships: the server half is built, but a released client sends no ",
+    "token on Unlock, so every lock on an armed cell would be unreleasable by its owner"
 );
 
 /// Backfill has not started.

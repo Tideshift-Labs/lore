@@ -5,6 +5,9 @@ pub struct CreateResourceRequest {
     pub resource_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub resource_name: ::prost::alloc::string::String,
+    /// FORK-LOCAL (Tideshift, CR-029). A governed create carries the complete
+    /// attached platform claim. Presence is all-or-none; an ungoverned legacy
+    /// create leaves every field below absent/default.
     #[prost(string, tag = "3")]
     pub verified_issuer: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
@@ -46,6 +49,8 @@ pub struct CreateResourceRequest {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateResourceResponse {
+    /// Exact acknowledgement of the attached claim. Governed Lore callers reject
+    /// an empty or divergent response before entering the mutation transaction.
     #[prost(bytes = "bytes", tag = "1")]
     pub claim_id: ::prost::bytes::Bytes,
     #[prost(uint64, tag = "2")]
@@ -146,10 +151,106 @@ pub struct VerifyRepositoryOperationAuthorizationResponse {
     pub verified_issuer: ::prost::alloc::string::String,
     #[prost(string, tag = "15")]
     pub authenticated_subject: ::prost::alloc::string::String,
-    /// Frozen claim-identity digest minted by the platform verify CAS and bound
-    /// into the first PREPARED fence.
+    /// FORK-LOCAL (Tideshift, CR-029): frozen claim-identity digest minted by
+    /// the platform verify CAS and bound into the first PREPARED fence.
     #[prost(bytes = "bytes", tag = "16")]
     pub expected_claim_identity_digest: ::prost::bytes::Bytes,
+}
+/// FORK-LOCAL (Tideshift, WP-120). The direct-human authorization request.
+///
+/// verified_issuer and authenticated_subject come from loreserver's verified JWT
+/// extension and are ECHOES: auth-grpc equality-checks them against the principal
+/// it derives from the forwarded bearer, and a divergence is PERMISSION_DENIED.
+/// There is deliberately no org_uuid and no initiating_principal_namespace —
+/// auth-grpc derives both from the verified subject and the repository row, so
+/// they cannot be stated by a caller.
+///
+/// method is a CLOSED set of ten: repository.delete, repository.metadata-set,
+/// branch.metadata-set, branch.push, repository.obliterate, lock.acquire,
+/// lock.renew, lock.release, lock.force_release, lock.admin_acquire.
+/// repository.create is refused here and stays on the mediated claim rail. An
+/// unknown method is refused, never defaulted.
+///
+/// scope is Lore's own tenant scope key over the target repository. It is
+/// supplied rather than derived because the receipt namespace is Lore's; auth-grpc
+/// requires it to contain repository_id and refuses otherwise.
+///
+/// branch_id is 16 bytes for the lock families, which are branch-scoped. Sent
+/// EMPTY for the five mutation families, including branch.push and
+/// branch.metadata-set, because the admission gate holds a repository-only scope
+/// and the branch is not known until the coordinator call site. Deferred, not
+/// absent: a witness issued for one branch cannot be presented for another only
+/// on the lock families, not on the two branch mutation families.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AuthorizeDirectRepositoryOperationRequest {
+    #[prost(string, tag = "1")]
+    pub verified_issuer: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub authenticated_subject: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub operation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "4")]
+    pub method: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub scope: ::prost::bytes::Bytes,
+    #[prost(uint32, tag = "6")]
+    pub fingerprint_version: u32,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub fingerprint: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub canonical_intent_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "9")]
+    pub repository_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "10")]
+    pub branch_id: ::prost::bytes::Bytes,
+}
+/// FORK-LOCAL (Tideshift, WP-120). Exact echo plus the witness.
+///
+/// No consumed_ticket_sha256 and no expected_claim_identity_digest, unlike the
+/// mediated response: loreserver calls its prepare with `witness: None` for a
+/// direct operation so it writes no dispatch-possibility fence and has nowhere
+/// sound to put either value.
+///
+/// bound_fields_digest is SHA-256 over
+/// "repository-operation-direct-authorization-v1\0" followed by, each
+/// length-prefixed with a big-endian u32: verified_issuer, authenticated_subject,
+/// operation_id, method, scope, u32be(fingerprint_version), fingerprint,
+/// canonical_intent_digest, repository_id, branch_id, authorization_id,
+/// u64be(authorization_revision), verification_nonce. Every input is a field
+/// loreserver already holds, so it can recompute this standalone.
+///
+/// authorization_id is frozen equal to operation_id, as CR-029 does.
+/// authorization_revision is always 1: a direct authorization is minted straight
+/// at VERIFIED and has no earlier state to advance from.
+/// org_uuid is audit only; it is not an input to Lore's direct receipt namespace.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AuthorizeDirectRepositoryOperationResponse {
+    #[prost(string, tag = "1")]
+    pub verified_issuer: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub authenticated_subject: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub operation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "4")]
+    pub method: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub scope: ::prost::bytes::Bytes,
+    #[prost(uint32, tag = "6")]
+    pub fingerprint_version: u32,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub fingerprint: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub canonical_intent_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "9")]
+    pub authorization_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "10")]
+    pub authorization_revision: u64,
+    #[prost(bytes = "bytes", tag = "11")]
+    pub verification_nonce: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "12")]
+    pub bound_fields_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "13")]
+    pub org_uuid: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DomainOperationMaintenanceVerificationRequest {
@@ -702,6 +803,54 @@ pub mod rebac_api_client {
                     GrpcMethod::new(
                         "ucs.auth.RebacApi",
                         "VerifyRepositoryOperationProofNamespaceRetire",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// FORK-LOCAL (Tideshift, WP-120). Private server-to-auth callback for a DIRECT
+        /// HUMAN mutation. loreserver calls this before DomainOperationPrepare when the
+        /// initiating principal is a human Lore JWT bearer rather than the mediated
+        /// control-plane service account: the human sends no carriage headers, so
+        /// loreserver mints its own operation id, fingerprint and prepare token and asks
+        /// the platform only whether this human may perform this mutation.
+        ///
+        /// The human's own Lore JWT MUST be forwarded as the `authorization: Bearer`
+        /// metadata on this call, exactly as it already is for CheckUserPermission.
+        /// auth-grpc authenticates that bearer itself; verified_issuer and
+        /// authenticated_subject in the body are echoes checked against it and never
+        /// select authority on their own.
+        ///
+        /// A refusal is a gRPC error, never an `authorized=false` field.
+        ///
+        /// The on-the-wire method path is
+        /// /ucs.auth.RebacApi/AuthorizeDirectRepositoryOperation.
+        pub async fn authorize_direct_repository_operation(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::AuthorizeDirectRepositoryOperationRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::AuthorizeDirectRepositoryOperationResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ucs.auth.RebacApi/AuthorizeDirectRepositoryOperation",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "ucs.auth.RebacApi",
+                        "AuthorizeDirectRepositoryOperation",
                     ),
                 );
             self.inner.unary(req, path, codec).await

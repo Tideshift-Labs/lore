@@ -15,6 +15,16 @@ message Resource {
   // Human readable description of the resource (i.e. file path, property name,
   // etc)
   string description = 3;
+
+  // FORK-LOCAL (Tideshift, CR-030/WP-120). The 32-byte ownership token this
+  // caller was issued when it acquired the lock, presented back to renew,
+  // release, or force-release it. Empty on a first acquire and on every read
+  // path. A cell that is not routing through the fenced lock authority ignores
+  // it entirely, so an older client and an older server both keep working.
+  //
+  // If upstream adds a field in this slot, reconcile the tag before
+  // regenerating.
+  bytes expected_ownership_token = 4;
 }
 
 // Represents the lock on a resource
@@ -28,6 +38,16 @@ message Lock {
 
   // Lock timestamp
   google.protobuf.Timestamp locked_at = 3;
+
+  // FORK-LOCAL (Tideshift, CR-030/WP-120). The 32-byte ownership token minted
+  // for this row, returned ONLY to the caller that just acquired or renewed it
+  // (Lock and AdminLock responses).
+  //
+  // Deliberately empty on Query and Status. Those read every lock in a
+  // repository, including other people's, and a token is the bearer secret that
+  // authorizes releasing one — populating it there would hand any reader the
+  // authority to release every lock it can see.
+  bytes ownership_token = 4;
 }
 
 //////////////////////////////////
@@ -49,6 +69,20 @@ service LockService {
 
   // Locks resources for another user
   rpc AdminLock(AdminLockRequest) returns (AdminLockResponse);
+
+  // FORK-LOCAL (Tideshift, CR-030/WP-120). Administrative release of locks held
+  // by another owner.
+  //
+  // A distinct RPC rather than a flag on Unlock, because the two are different
+  // authorities over different rows: Unlock releases what the caller itself
+  // holds, ForceUnlock takes a lock away from someone else and is recorded as a
+  // different transition (`lock.force_released`, not `lock.released`). Folding
+  // it into Unlock would make the audit trail and the permission check depend on
+  // a request field rather than on which door the caller came through.
+  //
+  // The on-the-wire method path is /urc.lock.LockService/ForceUnlock. If
+  // upstream adds a force-release RPC, reconcile the path before regenerating.
+  rpc ForceUnlock(ForceUnlockRequest) returns (ForceUnlockResponse);
 }
 
 message LockRequest { repeated Resource resources = 1; }
@@ -90,4 +124,25 @@ message AdminLockRequest {
 message AdminLockResponse {
   // List of created locks
   repeated Lock locks = 1;
+}
+
+// FORK-LOCAL (Tideshift, CR-030/WP-120).
+message ForceUnlockRequest {
+  // Resources to release. Ownership tokens are NOT required and ordinarily
+  // absent: an administrator holds no other owner's token, and no read path
+  // issues one. The row is named by its resource hash and by `owner` below, and
+  // the authority is the caller's administrative permission, not possession of
+  // a secret. A token supplied here is still checked against the row.
+  repeated Resource resources = 1;
+
+  // Authenticated subject of the owner being released. Explicit rather than
+  // inferred from the stored row, so the administrator states which owner it
+  // believes it is taking the lock from and a raced takeover is refused instead
+  // of silently releasing a different owner's lock.
+  string owner = 2;
+}
+
+message ForceUnlockResponse {
+  // Resources released.
+  repeated Resource resources = 1;
 }

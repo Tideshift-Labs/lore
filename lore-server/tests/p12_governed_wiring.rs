@@ -947,7 +947,7 @@ fn the_claim_witness_is_mediated_only_and_required_when_mediated() {
 fn a_governed_create_binds_the_same_method_it_sends_on_the_callback() {
     let seam = rust_fn_body(GOVERNED_SEAM, "impl GovernedRepositoryCreate {");
     assert!(
-        seam.contains("admitted.into_governed(PLATFORM_METHOD_REPOSITORY_CREATE, digest)"),
+        seam.contains(".complete_governed(admitted, PLATFORM_METHOD_REPOSITORY_CREATE, digest)"),
         "the create seam must bind the platform family constant; binding a \
          handler-supplied gRPC path is what made the receipt match fail after \
          the callback had already succeeded"
@@ -957,7 +957,7 @@ fn a_governed_create_binds_the_same_method_it_sends_on_the_callback() {
     // its absence is the property, not merely today's argument being right.
     let signature = {
         let start = seam
-            .find("pub fn prepare(")
+            .find("pub async fn prepare(")
             .expect("the create seam must expose `prepare`");
         let rest = &seam[start..];
         let end = rest
@@ -974,6 +974,12 @@ fn a_governed_create_binds_the_same_method_it_sends_on_the_callback() {
     );
 
     // Neither create handler may name a method at its `prepare` call.
+    // `prepare` is `async`, so the call terminates `).await?`, not the bare
+    // `)?` a synchronous call would -- searching for the pre-WP-120 marker
+    // here overruns past this call entirely and captures an arbitrary later
+    // slice of the file, which is how this pin can go stale silently
+    // (a stray `"` anywhere further down would fail it for the wrong reason,
+    // and its absence would let a real regression through).
     for (label, source) in [
         ("v0 repository create", CREATE_HANDLER),
         (
@@ -986,8 +992,8 @@ fn a_governed_create_binds_the_same_method_it_sends_on_the_callback() {
             .unwrap_or_else(|| panic!("{label} must call the shared create seam"));
         let rest = &source[start..];
         let end = rest
-            .find(")?")
-            .unwrap_or_else(|| panic!("{label} call must terminate"));
+            .find(").await?")
+            .unwrap_or_else(|| panic!("{label} call must terminate in `).await?`"));
         let call = &rest[..end];
         assert!(
             !call.contains('"'),
@@ -1005,12 +1011,12 @@ fn a_governed_create_binds_the_same_method_it_sends_on_the_callback() {
 fn the_governed_delete_seam_binds_its_method_by_construction_too() {
     let seam = rust_fn_body(GOVERNED_SEAM, "impl GovernedRepositoryDelete {");
     assert!(
-        seam.contains("admitted.into_governed(PLATFORM_METHOD_REPOSITORY_DELETE, digest)"),
+        seam.contains(".complete_governed(admitted, PLATFORM_METHOD_REPOSITORY_DELETE, digest)"),
         "the delete seam must bind the platform family constant"
     );
     let signature = {
         let start = seam
-            .find("pub fn prepare(")
+            .find("pub async fn prepare(")
             .expect("the delete seam must expose `prepare`");
         let rest = &seam[start..];
         let end = rest
@@ -1151,7 +1157,7 @@ fn no_governed_handler_can_spell_its_own_method() {
         let body = rust_fn_body(GOVERNED_SEAM, seam);
         let signature = {
             let start = body
-                .find("pub fn prepare(")
+                .find("pub async fn prepare(")
                 .unwrap_or_else(|| panic!("{seam} must expose `prepare`"));
             let rest = &body[start..];
             let end = rest
@@ -1174,7 +1180,7 @@ fn no_governed_handler_can_spell_its_own_method() {
         "the CAS seam must take a closed family, not a method string"
     );
     assert!(
-        cas.contains("admitted.into_governed(family.platform_method(), digest)"),
+        cas.contains(".complete_governed(admitted, family.platform_method(), digest)"),
         "the CAS seam must resolve its method from the family"
     );
 
@@ -1213,12 +1219,12 @@ fn no_governed_handler_can_spell_its_own_method() {
         (
             "v0/v1 shared branch push",
             include_str!("../src/grpc/handlers/branch_push.rs"),
-            "into_governed(",
+            "complete_governed(",
         ),
         (
             "v0 obliterate",
             include_str!("../src/grpc/handlers/obliterate.rs"),
-            "into_governed(",
+            "complete_governed(",
         ),
     ];
     for (label, source, call) in call_sites {
@@ -1240,10 +1246,13 @@ fn no_governed_handler_can_spell_its_own_method() {
     // Push and obliterate bind once each, which is what makes one constant cover
     // both wire versions rather than only v0.
     for (family, binding) in [
-        ("branch push", "into_governed(PLATFORM_METHOD_BRANCH_PUSH"),
+        (
+            "branch push",
+            "complete_governed(admitted, PLATFORM_METHOD_BRANCH_PUSH",
+        ),
         (
             "obliterate",
-            "into_governed(PLATFORM_METHOD_REPOSITORY_OBLITERATE",
+            "complete_governed(admitted, PLATFORM_METHOD_REPOSITORY_OBLITERATE",
         ),
     ] {
         let bindings: usize = call_sites

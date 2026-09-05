@@ -227,6 +227,9 @@ impl RemoteNotificationSender {
                 branch: Bytes::from(res.branch),
                 hash: Bytes::from(res.hash),
                 description: res.description.clone(),
+                // A notification describes a lock, it does not authorize one;
+                // the ownership token never travels on this path.
+                expected_ownership_token: Default::default(),
             })
             .collect()
     }

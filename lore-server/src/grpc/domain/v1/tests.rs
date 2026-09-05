@@ -458,6 +458,18 @@ impl RepositoryOperationAuthorizationVerifier for EchoVerifier {
     ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
         Ok(self.maintenance_response(request))
     }
+
+    /// WP-120's direct-authorization port is not part of the private receipt
+    /// rail these cases exercise, so reaching it from here is a wiring fault
+    /// rather than a case to model. Fails loudly instead of echoing, so a future
+    /// change that accidentally routes a mediated operation through the direct
+    /// port is a test failure and not a silently passing one.
+    async fn authorize_direct_repository_operation(
+        &self,
+        _request: Request<lore_proto::rebac::AuthorizeDirectRepositoryOperationRequest>,
+    ) -> Result<lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse, Status> {
+        unreachable!("the private receipt rail never uses the direct authorization port")
+    }
 }
 
 fn service() -> (

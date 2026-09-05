@@ -107,7 +107,8 @@ pub async fn handler(
                 Some(admitted),
                 MetadataCasFamily::Branch,
                 digest,
-            )?
+            )
+            .await?
         }
         None => None,
     };

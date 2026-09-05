@@ -763,7 +763,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                         rpc_timeout,
                         enforce_write_permission,
                     )
-                    .with_fenced_coordinator(fenced_coordinator),
+                    .with_fenced_coordinator(fenced_coordinator, self.0.domain_context.clone()),
                 )
             }
             None => None,

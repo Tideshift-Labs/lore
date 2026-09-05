@@ -7,17 +7,26 @@ use lore_base::types::KeyType;
 use lore_postgres::domain::DomainOutcome;
 use lore_postgres::domain::coordinator::ADMISSION_REJECTED_V1;
 use lore_postgres::domain::coordinator::BranchDeleteInput;
+use lore_postgres::domain::coordinator::BranchPushCommitInput;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
 use lore_postgres::domain::coordinator::ProjectionWrite;
 use lore_postgres::domain::coordinator::RepositoryCreateInput;
+use lore_postgres::domain::outbox::builders as outbox_builders;
 use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptKey;
 use lore_postgres::domain::receipts::ReceiptLookup;
+use lore_postgres::domain::schema::RECEIPT_STATE_COMMITTED;
 use lore_postgres::domain::store::PostgresDomainStore;
 use lore_postgres::pool::TlsConfig;
 use lore_postgres::store::mutable_store::PostgresMutableStore;
+use lore_proto::rebac::AuthorizeDirectRepositoryOperationRequest;
+use lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse;
+use lore_proto::rebac::DomainOperationMaintenanceVerificationRequest;
+use lore_proto::rebac::DomainOperationMaintenanceVerificationResponse;
+use lore_proto::rebac::VerifyRepositoryOperationAuthorizationRequest;
+use lore_proto::rebac::VerifyRepositoryOperationAuthorizationResponse;
 use lore_revision::branch;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::Metadata;
@@ -25,10 +34,13 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::authnz::rebac::RepositoryOperationAuthorizationVerifier;
+use lore_server::domain::AdmissionSource;
 use lore_server::domain::AdmittedOperation;
 use lore_server::domain::DomainContext;
 use lore_server::domain::GovernedRepositoryCreate;
 use lore_server::domain::GovernedScope;
+use lore_server::domain::PLATFORM_METHOD_BRANCH_PUSH;
 use lore_server::domain::PLATFORM_METHOD_REPOSITORY_CREATE;
 use lore_server::domain::PLATFORM_METHOD_REPOSITORY_OBLITERATE;
 use lore_server::domain::RepositoryCreatePublication;
@@ -43,6 +55,8 @@ use lore_server::grpc::domain_operation_metadata::OPERATION_ID_KEY;
 use lore_server::grpc::domain_operation_metadata::PREPARE_TOKEN_KEY;
 use lore_server::grpc::domain_operation_metadata::scope_key_mediated_namespace;
 use lore_storage::hash;
+use tonic::Request;
+use tonic::Status;
 use tonic::metadata::BinaryMetadataValue;
 use tonic::metadata::MetadataMap;
 use uuid::Uuid;
@@ -529,16 +543,17 @@ async fn governed_create_projection_rows_match_the_legacy_writers_exactly() {
             };
             let admitted = AdmittedOperation {
                 key: key.clone(),
-                carried: DomainOperationMetadata {
+                source: AdmissionSource::Carried(Box::new(DomainOperationMetadata {
                     operation_id,
                     fingerprint_version: 1,
                     fingerprint: binding.fingerprint.clone(),
                     prepare_token: token,
                     mediated_scope: None,
                     claim_witness: None,
-                },
+                })),
             };
             let governed = GovernedRepositoryCreate::prepare(Some(&domain), Some(admitted), digest)
+                .await
                 .expect("prepare must not error")
                 .expect("enforcement is on; must admit");
 
@@ -998,4 +1013,319 @@ async fn branch_delete_governed_and_real_legacy_delete_agree_on_the_lore_mutable
             );
         })
         .await;
+}
+
+// ---------------------------------------------------------------------------
+// WP-120: a released client (no carriage) reaches a governed push through
+// loreserver's own internal prepare.
+// ---------------------------------------------------------------------------
+
+/// A verifier double for the direct-authorization rail. Every method but
+/// `authorize_direct_repository_operation` is unreachable, matching the
+/// unit-level double in `domain.rs`'s own test module -- only the direct
+/// rail is exercised here.
+struct DirectEchoVerifier {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl DirectEchoVerifier {
+    fn new() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RepositoryOperationAuthorizationVerifier for DirectEchoVerifier {
+    async fn verify_repository_operation_authorization(
+        &self,
+        _request: Request<VerifyRepositoryOperationAuthorizationRequest>,
+    ) -> Result<VerifyRepositoryOperationAuthorizationResponse, Status> {
+        unreachable!("this file exercises only the direct rail")
+    }
+
+    async fn claim_repository_operation_stale_finalize_permit(
+        &self,
+        _request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
+        unreachable!("this file exercises only the direct rail")
+    }
+
+    async fn verify_repository_operation_terminal_status_attach(
+        &self,
+        _request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
+        unreachable!("this file exercises only the direct rail")
+    }
+
+    async fn verify_repository_operation_proof_namespace_materialize(
+        &self,
+        _request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
+        unreachable!("this file exercises only the direct rail")
+    }
+
+    async fn verify_repository_operation_proof_namespace_retire(
+        &self,
+        _request: Request<DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
+        unreachable!("this file exercises only the direct rail")
+    }
+
+    async fn authorize_direct_repository_operation(
+        &self,
+        request: Request<AuthorizeDirectRepositoryOperationRequest>,
+    ) -> Result<AuthorizeDirectRepositoryOperationResponse, Status> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let request = request.into_inner();
+        Ok(AuthorizeDirectRepositoryOperationResponse {
+            verified_issuer: request.verified_issuer,
+            authenticated_subject: request.authenticated_subject,
+            operation_id: request.operation_id.clone(),
+            method: request.method,
+            scope: request.scope,
+            fingerprint_version: request.fingerprint_version,
+            fingerprint: request.fingerprint,
+            canonical_intent_digest: request.canonical_intent_digest,
+            authorization_id: request.operation_id,
+            authorization_revision: 1,
+            verification_nonce: bytes::Bytes::from_static(&[0x11u8; 32]),
+            bound_fields_digest: bytes::Bytes::from_static(&[0x22u8; 32]),
+            org_uuid: bytes::Bytes::new(),
+        })
+    }
+}
+
+/// The headline WP-120 behaviour: a released client with a valid Lore JWT and
+/// NO carriage headers pushes a branch, loreserver mints its own operation
+/// id/fingerprint/prepare token and runs the internal prepare, and the
+/// resulting `GovernedOperation` commits through the same coordinator seam a
+/// carriage-bearing push uses -- one `PREPARED` receipt that transitions to
+/// `COMMITTED`, and exactly one `branch.pushed` outbox row keyed by the
+/// internally minted operation id.
+///
+/// Drives `DomainContext::admit`/`complete_governed` and
+/// `store.branch_push_commit` directly, bypassing the full gRPC handler and
+/// its `RepositoryContext`/revision-content machinery -- the WP-120 delta
+/// under test is entirely in the admission and receipt layer, which this
+/// reaches precisely, the same scoping `domain_outbox_producers.rs`'s own
+/// `branch_push_commit` cases use for the coordinator half.
+#[tokio::test]
+#[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored"]
+async fn released_client_push_with_no_carriage_commits_one_branch_pushed_row_via_internal_prepare()
+{
+    let url = std::env::var("LORE_TEST_PG_URL")
+        .expect("LORE_TEST_PG_URL must be set; an unconfigured live case is NOT RUN");
+
+    // SCHEMA-117 must be installed before the first `repository_create`: the
+    // lock-namespace row `branch_push_commit` revalidates against is created
+    // by an after-insert trigger on `lore_domain_branches`. See
+    // `domain_outbox_producers.rs`'s `store()` for the same ordering rule.
+    let domain_store = PostgresDomainStore::connect(&url, 4, &TlsConfig::default())
+        .await
+        .expect("real Postgres domain store must connect");
+    domain_store
+        .lock_coordinator()
+        .bootstrap()
+        .await
+        .expect("install SCHEMA-117 before any domain row exists");
+
+    let (raw_client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("direct assertion client must connect");
+    lore_base::lore_spawn!(async move {
+        if let Err(error) = connection.await {
+            eprintln!("direct postgres connection error: {error}");
+        }
+    });
+
+    let repository_id: [u8; 16] = rand::random();
+    let branch_id: [u8; 16] = rand::random();
+    let branch_name = "main";
+    let head = rand::random::<[u8; 32]>().to_vec();
+
+    // A repository/branch fixture, keyed by an ordinary mediated create --
+    // WP-120's delta is in the push admission, not in how the fixture
+    // repository came to exist.
+    let create_operation_id = Uuid::now_v7();
+    let fixture_principal = principal_namespace(Uuid::now_v7());
+    let create_key = mediated_key(create_operation_id, &rand::random(), &fixture_principal);
+    let create_input = RepositoryCreateInput {
+        repository_id: repository_id.to_vec(),
+        name: format!("wp120-push-{:016x}", rand::random::<u64>()),
+        metadata_hash: rand::random::<[u8; 32]>().to_vec(),
+        default_branch_id: branch_id.to_vec(),
+        default_branch_name: branch_name.to_owned(),
+        default_branch_metadata_hash: rand::random::<[u8; 32]>().to_vec(),
+        default_branch_latest_hash: head.clone(),
+        creation_fingerprint: rand::random::<[u8; 32]>().to_vec(),
+        creation_fingerprint_version: 1,
+        projection: Vec::new(),
+        events: Vec::new(),
+    };
+    let create_binding = OperationBinding {
+        method: PLATFORM_METHOD_REPOSITORY_CREATE.to_owned(),
+        scope: create_key.tenant_scope_key.clone(),
+        fingerprint_version: 1,
+        fingerprint: create_input.creation_fingerprint.clone(),
+        canonical_intent_digest: create_input.creation_fingerprint.clone(),
+    };
+    let PrepareResult::Prepared {
+        token: create_token,
+        ..
+    } = domain_store
+        .domain_operation_prepare(&create_key, &create_binding, None)
+        .await
+        .expect("prepare the fixture create")
+    else {
+        panic!("fixture create must prepare");
+    };
+    domain_store
+        .repository_create(
+            &GovernedOperation {
+                key: create_key,
+                binding: create_binding,
+                prepare_token: create_token,
+            },
+            &create_input,
+        )
+        .await
+        .expect("fixture repository create must succeed");
+
+    // --- The WP-120 delta under test: admit a released client with no
+    // carriage, through the internal prepare, then commit the push. ---
+    let verifier = std::sync::Arc::new(DirectEchoVerifier::new());
+    let domain = std::sync::Arc::new(
+        DomainContext::new(
+            std::sync::Arc::new(domain_store) as std::sync::Arc<dyn DomainTransactionStore>,
+            true,
+        )
+        .with_operation_verifier(Some(verifier.clone())),
+    );
+    let store = domain.store().clone();
+
+    let token = AuthorizationToken {
+        issuer: "https://issuer.example/wp120-live".to_owned(),
+        user_id: "wp120-released-client".to_owned(),
+        ..Default::default()
+    };
+    let new_head = rand::random::<[u8; 32]>().to_vec();
+    let digest = canonical_intent_digest(&CanonicalIntent::BranchPush {
+        repository_id: &repository_id,
+        branch_id: &branch_id,
+        requested_revision: &new_head,
+        force: false,
+        fast_forward_merge: false,
+    })
+    .expect("branch push intent must hash");
+
+    // No carriage headers, but the caller's own bearer IS present: the
+    // internal path forwards this exact value to the direct-authorization
+    // verifier as the human's own JWT, and the entry gate refuses to fire
+    // without it (`internal_admission_reason`'s condition 3).
+    let mut metadata = MetadataMap::new();
+    metadata.insert(
+        "authorization",
+        "Bearer wp120-released-client-jwt"
+            .parse()
+            .expect("ascii header"),
+    );
+
+    let admitted = domain
+        .admit(
+            &metadata,
+            Some(&token),
+            GovernedScope::TargetRepository {
+                repository_id: &repository_id,
+            },
+        )
+        .expect("a released client with a configured verifier must admit")
+        .expect("must be Some, the internal path, not the legacy carve-out");
+    assert!(
+        admitted.is_internally_prepared(),
+        "no carriage was presented; this must be WP-120's internal admission"
+    );
+    let internal_operation_id = admitted.key.operation_id;
+
+    let governed = domain
+        .complete_governed(admitted, PLATFORM_METHOD_BRANCH_PUSH, digest)
+        .await
+        .expect("the internal prepare must succeed and yield a governed operation");
+    assert_eq!(verifier.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // The PREPARED receipt must exist before the mutation commits.
+    let prepared_state: i16 = raw_client
+        .query_one(
+            "SELECT state FROM lore_domain_operation_receipts WHERE operation_id = $1",
+            &[&internal_operation_id.as_bytes().as_slice()],
+        )
+        .await
+        .expect("read the PREPARED receipt row")
+        .get(0);
+    assert_eq!(
+        prepared_state,
+        lore_postgres::domain::schema::RECEIPT_STATE_PREPARED,
+        "the internal prepare must persist a PREPARED receipt before any mutation"
+    );
+
+    let event = outbox_builders::branch_pushed(
+        "wp120-live-cell",
+        &repository_id,
+        &branch_id,
+        branch_name,
+        &head,
+        &new_head,
+    )
+    .expect("build the branch.pushed event");
+    let push_input = BranchPushCommitInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        expected_repository_generation: 1,
+        expected_branch_generation: 1,
+        // The after-insert trigger that creates the lock namespace row seeds
+        // both lock generations at 1, matching `domain_outbox_producers.rs`.
+        expected_repository_lock_generation: 1,
+        expected_branch_lock_generation: 1,
+        expected_branch_lock_namespace_last_applied_fence: 0,
+        expected_latest_hash: head,
+        new_latest_hash: new_head,
+        projection: Vec::new(),
+        event: Some(event),
+    };
+    let result = store
+        .branch_push_commit(&governed, &push_input)
+        .await
+        .expect("the released client's push must commit");
+    assert_eq!(result.outcome, DomainOutcome::Applied);
+
+    let committed_state: i16 = raw_client
+        .query_one(
+            "SELECT state FROM lore_domain_operation_receipts WHERE operation_id = $1",
+            &[&internal_operation_id.as_bytes().as_slice()],
+        )
+        .await
+        .expect("read the committed receipt row")
+        .get(0);
+    assert_eq!(
+        committed_state, RECEIPT_STATE_COMMITTED,
+        "the receipt must transition PREPARED -> COMMITTED with the mutation"
+    );
+
+    let outbox_rows: Vec<(String, Vec<u8>)> = raw_client
+        .query(
+            "SELECT event_kind, repository_id FROM lore_outbox_events WHERE repository_id = $1",
+            &[&repository_id.as_slice()],
+        )
+        .await
+        .expect("query outbox rows for this repository")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        outbox_rows.len(),
+        1,
+        "a released-client push must append exactly one outbox row, got {outbox_rows:?}"
+    );
+    assert_eq!(outbox_rows[0].0, "branch.pushed");
 }

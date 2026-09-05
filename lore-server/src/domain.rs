@@ -57,6 +57,7 @@ use lore_postgres::domain::locks::LockFencingReadiness;
 use lore_postgres::domain::locks::PostgresLockCoordinator;
 use lore_postgres::domain::outbox::builders as outbox_builders;
 use lore_postgres::domain::receipts::OperationBinding;
+use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptKey;
 use lore_revision::branch;
 use lore_revision::repository;
@@ -66,8 +67,11 @@ use tonic::metadata::MetadataMap;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::common::create_request_with_authorization;
+use crate::authnz::rebac::RepositoryOperationAuthorizationVerifier;
 use crate::event_relay::admission::OutboxAdmission;
 use crate::grpc::domain_operation_metadata;
 use crate::plugins::postgres::assert_domain_store_colocated;
@@ -78,6 +82,46 @@ use crate::store::configuration::resolve_plugin_config_with_fallback;
 /// The `mode` string that selects the Postgres backend.
 const POSTGRES_MODE: &str = "postgres";
 const CONTROL_PLANE_SERVICE_SUBJECT: &str = "lorehub-control-plane";
+
+// PIN(WP-120, 2026-09-04): the loreserver-internal prepare's wire contract with
+// auth-grpc, agreed with the platform lane and frozen here so a later reader can
+// check both halves against one statement.
+//
+// * RPC path: `/ucs.auth.RebacApi/AuthorizeDirectRepositoryOperation`.
+// * Request:  verified_issuer=1, authenticated_subject=2, operation_id=3 (16B
+//             UUIDv7), method=4, scope=5, fingerprint_version=6, fingerprint=7
+//             (32B), canonical_intent_digest=8 (32B), repository_id=9 (16B).
+// * Response: the same eight echoed, then authorization_id=9 (16B),
+//             authorization_revision=10, verification_nonce=11 (32B),
+//             bound_fields_digest=12 (32B), org_uuid=13 (audit only).
+// * `method` is a closed set: the six governed families named by the
+//   `PLATFORM_METHOD_*` constants below, plus the five lock families
+//   `lore-postgres` freezes (`lock.acquire`, `lock.renew`, `lock.admin_acquire`,
+//   `lock.release`, `lock.force_release`).
+// * `repository_id` means two different things by family and the verifier must
+//   branch on `method`: on `repository.create` it is the caller-chosen NEW
+//   identity and the decision is org-level, because there is no resource to look
+//   up; on every other family it names an existing repository.
+// * No `consumed_ticket_sha256` and no `expected_claim_identity_digest`. A
+//   direct human operation has no preclaim ticket and no platform claim, and
+//   sending either would file it as a mediated operation.
+// * The caller's own bearer token is forwarded on the call's `authorization`
+//   metadata. The verifier authenticates the human itself; the echoed issuer and
+//   subject are for agreement-checking, never for authentication.
+
+/// Domain separator for the fingerprint a loreserver-internal prepare mints.
+///
+/// PIN(WP-120, 2026-09-04). A mediated operation's fingerprint is computed by
+/// the control plane over the caller-controlled fields it holds. A released
+/// client holds nothing, so this server mints the fingerprint itself — and it
+/// must be **derived**, not random, so that the value in the `PREPARED` row is
+/// reproducible from the operation's own binding rather than being a second
+/// secret nothing can check. Every component is length-prefixed, including the
+/// method, so no two distinct bindings can frame to the same preimage.
+const INTERNAL_FINGERPRINT_DOMAIN_V1: &[u8] = b"lore-internal-prepare-fingerprint-v1\0";
+
+/// Width of the two 32-byte witness fields the direct verifier must return.
+const DIRECT_WITNESS_FIELD_LEN: usize = 32;
 
 /// Which tenant scope a governed operation belongs to.
 ///
@@ -156,6 +200,14 @@ pub struct DomainContext {
     /// once, and only when `[outbox_relay] enabled = true` — an absent handle
     /// is a cell with no relay, and it admits exactly as it did before WP-119.
     admission: OnceLock<Arc<OutboxAdmission>>,
+    /// WP-120's direct-authorization verifier, present only on a cell that has
+    /// the private auth-grpc endpoint configured.
+    ///
+    /// Its presence is the enablement switch for the loreserver-internal
+    /// prepare. A cell without it keeps refusing a carriage-less mutation under
+    /// enforcement exactly as it did before WP-120, rather than admitting one
+    /// it cannot get an authorization for.
+    operation_verifier: Option<Arc<dyn RepositoryOperationAuthorizationVerifier>>,
 }
 
 impl DomainContext {
@@ -167,6 +219,7 @@ impl DomainContext {
             lock_coordinator: None,
             cell_id: None,
             admission: OnceLock::new(),
+            operation_verifier: None,
         }
     }
 
@@ -184,7 +237,29 @@ impl DomainContext {
             lock_coordinator: Some(lock_coordinator),
             cell_id: None,
             admission: OnceLock::new(),
+            operation_verifier: None,
         }
+    }
+
+    /// Attach the private direct-authorization verifier.
+    ///
+    /// Separate from the constructors because the verifier is built from the
+    /// same `auth_url` the private receipt rail uses, and a cell can be in
+    /// Postgres mode with that endpoint unconfigured. `None` is a real state,
+    /// not a defaulting mistake: it means no released client can be admitted on
+    /// this cell, and every such caller keeps today's refusal.
+    #[must_use]
+    pub fn with_operation_verifier(
+        mut self,
+        verifier: Option<Arc<dyn RepositoryOperationAuthorizationVerifier>>,
+    ) -> Self {
+        self.operation_verifier = verifier;
+        self
+    }
+
+    /// The attached direct-authorization verifier, or `None`.
+    pub fn operation_verifier(&self) -> Option<&Arc<dyn RepositoryOperationAuthorizationVerifier>> {
+        self.operation_verifier.as_ref()
     }
 
     /// Attach the configured cell identity, so producers can build CR-032
@@ -258,27 +333,27 @@ impl DomainContext {
     /// same identity at a different layer is what CR-010 and
     /// `loreserver-body-repo-authz-recheck.md` record the cost of.
     ///
-    /// - `Ok(None)` — enforcement is off and the caller carried no operation
-    ///   identity: the legacy carve-out, and the only path that reaches today's
-    ///   unsynchronised writes.
-    /// - `Ok(Some(_))` — a validated governed operation.
+    /// - `Ok(None)` — enforcement is off, the caller carried no operation
+    ///   identity, and no internal admission was possible: the legacy carve-out,
+    ///   and the only path that reaches today's unsynchronised writes.
+    /// - `Ok(Some(_))` — a validated governed operation, either from presented
+    ///   carriage or from WP-120's loreserver-internal admission.
     /// - `Err(_)` — decisive pre-admission rejection. Under enforcement this
-    ///   covers absence; in every mode it covers malformed, wrong-length,
-    ///   wrong-version, non-UUIDv7, and divergent-duplicate carriage.
+    ///   covers absence that no internal admission could cover; in every mode it
+    ///   covers malformed, wrong-length, wrong-version, non-UUIDv7, and
+    ///   divergent-duplicate carriage.
     pub fn admit(
         &self,
         metadata: &MetadataMap,
         authorization: Option<&AuthorizationToken>,
         scope: GovernedScope<'_>,
     ) -> Result<Option<AdmittedOperation>, Status> {
-        let carried = if self.enforcement {
-            Some(domain_operation_metadata::require(metadata)?)
-        } else {
-            domain_operation_metadata::extract(metadata)?
-        };
-
-        let Some(carried) = carried else {
-            return Ok(None);
+        // Always `extract`, never `require`. Partial carriage is still an error
+        // — `extract` returns `Ok(None)` only when *none* of the three headers
+        // is present — so a caller that supplies two of three cannot fall
+        // through into the internal path and have this server invent the third.
+        let Some(carried) = domain_operation_metadata::extract(metadata)? else {
+            return self.admit_internal(metadata, authorization, &scope);
         };
 
         // A governed mutation needs a verified principal: the receipt namespace
@@ -355,9 +430,495 @@ impl DomainContext {
                 tenant_scope_key,
                 operation_id: carried.operation_id,
             },
-            carried,
+            source: AdmissionSource::Carried(Box::new(carried)),
         }))
     }
+
+    /// WP-120: admit a released client that presented a verified human JWT and
+    /// no carriage at all.
+    ///
+    /// Owner decision of 2026-09-04 (option A): a released desktop obtains
+    /// governed carriage through a **loreserver-internal** prepare rather than
+    /// by minting carriage of its own. This function is the entry half of that
+    /// decision — it decides whether an internal admission is possible and mints
+    /// the operation identity. The prepare itself runs later, in
+    /// [`DomainContext::complete_governed`], because the receipt binding needs
+    /// the canonical intent digest and that is only assembled at the coordinator
+    /// call site (see [`AdmittedOperation`]'s own note).
+    ///
+    /// # Every refusal below leaves the caller exactly where it was
+    ///
+    /// This is the property that makes the change safe to land: each `Ok(None)`
+    /// here falls through to the *pre-WP-120* outcome for that caller — today's
+    /// absent-carriage refusal under enforcement, or the legacy carve-out
+    /// without it. Nothing here can turn a previously-working call into a
+    /// failure, and nothing here admits a caller the old code would have
+    /// admitted differently.
+    ///
+    /// The claim is about the `Ok(None)` paths and nothing wider. A caller that
+    /// IS admitted here and then reaches a site with no coordinator call site —
+    /// either of the branch-delete or repository-delete guards, or a branch push
+    /// on a cell whose fenced lock routing is not armed — is refused
+    /// `UNIMPLEMENTED` by `reject_unwired_governed_operation` where it used to be
+    /// refused for absent carriage. Still a refusal, and still before any
+    /// mutation, but a different code. Worth knowing before reading a changed
+    /// status in a log as a regression.
+    ///
+    /// The operational consequence of that last case is real and easy to miss:
+    /// a released client can push on an enforcing cell only if fenced lock
+    /// routing is armed as well. Enforcement alone is not enough.
+    fn admit_internal(
+        &self,
+        metadata: &MetadataMap,
+        authorization: Option<&AuthorizationToken>,
+        scope: &GovernedScope<'_>,
+    ) -> Result<Option<AdmittedOperation>, Status> {
+        let admissible = self.internal_admission_reason(metadata, authorization, scope)?;
+        let Some((token, bearer, repository_id, tenant_scope_key)) = admissible else {
+            if self.enforcement {
+                // Unchanged pre-WP-120 refusal. Produced by `require` itself,
+                // so the status this caller sees is byte-identical to the one it
+                // saw before internal admission existed; `extract` already
+                // returned `None`, so `require` cannot succeed here.
+                domain_operation_metadata::require(metadata)?;
+                return Err(Status::internal(
+                    "domain carriage was absent yet accepted by require",
+                ));
+            }
+            return Ok(None);
+        };
+
+        // Same choke point, same reasoning, same position as the carried path:
+        // an internally admitted operation appends an outbox row too, and a
+        // backlog is a cell condition that must not relabel anything above it.
+        if let Some(admission) = self.admission.get() {
+            admission.refuse_if_closed()?;
+        }
+
+        Ok(Some(AdmittedOperation {
+            key: ReceiptKey {
+                verified_issuer: token.issuer.clone(),
+                authenticated_subject: token.user_id.clone(),
+                tenant_scope_key,
+                // Minted at handler entry rather than at the seam, so the
+                // receipt's temporal class is the moment the request arrived.
+                //
+                // A released client carries no operation identity of its own, so
+                // it gets a fresh id per attempt and there is **no cross-attempt
+                // idempotency**: a client retry is a new operation, not a
+                // replay. That is a property of the caller having nothing to
+                // replay with, not a gap in the rail — the rail still gives this
+                // operation atomicity, a single-use prepare token, and its
+                // classified outbox row.
+                operation_id: Uuid::now_v7(),
+            },
+            source: AdmissionSource::Internal(InternalAdmission {
+                repository_id,
+                bearer,
+            }),
+        }))
+    }
+
+    /// The closed list of conditions an internal admission needs.
+    ///
+    /// Returns the pieces the caller needs on success, and `Ok(None)` when this
+    /// cell or this caller cannot use the internal path at all.
+    #[allow(clippy::type_complexity)]
+    fn internal_admission_reason<'t>(
+        &self,
+        metadata: &MetadataMap,
+        authorization: Option<&'t AuthorizationToken>,
+        scope: &GovernedScope<'_>,
+    ) -> Result<Option<(&'t AuthorizationToken, String, Vec<u8>, Vec<u8>)>, Status> {
+        // 1. Enforcement. An unenforcing cell still writes the generic mutable
+        //    path unfenced, so admitting a governed mutation there would put two
+        //    writers on the same rows under two lock disciplines — the same
+        //    reasoning the delete and branch-delete seams already refuse on.
+        if !self.enforcement {
+            return Ok(None);
+        }
+        // 2. A verifier. Without one there is no way to obtain an authorization
+        //    for this principal, and minting a receipt on the strength of the
+        //    JWT alone would make loreserver its own authorizer.
+        if self.operation_verifier.is_none() {
+            return Ok(None);
+        }
+        // 3. A verified principal, and its raw bearer token. The token is
+        //    forwarded to auth-grpc so the verifier re-verifies the JWT itself
+        //    rather than trusting this server's report of who the caller is.
+        let Some(token) = authorization else {
+            return Ok(None);
+        };
+        let Some(bearer) = metadata
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+        else {
+            return Ok(None);
+        };
+        // 4. A human. The control-plane service principal always carries its own
+        //    carriage; minting identity for it would drop a mediated operation
+        //    into a direct receipt namespace, and every service account is
+        //    likewise excluded rather than silently granted a new admission
+        //    route it was never designed for.
+        if token.user_id == CONTROL_PLANE_SERVICE_SUBJECT || token.is_service_account == Some(true)
+        {
+            return Ok(None);
+        }
+        // 5. A direct scope. `Mediated` names an org and an initiating principal
+        //    that only carriage carries, so a mediated scope with no carriage is
+        //    a contradiction and is refused rather than downgraded.
+        //
+        //    No handler constructs `GovernedScope::Mediated` today — `admit`
+        //    derives the mediated scope key from the carriage itself, not from
+        //    this argument — so this arm is unreachable from the wire. It is a
+        //    fail-closed guard on a variant that exists, not a live path, and it
+        //    is written as a refusal so that a future handler which does pass
+        //    one gets a decisive answer rather than a scope key built from the
+        //    wrong provenance.
+        let repository_id = match scope {
+            // PIN(WP-120, 2026-09-04): `repository.create` is REFUSED on the
+            // direct rail and stays on the mediated claim rail. The platform's
+            // `AuthorizeDirectRepositoryOperation` accepts ten families and this
+            // is the one it excludes, because a create reserves a platform
+            // catalog row before Lore is called at all — there is no repository
+            // to check a role against, and no direct-human create exists.
+            //
+            // `Ok(None)` rather than an error, so a released client attempting a
+            // create lands on exactly the pre-WP-120 outcome: today's
+            // absent-carriage refusal under enforcement, or the legacy path
+            // without it. Erroring here would invent a new failure for a caller
+            // whose request was already going to be refused, and would report it
+            // as a client fault when it is a capability this rail does not have.
+            GovernedScope::RepositoryCreate { .. } => return Ok(None),
+            GovernedScope::TargetRepository { repository_id } => (*repository_id).to_vec(),
+            GovernedScope::Mediated { .. } => {
+                return Err(Status::invalid_argument(
+                    "mediated-scope governed operations require control-plane carriage",
+                ));
+            }
+        };
+        let tenant_scope_key = scope.tenant_scope_key()?;
+        Ok(Some((token, bearer, repository_id, tenant_scope_key)))
+    }
+
+    /// Turn an admitted operation into a governed one.
+    ///
+    /// The one completion point. Carriage the caller presented is a pure
+    /// projection, exactly as before WP-120. An internal admission runs its
+    /// prepare here, at the one layer that knows the canonical intent.
+    pub async fn complete_governed(
+        &self,
+        admitted: AdmittedOperation,
+        method: &str,
+        canonical_intent_digest: Vec<u8>,
+    ) -> Result<GovernedOperation, Status> {
+        match &admitted.source {
+            AdmissionSource::Carried(_) => {
+                Ok(admitted.into_governed(method, canonical_intent_digest))
+            }
+            AdmissionSource::Internal(_) => {
+                self.internal_prepare(admitted, method, canonical_intent_digest)
+                    .await
+            }
+        }
+    }
+
+    /// Run the same prepare contract the private `DomainOperationPrepare` runs,
+    /// on this server's own behalf, for a released client.
+    ///
+    /// The sequence, and why it is in this order:
+    ///
+    /// 1. Build the receipt binding. The fingerprint is **derived** from the
+    ///    binding (see [`INTERNAL_FINGERPRINT_DOMAIN_V1`]), never random.
+    /// 2. Call the auth-grpc verifier, forwarding the caller's own bearer token
+    ///    so the verifier authenticates the human independently.
+    /// 3. Exact-echo every identity and binding field it returns. A divergent
+    ///    echo is `PERMISSION_DENIED` and **no receipt row is written**, which is
+    ///    why the echo check precedes the prepare rather than following it.
+    /// 4. Persist the `PREPARED` receipt through the existing rail.
+    ///
+    /// Every failure lands before the mutation and is a typed refusal with no
+    /// side effect.
+    async fn internal_prepare(
+        &self,
+        admitted: AdmittedOperation,
+        method: &str,
+        canonical_intent_digest: Vec<u8>,
+    ) -> Result<GovernedOperation, Status> {
+        let AdmissionSource::Internal(internal) = &admitted.source else {
+            // Unreachable: `complete_governed` selects this arm. Refusing rather
+            // than asserting keeps it an enforced property.
+            return Err(Status::internal(
+                "internal prepare called for presented carriage",
+            ));
+        };
+        // A handler-supplied digest that is not the frozen width would travel
+        // into the receipt binding and the verifier request, so it is refused
+        // here rather than carried. `INTERNAL` rather than `INVALID_ARGUMENT`:
+        // every digest reaching this point came from `canonical_intent_digest`,
+        // so a wrong width is this server's fault, not the caller's.
+        if canonical_intent_digest.len() != domain_operation_metadata::DIGEST_LEN {
+            return Err(Status::internal(
+                "canonical intent digest must be 32 bytes for an internal prepare",
+            ));
+        }
+
+        let binding = OperationBinding {
+            method: method.to_owned(),
+            scope: admitted.key.tenant_scope_key.clone(),
+            fingerprint_version: i32::from(domain_operation_metadata::FINGERPRINT_VERSION_V1),
+            fingerprint: internal_prepare_fingerprint(
+                method,
+                &admitted.key.tenant_scope_key,
+                &canonical_intent_digest,
+            )?,
+            canonical_intent_digest,
+        };
+
+        // PIN(WP-120, 2026-09-04): `branch_id` is sent EMPTY for the governed
+        // families, and the platform's contract admits that ("16 bytes when the
+        // family names a branch and empty otherwise"). Two of these families do
+        // name a branch — `branch.push` and `branch.metadata-set` — so this is a
+        // deliberate narrowing, not an absence.
+        //
+        // The reason is structural: the entry gate is handed a `GovernedScope`,
+        // which carries a repository and never a branch, and the branch only
+        // becomes known at the coordinator call site inside the canonical
+        // intent. Threading it here means widening every seam signature, which
+        // the owner's happy-path-first ruling puts out of scope for this change.
+        //
+        // What it costs: the platform's role check for those two families is
+        // repository-scoped anyway, so no authorization decision changes. What
+        // it defers: the witness does not name the branch for them, so the
+        // cross-branch binding the platform gets for the lock families is
+        // absent here. The lock families, which are branch-scoped by nature, DO
+        // send it — see `prepare_direct_lock_operation`.
+        self.prepare_direct(
+            admitted.key.clone(),
+            binding,
+            &internal.repository_id,
+            &[],
+            &internal.bearer,
+        )
+        .await
+    }
+
+    /// Run the internal prepare for a **fenced lock** mutation.
+    ///
+    /// Locks reach the same rail by a different road. The lock coordinator
+    /// builds its own complete [`OperationBinding`] — method, `lock-tenant-
+    /// scope-v1` scope, fingerprint and canonical-intent digest all come from
+    /// `lore-postgres`'s typed lock intent, and it re-checks every one of them
+    /// under `validate_operation_binding` — so this path takes the finished
+    /// binding rather than a method plus a digest, and mints only the receipt
+    /// key around it.
+    ///
+    /// Everything after that is the same verifier callback, the same exact echo,
+    /// and the same prepare as every other governed family.
+    pub async fn prepare_direct_lock_operation(
+        &self,
+        token: &AuthorizationToken,
+        bearer: &str,
+        repository_id: &[u8],
+        branch_id: &[u8],
+        binding: OperationBinding,
+    ) -> Result<GovernedOperation, Status> {
+        if token.user_id == CONTROL_PLANE_SERVICE_SUBJECT || token.is_service_account == Some(true)
+        {
+            // Same exclusion the entry gate applies. The control plane reaches a
+            // governed lock through the mediated rail with its own carriage; a
+            // service account minting a direct lock receipt would take fenced
+            // ownership under a namespace that was never designed for it.
+            return Err(Status::permission_denied(
+                "Direct fenced lock mutations are for human principals",
+            ));
+        }
+        let key = ReceiptKey {
+            verified_issuer: token.issuer.clone(),
+            authenticated_subject: token.user_id.clone(),
+            // The lock coordinator derives the same value and refuses the
+            // operation if the two disagree, so this is a shared derivation
+            // rather than a value one side gets to choose.
+            tenant_scope_key: binding.scope.clone(),
+            operation_id: Uuid::now_v7(),
+        };
+        if let Some(admission) = self.admission.get() {
+            admission.refuse_if_closed()?;
+        }
+        // Every lock family is branch-scoped by nature, so the branch is always
+        // known here and always sent. This is the half of the platform's
+        // repository-and-branch binding that Lore can supply today.
+        self.prepare_direct(key, binding, repository_id, branch_id, bearer)
+            .await
+    }
+
+    /// The shared half of every internal prepare: verify, echo-check, persist.
+    async fn prepare_direct(
+        &self,
+        key: ReceiptKey,
+        binding: OperationBinding,
+        repository_id: &[u8],
+        branch_id: &[u8],
+        bearer: &str,
+    ) -> Result<GovernedOperation, Status> {
+        let verifier = self.operation_verifier.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "Internal domain prepare requires a configured repository-operation verifier",
+            )
+        })?;
+        let fingerprint_version = u32::try_from(binding.fingerprint_version)
+            .map_err(|_| Status::internal("fingerprint version is not representable"))?;
+        let request = create_request_with_authorization(
+            lore_proto::rebac::AuthorizeDirectRepositoryOperationRequest {
+                verified_issuer: key.verified_issuer.clone(),
+                authenticated_subject: key.authenticated_subject.clone(),
+                operation_id: bytes::Bytes::copy_from_slice(key.operation_id.as_bytes()),
+                method: binding.method.clone(),
+                scope: bytes::Bytes::copy_from_slice(&binding.scope),
+                fingerprint_version,
+                fingerprint: bytes::Bytes::copy_from_slice(&binding.fingerprint),
+                canonical_intent_digest: bytes::Bytes::copy_from_slice(
+                    &binding.canonical_intent_digest,
+                ),
+                repository_id: bytes::Bytes::copy_from_slice(repository_id),
+                branch_id: bytes::Bytes::copy_from_slice(branch_id),
+            },
+            Some(bearer.to_owned()),
+        )?;
+        let response = verifier
+            .authorize_direct_repository_operation(request)
+            .await?;
+        verify_direct_echo(&key, &binding, &response)?;
+
+        // The witness is deliberately `None`. A present witness makes the
+        // receipt rail also write the **mediated** dispatch-possibility fence,
+        // which requires a 32-byte `expected_claim_identity_digest` minted by
+        // the platform's claim CAS. A direct human operation has no claim, so
+        // there is nothing to fence and nothing honest to put in that column.
+        //
+        // BLOCKED(WP-120): direct-authorization evidence is verified but not
+        // persisted beside the receipt. Recording it needs a receipt-schema
+        // column of its own and a CR-029/CR-030 amendment naming its contract;
+        // inventing values for the mediated columns would file a direct
+        // operation as a mediated one.
+        let prepared = self
+            .store
+            .domain_operation_prepare(&key, &binding, None)
+            .await
+            .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?;
+        match prepared {
+            PrepareResult::Prepared { token, .. } => Ok(GovernedOperation {
+                key,
+                binding,
+                prepare_token: token,
+            }),
+            // The operation id was minted moments ago by this server, so every
+            // arm below is a cell fault or an id collision rather than a client
+            // one — but each is still decisive and leaves nothing mutated.
+            PrepareResult::Committed(outcome) => {
+                warn!(
+                    operation_id = %key.operation_id,
+                    ?outcome,
+                    "Internal prepare found a freshly minted operation id already decided"
+                );
+                Err(Status::aborted(
+                    "Internally prepared operation was already decided",
+                ))
+            }
+            PrepareResult::Mismatch => Err(Status::aborted(
+                "Internally prepared operation collided with a different binding",
+            )),
+            PrepareResult::ExpiredOrUnknown => Err(Status::aborted(
+                "Internally prepared operation was not admissible",
+            )),
+            PrepareResult::CapacityExhausted => Err(Status::resource_exhausted(
+                "Domain operation admission capacity is exhausted",
+            )),
+        }
+    }
+}
+
+/// The fingerprint a loreserver-internal prepare mints for one binding.
+///
+/// Deterministic from the binding's own caller-known fields, so the value in
+/// the `PREPARED` row can be recomputed and checked rather than being a second
+/// unverifiable secret. Every component is length-prefixed, including the
+/// method string, so two distinct bindings cannot frame to one preimage.
+fn internal_prepare_fingerprint(
+    method: &str,
+    scope: &[u8],
+    canonical_intent_digest: &[u8],
+) -> Result<Vec<u8>, Status> {
+    let mut preimage = Vec::with_capacity(
+        INTERNAL_FINGERPRINT_DOMAIN_V1.len()
+            + 12
+            + method.len()
+            + scope.len()
+            + canonical_intent_digest.len(),
+    );
+    preimage.extend_from_slice(INTERNAL_FINGERPRINT_DOMAIN_V1);
+    for component in [method.as_bytes(), scope, canonical_intent_digest] {
+        // A refusal, not a saturating conversion. Every component here is
+        // bounded far below `u32::MAX` today, but a saturating length is the one
+        // way this framing could stop being injective — two over-long
+        // components would frame identically — and a fingerprint that is not
+        // injective is a receipt key collision. Refusing costs nothing on a
+        // path that can never take it.
+        let len = u32::try_from(component.len()).map_err(|_| {
+            Status::internal("internal prepare fingerprint component exceeds the frame width")
+        })?;
+        preimage.extend_from_slice(&len.to_be_bytes());
+        preimage.extend_from_slice(component);
+    }
+    Ok(blake3::hash(&preimage).as_bytes().to_vec())
+}
+
+/// Refuse anything but an exact echo from the direct-authorization verifier.
+///
+/// Every identity and binding field is compared, and both witness widths are
+/// checked, before a receipt row can exist. A verifier that answers about a
+/// different principal, a different method, or a different intent is a
+/// conclusive denial rather than a widened path.
+fn verify_direct_echo(
+    key: &ReceiptKey,
+    binding: &OperationBinding,
+    response: &lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse,
+) -> Result<(), Status> {
+    let exact = response.verified_issuer == key.verified_issuer
+        && response.authenticated_subject == key.authenticated_subject
+        && response.operation_id.as_ref() == key.operation_id.as_bytes()
+        && response.method == binding.method
+        && response.scope.as_ref() == binding.scope
+        // Compared against the binding rather than against the v1 constant.
+        // The lock families build their own binding in `lore-postgres`, so a
+        // future family that versions its fingerprint differently must still be
+        // echo-checked against what was actually sent, not against a constant
+        // that happens to agree today.
+        && i64::from(response.fingerprint_version) == i64::from(binding.fingerprint_version)
+        && response.fingerprint.as_ref() == binding.fingerprint
+        && response.canonical_intent_digest.as_ref() == binding.canonical_intent_digest;
+    if !exact {
+        return Err(Status::permission_denied(
+            "Direct repository operation authorization binding mismatch",
+        ));
+    }
+    for (field, bytes) in [
+        ("verification_nonce", response.verification_nonce.as_ref()),
+        ("bound_fields_digest", response.bound_fields_digest.as_ref()),
+    ] {
+        if bytes.len() != DIRECT_WITNESS_FIELD_LEN {
+            return Err(Status::permission_denied(format!(
+                "Direct repository operation verifier returned invalid {field}"
+            )));
+        }
+    }
+    if response.authorization_id.len() != domain_operation_metadata::OPERATION_ID_LEN {
+        return Err(Status::permission_denied(
+            "Direct repository operation verifier returned invalid authorization_id",
+        ));
+    }
+    Ok(())
 }
 
 /// A governed operation that passed the entry gate.
@@ -372,17 +933,131 @@ impl DomainContext {
 pub struct AdmittedOperation {
     /// Receipt namespace this operation was admitted into.
     pub key: ReceiptKey,
-    /// The validated carriage.
-    pub carried: domain_operation_metadata::DomainOperationMetadata,
+    /// Where this operation's identity came from.
+    pub source: AdmissionSource,
+}
+
+/// Where an admitted operation's identity came from.
+///
+/// An enum rather than an optional carriage field on purpose: the two arms
+/// complete through genuinely different code, and a missed arm has to be a
+/// compile error. Filling a synthesised `DomainOperationMetadata` with zeroed
+/// stand-ins for the prepare token and fingerprint would make a skipped
+/// internal prepare present an all-zero bearer secret instead.
+/// `Debug` is hand-written for the same reason [`InternalAdmission`]'s is, and
+/// for symmetry with it. The carried arm holds a `prepare_token`, which is a
+/// single-use bearer secret, and `DomainOperationMetadata` derives `Debug` over
+/// it. Redacting only the internal arm's bearer would have left the sibling arm
+/// printing a credential from the same one-word edit.
+#[derive(Clone)]
+pub enum AdmissionSource {
+    /// Carriage the caller presented and this gate validated. Today's
+    /// control-plane-mediated path, and any client that prepared through the
+    /// private receipt rail itself.
+    ///
+    /// Boxed because the validated carriage is roughly six times the size of an
+    /// internal admission, and every `AdmittedOperation` — including the far
+    /// more common internal one, once released clients are the norm — would
+    /// otherwise carry that width.
+    Carried(Box<domain_operation_metadata::DomainOperationMetadata>),
+    /// WP-120: no carriage, a verified human principal on a released client.
+    /// This server mints the operation identity and runs the prepare itself.
+    Internal(InternalAdmission),
+}
+
+/// What an internal admission carries from the entry gate to the seam.
+///
+/// `Debug` is implemented by hand rather than derived: this type holds the
+/// caller's raw bearer token, and a derived `Debug` would print it in full the
+/// first time anyone writes `warn!(?admitted, ..)` at a governed site. That is a
+/// credential in a log file, reachable by a one-word edit at any of a dozen call
+/// sites, so the redaction lives in the type rather than in a convention every
+/// future call site has to remember.
+#[derive(Clone)]
+pub struct InternalAdmission {
+    /// 16-byte target repository identity, handed to the verifier so its
+    /// authorization decision names the resource actually being mutated.
+    pub repository_id: Vec<u8>,
+    /// The caller's own `authorization` header value, forwarded to auth-grpc so
+    /// the verifier authenticates the human independently rather than trusting
+    /// this server's report of who is calling.
+    ///
+    /// Never logged, never persisted, and never placed in a receipt row.
+    pub bearer: String,
+}
+
+impl std::fmt::Debug for AdmissionSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Carried(carried) => f
+                .debug_struct("Carried")
+                .field("operation_id", &carried.operation_id)
+                .field("fingerprint_version", &carried.fingerprint_version)
+                .field("fingerprint", &carried.fingerprint)
+                .field("prepare_token", &"<redacted>")
+                .field("mediated_scope", &carried.mediated_scope)
+                .field("claim_witness", &carried.claim_witness)
+                .finish(),
+            Self::Internal(internal) => f.debug_tuple("Internal").field(internal).finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for InternalAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InternalAdmission")
+            .field("repository_id", &self.repository_id)
+            .field("bearer", &"<redacted>")
+            .finish()
+    }
 }
 
 impl AdmittedOperation {
-    /// Complete the operation at the coordinator call site.
+    /// The carriage the caller presented, or `None` when this server minted the
+    /// operation identity itself.
+    #[must_use]
+    pub fn carried(&self) -> Option<&domain_operation_metadata::DomainOperationMetadata> {
+        match &self.source {
+            AdmissionSource::Carried(carried) => Some(carried),
+            AdmissionSource::Internal(_) => None,
+        }
+    }
+
+    /// Whether this server minted the operation identity itself.
+    #[must_use]
+    pub fn is_internally_prepared(&self) -> bool {
+        matches!(self.source, AdmissionSource::Internal(_))
+    }
+
+    /// Complete a **presented-carriage** operation at the coordinator call site.
+    ///
+    /// Unchanged from before WP-120 and still infallible: the caller already
+    /// holds a prepare token, so nothing here can fail. An internally admitted
+    /// operation has no token yet and cannot use this path — it goes through
+    /// [`DomainContext::complete_governed`], which is the entry point every seam
+    /// now calls.
     pub fn into_governed(
         self,
         method: impl Into<String>,
         canonical_intent_digest: Vec<u8>,
     ) -> GovernedOperation {
+        let (fingerprint_version, fingerprint, prepare_token) = match self.source {
+            AdmissionSource::Carried(carried) => (
+                carried.fingerprint_version,
+                carried.fingerprint,
+                carried.prepare_token,
+            ),
+            // Unreachable through `complete_governed`, which routes this arm to
+            // the internal prepare. A zero token is refused by `receipts::
+            // consume`'s constant-time comparison, so a future caller that
+            // reached here by mistake gets a decisive admission rejection rather
+            // than a silently unadmitted mutation.
+            AdmissionSource::Internal(_) => (
+                i32::from(domain_operation_metadata::FINGERPRINT_VERSION_V1),
+                Vec::new(),
+                [0u8; domain_operation_metadata::PREPARE_TOKEN_LEN],
+            ),
+        };
         GovernedOperation {
             binding: OperationBinding {
                 method: method.into(),
@@ -390,11 +1065,11 @@ impl AdmittedOperation {
                 // receipt's tenant scope are the same bytes: the operation
                 // targets exactly the resource whose namespace admits it.
                 scope: self.key.tenant_scope_key.clone(),
-                fingerprint_version: self.carried.fingerprint_version,
-                fingerprint: self.carried.fingerprint,
+                fingerprint_version,
+                fingerprint,
                 canonical_intent_digest,
             },
-            prepare_token: self.carried.prepare_token,
+            prepare_token,
             key: self.key,
         }
     }
@@ -485,7 +1160,7 @@ impl GovernedMetadataCas {
     /// spell a method of its own. Before this, each of the four bound its own
     /// gRPC path, so one operation id was consumable only by whichever wire
     /// version the caller happened to reach.
-    pub fn prepare(
+    pub async fn prepare(
         domain: Option<&Arc<DomainContext>>,
         admitted: Option<AdmittedOperation>,
         family: MetadataCasFamily,
@@ -502,9 +1177,12 @@ impl GovernedMetadataCas {
                 "Domain coordinator is unavailable",
             ));
         };
+        let operation = domain
+            .complete_governed(admitted, family.platform_method(), digest)
+            .await?;
         Ok(Some(Self {
             domain: domain.clone(),
-            operation: admitted.into_governed(family.platform_method(), digest),
+            operation,
         }))
     }
 
@@ -901,21 +1579,26 @@ fn build_create_witness(
     admitted: &AdmittedOperation,
     digest: &[u8],
 ) -> Result<Option<GovernedCreateWitness>, Status> {
-    let Some(mediated) = admitted.carried.mediated_scope.as_ref() else {
+    // An internally prepared create has no carriage at all, so it has no
+    // mediated scope and no claim — the same answer a direct carried create
+    // gives, reached one step earlier.
+    let Some(carried) = admitted.carried() else {
         return Ok(None);
     };
-    let Some(claim) = admitted.carried.claim_witness.as_ref() else {
+    let Some(mediated) = carried.mediated_scope.as_ref() else {
+        return Ok(None);
+    };
+    let Some(claim) = carried.claim_witness.as_ref() else {
         return Err(Status::invalid_argument(
             "mediated governed repository create is missing claim-witness carriage",
         ));
     };
-    let fingerprint_version =
-        u32::try_from(admitted.carried.fingerprint_version).map_err(|_| {
-            // Unreachable through `validated`, which only ever produces version
-            // 1. Refusing rather than casting keeps the wire type conversion an
-            // enforced property instead of a silent truncation.
-            Status::invalid_argument("domain-operation fingerprint version is not representable")
-        })?;
+    let fingerprint_version = u32::try_from(carried.fingerprint_version).map_err(|_| {
+        // Unreachable through `validated`, which only ever produces version
+        // 1. Refusing rather than casting keeps the wire type conversion an
+        // enforced property instead of a silent truncation.
+        Status::invalid_argument("domain-operation fingerprint version is not representable")
+    })?;
     Ok(Some(GovernedCreateWitness {
         verified_issuer: admitted.key.verified_issuer.clone(),
         authenticated_subject: admitted.key.authenticated_subject.clone(),
@@ -924,9 +1607,9 @@ fn build_create_witness(
         operation_id: *admitted.key.operation_id.as_bytes(),
         scope: admitted.key.tenant_scope_key.clone(),
         fingerprint_version,
-        fingerprint: admitted.carried.fingerprint.clone(),
+        fingerprint: carried.fingerprint.clone(),
         canonical_intent_digest: digest.to_vec(),
-        prepare_token: admitted.carried.prepare_token,
+        prepare_token: carried.prepare_token,
         claim: claim.clone(),
     }))
 }
@@ -975,7 +1658,7 @@ impl GovernedRepositoryCreate {
     /// the platform, so the method is [`PLATFORM_METHOD_REPOSITORY_CREATE`] and
     /// a handler has no say in it. See that constant for what passing it per
     /// handler cost.
-    pub fn prepare(
+    pub async fn prepare(
         domain: Option<&Arc<DomainContext>>,
         admitted: Option<AdmittedOperation>,
         digest: Vec<u8>,
@@ -1002,9 +1685,12 @@ impl GovernedRepositoryCreate {
             ));
         }
         let create_witness = build_create_witness(&admitted, &digest)?;
+        let operation = domain
+            .complete_governed(admitted, PLATFORM_METHOD_REPOSITORY_CREATE, digest)
+            .await?;
         Ok(Some(Self {
             domain: domain.clone(),
-            operation: admitted.into_governed(PLATFORM_METHOD_REPOSITORY_CREATE, digest),
+            operation,
             create_witness,
         }))
     }
@@ -1350,7 +2036,7 @@ impl GovernedRepositoryDelete {
     /// Same reason as the create seam, applied before rather than after the
     /// defect: the method is [`PLATFORM_METHOD_REPOSITORY_DELETE`] and the two
     /// wire versions have no say in it.
-    pub fn prepare(
+    pub async fn prepare(
         domain: Option<&Arc<DomainContext>>,
         admitted: Option<AdmittedOperation>,
         digest: Vec<u8>,
@@ -1373,9 +2059,12 @@ impl GovernedRepositoryDelete {
                 "Governed repository delete requires domain enforcement on this cell",
             ));
         }
+        let operation = domain
+            .complete_governed(admitted, PLATFORM_METHOD_REPOSITORY_DELETE, digest)
+            .await?;
         Ok(Some(Self {
             domain: domain.clone(),
-            operation: admitted.into_governed(PLATFORM_METHOD_REPOSITORY_DELETE, digest),
+            operation,
         }))
     }
 
@@ -1631,7 +2320,7 @@ impl GovernedBranchDelete {
     /// two-state branch-delete contract does not model. A governed branch delete
     /// is admitted only on an enforcing cell, so the unmodelled state cannot
     /// reach this path at all; it remains open for the ungoverned one.
-    pub fn prepare(
+    pub async fn prepare(
         domain: Option<&Arc<DomainContext>>,
         admitted: Option<AdmittedOperation>,
         method: &'static str,
@@ -1655,9 +2344,10 @@ impl GovernedBranchDelete {
                 "Governed branch delete requires domain enforcement on this cell",
             ));
         }
+        let operation = domain.complete_governed(admitted, method, digest).await?;
         Ok(Some(Self {
             domain: domain.clone(),
-            operation: admitted.into_governed(method, digest),
+            operation,
         }))
     }
 
@@ -1969,6 +2659,25 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
     let fragment_coordinator = store
         .fragment_coordinator()
         .with_outbox_cell_id(cell_id.clone());
+    // WP-120: the same private auth-grpc endpoint the receipt rail is mounted
+    // on. Resolved from one place so the internal prepare and the private rail
+    // can never end up pointed at different verifiers.
+    //
+    // The rail additionally requires JWT authentication to be on
+    // (`grpc::server::domain_operation_service_available`). That condition is
+    // not re-tested here because it is already load-bearing at the point of
+    // use: an internal admission requires an `AuthorizationToken`, and one only
+    // exists on a cell whose JWT verifier ran.
+    let operation_verifier: Option<Arc<dyn RepositoryOperationAuthorizationVerifier>> = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.auth_url.clone())
+        .map(|auth_url| {
+            Arc::new(
+                crate::authnz::rebac::GrpcRepositoryOperationAuthorizationVerifier::new(auth_url),
+            ) as Arc<dyn RepositoryOperationAuthorizationVerifier>
+        });
     let context = if lock_fencing {
         DomainContext::new_with_lock_coordinator(
             Arc::new(store),
@@ -1978,7 +2687,8 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
     } else {
         DomainContext::new(Arc::new(store), enforcement)
     }
-    .with_cell_id(cell_id);
+    .with_cell_id(cell_id)
+    .with_operation_verifier(operation_verifier);
     Ok(ConfiguredDomainContext {
         context: Some(Arc::new(context)),
         mutable_enforcement: Some(mutable_enforcement),
@@ -2110,9 +2820,16 @@ fn resolve_lock_fencing(readiness: &LockFencingReadiness, settings: &Settings) -
             readiness.unfenced_rows
         ));
     }
+    // WP-120 makes public clients token-capable, which was the original reason
+    // this refusal existed. It stays because the *other* half never landed:
+    // nothing on the wire renews a lease, so a finite expiry would silently drop
+    // a lock a working client still believes it holds, and the row it leaves
+    // behind is a takeover target for anyone else. Leases stay off until a
+    // renewal cadence is specified.
     if readiness.lease_enabled {
         return Err(anyhow!(
-            "Finite lock leases are enabled before token-capable public clients are available"
+            "Finite lock leases are enabled, but no public client renews a lease, so a lock \
+             would expire under a caller that still holds it"
         ));
     }
     info!("Fenced lock coordinator is active");
@@ -2418,6 +3135,162 @@ pub(crate) mod test_support {
         DomainContext::new(Arc::new(UnreachableDomainStore), enforcement)
     }
 
+    /// [`UnreachableDomainStore`] with one method made reachable:
+    /// `domain_operation_prepare` returns a fixed `Prepared`.
+    ///
+    /// The internal-prepare tests that reach the coordinator are the ones whose
+    /// verifier ACCEPTS. Every refusal case fails at the echo check, before the
+    /// prepare, which is the ordering the design depends on — so those keep
+    /// using [`UnreachableDomainStore`] and its panic is the proof that no
+    /// receipt row could have been written. This double exists only for the
+    /// happy path, and everything except prepare still panics, so a test that
+    /// wanders past it fails loudly rather than silently exercising a stub.
+    pub(crate) struct PreparingDomainStore;
+
+    /// The token this double hands back, so a test can assert the governed
+    /// operation carries the coordinator's token rather than anything the
+    /// caller supplied.
+    pub(crate) const PREPARED_TEST_TOKEN: [u8; 32] = [0x5Au8; 32];
+
+    #[async_trait]
+    impl DomainTransactionStore for PreparingDomainStore {
+        async fn domain_operation_prepare(
+            &self,
+            _key: &ReceiptKey,
+            _binding: &OperationBinding,
+            witness: Option<&AuthorizationWitness>,
+        ) -> Result<PrepareResult, DomainError> {
+            // The direct rail must never write a mediated dispatch fence, and a
+            // present witness is what makes the real rail write one. Asserted
+            // here rather than documented, so a change that starts passing one
+            // fails this test instead of quietly filing a direct operation as a
+            // mediated one.
+            assert!(
+                witness.is_none(),
+                "a direct internal prepare must pass no authorization witness"
+            );
+            Ok(PrepareResult::Prepared {
+                token: PREPARED_TEST_TOKEN,
+                hard_expires_at: std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(1),
+            })
+        }
+
+        async fn domain_operation_clock_get(&self) -> Result<std::time::SystemTime, DomainError> {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+
+        async fn domain_operation_receipt_get(
+            &self,
+            _key: &ReceiptKey,
+            _binding: &OperationBinding,
+        ) -> Result<ReceiptLookup, DomainError> {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+
+        async fn domain_operation_verified_stale_finalize(
+            &self,
+            _input: &lore_postgres::domain::maintenance::VerifiedStaleFinalizeInput,
+        ) -> Result<lore_postgres::domain::maintenance::VerifiedStaleFinalizeResult, DomainError>
+        {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+
+        async fn domain_operation_terminal_status_attach(
+            &self,
+            _input: &lore_postgres::domain::maintenance::TerminalStatusAttachInput,
+        ) -> Result<lore_postgres::domain::maintenance::TerminalStatusAttachmentAck, DomainError>
+        {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+
+        async fn domain_operation_proof_namespace_materialize(
+            &self,
+            _input: &lore_postgres::domain::maintenance::ProofNamespaceMaterializeInput,
+        ) -> Result<lore_postgres::domain::maintenance::ProofNamespaceMaterializeReceipt, DomainError>
+        {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+
+        async fn domain_operation_proof_namespace_retire(
+            &self,
+            _input: &lore_postgres::domain::maintenance::ProofNamespaceRetireInput,
+        ) -> Result<lore_postgres::domain::maintenance::ProofNamespaceRetireAck, DomainError>
+        {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+
+        async fn repository_snapshot(
+            &self,
+            _repository_id: &[u8],
+        ) -> Result<Option<lore_postgres::domain::coordinator::RepositorySnapshot>, DomainError>
+        {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+
+        async fn branch_snapshot(
+            &self,
+            _repository_id: &[u8],
+            _branch_id: &[u8],
+        ) -> Result<Option<BranchSnapshot>, DomainError> {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+
+        async fn repository_create(
+            &self,
+            _operation: &GovernedOperation,
+            _input: &RepositoryCreateInput,
+        ) -> Result<MutationResult, DomainError> {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+
+        async fn repository_delete(
+            &self,
+            _operation: &GovernedOperation,
+            _input: &RepositoryDeleteInput,
+        ) -> Result<MutationResult, DomainError> {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+
+        async fn branch_delete(
+            &self,
+            _operation: &GovernedOperation,
+            _input: &BranchDeleteInput,
+        ) -> Result<MutationResult, DomainError> {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+
+        async fn metadata_compare_and_swap(
+            &self,
+            _operation: &GovernedOperation,
+            _input: &MetadataCasInput,
+        ) -> Result<MutationResult, DomainError> {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+
+        async fn branch_push_commit(
+            &self,
+            _operation: &GovernedOperation,
+            _input: &lore_postgres::domain::coordinator::BranchPushCommitInput,
+        ) -> Result<MutationResult, DomainError> {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+
+        async fn begin_obliterate(
+            &self,
+            _operation: &GovernedOperation,
+            _repository_id: &[u8],
+            _event: Option<&PendingEvent>,
+        ) -> Result<MutationResult, DomainError> {
+            unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+    }
+
+    /// A context whose coordinator will serve one `domain_operation_prepare`.
+    pub(crate) fn preparing_context() -> DomainContext {
+        DomainContext::new(Arc::new(PreparingDomainStore), true)
+    }
+
     /// A scriptable coordinator for `branch_push.rs`'s `GovernedPushCommit::publish`
     /// tests (INV-EE P1-5): records every `branch_push_commit` call's input and
     /// returns a caller-supplied scripted [`MutationResult`] for it. Every other
@@ -2577,7 +3450,9 @@ mod tests {
     use tonic::metadata::BinaryMetadataValue;
     use uuid::Uuid;
 
+    use super::test_support::PREPARED_TEST_TOKEN;
     use super::test_support::context;
+    use super::test_support::preparing_context;
     use super::*;
     use crate::auth::jwk::JWKServiceSettings;
     use crate::grpc::domain_operation_metadata::FINGERPRINT_KEY;
@@ -2873,8 +3748,9 @@ mod tests {
             .expect("valid carriage plus a verified principal must admit")
             .expect("must be Some");
 
-        let expected_prepare_token = admitted.carried.prepare_token;
-        let expected_fingerprint = admitted.carried.fingerprint.clone();
+        let carried = admitted.carried().expect("presented carriage").clone();
+        let expected_prepare_token = carried.prepare_token;
+        let expected_fingerprint = carried.fingerprint.clone();
         let expected_scope = admitted.key.tenant_scope_key.clone();
 
         let governed =
@@ -2884,6 +3760,751 @@ mod tests {
         assert_eq!(governed.binding.fingerprint, expected_fingerprint);
         assert_eq!(governed.binding.scope, expected_scope);
         assert_eq!(governed.binding.scope, governed.key.tenant_scope_key);
+    }
+
+    // --- 6a. WP-120 internal admission --------------------------------------
+
+    /// A verifier double for the direct-authorization rail. Every method but
+    /// `authorize_direct_repository_operation` is unreachable, matching this
+    /// file's other doubles (`UnreachableDomainStore`) -- a signature drift on
+    /// an unused method must fail to compile, not silently inherit a body.
+    struct DirectVerifierDouble {
+        calls: std::sync::atomic::AtomicUsize,
+        forwarded_bearer: std::sync::Mutex<Option<String>>,
+        diverge: Option<EchoDivergence>,
+        error: Option<Status>,
+    }
+
+    /// Which single field of an otherwise-exact echo this double flips.
+    #[derive(Clone, Copy)]
+    enum EchoDivergence {
+        VerifiedIssuer,
+        AuthenticatedSubject,
+        OperationId,
+        Method,
+        Scope,
+        FingerprintVersion,
+        Fingerprint,
+        CanonicalIntentDigest,
+    }
+
+    impl DirectVerifierDouble {
+        fn echo() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                forwarded_bearer: std::sync::Mutex::new(None),
+                diverge: None,
+                error: None,
+            }
+        }
+
+        fn diverging(divergence: EchoDivergence) -> Self {
+            Self {
+                diverge: Some(divergence),
+                ..Self::echo()
+            }
+        }
+
+        fn erroring(status: Status) -> Self {
+            Self {
+                error: Some(status),
+                ..Self::echo()
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn forwarded_bearer(&self) -> Option<String> {
+            self.forwarded_bearer
+                .lock()
+                .expect("forwarded-bearer mutex poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RepositoryOperationAuthorizationVerifier for DirectVerifierDouble {
+        async fn verify_repository_operation_authorization(
+            &self,
+            _request: tonic::Request<
+                lore_proto::rebac::VerifyRepositoryOperationAuthorizationRequest,
+            >,
+        ) -> Result<lore_proto::rebac::VerifyRepositoryOperationAuthorizationResponse, Status>
+        {
+            unreachable!("WP-120 internal-admission tests exercise only the direct rail")
+        }
+
+        async fn claim_repository_operation_stale_finalize_permit(
+            &self,
+            _request: tonic::Request<
+                lore_proto::rebac::DomainOperationMaintenanceVerificationRequest,
+            >,
+        ) -> Result<lore_proto::rebac::DomainOperationMaintenanceVerificationResponse, Status>
+        {
+            unreachable!("WP-120 internal-admission tests exercise only the direct rail")
+        }
+
+        async fn verify_repository_operation_terminal_status_attach(
+            &self,
+            _request: tonic::Request<
+                lore_proto::rebac::DomainOperationMaintenanceVerificationRequest,
+            >,
+        ) -> Result<lore_proto::rebac::DomainOperationMaintenanceVerificationResponse, Status>
+        {
+            unreachable!("WP-120 internal-admission tests exercise only the direct rail")
+        }
+
+        async fn verify_repository_operation_proof_namespace_materialize(
+            &self,
+            _request: tonic::Request<
+                lore_proto::rebac::DomainOperationMaintenanceVerificationRequest,
+            >,
+        ) -> Result<lore_proto::rebac::DomainOperationMaintenanceVerificationResponse, Status>
+        {
+            unreachable!("WP-120 internal-admission tests exercise only the direct rail")
+        }
+
+        async fn verify_repository_operation_proof_namespace_retire(
+            &self,
+            _request: tonic::Request<
+                lore_proto::rebac::DomainOperationMaintenanceVerificationRequest,
+            >,
+        ) -> Result<lore_proto::rebac::DomainOperationMaintenanceVerificationResponse, Status>
+        {
+            unreachable!("WP-120 internal-admission tests exercise only the direct rail")
+        }
+
+        async fn authorize_direct_repository_operation(
+            &self,
+            request: tonic::Request<lore_proto::rebac::AuthorizeDirectRepositoryOperationRequest>,
+        ) -> Result<lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse, Status> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self
+                .forwarded_bearer
+                .lock()
+                .expect("forwarded-bearer mutex poisoned") = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            if let Some(status) = &self.error {
+                return Err(status.clone());
+            }
+            let request = request.into_inner();
+            let mut response = lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse {
+                verified_issuer: request.verified_issuer,
+                authenticated_subject: request.authenticated_subject,
+                operation_id: request.operation_id,
+                method: request.method,
+                scope: request.scope,
+                fingerprint_version: request.fingerprint_version,
+                fingerprint: request.fingerprint,
+                canonical_intent_digest: request.canonical_intent_digest,
+                authorization_id: bytes::Bytes::from_static(&[0x77u8; 16]),
+                authorization_revision: 1,
+                verification_nonce: bytes::Bytes::from_static(&[0x11u8; 32]),
+                bound_fields_digest: bytes::Bytes::from_static(&[0x22u8; 32]),
+                org_uuid: bytes::Bytes::new(),
+            };
+            match self.diverge {
+                Some(EchoDivergence::VerifiedIssuer) => {
+                    response.verified_issuer = "wrong-issuer".to_owned();
+                }
+                Some(EchoDivergence::AuthenticatedSubject) => {
+                    response.authenticated_subject = "wrong-subject".to_owned();
+                }
+                Some(EchoDivergence::OperationId) => {
+                    response.operation_id = bytes::Bytes::from_static(&[0xFFu8; 16]);
+                }
+                Some(EchoDivergence::Method) => {
+                    response.method = "wrong-method".to_owned();
+                }
+                Some(EchoDivergence::Scope) => {
+                    response.scope = bytes::Bytes::from_static(b"wrong-scope");
+                }
+                Some(EchoDivergence::FingerprintVersion) => {
+                    response.fingerprint_version = response.fingerprint_version.wrapping_add(1);
+                }
+                Some(EchoDivergence::Fingerprint) => {
+                    response.fingerprint = bytes::Bytes::from_static(&[0xEEu8; 32]);
+                }
+                Some(EchoDivergence::CanonicalIntentDigest) => {
+                    response.canonical_intent_digest = bytes::Bytes::from_static(&[0xDDu8; 32]);
+                }
+                None => {}
+            }
+            Ok(response)
+        }
+    }
+
+    fn human_token() -> AuthorizationToken {
+        test_token("https://issuer.example", "released-desktop-user")
+    }
+
+    fn direct_scope_ctx(repository_id: &[u8; 16]) -> GovernedScope<'_> {
+        GovernedScope::TargetRepository { repository_id }
+    }
+
+    /// The bearer this cell's JWT interceptor would have verified.
+    pub(crate) const TEST_BEARER: &str = "Bearer released-desktop-jwt";
+
+    /// Request metadata carrying the caller's own `authorization` header and
+    /// nothing else.
+    ///
+    /// An empty `MetadataMap` beside a verified `AuthorizationToken` is a shape
+    /// the real server never emits: the interceptor derives that token FROM this
+    /// header, so one cannot exist without the other. The internal path forwards
+    /// this exact value to auth-grpc as the human's bearer, so a fixture without
+    /// it exercises the no-bearer refusal rather than the case it names.
+    fn human_metadata() -> MetadataMap {
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            "authorization",
+            TEST_BEARER.parse().expect("a static header value parses"),
+        );
+        metadata
+    }
+
+    // Gate 1: enforcement off leaves the caller on the legacy path even with
+    // a verifier configured -- a verifier's presence is not itself a licence
+    // to admit a governed mutation on a cell that still writes the generic
+    // mutable path unfenced.
+    #[test]
+    fn internal_admission_is_unavailable_when_enforcement_is_off_even_with_a_verifier_configured() {
+        let ctx = context(false)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let token = human_token();
+
+        let result = ctx.admit_internal(
+            &human_metadata(),
+            Some(&token),
+            &direct_scope_ctx(&repository_id),
+        );
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    // Gate 2: no verifier configured, enforcement on, no carriage -- falls
+    // through to the exact pre-WP-120 absent-carriage refusal. This is the
+    // same status `enforcement_on_with_no_carriage_is_refused_as_invalid_argument`
+    // already pins through the public `admit` entry point; this one exercises
+    // `admit_internal` directly so the gate itself, not just its caller, is
+    // proven byte-identical.
+    #[test]
+    fn internal_admission_is_unavailable_with_no_verifier_configured_and_falls_through_to_the_pre_wp120_refusal()
+     {
+        let ctx = context(true);
+        let repository_id = test_repository_id();
+        let token = human_token();
+
+        let err = ctx
+            .admit(
+                &human_metadata(),
+                Some(&token),
+                direct_scope_ctx(&repository_id),
+            )
+            .expect_err("no verifier configured must fall through to the pre-WP-120 refusal");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    // Gate 3: no verified principal at all -- absent carriage still refuses
+    // through `require`, not through a WP-120-specific status, even with a
+    // verifier configured.
+    #[test]
+    fn internal_admission_is_unavailable_with_no_authorization_token() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+
+        let err = ctx
+            .admit(&human_metadata(), None, direct_scope_ctx(&repository_id))
+            .expect_err("no authorization token must fall through to the pre-WP-120 refusal");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    // Gate 4 (security-critical): the control-plane service principal never
+    // takes the internal-admission path, even with a verifier configured and
+    // every other gate open. It always carries its own mediated carriage; a
+    // silent internal admission would drop a mediated operation into a
+    // direct human's receipt namespace.
+    #[test]
+    fn internal_admission_excludes_the_control_plane_service_principal() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let control_plane = AuthorizationToken {
+            issuer: "https://issuer.example".to_owned(),
+            user_id: CONTROL_PLANE_SERVICE_SUBJECT.to_owned(),
+            is_service_account: Some(true),
+            ..Default::default()
+        };
+
+        let err = ctx
+            .admit(
+                &human_metadata(),
+                Some(&control_plane),
+                direct_scope_ctx(&repository_id),
+            )
+            .expect_err("the control-plane principal must never take the internal path");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    // Gate 4 (security-critical), the other half: ANY service account is
+    // excluded, not only the named control-plane subject.
+    #[test]
+    fn internal_admission_excludes_every_service_account_not_only_the_control_plane_subject() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let service_account = AuthorizationToken {
+            issuer: "https://issuer.example".to_owned(),
+            user_id: "some-other-service-account".to_owned(),
+            is_service_account: Some(true),
+            ..Default::default()
+        };
+
+        let err = ctx
+            .admit(
+                &human_metadata(),
+                Some(&service_account),
+                direct_scope_ctx(&repository_id),
+            )
+            .expect_err("no service account, named or not, may take the internal path");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    // Gate 5: a mediated scope with no carriage is a contradiction -- refused
+    // directly, not silently downgraded to the legacy path or the generic
+    // absent-carriage refusal.
+    #[test]
+    fn internal_admission_refuses_a_mediated_scope_with_no_carriage() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let org_uuid = test_repository_id();
+        let token = human_token();
+
+        let err = ctx
+            .admit(
+                &human_metadata(),
+                Some(&token),
+                GovernedScope::Mediated {
+                    org_uuid: &org_uuid,
+                    principal_user_id: b"user-1",
+                },
+            )
+            .expect_err("a mediated scope with no carriage must be refused, not downgraded");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    // The positive case: every gate open admits, keyed by the token and a
+    // freshly minted operation id, and is reported as internally prepared.
+    #[test]
+    fn internal_admission_admits_a_released_client_when_every_gate_is_open() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let token = human_token();
+
+        let admitted = ctx
+            .admit(
+                &human_metadata(),
+                Some(&token),
+                direct_scope_ctx(&repository_id),
+            )
+            .expect("every gate open must admit")
+            .expect("must be Some, not the legacy path");
+
+        assert!(admitted.is_internally_prepared());
+        assert!(admitted.carried().is_none());
+        assert_eq!(admitted.key.verified_issuer, token.issuer);
+        assert_eq!(admitted.key.authenticated_subject, token.user_id);
+    }
+
+    // Two internal admissions for the same repository mint two different
+    // operation ids: a released client carries no operation identity of its
+    // own, so there is no cross-attempt idempotency by construction.
+    #[test]
+    fn internal_admission_mints_a_fresh_operation_id_per_attempt() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let token = human_token();
+
+        let first = ctx
+            .admit(
+                &human_metadata(),
+                Some(&token),
+                direct_scope_ctx(&repository_id),
+            )
+            .expect("admit")
+            .expect("Some");
+        let second = ctx
+            .admit(
+                &human_metadata(),
+                Some(&token),
+                direct_scope_ctx(&repository_id),
+            )
+            .expect("admit")
+            .expect("Some");
+
+        assert_ne!(first.key.operation_id, second.key.operation_id);
+    }
+
+    // --- 6b. WP-120 complete_governed / internal_prepare --------------------
+
+    // Carriage still wins: `complete_governed` on a `Carried` admission never
+    // calls the verifier, even when one is configured, and produces the exact
+    // same `GovernedOperation` `into_governed` builds directly.
+    #[tokio::test]
+    async fn complete_governed_on_carried_admission_never_calls_the_verifier_and_matches_into_governed()
+     {
+        let verifier = std::sync::Arc::new(DirectVerifierDouble::echo());
+        let ctx = context(false).with_operation_verifier(Some(verifier.clone()));
+        let operation_id = Uuid::now_v7();
+        let metadata = valid_metadata(operation_id);
+        let token = test_token("https://issuer.example", "subject-123");
+        let repository_id = test_repository_id();
+
+        let admitted = ctx
+            .admit(
+                &metadata,
+                Some(&token),
+                GovernedScope::TargetRepository {
+                    repository_id: &repository_id,
+                },
+            )
+            .expect("valid carriage plus a verified principal must admit")
+            .expect("must be Some");
+        let digest = vec![0x99u8; 32];
+        let expected = admitted
+            .clone()
+            .into_governed("lore.RepositoryService/RepositoryDelete", digest.clone());
+
+        let governed = ctx
+            .complete_governed(admitted, "lore.RepositoryService/RepositoryDelete", digest)
+            .await
+            .expect("carried admission must complete without touching the verifier");
+
+        assert_eq!(governed.prepare_token, expected.prepare_token);
+        assert_eq!(governed.binding.fingerprint, expected.binding.fingerprint);
+        assert_eq!(governed.binding.scope, expected.binding.scope);
+        assert_eq!(governed.key.operation_id, expected.key.operation_id);
+        assert_eq!(verifier.call_count(), 0);
+    }
+
+    // Echo divergence: a verifier that flips any single field of its
+    // otherwise-exact echo must be refused `PERMISSION_DENIED`, and the
+    // refusal happens before `domain_operation_prepare` is ever called --
+    // `UnreachableDomainStore` backs this context, so a regression that
+    // reordered the echo check after the store call would panic this test
+    // instead of merely failing an assertion.
+    async fn assert_echo_divergence_is_refused(divergence: EchoDivergence) {
+        let ctx = context(true).with_operation_verifier(Some(std::sync::Arc::new(
+            DirectVerifierDouble::diverging(divergence),
+        )));
+        let repository_id = test_repository_id();
+        let token = human_token();
+
+        let admitted = ctx
+            .admit(
+                &human_metadata(),
+                Some(&token),
+                direct_scope_ctx(&repository_id),
+            )
+            .expect("every gate open must admit")
+            .expect("must be Some");
+
+        let error = ctx
+            .complete_governed(
+                admitted,
+                PLATFORM_METHOD_REPOSITORY_METADATA_SET,
+                vec![0x11u8; 32],
+            )
+            .await
+            .expect_err("a divergent echo must be refused, not admitted");
+
+        assert_eq!(error.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn internal_prepare_refuses_a_verified_issuer_echo_divergence() {
+        assert_echo_divergence_is_refused(EchoDivergence::VerifiedIssuer).await;
+    }
+
+    #[tokio::test]
+    async fn internal_prepare_refuses_an_authenticated_subject_echo_divergence() {
+        assert_echo_divergence_is_refused(EchoDivergence::AuthenticatedSubject).await;
+    }
+
+    #[tokio::test]
+    async fn internal_prepare_refuses_an_operation_id_echo_divergence() {
+        assert_echo_divergence_is_refused(EchoDivergence::OperationId).await;
+    }
+
+    #[tokio::test]
+    async fn internal_prepare_refuses_a_method_echo_divergence() {
+        assert_echo_divergence_is_refused(EchoDivergence::Method).await;
+    }
+
+    #[tokio::test]
+    async fn internal_prepare_refuses_a_scope_echo_divergence() {
+        assert_echo_divergence_is_refused(EchoDivergence::Scope).await;
+    }
+
+    #[tokio::test]
+    async fn internal_prepare_refuses_a_fingerprint_version_echo_divergence() {
+        assert_echo_divergence_is_refused(EchoDivergence::FingerprintVersion).await;
+    }
+
+    #[tokio::test]
+    async fn internal_prepare_refuses_a_fingerprint_echo_divergence() {
+        assert_echo_divergence_is_refused(EchoDivergence::Fingerprint).await;
+    }
+
+    #[tokio::test]
+    async fn internal_prepare_refuses_a_canonical_intent_digest_echo_divergence() {
+        assert_echo_divergence_is_refused(EchoDivergence::CanonicalIntentDigest).await;
+    }
+
+    // The internal prepare forwards the caller's own bearer token to the
+    // verifier, unaltered, so the verifier re-verifies the JWT itself rather
+    // than trusting this server's report of who is calling.
+    #[tokio::test]
+    async fn internal_prepare_forwards_the_callers_own_bearer_token_to_the_verifier() {
+        let verifier = std::sync::Arc::new(DirectVerifierDouble::echo());
+        // `preparing_context` rather than `context(true)`: an ACCEPTING verifier
+        // means execution continues past the echo check into the coordinator's
+        // prepare, which `UnreachableDomainStore` panics on by design. Every
+        // refusal case still uses that store, and its panic is what proves those
+        // paths write no receipt row.
+        let ctx = preparing_context().with_operation_verifier(Some(verifier.clone()));
+        let repository_id = test_repository_id();
+        let token = human_token();
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            "authorization",
+            "Bearer released-client-jwt".parse().expect("ascii header"),
+        );
+
+        let admitted = ctx
+            .admit_internal(&metadata, Some(&token), &direct_scope_ctx(&repository_id))
+            .expect("every gate open must admit")
+            .expect("must be Some");
+
+        let governed = ctx
+            .complete_governed(
+                admitted,
+                PLATFORM_METHOD_REPOSITORY_METADATA_SET,
+                vec![0x22u8; 32],
+            )
+            .await
+            .expect("echoing verifier must admit");
+
+        assert_eq!(
+            verifier.forwarded_bearer(),
+            Some("Bearer released-client-jwt".to_owned()),
+            "the verifier must receive the caller's own bearer, unaltered"
+        );
+        assert_eq!(
+            governed.prepare_token, PREPARED_TEST_TOKEN,
+            "the governed operation must carry the token the coordinator minted"
+        );
+        assert_eq!(
+            governed.binding.method,
+            PLATFORM_METHOD_REPOSITORY_METADATA_SET
+        );
+    }
+
+    // A verifier that errors is a refusal, never a silent downgrade to the
+    // legacy path -- the caller already committed to the internal path by
+    // reaching `complete_governed`'s `Internal` arm.
+    #[tokio::test]
+    async fn internal_prepare_refuses_when_the_configured_verifier_errors() {
+        let ctx = context(true).with_operation_verifier(Some(std::sync::Arc::new(
+            DirectVerifierDouble::erroring(Status::unavailable("verifier unreachable")),
+        )));
+        let repository_id = test_repository_id();
+        let token = human_token();
+
+        let admitted = ctx
+            .admit(
+                &human_metadata(),
+                Some(&token),
+                direct_scope_ctx(&repository_id),
+            )
+            .expect("every gate open must admit")
+            .expect("must be Some");
+
+        let error = ctx
+            .complete_governed(
+                admitted,
+                PLATFORM_METHOD_REPOSITORY_METADATA_SET,
+                vec![0x33u8; 32],
+            )
+            .await
+            .expect_err("a verifier error must be refused, not downgraded");
+
+        assert_eq!(error.code(), Code::Unavailable);
+    }
+
+    // A fenced-lock direct prepare against a cell with no verifier configured
+    // is refused the same way -- `prepare_direct_lock_operation` does not
+    // gate on verifier presence itself the way `admit_internal` does, so this
+    // is its own independent proof rather than a restatement of the
+    // repository-mutation gate table above.
+    #[tokio::test]
+    async fn prepare_direct_lock_operation_refuses_with_no_verifier_configured() {
+        let ctx = context(true);
+        let token = human_token();
+        let repository_id = test_repository_id();
+        let branch_id = test_repository_id();
+        let binding = OperationBinding {
+            method: "lock.acquire".to_owned(),
+            scope: vec![0x44u8; 16],
+            fingerprint_version: 1,
+            fingerprint: vec![0x55u8; 32],
+            canonical_intent_digest: vec![0x66u8; 32],
+        };
+
+        let error = ctx
+            .prepare_direct_lock_operation(&token, "Bearer x", &repository_id, &branch_id, binding)
+            .await
+            .expect_err("no verifier configured must refuse, not panic or silently admit");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+    }
+
+    // A fenced-lock direct prepare excludes the control-plane and service
+    // accounts the same way the repository-mutation gate does -- a direct
+    // fenced lock is for human principals.
+    #[tokio::test]
+    async fn prepare_direct_lock_operation_excludes_service_accounts() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let branch_id = test_repository_id();
+        let service_account = AuthorizationToken {
+            issuer: "https://issuer.example".to_owned(),
+            user_id: "some-service-account".to_owned(),
+            is_service_account: Some(true),
+            ..Default::default()
+        };
+        let binding = OperationBinding {
+            method: "lock.acquire".to_owned(),
+            scope: vec![0x44u8; 16],
+            fingerprint_version: 1,
+            fingerprint: vec![0x55u8; 32],
+            canonical_intent_digest: vec![0x66u8; 32],
+        };
+
+        let error = ctx
+            .prepare_direct_lock_operation(
+                &service_account,
+                "Bearer x",
+                &repository_id,
+                &branch_id,
+                binding,
+            )
+            .await
+            .expect_err("a service account must be refused a direct fenced lock");
+
+        assert_eq!(error.code(), Code::PermissionDenied);
+    }
+
+    // --- 6c. internal_prepare_fingerprint determinism -----------------------
+    //
+    // Every vector below is computed independently (Python's `blake3`
+    // package, not this function's own output) over
+    // `b"lore-internal-prepare-fingerprint-v1\0"` followed by each of
+    // method/scope/canonical_intent_digest, u32-big-endian length-prefixed.
+    // Per the testing guide's "never hash two blocks of output to rule out a
+    // difference" rule, these are golden values, not a change detector.
+
+    fn fingerprint_digest_fixture() -> [u8; 32] {
+        let mut digest = [0u8; 32];
+        for (index, byte) in digest.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        digest
+    }
+
+    #[test]
+    fn internal_prepare_fingerprint_matches_an_independently_computed_golden_vector() {
+        let fingerprint = internal_prepare_fingerprint(
+            "branch.push",
+            b"test-scope-bytes",
+            &fingerprint_digest_fixture(),
+        )
+        .expect("bounded inputs must not overflow the frame width");
+
+        assert_eq!(
+            hex::encode(&fingerprint),
+            "8b51c6c83b92f3c6f2f40e85d611ead84ff1bde91c64b82babe004a7baef90d8"
+        );
+    }
+
+    #[test]
+    fn internal_prepare_fingerprint_changes_when_the_method_changes() {
+        let fingerprint = internal_prepare_fingerprint(
+            "repository.metadata-set",
+            b"test-scope-bytes",
+            &fingerprint_digest_fixture(),
+        )
+        .expect("bounded inputs must not overflow the frame width");
+
+        assert_eq!(
+            hex::encode(&fingerprint),
+            "220c20b16ec8c3bd3a0a61400255fb492a1d598832abd66b3a70978cbb5c6616"
+        );
+    }
+
+    #[test]
+    fn internal_prepare_fingerprint_changes_when_the_scope_changes() {
+        let fingerprint = internal_prepare_fingerprint(
+            "branch.push",
+            b"different-scope",
+            &fingerprint_digest_fixture(),
+        )
+        .expect("bounded inputs must not overflow the frame width");
+
+        assert_eq!(
+            hex::encode(&fingerprint),
+            "8e356e78514930907e37109a15e141a2d15983f1ed752829589be3cdfe7c8b48"
+        );
+    }
+
+    #[test]
+    fn internal_prepare_fingerprint_changes_when_the_digest_changes() {
+        let mut digest = fingerprint_digest_fixture();
+        digest[0] = 0xff;
+
+        let fingerprint = internal_prepare_fingerprint("branch.push", b"test-scope-bytes", &digest)
+            .expect("bounded inputs must not overflow the frame width");
+
+        assert_eq!(
+            hex::encode(&fingerprint),
+            "89d96fa375318e4a0e156584292745ba017b99d40c6c2dc5de0dd866fdc8fe35"
+        );
+    }
+
+    #[test]
+    fn internal_prepare_fingerprint_changes_with_an_empty_scope() {
+        let fingerprint =
+            internal_prepare_fingerprint("branch.push", b"", &fingerprint_digest_fixture())
+                .expect("bounded inputs must not overflow the frame width");
+
+        assert_eq!(
+            hex::encode(&fingerprint),
+            "94bfef7a8a2c81b22e1d5217d45bffd6dfa5e00ff0eba7e91e2b3c04afe729fc"
+        );
     }
 
     // --- 7. resolve_enforcement ---------------------------------------------

@@ -107,20 +107,24 @@ fn row_to_lock_data(row: &Row) -> LockData {
     }
 }
 
-// BLOCKED(WP-117): unfenced lock path reaches store/lock_store.rs directly;
-// events flow only when fenced routing is armed
-// (PUBLIC_MUTATION_CONTRACT_AVAILABLE, WP-120).
+// The unfenced lock path: this store is what a cell reaches when fenced routing
+// is NOT armed, and none of its methods can append a CR-032 `lock_namespace`
+// event.
 //
-// Every method below is the production lock writer today, and none of them can
-// append a CR-032 `lock_namespace` event. `lore_locks` does carry a `fence`
-// column and both lock-generation columns — SCHEMA-117 added them — but this
-// store never writes or reads any of them, and it holds no lock-namespace row,
-// so it commits no version for an event to key on. The producer lives on
-// `domain::locks::PostgresLockCoordinator`, which writes the same table through
-// its own fenced SQL; see `lore-server/src/grpc/lock_service.rs`'s
-// `fenced_public_mutation_unavailable` for why the public RPCs cannot reach it
-// yet. Do not add an outbox append here — a second writer of the same rows
-// under a different lock discipline is exactly what CR-030 exists to end.
+// `lore_locks` does carry a `fence` column and both lock-generation columns —
+// SCHEMA-117 added them — but this store never writes or reads any of them, and
+// it holds no lock-namespace row, so it commits no version for an event to key
+// on. The producer lives on `domain::locks::PostgresLockCoordinator`, which
+// writes the same table through its own fenced SQL.
+//
+// As of WP-120 the public lock RPCs DO reach that coordinator on an armed cell:
+// `PUBLIC_MUTATION_CONTRACT_AVAILABLE` is true, and
+// `lore-server/src/grpc/lock_service.rs` routes `Lock`, `Unlock`, `AdminLock`
+// and `ForceUnlock` through it. So this store is the legacy route for an
+// unarmed cell, not a permanent second writer — but that makes the rule below
+// stricter, not looser. Do not add an outbox append here: a second writer of
+// the same rows under a different lock discipline is exactly what CR-030 exists
+// to end, and the two routes now coexist across cells rather than across time.
 #[async_trait]
 impl LockStore for PostgresLockStore {
     #[tracing::instrument(level = "debug", skip_all)]

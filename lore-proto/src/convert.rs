@@ -266,8 +266,13 @@ impl From<LockData> for crate::lock::Lock {
                 branch: lock.resource.branch.into(),
                 hash: lock.resource.hash.into(),
                 description: lock.resource.description,
+                // The legacy `LockData` projection carries no fenced token.
+                // The fenced acquire path builds its wire rows directly and is
+                // the only producer that ever fills these in.
+                expected_ownership_token: Default::default(),
             }),
             owner: lock.owner,
+            ownership_token: Default::default(),
             locked_at: Some(prost_types::Timestamp {
                 seconds: (lock.locked_at / 1000) as i64,
                 nanos: ((lock.locked_at % 1_000) * 1_000_000) as i32,
@@ -283,8 +288,10 @@ impl From<&LockData> for crate::lock::Lock {
                 branch: lock.resource.branch.into(),
                 hash: lock.resource.hash.into(),
                 description: lock.resource.description.clone(),
+                expected_ownership_token: Default::default(),
             }),
             owner: lock.owner.clone(),
+            ownership_token: Default::default(),
             locked_at: Some(prost_types::Timestamp {
                 seconds: (lock.locked_at / 1000) as i64,
                 nanos: ((lock.locked_at % 1_000) * 1_000_000) as i32,
@@ -339,6 +346,7 @@ impl From<LockResource> for crate::lock::Resource {
             branch: resource.branch.into(),
             hash: resource.hash.into(),
             description: resource.description,
+            expected_ownership_token: Default::default(),
         }
     }
 }
@@ -349,6 +357,7 @@ impl From<&LockResource> for crate::lock::Resource {
             branch: resource.branch.into(),
             hash: resource.hash.into(),
             description: resource.description.clone(),
+            expected_ownership_token: Default::default(),
         }
     }
 }

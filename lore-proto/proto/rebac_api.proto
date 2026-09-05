@@ -31,6 +31,26 @@ service RebacApi {
       returns (DomainOperationMaintenanceVerificationResponse) {};
   rpc VerifyRepositoryOperationProofNamespaceRetire(DomainOperationMaintenanceVerificationRequest)
       returns (DomainOperationMaintenanceVerificationResponse) {};
+
+  // FORK-LOCAL (Tideshift, WP-120). Private server-to-auth callback for a DIRECT
+  // HUMAN mutation. loreserver calls this before DomainOperationPrepare when the
+  // initiating principal is a human Lore JWT bearer rather than the mediated
+  // control-plane service account: the human sends no carriage headers, so
+  // loreserver mints its own operation id, fingerprint and prepare token and asks
+  // the platform only whether this human may perform this mutation.
+  //
+  // The human's own Lore JWT MUST be forwarded as the `authorization: Bearer`
+  // metadata on this call, exactly as it already is for CheckUserPermission.
+  // auth-grpc authenticates that bearer itself; verified_issuer and
+  // authenticated_subject in the body are echoes checked against it and never
+  // select authority on their own.
+  //
+  // A refusal is a gRPC error, never an `authorized=false` field.
+  //
+  // The on-the-wire method path is
+  // /ucs.auth.RebacApi/AuthorizeDirectRepositoryOperation.
+  rpc AuthorizeDirectRepositoryOperation(AuthorizeDirectRepositoryOperationRequest)
+      returns (AuthorizeDirectRepositoryOperationResponse) {};
 }
 
 // Messages for requests/responses
@@ -120,6 +140,79 @@ message VerifyRepositoryOperationAuthorizationResponse {
   // FORK-LOCAL (Tideshift, CR-029): frozen claim-identity digest minted by
   // the platform verify CAS and bound into the first PREPARED fence.
   bytes expected_claim_identity_digest = 16;
+}
+
+// FORK-LOCAL (Tideshift, WP-120). The direct-human authorization request.
+//
+// verified_issuer and authenticated_subject come from loreserver's verified JWT
+// extension and are ECHOES: auth-grpc equality-checks them against the principal
+// it derives from the forwarded bearer, and a divergence is PERMISSION_DENIED.
+// There is deliberately no org_uuid and no initiating_principal_namespace —
+// auth-grpc derives both from the verified subject and the repository row, so
+// they cannot be stated by a caller.
+//
+// method is a CLOSED set of ten: repository.delete, repository.metadata-set,
+// branch.metadata-set, branch.push, repository.obliterate, lock.acquire,
+// lock.renew, lock.release, lock.force_release, lock.admin_acquire.
+// repository.create is refused here and stays on the mediated claim rail. An
+// unknown method is refused, never defaulted.
+//
+// scope is Lore's own tenant scope key over the target repository. It is
+// supplied rather than derived because the receipt namespace is Lore's; auth-grpc
+// requires it to contain repository_id and refuses otherwise.
+//
+// branch_id is 16 bytes for the lock families, which are branch-scoped. Sent
+// EMPTY for the five mutation families, including branch.push and
+// branch.metadata-set, because the admission gate holds a repository-only scope
+// and the branch is not known until the coordinator call site. Deferred, not
+// absent: a witness issued for one branch cannot be presented for another only
+// on the lock families, not on the two branch mutation families.
+message AuthorizeDirectRepositoryOperationRequest {
+  string verified_issuer = 1;
+  string authenticated_subject = 2;
+  bytes operation_id = 3;
+  string method = 4;
+  bytes scope = 5;
+  uint32 fingerprint_version = 6;
+  bytes fingerprint = 7;
+  bytes canonical_intent_digest = 8;
+  bytes repository_id = 9;
+  bytes branch_id = 10;
+}
+
+// FORK-LOCAL (Tideshift, WP-120). Exact echo plus the witness.
+//
+// No consumed_ticket_sha256 and no expected_claim_identity_digest, unlike the
+// mediated response: loreserver calls its prepare with `witness: None` for a
+// direct operation so it writes no dispatch-possibility fence and has nowhere
+// sound to put either value.
+//
+// bound_fields_digest is SHA-256 over
+// "repository-operation-direct-authorization-v1\0" followed by, each
+// length-prefixed with a big-endian u32: verified_issuer, authenticated_subject,
+// operation_id, method, scope, u32be(fingerprint_version), fingerprint,
+// canonical_intent_digest, repository_id, branch_id, authorization_id,
+// u64be(authorization_revision), verification_nonce. Every input is a field
+// loreserver already holds, so it can recompute this standalone.
+//
+// authorization_id is frozen equal to operation_id, as CR-029 does.
+// authorization_revision is always 1: a direct authorization is minted straight
+// at VERIFIED and has no earlier state to advance from.
+// org_uuid is audit only; it is not an input to Lore's direct receipt namespace.
+message AuthorizeDirectRepositoryOperationResponse {
+  string verified_issuer = 1;
+  string authenticated_subject = 2;
+  bytes operation_id = 3;
+  string method = 4;
+  bytes scope = 5;
+  uint32 fingerprint_version = 6;
+  bytes fingerprint = 7;
+  bytes canonical_intent_digest = 8;
+  bytes authorization_id = 9;
+  uint64 authorization_revision = 10;
+  bytes verification_nonce = 11;
+  bytes bound_fields_digest = 12;
+  bytes org_uuid = 13;
 }
 
 // Closed method discriminator for the four CR-029 maintenance verifier ports.

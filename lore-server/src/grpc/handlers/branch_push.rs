@@ -447,9 +447,12 @@ pub(crate) async fn prepare_governed_push(
         verified_issuer: admitted.key.verified_issuer.clone(),
         authenticated_subject: admitted.key.authenticated_subject.clone(),
     };
+    let operation = domain
+        .complete_governed(admitted, PLATFORM_METHOD_BRANCH_PUSH, digest)
+        .await?;
     Ok(Some(GovernedPushCommit {
         domain: domain.clone(),
-        operation: admitted.into_governed(PLATFORM_METHOD_BRANCH_PUSH, digest),
+        operation,
         repository_generation: repository.generation,
         branch_generation: branch.generation,
         expected_latest_hash: branch.latest_hash,
@@ -1458,14 +1461,14 @@ mod tests {
                 tenant_scope_key: vec![7; 16],
                 operation_id,
             },
-            carried: DomainOperationMetadata {
+            source: crate::domain::AdmissionSource::Carried(Box::new(DomainOperationMetadata {
                 operation_id,
                 fingerprint_version: 1,
                 fingerprint: vec![8; 32],
                 prepare_token: [9; 32],
                 mediated_scope: None,
                 claim_witness: None,
-            },
+            })),
         };
         let governed = prepare_governed_push(
             Some(&context),
