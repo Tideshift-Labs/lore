@@ -93,6 +93,9 @@ $caseCatalog = @(
     [pscustomobject]@{ Key = 'e'; Test = "$testPrefix::case_e_a_lost_relay_worker_is_reclaimed_by_the_other_process" }
     [pscustomobject]@{ Key = 'f'; Test = "$testPrefix::case_f_an_obliterate_through_one_process_is_seen_by_the_other" }
     [pscustomobject]@{ Key = 'g'; Test = "$testPrefix::case_g_both_processes_report_their_event_plane_facets_at_rest" }
+    # case_h is deliberately absent. It is written, it compiles, and it cannot pass here yet;
+    # see the BLOCKED footer. Listing a case this harness structurally cannot serve would make
+    # this runner permanently red, and a gate that is always red is a gate nobody reads.
 )
 
 $selected = if ($Case) {
@@ -525,10 +528,26 @@ Write-Host '    allocates a NEW generation instead of resuming, because DurableS
 Write-Host '    resume-at-position operation that also restores the persisted frontier.'
 Write-Host '    Missing artefact: ReceiverStore::read_checkpoint plus the TODO(WP-111) in'
 Write-Host '    lore-server/src/plugins/remote_notification/receiver.rs.'
-Write-Host '  - cross-process fenced public lock mutation ownership (ARMED Lock/Unlock/AdminLock/'
-Write-Host '    ForceUnlock over real gRPC). WP-120 closed the refusal this line used to name'
-Write-Host '    (schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE is now true and the RPCs serve), but no'
-Write-Host '    case in this harness drives them yet -- a real coverage gap, not the prior gate.'
+Write-Host '  - EVERY cross-process fenced or governed mutation, including case_h. This harness'
+Write-Host '    cannot serve one at all, and the reason is structural rather than a missing case.'
+Write-Host '    A real loreserver only builds a repository-operation verifier when'
+Write-Host '    settings.environment.endpoint.auth_url names a live rebac/auth-grpc service'
+Write-Host '    (lore-server/src/domain.rs:2702-2711). This harness stands up no such service and'
+Write-Host '    points its two loreservers at none, so the INTERNAL prepare that every released'
+Write-Host '    client mutation goes through is refused with FailedPrecondition:'
+Write-Host '      "Internal domain prepare requires a configured repository-operation verifier"'
+Write-Host '    That refusal lands before any lock logic, so it is not specific to locking: a'
+Write-Host '    governed create or delete case written here would fail identically.'
+Write-Host '    p12_lock_service_fenced_routing.rs only avoids it through an IN-PROCESS'
+Write-Host '    DirectEchoVerifier double, which cannot be reached across two real subprocesses.'
+Write-Host '    Missing artefact: a lightweight rebac stub serving the verifier contract over real'
+Write-Host '    gRPC, plus the auth_url wiring to point both loreservers at it.'
+Write-Host '    case_h_a_lock_acquired_through_one_process_is_released_through_the_other_only_with_its_token'
+Write-Host '    is written and compiles against that future harness; it is kept out of the'
+Write-Host '    inventory above rather than deleted, so it costs nothing and is ready to run the'
+Write-Host '    day the stub exists. Put it back in the inventory in the same change.'
+Write-Host '  - cross-process fenced ADMIN lock mutation (AdminLock/ForceUnlock over real gRPC),'
+Write-Host '    which needs the same stub and has no case written at all.'
 
 if ($null -ne $setupError) {
     Write-Warning "Setup failed: $setupError"

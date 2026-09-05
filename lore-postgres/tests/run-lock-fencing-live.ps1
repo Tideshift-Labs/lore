@@ -67,7 +67,7 @@ $inventory = @(
             'missing_and_repeated_release_are_not_found_and_empty_list_is_ok',
             'batched_status_orders_by_stored_key_and_repeats_a_duplicate_request',
             'an_absent_schema_routes_legacy_but_a_partial_one_is_refused',
-            'arming_is_refused_until_the_public_mutation_contract_exists',
+            'arming_succeeds_now_that_the_public_mutation_contract_exists',
             'readiness_rejects_each_missing_fenced_precondition',
             'same_database_identity_accepts_only_the_domain_authority_database',
             'lock_backfill_is_restartable_and_quarantines_ambiguous_legacy_owners',

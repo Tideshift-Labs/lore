@@ -42,14 +42,18 @@
 //! Before WP-120, arming fenced routing also made the **public** lock mutation
 //! RPCs refuse outright, so a cell could prove cross-process lock ownership
 //! through the public service, or the governed outbox path, but not both --
-//! [`Arming`] was that forced choice. `PUBLIC_MUTATION_CONTRACT_AVAILABLE` is
-//! now `true`: an armed cell serves `Lock`/`Unlock`/`AdminLock`/`ForceUnlock`
-//! from the fenced coordinator with per-resource ownership tokens, in addition
-//! to the governed outbox path, so `Arming::GovernedOutbox` proves both today.
-//! [`Arming`] stays as the choice between the fenced route and the legacy
-//! `PostgresLockStore` route (`Arming::PublicLocks`), which remains real,
-//! distinct coverage of the pre-fencing lock path -- it is no longer the only
-//! way to reach a serving public lock RPC.
+//! [`Arming`] was that forced choice. WP-120 (`9a6d5e0`) built the whole
+//! server-side gRPC path: an armed cell now serves `Lock`/`Unlock`/`AdminLock`/
+//! `ForceUnlock` from the fenced coordinator with per-resource ownership
+//! tokens, in addition to the governed outbox path, so `Arming::GovernedOutbox`
+//! proves both today -- through `SharedBackend::open`'s test-only
+//! `enable_fencing_for_component_fixture` bypass, independent of whether
+//! production's `schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE` (still `false` as
+//! of CR-030's client-side lane) has flipped. [`Arming`] stays as the choice
+//! between the fenced route and the legacy `PostgresLockStore` route
+//! (`Arming::PublicLocks`), which remains real, distinct coverage of the
+//! pre-fencing lock path -- it is no longer the only way to reach a serving
+//! public lock RPC.
 
 #![allow(dead_code)]
 

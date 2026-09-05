@@ -214,7 +214,10 @@ async fn prepare_bound(
     };
     let prepared = backend
         .domain
-        .domain_operation_prepare(&key, &binding, None)
+        // No client-supplied attempt identity: this fixture prepares the operation the way an
+        // internal handler would (WP-120's `client_attempt_id` is for a released client's own
+        // dispatch, which this harness's governed-create fixture is not).
+        .domain_operation_prepare(&key, &binding, None, None)
         .await
         .expect("prepare the governed operation");
     let PrepareResult::Prepared { token, .. } = prepared else {

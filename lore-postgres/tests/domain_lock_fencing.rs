@@ -2235,27 +2235,22 @@ async fn an_absent_schema_routes_legacy_but_a_partial_one_is_refused() {
     );
 }
 
-/// The cutover entry point must refuse while the state it produces is
-/// unserviceable.
+/// The cutover entry point arms production fenced routing once its evidence
+/// passes and the WP-120/CR-030 client contract exists.
 ///
-/// This case is a tripwire on `PUBLIC_MUTATION_CONTRACT_AVAILABLE`: it fails
-/// the day a follow-on lane flips that constant, which is when its first
-/// assertion stops describing the contract and must be rewritten rather than
-/// deleted.
-///
-/// WP-120 (`9a6d5e0`) built the whole SERVER half: fenced `Lock`/`Unlock`/
-/// `AdminLock`/`ForceUnlock` are served (`lore-server/src/grpc/lock_service.rs`)
-/// and issue/consume a per-resource ownership token. But `lore/src` cannot
-/// yet keep or present that token, so arming today would still strand every
-/// fenced lock unreleasable by its owner (INV-EE P0-2) -- a follow-on lane
-/// builds the client half and flips the constant in that change
-/// (`PUBLIC_MUTATION_CONTRACT_AVAILABLE` stays `false` in
-/// `lore-postgres/src/domain/locks/schema.rs` until then). The refusal is
-/// the WP-120 gate and nothing else: the same evidence arms successfully
-/// through the fixture path.
+/// This case used to be a tripwire on `PUBLIC_MUTATION_CONTRACT_AVAILABLE`:
+/// while the client half did not exist, this asserted the arming REFUSAL,
+/// naming `PUBLIC_MUTATION_CONTRACT_MISSING`, and a second call proved the
+/// same evidence armed successfully through the test-only
+/// `enable_fencing_for_component_fixture` bypass. The constant flipped to
+/// `true` once `lore-revision/src/attempt_store.rs` gave the CLI and the
+/// embedding library a durable per-repository ownership-token store
+/// (CR-030, WP-120), so production `enable_fencing` is now the one under
+/// test, not the bypass. Kept as a rewrite rather than a deletion, per this
+/// test's own original doc comment: the assertion changed, the case did not.
 #[tokio::test]
 #[ignore = "run with tests/run-lock-fencing-live.ps1"]
-async fn arming_is_refused_until_the_public_mutation_contract_exists() {
+async fn arming_succeeds_now_that_the_public_mutation_contract_exists() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -2267,35 +2262,29 @@ async fn arming_is_refused_until_the_public_mutation_contract_exists() {
         .await
         .expect("complete empty backfill");
 
-    let refused = coordinator.enable_fencing(false).await;
-    match refused {
-        Err(DomainError::NotReady(reason)) => assert_eq!(
-            reason,
-            lore_postgres::domain::locks::schema::PUBLIC_MUTATION_CONTRACT_MISSING,
-            "the refusal must name the missing WP-120 contract, not an evidence gap"
-        ),
-        other => panic!("arming must be refused before WP-120, got {other:?}"),
+    // Asserting on a constant is the point here, not an oversight: this is the tripwire that
+    // stops the case below from passing against a reverted flip by exercising the wrong gate.
+    // Left as a runtime assertion rather than a `const` block so the failure names this test
+    // rather than refusing to compile the whole target.
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(
+            lore_postgres::domain::locks::schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE,
+            "this case only means what it says once the client contract exists; a build that \
+             reverted the flip would otherwise pass this test by exercising the wrong gate"
+        );
     }
-    assert!(
-        !coordinator
-            .readiness()
-            .await
-            .expect("readiness after a refused arming")
-            .fencing_enabled,
-        "a refused arming must leave the cell on the legacy route"
-    );
-
-    // Every evidence check passed; only the contract gate refused.
     coordinator
-        .enable_fencing_for_component_fixture(false)
+        .enable_fencing(false)
         .await
-        .expect("the same evidence must arm through the fixture path");
+        .expect("production arming must succeed now that the client half ships");
     assert!(
         coordinator
             .readiness()
             .await
-            .expect("readiness after fixture arming")
-            .fencing_enabled
+            .expect("readiness after arming")
+            .fencing_enabled,
+        "a successful production arming must leave the cell on the fenced route"
     );
 }
 

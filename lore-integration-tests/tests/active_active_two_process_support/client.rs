@@ -135,12 +135,19 @@ pub async fn lock_acquire(
 }
 
 /// Release one lock through a process.
+///
+/// `ownership_token`: empty is correct for the UNARMED cell most cases run against -- the legacy
+/// lock store ignores the field entirely. An armed cell REQUIRES it and answers
+/// `INVALID_ARGUMENT` without one; a case that arms fenced routing takes the token off the
+/// acquire response's `Lock.ownership_token` and threads it here (CR-030, WP-120).
+#[allow(clippy::too_many_arguments)]
 pub async fn lock_release(
     endpoint: String,
     token: &str,
     repository_id: &[u8],
     branch_id: &[u8],
     hash: &[u8],
+    ownership_token: &[u8],
 ) -> Result<UnlockResponse, Status> {
     let mut client = LockServiceClient::connect(endpoint)
         .await
@@ -150,16 +157,7 @@ pub async fn lock_release(
             branch: branch_id.to_vec().into(),
             hash: hash.to_vec().into(),
             description: String::new(),
-            // Empty, which is correct for the UNARMED cell these cases run
-            // against: the legacy lock store ignores the field entirely.
-            //
-            // An armed cell REQUIRES it and answers `INVALID_ARGUMENT` without
-            // one. A case that arms fenced routing must take the token off the
-            // acquire response's `Lock.ownership_token` and thread it here,
-            // which means this function needs it as a parameter. Left as a
-            // parameterless default rather than guessed, so the armed case adds
-            // the argument deliberately instead of inheriting a silent empty.
-            expected_ownership_token: Default::default(),
+            expected_ownership_token: ownership_token.to_vec().into(),
         }],
     });
     decorate(&mut request, token, Some(repository_id));

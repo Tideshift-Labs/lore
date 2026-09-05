@@ -540,9 +540,16 @@ mod active_active_two_process_tests {
             "a refused acquire must not disturb the authoritative lock row"
         );
 
-        client::lock_release(a.grpc_endpoint(), &token_a, &repository, &branch, &resource)
-            .await
-            .unwrap_or_else(|status| panic!("release through A: {status:?}"));
+        client::lock_release(
+            a.grpc_endpoint(),
+            &token_a,
+            &repository,
+            &branch,
+            &resource,
+            &[],
+        )
+        .await
+        .unwrap_or_else(|status| panic!("release through A: {status:?}"));
         assert!(
             fixture.backend.lock_owners(&repository).await.is_empty(),
             "the release must remove the authoritative lock row"
@@ -1379,6 +1386,101 @@ mod active_active_two_process_tests {
             b.receiver_identity(),
             "the two processes must join the membership under different identities, or one \
              process's receiver could satisfy an assertion about the other's"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Case H — cross-process fenced lock ownership (CR-030, WP-120)
+    // -----------------------------------------------------------------------
+
+    /// A lock acquired through one process is releasable through the other ONLY by presenting
+    /// the ownership token the acquire returned. This is Case C's proof one layer further in:
+    /// Case C shows the legacy, unfenced lock store agreeing across two processes; this shows the
+    /// fenced coordinator's per-resource token agreeing across two processes too, over real gRPC,
+    /// each server reaching the coordinator through its own `DomainContext` but the same
+    /// database row.
+    ///
+    /// `Arming::GovernedOutbox` arms fenced lock routing through the same test-only
+    /// `enable_fencing_for_component_fixture` bypass `p12_lock_service_fenced_routing.rs` uses
+    /// (`active_active_two_process_support::backend::SharedBackend::open`) -- independent of
+    /// whether production's `PUBLIC_MUTATION_CONTRACT_AVAILABLE` has flipped, because this case
+    /// drives the server's fenced `Lock`/`Unlock` RPCs directly with an explicit token rather
+    /// than through the `lore` CLI's own client-side token store.
+    #[tokio::test]
+    #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
+    async fn case_h_a_lock_acquired_through_one_process_is_released_through_the_other_only_with_its_token()
+     {
+        let fixture = Fixture::open(Arming::GovernedOutbox).await;
+        let a = fixture.start("a", BootOptions::relaying()).await;
+        let b = fixture.start("b", BootOptions::relaying()).await;
+        let token = fixture.minter.mint("case-h-owner");
+
+        let (repository, branch, _) =
+            governed_repository(&fixture, &a, &token, "case-h-owner", "h").await;
+        let resource = [0x8au8; 32];
+
+        let acquired = client::lock_acquire(
+            a.grpc_endpoint(),
+            &token,
+            &repository,
+            &branch,
+            &resource,
+            "wp109/case-h",
+        )
+        .await
+        .unwrap_or_else(|status| panic!("acquire through A must succeed: {status:?}"));
+        let ownership_token = acquired
+            .locks
+            .first()
+            .unwrap_or_else(|| panic!("one resource requested, one lock expected: {acquired:?}"))
+            .ownership_token
+            .to_vec();
+        assert_eq!(
+            ownership_token.len(),
+            32,
+            "a fenced acquire must mint a real 32-byte ownership token, got {ownership_token:?}"
+        );
+
+        let refused = client::lock_release(
+            b.grpc_endpoint(),
+            &token,
+            &repository,
+            &branch,
+            &resource,
+            &[],
+        )
+        .await
+        .expect_err(
+            "releasing a fenced lock through the other process with no token must be refused",
+        );
+        assert_eq!(
+            refused.code(),
+            Code::InvalidArgument,
+            "a tokenless release of a fenced lock must be INVALID_ARGUMENT, got {refused:?}"
+        );
+        assert_eq!(
+            fixture.backend.lock_owners(&repository).await.len(),
+            1,
+            "a refused release must not disturb the authoritative lock row"
+        );
+
+        client::lock_release(
+            b.grpc_endpoint(),
+            &token,
+            &repository,
+            &branch,
+            &resource,
+            &ownership_token,
+        )
+        .await
+        .unwrap_or_else(|status| {
+            panic!(
+                "releasing through the OTHER process with the stored token must succeed: {status:?}"
+            )
+        });
+        assert!(
+            fixture.backend.lock_owners(&repository).await.is_empty(),
+            "the token-bearing release through process B must remove the authoritative lock row"
         );
     }
 }

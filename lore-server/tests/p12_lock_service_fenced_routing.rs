@@ -15,18 +15,17 @@
 //!   `Unlock` for a released client (a verified human JWT, no carriage)
 //!   through `DomainContext::prepare_direct_lock_operation`, issuing a
 //!   per-resource ownership token on acquire and requiring it on release.
-//!   WP-120 (`9a6d5e0`) built this whole gRPC path, but
-//!   `PUBLIC_MUTATION_CONTRACT_AVAILABLE` stays `false` in production
-//!   (`lore-postgres/src/domain/locks/schema.rs`) until a follow-on lane
-//!   ships the client half that keeps and presents that token -- see
+//!   WP-120 (`9a6d5e0`) built this whole gRPC path, and
+//!   `PUBLIC_MUTATION_CONTRACT_AVAILABLE` is now `true` in production
+//!   (`lore-postgres/src/domain/locks/schema.rs`) now that a follow-on lane
+//!   shipped the client half that keeps and presents that token -- see
 //!   `lore-postgres/tests/domain_lock_fencing.rs`'s
-//!   `arming_is_refused_until_the_public_mutation_contract_exists` for the
+//!   `arming_succeeds_now_that_the_public_mutation_contract_exists` for the
 //!   coordinator-level half of that gate. `armed_service` below arms the
-//!   coordinator through the test-only
-//!   `PostgresLockCoordinator::enable_fencing_for_component_fixture` bypass
-//!   so the served path can be exercised deterministically ahead of that
-//!   lane, exactly as `enable_fencing_for_component_fixture`'s own doc
-//!   comment intends; and
+//!   coordinator through production `PostgresLockCoordinator::enable_fencing`
+//!   itself, exercising the same gate a real cutover goes through rather than
+//!   the test-only `enable_fencing_for_component_fixture` bypass this file
+//!   used before the flip; and
 //! - a server built with no `fenced_coordinator` (the legacy default) routes
 //!   through `store::lock_store::PostgresLockStore`, which succeeds and
 //!   appends no CR-032 outbox row, because that store has no fence, no
@@ -406,9 +405,9 @@ async fn armed_service(
         .await
         .expect("complete empty backfill");
     coordinator
-        .enable_fencing_for_component_fixture(false)
+        .enable_fencing(false)
         .await
-        .expect("arm fenced routing through the test-only fixture bypass");
+        .expect("arm fenced routing through the production gate");
     let (repository_id, branch_id) = create_repository_and_branch(&domain_store).await;
 
     let verifier = Arc::new(DirectEchoVerifier::new());
