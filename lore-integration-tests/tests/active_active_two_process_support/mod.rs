@@ -62,6 +62,7 @@ pub mod carriage;
 pub mod cell;
 pub mod client;
 pub mod jwks;
+pub mod rebac_stub;
 
 use std::path::PathBuf;
 
@@ -226,6 +227,13 @@ impl Env {
     /// Process B's gRPC and HTTP ports.
     pub fn b_ports(&self) -> (u16, u16) {
         (self.port_base + 3, self.port_base + 4)
+    }
+    /// Port the harness serves its rebac/auth-grpc stand-in on.
+    ///
+    /// Inside the case's own ten-port band, like every other listener here, so
+    /// two cases in one run cannot collide.
+    pub fn rebac_stub_port(&self) -> u16 {
+        self.port_base + 5
     }
     /// The URL both processes fetch keys from.
     pub fn jwks_url(&self) -> String {

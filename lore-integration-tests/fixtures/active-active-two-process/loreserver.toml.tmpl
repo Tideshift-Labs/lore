@@ -18,6 +18,26 @@
 # relay owner, and their producer instance id. Same database, same bucket, same
 # cell id: that identity is the whole point of the proof.
 
+# The private auth-grpc endpoint, served by the harness's own rebac stand-in
+# (`active_active_two_process_support::rebac_stub`). This one key does three
+# things, and all three are wanted:
+#
+#   1. It is the ONLY condition under which loreserver builds a
+#      repository-operation verifier, and without one every carriage-free
+#      mutation by a human is refused before any handler logic runs. That
+#      refusal is what kept every cross-process governed mutation out of this
+#      harness.
+#   2. It mounts the private `lore.domain.v1.DomainOperationService`, whose
+#      public `DomainOperationAttemptReceiptGet` a released client reads its own
+#      attempt receipt back through.
+#   3. It switches the repository-query authorizer from
+#      `AllowAllRepositoryAuthorizer` to the auth-grpc one, so `RepositoryGet`
+#      and the metadata RPCs now call `CheckUserPermission`. The stub answers
+#      that too, deliberately permissively; the read cases here are about
+#      cross-process state, not about access control.
+[environment.endpoint]
+auth_url = "{{AUTH_URL}}"
+
 # QUIC shares 41337 with gRPC in the compiled-in defaults, and this harness
 # drives gRPC only. Leaving QUIC on would bind the same port twice per process
 # and collide across the two processes as well.

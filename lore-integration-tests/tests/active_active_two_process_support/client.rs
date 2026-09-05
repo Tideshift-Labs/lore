@@ -20,6 +20,7 @@ use lore_proto::lore::repository::v1::RepositoryGetRequest;
 use lore_proto::lore::repository::v1::RepositoryGetResponse;
 use lore_proto::lore::repository::v1::repository_get_request;
 use lore_proto::lore::repository::v1::repository_service_client::RepositoryServiceClient;
+use lore_server::grpc::domain_operation_metadata::ATTEMPT_ID_KEY;
 use tonic::Request;
 use tonic::Status;
 use tonic::metadata::BinaryMetadataValue;
@@ -163,6 +164,88 @@ pub async fn lock_release(
     decorate(&mut request, token, Some(repository_id));
     client
         .unlock(request)
+        .await
+        .map(|response| response.into_inner())
+}
+
+/// Push a branch with NO governed carriage, the way a released client does.
+///
+/// This is the whole released-client shape WP-120 built: no operation id, no
+/// fingerprint, no prepare token — only a bearer, the repository, and the
+/// client's own attempt identity. On an enforcing cell with a configured
+/// verifier, loreserver mints the operation identity itself, asks the
+/// authorizer whether this human may perform this mutation, and runs the same
+/// prepare-then-consume rail a mediated operation runs.
+///
+/// `attempt_id` travels as ASCII in `lore-attempt-id` (not a `-bin` key, and
+/// not the raw sixteen bytes): `extract_attempt_id` reads it with `read_ascii`
+/// and parses it with `Uuid::parse_str`. It must be a UUIDv7 — the receipt rail
+/// classifies replay by the embedded timestamp, so a non-v7 value is refused
+/// rather than filed as an identity nothing can order.
+pub async fn branch_push_no_carriage(
+    endpoint: String,
+    token: &str,
+    repository_id: &[u8],
+    branch_id: &[u8],
+    revision: &[u8],
+    attempt_id: uuid::Uuid,
+) -> Result<lore_proto::lore::revision::v1::BranchPushResponse, Status> {
+    let mut client =
+        lore_proto::lore::revision::v1::revision_service_client::RevisionServiceClient::connect(
+            endpoint,
+        )
+        .await
+        .map_err(|error| Status::unavailable(format!("dial the process: {error}")))?;
+    let mut request = Request::new(lore_proto::lore::revision::v1::BranchPushRequest {
+        id: branch_id.to_vec().into(),
+        revision_signature: revision.to_vec().into(),
+        force: false,
+        fast_forward_merge: false,
+    });
+    decorate(&mut request, token, Some(repository_id));
+    request.metadata_mut().insert(
+        ATTEMPT_ID_KEY,
+        attempt_id
+            .to_string()
+            .parse()
+            .expect("a UUID's text form is ASCII"),
+    );
+    client
+        .branch_push(request)
+        .await
+        .map(|response| response.into_inner())
+}
+
+/// Read back the receipt for one attempt, by the identity the client minted.
+///
+/// The one method on the private `DomainOperationService` an ordinary human may
+/// call. Every sibling demands the control-plane service account; this one
+/// takes the receipt namespace from the verified JWT and the request carries
+/// nothing but the attempt id, so a caller cannot name a namespace and an
+/// attempt belonging to someone else answers exactly as one that never existed.
+///
+/// Mounted on the same gRPC port as everything else here, and only on a cell
+/// with a domain coordinator, JWT authentication, and a configured `auth_url`
+/// (`grpc::server::domain_operation_service_available`).
+pub async fn attempt_receipt_get(
+    endpoint: String,
+    token: &str,
+    attempt_id: uuid::Uuid,
+) -> Result<lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetResponse, Status> {
+    let mut client =
+        lore_proto::lore::domain::v1::domain_operation_service_client::DomainOperationServiceClient::connect(endpoint)
+            .await
+            .map_err(|error| Status::unavailable(format!("dial the process: {error}")))?;
+    let mut request = Request::new(
+        lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetRequest {
+            client_attempt_id: attempt_id.as_bytes().to_vec().into(),
+        },
+    );
+    // No repository metadata: this RPC is scoped by the verified principal, not
+    // by a partition, and sending one would suggest otherwise.
+    decorate(&mut request, token, None);
+    client
+        .domain_operation_attempt_receipt_get(request)
         .await
         .map(|response| response.into_inner())
 }

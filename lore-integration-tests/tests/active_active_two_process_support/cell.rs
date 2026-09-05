@@ -133,6 +133,7 @@ impl Cell {
         grpc_port: u16,
         http_port: u16,
         jwks_url: &str,
+        auth_url: &str,
         options: BootOptions<'_>,
     ) -> Self {
         let config_dir = env.work_dir.join(format!("cell-{name}"));
@@ -148,6 +149,11 @@ impl Cell {
             ("S3_ENDPOINT", env.s3_endpoint.clone()),
             ("S3_REGION", env.s3_region.clone()),
             ("JWKS_URL", jwks_url.to_owned()),
+            // Both processes point at ONE stub. That is the point: a governed
+            // mutation admitted through process A and a receipt read through
+            // process B must be authorized by the same authority, or the proof
+            // would be about two cells rather than one.
+            ("AUTH_URL", auth_url.to_owned()),
             ("JWT_ISSUER", env.jwt_issuer.clone()),
             ("JWT_AUDIENCE", env.jwt_audience.clone()),
             ("GATEWAY_URI", env.gateway_uri.clone()),

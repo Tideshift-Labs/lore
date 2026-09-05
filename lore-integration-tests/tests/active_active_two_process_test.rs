@@ -24,6 +24,8 @@ mod active_active_two_process_tests {
 
     use lore_base::types::Hash;
     use lore_base::types::RepositoryId;
+    use lore_proto::lore::domain::v1::DomainOperationOutcome;
+    use lore_proto::lore::domain::v1::DomainOperationReceiptStatus;
     use tonic::Code;
 
     use crate::active_active_two_process_support::Arming;
@@ -36,6 +38,8 @@ mod active_active_two_process_tests {
     use crate::active_active_two_process_support::client;
     use crate::active_active_two_process_support::jwks::JwksServer;
     use crate::active_active_two_process_support::jwks::TokenMinter;
+    use crate::active_active_two_process_support::rebac_stub::RebacStub;
+    use crate::active_active_two_process_support::rebac_stub::policy::Role;
 
     /// The `event_kind` a governed branch push appends
     /// (`lore-postgres/src/domain/outbox/builders.rs`).
@@ -62,17 +66,25 @@ mod active_active_two_process_tests {
         /// Held for its `Drop`: both processes fetch keys from it, so it has to
         /// outlive them.
         _jwks: JwksServer,
+        /// The rebac/auth-grpc stand-in both processes point `auth_url` at.
+        ///
+        /// Held rather than detached because a case asserts against it: how
+        /// many direct authorizations it issued, and for whom. It also has to
+        /// outlive both processes, which dial it lazily on every governed
+        /// mutation and every repository read.
+        stub: RebacStub,
         minter: TokenMinter,
         backend: SharedBackend,
     }
 
     impl Fixture {
-        /// Read the runner's contract, serve the keys, and prepare the shared
-        /// backend for `arming`.
+        /// Read the runner's contract, serve the keys and the authorizer, and
+        /// prepare the shared backend for `arming`.
         async fn open(arming: Arming) -> Self {
             let env = Env::from_process();
             std::fs::create_dir_all(&env.work_dir).expect("create the case work directory");
             let jwks = JwksServer::start(env.jwks_port(), &env.jwks_json).await;
+            let stub = RebacStub::start(&env, env.rebac_stub_port()).await;
             let minter = TokenMinter::from_env(&env);
             let backend = SharedBackend::open(&env, arming).await;
             assert!(
@@ -83,6 +95,7 @@ mod active_active_two_process_tests {
             Self {
                 env,
                 _jwks: jwks,
+                stub,
                 minter,
                 backend,
             }
@@ -94,7 +107,16 @@ mod active_active_two_process_tests {
                 "b" => self.env.b_ports(),
                 other => panic!("unknown cell name {other}"),
             };
-            Cell::start(&self.env, name, grpc, http, &self.env.jwks_url(), options).await
+            Cell::start(
+                &self.env,
+                name,
+                grpc,
+                http,
+                &self.env.jwks_url(),
+                self.stub.url(),
+                options,
+            )
+            .await
         }
     }
 
@@ -105,6 +127,20 @@ mod active_active_two_process_tests {
     /// message is traceable to when it was minted.
     fn id16() -> [u8; 16] {
         *uuid::Uuid::now_v7().as_bytes()
+    }
+
+    /// A subject the DIRECT authorization rail will accept.
+    ///
+    /// auth-grpc derives the initiating principal namespace as
+    /// `"principal-v1\0" || Principal.userId` and denies unless the result is
+    /// exactly 49 bytes, which admits only a canonical lowercase UUID. Nothing
+    /// in Lore enforces that, so a case using a readable label like
+    /// `case-h-owner` would pass against this harness and be refused by the
+    /// real platform — the most valuable kind of harness lie to prevent. The
+    /// mediated cases keep their readable subjects, which never reach that
+    /// gate.
+    fn direct_subject() -> String {
+        uuid::Uuid::now_v7().to_string()
     }
 
     fn repository_id(bytes: [u8; 16]) -> RepositoryId {
@@ -286,6 +322,18 @@ mod active_active_two_process_tests {
                 "process {label} served a different repository name"
             );
         }
+
+        // Those reads went through the auth-grpc repository-query authorizer,
+        // which exists on this cell only because WP-120 wired `auth_url`.
+        // Asserted so the new coupling is visible rather than implicit: this
+        // case now depends on the harness's stub answering `CheckUserPermission`
+        // — permissively, on purpose, so nothing here is evidence about read
+        // authorization.
+        assert!(
+            fixture.stub.permission_checks() >= 2,
+            "each process's RepositoryGet must have consulted the authorizer; it saw {} checks",
+            fixture.stub.permission_checks()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1094,6 +1142,13 @@ mod active_active_two_process_tests {
     /// revision (`lore-server/src/grpc/handlers/branch_push.rs:682`) — a
     /// genuine read of the shared immutable store through B's own code path,
     /// observable through a client, which a direct store query would not be.
+    ///
+    /// `Arming::PublicLocks` is load-bearing here now that WP-120 has wired a
+    /// verifier. It leaves domain enforcement OFF, so the carriage-free pushes
+    /// this case makes take the legacy path. On an ENFORCING cell they would
+    /// take the direct rail instead and be denied for want of a role grant,
+    /// which would look like an obliterate that had not worked. A case moved to
+    /// `GovernedOutbox` must grant its subject a role and mint a UUID subject.
     #[tokio::test]
     #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
     async fn case_f_an_obliterate_through_one_process_is_seen_by_the_other() {
@@ -1413,10 +1468,21 @@ mod active_active_two_process_tests {
         let fixture = Fixture::open(Arming::GovernedOutbox).await;
         let a = fixture.start("a", BootOptions::relaying()).await;
         let b = fixture.start("b", BootOptions::relaying()).await;
-        let token = fixture.minter.mint("case-h-owner");
+        // A canonical UUID subject, not a readable label, and that is a
+        // contract requirement rather than a style choice. auth-grpc derives the
+        // initiating principal namespace as `"principal-v1\0" || userId` and
+        // denies unless it comes to exactly 49 bytes, which admits only a
+        // 36-character lowercase UUID. A case run under `case-h-owner` would
+        // pass against this harness and be refused by the real platform.
+        let owner = direct_subject();
+        let token = fixture.minter.mint(&owner);
 
-        let (repository, branch, _) =
-            governed_repository(&fixture, &a, &token, "case-h-owner", "h").await;
+        let (repository, branch, _) = governed_repository(&fixture, &a, &token, &owner, "h").await;
+        // The floor, not a blanket owner. `lock.acquire` and `lock.release` are
+        // what any contributor does with their own lock, so `developer` is what
+        // the platform's table requires; granting `owner` here would make the
+        // case pass without the role check ever being at its boundary.
+        fixture.stub.grant(&repository, &owner, Role::Developer);
         let resource = [0x8au8; 32];
 
         let acquired = client::lock_acquire(
@@ -1481,6 +1547,224 @@ mod active_active_two_process_tests {
         assert!(
             fixture.backend.lock_owners(&repository).await.is_empty(),
             "the token-bearing release through process B must remove the authoritative lock row"
+        );
+
+        // The case must have gone through the direct rail, not around it. A
+        // fenced acquire that somehow reached the coordinator without an
+        // authorization would satisfy every assertion above and prove nothing
+        // about WP-120.
+        assert_eq!(
+            fixture
+                .stub
+                .authorized_count(&owner, "lock.acquire", &repository),
+            1,
+            "the acquire must have been authorized exactly once through the direct rail; \
+             the stub issued {:?}",
+            fixture.stub.authorized()
+        );
+        // Exactly one, not "at least one". The tokenless release is refused by
+        // the lock service's own argument check before it reaches the rail, so a
+        // second authorization here would mean that ordering had changed and a
+        // refused release had begun consuming an authorization it never used.
+        assert_eq!(
+            fixture
+                .stub
+                .authorized_count(&owner, "lock.release", &repository),
+            1,
+            "exactly the token-bearing release must have been authorized; the stub issued {:?}",
+            fixture.stub.authorized()
+        );
+        // The lock families are the only ones that supply the BRANCH half of
+        // the platform's binding — the five mutation families send it empty —
+        // so a case that never looked at it would leave that half unproven.
+        for entry in fixture.stub.authorized() {
+            assert_eq!(
+                entry.branch_id.as_slice(),
+                &branch[..],
+                "a lock-family authorization must carry the branch it is scoped to, got {entry:?}"
+            );
+        }
+        // And the tokenless refusal must have come from Lore's fenced
+        // coordinator, not from the authorizer. `developer` clears every lock
+        // family this case uses, so a refusal here would mean the case proved
+        // the stub's policy rather than the fence.
+        assert!(
+            fixture.stub.refusals().is_empty(),
+            "the authorizer must refuse nothing in this case; it refused {:?}",
+            fixture.stub.refusals()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Case I — a released client's push, reconciled through the other process
+    // -----------------------------------------------------------------------
+
+    /// The whole WP-120 released-client round trip, across two processes.
+    ///
+    /// A human with no carriage pushes through process A. loreserver mints the
+    /// operation identity itself, asks the authorizer whether this human may
+    /// perform this mutation, runs the ordinary prepare-then-consume rail, and
+    /// appends the governed outbox row. The client then asks process B — which
+    /// served none of that — what happened to the attempt id it minted before
+    /// dispatch, and gets the receipt.
+    ///
+    /// Three things make this more than case B with the carriage removed:
+    ///
+    /// * The push is a call a **released client can actually make**. Case B's
+    ///   pushes carry carriage this harness minted against the coordinator,
+    ///   which no shipped client can produce.
+    /// * The receipt is read through the **other process**, so the answer comes
+    ///   from the shared coordinator rather than from process A's memory of its
+    ///   own write.
+    /// * A different principal reading the same attempt id gets `NOT_FOUND`,
+    ///   which is the property that makes this RPC safe to expose to a caller
+    ///   that is not the control plane: the namespace comes from the verified
+    ///   token, so a caller cannot name someone else's.
+    ///
+    /// The role granted is `developer`, the exact floor `branch.push` requires,
+    /// so the gate is exercised at its boundary rather than waved through by an
+    /// owner grant.
+    #[tokio::test]
+    #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
+    async fn case_i_a_released_client_push_through_a_is_reconciled_through_b_by_attempt_id() {
+        let fixture = Fixture::open(Arming::GovernedOutbox).await;
+        let a = fixture.start("a", BootOptions::relaying()).await;
+        let b = fixture.start("b", BootOptions::relaying()).await;
+        // Canonical UUID subjects, for the reason case H spells out: auth-grpc
+        // denies any subject that cannot key a 49-byte principal namespace.
+        let writer = direct_subject();
+        let outsider = direct_subject();
+        let token = fixture.minter.mint(&writer);
+        let stranger = fixture.minter.mint(&outsider);
+
+        // The repository itself still comes through the mediated rail: a
+        // direct-human `repository.create` does not exist, on either side. The
+        // platform refuses it by name and loreserver's own admission gate
+        // returns `Ok(None)` for a create scope, so the create here is
+        // deliberately the one governed step this case does NOT prove.
+        let (repository, branch, _) = governed_repository(&fixture, &a, &token, &writer, "i").await;
+        fixture.stub.grant(&repository, &writer, Role::Developer);
+
+        let candidate = fixture
+            .backend
+            .serialize_revision(
+                repository_id(repository),
+                Hash::default(),
+                1,
+                Some("from-a-released-client.txt"),
+            )
+            .await;
+
+        // Minted by the CLIENT, before dispatch. That is the whole point of the
+        // identity: it is the only thing a client that lost its response still
+        // holds.
+        let attempt = uuid::Uuid::now_v7();
+        client::branch_push_no_carriage(
+            a.grpc_endpoint(),
+            &token,
+            &repository,
+            &branch,
+            candidate.as_ref(),
+            attempt,
+        )
+        .await
+        .unwrap_or_else(|status| {
+            panic!(
+                "a released client's push through process A must succeed: {status:?}; \
+                 the authorizer refused {:?}",
+                fixture.stub.refusals()
+            )
+        });
+
+        // The direct rail was actually used. Without this, a cell that had
+        // quietly fallen back to the legacy unfenced path would satisfy every
+        // assertion below.
+        assert_eq!(
+            fixture
+                .stub
+                .authorized_count(&writer, "branch.push", &repository),
+            1,
+            "the push must have been authorized exactly once through the direct rail; \
+             the stub issued {:?}",
+            fixture.stub.authorized()
+        );
+        // A mutation family sends the branch EMPTY, unlike the lock families
+        // case H covers. That is loreserver's deliberate deferral, not an
+        // absence, and pinning it here keeps a future change that starts
+        // sending it from passing unnoticed.
+        for entry in fixture.stub.authorized() {
+            assert!(
+                entry.branch_id.is_empty(),
+                "branch.push binds the repository only; loreserver defers the branch half, \
+                 got {entry:?}"
+            );
+        }
+        assert!(
+            fixture.stub.refusals().is_empty(),
+            "the authorizer must refuse nothing in this case; it refused {:?}",
+            fixture.stub.refusals()
+        );
+
+        // Authority, over the harness's own connection.
+        let tip = fixture
+            .backend
+            .branch_latest_hash(&repository, &branch)
+            .await
+            .expect("the domain projection must carry the branch after a governed push");
+        assert_eq!(
+            tip.as_slice(),
+            candidate.as_ref(),
+            "the authoritative branch tip must be the released client's revision"
+        );
+        let rows = fixture.backend.outbox_rows_of_kind(BRANCH_PUSHED).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "a carriage-free governed push must append exactly one branch.pushed row, got [{}]",
+            describe(&rows)
+        );
+        assert_eq!(
+            rows[0].aggregate_kind, "branch",
+            "a branch push must be keyed on the branch aggregate"
+        );
+
+        // The reconciliation, through the process that served none of it.
+        let receipt = client::attempt_receipt_get(b.grpc_endpoint(), &token, attempt)
+            .await
+            .unwrap_or_else(|status| {
+                panic!("process B must serve the attempt receipt to its own principal: {status:?}")
+            });
+        assert_eq!(
+            receipt.status,
+            DomainOperationReceiptStatus::Committed as i32,
+            "an applied push must read back COMMITTED through the other process, got {receipt:?}"
+        );
+        assert_eq!(
+            receipt.outcome,
+            DomainOperationOutcome::Applied as i32,
+            "the committed receipt must report the mutation as applied, got {receipt:?}"
+        );
+        assert_eq!(
+            receipt.method, "branch.push",
+            "the receipt must name the family it was filed under, got {receipt:?}"
+        );
+
+        // A different subject reads absent. Not an error, and not someone
+        // else's receipt: an attempt id belonging to another principal answers
+        // exactly as one that never existed.
+        let absent = client::attempt_receipt_get(b.grpc_endpoint(), &stranger, attempt)
+            .await
+            .unwrap_or_else(|status| {
+                panic!("a stranger's receipt lookup must be answered, not refused: {status:?}")
+            });
+        assert_eq!(
+            absent.status,
+            DomainOperationReceiptStatus::NotFound as i32,
+            "another principal must not reach this attempt's receipt, got {absent:?}"
+        );
+        assert!(
+            absent.method.is_empty(),
+            "an absent receipt must leak no method, got {absent:?}"
         );
     }
 }

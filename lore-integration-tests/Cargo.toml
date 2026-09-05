@@ -67,6 +67,11 @@ serde = { workspace = true }
 lore-postgres = { workspace = true }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 tonic = { workspace = true, features = ["channel"] }
+# WP-120 only. The harness's rebac/auth-grpc stand-in serves two services
+# `lore-proto` compiles with `.build_server(false)` — loreserver is only ever a
+# client of both — so the server halves are hand-rolled in the shape
+# `tonic-prost-build` emits, and that shape needs the codec directly.
+tonic-prost = { workspace = true }
 
 [features]
 integration_tests = ["lore-server/integration_tests"]
