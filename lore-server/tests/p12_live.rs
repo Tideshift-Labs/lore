@@ -146,7 +146,7 @@ async fn create_repository(
         canonical_intent_digest: digest,
     };
     let prepared = store
-        .domain_operation_prepare(&key, &binding, None)
+        .domain_operation_prepare(&key, &binding, None, None)
         .await
         .expect("fixture prepare must succeed");
     let PrepareResult::Prepared { token, .. } = prepared else {
@@ -220,7 +220,7 @@ async fn exact_mediated_obliterate_consumes_while_tuple_tamper_preserves_prepare
             canonical_intent_digest: digest.clone(),
         };
         let prepared = store
-            .domain_operation_prepare(&key, &binding, None)
+            .domain_operation_prepare(&key, &binding, None, None)
             .await
             .expect("obliterate prepare must succeed");
         let PrepareResult::Prepared { token, .. } = prepared else {
@@ -535,7 +535,7 @@ async fn governed_create_projection_rows_match_the_legacy_writers_exactly() {
                 canonical_intent_digest: digest.clone(),
             };
             let prepared = store
-                .domain_operation_prepare(&key, &binding, None)
+                .domain_operation_prepare(&key, &binding, None, None)
                 .await
                 .expect("prepare must succeed");
             let PrepareResult::Prepared { token, .. } = prepared else {
@@ -871,7 +871,7 @@ async fn branch_delete_governed_and_real_legacy_delete_agree_on_the_lore_mutable
                 canonical_intent_digest: rand::random::<[u8; 32]>().to_vec(),
             };
             let prepared = domain_store
-                .domain_operation_prepare(&key, &binding, None)
+                .domain_operation_prepare(&key, &binding, None, None)
                 .await
                 .expect("prepare must succeed");
             let PrepareResult::Prepared { token, .. } = prepared else {
@@ -1175,7 +1175,7 @@ async fn released_client_push_with_no_carriage_commits_one_branch_pushed_row_via
         token: create_token,
         ..
     } = domain_store
-        .domain_operation_prepare(&create_key, &create_binding, None)
+        .domain_operation_prepare(&create_key, &create_binding, None, None)
         .await
         .expect("prepare the fixture create")
     else {

@@ -291,6 +291,7 @@ impl DomainTransactionStore for PostgresDomainStore {
         key: &receipts::ReceiptKey,
         binding: &receipts::OperationBinding,
         witness: Option<&receipts::AuthorizationWitness>,
+        client_attempt_id: Option<uuid::Uuid>,
     ) -> Result<receipts::PrepareResult, DomainError> {
         let _t = self
             .instruments()
@@ -300,7 +301,7 @@ impl DomainTransactionStore for PostgresDomainStore {
             .transaction()
             .await
             .map_err(|e| DomainError::from_pg("domain operation prepare transaction", e))?;
-        let result = receipts::prepare(&tx, key, binding, witness).await?;
+        let result = receipts::prepare(&tx, key, binding, witness, client_attempt_id).await?;
         classify_commit(tx.commit().await, "domain operation prepare commit")?;
         Ok(result)
     }

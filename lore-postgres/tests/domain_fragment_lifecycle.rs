@@ -2496,7 +2496,7 @@ async fn prepare_operation(store: &PostgresDomainStore, method: &str) -> Governe
     };
     let op_binding = binding(method);
     let prepared = store
-        .domain_operation_prepare(&key, &op_binding, None)
+        .domain_operation_prepare(&key, &op_binding, None, None)
         .await
         .expect("prepare domain operation");
     let PrepareResult::Prepared { token, .. } = prepared else {

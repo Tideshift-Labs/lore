@@ -124,7 +124,7 @@ async fn admitted_operation(url: &str, method: &str) -> GovernedOperation {
     let clock = admission_clock(&tx).await.expect("read admission clock");
     let key = isolated_key(uuid_v7_at(clock));
     let op_binding = binding(method);
-    let result = prepare(&tx, &key, &op_binding, None)
+    let result = prepare(&tx, &key, &op_binding, None, None)
         .await
         .expect("prepare must not error");
     tx.commit().await.expect("commit prepare");

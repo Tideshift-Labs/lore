@@ -151,6 +151,7 @@ impl DomainTransactionStore for RecordingStore {
         key: &ReceiptKey,
         binding: &OperationBinding,
         witness: Option<&AuthorizationWitness>,
+        _client_attempt_id: Option<uuid::Uuid>,
     ) -> Result<PrepareResult, DomainError> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_prepare_outcome_unknown.load(Ordering::SeqCst) {

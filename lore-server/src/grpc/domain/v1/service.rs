@@ -521,7 +521,7 @@ impl DomainOperationService for LoreDomainOperationV1Service {
         let result = self
             .domain
             .store()
-            .domain_operation_prepare(&key, &binding, Some(&witness))
+            .domain_operation_prepare(&key, &binding, Some(&witness), None)
             .await
             .map_err(|e| map_domain_error_to_status(&e))?;
 

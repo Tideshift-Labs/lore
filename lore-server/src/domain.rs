@@ -515,6 +515,10 @@ impl DomainContext {
             source: AdmissionSource::Internal(InternalAdmission {
                 repository_id,
                 bearer,
+                // Read here rather than at the seam because this is the last point that holds the
+                // request's metadata. A malformed value refuses the mutation; see
+                // `extract_attempt_id` for why that is the safer direction.
+                client_attempt_id: domain_operation_metadata::extract_attempt_id(metadata)?,
             }),
         }))
     }
@@ -700,6 +704,7 @@ impl DomainContext {
             &internal.repository_id,
             &[],
             &internal.bearer,
+            internal.client_attempt_id,
         )
         .await
     }
@@ -716,6 +721,7 @@ impl DomainContext {
     ///
     /// Everything after that is the same verifier callback, the same exact echo,
     /// and the same prepare as every other governed family.
+    #[allow(clippy::too_many_arguments)]
     pub async fn prepare_direct_lock_operation(
         &self,
         token: &AuthorizationToken,
@@ -723,6 +729,7 @@ impl DomainContext {
         repository_id: &[u8],
         branch_id: &[u8],
         binding: OperationBinding,
+        client_attempt_id: Option<Uuid>,
     ) -> Result<GovernedOperation, Status> {
         if token.user_id == CONTROL_PLANE_SERVICE_SUBJECT || token.is_service_account == Some(true)
         {
@@ -749,11 +756,19 @@ impl DomainContext {
         // Every lock family is branch-scoped by nature, so the branch is always
         // known here and always sent. This is the half of the platform's
         // repository-and-branch binding that Lore can supply today.
-        self.prepare_direct(key, binding, repository_id, branch_id, bearer)
-            .await
+        self.prepare_direct(
+            key,
+            binding,
+            repository_id,
+            branch_id,
+            bearer,
+            client_attempt_id,
+        )
+        .await
     }
 
     /// The shared half of every internal prepare: verify, echo-check, persist.
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_direct(
         &self,
         key: ReceiptKey,
@@ -761,6 +776,7 @@ impl DomainContext {
         repository_id: &[u8],
         branch_id: &[u8],
         bearer: &str,
+        client_attempt_id: Option<Uuid>,
     ) -> Result<GovernedOperation, Status> {
         let verifier = self.operation_verifier.as_ref().ok_or_else(|| {
             Status::failed_precondition(
@@ -804,7 +820,7 @@ impl DomainContext {
         // operation as a mediated one.
         let prepared = self
             .store
-            .domain_operation_prepare(&key, &binding, None)
+            .domain_operation_prepare(&key, &binding, None, client_attempt_id)
             .await
             .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?;
         match prepared {
@@ -984,6 +1000,20 @@ pub struct InternalAdmission {
     ///
     /// Never logged, never persisted, and never placed in a receipt row.
     pub bearer: String,
+    /// The client's own attempt identity, when it sent one. PIN(WP-120, 2026-09-05).
+    ///
+    /// Persisted beside the receipt so a client whose response was lost can find the receipt
+    /// again. It has to be the client's value rather than this server's, because the operation id
+    /// minted here is only ever learned from the response, and the response is the thing that
+    /// went missing.
+    ///
+    /// It lives on this arm alone. A carried admission belongs to the control plane, which minted
+    /// the operation id itself and already knows it, so it has nothing to join and needs no second
+    /// identifier. That asymmetry is the shape of the problem, not an oversight.
+    ///
+    /// An identifier, never an authority: the receipt namespace still comes from the verified
+    /// token, so a caller quoting someone else's attempt id finds nothing.
+    pub client_attempt_id: Option<Uuid>,
 }
 
 impl std::fmt::Debug for AdmissionSource {
@@ -1008,6 +1038,7 @@ impl std::fmt::Debug for InternalAdmission {
         f.debug_struct("InternalAdmission")
             .field("repository_id", &self.repository_id)
             .field("bearer", &"<redacted>")
+            .field("client_attempt_id", &self.client_attempt_id)
             .finish()
     }
 }
@@ -3023,6 +3054,7 @@ pub(crate) mod test_support {
             _key: &ReceiptKey,
             _binding: &OperationBinding,
             _witness: Option<&AuthorizationWitness>,
+            _client_attempt_id: Option<uuid::Uuid>,
         ) -> Result<PrepareResult, DomainError> {
             unreachable!("DomainContext::admit tests never call the coordinator")
         }
@@ -3159,6 +3191,7 @@ pub(crate) mod test_support {
             _key: &ReceiptKey,
             _binding: &OperationBinding,
             witness: Option<&AuthorizationWitness>,
+            _client_attempt_id: Option<uuid::Uuid>,
         ) -> Result<PrepareResult, DomainError> {
             // The direct rail must never write a mediated dispatch fence, and a
             // present witness is what makes the real rail write one. Asserted
@@ -3330,6 +3363,7 @@ pub(crate) mod test_support {
             _key: &ReceiptKey,
             _binding: &OperationBinding,
             _witness: Option<&AuthorizationWitness>,
+            _client_attempt_id: Option<uuid::Uuid>,
         ) -> Result<PrepareResult, DomainError> {
             unreachable!("ScriptedDomainStore only scripts branch_push_commit")
         }
@@ -4375,7 +4409,14 @@ mod tests {
         };
 
         let error = ctx
-            .prepare_direct_lock_operation(&token, "Bearer x", &repository_id, &branch_id, binding)
+            .prepare_direct_lock_operation(
+                &token,
+                "Bearer x",
+                &repository_id,
+                &branch_id,
+                binding,
+                None,
+            )
             .await
             .expect_err("no verifier configured must refuse, not panic or silently admit");
 
@@ -4412,6 +4453,7 @@ mod tests {
                 &repository_id,
                 &branch_id,
                 binding,
+                None,
             )
             .await
             .expect_err("a service account must be refused a direct fenced lock");
@@ -4802,7 +4844,7 @@ mod tests {
             // Prepare exactly the way DomainOperationPrepare does: the
             // mediated key.
             let prepared = store
-                .domain_operation_prepare(&mediated_key, &binding, None)
+                .domain_operation_prepare(&mediated_key, &binding, None, None)
                 .await
                 .expect("prepare through the real production construction path must succeed");
             let PrepareResult::Prepared { token, .. } = prepared else {

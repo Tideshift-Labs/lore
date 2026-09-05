@@ -281,7 +281,7 @@ async fn coordinator_prepare_commit_is_visible_and_receipt_get_replays_it() {
     let original = binding("lore.domain.v1.test/CoordinatorWrapper");
 
     let first = store
-        .domain_operation_prepare(&key, &original, None)
+        .domain_operation_prepare(&key, &original, None, None)
         .await
         .expect("coordinator prepare");
     let PrepareResult::Prepared {
@@ -315,7 +315,7 @@ async fn coordinator_prepare_commit_is_visible_and_receipt_get_replays_it() {
     assert_eq!(hard_expires_at, first_expiry);
 
     let retry = store
-        .domain_operation_prepare(&key, &original, None)
+        .domain_operation_prepare(&key, &original, None, None)
         .await
         .expect("exact coordinator prepare retry");
     assert!(matches!(
@@ -326,7 +326,7 @@ async fn coordinator_prepare_commit_is_visible_and_receipt_get_replays_it() {
     let mut changed = original.clone();
     changed.fingerprint[0] ^= 0xFF;
     let mismatch = store
-        .domain_operation_prepare(&key, &changed, None)
+        .domain_operation_prepare(&key, &changed, None, None)
         .await
         .expect("mismatched coordinator prepare");
     assert_eq!(mismatch, PrepareResult::Mismatch);
@@ -354,7 +354,7 @@ async fn prepare_stale_is_expired_or_unknown_and_writes_nothing() {
     let b = binding("lore.domain.v1.test/Stale");
 
     let tx = client.transaction().await.expect("begin tx");
-    let result = prepare(&tx, &key, &b, None)
+    let result = prepare(&tx, &key, &b, None, None)
         .await
         .expect("prepare must not error");
     tx.commit().await.expect("commit");
@@ -388,7 +388,7 @@ async fn prepare_admissible_persists_a_prepared_row() {
     let b = binding("lore.domain.v1.test/Admissible");
 
     let tx = client.transaction().await.expect("begin tx");
-    let result = prepare(&tx, &key, &b, None)
+    let result = prepare(&tx, &key, &b, None, None)
         .await
         .expect("prepare must not error");
     tx.commit().await.expect("commit");
@@ -419,7 +419,7 @@ async fn prepare_receipt_bearing_future_commits_a_real_not_applied_receipt() {
     let b = binding("lore.domain.v1.test/ReceiptBearingFuture");
 
     let tx = client.transaction().await.expect("begin tx");
-    let result = prepare(&tx, &key, &b, None)
+    let result = prepare(&tx, &key, &b, None, None)
         .await
         .expect("prepare must not error");
     tx.commit().await.expect("commit");
@@ -462,7 +462,7 @@ async fn prepare_beyond_horizon_creates_a_compact_marker_and_no_ordinary_receipt
     let b = binding("lore.domain.v1.test/BeyondHorizon");
 
     let tx = client.transaction().await.expect("begin tx");
-    let result = prepare(&tx, &key, &b, None)
+    let result = prepare(&tx, &key, &b, None, None)
         .await
         .expect("prepare must not error");
     tx.commit().await.expect("commit");
@@ -508,7 +508,7 @@ async fn prepare_exact_retry_returns_the_same_token() {
     let b = binding("lore.domain.v1.test/ExactRetry");
 
     let tx = client.transaction().await.expect("begin first tx");
-    let first = prepare(&tx, &key, &b, None).await.expect("first prepare");
+    let first = prepare(&tx, &key, &b, None, None).await.expect("first prepare");
     tx.commit().await.expect("commit first");
     let PrepareResult::Prepared {
         token: first_token, ..
@@ -518,7 +518,7 @@ async fn prepare_exact_retry_returns_the_same_token() {
     };
 
     let tx = client.transaction().await.expect("begin retry tx");
-    let retry = prepare(&tx, &key, &b, None).await.expect("retry prepare");
+    let retry = prepare(&tx, &key, &b, None, None).await.expect("retry prepare");
     tx.commit().await.expect("commit retry");
     let PrepareResult::Prepared {
         token: retry_token, ..
@@ -551,7 +551,7 @@ async fn prepare_retry_with_a_changed_binding_field_returns_mismatch_and_mutates
         let original = binding("lore.domain.v1.test/MismatchOriginal");
 
         let tx = client.transaction().await.expect("begin original tx");
-        let first = prepare(&tx, &key, &original, None)
+        let first = prepare(&tx, &key, &original, None, None)
             .await
             .expect("original prepare");
         tx.commit().await.expect("commit original");
@@ -573,7 +573,7 @@ async fn prepare_retry_with_a_changed_binding_field_returns_mismatch_and_mutates
         }
 
         let tx = client.transaction().await.expect("begin mismatch tx");
-        let result = prepare(&tx, &key, &changed, None)
+        let result = prepare(&tx, &key, &changed, None, None)
             .await
             .expect("mismatched prepare must not error");
         tx.commit().await.expect("commit mismatch attempt");
@@ -613,7 +613,7 @@ async fn consume_is_single_use_once_the_receipt_is_terminal() {
     let b = binding("lore.domain.v1.test/ConsumeSingleUse");
 
     let tx = client.transaction().await.expect("begin prepare tx");
-    let prepared = prepare(&tx, &key, &b, None).await.expect("prepare");
+    let prepared = prepare(&tx, &key, &b, None, None).await.expect("prepare");
     tx.commit().await.expect("commit prepare");
     let PrepareResult::Prepared { token, .. } = prepared else {
         panic!("expected Prepared, got {prepared:?}");
@@ -674,7 +674,7 @@ async fn consume_rejects_a_token_presented_for_the_wrong_key_or_binding() {
     let binding_a = binding("lore.domain.v1.test/ConsumeScopeA");
 
     let tx = client.transaction().await.expect("begin prepare tx");
-    let prepared = prepare(&tx, &key_a, &binding_a, None)
+    let prepared = prepare(&tx, &key_a, &binding_a, None, None)
         .await
         .expect("prepare");
     tx.commit().await.expect("commit prepare");
@@ -750,7 +750,7 @@ async fn consume_and_receipt_get_reject_changed_canonical_intent() {
     let original = binding("lore.domain.v1.test/CanonicalIntent");
 
     let tx = client.transaction().await.expect("begin prepare tx");
-    let prepared = prepare(&tx, &key, &original, None).await.expect("prepare");
+    let prepared = prepare(&tx, &key, &original, None, None).await.expect("prepare");
     tx.commit().await.expect("commit prepare");
     let PrepareResult::Prepared { token, .. } = prepared else {
         panic!("expected Prepared, got {prepared:?}");
@@ -819,12 +819,12 @@ async fn prepare_expires_a_past_ttl_prepared_row() {
     let b = binding("lore.domain.v1.test/PrepareExpiry");
 
     let tx = client.transaction().await.expect("begin prepare tx");
-    prepare(&tx, &key, &b, None).await.expect("prepare");
+    prepare(&tx, &key, &b, None, None).await.expect("prepare");
     tx.commit().await.expect("commit prepare");
     age_past_hard_ttl(&client, &key).await;
 
     let tx = client.transaction().await.expect("begin second-touch tx");
-    let result = prepare(&tx, &key, &b, None)
+    let result = prepare(&tx, &key, &b, None, None)
         .await
         .expect("prepare must not error");
     tx.commit().await.expect("commit");
@@ -856,7 +856,7 @@ async fn consume_expires_a_past_ttl_prepared_row() {
     let b = binding("lore.domain.v1.test/ConsumeExpiry");
 
     let tx = client.transaction().await.expect("begin prepare tx");
-    let prepared = prepare(&tx, &key, &b, None).await.expect("prepare");
+    let prepared = prepare(&tx, &key, &b, None, None).await.expect("prepare");
     tx.commit().await.expect("commit prepare");
     let PrepareResult::Prepared { token, .. } = prepared else {
         panic!("expected Prepared, got {prepared:?}");
@@ -909,7 +909,7 @@ async fn receipt_get_of_a_past_ttl_prepared_row() {
     let b = binding("lore.domain.v1.test/GetExpiry");
 
     let tx = client.transaction().await.expect("begin prepare tx");
-    prepare(&tx, &key, &b, None).await.expect("prepare");
+    prepare(&tx, &key, &b, None, None).await.expect("prepare");
     tx.commit().await.expect("commit prepare");
     age_past_hard_ttl(&client, &key).await;
 
@@ -960,7 +960,7 @@ async fn commit_terminal_against_an_already_committed_row_errors() {
     let b = binding("lore.domain.v1.test/TerminalImmutable");
 
     let tx = client.transaction().await.expect("begin prepare tx");
-    prepare(&tx, &key, &b, None).await.expect("prepare");
+    prepare(&tx, &key, &b, None, None).await.expect("prepare");
     let admission_clock_value = admission_clock(&tx).await.expect("read clock");
     commit_terminal(
         &tx,
@@ -1027,7 +1027,7 @@ async fn receipt_get_of_a_prepared_row_carries_no_token() {
     let b = binding("lore.domain.v1.test/GetNoToken");
 
     let tx = client.transaction().await.expect("begin prepare tx");
-    prepare(&tx, &key, &b, None).await.expect("prepare");
+    prepare(&tx, &key, &b, None, None).await.expect("prepare");
     tx.commit().await.expect("commit prepare");
 
     let tx = client.transaction().await.expect("begin get tx");
@@ -1070,7 +1070,7 @@ async fn prepare_of_a_future_marker_under_a_different_binding_must_return_mismat
     let binding_a = binding("lore.domain.v1.test/FutureMarkerA");
 
     let tx = client.transaction().await.expect("begin first tx");
-    let first = prepare(&tx, &key, &binding_a, None)
+    let first = prepare(&tx, &key, &binding_a, None, None)
         .await
         .expect("first prepare");
     tx.commit().await.expect("commit first");
@@ -1081,7 +1081,7 @@ async fn prepare_of_a_future_marker_under_a_different_binding_must_return_mismat
 
     let binding_b = binding("lore.domain.v1.test/FutureMarkerB");
     let tx = client.transaction().await.expect("begin second tx");
-    let second = prepare(&tx, &key, &binding_b, None)
+    let second = prepare(&tx, &key, &binding_b, None, None)
         .await
         .expect("second prepare");
     tx.commit().await.expect("commit second");
@@ -1116,7 +1116,7 @@ async fn receipt_get_of_a_future_marker_under_a_different_binding_must_return_mi
     let binding_a = binding("lore.domain.v1.test/FutureMarkerGetA");
 
     let tx = client.transaction().await.expect("begin prepare tx");
-    prepare(&tx, &key, &binding_a, None).await.expect("prepare");
+    prepare(&tx, &key, &binding_a, None, None).await.expect("prepare");
     tx.commit().await.expect("commit prepare");
 
     let binding_b = binding("lore.domain.v1.test/FutureMarkerGetB");
@@ -1159,7 +1159,7 @@ async fn beyond_horizon_prepare_at_retained_quota_limit_is_capacity_exhausted() 
 
     // Seed the quota row for real via one successful marker admission.
     let tx = client.transaction().await.expect("begin seed tx");
-    prepare(&tx, &issuer_key, &b, None)
+    prepare(&tx, &issuer_key, &b, None, None)
         .await
         .expect("seed prepare");
     tx.commit().await.expect("commit seed");
@@ -1188,6 +1188,7 @@ async fn beyond_horizon_prepare_at_retained_quota_limit_is_capacity_exhausted() 
         &tx,
         &new_operation_key,
         &binding("lore.domain.v1.test/QuotaRetainedNew"),
+        None,
         None,
     )
     .await
@@ -1232,6 +1233,7 @@ async fn beyond_horizon_prepare_at_hourly_quota_limit_is_capacity_exhausted() {
         &seed_key,
         &binding("lore.domain.v1.test/QuotaHourlySeed"),
         None,
+        None,
     )
     .await
     .expect("seed prepare");
@@ -1261,6 +1263,7 @@ async fn beyond_horizon_prepare_at_hourly_quota_limit_is_capacity_exhausted() {
         &tx,
         &new_operation_key,
         &binding("lore.domain.v1.test/QuotaHourlyNew"),
+        None,
         None,
     )
     .await
@@ -1308,7 +1311,7 @@ async fn prepare_accepts_an_authorization_witness() {
     };
 
     let tx = client.transaction().await.expect("begin tx");
-    let result = prepare(&tx, &key, &b, Some(&witness))
+    let result = prepare(&tx, &key, &b, Some(&witness), None)
         .await
         .expect("prepare with a witness must not error");
     tx.commit().await.expect("commit");
@@ -1344,7 +1347,7 @@ async fn concurrent_duplicate_future_marker_prepares_do_not_double_count_the_quo
     let (result_a, result_b) = tokio::join!(
         async {
             let tx = client_a.transaction().await.expect("begin tx a");
-            let r = prepare(&tx, &key_a, &binding_a, None)
+            let r = prepare(&tx, &key_a, &binding_a, None, None)
                 .await
                 .expect("prepare a");
             tx.commit().await.expect("commit a");
@@ -1352,7 +1355,7 @@ async fn concurrent_duplicate_future_marker_prepares_do_not_double_count_the_quo
         },
         async {
             let tx = client_b.transaction().await.expect("begin tx b");
-            let r = prepare(&tx, &key_b, &binding_b, None)
+            let r = prepare(&tx, &key_b, &binding_b, None, None)
                 .await
                 .expect("prepare b");
             tx.commit().await.expect("commit b");

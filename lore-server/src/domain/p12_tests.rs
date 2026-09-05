@@ -225,6 +225,7 @@ impl DomainTransactionStore for MetadataCasScriptedStore {
         _key: &ReceiptKey,
         _binding: &OperationBinding,
         _witness: Option<&AuthorizationWitness>,
+        _client_attempt_id: Option<uuid::Uuid>,
     ) -> Result<PrepareResult, DomainError> {
         unreachable!("MetadataCasScriptedStore only scripts metadata_compare_and_swap")
     }
@@ -509,6 +510,7 @@ impl DomainTransactionStore for RepositoryCreateScriptedStore {
         _key: &ReceiptKey,
         _binding: &OperationBinding,
         _witness: Option<&AuthorizationWitness>,
+        _client_attempt_id: Option<uuid::Uuid>,
     ) -> Result<PrepareResult, DomainError> {
         unreachable!(
             "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"

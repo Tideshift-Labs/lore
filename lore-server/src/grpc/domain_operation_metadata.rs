@@ -58,6 +58,24 @@ pub const PREPARE_TOKEN_KEY: &str = "lore-domain-prepare-token-bin";
 /// Frozen CR-029 mediated receipt-namespace tuple.
 pub const MEDIATED_SCOPE_KEY: &str = "lore-domain-mediated-scope-bin";
 
+// PIN(WP-120, 2026-09-05): the client's own attempt identity, sent on every mutating dispatch.
+//
+// Plain ASCII, so no `-bin` suffix: the value is the hyphenated lowercase UUIDv7 that
+// `lore_transport::outcome::AttemptId`'s `Display` renders, and a `-bin` key would make tonic
+// expect base64. The client half is `lore-transport`'s `ATTEMPT_ID_METADATA_KEY`; the two
+// literals must stay equal.
+//
+// Why the client sends an identity at all, when this server already mints an operation id: the
+// server's id is only ever learned from the response, and the case this whole rail exists for is
+// the response that never arrived. Nothing the server already holds can join a lost attempt to
+// its receipt, so the client supplies something it minted before dispatch and the server files it
+// alongside.
+//
+// It is an identifier, never an authority. The receipt namespace still comes from the verified
+// token, so two clients that mint the same UUID collide only with themselves.
+/// The client's own attempt identity for one mutating dispatch.
+pub const ATTEMPT_ID_KEY: &str = "lore-attempt-id";
+
 /// A UUID is 16 bytes. Any other length is rejected, never padded or truncated.
 pub const OPERATION_ID_LEN: usize = 16;
 /// `PrepareResult::Prepared.token` is `[u8; 32]`.
@@ -342,6 +360,71 @@ fn read_bin(
         }
     }
     Ok(found)
+}
+
+/// Read one ASCII header, refusing divergent duplicates.
+///
+/// The plain-text sibling of [`read_bin`], with the same duplicate rule and for the same reason:
+/// picking the first of two disagreeing values is the divergence CR-010 records.
+fn read_ascii(
+    metadata: &MetadataMap,
+    header: &'static str,
+) -> Result<Option<String>, DomainOperationMetadataError> {
+    let mut found: Option<String> = None;
+    for value in metadata.get_all(header).iter() {
+        let text = value
+            .to_str()
+            .map_err(|e| DomainOperationMetadataError::Malformed {
+                header,
+                detail: e.to_string(),
+            })?
+            .to_owned();
+        match &found {
+            None => found = Some(text),
+            Some(first) if *first == text => {}
+            Some(_) => {
+                return Err(DomainOperationMetadataError::DivergentDuplicate { header });
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Read the optional client attempt id.
+///
+/// Absent is ordinary and not an error: a client older than WP-120 sends nothing, and the
+/// mutation proceeds with no reconciliation aid attached.
+///
+/// Present-but-unreadable is refused rather than ignored, and the asymmetry is deliberate. A
+/// client sends this header because it intends to ask about the attempt later. Completing the
+/// mutation while quietly discarding the identity would leave that client holding an id this
+/// server never filed, and it could not tell the difference between an attempt with no receipt
+/// and one whose header this server dropped. Refusing a mutation the caller can reissue under a
+/// fresh id is the smaller harm than completing one it can never ask about.
+///
+/// The v7 check is not decoration. The receipt rail classifies replay by a UUID's embedded
+/// timestamp, so a non-v7 value would be filed as an identity nothing can order.
+pub fn extract_attempt_id(
+    metadata: &MetadataMap,
+) -> Result<Option<Uuid>, DomainOperationMetadataError> {
+    let Some(text) = read_ascii(metadata, ATTEMPT_ID_KEY)? else {
+        return Ok(None);
+    };
+    let attempt =
+        Uuid::parse_str(text.trim()).map_err(|e| DomainOperationMetadataError::Malformed {
+            header: ATTEMPT_ID_KEY,
+            detail: e.to_string(),
+        })?;
+    if attempt.get_version_num() != 7 {
+        return Err(DomainOperationMetadataError::Malformed {
+            header: ATTEMPT_ID_KEY,
+            detail: format!(
+                "attempt id is UUID version {}, not the required 7",
+                attempt.get_version_num()
+            ),
+        });
+    }
+    Ok(Some(attempt))
 }
 
 /// Check RFC 9562 version and variant bits. A 16-byte value that is not a

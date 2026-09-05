@@ -150,7 +150,7 @@ async fn prepare_terminal_fixture_by_the_rail(
     current_witness.authorization_id = current_operation_id.as_bytes().to_vec();
     current_witness.expected_claim_identity_digest = stale.expected_claim_identity_digest.clone();
     let prepared = store
-        .domain_operation_prepare(&current_key, &stale.binding, Some(&current_witness))
+        .domain_operation_prepare(&current_key, &stale.binding, Some(&current_witness), None)
         .await
         .expect("rail prepares the terminal fixture");
     let PrepareResult::Prepared { token, .. } = prepared else {

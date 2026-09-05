@@ -179,7 +179,7 @@ async fn every_one_field_digest_mutation_is_refused_against_the_prepared_fence()
         expected_claim_identity_digest: golden_digest.to_vec(),
     };
     let prepared = store
-        .domain_operation_prepare(&key, &binding, Some(&witness))
+        .domain_operation_prepare(&key, &binding, Some(&witness), None)
         .await
         .expect("prepare binds the golden digest into its fence");
     assert!(matches!(prepared, PrepareResult::Prepared { .. }));

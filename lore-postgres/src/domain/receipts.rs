@@ -486,6 +486,7 @@ pub async fn prepare(
     key: &ReceiptKey,
     binding: &OperationBinding,
     witness: Option<&AuthorizationWitness>,
+    client_attempt_id: Option<Uuid>,
 ) -> Result<PrepareResult, DomainError> {
     let clock = admission_clock(tx).await?;
     let uuid_ts = uuid_v7_timestamp(&key.operation_id)?;
@@ -547,6 +548,7 @@ pub async fn prepare(
                 uuid_ts,
                 clock,
                 hard_expires_at,
+                client_attempt_id,
             )
             .await?;
             Ok(PrepareResult::Prepared {
@@ -571,6 +573,7 @@ pub async fn prepare(
                 uuid_ts,
                 clock,
                 hard_expires_at,
+                client_attempt_id,
             )
             .await?;
             let outcome = DomainOutcome::NotApplied {
@@ -642,7 +645,12 @@ async fn insert_prepared(
     uuid_timestamp: SystemTime,
     prepared_at: SystemTime,
     hard_expires_at: SystemTime,
+    client_attempt_id: Option<Uuid>,
 ) -> Result<(), DomainError> {
+    // `client_attempt_id` is stored as raw bytes rather than a `uuid` column to match every other
+    // identifier on this table, which is `bytea`. It is nullable because a client older than
+    // WP-120 sends none, and a receipt without one is an ordinary receipt, not a defective one.
+    let client_attempt_id = client_attempt_id.map(|id| id.as_bytes().to_vec());
     tx.execute(
         "INSERT INTO lore_domain_operation_receipts ( \
              verified_issuer, authenticated_subject, tenant_scope_key, operation_id, \
@@ -650,9 +658,9 @@ async fn insert_prepared(
              state, consume_token, \
              authorization_id, authorization_revision, verification_nonce, \
              bound_fields_digest, consumed_ticket_sha256, \
-             uuid_timestamp, prepared_at, hard_expires_at \
+             uuid_timestamp, prepared_at, hard_expires_at, client_attempt_id \
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                   $12, $13, $14, $15, $16, $17, $18, $19)",
+                   $12, $13, $14, $15, $16, $17, $18, $19, $20)",
         &[
             &key.verified_issuer,
             &key.authenticated_subject,
@@ -673,6 +681,7 @@ async fn insert_prepared(
             &uuid_timestamp,
             &prepared_at,
             &hard_expires_at,
+            &client_attempt_id,
         ],
     )
     .await

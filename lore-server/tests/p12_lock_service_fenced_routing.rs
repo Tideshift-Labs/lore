@@ -348,7 +348,7 @@ async fn create_repository_and_branch(store: &PostgresDomainStore) -> ([u8; 16],
         canonical_intent_digest: digest.clone(),
     };
     let PrepareResult::Prepared { token, .. } = store
-        .domain_operation_prepare(&key, &binding, None)
+        .domain_operation_prepare(&key, &binding, None, None)
         .await
         .expect("prepare the fixture repository create")
     else {

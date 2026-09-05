@@ -161,7 +161,7 @@ async fn admitted_operation(
     let binding = binding(method);
     let witness = witness(operation_id);
     let prepared = store
-        .domain_operation_prepare(&key, &binding, Some(&witness))
+        .domain_operation_prepare(&key, &binding, Some(&witness), None)
         .await
         .expect("prepare governed operation");
     let PrepareResult::Prepared { token, .. } = prepared else {

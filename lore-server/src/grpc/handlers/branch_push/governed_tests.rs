@@ -133,7 +133,7 @@ async fn prepare_bound_operation(
         operation_id: uuid_v7_at(clock),
     };
     let prepared = store
-        .domain_operation_prepare(&key, &binding, None)
+        .domain_operation_prepare(&key, &binding, None, None)
         .await
         .expect("prepare lock operation");
     let PrepareResult::Prepared { token, .. } = prepared else {
@@ -168,7 +168,7 @@ async fn prepare_create_operation(store: &PostgresDomainStore) -> GovernedOperat
         canonical_intent_digest: rand::random::<[u8; 32]>().to_vec(),
     };
     let prepared = store
-        .domain_operation_prepare(&key, &binding, None)
+        .domain_operation_prepare(&key, &binding, None, None)
         .await
         .expect("prepare repository create");
     let PrepareResult::Prepared { token, .. } = prepared else {
@@ -1352,7 +1352,7 @@ async fn prepare_and_build_push_request(
         canonical_intent_digest: digest,
     };
     let prepared = store
-        .domain_operation_prepare(&key, &binding, None)
+        .domain_operation_prepare(&key, &binding, None, None)
         .await
         .expect("prepare branch push operation");
     let PrepareResult::Prepared { token, .. } = prepared else {

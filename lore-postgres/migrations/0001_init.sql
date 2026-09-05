@@ -565,6 +565,35 @@ CREATE TABLE IF NOT EXISTS lore_domain_schema_state (
         enforcement_enabled = false OR backfill_state = 3
     )
 );
+
+-- WP-120: the client's own attempt identity for one dispatched mutation.
+--
+-- ALTER rather than a column in the CREATE TABLE above, and that is load-bearing rather than
+-- stylistic. Every CREATE TABLE here is IF NOT EXISTS, so on any database that already has the
+-- receipts table the whole body is skipped in silence: a column added inside it would exist on a
+-- freshly installed cell and be missing on every cell that has ever run, with nothing to say so
+-- until an INSERT failed in production. ALTER ... ADD COLUMN IF NOT EXISTS runs on both.
+--
+-- Nullable on purpose. A client older than WP-120 sends no attempt id, and a receipt without one
+-- is an ordinary receipt rather than a defective one, so there is no default to backfill and
+-- nothing to migrate.
+ALTER TABLE lore_domain_operation_receipts
+    ADD COLUMN IF NOT EXISTS client_attempt_id bytea
+    CHECK (client_attempt_id IS NULL OR octet_length(client_attempt_id) = 16);
+
+-- Namespaced deliberately, and this is the security-bearing part of the change.
+--
+-- The lookup that uses this index resolves the namespace from the caller's verified token and
+-- takes only the attempt id from the request. Leading with the three namespace columns means the
+-- index itself cannot serve a probe that supplies an attempt id alone, so its shape matches the
+-- authority the query is allowed to exercise. An index on client_attempt_id by itself would make
+-- a cross-namespace scan the cheap plan, which is exactly the query that must never be cheap.
+--
+-- Partial, because a row without an attempt id can never be found through it.
+CREATE INDEX IF NOT EXISTS lore_domain_operation_receipts_client_attempt
+    ON lore_domain_operation_receipts
+       (verified_issuer, authenticated_subject, tenant_scope_key, client_attempt_id)
+    WHERE client_attempt_id IS NOT NULL;
 -- ---------------------------------------------------------------------------
 -- Dispatch-possibility fence
 -- ---------------------------------------------------------------------------

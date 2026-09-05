@@ -365,6 +365,11 @@ struct FencedCall {
     authorization: crate::auth::jwt::AuthorizationToken,
     caller: VerifiedLockOwner,
     bearer: String,
+    /// The client's own attempt identity, when it sent one. PIN(WP-120, 2026-09-05).
+    ///
+    /// Resolved here with everything else the request supplies, because this is where the
+    /// metadata is in hand; the three fenced mutations below only ever pass it along.
+    client_attempt_id: Option<uuid::Uuid>,
 }
 
 impl LoreLockService {
@@ -405,6 +410,9 @@ impl LoreLockService {
             authorization,
             caller,
             bearer,
+            client_attempt_id: crate::grpc::domain_operation_metadata::extract_attempt_id(
+                metadata,
+            )?,
         }))
     }
 
@@ -460,6 +468,7 @@ impl LoreLockService {
                 repository.as_ref(),
                 &batch.branch_id,
                 binding,
+                call.client_attempt_id,
             )
             .await?;
         let result = call
@@ -511,6 +520,7 @@ impl LoreLockService {
                 repository.as_ref(),
                 &batch.branch_id,
                 binding,
+                call.client_attempt_id,
             )
             .await?;
         let result = call
@@ -569,6 +579,7 @@ impl LoreLockService {
                 repository.as_ref(),
                 &batch.branch_id,
                 binding,
+                call.client_attempt_id,
             )
             .await?;
         let result = call

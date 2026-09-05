@@ -536,11 +536,17 @@ pub trait DomainTransactionStore: Send + Sync {
     /// The authorization witness is immutable server-only evidence. It is not
     /// part of the caller-known fingerprint and must already have been verified
     /// before this method is called.
+    /// `client_attempt_id` is the caller's own identity for this attempt, when it sent one. It is
+    /// recorded beside the receipt and never used to find or authorise it: the namespace still
+    /// comes from the verified principal in `key`. It exists because a client that loses a
+    /// response cannot learn the `operation_id` this server minted, so without something the
+    /// client chose before dispatch there is no value both sides can name the attempt by.
     async fn domain_operation_prepare(
         &self,
         key: &ReceiptKey,
         binding: &OperationBinding,
         witness: Option<&AuthorizationWitness>,
+        client_attempt_id: Option<uuid::Uuid>,
     ) -> Result<PrepareResult, DomainError>;
 
     /// Load one receipt or compact future-rejection marker in its exact

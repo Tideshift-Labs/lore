@@ -135,7 +135,7 @@ async fn prepare_bound_operation(
         operation_id: uuid_v7_at(clock),
     };
     let prepared = store
-        .domain_operation_prepare(&key, &binding, None)
+        .domain_operation_prepare(&key, &binding, None, None)
         .await
         .expect("prepare lock operation");
     let PrepareResult::Prepared { token, .. } = prepared else {
@@ -164,7 +164,7 @@ async fn prepare_create_operation(store: &PostgresDomainStore) -> GovernedOperat
     };
     let binding = binding("repository_create");
     let prepared = store
-        .domain_operation_prepare(&key, &binding, None)
+        .domain_operation_prepare(&key, &binding, None, None)
         .await
         .expect("prepare repository create");
     let PrepareResult::Prepared { token, .. } = prepared else {
@@ -1849,7 +1849,7 @@ async fn lock_operations_reuse_cr029_receipt_bands_markers_and_quota() {
         ),
     };
     let future = store
-        .domain_operation_prepare(&future_key, &binding("lock.future.receipt"), None)
+        .domain_operation_prepare(&future_key, &binding("lock.future.receipt"), None, None)
         .await
         .expect("receipt-bearing future");
     assert!(
@@ -1868,7 +1868,7 @@ async fn lock_operations_reuse_cr029_receipt_bands_markers_and_quota() {
     };
     let marker_binding = binding("lock.future.marker");
     let marker = store
-        .domain_operation_prepare(&marker_key, &marker_binding, None)
+        .domain_operation_prepare(&marker_key, &marker_binding, None, None)
         .await
         .expect("future marker");
     assert!(

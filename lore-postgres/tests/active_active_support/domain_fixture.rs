@@ -83,7 +83,7 @@ pub async fn admitted(
     };
     let binding = binding(method, ids);
     let prepared = store
-        .domain_operation_prepare(&key, &binding, None)
+        .domain_operation_prepare(&key, &binding, None, None)
         .await
         .expect("prepare governed operation");
     let PrepareResult::Prepared { token, .. } = prepared else {
@@ -116,7 +116,7 @@ pub async fn admitted_lock(
         operation_id: uuid_v7_at(clock),
     };
     let prepared = store
-        .domain_operation_prepare(&key, &binding, None)
+        .domain_operation_prepare(&key, &binding, None, None)
         .await
         .expect("prepare lock operation");
     let PrepareResult::Prepared { token, .. } = prepared else {
