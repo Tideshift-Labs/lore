@@ -28,12 +28,15 @@ use lore_revision::repository;
 use lore_revision::repository::BranchSwitchOptions;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
+use lore_transport::attempt_store::AttemptStore;
 use serde::Deserialize;
 use serde::Serialize;
 
 use crate::call::repository_call_read;
 use crate::call::repository_call_write;
 use crate::call_delegation::dispatch_call;
+use crate::call_delegation::reject_undelegatable;
+use crate::call_delegation::service_delegation_requested;
 use crate::interface::Context;
 use crate::interface::LoreString;
 
@@ -877,17 +880,64 @@ pub async fn push(
     dispatch_call(globals, args, callback, push_local).await
 }
 
+/// Push, journalling every irreversible dispatch in the caller's own attempt store (WP-120).
+///
+/// The door [`push`] does not have. An embedder that keeps a durable record of what it dispatched
+/// supplies its store here, and every irreversible dispatch inside the push mints an id, records it
+/// before the request leaves, and resolves it after. A push reaches several such dispatches, so a
+/// caller sees several ids per call, each one a separate server receipt it can later quote to
+/// `DomainOperationAttemptReceiptGet`. That is the whole point: the id the caller wrote down is the
+/// id the server files under.
+///
+/// Separate from [`push`] rather than an added parameter on it, because `push` is a C ABI entry
+/// point and a live `Arc<dyn AttemptStore>` cannot cross that boundary. Callers that keep no
+/// journal keep calling [`push`] and nothing about it changed.
+///
+/// Refuses under `LORE_USE_SERVICE` instead of delegating, since a delegated call would leave the
+/// store behind; see [`crate::call_delegation::reject_undelegatable`] for why that refusal is worth
+/// a failed call.
+pub async fn push_with_attempt_store(
+    globals: LoreGlobalArgs,
+    args: LoreBranchPushArgs,
+    callback: LoreEventCallback,
+    attempts: Arc<dyn AttemptStore>,
+) -> i32 {
+    if service_delegation_requested() {
+        return reject_undelegatable(
+            globals,
+            callback,
+            "push_with_attempt_store cannot delegate to a service: the attempt store is \
+             in-process, and a delegated push would file receipts under identities the caller \
+             never recorded. Unset LORE_USE_SERVICE, or call push and keep no journal."
+                .to_owned(),
+        )
+        .await;
+    }
+    push_journalled(globals, args, callback, Some(attempts)).await
+}
+
 async fn push_local(
     globals: LoreGlobalArgs,
     args: LoreBranchPushArgs,
     callback: LoreEventCallback,
+) -> i32 {
+    push_journalled(globals, args, callback, None).await
+}
+
+async fn push_journalled(
+    globals: LoreGlobalArgs,
+    args: LoreBranchPushArgs,
+    callback: LoreEventCallback,
+    attempts: Option<Arc<dyn AttemptStore>>,
 ) -> i32 {
     repository_call_write(
         globals,
         callback,
         args,
         push,
-        |repository, token, args| async move { push_impl(repository, &token, args).await },
+        move |repository, token, args| async move {
+            push_impl(repository, &token, args, attempts).await
+        },
     )
     .await
 }
@@ -896,6 +946,7 @@ async fn push_impl(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     args: LoreBranchPushArgs,
+    attempts: Option<Arc<dyn AttemptStore>>,
 ) -> Result<(), branch::push::PushError> {
     repository
         .remote()
@@ -910,10 +961,11 @@ async fn push_impl(
     // Push is never local
     repository.set_disable_upload(false);
 
-    // `None`: the CLI keeps no attempt journal, so the transport mints its own id per dispatch
-    // exactly as it did before. An embedder that does keep one calls this path with its own
-    // store, which is what makes the id it recorded the id the server files a receipt under.
-    lore_revision::branch::push::push(repository, token, options, None).await
+    // `None` for the CLI, which keeps no attempt journal: the transport mints its own id per
+    // dispatch exactly as it did before. An embedder that keeps one reaches here through
+    // `push_with_attempt_store`, which is what makes the id it recorded the id the server files a
+    // receipt under.
+    lore_revision::branch::push::push(repository, token, options, attempts).await
 }
 
 #[repr(C)]

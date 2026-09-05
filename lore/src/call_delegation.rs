@@ -115,6 +115,35 @@ async fn reject_call(
     .await
 }
 
+/// Whether this process hands its calls to a service rather than running them itself.
+///
+/// One definition, read by [`dispatch_call`] and by every entry point that has to refuse when it
+/// is true. Two copies of this check would drift, and the failure that drift produces is silent.
+pub(crate) fn service_delegation_requested() -> bool {
+    std::env::var("LORE_USE_SERVICE").is_ok_and(|value| !value.is_empty())
+}
+
+/// Refuse a call carrying in-process state that delegation cannot take with it (WP-120).
+///
+/// An entry point that accepts an `AttemptStore` accepts a live trait object. `service_call`
+/// serializes its arguments and sends them to another process, so the store cannot go: the service
+/// would run the operation, mint its own attempt ids, and file receipts under identities the caller
+/// never recorded. The caller's later lookup would answer "no such receipt" forever, having done
+/// everything right. Refusing is loud and costs one call; delegating and dropping the store is
+/// silent and costs the reconciliation the caller built.
+pub(crate) async fn reject_undelegatable(
+    globals: LoreGlobalArgs,
+    callback: LoreEventCallback,
+    reason: String,
+) -> i32 {
+    reject_call(
+        globals,
+        callback,
+        ArgumentError::from(InvalidArguments { reason }),
+    )
+    .await
+}
+
 pub(crate) async fn dispatch_call<
     ArgsType: InvokableLoreArgs + Clone + Send + 'static,
     Handler: Fn(LoreGlobalArgs, ArgsType, LoreEventCallback) -> Fut,
@@ -125,9 +154,7 @@ pub(crate) async fn dispatch_call<
     callback: LoreEventCallback,
     handler: Handler,
 ) -> i32 {
-    if let Ok(environment_value) = std::env::var("LORE_USE_SERVICE")
-        && !environment_value.is_empty()
-    {
+    if service_delegation_requested() {
         service_call(globals, args, callback).await
     } else {
         handler(globals, args, callback).await
