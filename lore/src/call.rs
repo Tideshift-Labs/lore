@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use lore_base::error::InvalidArguments;
 use lore_base::error::RepositoryNotFound;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::FfiError;
@@ -24,78 +23,10 @@ use lore_revision::repository::RepositoryError;
 use lore_revision::repository::RepositoryFormat;
 pub use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::util;
-use lore_transport::outcome::AttemptId;
-use uuid::Uuid;
 
 use crate::interface::LoreEventCallback;
 use crate::util::log_command_done;
 use crate::util::log_command_info;
-
-/// Read the caller's attempt identity off the globals (WP-120).
-///
-/// `Ok(None)` is the ordinary case: the CLI and every embedder that does not track attempts
-/// supply nothing, and nothing changes for them.
-///
-/// A value that is present but unreadable is an error rather than something to ignore, and the
-/// asymmetry is deliberate. A caller supplies this because it keeps a durable record and means to
-/// reconcile a lost response against an authoritative receipt later. Dropping the value and
-/// proceeding would let the mutation dispatch under an identity the caller never wrote down, and
-/// its later lookup would answer "no such receipt" forever while appearing to work perfectly.
-/// Failing the call is loud, local, and costs one reissued operation; the alternative is silent
-/// and permanent.
-fn dispatch_attempt(globals: &LoreGlobalArgs) -> Result<Option<AttemptId>, InvalidArguments> {
-    let Some(text) = globals.attempt_id() else {
-        return Ok(None);
-    };
-    let uuid = Uuid::parse_str(text.trim()).map_err(|_| InvalidArguments {
-        reason: "attempt_id is not a UUID".to_owned(),
-    })?;
-    // v7 because the receipt rail orders and classifies attempts by a UUID's embedded timestamp.
-    // A value of any other version could never have been filed as one, so quoting it later is a
-    // caller error rather than a miss, and it is better found here than three layers down.
-    if uuid.get_version_num() != 7 {
-        return Err(InvalidArguments {
-            reason: format!(
-                "attempt_id is UUID version {}, not the required 7",
-                uuid.get_version_num()
-            ),
-        });
-    }
-    Ok(Some(AttemptId::from_uuid(uuid)))
-}
-
-/// Run one operation inside the caller-supplied attempt scope, when there is one.
-///
-/// The transport's mutable dispatch reuses an attempt already in scope and mints one only when
-/// none is present, so entering here is what makes the caller's own identity the one the server
-/// files its receipt under. Without a supplied id this is exactly the future it was given.
-///
-/// It returns a future rather than being an `async fn`, and clippy will tell you that is
-/// needless. It is not. The result of this call is handed straight to `LORE_CONTEXT.scope`,
-/// whose `Send`-ness the compiler proves structurally through the future it wraps; an `async fn`
-/// here erases that proof and every caller in `auth.rs`, `branch.rs` and their siblings fails
-/// with "implementation of `Send` is not general enough". Measured, not guessed: written as an
-/// `async fn` first, and that is the error it produced.
-#[expect(
-    clippy::manual_async_fn,
-    reason = "an async fn breaks Send inference for the enclosing LORE_CONTEXT scope"
-)]
-fn in_dispatch_attempt<F>(
-    attempt: Option<AttemptId>,
-    operation: F,
-) -> impl Future<Output = F::Output>
-where
-    F: Future,
-{
-    async move {
-        match attempt {
-            Some(attempt) => {
-                lore_transport::outcome::with_dispatch_attempt(attempt, operation).await
-            }
-            None => operation.await,
-        }
-    }
-}
 
 pub fn setup_execution(
     globals: LoreGlobalArgs,
@@ -137,44 +68,39 @@ where
     F: FnOnce(Arc<RepositoryContext>, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
 {
-    let (repository_path, execution, attempt) =
-        match prepare_repository_call(globals, callback).await {
-            Ok(v) => v,
-            Err(status) => return status,
-        };
+    let (repository_path, execution) = match prepare_repository_call(globals, callback).await {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
 
     LORE_CONTEXT
-        .scope(
-            execution,
-            in_dispatch_attempt(attempt, async move {
-                log_command_info(&caller, &args);
-                let time_start = Instant::now();
+        .scope(execution, async move {
+            log_command_info(&caller, &args);
+            let time_start = Instant::now();
 
-                let detail;
-                let mut weak_repository = None;
-                match repository::load_and_connect_with_token(
-                    &repository_path,
-                    RepositoryAccess::ReadOnly,
-                    None,
-                )
-                .await
-                {
-                    Ok(repository) => {
-                        detail =
-                            LoreErrorDetail::from_result(command(repository.clone(), args).await);
-                        weak_repository = Some(post_command_cleanup(repository).await);
-                    }
-                    Err(err) => {
-                        detail = LoreErrorDetail::from_error(&err);
-                    }
+            let detail;
+            let mut weak_repository = None;
+            match repository::load_and_connect_with_token(
+                &repository_path,
+                RepositoryAccess::ReadOnly,
+                None,
+            )
+            .await
+            {
+                Ok(repository) => {
+                    detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
+                    weak_repository = Some(post_command_cleanup(repository).await);
                 }
+                Err(err) => {
+                    detail = LoreErrorDetail::from_error(&err);
+                }
+            }
 
-                check_no_lingering_repository(weak_repository);
+            check_no_lingering_repository(weak_repository);
 
-                log_command_done(&caller, time_start);
-                execution_context().dispatcher.complete(detail).await
-            }),
-        )
+            log_command_done(&caller, time_start);
+            execution_context().dispatcher.complete(detail).await
+        })
         .await
 }
 
@@ -198,48 +124,44 @@ where
     F: FnOnce(Arc<RepositoryContext>, RepositoryWriteToken, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
 {
-    let (repository_path, execution, attempt) =
-        match prepare_repository_call(globals, callback).await {
-            Ok(v) => v,
-            Err(status) => return status,
-        };
+    let (repository_path, execution) = match prepare_repository_call(globals, callback).await {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
 
     let token = RepositoryWriteToken::acquire(&repository_path).await;
     let context_token = token.share();
 
     LORE_CONTEXT
-        .scope(
-            execution,
-            in_dispatch_attempt(attempt, async move {
-                log_command_info(&caller, &args);
-                let time_start = Instant::now();
+        .scope(execution, async move {
+            log_command_info(&caller, &args);
+            let time_start = Instant::now();
 
-                let detail;
-                let mut weak_repository = None;
-                match repository::load_and_connect_with_token(
-                    &repository_path,
-                    RepositoryAccess::ReadWrite,
-                    Some(context_token),
-                )
-                .await
-                {
-                    Ok(repository) => {
-                        detail = LoreErrorDetail::from_result(
-                            command(repository.clone(), token, args).await,
-                        );
-                        weak_repository = Some(post_command_cleanup(repository).await);
-                    }
-                    Err(err) => {
-                        detail = LoreErrorDetail::from_error(&err);
-                    }
+            let detail;
+            let mut weak_repository = None;
+            match repository::load_and_connect_with_token(
+                &repository_path,
+                RepositoryAccess::ReadWrite,
+                Some(context_token),
+            )
+            .await
+            {
+                Ok(repository) => {
+                    detail = LoreErrorDetail::from_result(
+                        command(repository.clone(), token, args).await,
+                    );
+                    weak_repository = Some(post_command_cleanup(repository).await);
                 }
+                Err(err) => {
+                    detail = LoreErrorDetail::from_error(&err);
+                }
+            }
 
-                check_no_lingering_repository(weak_repository);
+            check_no_lingering_repository(weak_repository);
 
-                log_command_done(&caller, time_start);
-                execution_context().dispatcher.complete(detail).await
-            }),
-        )
+            log_command_done(&caller, time_start);
+            execution_context().dispatcher.complete(detail).await
+        })
         .await
 }
 
@@ -262,7 +184,7 @@ where
     F: FnOnce(Arc<RepositoryContext>, RepositoryWriteToken, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
 {
-    let (repository_path, execution, attempt) =
+    let (repository_path, execution) =
         match prepare_repository_call_result::<ErrT>(globals, callback).await {
             Ok(value) => value,
             Err(err) => return Err(err),
@@ -272,39 +194,36 @@ where
     let context_token = token.share();
 
     LORE_CONTEXT
-        .scope(
-            execution,
-            in_dispatch_attempt(attempt, async move {
-                log_command_info(&caller, &args);
-                let time_start = Instant::now();
+        .scope(execution, async move {
+            log_command_info(&caller, &args);
+            let time_start = Instant::now();
 
-                let mut weak_repository = None;
-                let result = match repository::load_and_connect_with_token(
-                    &repository_path,
-                    RepositoryAccess::ReadWrite,
-                    Some(context_token),
-                )
-                .await
-                {
-                    Ok(repository) => {
-                        let result = command(repository.clone(), token, args).await;
-                        weak_repository = Some(post_command_cleanup(repository).await);
-                        result
-                    }
-                    Err(err) => Err(ErrT::from(err)),
-                };
+            let mut weak_repository = None;
+            let result = match repository::load_and_connect_with_token(
+                &repository_path,
+                RepositoryAccess::ReadWrite,
+                Some(context_token),
+            )
+            .await
+            {
+                Ok(repository) => {
+                    let result = command(repository.clone(), token, args).await;
+                    weak_repository = Some(post_command_cleanup(repository).await);
+                    result
+                }
+                Err(err) => Err(ErrT::from(err)),
+            };
 
-                check_no_lingering_repository(weak_repository);
-                log_command_done(&caller, time_start);
+            check_no_lingering_repository(weak_repository);
+            log_command_done(&caller, time_start);
 
-                let detail = match &result {
-                    Ok(_) => LoreErrorDetail::default(),
-                    Err(err) => LoreErrorDetail::from_error(err),
-                };
-                let _ = execution_context().dispatcher.complete(detail).await;
-                result
-            }),
-        )
+            let detail = match &result {
+                Ok(_) => LoreErrorDetail::default(),
+                Err(err) => LoreErrorDetail::from_error(err),
+            };
+            let _ = execution_context().dispatcher.complete(detail).await;
+            result
+        })
         .await
 }
 
@@ -324,44 +243,39 @@ where
     F: FnOnce(Arc<RepositoryContext>, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
 {
-    let (repository_path, execution, attempt) =
-        match prepare_repository_call(globals, callback).await {
-            Ok(v) => v,
-            Err(status) => return status,
-        };
+    let (repository_path, execution) = match prepare_repository_call(globals, callback).await {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
 
     LORE_CONTEXT
-        .scope(
-            execution,
-            in_dispatch_attempt(attempt, async move {
-                log_command_info(&caller, &args);
-                let time_start = Instant::now();
+        .scope(execution, async move {
+            log_command_info(&caller, &args);
+            let time_start = Instant::now();
 
-                let detail;
-                let mut weak_repository = None;
-                match repository::load_and_connect_with_token(
-                    &repository_path,
-                    RepositoryAccess::NoStore,
-                    None,
-                )
-                .await
-                {
-                    Ok(repository) => {
-                        detail =
-                            LoreErrorDetail::from_result(command(repository.clone(), args).await);
-                        weak_repository = Some(post_command_cleanup(repository).await);
-                    }
-                    Err(err) => {
-                        detail = LoreErrorDetail::from_error(&err);
-                    }
+            let detail;
+            let mut weak_repository = None;
+            match repository::load_and_connect_with_token(
+                &repository_path,
+                RepositoryAccess::NoStore,
+                None,
+            )
+            .await
+            {
+                Ok(repository) => {
+                    detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
+                    weak_repository = Some(post_command_cleanup(repository).await);
                 }
+                Err(err) => {
+                    detail = LoreErrorDetail::from_error(&err);
+                }
+            }
 
-                check_no_lingering_repository(weak_repository);
+            check_no_lingering_repository(weak_repository);
 
-                log_command_done(&caller, time_start);
-                execution_context().dispatcher.complete(detail).await
-            }),
-        )
+            log_command_done(&caller, time_start);
+            execution_context().dispatcher.complete(detail).await
+        })
         .await
 }
 
@@ -369,7 +283,7 @@ where
 async fn prepare_repository_call(
     mut globals: LoreGlobalArgs,
     callback: LoreEventCallback,
-) -> Result<(PathBuf, Arc<ExecutionContext>, Option<AttemptId>), i32> {
+) -> Result<(PathBuf, Arc<ExecutionContext>), i32> {
     let repository_path = if let Ok(path) = util::path::make_absolute_from(
         globals.repository_path.as_str(),
         globals.working_directory().map(Path::new),
@@ -380,29 +294,7 @@ async fn prepare_repository_call(
         PathBuf::from(globals.repository_path.as_str())
     };
 
-    // Read before `globals` is moved into the execution context, and refused here rather than
-    // deeper so a bad value costs nothing but this call.
-    let attempt = dispatch_attempt(&globals);
-
     let execution = setup_execution(globals, callback);
-
-    let attempt = match attempt {
-        Ok(attempt) => attempt,
-        Err(invalid) => {
-            // Reported exactly as a pre-command failure is, so a caller sees the same status,
-            // return value and detail shape it would for any other refusal before the command.
-            let err = RepositoryError::from(invalid);
-            let status = LORE_CONTEXT
-                .scope(execution, async move {
-                    execution_context()
-                        .dispatcher
-                        .complete(LoreErrorDetail::from_error(&err))
-                        .await
-                })
-                .await;
-            return Err(status);
-        }
-    };
 
     let format = RepositoryFormat::detect(&repository_path);
     let dot_dir = format.dot_dir();
@@ -424,7 +316,7 @@ async fn prepare_repository_call(
         return Err(status);
     }
 
-    Ok((repository_path, execution, attempt))
+    Ok((repository_path, execution))
 }
 
 /// Typed counterpart to [`prepare_repository_call`]. On failure it dispatches
@@ -432,7 +324,7 @@ async fn prepare_repository_call(
 async fn prepare_repository_call_result<ErrT>(
     mut globals: LoreGlobalArgs,
     callback: LoreEventCallback,
-) -> Result<(PathBuf, Arc<ExecutionContext>, Option<AttemptId>), ErrT>
+) -> Result<(PathBuf, Arc<ExecutionContext>), ErrT>
 where
     ErrT: EventError + FfiError + HasTrace + From<RepositoryError>,
 {
@@ -446,25 +338,7 @@ where
         PathBuf::from(globals.repository_path.as_str())
     };
 
-    // Same refusal as the untyped path, reported through this one's structured error.
-    let attempt = dispatch_attempt(&globals);
-
     let execution = setup_execution(globals, callback);
-
-    let attempt = match attempt {
-        Ok(attempt) => attempt,
-        Err(invalid) => {
-            let err = ErrT::from(RepositoryError::from(invalid));
-            let detail = LoreErrorDetail::from_error(&err);
-            LORE_CONTEXT
-                .scope(execution, async move {
-                    let _ = execution_context().dispatcher.complete(detail).await;
-                })
-                .await;
-            return Err(err);
-        }
-    };
-
     let format = RepositoryFormat::detect(&repository_path);
     let dot_dir = format.dot_dir();
     if !repository_path.join(dot_dir).is_dir() {
@@ -480,7 +354,7 @@ where
         return Err(err);
     }
 
-    Ok((repository_path, execution, attempt))
+    Ok((repository_path, execution))
 }
 
 async fn post_command_cleanup(
@@ -615,83 +489,6 @@ mod tests {
     use lore_revision::interface::LoreGlobalArgs;
 
     use super::*;
-
-    fn globals_with_attempt(attempt: &str) -> LoreGlobalArgs {
-        LoreGlobalArgs {
-            attempt_id: attempt.into(),
-            ..Default::default()
-        }
-    }
-
-    /// The ordinary case, and the one every existing caller is in.
-    #[test]
-    fn no_attempt_id_supplied_is_not_an_error() {
-        let parsed = dispatch_attempt(&LoreGlobalArgs::default())
-            .expect("supplying nothing must not be an error");
-        assert!(parsed.is_none());
-    }
-
-    /// The supplied identity survives parsing byte for byte. If it did not, the caller would
-    /// journal one id and the server would file the receipt under another.
-    #[test]
-    fn a_supplied_v7_attempt_is_preserved_exactly() {
-        let uuid = uuid::Uuid::now_v7();
-        let parsed = dispatch_attempt(&globals_with_attempt(&uuid.to_string()))
-            .expect("a v7 uuid must be accepted")
-            .expect("a supplied value must be present");
-
-        assert_eq!(parsed.as_uuid(), uuid);
-    }
-
-    /// Refused rather than ignored. Ignoring it would dispatch the mutation under an identity
-    /// the caller never wrote down, and its later lookup would answer absent forever.
-    #[test]
-    fn a_malformed_attempt_is_refused_rather_than_dropped() {
-        let error = dispatch_attempt(&globals_with_attempt("not-a-uuid"))
-            .expect_err("a malformed attempt id must refuse the call");
-
-        assert!(error.reason.contains("not a UUID"), "got: {}", error.reason);
-    }
-
-    /// A v4 is a well-formed UUID and still wrong: the receipt rail orders attempts by the
-    /// timestamp a v7 embeds, so a v4 could never have been filed as one.
-    #[test]
-    fn a_non_v7_attempt_is_refused() {
-        let error = dispatch_attempt(&globals_with_attempt(&uuid::Uuid::new_v4().to_string()))
-            .expect_err("a non-v7 uuid must refuse the call");
-
-        assert!(error.reason.contains("version 4"), "got: {}", error.reason);
-    }
-
-    /// The property this whole change exists for: the id the caller supplied is the id the
-    /// dispatch sees. The transport reuses whatever is in scope and mints only when nothing is,
-    /// and a separate suite already proves what is in scope is what reaches the wire, so this
-    /// closes the chain from the caller's journal to the server's receipt.
-    #[tokio::test]
-    async fn the_supplied_attempt_is_what_the_dispatch_scope_sees() {
-        let uuid = uuid::Uuid::now_v7();
-        let attempt = dispatch_attempt(&globals_with_attempt(&uuid.to_string()))
-            .expect("a v7 uuid must be accepted");
-
-        let seen = in_dispatch_attempt(attempt, async {
-            lore_transport::outcome::current_dispatch_attempt()
-        })
-        .await;
-
-        assert_eq!(seen.map(|a| a.as_uuid()), Some(uuid));
-    }
-
-    /// And a caller that supplies nothing leaves the scope empty, so the transport mints its own
-    /// exactly as it did before this existed.
-    #[tokio::test]
-    async fn supplying_no_attempt_leaves_the_dispatch_scope_empty() {
-        let seen = in_dispatch_attempt(None, async {
-            lore_transport::outcome::current_dispatch_attempt()
-        })
-        .await;
-
-        assert!(seen.is_none());
-    }
 
     // A concrete `#[error_set]` error for the wrapper closures. Its `NotFound`
     // variant wraps `lore_base::error::NotFound`, which carries error code 79, so
