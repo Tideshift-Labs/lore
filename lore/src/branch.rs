@@ -1734,7 +1734,86 @@ async fn metadata_clear_local(
 
 #[cfg(test)]
 mod tests {
+    use lore_base::error::InvalidArguments;
+    use lore_error_set::FfiError;
+    use lore_revision::interface::LoreEventCallbackConfig;
+    use lore_transport::VolatileAttemptStore;
+    use serial_test::serial;
+
     use super::*;
+    use crate::call_delegation::tests::RestoreLoreUseService;
+
+    // Accepted as a source-level fact, not tested: `push` (via `push_local`) still reaches
+    // `push_journalled` with `None`, exactly as it did before `push_with_attempt_store` existed.
+    // The claim is one literal at one call site (`push_local`'s `push_journalled(globals, args,
+    // callback, None)`, above in this file), and proving it by driving a real dispatch needs a
+    // live-connected `RepositoryContext`, a fixture that does not exist anywhere in this codebase
+    // (see `lore/docs/testing-guide.md`, which already priced building one as "a real feature
+    // addition to the test infrastructure, not a cheap extension" for a closer-to-the-metal case
+    // than this one). Getting this literal wrong costs an extra attempt record, not lost
+    // correctness -- the cheap direction of that failure -- so it does not earn a live tier.
+    // Ruled by team-lead and the receipt-client-binding lane, 2026-09.
+
+    /// The same status shape `crate::call_delegation::reject_call` uses for every other
+    /// pre-command rejection, so this refusal cannot be told apart from one of those by a
+    /// caller inspecting the status alone.
+    fn undelegatable_status() -> i32 {
+        InvalidArguments {
+            reason: String::new(),
+        }
+        .ffi_code()
+    }
+
+    fn no_callback() -> LoreEventCallback {
+        lore_revision::event::convert_event_callback(LoreEventCallbackConfig {
+            user_context: 0,
+            func: None,
+        })
+    }
+
+    /// `push_with_attempt_store` must refuse under `LORE_USE_SERVICE` rather than delegate --
+    /// see the function's own doc comment for why a delegated push would strand the caller's
+    /// journal. The repository path is deliberately nonexistent and the store deliberately
+    /// records every call it receives: either one being touched would mean the refusal ran too
+    /// late, after the code had already started the operation it exists to prevent.
+    #[test]
+    #[serial(lore_use_service)]
+    fn push_with_attempt_store_refuses_when_delegation_is_requested() {
+        let _restore = RestoreLoreUseService::set("1");
+
+        let globals = LoreGlobalArgs {
+            repository_path: LoreString::from_str(
+                "Z:/lore-push-with-attempt-store-test-nonexistent-9f3c2a",
+            ),
+            ..LoreGlobalArgs::default()
+        };
+        let args = LoreBranchPushArgs {
+            branch: LoreString::default(),
+            fast_forward_merge: 0,
+        };
+        let store = Arc::new(VolatileAttemptStore::new());
+        let attempts: Arc<dyn AttemptStore> = store.clone();
+
+        let status = crate::runtime().block_on(push_with_attempt_store(
+            globals,
+            args,
+            no_callback(),
+            attempts,
+        ));
+
+        assert_eq!(
+            status,
+            undelegatable_status(),
+            "the refusal must use the same status shape every other pre-command rejection uses"
+        );
+        assert!(
+            crate::runtime()
+                .block_on(store.unresolved())
+                .expect("unresolved() must succeed on a fresh store")
+                .is_empty(),
+            "the attempt store must never be touched when the call is refused before it runs"
+        );
+    }
 
     #[test]
     fn archive_args_old_payload_missing_cascade_fields_uses_defaults() {

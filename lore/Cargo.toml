@@ -51,3 +51,4 @@ swfs = ["lore-revision/swfs"]
 [dev-dependencies]
 rand = { workspace = true }
 serial_test = { workspace = true }
+lore-transport = { workspace = true, features = ["test_seams"] }

@@ -162,7 +162,7 @@ pub(crate) async fn dispatch_call<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -177,9 +177,79 @@ mod tests {
     use lore_revision::event::LoreEvent;
     use lore_revision::interface::LoreEventCallbackConfig;
     use lore_revision::interface::LoreGlobalArgs;
+    use serial_test::serial;
 
     use super::*;
     use crate::interface::LoreString;
+
+    /// Restores `LORE_USE_SERVICE` to whatever it was before the test ran, even if the test
+    /// panics. The variable is process-global, so every test that touches it -- here and in
+    /// `branch::tests` -- carries `#[serial(lore_use_service)]` to keep them from racing each
+    /// other; this guard is the belt to that suspenders, covering the panic-mid-test case a bare
+    /// serial ordering does not.
+    pub(crate) struct RestoreLoreUseService(Option<String>);
+
+    impl RestoreLoreUseService {
+        pub(crate) fn set(value: &str) -> Self {
+            let previous = std::env::var("LORE_USE_SERVICE").ok();
+            // SAFETY: every reader and writer of this variable in the test binary is serialized
+            // by `#[serial(lore_use_service)]`.
+            unsafe {
+                std::env::set_var("LORE_USE_SERVICE", value);
+            }
+            Self(previous)
+        }
+
+        pub(crate) fn unset() -> Self {
+            let previous = std::env::var("LORE_USE_SERVICE").ok();
+            // SAFETY: see `set`.
+            unsafe {
+                std::env::remove_var("LORE_USE_SERVICE");
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for RestoreLoreUseService {
+        fn drop(&mut self) {
+            // SAFETY: see `set`.
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("LORE_USE_SERVICE", value),
+                    None => std::env::remove_var("LORE_USE_SERVICE"),
+                }
+            }
+        }
+    }
+
+    /// Pins the three-way behaviour two callers now depend on: [`dispatch_call`] (delegates to a
+    /// service) and [`crate::branch::push_with_attempt_store`] (refuses rather than delegate).
+    /// Both read this exact function, so a drift here is a drift in both.
+    #[test]
+    #[serial(lore_use_service)]
+    fn service_delegation_is_false_when_the_variable_is_unset() {
+        let _restore = RestoreLoreUseService::unset();
+        assert!(!service_delegation_requested());
+    }
+
+    #[test]
+    #[serial(lore_use_service)]
+    fn service_delegation_is_false_when_the_variable_is_set_empty() {
+        let _restore = RestoreLoreUseService::set("");
+        assert!(!service_delegation_requested());
+    }
+
+    #[test]
+    #[serial(lore_use_service)]
+    fn service_delegation_is_true_for_any_non_empty_value() {
+        for value in ["1", "true", "0", "grpc://service.example"] {
+            let _restore = RestoreLoreUseService::set(value);
+            assert!(
+                service_delegation_requested(),
+                "expected delegation requested for LORE_USE_SERVICE={value:?}"
+            );
+        }
+    }
 
     // A concrete error whose `NotFound` variant carries error code 79, so the
     // async failure path has a known non-`1` code to assert against.
