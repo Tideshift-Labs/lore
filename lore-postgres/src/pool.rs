@@ -35,8 +35,20 @@
 
 use std::sync::Arc;
 
+/// The pool and pooled-client types this crate's stores and domain APIs take,
+/// re-exported so a consumer crate can name them without declaring its own
+/// `deadpool-postgres` dependency.
+///
+/// `lore-server` holds a relay pool and hands `&mut Client` to
+/// [`crate::domain::outbox::relay::claim_batch`] (WP-119 Step B). A second
+/// manifest declaration would unify only while both resolve to the same
+/// version; a minor drift makes two distinct crates whose identically named
+/// types do not unify, and the resulting error names a type that looks correct
+/// in both places. Re-exporting removes the second declaration entirely.
+pub use deadpool_postgres::Client;
 use deadpool_postgres::Manager;
 use deadpool_postgres::ManagerConfig;
+pub use deadpool_postgres::Pool;
 use deadpool_postgres::PoolError;
 use deadpool_postgres::RecyclingMethod;
 use rustls::ClientConfig;
@@ -53,19 +65,6 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::ServerName;
 use rustls::pki_types::UnixTime;
 use tokio_postgres_rustls::MakeRustlsConnect;
-
-/// The pool and pooled-client types this crate's stores and domain APIs take,
-/// re-exported so a consumer crate can name them without declaring its own
-/// `deadpool-postgres` dependency.
-///
-/// `lore-server` holds a relay pool and hands `&mut Client` to
-/// [`crate::domain::outbox::relay::claim_batch`] (WP-119 Step B). A second
-/// manifest declaration would unify only while both resolve to the same
-/// version; a minor drift makes two distinct crates whose identically named
-/// types do not unify, and the resulting error names a type that looks correct
-/// in both places. Re-exporting removes the second declaration entirely.
-pub use deadpool_postgres::Client;
-pub use deadpool_postgres::Pool;
 
 /// TLS settings for the Postgres connector. `Default` = verify against the
 /// platform trust store with no extra CA (secure).
