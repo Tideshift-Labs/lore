@@ -32,11 +32,13 @@ use lore_postgres::domain::maintenance::TerminalStatusAttachInput;
 use lore_postgres::domain::maintenance::TerminalStatusAttachmentAck;
 use lore_postgres::domain::maintenance::VerifiedStaleFinalizeInput;
 use lore_postgres::domain::maintenance::VerifiedStaleFinalizeResult;
+use lore_postgres::domain::receipts::AttemptReceipt;
 use lore_postgres::domain::receipts::AuthorizationWitness;
 use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptKey;
 use lore_postgres::domain::receipts::ReceiptLookup;
+use lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetRequest;
 use lore_proto::lore::domain::v1::DomainOperationClockGetRequest;
 use lore_proto::lore::domain::v1::DomainOperationOutcome;
 use lore_proto::lore::domain::v1::DomainOperationPrepareRequest;
@@ -68,6 +70,7 @@ use tonic_prost::prost::Message;
 use uuid::Uuid;
 
 use super::service::LoreDomainOperationV1Service;
+use super::strict_codec::validate_attempt_receipt_get;
 use super::strict_codec::validate_prepare;
 use super::strict_codec::validate_proof_namespace_materialize;
 use super::strict_codec::validate_proof_namespace_materialize_raw;
@@ -96,6 +99,7 @@ struct RecordingStore {
     clock_calls: AtomicUsize,
     prepare_calls: AtomicUsize,
     receipt_calls: AtomicUsize,
+    attempt_receipt_calls: AtomicUsize,
     stale_finalize_calls: AtomicUsize,
     terminal_attach_calls: AtomicUsize,
     materialize_calls: AtomicUsize,
@@ -103,6 +107,11 @@ struct RecordingStore {
     fail_prepare_outcome_unknown: AtomicBool,
     prepare_result: Mutex<PrepareResult>,
     receipt_result: Mutex<ReceiptLookup>,
+    attempt_receipt_result: Mutex<AttemptReceipt>,
+    /// What the handler actually passed to the store on the most recent call: the isolation
+    /// property this whole method rests on (the verified issuer/subject, never anything the
+    /// request itself could name) is only checkable if the double records what it received.
+    last_attempt_receipt_call: Mutex<Option<(String, String, Uuid)>>,
     recorded_prepare: Mutex<Option<RecordedPrepare>>,
 }
 
@@ -112,6 +121,7 @@ impl RecordingStore {
             clock_calls: AtomicUsize::new(0),
             prepare_calls: AtomicUsize::new(0),
             receipt_calls: AtomicUsize::new(0),
+            attempt_receipt_calls: AtomicUsize::new(0),
             stale_finalize_calls: AtomicUsize::new(0),
             terminal_attach_calls: AtomicUsize::new(0),
             materialize_calls: AtomicUsize::new(0),
@@ -127,6 +137,11 @@ impl RecordingStore {
                 hard_expires_at: SystemTime::UNIX_EPOCH
                     + Duration::from_millis(CLOCK_MILLIS + 900_000),
             }),
+            attempt_receipt_result: Mutex::new(AttemptReceipt {
+                lookup: ReceiptLookup::NotFound,
+                method: None,
+            }),
+            last_attempt_receipt_call: Mutex::new(None),
             recorded_prepare: Mutex::new(None),
         }
     }
@@ -146,11 +161,24 @@ impl DomainTransactionStore for RecordingStore {
     // and absence is what tells a client to stop waiting.
     async fn domain_operation_attempt_receipt_get(
         &self,
-        _verified_issuer: &str,
-        _authenticated_subject: &str,
-        _client_attempt_id: &uuid::Uuid,
+        verified_issuer: &str,
+        authenticated_subject: &str,
+        client_attempt_id: &uuid::Uuid,
     ) -> Result<lore_postgres::domain::receipts::AttemptReceipt, DomainError> {
-        unreachable!("RecordingStore does not serve attempt receipt lookups")
+        self.attempt_receipt_calls.fetch_add(1, Ordering::SeqCst);
+        *self
+            .last_attempt_receipt_call
+            .lock()
+            .expect("last attempt receipt call") = Some((
+            verified_issuer.to_string(),
+            authenticated_subject.to_string(),
+            *client_attempt_id,
+        ));
+        Ok(self
+            .attempt_receipt_result
+            .lock()
+            .expect("attempt receipt result")
+            .clone())
     }
 
     async fn domain_operation_clock_get(&self) -> Result<SystemTime, DomainError> {
@@ -506,6 +534,24 @@ fn service_token() -> AuthorizationToken {
         user_id: "lorehub-control-plane".into(),
         is_service_account: Some(true),
         ..Default::default()
+    }
+}
+
+/// An ordinary human-principal token, the shape `DomainOperationAttemptReceiptGet` actually
+/// expects to serve -- unlike every other method on this service, which requires
+/// [`service_token`]'s control-plane service account.
+fn human_token(issuer: &str, subject: &str) -> AuthorizationToken {
+    AuthorizationToken {
+        issuer: issuer.into(),
+        user_id: subject.into(),
+        is_service_account: Some(false),
+        ..Default::default()
+    }
+}
+
+fn valid_attempt_receipt_get() -> DomainOperationAttemptReceiptGetRequest {
+    DomainOperationAttemptReceiptGetRequest {
+        client_attempt_id: Bytes::copy_from_slice(Uuid::now_v7().as_bytes()),
     }
 }
 
@@ -1398,6 +1444,409 @@ async fn receipt_maps_terminal_and_future_marker_results_exactly() {
     assert_eq!(response.reason_version, Some(1));
     assert_eq!(response.reason, "UUID_FUTURE_HORIZON_EXCEEDED_V1");
     assert!(response.from_future_marker);
+}
+
+// -------------------------------------------------------------------------------------------
+// WP-120's public `DomainOperationAttemptReceiptGet`: the human-principal counterpart to the
+// private rail above. It is the one method on this service that admits an ordinary verified
+// human rather than the control-plane service account, so these tests cover the auth/
+// validation/isolation boundary that replaces `authenticated_service`'s gate, plus every
+// `ReceiptLookup` status the handler maps.
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn attempt_receipt_get_maps_prepared_with_both_timestamps() {
+    let (service, store, _) = service();
+    *store
+        .attempt_receipt_result
+        .lock()
+        .expect("attempt receipt result") = AttemptReceipt {
+        lookup: ReceiptLookup::Prepared {
+            prepared_at: SystemTime::UNIX_EPOCH + Duration::from_millis(CLOCK_MILLIS),
+            hard_expires_at: SystemTime::UNIX_EPOCH + Duration::from_millis(CLOCK_MILLIS + 900_000),
+        },
+        method: Some("RevisionService.BranchPush".to_string()),
+    };
+
+    let response = service
+        .domain_operation_attempt_receipt_get(authenticated_as(
+            valid_attempt_receipt_get(),
+            human_token("https://issuer.example", "human-subject-1"),
+        ))
+        .await
+        .expect("attempt receipt lookup succeeds")
+        .into_inner();
+
+    assert_eq!(
+        response.status,
+        DomainOperationReceiptStatus::Prepared as i32
+    );
+    assert_eq!(response.prepared_at_unix_millis, Some(CLOCK_MILLIS as i64));
+    assert_eq!(
+        response.hard_expires_at_unix_millis,
+        Some(CLOCK_MILLIS as i64 + 900_000)
+    );
+    assert_eq!(response.method, "RevisionService.BranchPush");
+    assert_eq!(store.attempt_receipt_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn attempt_receipt_get_maps_committed_applied() {
+    let (service, store, _) = service();
+    *store
+        .attempt_receipt_result
+        .lock()
+        .expect("attempt receipt result") = AttemptReceipt {
+        lookup: ReceiptLookup::Committed {
+            outcome: DomainOutcome::Applied,
+            from_future_marker: false,
+        },
+        method: Some("RevisionService.BranchCreate".to_string()),
+    };
+
+    let response = service
+        .domain_operation_attempt_receipt_get(authenticated_as(
+            valid_attempt_receipt_get(),
+            human_token("https://issuer.example", "human-subject-1"),
+        ))
+        .await
+        .expect("attempt receipt lookup succeeds")
+        .into_inner();
+
+    assert_eq!(
+        response.status,
+        DomainOperationReceiptStatus::Committed as i32
+    );
+    assert_eq!(response.outcome, DomainOperationOutcome::Applied as i32);
+    assert!(!response.from_future_marker);
+    assert_eq!(response.method, "RevisionService.BranchCreate");
+}
+
+#[tokio::test]
+async fn attempt_receipt_get_maps_committed_not_applied_with_its_versioned_reason() {
+    let (service, store, _) = service();
+    *store
+        .attempt_receipt_result
+        .lock()
+        .expect("attempt receipt result") = AttemptReceipt {
+        lookup: ReceiptLookup::Committed {
+            outcome: DomainOutcome::NotApplied {
+                reason_version: 2,
+                reason: "BRANCH_PROTECTED".to_string(),
+            },
+            from_future_marker: true,
+        },
+        method: Some("RevisionService.BranchDelete".to_string()),
+    };
+
+    let response = service
+        .domain_operation_attempt_receipt_get(authenticated_as(
+            valid_attempt_receipt_get(),
+            human_token("https://issuer.example", "human-subject-1"),
+        ))
+        .await
+        .expect("attempt receipt lookup succeeds")
+        .into_inner();
+
+    assert_eq!(
+        response.status,
+        DomainOperationReceiptStatus::Committed as i32
+    );
+    assert_eq!(response.outcome, DomainOperationOutcome::NotApplied as i32);
+    assert_eq!(response.reason_version, Some(2));
+    assert_eq!(response.reason, "BRANCH_PROTECTED");
+    assert!(response.from_future_marker);
+}
+
+#[tokio::test]
+async fn attempt_receipt_get_maps_mismatch_expired_and_expired_or_unknown() {
+    for (lookup, expected_status) in [
+        (
+            ReceiptLookup::Mismatch,
+            DomainOperationReceiptStatus::Mismatch,
+        ),
+        (
+            ReceiptLookup::Expired,
+            DomainOperationReceiptStatus::Expired,
+        ),
+        (
+            ReceiptLookup::ExpiredOrUnknown,
+            DomainOperationReceiptStatus::ExpiredOrUnknown,
+        ),
+    ] {
+        let (service, store, _) = service();
+        *store
+            .attempt_receipt_result
+            .lock()
+            .expect("attempt receipt result") = AttemptReceipt {
+            lookup,
+            method: Some("RevisionService.BranchPush".to_string()),
+        };
+
+        let response = service
+            .domain_operation_attempt_receipt_get(authenticated_as(
+                valid_attempt_receipt_get(),
+                human_token("https://issuer.example", "human-subject-1"),
+            ))
+            .await
+            .expect("attempt receipt lookup succeeds")
+            .into_inner();
+
+        assert_eq!(
+            response.status, expected_status as i32,
+            "{expected_status:?}"
+        );
+        assert_eq!(response.method, "RevisionService.BranchPush");
+    }
+}
+
+#[tokio::test]
+async fn attempt_receipt_get_not_found_reports_no_method() {
+    let (service, store, _) = service();
+    *store
+        .attempt_receipt_result
+        .lock()
+        .expect("attempt receipt result") = AttemptReceipt {
+        lookup: ReceiptLookup::NotFound,
+        method: None,
+    };
+
+    let response = service
+        .domain_operation_attempt_receipt_get(authenticated_as(
+            valid_attempt_receipt_get(),
+            human_token("https://issuer.example", "human-subject-1"),
+        ))
+        .await
+        .expect("attempt receipt lookup succeeds")
+        .into_inner();
+
+    assert_eq!(
+        response.status,
+        DomainOperationReceiptStatus::NotFound as i32
+    );
+    assert_eq!(
+        response.method, "",
+        "method must be empty on the wire when there is no receipt to name one"
+    );
+}
+
+#[tokio::test]
+async fn attempt_receipt_get_requires_a_verified_issuer_and_subject() {
+    let (service, store, _) = service();
+
+    for (issuer, subject) in [("", "human-subject-1"), ("https://issuer.example", "")] {
+        let error = service
+            .domain_operation_attempt_receipt_get(authenticated_as(
+                valid_attempt_receipt_get(),
+                human_token(issuer, subject),
+            ))
+            .await
+            .expect_err("an empty issuer or subject must be refused");
+        assert_eq!(error.code(), Code::Unauthenticated);
+    }
+    assert_eq!(store.attempt_receipt_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn attempt_receipt_get_rejects_an_oversized_issuer_or_subject() {
+    let (service, store, _) = service();
+    let oversized = "x".repeat(257);
+
+    for (issuer, subject) in [
+        (oversized.clone(), "human-subject-1".to_string()),
+        ("https://issuer.example".to_string(), oversized.clone()),
+    ] {
+        let error = service
+            .domain_operation_attempt_receipt_get(authenticated_as(
+                valid_attempt_receipt_get(),
+                human_token(&issuer, &subject),
+            ))
+            .await
+            .expect_err("an oversized issuer or subject must be refused");
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+    assert_eq!(store.attempt_receipt_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn attempt_receipt_get_requires_an_authenticated_caller() {
+    let (service, store, _) = service();
+    let error = service
+        .domain_operation_attempt_receipt_get(Request::new(valid_attempt_receipt_get()))
+        .await
+        .expect_err("a request with no verified authorization must be refused");
+    assert_eq!(error.code(), Code::Unauthenticated);
+    assert_eq!(store.attempt_receipt_calls.load(Ordering::SeqCst), 0);
+}
+
+/// Direct validator pins: `validate_attempt_receipt_get`'s v7 check matters because the receipt
+/// rail orders and classifies attempts by the UUID's embedded timestamp, so a value of any other
+/// version could never have been filed as one.
+#[test]
+fn attempt_receipt_get_validation_rejects_wrong_length() {
+    for len in [15, 17] {
+        let request = DomainOperationAttemptReceiptGetRequest {
+            client_attempt_id: Bytes::from(vec![0u8; len]),
+        };
+        let error = validate_attempt_receipt_get(&request)
+            .expect_err("a non-16-byte client_attempt_id must be rejected");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error.message().contains("must be exactly 16 bytes"),
+            "expected the exact-length message, got: {}",
+            error.message()
+        );
+    }
+}
+
+#[test]
+fn attempt_receipt_get_validation_rejects_a_non_v7_uuid() {
+    let non_v7 = Uuid::new_v4();
+    let request = DomainOperationAttemptReceiptGetRequest {
+        client_attempt_id: Bytes::copy_from_slice(non_v7.as_bytes()),
+    };
+    let error = validate_attempt_receipt_get(&request).expect_err("a non-v7 UUID must be rejected");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("must be a UUIDv7"));
+}
+
+#[test]
+fn attempt_receipt_get_validation_accepts_a_v7_uuid() {
+    let v7 = Uuid::now_v7();
+    let request = DomainOperationAttemptReceiptGetRequest {
+        client_attempt_id: Bytes::copy_from_slice(v7.as_bytes()),
+    };
+    let accepted =
+        validate_attempt_receipt_get(&request).expect("a well-formed v7 uuid must validate");
+    assert_eq!(accepted, v7);
+}
+
+/// The property the whole method rests on: the request carries only an attempt id, so the
+/// verified issuer and subject the store sees can only ever be the token's own, never anything
+/// the request could name. Proven by recording exactly what the store received.
+#[tokio::test]
+async fn attempt_receipt_get_passes_only_the_tokens_verified_identity_to_the_store() {
+    let (service, store, _) = service();
+    *store
+        .attempt_receipt_result
+        .lock()
+        .expect("attempt receipt result") = AttemptReceipt {
+        lookup: ReceiptLookup::NotFound,
+        method: None,
+    };
+
+    let request = valid_attempt_receipt_get();
+    let attempt_id = Uuid::from_slice(&request.client_attempt_id).expect("valid uuid");
+
+    service
+        .domain_operation_attempt_receipt_get(authenticated_as(
+            request,
+            human_token("https://issuer-a.example", "human-subject-a"),
+        ))
+        .await
+        .expect("attempt receipt lookup succeeds");
+
+    let recorded = store
+        .last_attempt_receipt_call
+        .lock()
+        .expect("last attempt receipt call")
+        .clone()
+        .expect("the store must have been called");
+    assert_eq!(
+        recorded,
+        (
+            "https://issuer-a.example".to_string(),
+            "human-subject-a".to_string(),
+            attempt_id
+        ),
+        "the store must see exactly the token's verified issuer/subject and the request's own \
+         attempt id, and nothing else"
+    );
+}
+
+#[tokio::test]
+async fn attempt_receipt_get_two_different_callers_pass_two_different_identities() {
+    let (service, store, _) = service();
+    *store
+        .attempt_receipt_result
+        .lock()
+        .expect("attempt receipt result") = AttemptReceipt {
+        lookup: ReceiptLookup::NotFound,
+        method: None,
+    };
+
+    service
+        .domain_operation_attempt_receipt_get(authenticated_as(
+            valid_attempt_receipt_get(),
+            human_token("https://issuer-a.example", "human-subject-a"),
+        ))
+        .await
+        .expect("first lookup succeeds");
+    let first_seen = store
+        .last_attempt_receipt_call
+        .lock()
+        .expect("last attempt receipt call")
+        .clone()
+        .expect("first call recorded");
+
+    service
+        .domain_operation_attempt_receipt_get(authenticated_as(
+            valid_attempt_receipt_get(),
+            human_token("https://issuer-b.example", "human-subject-b"),
+        ))
+        .await
+        .expect("second lookup succeeds");
+    let second_seen = store
+        .last_attempt_receipt_call
+        .lock()
+        .expect("last attempt receipt call")
+        .clone()
+        .expect("second call recorded");
+
+    assert_eq!(first_seen.0, "https://issuer-a.example");
+    assert_eq!(first_seen.1, "human-subject-a");
+    assert_eq!(second_seen.0, "https://issuer-b.example");
+    assert_eq!(second_seen.1, "human-subject-b");
+    assert_ne!(
+        first_seen, second_seen,
+        "two different callers must produce two different store identities"
+    );
+}
+
+/// A service-account-shaped token gets no special treatment: `get_authorization` does not branch
+/// on `is_service_account`, so a service account reading this rail is scoped to exactly its own
+/// (issuer, subject) the same as any human principal, never a broader view of every attempt.
+#[tokio::test]
+async fn attempt_receipt_get_a_service_account_token_reads_only_its_own_identity() {
+    let (service, store, _) = service();
+    *store
+        .attempt_receipt_result
+        .lock()
+        .expect("attempt receipt result") = AttemptReceipt {
+        lookup: ReceiptLookup::NotFound,
+        method: None,
+    };
+
+    let token = AuthorizationToken {
+        issuer: "https://issuer.example".into(),
+        user_id: "lorehub-control-plane".into(),
+        is_service_account: Some(true),
+        ..Default::default()
+    };
+
+    service
+        .domain_operation_attempt_receipt_get(authenticated_as(valid_attempt_receipt_get(), token))
+        .await
+        .expect("attempt receipt lookup succeeds");
+
+    let recorded = store
+        .last_attempt_receipt_call
+        .lock()
+        .expect("last attempt receipt call")
+        .clone()
+        .expect("the store must have been called");
+    assert_eq!(recorded.0, "https://issuer.example");
+    assert_eq!(recorded.1, "lorehub-control-plane");
 }
 
 #[tokio::test]
