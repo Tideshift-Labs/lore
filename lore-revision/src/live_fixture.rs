@@ -334,7 +334,13 @@ impl LockServer {
         // of this function polled for readiness by opening a throwaway connection; that loop was
         // measured never to spin even once, and every server it built accepted one connection
         // nobody ever spoke on. It is gone rather than left in as reassurance.
-        let handle = lore_base::lore_spawn!(async move {
+        //
+        // `lore_spawn_net_nocontext!` rather than `lore_spawn!`, on both counts the macro's name
+        // carries. A tonic accept loop belongs on the network runtime, not on core. And it
+        // deliberately inherits no `LORE_CONTEXT`: this task outlives every call made through it,
+        // so a caller that happened to start a server from inside a scope would otherwise stamp
+        // one command's context on every request the server ever handles.
+        let handle = lore_base::lore_spawn_net_nocontext!(async move {
             let _ = tonic::transport::Server::builder()
                 .add_service(LockServiceServer::new(lock_service))
                 .add_service(RevisionServiceServer::new(revision_service))

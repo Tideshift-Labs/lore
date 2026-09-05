@@ -662,6 +662,10 @@ fn the_force_release_escalation_is_journalled() {
 ///
 /// The number a correct `record()` sees: every call before this one had already arrived, and this
 /// one had not. Panics if the RPC never arrived, which is a test bug rather than a soft failure.
+///
+/// Taking the FIRST match is only right because every caller has already asserted that exactly one
+/// call of that RPC reached the server. Add a second one without that assertion and this silently
+/// starts answering about the wrong dispatch.
 fn call_index(calls: &[lore_revision::live_fixture::LockCall], rpc: LockRpc) -> usize {
     calls
         .iter()
