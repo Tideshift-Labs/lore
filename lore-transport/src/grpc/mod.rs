@@ -83,54 +83,167 @@ const RETRY_MAX_BACKOFF_MS: u64 = 10_000;
 const RETRY_MAX_ATTEMPTS: usize = 60;
 const GRPC_CONNECT_TIMEOUT_SECS: u64 = 5;
 
+/// The total wall-clock time one refused RPC may spend waiting between
+/// attempts. **This is the primary bound on the per-RPC retry budget**;
+/// [`RETRY_MAX_ATTEMPTS`] is now a secondary one that the schedule reaches only
+/// if the waits are short enough to fit sixty of them inside this.
+///
+/// Two minutes, chosen against what the retries are for rather than against the
+/// schedule that produced them. The retryable refusal on this wire is CR-032's
+/// admission gate, whose verdict a five-second readiness tick refreshes; two
+/// minutes is more than twenty refreshes, so a cell that recovers at all
+/// recovers well inside it, and a cell that has not recovered by then is not
+/// one more round trip away from doing so. Past that point the retries stop
+/// being patience and start being an unresponsive client.
+///
+/// The number this replaces was not chosen at all — it was whatever
+/// `RETRY_START_BACKOFF_MS`, `RETRY_MAX_BACKOFF_MS` and `RETRY_MAX_ATTEMPTS`
+/// happened to multiply out to, and it came to over ten minutes per refused
+/// RPC. See [`grpc_retry`] for the measurement.
+const RETRY_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(120);
+
 /// [`RETRY_MAX_BACKOFF_MS`] as a `Duration`, which is also the ceiling a
 /// server-supplied retry hint is clamped to. See [`retry_delay_hint`].
 const RETRY_MAX_BACKOFF: Duration = Duration::from_millis(RETRY_MAX_BACKOFF_MS);
 
-/// The client's `RESOURCE_EXHAUSTED` backoff schedule: 50 ms doubling to a 10 s
-/// ceiling, over 60 attempts, with up to 100 ms of jitter per wait added by
-/// [`crate::util::Retry`].
+/// The client's `RESOURCE_EXHAUSTED` retry policy for one RPC: 50 ms doubling
+/// to a 10 s ceiling with up to 100 ms of jitter per wait
+/// ([`crate::util::Retry`]), under a [`RETRY_WALL_CLOCK_BUDGET`] ceiling on the
+/// total, and at most [`RETRY_MAX_ATTEMPTS`] attempts.
 ///
 /// # The per-RPC budget, measured rather than assumed
 ///
-/// This schedule is bounded but not short, and the number is written down here
-/// because a server-side constant once justified itself against a client that
-/// did not exist. `lore-server`'s
+/// The number is written down here because a server-side constant once
+/// justified itself against a client that did not exist. `lore-server`'s
 /// `measure_the_real_lore_client_resource_exhausted_retry_budget`
-/// (`lore-server/tests/outbox_load_proof.rs`) drives *this* schedule under a
-/// paused clock and pins the three constants above against this file, so a
-/// change here trips that test rather than silently invalidating its number.
+/// (`lore-server/tests/outbox_load_proof.rs`) drives the *unbudgeted* schedule
+/// under a paused clock and pins constants above against this file;
+/// `tests/grpc_retry_hint.rs` drives *this function's own* budgeted policy the
+/// same way.
 ///
 /// | | attempts | elapsed per refused RPC |
 /// | --- | --- | --- |
-/// | no server hint | 60 | 532.8 s to 539.0 s |
-/// | honouring a 10 s `RetryInfo` | 60 | 600.0 s to 605.2 s |
+/// | no server hint | 18 | 112.8 s to 114.3 s |
+/// | honouring a 10 s `RetryInfo` | 11 | 110.0 s to 110.3 s |
 ///
-/// The hinted row's arithmetic: attempts 1 to 8 have a base step below 10 s, so
-/// the hint dominates at exactly 10,000 ms each (80.0 s); attempts 9 to 60 sit
-/// at the 10,000 ms ceiling plus jitter, so the base step dominates
-/// (520.0 s to 525.2 s).
+/// The unhinted row: base steps 50+100+200+400+800+1600+3200+6400 ms cover the
+/// first eight attempts (12.75 s), then each further attempt costs the 10,000 ms
+/// ceiling, so attempt 18 ends at 112.75 s and a nineteenth would need to run
+/// past 120 s. The hinted row: attempts 1 to 8 have a base step below 10 s, so
+/// the hint dominates at exactly 10,000 ms each (80.0 s); attempts 9 to 11 sit
+/// at the 10,000 ms ceiling plus jitter; a twelfth would pass 120 s.
 ///
-/// **Honouring the hint lengthens the worst case by about a minute, and that is
-/// the trade being made.** What it buys is that no retry lands before the server
-/// has had a chance to re-examine its answer. Unhinted, the first eight attempts
-/// all fall inside 12.75 s, and CR-032's admission gate serves a verdict its
-/// readiness tick refreshes every five seconds — so those attempts were
-/// guaranteed to re-read the identical cached refusal. Trading a minute of tail
-/// latency for eight pointless round trips against an already-loaded cell is the
-/// right direction.
+/// **The wall-clock budget, not the attempt count, is what ends both.** Sixty
+/// attempts are still allowed and no longer reachable at this backoff — they
+/// bound a schedule whose steps are short, which this one's are not. Removing
+/// the attempt cap would leave the budget doing all the work; it is kept as the
+/// secondary bound because it costs nothing and it is the one that holds if the
+/// backoff constants are ever made much smaller.
 ///
-/// **This is a floor, not a ceiling, in two ways that still hold.** It counts
-/// only the waits, not the round trips between them; and `grpc_retry()` is built
-/// per RPC, so an operation issuing several refused RPCs pays the budget several
-/// times over. Nothing above truncates it: the endpoint carries no request
-/// timeout, and [`GRPC_CONNECT_TIMEOUT_SECS`] bounds channel setup only.
-fn grpc_retry() -> crate::util::Retry {
-    crate::util::retry(
-        RETRY_START_BACKOFF_MS,
-        RETRY_MAX_BACKOFF_MS,
-        RETRY_MAX_ATTEMPTS,
-    )
+/// **The hint is honoured within the budget, never past it.** Each wait is
+/// `max(this client's own step, the server's hint)`, and a wait that would end
+/// after the deadline is not started at all — the RPC ends on the last error it
+/// actually received. Truncating such a wait instead would send the next attempt
+/// *earlier* than the server asked, which is the one direction that makes things
+/// worse for a cell already refusing.
+///
+/// What honouring the hint still buys, inside the shorter budget: unhinted, the
+/// first eight attempts all fall inside 12.75 s, and CR-032's admission gate
+/// serves a verdict its readiness tick refreshes every five seconds — so those
+/// eight were guaranteed to re-read the identical cached refusal. Every hinted
+/// retry arrives after at least one whole refresh.
+///
+/// **It is wall clock, so the round trips spend it too.** The deadline is taken
+/// when the budget is built, and everything after that draws on it: the waits,
+/// the refused round trips between them, and any time spent in a stream body.
+/// Slow round trips therefore buy *fewer* attempts rather than a longer RPC, so
+/// the table above is the attempt count when the round trips are free, which is
+/// its maximum — 5 s round trips turn the unhinted 18 into 12, and an RPC that
+/// spends the whole budget in-body gets no retries at all. This is the opposite
+/// of what the same paragraph said before the budget existed, when the schedule
+/// counted only its own waits and every number here was a floor.
+///
+/// **It bounds one RPC, not one operation.** `grpc_retry()` is built per RPC, so
+/// an operation issuing several refused RPCs pays the budget several times over,
+/// and a verb wrapped in [`with_reconnect_classified`] builds a fresh one on
+/// each of its [`crate::replay::ATTEMPT_BUDGET`] dispatches — 240 s of retry
+/// waiting end to end at today's value of 2. Nothing else truncates any of it:
+/// the endpoint carries no request timeout, and [`GRPC_CONNECT_TIMEOUT_SECS`]
+/// bounds channel setup only.
+///
+/// `pub` and `#[doc(hidden)]` for the same reason as [`retry_delay_hint`]: the
+/// budget suite measures the shipped policy itself rather than a copy of its
+/// constants.
+#[doc(hidden)]
+pub fn grpc_retry() -> RetryBudget {
+    RetryBudget {
+        retry: crate::util::retry(
+            RETRY_START_BACKOFF_MS,
+            RETRY_MAX_BACKOFF_MS,
+            RETRY_MAX_ATTEMPTS,
+        ),
+        deadline: tokio::time::Instant::now() + RETRY_WALL_CLOCK_BUDGET,
+    }
+}
+
+/// One RPC's retry budget: the attempt schedule, plus the wall-clock deadline
+/// that is the primary bound on it.
+///
+/// The deadline is taken when the budget is built, which every RPC does before
+/// its first send, so it covers the whole of that RPC's retry life. It is not
+/// shared: a caller issuing several RPCs builds one of these per RPC and pays
+/// the budget per RPC. See [`grpc_retry`].
+#[doc(hidden)]
+pub struct RetryBudget {
+    retry: crate::util::Retry,
+    deadline: tokio::time::Instant,
+}
+
+impl RetryBudget {
+    /// Attempts spent so far. Exposed for the budget suite's measurements.
+    #[doc(hidden)]
+    pub fn counter(&self) -> usize {
+        self.retry.counter()
+    }
+
+    /// Wait out one attempt, honouring `hint`, and report whether the caller
+    /// may try again. `false` ends the retry loop.
+    ///
+    /// The gate runs **before** the wait and refuses on the upper bound, so no
+    /// wait is ever started that could end past the deadline:
+    /// [`crate::util::Retry::next_delay_upper_bound`] is the most the client's
+    /// own step can cost, the hint may raise it, and the sum is compared
+    /// against the deadline while nothing has been slept and no attempt spent.
+    /// Refusing rather than shortening is the point — a truncated wait would
+    /// retry sooner than the server asked.
+    ///
+    /// Both refusals, this one and an exhausted attempt count, return `false`
+    /// the same way, so [`handle_error`] returns the same refusal to the caller
+    /// either way. Neither is a new error kind, and neither reclassifies the
+    /// RPC: this seam still never authorises a redispatch.
+    #[doc(hidden)]
+    pub async fn wait(&mut self, hint: Option<Duration>) -> bool {
+        let Some(step) = self.retry.next_delay_upper_bound() else {
+            // The secondary bound: the attempt count is spent.
+            return false;
+        };
+
+        let longest = match hint {
+            Some(hint) => step.max(hint),
+            None => step,
+        };
+        // `checked_add` rather than `+`: a hint arrives from the wire, and
+        // `Instant + Duration` panics on overflow. A hint so large it cannot be
+        // added to now is, unambiguously, one that does not fit the budget.
+        let Some(ends_at) = tokio::time::Instant::now().checked_add(longest) else {
+            return false;
+        };
+        if ends_at > self.deadline {
+            return false;
+        }
+
+        wait_with_hint(&mut self.retry, hint).await
+    }
 }
 
 #[derive(Default)]
@@ -981,6 +1094,12 @@ pub fn retry_delay_hint(status: &Status) -> Option<Duration> {
 /// An exhausted budget returns `false` without sleeping the remainder: there is
 /// no attempt left for it to belong to.
 ///
+/// **This is the unbudgeted primitive.** It knows how long one attempt waits and
+/// nothing about how many seconds the RPC has left; [`RetryBudget::wait`] is
+/// what production calls, and it gates this one against
+/// [`RETRY_WALL_CLOCK_BUDGET`]. Driving this function directly measures the
+/// backoff schedule, not the shipped policy.
+///
 /// `pub` and `#[doc(hidden)]` for the same reason as [`retry_delay_hint`]: it is
 /// a test seam, not advertised surface.
 #[doc(hidden)]
@@ -1007,11 +1126,17 @@ pub async fn wait_with_hint(retry: &mut crate::util::Retry, hint: Option<Duratio
 /// re-issuing one of those is the redispatch that [`with_reconnect_classified`]
 /// exists to refuse. A hint in the trailer is a request for patience, never a
 /// warrant to send a mutation twice.
-async fn handle_error(retry: &mut crate::util::Retry, status: Status) -> Result<(), ProtocolError> {
+///
+/// `retry` carries the RPC's wall-clock deadline as well as its attempt count,
+/// so a hint too long to fit in what remains ends the loop here rather than
+/// stretching it. The status returned is the one the server actually sent,
+/// whichever bound ran out — a caller cannot tell the two apart, and does not
+/// need to.
+async fn handle_error(retry: &mut RetryBudget, status: Status) -> Result<(), ProtocolError> {
     match status.code() {
         tonic::Code::ResourceExhausted => {
             let hint = retry_delay_hint(&status);
-            if !wait_with_hint(retry, hint).await {
+            if !retry.wait(hint).await {
                 return Err(ProtocolError::from(status));
             }
         }

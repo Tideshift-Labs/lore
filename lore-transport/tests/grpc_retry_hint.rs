@@ -345,3 +345,226 @@ async fn an_already_exhausted_budget_returns_false_without_sleeping_the_hint() {
         started.elapsed()
     );
 }
+
+// ---------------------------------------------------------------------------
+// `RetryBudget` -- the 120s total wall-clock cap over `grpc_retry()`
+// ---------------------------------------------------------------------------
+//
+// `wait_with_hint`/`util::Retry` above are the unbudgeted primitive and stay exactly as they
+// were (the two tests above already pin their 532.75s-539s and 600.0s-605.2s windows
+// unchanged). `RetryBudget` wraps that primitive with a 120s deadline: before starting any
+// wait it computes `max(retry.next_delay_upper_bound(), hint)` and refuses -- returning
+// `false` without sleeping -- if starting a wait that long could finish after the deadline.
+
+/// Unhinted worst case through the shipped per-RPC policy (`grpc_retry()`), now capped by the
+/// 120s wall-clock budget. Derivation: base steps 50+100+200+400+800+1600+3200+6400 = 12,750 ms
+/// over 8 attempts, then 10,000 ms each; 12,750 + 10*10,000 = 112,750 ms after 18 attempts. A
+/// 19th attempt needs a 10,100 ms upper bound (10,000 ms base step plus the 100 ms jitter cap),
+/// and 112,750 + 10,100 = 122,850 ms > 120,000 ms, so it is refused before ever sleeping.
+/// Jitter across the 18 real waits: the first five steps (50/100/200/400/800 ms) are below the
+/// 1,000 ms jitter-cap threshold, where `jitter = min((raw * current) as u64, 100)` truncates a
+/// real-valued draw strictly below its supremum (`raw` is `rand::random::<f32>() * 0.1`, so
+/// `raw * current` is strictly less than 5/10/20/40/80 respectively) -- the achievable integer
+/// maximum is one less than each supremum: 4+9+19+39+79 = 150 ms, not the naive 5+10+20+40+80 =
+/// 155 ms. The remaining 13 steps (1600/3200/6400 ms, then 10,000 ms x 10) clear the 100 ms cap
+/// well before the same truncation matters (`raw` only needs to exceed 100/1600 = 0.0625 of its
+/// 0.1 ceiling), so each is capped at exactly 100 ms = 1,300 ms; total at most 1,450 ms. The
+/// assertion below still allows up to 114,205 ms rather than the tighter 114,200 ms this implies
+/// -- 5 ms of slack, kept for the same paused-clock rounding reason the hinted case's window
+/// documents below, and small enough that it cannot mask a real regression.
+#[tokio::test(start_paused = true)]
+async fn grpc_retry_unhinted_worst_case_is_bounded_by_the_wall_clock_budget() {
+    let mut budget = lore_transport::grpc::grpc_retry();
+    let started = tokio::time::Instant::now();
+    let mut attempts = 0_usize;
+    while budget.wait(None).await {
+        attempts += 1;
+    }
+    let total = started.elapsed();
+
+    assert_eq!(
+        attempts, 18,
+        "expected the budget to refuse the 19th attempt"
+    );
+    assert_eq!(budget.counter(), 18);
+    assert!(
+        total >= Duration::from_millis(112_750) && total <= Duration::from_millis(114_205),
+        "unhinted budgeted total {total:?} is outside the derived 112.750s-114.205s window"
+    );
+    assert!(
+        total <= Duration::from_secs(120),
+        "the wall-clock budget must never be exceeded: {total:?}"
+    );
+}
+
+/// Hinted worst case (a 10s hint, the value CR-032's admission gate sends) through the shipped
+/// policy, still capped at 120s total. The hint is built the same way the tests above build one
+/// -- through this file's own fixture encoder, a real `tonic::Status`, and back through
+/// `lore_transport::grpc::retry_delay_hint` -- so this is joined on real bytes, not a
+/// hand-built `Duration`.
+///
+/// Derivation: attempts 1-8 have a base step under 10s, so `wait_with_hint`'s
+/// `max(step, hint)` resolves to the hint exactly: 8 * 10,000 ms = 80,000 ms, and each of those
+/// eight waits is therefore at least 10s (the hint is still honoured within the budget). Attempts
+/// 9-11 sit at the 10,000 ms base-step ceiling (already >= the hint) plus up to 100 ms jitter
+/// (reachable, not just a supremum: `min` saturates to exactly 100 whenever the raw draw clears
+/// 0.01 of its 0.1 ceiling, comfortably likely), so cumulative time after 11 attempts is at most
+/// 80,000 + 3*10,100 = 110,300 ms exactly. A 12th attempt needs a 10,100 ms upper bound; even the
+/// minimum possible cumulative total (110,000 ms) plus that exceeds the 120,000 ms deadline, so a
+/// 12th attempt is always refused.
+///
+/// The assertion's ceiling is 110,400 ms, not the tight 110,300 ms this derives: paused-clock
+/// `Instant` arithmetic can accumulate a tick of rounding across 11 `tokio::time::advance` calls,
+/// and an independent re-measurement of this same derivation once read 110.311 s. The 100 ms of
+/// slack absorbs that without hiding a real regression -- a genuine defect here (dropping the
+/// hint, a different cap, an extra attempt) moves the reading by seconds, not milliseconds, so do
+/// not "tidy" this back down to the derived 110,300 ms figure.
+#[tokio::test(start_paused = true)]
+async fn grpc_retry_hinted_worst_case_is_bounded_by_the_wall_clock_budget() {
+    let hint_status = hinted_status(10, 0);
+    let hint = lore_transport::grpc::retry_delay_hint(&hint_status);
+    assert_eq!(hint, Some(Duration::from_secs(10)));
+
+    let mut budget = lore_transport::grpc::grpc_retry();
+    let started = tokio::time::Instant::now();
+    let mut attempts = 0_usize;
+    let mut per_attempt = Vec::new();
+    let mut last = started;
+    while budget.wait(hint).await {
+        attempts += 1;
+        let now = tokio::time::Instant::now();
+        per_attempt.push(now - last);
+        last = now;
+    }
+    let total = started.elapsed();
+
+    assert_eq!(
+        attempts, 11,
+        "expected the budget to refuse the 12th attempt"
+    );
+    assert_eq!(budget.counter(), 11);
+    for (index, step) in per_attempt.iter().take(8).enumerate() {
+        assert!(
+            *step >= Duration::from_secs(10),
+            "attempt {} waited {:?}, expected the 10s hint to dominate within the budget",
+            index + 1,
+            step
+        );
+    }
+    assert!(
+        total >= Duration::from_millis(110_000) && total <= Duration::from_millis(110_400),
+        "hinted budgeted total {total:?} is outside the 110.000s-110.400s window (110.300s tight \
+         derivation plus 100ms of paused-clock rounding slack -- see the doc comment above)"
+    );
+    assert!(
+        total <= Duration::from_secs(120),
+        "the wall-clock budget must never be exceeded: {total:?}"
+    );
+}
+
+/// A hint longer than the remaining budget must end retrying rather than truncating the wait.
+/// Drives a fresh `grpc_retry()` budget until it refuses on its own (the unhinted worst case
+/// above: 18 real attempts, leaving only a few seconds of the 120s deadline), then asks for a
+/// wait with a 60s hint -- far longer than what remains. The budget must refuse promptly rather
+/// than sleeping any part of that hint past its deadline, and refusing must not consume an
+/// attempt.
+#[tokio::test(start_paused = true)]
+async fn a_hint_exceeding_the_remaining_budget_refuses_promptly_without_truncating_the_wait() {
+    let mut budget = lore_transport::grpc::grpc_retry();
+    while budget.wait(None).await {}
+    let attempts_before_refusal = budget.counter();
+
+    let started = tokio::time::Instant::now();
+    let waited = budget.wait(Some(Duration::from_secs(60))).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        !waited,
+        "a hint exceeding the remaining budget must not be honoured by sleeping past the deadline"
+    );
+    assert_eq!(
+        budget.counter(),
+        attempts_before_refusal,
+        "a refusal must not consume an attempt"
+    );
+    assert!(
+        elapsed < Duration::from_millis(5),
+        "a refusal must be prompt, not sleep any part of the hint: {elapsed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `util::Retry::next_delay_upper_bound`
+// ---------------------------------------------------------------------------
+
+/// `next_delay_upper_bound` must be a true upper bound on the *next* wait (jitter included), not
+/// a state change: calling it twice in a row must return the same value while `counter()` does
+/// not move, and it must report `None` once the attempt limit is reached rather than some stale
+/// last-known bound.
+#[tokio::test(start_paused = true)]
+async fn next_delay_upper_bound_is_a_true_upper_bound_and_not_a_state_change() {
+    let mut retry = lore_transport::util::retry(50, 10_000, 3);
+
+    let first = retry.next_delay_upper_bound();
+    let second = retry.next_delay_upper_bound();
+    assert!(
+        first.is_some(),
+        "an unexhausted Retry must report an upper bound"
+    );
+    assert_eq!(first, second, "calling it twice must not change the answer");
+    assert_eq!(retry.counter(), 0, "calling it must not consume an attempt");
+
+    for attempt in 1..=3 {
+        assert!(
+            retry.wait().await,
+            "the retry budget must not exhaust before attempt {attempt}"
+        );
+    }
+    assert_eq!(retry.counter(), 3);
+
+    assert_eq!(
+        retry.next_delay_upper_bound(),
+        None,
+        "an exhausted Retry must report no upper bound"
+    );
+    assert_eq!(
+        retry.next_delay_upper_bound(),
+        None,
+        "calling it again on an exhausted Retry must still report no upper bound"
+    );
+    assert_eq!(
+        retry.counter(),
+        3,
+        "exhaustion checks must not move the counter"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `handle_error` stays on the budgeted path
+// ---------------------------------------------------------------------------
+
+/// `wait_with_hint`/`util::Retry` stay `pub` -- deliberately, so the two no-regression pins above
+/// can keep driving the unbudgeted primitive directly. That same reachability means a future
+/// `RESOURCE_EXHAUSTED` call site could call `wait_with_hint` instead of `RetryBudget::wait` and
+/// silently lose the 120s wall-clock cap: every case above drives one function or the other
+/// directly, so none of them would notice a regression in which one `handle_error` itself calls.
+///
+/// Pinned the way `lore-server/tests/outbox_load_proof.rs`'s
+/// `measure_the_real_lore_client_resource_exhausted_retry_budget` pins this same file: read the
+/// production source and assert the one line that routes a refused RPC through the budgeted
+/// `RetryBudget::wait` rather than the unbudgeted `wait_with_hint`. This proves only that the call
+/// site still reads that way in source today -- it is not a substitute for the behavioural cases
+/// above, and it does not prove no *other* call site exists. If it ever fails, the right response
+/// is to re-measure the budget this file pins against whatever `handle_error` now does, not to
+/// update this string to match it.
+#[test]
+fn handle_error_stays_on_the_budgeted_retry_path() {
+    let source = include_str!("../src/grpc/mod.rs");
+    assert!(
+        source.contains("if !retry.wait(hint).await {"),
+        "lore-transport's RESOURCE_EXHAUSTED handler no longer calls RetryBudget::wait(hint) -- \
+         if it now calls the unbudgeted wait_with_hint instead, the 120s wall-clock cap this file \
+         measures no longer applies to a real RPC. Re-measure the budget this file pins before \
+         assuming these numbers still describe production behaviour."
+    );
+}
