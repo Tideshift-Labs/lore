@@ -45,6 +45,25 @@ use lore_proto::lock::lock_service_server::LockServiceServer;
 use lore_proto::lore::environment::v1 as environment_v1;
 use lore_proto::lore::environment::v1::environment_service_server::EnvironmentService;
 use lore_proto::lore::environment::v1::environment_service_server::EnvironmentServiceServer;
+use lore_proto::lore::model::v1 as model_v1;
+use lore_proto::lore::revision::v1::BranchCreateRequest;
+use lore_proto::lore::revision::v1::BranchCreateResponse;
+use lore_proto::lore::revision::v1::BranchDeleteRequest;
+use lore_proto::lore::revision::v1::BranchDeleteResponse;
+use lore_proto::lore::revision::v1::BranchGetRequest;
+use lore_proto::lore::revision::v1::BranchGetResponse;
+use lore_proto::lore::revision::v1::BranchListRequest;
+use lore_proto::lore::revision::v1::BranchListResponse;
+use lore_proto::lore::revision::v1::BranchMetadataGetRequest;
+use lore_proto::lore::revision::v1::BranchMetadataGetResponse;
+use lore_proto::lore::revision::v1::BranchMetadataSetRequest;
+use lore_proto::lore::revision::v1::BranchMetadataSetResponse;
+use lore_proto::lore::revision::v1::BranchPushRequest;
+use lore_proto::lore::revision::v1::BranchPushResponse;
+use lore_proto::lore::revision::v1::RevisionListRequest;
+use lore_proto::lore::revision::v1::RevisionListResponse;
+use lore_proto::lore::revision::v1::revision_service_server::RevisionService;
+use lore_proto::lore::revision::v1::revision_service_server::RevisionServiceServer;
 use lore_transport::outcome::ATTEMPT_ID_METADATA_KEY;
 use parking_lot::Mutex;
 use tonic::Request;
@@ -93,14 +112,43 @@ pub struct LockCall {
     pub all_resources_carried_a_token: bool,
 }
 
+/// Why the stub refuses a call.
+///
+/// A fixture-owned enum rather than a re-exported `tonic::Code`, because a consumer crate should
+/// not have to take a `tonic` dependency to say "refuse this one". `lore` has none, and its tests
+/// are the main reason this fixture exists.
+///
+/// Every variant here is decisive: the client retries only `ResourceExhausted`, which is
+/// deliberately not offered, so a refusal fixture always terminates on the first answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The caller may not do this. The ordinary shape of a fenced cell turning down a tokenless
+    /// release, and what makes the release path escalate.
+    PermissionDenied,
+    /// The server failed for its own reasons.
+    Internal,
+    /// The row was not there. Note that the client deliberately swallows this on `Unlock` and
+    /// reports an empty release rather than an error, so it is not a way to fail an unlock.
+    NotFound,
+}
+
+impl Refusal {
+    fn status(self) -> Status {
+        match self {
+            Self::PermissionDenied => Status::permission_denied("fixture refusal"),
+            Self::Internal => Status::internal("fixture refusal"),
+            Self::NotFound => Status::not_found("fixture refusal"),
+        }
+    }
+}
+
 /// How the stub answers one RPC.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum RpcOutcome {
     /// Answer successfully.
     Grant,
-    /// Answer with this status. Only `ResourceExhausted` is retried by the client; every other
-    /// code fails the call on the first answer, which is what makes a failure fixture bounded.
-    Refuse(tonic::Code, String),
+    /// Answer with a refusal.
+    Refuse(Refusal),
 }
 
 /// The stub's per-RPC policy, changeable while the server is running.
@@ -151,10 +199,62 @@ impl Default for LockPolicy {
     }
 }
 
+/// Which revision RPC one recorded call came through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevisionRpc {
+    BranchGet,
+    BranchCreate,
+    BranchPush,
+}
+
+/// One revision request the stub server actually received.
+#[derive(Clone, Debug)]
+pub struct RevisionCall {
+    pub rpc: RevisionRpc,
+    pub attempt_id: Option<String>,
+}
+
+/// What `BranchGet` reports about the branch a push is about to compare against.
+///
+/// The three fields are the whole of what a push reads from the remote before it decides what to
+/// dispatch, so they are the whole of what a fixture needs to steer it.
+#[derive(Clone, Debug)]
+pub enum BranchAnswer {
+    /// No such branch. The push then treats the branch as absent on the remote.
+    NotFound,
+    /// A branch record. `latest` equal to the local tip is what makes a push idempotent, and
+    /// `deleted` is what makes it restore the branch rather than return immediately.
+    Present {
+        latest: Vec<u8>,
+        metadata: Vec<u8>,
+        deleted: bool,
+    },
+}
+
+/// The revision service's policy, alongside [`LockPolicy`] for the lock service.
+#[derive(Clone, Debug)]
+pub struct RevisionPolicy {
+    pub branch_get: BranchAnswer,
+    pub branch_create: RpcOutcome,
+    pub branch_push: RpcOutcome,
+}
+
+impl Default for RevisionPolicy {
+    fn default() -> Self {
+        Self {
+            branch_get: BranchAnswer::NotFound,
+            branch_create: RpcOutcome::Grant,
+            branch_push: RpcOutcome::Grant,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ServerState {
     calls: Mutex<Vec<LockCall>>,
     policy: Mutex<LockPolicy>,
+    revision_calls: Mutex<Vec<RevisionCall>>,
+    revision_policy: Mutex<RevisionPolicy>,
     /// Monotonic counter feeding minted ownership tokens, so two granted rows never share one.
     minted: Mutex<u64>,
 }
@@ -189,9 +289,19 @@ impl LockServer {
     }
 
     pub async fn start_with_policy(policy: LockPolicy) -> Self {
+        Self::start_with_policies(policy, RevisionPolicy::default()).await
+    }
+
+    /// Serve the revision service too, for a push.
+    ///
+    /// One server rather than two, because a repository names exactly one remote and a push
+    /// reaches both services through it.
+    pub async fn start_with_policies(policy: LockPolicy, revision: RevisionPolicy) -> Self {
         let state = Arc::new(ServerState {
             calls: Mutex::new(Vec::new()),
             policy: Mutex::new(policy),
+            revision_calls: Mutex::new(Vec::new()),
+            revision_policy: Mutex::new(revision),
             minted: Mutex::new(0),
         });
 
@@ -202,14 +312,18 @@ impl LockServer {
             .local_addr()
             .expect("reading the fixture server's local address");
 
-        let service = StubLockService {
+        let lock_service = StubLockService {
+            state: state.clone(),
+        };
+        let revision_service = StubRevisionService {
             state: state.clone(),
         };
 
         #[allow(clippy::disallowed_methods)] // Test-local server task.
         let handle = tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
-                .add_service(LockServiceServer::new(service))
+                .add_service(LockServiceServer::new(lock_service))
+                .add_service(RevisionServiceServer::new(revision_service))
                 .add_service(EnvironmentServiceServer::new(StubEnvironmentService))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await;
@@ -252,9 +366,30 @@ impl LockServer {
             .collect()
     }
 
+    /// Every revision request the server received, in arrival order.
+    pub fn revision_calls(&self) -> Vec<RevisionCall> {
+        self.state.revision_calls.lock().clone()
+    }
+
+    /// Only the revision requests that came through `rpc`.
+    pub fn revision_calls_for(&self, rpc: RevisionRpc) -> Vec<RevisionCall> {
+        self.state
+            .revision_calls
+            .lock()
+            .iter()
+            .filter(|call| call.rpc == rpc)
+            .cloned()
+            .collect()
+    }
+
     /// Change how the server answers, mid-test.
     pub fn set_policy(&self, policy: LockPolicy) {
         *self.state.policy.lock() = policy;
+    }
+
+    /// Change how the revision service answers, mid-test.
+    pub fn set_revision_policy(&self, policy: RevisionPolicy) {
+        *self.state.revision_policy.lock() = policy;
     }
 
     /// A cheap, cloneable read handle on what the server has seen.
@@ -364,10 +499,10 @@ impl StubLockService {
     fn outcome(&self, rpc: LockRpc) -> RpcOutcome {
         let policy = self.state.policy.lock();
         match rpc {
-            LockRpc::Lock => policy.lock.clone(),
-            LockRpc::AdminLock => policy.admin_lock.clone(),
-            LockRpc::Unlock => policy.unlock.clone(),
-            LockRpc::ForceUnlock => policy.force_unlock.clone(),
+            LockRpc::Lock => policy.lock,
+            LockRpc::AdminLock => policy.admin_lock,
+            LockRpc::Unlock => policy.unlock,
+            LockRpc::ForceUnlock => policy.force_unlock,
             LockRpc::Query | LockRpc::Status => RpcOutcome::Grant,
         }
     }
@@ -379,7 +514,7 @@ impl LockService for StubLockService {
         let resources = request.get_ref().resources.clone();
         self.record(LockRpc::Lock, &request, &resources, "");
         match self.outcome(LockRpc::Lock) {
-            RpcOutcome::Refuse(code, message) => Err(Status::new(code, message)),
+            RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::Grant => Ok(Response::new(LockResponse {
                 locks: self.grant(resources, "fixture-owner"),
             })),
@@ -424,7 +559,7 @@ impl LockService for StubLockService {
         let resources = request.get_ref().resources.clone();
         self.record(LockRpc::Unlock, &request, &resources, "");
         match self.outcome(LockRpc::Unlock) {
-            RpcOutcome::Refuse(code, message) => Err(Status::new(code, message)),
+            RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::Grant => {
                 let echo = self.state.policy.lock().unlock_echo;
                 let confirmed = match echo {
@@ -447,7 +582,7 @@ impl LockService for StubLockService {
         let owner = request.get_ref().owner.clone();
         self.record(LockRpc::AdminLock, &request, &resources, &owner);
         match self.outcome(LockRpc::AdminLock) {
-            RpcOutcome::Refuse(code, message) => Err(Status::new(code, message)),
+            RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::Grant => Ok(Response::new(AdminLockResponse {
                 locks: self.grant(resources, &owner),
             })),
@@ -462,9 +597,145 @@ impl LockService for StubLockService {
         let owner = request.get_ref().owner.clone();
         self.record(LockRpc::ForceUnlock, &request, &resources, &owner);
         match self.outcome(LockRpc::ForceUnlock) {
-            RpcOutcome::Refuse(code, message) => Err(Status::new(code, message)),
+            RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::Grant => Ok(Response::new(ForceUnlockResponse { resources })),
         }
+    }
+}
+
+/// The revision half of the stub, serving only what a push reads before it dispatches.
+///
+/// Everything else answers `Unimplemented`, which is honest: a push that reached one of them would
+/// be taking a path this fixture does not claim to model, and a silent default would hide that.
+struct StubRevisionService {
+    state: Arc<ServerState>,
+}
+
+impl StubRevisionService {
+    fn record<T>(&self, rpc: RevisionRpc, request: &Request<T>) {
+        let attempt_id = request
+            .metadata()
+            .get(ATTEMPT_ID_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        self.state
+            .revision_calls
+            .lock()
+            .push(RevisionCall { rpc, attempt_id });
+    }
+}
+
+#[tonic::async_trait]
+impl RevisionService for StubRevisionService {
+    type BranchListStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<BranchListResponse, Status>> + Send>,
+    >;
+
+    async fn branch_create(
+        &self,
+        request: Request<BranchCreateRequest>,
+    ) -> Result<Response<BranchCreateResponse>, Status> {
+        self.record(RevisionRpc::BranchCreate, &request);
+        let outcome = self.state.revision_policy.lock().branch_create;
+        match outcome {
+            RpcOutcome::Refuse(refusal) => Err(refusal.status()),
+            RpcOutcome::Grant => {
+                let body = request.into_inner();
+                // The branch point the caller named, echoed back as the created tip. A push that
+                // reads this value compares it against the branch point it asked for, so echoing
+                // is the only answer that does not fail the caller for a reason the fixture
+                // invented.
+                let latest = body
+                    .stack
+                    .first()
+                    .map(|point| point.revision_signature.clone())
+                    .unwrap_or_default();
+                Ok(Response::new(BranchCreateResponse {
+                    branch: Some(model_v1::Branch {
+                        id: body.id,
+                        name: body.name,
+                        creator: body.creator.unwrap_or_default(),
+                        category: body.category,
+                        latest,
+                        stack: body.stack,
+                        ..model_v1::Branch::default()
+                    }),
+                }))
+            }
+        }
+    }
+
+    async fn branch_delete(
+        &self,
+        _request: Request<BranchDeleteRequest>,
+    ) -> Result<Response<BranchDeleteResponse>, Status> {
+        Err(Status::unimplemented("not modelled by the live fixture"))
+    }
+
+    async fn branch_get(
+        &self,
+        request: Request<BranchGetRequest>,
+    ) -> Result<Response<BranchGetResponse>, Status> {
+        self.record(RevisionRpc::BranchGet, &request);
+        let answer = self.state.revision_policy.lock().branch_get.clone();
+        match answer {
+            BranchAnswer::NotFound => Err(Status::not_found("no such branch")),
+            BranchAnswer::Present {
+                latest,
+                metadata,
+                deleted,
+            } => Ok(Response::new(BranchGetResponse {
+                branch: Some(model_v1::Branch {
+                    latest: latest.into(),
+                    metadata: metadata.into(),
+                    deleted,
+                    ..model_v1::Branch::default()
+                }),
+            })),
+        }
+    }
+
+    async fn branch_list(
+        &self,
+        _request: Request<BranchListRequest>,
+    ) -> Result<Response<Self::BranchListStream>, Status> {
+        Err(Status::unimplemented("not modelled by the live fixture"))
+    }
+
+    async fn branch_push(
+        &self,
+        request: Request<BranchPushRequest>,
+    ) -> Result<Response<BranchPushResponse>, Status> {
+        self.record(RevisionRpc::BranchPush, &request);
+        let outcome = self.state.revision_policy.lock().branch_push;
+        match outcome {
+            RpcOutcome::Refuse(refusal) => Err(refusal.status()),
+            RpcOutcome::Grant => Ok(Response::new(BranchPushResponse {
+                revision_signature: request.into_inner().revision_signature,
+                ..BranchPushResponse::default()
+            })),
+        }
+    }
+
+    async fn branch_metadata_get(
+        &self,
+        _request: Request<BranchMetadataGetRequest>,
+    ) -> Result<Response<BranchMetadataGetResponse>, Status> {
+        Err(Status::unimplemented("not modelled by the live fixture"))
+    }
+
+    async fn branch_metadata_set(
+        &self,
+        _request: Request<BranchMetadataSetRequest>,
+    ) -> Result<Response<BranchMetadataSetResponse>, Status> {
+        Err(Status::unimplemented("not modelled by the live fixture"))
+    }
+
+    async fn revision_list(
+        &self,
+        _request: Request<RevisionListRequest>,
+    ) -> Result<Response<RevisionListResponse>, Status> {
+        Err(Status::unimplemented("not modelled by the live fixture"))
     }
 }
 
@@ -516,6 +787,12 @@ pub struct LiveRepository {
     pub committed_files: Vec<String>,
     /// The same files as absolute paths, for a caller building `LoreArray` arguments.
     pub committed_files_absolute: Vec<PathBuf>,
+    /// The signature of the revision the commit produced, which is this repository's local tip.
+    ///
+    /// A push fixture needs it: a remote reporting this exact value as the branch's tip is what
+    /// makes the push idempotent, which is the one shape that reaches a dispatch without also
+    /// needing every fragment-upload RPC modelled.
+    pub committed_revision: crate::lore::Hash,
     pub remote_url: String,
     _tempdir: TempDir,
 }
@@ -601,7 +878,7 @@ impl LiveRepository {
         .await
         .expect("staging the fixture file");
 
-        Box::pin(crate::commit::commit(
+        let committed_revision = Box::pin(crate::commit::commit(
             repository.clone(),
             &token,
             crate::commit::CommitOptions {
@@ -615,6 +892,29 @@ impl LiveRepository {
         ))
         .await
         .expect("committing the fixture revision");
+
+        // Repository metadata, which `create_local` does not write and a push reads before it
+        // dispatches anything. A real repository always has it: a clone receives it from the
+        // server, and `metadata_hash`'s own fallback is to fetch it from the remote. Writing it
+        // here rather than adding a `RepositoryService` stub is the honest fix, because the
+        // fallback would hand back a hash whose body the local immutable store still would not
+        // hold. Without it a push fails with `AddressNotFound` before reaching a single RPC.
+        let metadata_hash = crate::repository::metadata_store(
+            repository.clone(),
+            crate::repository::RepositoryMetadata {
+                name: "live-fixture".to_owned(),
+                description: String::new(),
+                default_branch,
+                default_branch_name: crate::branch::DEFAULT_DEFAULT_NAME.to_string(),
+                creator: "live-fixture-user".to_owned(),
+                created: 0,
+            },
+        )
+        .await
+        .expect("storing the fixture repository metadata");
+        crate::repository::metadata_store_hash(repository.clone(), metadata_hash)
+            .await
+            .expect("recording the fixture repository metadata hash");
 
         repository
             .flush(true)
@@ -631,6 +931,7 @@ impl LiveRepository {
             repository_id,
             committed_files: names.iter().map(|name| (*name).to_owned()).collect(),
             committed_files_absolute,
+            committed_revision,
             remote_url: remote_url.to_owned(),
             _tempdir: tempdir,
         }
