@@ -39,53 +39,13 @@ fn no_callback() -> LoreEventCallback {
     })
 }
 
-/// The fixture reaches a real lock dispatch, and the caller's store is what journals it.
-///
-/// This is the smoke test for the fixture itself as much as for the entry point: if the remote
-/// were not resolving to `Connected`, the acquire would fail offline before it reached a single
-/// dispatch and the server would have seen nothing.
-#[test]
-fn file_acquire_with_attempt_store_journals_the_lock_dispatch() {
-    let runtime = lore::runtime();
-
-    let server = runtime.block_on(LockServer::start());
-    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
-        LiveRepository::create(&server.remote_url()).await
-    }));
-
-    let store = Arc::new(VolatileAttemptStore::new());
-    let attempts: Arc<dyn AttemptStore> = store.clone();
-
-    let status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
-        fixture.globals(),
-        lore::lock::LoreLockFileAcquireArgs {
-            paths: LoreArray::from_vec(
-                fixture
-                    .committed_files_absolute
-                    .iter()
-                    .map(LoreString::from)
-                    .collect(),
-            ),
-            branch: LoreString::default(),
-        },
-        no_callback(),
-        attempts,
-    ));
-
-    assert_eq!(status, 0, "the acquire must succeed against the fixture");
-
-    let locks = server.calls_for(LockRpc::Lock);
-    assert_eq!(
-        locks.len(),
-        1,
-        "one batch of one path is one lock dispatch, got {:?}",
-        server.calls()
-    );
-    assert!(
-        locks[0].attempt_id.is_some(),
-        "the dispatch must have carried an attempt id to the server"
-    );
-}
+// A smoke test lived here, asserting that an acquire reached the server carrying an attempt id.
+// A reviewer proved it vacuous: replacing the caller's store with `None` at the entry point left
+// it green, because the transport mints its own id per dispatch when no store is supplied, so the
+// header it checked was there either way. Removed rather than reworded. Everything it covered --
+// that the fixture connects, that a dispatch reaches the server, that the id is journalled -- is
+// covered by `acquire_journals_one_attempt_per_dispatch_before_the_dispatch_and_resolves_it_after`
+// below, which the same probe turned red.
 
 /// Every path a lock verb needs, as absolute paths, in the shape `LoreLockFile*Args` wants.
 fn all_paths(fixture: &LiveRepository) -> LoreArray<LoreString> {
@@ -464,13 +424,21 @@ fn release_journals_its_unlock_dispatch_before_the_dispatch_and_resolves_it_afte
         1,
         "the release's own dispatch must be the only record in this spy's log, got {records:?}"
     );
-    let (record_attempt_id, operation, _) = records[0].clone();
+    let (record_attempt_id, operation, calls_when_recorded) = records[0].clone();
     assert_eq!(
         operation,
         GrpcRpc::LockUnlock.wire_name(),
         "the journalled operation must name the release's own RPC, not the earlier acquire's"
     );
     assert_eq!(record_attempt_id, server_attempt_id);
+    // Not zero here: the acquire above already put one call on this server. The discriminating
+    // value is the position of the unlock itself, which is what "the record was written before
+    // this request left" means once the server has a history.
+    assert_eq!(
+        calls_when_recorded,
+        Some(call_index(&server.calls(), LockRpc::Unlock)),
+        "the record must have been written before the unlock reached the server"
+    );
 
     let resolves = spy.resolve_entries();
     assert_eq!(resolves.len(), 1, "got {resolves:?}");
@@ -535,11 +503,18 @@ fn a_decisive_refusal_resolves_not_applied_and_the_record_still_exists() {
 
 /// Nothing is journalled when the remote never resolves at all.
 ///
-/// The remote here names a port nothing listens on, so the connect inside the batch task fails
-/// before `under_own_attempt` ever mints an id. This pins that the journal entry is minted inside
-/// the batch task, after a real lock connect, and not eagerly at the top of the verb -- a caller
-/// speculatively recording an attempt for a connection that was never established would leave a
-/// permanently unresolved record for a mutation that was never dispatched.
+/// The remote here names a port nothing listens on, so the connect fails and the acquire never
+/// reaches `under_own_attempt`. This pins that the journal entry is minted inside the batch task,
+/// after a real lock connect, and not eagerly at the top of the verb -- a caller speculatively
+/// recording an attempt for a connection that was never established would leave a permanently
+/// unresolved record for a mutation that was never dispatched.
+///
+/// The second half is what makes the first half mean anything. An empty journal is also what a
+/// repository that never opened at all would produce, and a reviewer proved that an earlier
+/// version of this test stayed green when pointed at a path with no repository on it. So the same
+/// call is made twice, once against a real repository whose remote is unreachable and once against
+/// a path that holds no repository, and the two statuses must differ. A test that cannot tell
+/// those apart is not testing the connect.
 #[test]
 fn nothing_is_journalled_when_the_remote_never_resolves() {
     let runtime = lore::runtime();
@@ -568,6 +543,27 @@ fn nothing_is_journalled_when_the_remote_never_resolves() {
         spy.record_entries().is_empty(),
         "no record may be written when the connect that would precede it never succeeded, got {:?}",
         spy.record_entries()
+    );
+
+    let mut absent = fixture.globals();
+    absent.repository_path =
+        LoreString::from_str("Z:/lore-live-lock-journal-no-such-repository-4c81ad");
+    let absent_spy = Arc::new(JournalSpy::without_server());
+    let absent_attempts: Arc<dyn AttemptStore> = absent_spy.clone();
+    let absent_status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        absent,
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        no_callback(),
+        absent_attempts,
+    ));
+
+    assert_ne!(
+        status, absent_status,
+        "the unreachable-remote failure must be distinguishable from a repository that was never \
+         opened; if these agree, this test cannot tell which one it just proved"
     );
 }
 
@@ -652,6 +648,25 @@ fn the_force_release_escalation_is_journalled() {
         spy.record_entries()
     );
     assert_eq!(force_records[0].0, server_attempt_id);
+    // A release that escalates has already made a query and a refused unlock by this point, so the
+    // discriminating value is the takeover's own position in the server's history rather than
+    // zero. Recording after the takeover left would put this one higher.
+    assert_eq!(
+        force_records[0].2,
+        Some(call_index(&server.calls(), LockRpc::ForceUnlock)),
+        "the record must have been written before the takeover reached the server"
+    );
+}
+
+/// Where the first call of `rpc` sits in the server's arrival order.
+///
+/// The number a correct `record()` sees: every call before this one had already arrived, and this
+/// one had not. Panics if the RPC never arrived, which is a test bug rather than a soft failure.
+fn call_index(calls: &[lore_revision::live_fixture::LockCall], rpc: LockRpc) -> usize {
+    calls
+        .iter()
+        .position(|call| call.rpc == rpc)
+        .expect("the RPC under test must have reached the server")
 }
 
 /// Release clears ownership for exactly what the server confirmed, and `resolve` clears none of

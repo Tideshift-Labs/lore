@@ -40,8 +40,11 @@ use crate::lore::RepositoryId;
 /// the entire reason any of this exists. Any other error means the transport either held proof
 /// the request never left or carried back the server's own refusal, and both are decisively
 /// not-applied.
-/// PIN(WP-120, 2026-09-05): this helper is wired at the push dispatches in this file and nowhere
-/// else, and that is the whole desktop surface rather than a partial rollout. Every other
+/// PIN(WP-120, 2026-09-05): this helper is wired at `branch::push`'s dispatches and at the lock
+/// verbs' (`lock::file::acquire`'s batch lock, `lock::file::release`'s batch unlock and its
+/// force-release escalation), and that is the whole desktop surface rather than a partial
+/// rollout. The wording here said "in this file and nowhere else" while the helper still lived in
+/// `branch/push.rs`; it moved when the lock verbs were wired, and the sentence did not. Every other
 /// `MutableNoReplay` domain dispatch on the client path is unwired because `lore-engine` in
 /// lorehub-desktop reaches none of them: `branch::merge_into`'s pushes (`branch/merge.rs:4000`
 /// and `:4383`, whose only caller anywhere is the CLI entry point in `lore/src/branch.rs`),

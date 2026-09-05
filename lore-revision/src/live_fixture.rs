@@ -20,7 +20,17 @@
 //! everything else answer `Unimplemented`.
 //!
 //! Behind `test_seams` for the reason that feature exists — production must never link it. The
-//! feature is enabled for `lore`'s dev build the same way `lore-transport`'s already is.
+//! feature is enabled for `lore`'s dev build the same way `lore-transport`'s already is, and it
+//! carries the same known limit that feature already documents: a *workspace-wide* build of all
+//! targets unifies the feature onto the one `lore-revision` every crate in the workspace shares,
+//! so `loreserver`'s binary links this module in that build too. A normal build of any crate does
+//! not — `cargo tree -p lore -e features,normal` names no `test_seams` edge — and that is the
+//! property worth re-checking if this file ever stops being test-only in spirit.
+//!
+//! Every failure in here is an `expect`, against the crate's own no-`expect`-outside-tests rule.
+//! That rule is about code a user can reach, and nothing here is: the feature is absent from every
+//! normal build. A fixture that propagated its own setup failures would make each caller handle an
+//! error that means only "the test rig is broken".
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -319,8 +329,12 @@ impl LockServer {
             state: state.clone(),
         };
 
-        #[allow(clippy::disallowed_methods)] // Test-local server task.
-        let handle = tokio::spawn(async move {
+        // The listener is bound above, before this task exists, so the OS is already queueing
+        // connections into its backlog and a client cannot arrive too early. An earlier version
+        // of this function polled for readiness by opening a throwaway connection; that loop was
+        // measured never to spin even once, and every server it built accepted one connection
+        // nobody ever spoke on. It is gone rather than left in as reassurance.
+        let handle = lore_base::lore_spawn!(async move {
             let _ = tonic::transport::Server::builder()
                 .add_service(LockServiceServer::new(lock_service))
                 .add_service(RevisionServiceServer::new(revision_service))
@@ -328,15 +342,6 @@ impl LockServer {
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await;
         });
-
-        // The client's first connect fails outright rather than retrying if the listener is not
-        // accepting yet, so wait for it here rather than making every caller carry a retry.
-        for _ in 0..200u32 {
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
 
         Self {
             addr,

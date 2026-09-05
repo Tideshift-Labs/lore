@@ -1746,13 +1746,16 @@ mod tests {
     // Accepted as a source-level fact, not tested: `push` (via `push_local`) still reaches
     // `push_journalled` with `None`, exactly as it did before `push_with_attempt_store` existed.
     // The claim is one literal at one call site (`push_local`'s `push_journalled(globals, args,
-    // callback, None)`, above in this file), and proving it by driving a real dispatch needs a
-    // live-connected `RepositoryContext`, a fixture that does not exist anywhere in this codebase
-    // (see `lore/docs/testing-guide.md`, which already priced building one as "a real feature
-    // addition to the test infrastructure, not a cheap extension" for a closer-to-the-metal case
-    // than this one). Getting this literal wrong costs an extra attempt record, not lost
-    // correctness -- the cheap direction of that failure -- so it does not earn a live tier.
+    // callback, None)`, above in this file). Getting it wrong costs an extra attempt record, not
+    // lost correctness -- the cheap direction of that failure -- so it does not earn a live tier.
     // Ruled by team-lead and the receipt-client-binding lane, 2026-09.
+    //
+    // The reason recorded here in that ruling -- that no live-connected `RepositoryContext`
+    // fixture existed anywhere in this codebase -- no longer holds. One exists now
+    // (`lore_revision::live_fixture`), and the sibling claim it was blocking, that
+    // `push_with_attempt_store` forwards the store it was given, is proven against it in
+    // `lore/tests/live_push_journal.rs`. This literal is still not worth a live test, but for the
+    // reason above rather than for want of a fixture.
 
     /// The same status shape `crate::call_delegation::reject_call` uses for every other
     /// pre-command rejection, so this refusal cannot be told apart from one of those by a
