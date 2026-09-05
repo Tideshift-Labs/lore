@@ -36,6 +36,37 @@ use crate::domain_receipt::DomainReceiptQuery;
 use crate::error::ProtocolError;
 use crate::outcome::AttemptId;
 
+/// Where an attempt stands.
+///
+/// Kept on the record rather than implied by the record's presence, because "gone" and "settled"
+/// have to be distinguishable. A store that deleted a record on resolution would make a resolved
+/// attempt read exactly like one that was never written, and a delayed transport callback or a
+/// stale UI event arriving afterwards would find no record and could offer a retry for a mutation
+/// that already applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttemptState {
+    /// Recorded, and nothing authoritative has settled it.
+    Unresolved,
+    /// An operator acknowledged an attempt nobody can settle.
+    ///
+    /// Correctness is still unresolved: this appears in [`AttemptStore::unresolved`] exactly as
+    /// [`Self::Unresolved`] does, keeps the repository's write latch, and carries the permanent
+    /// no-old-id-replay marker that has to be restored before the client admits any new write.
+    /// It is a distinct state only so a caller can restore that marker and show the audit trail.
+    AdjudicatedUnknown,
+    /// Authoritative evidence settled it. The record is retained as lineage.
+    Resolved(AttemptResolution),
+}
+
+impl AttemptState {
+    /// Whether this state still blocks new writes for the attempt's repository.
+    ///
+    /// `AdjudicatedUnknown` answers `true`, which is the whole reason it is not a resolution.
+    pub fn is_unresolved(&self) -> bool {
+        !matches!(self, Self::Resolved(_))
+    }
+}
+
 /// One dispatched-or-about-to-be-dispatched mutation.
 ///
 /// Written before the request leaves the client and read back after a restart, so every field
@@ -45,6 +76,8 @@ use crate::outcome::AttemptId;
 pub struct AttemptRecord {
     /// The identity this attempt was dispatched under. The store's primary key.
     pub attempt_id: AttemptId,
+    /// Where the attempt stands. A fresh record is [`AttemptState::Unresolved`].
+    pub state: AttemptState,
     /// The RPC, named as [`crate::outcome::GrpcRpc::wire_name`] names it, so a stored record can
     /// be read against the service definition without a translation table.
     pub operation: String,
@@ -71,6 +104,13 @@ pub struct AttemptRecord {
 /// owes the same care as any other credential store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LockOwnership {
+    /// The attempt that acquired this lock.
+    ///
+    /// Carried on the ownership rather than only on the acquiring call, because releasing the
+    /// lock needs it: a release whose answer is lost is reconciled through the receipt for the
+    /// *acquiring* attempt, and the releasing caller looks the ownership up by resource. Without
+    /// this field the lookup returns a token and loses the identity the receipt is filed under.
+    pub attempt_id: AttemptId,
     /// The branch the lock is scoped to.
     pub branch: Context,
     /// The locked resource.
@@ -111,16 +151,21 @@ pub trait AttemptStore: Send + Sync {
     /// failing or duplicating.
     async fn record(&self, record: &AttemptRecord) -> Result<(), ProtocolError>;
 
-    /// Read one attempt back.
+    /// Read one attempt back, whatever state it is in.
     ///
-    /// `None` means no such record, which after a restart means the attempt was never durably
-    /// recorded and so was never dispatched.
+    /// `None` means no such record ever existed, which after a restart means the attempt was
+    /// never durably recorded and so was never dispatched. A resolved attempt is *not* `None`:
+    /// it comes back carrying [`AttemptState::Resolved`]. That distinction is the point — a late
+    /// transport callback or a stale UI event that finds `None` may offer a fresh attempt, and it
+    /// must never be able to do that for a mutation that already applied.
     async fn lookup(&self, attempt: &AttemptId) -> Result<Option<AttemptRecord>, ProtocolError>;
 
-    /// Every attempt that has not been resolved, oldest first.
+    /// Every attempt still blocking writes, oldest first.
     ///
-    /// The boot-recovery read. An empty result is the only state in which a client may consider
-    /// itself to have no outstanding correctness work.
+    /// The boot-recovery read, and the only state in which a client may consider itself to have
+    /// no outstanding correctness work is an empty result. Includes
+    /// [`AttemptState::AdjudicatedUnknown`] records, whose no-old-id-replay marker and write latch
+    /// have to be restored before any new write is admitted.
     async fn unresolved(&self) -> Result<Vec<AttemptRecord>, ProtocolError>;
 
     /// Durably associate an ownership token with the resource it locks.
@@ -128,11 +173,7 @@ pub trait AttemptStore: Send + Sync {
     /// Separate from [`Self::record`] because the token arrives with the server's *response*,
     /// while the attempt record is written before the request. An acquire that returns a token
     /// the client then fails to store has produced a lock only an administrator can release.
-    async fn record_ownership(
-        &self,
-        attempt: &AttemptId,
-        ownership: &LockOwnership,
-    ) -> Result<(), ProtocolError>;
+    async fn record_ownership(&self, ownership: &LockOwnership) -> Result<(), ProtocolError>;
 
     /// The token held for one resource, if this client holds one.
     async fn ownership_for(
@@ -141,11 +182,16 @@ pub trait AttemptStore: Send + Sync {
         resource_hash: &Hash,
     ) -> Result<Option<LockOwnership>, ProtocolError>;
 
-    /// Mark an attempt resolved and release what it was holding.
+    /// Settle an attempt and release any lock ownership it held.
     ///
-    /// The only way a record leaves the store. There is no expiry and no eviction: an attempt
-    /// nobody has resolved is precisely the one that must not be forgotten, and a store that
-    /// aged records out would lose them in exactly the case they were written for.
+    /// Moves the record to [`AttemptState::Resolved`] and *keeps* it. Nothing removes a record:
+    /// there is no expiry, no eviction, and no delete. An unresolved attempt is precisely the one
+    /// that must not be forgotten, and a resolved one is the lineage that stops a late callback
+    /// or a restored snapshot from offering a retry for a mutation that already happened.
+    ///
+    /// Compaction of long-settled lineage is an implementation's own business, and any
+    /// implementation that does it owes the same argument this trait makes: that nothing which
+    /// could still resurrect a retry affordance is what got compacted.
     async fn resolve(
         &self,
         attempt: &AttemptId,
@@ -159,9 +205,13 @@ pub trait AttemptStore: Send + Sync {
 /// process. It is behind `test_seams` for the reason the feature exists — production must not be
 /// able to reach it by accident, because a durable-intent store that silently forgets is worse
 /// than none at all. A caller with no real store should fail to start, not quietly get this one.
+/// One more thing to know before reaching for it: a workspace-wide `--all-targets` build unifies
+/// this crate's features, so `test_seams` is on for `lore` and `loreserver` in that build and
+/// this type is nameable there. The gate keeps it out of a release artifact, not out of every
+/// compilation, so it is a guard against reaching for it by accident rather than a wall.
 #[cfg(any(test, feature = "test_seams"))]
 pub struct VolatileAttemptStore {
-    attempts: parking_lot::Mutex<Vec<AttemptRecord>>,
+    attempts: parking_lot::Mutex<std::collections::HashMap<uuid::Uuid, AttemptRecord>>,
     ownership: parking_lot::Mutex<Vec<LockOwnership>>,
 }
 
@@ -176,7 +226,7 @@ impl Default for VolatileAttemptStore {
 impl VolatileAttemptStore {
     pub fn new() -> Self {
         Self {
-            attempts: parking_lot::Mutex::new(Vec::new()),
+            attempts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             ownership: parking_lot::Mutex::new(Vec::new()),
         }
     }
@@ -186,37 +236,36 @@ impl VolatileAttemptStore {
 #[async_trait]
 impl AttemptStore for VolatileAttemptStore {
     async fn record(&self, record: &AttemptRecord) -> Result<(), ProtocolError> {
-        let mut attempts = self.attempts.lock();
-        match attempts
-            .iter_mut()
-            .find(|stored| stored.attempt_id.as_uuid() == record.attempt_id.as_uuid())
-        {
-            Some(stored) => *stored = record.clone(),
-            None => attempts.push(record.clone()),
-        }
+        self.attempts
+            .lock()
+            .insert(record.attempt_id.as_uuid(), record.clone());
         Ok(())
     }
 
     async fn lookup(&self, attempt: &AttemptId) -> Result<Option<AttemptRecord>, ProtocolError> {
-        Ok(self
-            .attempts
-            .lock()
-            .iter()
-            .find(|stored| stored.attempt_id.as_uuid() == attempt.as_uuid())
-            .cloned())
+        Ok(self.attempts.lock().get(&attempt.as_uuid()).cloned())
     }
 
     async fn unresolved(&self) -> Result<Vec<AttemptRecord>, ProtocolError> {
-        let mut attempts = self.attempts.lock().clone();
-        attempts.sort_by_key(|record| record.recorded_at_unix_millis);
+        let mut attempts: Vec<AttemptRecord> = self
+            .attempts
+            .lock()
+            .values()
+            .filter(|record| record.state.is_unresolved())
+            .cloned()
+            .collect();
+        // Tie-broken by the attempt id, which is a v7 and so itself mint-ordered. A client clock
+        // can repeat a millisecond or step backwards, and an order that changed between two reads
+        // of the same unchanged store would be a poor thing to show an operator.
+        attempts.sort_by(|left, right| {
+            left.recorded_at_unix_millis
+                .cmp(&right.recorded_at_unix_millis)
+                .then_with(|| left.attempt_id.as_uuid().cmp(&right.attempt_id.as_uuid()))
+        });
         Ok(attempts)
     }
 
-    async fn record_ownership(
-        &self,
-        _attempt: &AttemptId,
-        ownership: &LockOwnership,
-    ) -> Result<(), ProtocolError> {
+    async fn record_ownership(&self, ownership: &LockOwnership) -> Result<(), ProtocolError> {
         let mut held = self.ownership.lock();
         match held
             .iter_mut()
@@ -244,11 +293,14 @@ impl AttemptStore for VolatileAttemptStore {
     async fn resolve(
         &self,
         attempt: &AttemptId,
-        _resolution: AttemptResolution,
+        resolution: AttemptResolution,
     ) -> Result<(), ProtocolError> {
-        self.attempts
+        if let Some(stored) = self.attempts.lock().get_mut(&attempt.as_uuid()) {
+            stored.state = AttemptState::Resolved(resolution);
+        }
+        self.ownership
             .lock()
-            .retain(|stored| stored.attempt_id.as_uuid() != attempt.as_uuid());
+            .retain(|held| held.attempt_id.as_uuid() != attempt.as_uuid());
         Ok(())
     }
 }
