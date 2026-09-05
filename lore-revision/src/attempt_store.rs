@@ -24,8 +24,9 @@
 //! The 32 bytes CR-030 issues on acquire are the whole authority to release the lock they name.
 //! Three things follow, and all three are load-bearing rather than hygienic:
 //!
-//! * the file is created `0o600` on unix before anything is written into it, so the token is
-//!   never briefly world-readable;
+//! * on unix the file is created `0o600` before anything is written into it, so the token is
+//!   never briefly group- or world-readable, and it is created fresh rather than opened, so a
+//!   file left lying at that path cannot contribute its own looser mode;
 //! * nothing in this module logs a token, and [`lore_transport::OwnershipToken`]'s `Debug` is
 //!   redacted, so a token cannot reach a log through a formatted record either;
 //! * a file this module cannot parse is an **error**, never an empty store. Reading a damaged
@@ -38,7 +39,14 @@
 //! that cache's key lives in the OS secure store, outside the file, so a stolen file alone is
 //! useless. A key kept beside this file in the same working tree would be taken with it. Anyone
 //! who can read `.lore/` can already read the repository's whole contents and the anchor that
-//! says what it is, so the file mode is the boundary that actually holds here.
+//! says what it is, so the file mode is the boundary that actually holds.
+//!
+//! **That boundary holds on unix only.** Windows has no mode and nothing here sets an ACL, so the
+//! file inherits whatever the working tree's directory grants. On a non-system drive that
+//! commonly includes read for `BUILTIN\Users`, which means another local account can read a token
+//! and release a lock it does not hold. It is a real gap and it is stated rather than papered
+//! over: closing it needs an explicit DACL on `.lore/`, which is a decision about the whole
+//! directory rather than about this one file, and it is not this lane's to make.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -95,10 +103,11 @@ pub struct RepositoryAttemptStore {
     path: Option<PathBuf>,
     /// Serialises this process's own read-modify-write spans.
     ///
-    /// The `FSLock` below already serialises across processes, and would serialise these too. This
-    /// exists because an acquire dispatches its batches concurrently and each one records its own
-    /// tokens: without it, two tasks in one process would contend on a file lock that is not
-    /// reentrant, and the cost of finding out is a deadlock rather than a wait.
+    /// The `FSLock` below already serialises across processes, and would serialise these too, by
+    /// polling. This exists because an acquire dispatches its batches concurrently and each one
+    /// records its own tokens, so without it two tasks in one process would take turns through a
+    /// retry loop with a sleep in it — correct, but paying wall-clock time to discover a
+    /// contention this process can settle for free.
     write_guard: tokio::sync::Mutex<()>,
 }
 
@@ -241,7 +250,10 @@ impl RepositoryAttemptStore {
                 "Failed to replace the attempt store {}: {error}",
                 path.display()
             ))
-        })
+        })?;
+
+        sync_parent_directory(path);
+        Ok(())
     }
 
     /// One guarded load-modify-store span.
@@ -266,13 +278,30 @@ impl RepositoryAttemptStore {
 
 /// Create a file only this user can read, then write the whole body into it.
 ///
-/// The mode is set at creation on unix rather than afterwards: a `set_permissions` following the
+/// Two things here are load-bearing for a file that holds bearer tokens.
+///
+/// **`create_new`, after removing whatever was there.** The unix `mode` applies only when the
+/// open actually creates the file, so opening an existing path with `create(true)` would write
+/// tokens into a file that kept *its* mode — a stale temporary from an aborted write on an older
+/// build, an extracted archive, or a symlink someone left pointing elsewhere. Removing first and
+/// refusing to open anything that survives that makes the mode unconditional and takes the
+/// symlink-follow with it.
+///
+/// **The mode is set at creation rather than afterwards.** A `set_permissions` following the
 /// write leaves a window in which the token is readable by anyone who can reach the directory.
+///
+/// Neither applies on Windows, which has no mode; see this module's own note on what does and
+/// does not hold there.
+#[allow(clippy::disallowed_methods)]
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ProtocolError> {
     use std::io::Write;
 
+    // Not `?`: absence is the ordinary case and is not a failure. A path that cannot be removed
+    // fails the `create_new` below, with a message naming the real problem.
+    let _ = std::fs::remove_file(path);
+
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(true).write(true);
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -285,14 +314,44 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ProtocolError> {
             path.display()
         ))
     })?;
-    file.write_all(bytes)
+
+    // The temporary is removed on any failure. Leaving one behind is not merely untidy: it is a
+    // file holding whatever bytes did land, at whatever point the write stopped, sitting beside
+    // the store until something else happens to overwrite it.
+    let written = file
+        .write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|error| {
             ProtocolError::internal(format!(
                 "Failed to write the attempt store temporary {}: {error}",
                 path.display()
             ))
-        })
+        });
+    if written.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+    written
+}
+
+/// Flush the directory entry a rename just created.
+///
+/// `sync_all` on the temporary persists its *contents*; on several filesystems the rename that
+/// gives those contents their name is a separate metadata operation that a crash can still lose.
+/// The trait this implements promises a record survives a crash once the write returns, and
+/// without this that promise covers the bytes but not the name they are reachable under — which
+/// for this file reads back as an empty store, which reads as "no token for that lock".
+///
+/// A directory that cannot be opened or synced is not fatal. Some platforms do not permit either
+/// on a directory handle, and on those the rename is already durable or the guarantee was never
+/// available to ask for; failing the whole write there would refuse to store a token this client
+/// has already been issued, which is worse than the weaker guarantee.
+fn sync_parent_directory(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Ok(directory) = std::fs::File::open(parent)
+    {
+        let _ = directory.sync_all();
+    }
 }
 
 #[async_trait]
@@ -411,6 +470,30 @@ impl AttemptStore for RepositoryAttemptStore {
             document
                 .ownership
                 .retain(|held| !(held.branch == branch && held.resource == resource));
+        })
+        .await
+    }
+
+    /// One rewrite for the whole batch. The default's loop would take the file lock, rewrite the
+    /// document and fsync once per released resource, which on a branch-wide release is quadratic
+    /// in the number of locks held.
+    async fn clear_ownership_batch(
+        &self,
+        resources: &[(Context, Hash)],
+    ) -> Result<(), ProtocolError> {
+        if resources.is_empty() {
+            return Ok(());
+        }
+        let cleared = resources
+            .iter()
+            .map(|(branch, resource_hash)| (branch.to_string(), resource_hash.to_string()))
+            .collect::<Vec<_>>();
+        self.update(|document| {
+            document.ownership.retain(|held| {
+                !cleared
+                    .iter()
+                    .any(|(branch, resource)| held.branch == *branch && held.resource == *resource)
+            });
         })
         .await
     }

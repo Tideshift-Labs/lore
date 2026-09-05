@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use lore_macro::LoreArgs;
 use lore_revision::attempt_store::repository_attempt_store;

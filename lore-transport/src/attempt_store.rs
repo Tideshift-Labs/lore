@@ -325,6 +325,24 @@ pub trait AttemptStore: Send + Sync {
         resource_hash: &Hash,
     ) -> Result<(), ProtocolError>;
 
+    /// Forget the tokens for a batch of resources the server has confirmed released.
+    ///
+    /// Defaulted to a loop over [`Self::clear_ownership`], and overridden by any implementation
+    /// whose single clear rewrites a whole document: a release covering a branch confirms
+    /// hundreds of resources at once, and clearing them one at a time makes that quadratic.
+    ///
+    /// The batch carries [`Self::clear_ownership`]'s rule unchanged, per resource: name only what
+    /// the server confirmed. A release whose outcome is unknown belongs in no batch.
+    async fn clear_ownership_batch(
+        &self,
+        resources: &[(Context, Hash)],
+    ) -> Result<(), ProtocolError> {
+        for (branch, resource_hash) in resources {
+            self.clear_ownership(branch, resource_hash).await?;
+        }
+        Ok(())
+    }
+
     /// Settle an attempt and release any lock ownership it held.
     ///
     /// Moves the record to [`AttemptState::Resolved`] and *keeps* it. Nothing removes a record:

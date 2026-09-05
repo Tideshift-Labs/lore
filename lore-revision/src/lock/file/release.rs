@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -319,66 +320,56 @@ pub async fn release(
     }
 
     let mut unlocks = Vec::with_capacity(resources_count);
-    let mut released_any = false;
-    // Kept rather than discarded so a release that frees nothing reports why, instead of the
-    // generic failure the single-set version used to raise.
+    // The first wholesale failure of either set. The release fails on it even when the other set
+    // succeeded: the two are one user request split on an implementation detail — which rows this
+    // client happens to hold a token for — so reporting success because the other half worked
+    // would tell someone their locks are released when their own are not.
     let mut first_failure: Option<ReleaseError> = None;
 
-    if !held.is_empty() {
-        match unlock_batches(&remote, repository.id, &held).await {
-            Ok(mut released) => {
-                released_any = true;
-                unlocks.append(&mut released);
-            }
-            Err(error) => first_failure = Some(error),
-        }
+    if !held.is_empty()
+        && let Err(error) = unlock_batches(&remote, repository.id, &held, &mut unlocks).await
+    {
+        first_failure = Some(error);
     }
 
-    if !unheld.is_empty() {
-        match unlock_batches(&remote, repository.id, &unheld).await {
-            Ok(mut released) => {
-                released_any = true;
-                unlocks.append(&mut released);
-            }
-            // `Unlock` first, escalate second, and in that order deliberately. An unfenced cell
-            // releases these on the first call, so its behaviour is unchanged; a fenced cell
-            // refuses them before it mutates anything, which makes the retry safe. Escalating
-            // first would instead break every unfenced cell, because `ForceUnlock` does not
-            // exist there.
-            Err(unlock_error) => {
-                match force_release(
-                    &remote,
-                    repository.id,
-                    &unheld,
-                    &queried_owners,
-                    unlock_error,
-                )
-                .await
-                {
-                    Ok(mut released) => {
-                        released_any = true;
-                        unlocks.append(&mut released);
-                    }
-                    Err(error) => first_failure = first_failure.or(Some(error)),
-                }
-            }
-        }
+    if !unheld.is_empty()
+        // `Unlock` first, escalate second, and in that order deliberately. An unfenced cell
+        // releases these on the first call, so its behaviour is unchanged; a fenced cell refuses
+        // them before it mutates anything, which makes the retry safe. Escalating first would
+        // instead break every unfenced cell, because `ForceUnlock` does not exist there.
+        && let Err(unlock_error) =
+            unlock_batches(&remote, repository.id, &unheld, &mut unlocks).await
+        && let Err(error) = force_release(
+            &remote,
+            repository.id,
+            &unheld,
+            &queried_owners,
+            unlock_error,
+            &mut unlocks,
+        )
+        .await
+    {
+        first_failure = first_failure.or(Some(error));
     }
 
-    if !released_any {
-        return Err(
-            first_failure.unwrap_or_else(|| ReleaseError::internal("Failed to release the lock"))
-        );
-    }
-
+    // Clearing comes before the failure is raised, never after. Whatever the server confirmed is
+    // released whether or not something else in the same request failed, and a token kept for a
+    // lock that is gone will one day be presented against a row somebody else holds.
+    //
     // Only on a confirmed release, and only for what the server named. A release whose outcome is
     // unknown must leave the token exactly where it is: discarding it on a maybe strands a lock
     // that is still held with nothing left to release it.
-    for resource in unlocks.iter() {
-        ownership
-            .clear_ownership(&resource.branch, &resource.hash)
-            .await
-            .forward::<ReleaseError>("Failed to clear the released lock ownership")?;
+    let cleared = unlocks
+        .iter()
+        .map(|resource| (resource.branch, resource.hash))
+        .collect::<Vec<_>>();
+    ownership
+        .clear_ownership_batch(&cleared)
+        .await
+        .forward::<ReleaseError>("Failed to clear the released lock ownership")?;
+
+    if let Some(failure) = first_failure {
+        return Err(failure);
     }
 
     if unlocks.is_empty() {
@@ -419,7 +410,8 @@ async fn unlock_batches(
     remote: &Arc<Connection>,
     repository_id: crate::lore::RepositoryId,
     resources: &[FencedLockResource],
-) -> Result<Vec<LockResource>, ReleaseError> {
+    released: &mut Vec<LockResource>,
+) -> Result<(), ReleaseError> {
     let batch_iterator = resources.chunks(LOCK_BATCH_SIZE);
     let num_batches = batch_iterator.len();
 
@@ -453,7 +445,9 @@ async fn unlock_batches(
     }
     task_error?;
 
-    let mut released = Vec::with_capacity(resources.len());
+    // Appended as the results are read, so the caller keeps what a partly successful set released
+    // even when a later set fails. Those rows are gone on the server, and their tokens have to be
+    // cleared whatever else went wrong.
     let mut num_batch_success = 0;
     let mut num_batch_failed = 0;
     let mut first_failure: Option<ReleaseError> = None;
@@ -480,7 +474,7 @@ async fn unlock_batches(
         );
     }
 
-    Ok(released)
+    Ok(())
 }
 
 /// Escalate a refused release to the administrative takeover (CR-030, WP-120).
@@ -506,7 +500,8 @@ async fn force_release(
     resources: &[FencedLockResource],
     owners: &HashMap<lock::LockResource, String>,
     unlock_error: ReleaseError,
-) -> Result<Vec<LockResource>, ReleaseError> {
+    released: &mut Vec<LockResource>,
+) -> Result<(), ReleaseError> {
     // Grouped by owner because one `ForceUnlock` names exactly one. A rebuilt set spans several
     // when `--owner` was not given and the branch holds other people's locks.
     let mut by_owner: HashMap<&str, Vec<LockResource>> = HashMap::new();
@@ -525,7 +520,10 @@ async fn force_release(
         resources.len()
     );
 
-    let mut released = Vec::with_capacity(resources.len());
+    // Each batch appends into the caller's accumulator as it lands, so a takeover that clears
+    // three hundred rows and then fails on the fourth batch still tells the caller which three
+    // hundred are gone. Collecting locally and returning them only on success would drop that, and
+    // their tokens would stay in the store naming rows nobody holds any more.
     for (owner, owned) in by_owner {
         for batch in owned.chunks(LOCK_BATCH_SIZE) {
             let connection = match remote.lock(repository_id).await {
@@ -539,5 +537,5 @@ async fn force_release(
         }
     }
 
-    Ok(released)
+    Ok(())
 }

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -405,9 +406,15 @@ async fn record_batch_ownership(
             continue;
         };
         // Minted here rather than read from the dispatch, which does not surface the identity it
-        // stamped on the request. PIN(WP-120, 2026-09-05): the reconciler lane that reads a
-        // receipt back under a client-minted attempt id has to join these two, either by
-        // returning the transport's id or by passing one in.
+        // stamped on the request.
+        //
+        // PIN(WP-120, 2026-09-05): so this id matches **no** server receipt today. It is not a
+        // stale join waiting to be tightened — it is a local identity that no `Unlock` or
+        // `Lock` receipt is filed under, and a reconciler reading it as a receipt key would find
+        // nothing and could read that absence as "the acquire did not happen". Whoever wires the
+        // reconciler must either have the transport return the id it stamped, or scope an id
+        // around the dispatch here and record that one; until then nothing may treat this field
+        // as a receipt key. It identifies which local acquire took the lock, and no more.
         let record = LockOwnership {
             attempt_id: AttemptId::new(),
             branch: acquired.lock.resource.branch,
