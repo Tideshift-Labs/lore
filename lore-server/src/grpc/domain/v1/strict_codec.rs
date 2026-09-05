@@ -362,13 +362,17 @@ pub(super) struct ValidatedReceiptGet {
     pub(super) consumed_ticket_sha256: Vec<u8>,
 }
 
+/// The refusal [`exact_len`] raises, separated so a caller that checks a width by converting to a
+/// fixed-width array can produce the identical message rather than a near-miss of its own.
+fn exact_len_status(field: &'static str, expected: usize) -> Status {
+    Status::invalid_argument(format!("{field} must be exactly {expected} bytes"))
+}
+
 fn exact_len(field: &'static str, bytes: &[u8], expected: usize) -> Result<(), Status> {
     if bytes.len() == expected {
         return Ok(());
     }
-    Err(Status::invalid_argument(format!(
-        "{field} must be exactly {expected} bytes"
-    )))
+    Err(exact_len_status(field, expected))
 }
 
 fn bounded_nonempty(field: &'static str, bytes: &[u8], maximum: usize) -> Result<(), Status> {
@@ -486,9 +490,17 @@ pub(super) fn validate_prepare(
 pub(super) fn validate_attempt_receipt_get(
     request: &DomainOperationAttemptReceiptGetRequest,
 ) -> Result<Uuid, Status> {
-    exact_len("client_attempt_id", &request.client_attempt_id, UUID_LEN)?;
-    let attempt = Uuid::from_slice(&request.client_attempt_id)
-        .map_err(|_| Status::invalid_argument("client_attempt_id is not a UUID"))?;
+    // One check, not two. Going through a fixed-width array rather than `exact_len` followed by
+    // `Uuid::from_slice` is what keeps that true: `from_slice` fails only on a length it has
+    // already been given, so the pair leaves a second error arm no input can reach. A validator
+    // with an unreachable refusal in it is worse than it looks: the next reader has to work out
+    // whether it guards something, and a test written for it can only ever pass vacuously.
+    let bytes: [u8; UUID_LEN] = request
+        .client_attempt_id
+        .as_ref()
+        .try_into()
+        .map_err(|_| exact_len_status("client_attempt_id", UUID_LEN))?;
+    let attempt = Uuid::from_bytes(bytes);
     if attempt.get_version_num() != 7 {
         return Err(Status::invalid_argument(
             "client_attempt_id must be a UUIDv7",
