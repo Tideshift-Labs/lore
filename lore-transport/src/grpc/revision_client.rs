@@ -60,7 +60,7 @@ impl RevisionService {
         stack: &[BranchPoint],
     ) -> Result<Hash, ProtocolError> {
         lore_debug!("Creating remote branch {name} ({branch}) with stack {stack:?}");
-        let _ = RequestScopedCounter::new(self.request_inflight.clone());
+        let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let response = loop {
@@ -92,7 +92,7 @@ impl RevisionService {
 
     pub async fn branch_delete(&self, branch: BranchId) -> Result<(), ProtocolError> {
         lore_debug!("Deleting remote branch {}", branch);
-        let _ = RequestScopedCounter::new(self.request_inflight.clone());
+        let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let _response = loop {
@@ -115,7 +115,7 @@ impl RevisionService {
 
     pub async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
         lore_debug!("List branches");
-        let _ = RequestScopedCounter::new(self.request_inflight.clone());
+        let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let list = loop {
@@ -170,7 +170,7 @@ impl RevisionService {
             name,
             self.repository
         );
-        let _ = RequestScopedCounter::new(self.request_inflight.clone());
+        let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let branch_record = loop {
@@ -229,7 +229,7 @@ impl RevisionService {
         fast_forward_merge: bool,
     ) -> Result<BranchPushResponse, ProtocolError> {
         lore_debug!("Pushing branch: {} at {}", branch, revision);
-        let _ = RequestScopedCounter::new(self.request_inflight.clone());
+        let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let response = loop {
@@ -320,7 +320,7 @@ impl RevisionService {
 
     pub async fn branch_metadata_get(&self, branch: BranchId) -> Result<Hash, ProtocolError> {
         lore_debug!("Getting branch metadata for {}", branch);
-        let _ = RequestScopedCounter::new(self.request_inflight.clone());
+        let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let response = loop {
@@ -348,7 +348,7 @@ impl RevisionService {
         new: Hash,
     ) -> Result<MetadataSetResult, ProtocolError> {
         lore_debug!("Setting branch metadata for {}", branch);
-        let _ = RequestScopedCounter::new(self.request_inflight.clone());
+        let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let response = loop {

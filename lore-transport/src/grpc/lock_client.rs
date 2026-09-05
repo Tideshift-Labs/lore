@@ -50,7 +50,7 @@ impl LockService {
     ) -> Result<Vec<LockData>, ProtocolError> {
         lore_debug!("Locking resources");
 
-        let _ = RequestScopedCounter::new(self.request_inflight.clone());
+        let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let locks = loop {
@@ -93,7 +93,7 @@ impl LockService {
     ) -> Result<Vec<LockData>, ProtocolError> {
         lore_debug!("Querying resources");
 
-        let _ = RequestScopedCounter::new(self.request_inflight.clone());
+        let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let locks = loop {
@@ -118,7 +118,7 @@ impl LockService {
     pub async fn status(&self, resources: &[LockResource]) -> Result<Vec<LockData>, ProtocolError> {
         lore_debug!("Fetching resource lock status");
 
-        let _ = RequestScopedCounter::new(self.request_inflight.clone());
+        let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let locks = loop {
@@ -145,7 +145,7 @@ impl LockService {
     ) -> Result<Vec<LockResource>, ProtocolError> {
         lore_debug!("Releasing resources");
 
-        let _ = RequestScopedCounter::new(self.request_inflight.clone());
+        let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let resources = loop {

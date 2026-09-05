@@ -40,7 +40,7 @@ impl AdminService {
 
         let mut retry = grpc_retry();
         let _response = loop {
-            let _ = RequestScopedCounter::new(self.request_inflight.clone());
+            let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
             let request = ObliterateRequest {
                 address: Some(address.into()),
