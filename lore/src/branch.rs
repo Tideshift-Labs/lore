@@ -910,7 +910,10 @@ async fn push_impl(
     // Push is never local
     repository.set_disable_upload(false);
 
-    lore_revision::branch::push::push(repository, token, options).await
+    // `None`: the CLI keeps no attempt journal, so the transport mints its own id per dispatch
+    // exactly as it did before. An embedder that does keep one calls this path with its own
+    // store, which is what makes the id it recorded the id the server files a receipt under.
+    lore_revision::branch::push::push(repository, token, options, None).await
 }
 
 #[repr(C)]
