@@ -21,6 +21,7 @@
 
 use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::fragments::schema as fragment_schema;
+use lore_postgres::domain::locks::schema as lock_schema;
 use lore_postgres::pool::TlsConfig;
 use lore_postgres::store::lock_store::PostgresLockStore;
 
@@ -565,4 +566,93 @@ fn the_compared_epoch_columns_are_not_null_and_disposition_stays_closed() {
              is a total predicate only while the vocabulary is closed.\nActual: {line}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// SCHEMA-117 amendment (RULING B) offline pins.
+//
+// `lore_locks` is extended by `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+// rather than one inline `CREATE TABLE` body, so the fragment schema's
+// `create_table_body`/`column_declaration` helpers above (built for a single
+// contiguous `CREATE TABLE`) don't apply here; these pins match by substring
+// instead, which is adequate for a constraint/column *name* fact rather than
+// a full column-shape fact.
+//
+// These run in the DEFAULT tier -- no `#[ignore]`, no database -- mirroring
+// `domain/fragments/schema.rs`'s `seed_schema_version_matches_the_constant`
+// for a schema module that (being fork-local `lore-postgres`, not
+// upstream) cannot host its own `#[cfg(test)]` pin without editing `src/`.
+
+/// Pull the aliased `schema_version` literal out of one DDL body. Mirrors
+/// `fragment_schema`'s own private helper of the same name exactly.
+fn seeded_schema_version(ddl: &str, source: &str) -> i64 {
+    let line = ddl
+        .lines()
+        .find(|line| line.contains("AS schema_version"))
+        .unwrap_or_else(|| {
+            panic!("{source} must alias its schema_version literal so this test can find it")
+        });
+    line.split_whitespace()
+        .next()
+        .and_then(|token| token.parse().ok())
+        .unwrap_or_else(|| {
+            panic!("{source}'s aliased schema_version column must lead with an integer literal")
+        })
+}
+
+/// RULING B: `LOCK_SCHEMA`'s seed literal must equal `LOCK_SCHEMA_VERSION`.
+/// `bootstrap()` upgrades an existing row to the constant; the seed for a
+/// brand-new database is a raw SQL literal that cannot reference it, so
+/// nothing else would notice a version bump applied to one and not the other.
+#[test]
+fn lock_schema_seed_matches_the_lock_schema_version_constant() {
+    let literal = seeded_schema_version(lock_schema::LOCK_SCHEMA, "the LOCK_SCHEMA seed");
+    assert_eq!(
+        literal,
+        lock_schema::LOCK_SCHEMA_VERSION,
+        "LOCK_SCHEMA's seed writes schema_version {literal} but bootstrap() upgrades to \
+         LOCK_SCHEMA_VERSION = {}; bump both or neither",
+        lock_schema::LOCK_SCHEMA_VERSION
+    );
+}
+
+/// RULING B: `migrations/0001_init.sql` carries the same constraint name and
+/// column as the runtime `LOCK_SCHEMA`, and no longer declares the superseded
+/// v1 constraint alongside it.
+#[test]
+fn migrations_0001_carries_the_v2_fenced_shape_constraint_and_never_issued_column() {
+    assert!(
+        MIGRATIONS_0001.contains("token_never_issued"),
+        "migrations/0001_init.sql must declare the token_never_issued column, mirroring LOCK_SCHEMA"
+    );
+    assert!(
+        MIGRATIONS_0001.contains("lore_locks_fenced_shape_v2"),
+        "migrations/0001_init.sql must carry the lore_locks_fenced_shape_v2 constraint name, \
+         mirroring LOCK_SCHEMA"
+    );
+    assert!(
+        !MIGRATIONS_0001.contains("CONSTRAINT lore_locks_fenced_shape CHECK"),
+        "migrations/0001_init.sql must not keep declaring the superseded v1 constraint \
+         (lore_locks_fenced_shape) alongside its v2 replacement"
+    );
+}
+
+/// The runtime side of the same fact: `LOCK_SCHEMA` itself must declare both,
+/// so a change made only to the migration file (or only to the runtime
+/// constant) is caught here rather than by the live parity gate alone.
+#[test]
+fn lock_schema_carries_the_v2_fenced_shape_constraint_and_never_issued_column() {
+    assert!(
+        lock_schema::LOCK_SCHEMA.contains("token_never_issued"),
+        "LOCK_SCHEMA must declare the token_never_issued column"
+    );
+    assert!(
+        lock_schema::LOCK_SCHEMA.contains("lore_locks_fenced_shape_v2"),
+        "LOCK_SCHEMA must carry the lore_locks_fenced_shape_v2 constraint name"
+    );
+    assert!(
+        !lock_schema::LOCK_SCHEMA.contains("CONSTRAINT lore_locks_fenced_shape CHECK"),
+        "LOCK_SCHEMA must not keep declaring the superseded v1 constraint \
+         (lore_locks_fenced_shape) alongside its v2 replacement"
+    );
 }

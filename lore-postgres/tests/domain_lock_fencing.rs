@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use lore_base::types::LockResource;
 use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
@@ -32,6 +33,7 @@ use lore_postgres::domain::locks::acquire_or_renew_binding;
 use lore_postgres::domain::locks::force_release_binding;
 use lore_postgres::domain::locks::lock_tenant_scope_key;
 use lore_postgres::domain::locks::release_binding;
+use lore_postgres::domain::locks::schema as lock_schema;
 use lore_postgres::domain::outbox::version::AggregateVersion;
 use lore_postgres::domain::receipts::MARKER_SAFETY_EPSILON;
 use lore_postgres::domain::receipts::NORMAL_FUTURE_SKEW;
@@ -45,6 +47,8 @@ use lore_postgres::domain::receipts::UUID_TIME_OUT_OF_RANGE_V1;
 use lore_postgres::domain::schema::FUTURE_REJECT_QUOTA_HOURLY_MAX;
 use lore_postgres::domain::schema::FUTURE_REJECT_QUOTA_RETAINED_MAX;
 use lore_postgres::pool::TlsConfig;
+use lore_postgres::store::lock_store::PostgresLockStore;
+use lore_revision::lock::LockStore;
 use tokio_postgres::Client;
 use uuid::NoContext;
 use uuid::Timestamp;
@@ -387,7 +391,9 @@ async fn a_fresh_acquire_commits_exactly_one_lock_acquired_row_with_the_fence_an
         "ordinal must be the fence read back from the committed lock row, not a caller value"
     );
     assert_eq!(
-        decoded.identity, lock.ownership_token,
+        decoded.identity,
+        lock.ownership_token
+            .expect("a fresh acquire always issues a real token"),
         "identity must be the owner token minted inside the transaction"
     );
 }
@@ -419,7 +425,7 @@ async fn a_same_owner_renewal_commits_exactly_one_lock_renewed_row_with_the_new_
         &repository_id,
         &branch_id,
         lock_owner.clone(),
-        vec![resource(hash, Some(held.ownership_token))],
+        vec![resource(hash, held.ownership_token)],
         None,
     );
     input.outbox_cell_id = Some(cell_id.clone());
@@ -453,7 +459,12 @@ async fn a_same_owner_renewal_commits_exactly_one_lock_renewed_row_with_the_new_
         decoded.ordinal,
         u64::try_from(renewed.fence).expect("fence fits u64")
     );
-    assert_eq!(decoded.identity, renewed.ownership_token);
+    assert_eq!(
+        decoded.identity,
+        renewed
+            .ownership_token
+            .expect("a renewal always issues a real token")
+    );
 }
 
 #[tokio::test]
@@ -527,7 +538,12 @@ async fn an_expiry_takeover_by_a_different_owner_commits_exactly_one_lock_taken_
         u64::try_from(successor.fence).expect("fence fits u64"),
         "ordinal must be the successor's committed fence, not the predecessor's"
     );
-    assert_eq!(decoded.identity, successor.ownership_token);
+    assert_eq!(
+        decoded.identity,
+        successor
+            .ownership_token
+            .expect("a takeover always issues a real token")
+    );
 }
 
 #[tokio::test]
@@ -551,7 +567,7 @@ async fn owner_release_and_admin_force_release_each_commit_their_pinned_kind() {
         repository_id: repository_id.to_vec(),
         branch_id: branch_id.to_vec(),
         owner: lock_owner.clone(),
-        resources: vec![resource(hash, Some(held.ownership_token))],
+        resources: vec![resource(hash, held.ownership_token)],
         outbox_cell_id: Some(cell_id.clone()),
     };
     let release_op = prepare_bound_operation(
@@ -575,7 +591,11 @@ async fn owner_release_and_admin_force_release_each_commit_their_pinned_kind() {
     assert_eq!(row.event_kind, "lock.released");
     assert_eq!(row.cell_id, cell_id);
     let decoded = AggregateVersion::decode(&row.aggregate_version).expect("decode");
-    assert_eq!(decoded.identity, held.ownership_token);
+    assert_eq!(
+        decoded.identity,
+        held.ownership_token
+            .expect("a normal acquire always issues a real token")
+    );
 
     // -- dark administrative force release, a fresh repository/lock --
     let (repository_id, branch_id) = create_repository(&store).await;
@@ -590,7 +610,7 @@ async fn owner_release_and_admin_force_release_each_commit_their_pinned_kind() {
         branch_id: branch_id.to_vec(),
         target_owner: target,
         acting_owner: admin.clone(),
-        resources: vec![resource(hash, Some(held.ownership_token))],
+        resources: vec![resource(hash, held.ownership_token)],
         outbox_cell_id: Some(force_cell_id.clone()),
     };
     let force_op = prepare_bound_operation(
@@ -614,7 +634,11 @@ async fn owner_release_and_admin_force_release_each_commit_their_pinned_kind() {
     assert_eq!(row.event_kind, "lock.force_released");
     assert_eq!(row.cell_id, force_cell_id);
     let decoded = AggregateVersion::decode(&row.aggregate_version).expect("decode");
-    assert_eq!(decoded.identity, held.ownership_token);
+    assert_eq!(
+        decoded.identity,
+        held.ownership_token
+            .expect("a normal acquire always issues a real token")
+    );
 }
 
 /// CR-032 classifies "Expired-row cleanup that changes no logical ownership"
@@ -989,8 +1013,8 @@ async fn a_mixed_batch_of_the_callers_own_current_and_stale_generation_rows_is_a
         &branch_id,
         lock_owner.clone(),
         vec![
-            resource(stays_current_hash, Some(stays_current.ownership_token)),
-            resource(goes_stale_hash, Some(goes_stale.ownership_token)),
+            resource(stays_current_hash, stays_current.ownership_token),
+            resource(goes_stale_hash, goes_stale.ownership_token),
         ],
         None,
     );
@@ -1087,7 +1111,12 @@ async fn a_stale_generation_row_held_by_a_different_owner_is_a_takeover() {
         "a foreign row made non-current by a generation bump is a takeover, not an acquire"
     );
     let decoded = AggregateVersion::decode(&row.aggregate_version).expect("decode");
-    assert_eq!(decoded.identity, successor.ownership_token);
+    assert_eq!(
+        decoded.identity,
+        successor
+            .ownership_token
+            .expect("a takeover always issues a real token")
+    );
 }
 
 #[tokio::test]
@@ -1278,7 +1307,7 @@ async fn same_subject_under_different_issuers_is_foreign_for_every_owner_operati
         &repository_id,
         &branch_id,
         owner_b.clone(),
-        vec![resource(hash, Some(held.ownership_token))],
+        vec![resource(hash, held.ownership_token)],
         None,
     );
     let renew_op = prepare_bound_operation(
@@ -1299,7 +1328,7 @@ async fn same_subject_under_different_issuers_is_foreign_for_every_owner_operati
         repository_id: repository_id.to_vec(),
         branch_id: branch_id.to_vec(),
         owner: owner_b.clone(),
-        resources: vec![resource(hash, Some(held.ownership_token))],
+        resources: vec![resource(hash, held.ownership_token)],
         outbox_cell_id: None,
     };
     let release_op = prepare_bound_operation(
@@ -1567,7 +1596,7 @@ async fn stale_release_renew_force_and_cleanup_cannot_touch_a_successor() {
         repository_id: repository_id.to_vec(),
         branch_id: branch_id.to_vec(),
         owner: owner_a.clone(),
-        resources: vec![resource(hash, Some(predecessor.ownership_token))],
+        resources: vec![resource(hash, predecessor.ownership_token)],
         outbox_cell_id: None,
     };
     let stale_release_op = prepare_bound_operation(
@@ -1588,7 +1617,7 @@ async fn stale_release_renew_force_and_cleanup_cannot_touch_a_successor() {
         &repository_id,
         &branch_id,
         owner_a.clone(),
-        vec![resource(hash, Some(predecessor.ownership_token))],
+        vec![resource(hash, predecessor.ownership_token)],
         Some(Duration::from_secs(2)),
     );
     let stale_renew_op = prepare_bound_operation(
@@ -1610,7 +1639,7 @@ async fn stale_release_renew_force_and_cleanup_cannot_touch_a_successor() {
         branch_id: branch_id.to_vec(),
         target_owner: owner_a,
         acting_owner: admin.clone(),
-        resources: vec![resource(hash, Some(predecessor.ownership_token))],
+        resources: vec![resource(hash, predecessor.ownership_token)],
         outbox_cell_id: None,
     };
     let stale_force_op = prepare_bound_operation(
@@ -1990,7 +2019,7 @@ async fn missing_and_repeated_release_are_not_found_and_empty_list_is_ok() {
         repository_id: repository_id.to_vec(),
         branch_id: branch_id.to_vec(),
         owner: lock_owner.clone(),
-        resources: vec![resource(hash, Some(held.ownership_token))],
+        resources: vec![resource(hash, held.ownership_token)],
         outbox_cell_id: None,
     };
     let release_op = prepare_bound_operation(
@@ -2010,7 +2039,7 @@ async fn missing_and_repeated_release_are_not_found_and_empty_list_is_ok() {
         repository_id: repository_id.to_vec(),
         branch_id: branch_id.to_vec(),
         owner: lock_owner.clone(),
-        resources: vec![resource(hash, Some(held.ownership_token))],
+        resources: vec![resource(hash, held.ownership_token)],
         outbox_cell_id: None,
     };
     let repeat_op = prepare_bound_operation(
@@ -2626,4 +2655,867 @@ async fn push_witness_capture_and_transaction_local_revalidation_detect_change()
     .await
     .expect("matching witness");
     tx.rollback().await.expect("rollback matching final push");
+}
+
+// ---------------------------------------------------------------------------
+// SCHEMA-117 amendment (RULING B): a cutover-converted legacy row can record
+// that its ownership token was never issued, rather than `backfill` minting
+// and discarding a random token nobody holds
+// (`schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE`'s own doc comment names this
+// residual as BLOCKED(WP-120)). `FencedLock.ownership_token` is now
+// `Option<[u8; 32]>`; every existing case above that reads it through a
+// normal acquire/renew/takeover keeps `.expect("... always issues a real
+// token")` at the read site, since only a backfill-converted row can ever be
+// `None`.
+// ---------------------------------------------------------------------------
+
+/// Read `lore_locks`' authoritative token-shape columns directly, independent
+/// of any Rust-side projection.
+async fn stored_token_shape(
+    direct: &Client,
+    repository_id: &[u8; 16],
+    branch_id: &[u8; 16],
+    hash: &[u8; 32],
+) -> (Option<Vec<u8>>, bool) {
+    let row = direct
+        .query_one(
+            "SELECT ownership_token, token_never_issued FROM lore_locks \
+              WHERE repository=$1 AND branch=$2 AND hash=$3",
+            &[
+                &repository_id.as_slice(),
+                &branch_id.as_slice(),
+                &hash.as_slice(),
+            ],
+        )
+        .await
+        .expect("read stored token shape");
+    (row.get(0), row.get(1))
+}
+
+/// Convert one legacy row through a real backfill pass and return its
+/// verified owner, ready for the release/acquire/force-release cases below.
+async fn backfill_one_never_issued_row(
+    store: &PostgresDomainStore,
+    direct: &Client,
+    repository_id: &[u8; 16],
+    branch_id: &[u8; 16],
+    hash: &[u8; 32],
+    subject: &str,
+) -> VerifiedLockOwner {
+    insert_legacy_lock(direct, repository_id, branch_id, hash, subject).await;
+    let mapping = BTreeMap::from([(subject.to_owned(), "https://issuer.example".to_owned())]);
+    let report = store
+        .lock_coordinator()
+        .backfill(&mapping)
+        .await
+        .expect("backfill the never-issued row");
+    assert_eq!(report.converted, 1);
+    owner("https://issuer.example", subject)
+}
+
+/// RULING B item 1: `backfill` over a live legacy row must write
+/// `ownership_token IS NULL AND token_never_issued = true`, not mint and
+/// discard a random value nobody holds. Asserted against the database row
+/// itself, not just `BackfillReport.converted`.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn backfill_converts_a_legacy_row_to_a_never_issued_token() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let direct = client(&url).await;
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let hash: [u8; 32] = rand::random();
+
+    backfill_one_never_issued_row(
+        &store,
+        &direct,
+        &repository_id,
+        &branch_id,
+        &hash,
+        "wp121-backfill-owner",
+    )
+    .await;
+
+    let (token, never_issued) =
+        stored_token_shape(&direct, &repository_id, &branch_id, &hash).await;
+    assert!(
+        token.is_none(),
+        "backfill must leave the ownership token NULL, not a minted-then-discarded value"
+    );
+    assert!(
+        never_issued,
+        "backfill must record that this row's token was never issued"
+    );
+}
+
+/// RULING B item 2: the `lore_locks_fenced_shape_v2` CHECK is real. Its fenced
+/// arm admits exactly two token shapes, and its legacy (all-NULL) arm
+/// additionally requires `token_never_issued = false`; a direct write outside
+/// any of those three admitted shapes must be rejected by the constraint
+/// itself.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn fenced_shape_v2_check_rejects_every_invalid_token_shape() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let _store = store(&url).await;
+    let direct = client(&url).await;
+    let repository_id: [u8; 16] = rand::random();
+    let branch_id: [u8; 16] = rand::random();
+
+    let constraint_violation = |error: &tokio_postgres::Error| -> bool {
+        error
+            .as_db_error()
+            .is_some_and(|db| db.constraint() == Some("lore_locks_fenced_shape_v2"))
+    };
+
+    // token_never_issued = true with a real 32-byte token: rejected.
+    let hash_a: [u8; 32] = rand::random();
+    insert_legacy_lock(&direct, &repository_id, &branch_id, &hash_a, "shape-a").await;
+    let token: [u8; 32] = rand::random();
+    let error = direct
+        .execute(
+            "UPDATE lore_locks SET \
+                 repository_lock_generation=1, branch_lock_generation=1, \
+                 owner_issuer='https://issuer.example', owner_subject='shape-a', \
+                 ownership_token=$4, fence=1, acquired_at=clock_timestamp(), \
+                 renewed_at=clock_timestamp(), token_never_issued=true \
+              WHERE repository=$1 AND branch=$2 AND hash=$3",
+            &[
+                &repository_id.as_slice(),
+                &branch_id.as_slice(),
+                &hash_a.as_slice(),
+                &token.as_slice(),
+            ],
+        )
+        .await
+        .expect_err("never_issued=true with a real token must violate the CHECK");
+    assert!(
+        constraint_violation(&error),
+        "expected lore_locks_fenced_shape_v2 violation, got {error}"
+    );
+
+    // token_never_issued = false with a NULL token: rejected.
+    let hash_b: [u8; 32] = rand::random();
+    insert_legacy_lock(&direct, &repository_id, &branch_id, &hash_b, "shape-b").await;
+    let error = direct
+        .execute(
+            "UPDATE lore_locks SET \
+                 repository_lock_generation=1, branch_lock_generation=1, \
+                 owner_issuer='https://issuer.example', owner_subject='shape-b', \
+                 ownership_token=NULL, fence=1, acquired_at=clock_timestamp(), \
+                 renewed_at=clock_timestamp(), token_never_issued=false \
+              WHERE repository=$1 AND branch=$2 AND hash=$3",
+            &[
+                &repository_id.as_slice(),
+                &branch_id.as_slice(),
+                &hash_b.as_slice(),
+            ],
+        )
+        .await
+        .expect_err("never_issued=false with no token must violate the CHECK");
+    assert!(
+        constraint_violation(&error),
+        "expected lore_locks_fenced_shape_v2 violation, got {error}"
+    );
+
+    // A legacy (all-fenced-columns-NULL) row claiming token_never_issued =
+    // true: rejected too -- the legacy arm requires it stay false.
+    let hash_c: [u8; 32] = rand::random();
+    insert_legacy_lock(&direct, &repository_id, &branch_id, &hash_c, "shape-c").await;
+    let error = direct
+        .execute(
+            "UPDATE lore_locks SET token_never_issued=true \
+              WHERE repository=$1 AND branch=$2 AND hash=$3",
+            &[
+                &repository_id.as_slice(),
+                &branch_id.as_slice(),
+                &hash_c.as_slice(),
+            ],
+        )
+        .await
+        .expect_err("a legacy row cannot claim token_never_issued on its own");
+    assert!(
+        constraint_violation(&error),
+        "expected lore_locks_fenced_shape_v2 violation, got {error}"
+    );
+
+    // SOURCE FOLLOW-UP: `fence`, `repository_lock_generation`, and
+    // `branch_lock_generation` have the exact same three-valued-logic hole
+    // the token width check had -- `NULL >= 1` is NULL, not false, and a
+    // CHECK constraint admits NULL. An otherwise-fully-fenced row (real
+    // token, real owner, real timestamps) with any ONE of these three left
+    // NULL must still be rejected.
+    for (label, column) in [
+        ("fence", "fence"),
+        ("repository_lock_generation", "repository_lock_generation"),
+        ("branch_lock_generation", "branch_lock_generation"),
+    ] {
+        let hash: [u8; 32] = rand::random();
+        let subject = format!("shape-null-{label}");
+        insert_legacy_lock(&direct, &repository_id, &branch_id, &hash, &subject).await;
+        let token: [u8; 32] = rand::random();
+        let set_generations_and_fence = [
+            "repository_lock_generation",
+            "branch_lock_generation",
+            "fence",
+        ]
+        .iter()
+        .filter(|candidate| **candidate != column)
+        .map(|candidate| format!("{candidate}=1"))
+        .collect::<Vec<_>>()
+        .join(", ");
+        let sql = format!(
+            "UPDATE lore_locks SET \
+                 {set_generations_and_fence}, \
+                 owner_issuer='https://issuer.example', owner_subject=$4, \
+                 ownership_token=$5, acquired_at=clock_timestamp(), \
+                 renewed_at=clock_timestamp(), token_never_issued=false \
+              WHERE repository=$1 AND branch=$2 AND hash=$3"
+        );
+        let error = direct
+            .execute(
+                sql.as_str(),
+                &[
+                    &repository_id.as_slice(),
+                    &branch_id.as_slice(),
+                    &hash.as_slice(),
+                    &subject.as_str(),
+                    &token.as_slice(),
+                ],
+            )
+            .await
+            .expect_err(&format!(
+                "an otherwise-fenced row with NULL {column} must violate the CHECK"
+            ));
+        assert!(
+            constraint_violation(&error),
+            "expected lore_locks_fenced_shape_v2 violation for NULL {column}, got {error}"
+        );
+    }
+}
+
+/// RULING B item 3: a never-issued row refuses `release` from its own owner,
+/// both tokenless and with a 32-byte token guess -- but the two refusals are
+/// different shapes, not both `AuthorityMismatch`. A tokenless,
+/// non-administrative release is refused `InvalidInput` by a precondition in
+/// `release_inner` that runs before any row is read at all (unchanged,
+/// correct behaviour for every release, never-issued or not: it is malformed
+/// input, not an authority mismatch). Only a TOKEN-BEARING release reaches
+/// the row, and there it is refused `AuthorityMismatch` because no token can
+/// ever match a never-issued row's stored `NULL`. The row survives either
+/// way.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn a_never_issued_row_refuses_release_from_its_own_owner_with_or_without_a_token() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.lock_coordinator();
+    let direct = client(&url).await;
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let hash: [u8; 32] = rand::random();
+    let lock_owner = backfill_one_never_issued_row(
+        &store,
+        &direct,
+        &repository_id,
+        &branch_id,
+        &hash,
+        "wp121-release-owner",
+    )
+    .await;
+
+    let tokenless_input = ReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        owner: lock_owner.clone(),
+        resources: vec![resource(hash, None)],
+        outbox_cell_id: None,
+    };
+    let tokenless_op = prepare_bound_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        release_binding(&tokenless_input).expect("tokenless release binding"),
+    )
+    .await;
+    // Not a rejection at all: `release_inner` refuses a tokenless,
+    // non-administrative release before it ever reads a row, for every
+    // release -- never-issued or not. This is the general "malformed input"
+    // precondition, unrelated to RULING B.
+    let tokenless_error = coordinator
+        .release(&tokenless_op, &tokenless_input)
+        .await
+        .expect_err(
+            "a tokenless, non-administrative release must be refused before any row is read",
+        );
+    assert!(
+        matches!(
+            &tokenless_error,
+            DomainError::InvalidInput(message) if message.contains("ownership token")
+        ),
+        "expected InvalidInput naming the missing ownership token, got {tokenless_error:?}"
+    );
+
+    let guess_input = ReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        owner: lock_owner.clone(),
+        resources: vec![resource(hash, Some(rand::random()))],
+        outbox_cell_id: None,
+    };
+    let guess_op = prepare_bound_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        release_binding(&guess_input).expect("token-guess release binding"),
+    )
+    .await;
+    let guess_result = coordinator
+        .release(&guess_op, &guess_input)
+        .await
+        .expect("token-guess release result");
+    assert_rejection(&guess_result, LockRejection::AuthorityMismatch);
+
+    let (token, never_issued) =
+        stored_token_shape(&direct, &repository_id, &branch_id, &hash).await;
+    assert!(
+        token.is_none() && never_issued,
+        "the never-issued row must survive both refusals unchanged"
+    );
+}
+
+/// RULING B item 4: a never-issued row refuses `acquire_or_renew` from its
+/// own owner too, tokenless and token-bearing -- `AuthorityMismatch` either
+/// way. This is the residual `PUBLIC_MUTATION_CONTRACT_AVAILABLE`'s doc
+/// comment names: only `force_release` can clear such a row.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn a_never_issued_row_refuses_acquire_or_renew_from_its_own_owner_with_or_without_a_token() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.lock_coordinator();
+    let direct = client(&url).await;
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let hash: [u8; 32] = rand::random();
+    let lock_owner = backfill_one_never_issued_row(
+        &store,
+        &direct,
+        &repository_id,
+        &branch_id,
+        &hash,
+        "wp121-renew-owner",
+    )
+    .await;
+
+    let tokenless_input = acquire_input(
+        &repository_id,
+        &branch_id,
+        lock_owner.clone(),
+        vec![resource(hash, None)],
+        None,
+    );
+    let tokenless_op = prepare_bound_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&tokenless_input).expect("tokenless renew binding"),
+    )
+    .await;
+    let tokenless_result = coordinator
+        .acquire_or_renew(&tokenless_op, &tokenless_input)
+        .await
+        .expect("tokenless renew result");
+    assert_rejection(&tokenless_result, LockRejection::AuthorityMismatch);
+
+    let guess_input = acquire_input(
+        &repository_id,
+        &branch_id,
+        lock_owner.clone(),
+        vec![resource(hash, Some(rand::random()))],
+        None,
+    );
+    let guess_op = prepare_bound_operation(
+        &store,
+        &lock_owner,
+        &repository_id,
+        &branch_id,
+        acquire_or_renew_binding(&guess_input).expect("token-guess renew binding"),
+    )
+    .await;
+    let guess_result = coordinator
+        .acquire_or_renew(&guess_op, &guess_input)
+        .await
+        .expect("token-guess renew result");
+    assert_rejection(&guess_result, LockRejection::AuthorityMismatch);
+}
+
+/// RULING B item 5: `force_release` (tokenless, acting administrator present)
+/// is the only way to clear a never-issued row. It must succeed, commit, and
+/// emit exactly one `lock.force_released` outbox event whose
+/// `aggregate_identity` is EMPTY -- there is no token to name.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn force_release_clears_a_never_issued_row_with_an_empty_aggregate_identity() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.lock_coordinator();
+    let db = client(&url).await;
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let hash: [u8; 32] = rand::random();
+    let target = backfill_one_never_issued_row(
+        &store,
+        &db,
+        &repository_id,
+        &branch_id,
+        &hash,
+        "wp121-force-target",
+    )
+    .await;
+    let admin = owner("https://issuer.example", "wp121-force-admin");
+    let cell_id = outbox_cell_id();
+
+    let force_input = ForceReleaseInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        target_owner: target,
+        acting_owner: admin.clone(),
+        resources: vec![resource(hash, None)],
+        outbox_cell_id: Some(cell_id.clone()),
+    };
+    let force_op = prepare_bound_operation(
+        &store,
+        &admin,
+        &repository_id,
+        &branch_id,
+        force_release_binding(&force_input).expect("valid never-issued force-release binding"),
+    )
+    .await;
+    let forced = coordinator
+        .force_release(&force_op, &force_input)
+        .await
+        .expect("force release of a never-issued row must succeed");
+    assert_eq!(forced.outcome, DomainOutcome::Applied);
+
+    assert_eq!(
+        outbox_row_count_for_repository(&db, &repository_id).await,
+        1
+    );
+    let row = one_outbox_row_for_repository(&db, &repository_id).await;
+    assert_eq!(row.event_kind, "lock.force_released");
+    assert_eq!(row.cell_id, cell_id);
+    let decoded = AggregateVersion::decode(&row.aggregate_version).expect("decode");
+    assert!(
+        decoded.identity.is_empty(),
+        "a never-issued row's force-release has no token to name, so its aggregate_identity \
+         must be empty, not zero-filled or absent bytes"
+    );
+
+    assert!(
+        coordinator
+            .status(&repository_id, &branch_id, &hash)
+            .await
+            .expect("status after force release")
+            .is_none(),
+        "the row must be cleared"
+    );
+}
+
+/// RULING B item 6: `query`/`status` still surface a never-issued row -- it
+/// must not vanish from either read path -- with `ownership_token: None`.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn query_and_status_still_return_a_never_issued_row_with_no_token() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.lock_coordinator();
+    let direct = client(&url).await;
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let hash: [u8; 32] = rand::random();
+    backfill_one_never_issued_row(
+        &store,
+        &direct,
+        &repository_id,
+        &branch_id,
+        &hash,
+        "wp121-query-owner",
+    )
+    .await;
+
+    let queried = coordinator
+        .query(&repository_id, Some(&branch_id), None)
+        .await
+        .expect("query must not error on a never-issued row");
+    assert_eq!(
+        queried.len(),
+        1,
+        "a never-issued row must not vanish from Query"
+    );
+    assert_eq!(queried[0].ownership_token, None);
+
+    let status = coordinator
+        .status(&repository_id, &branch_id, &hash)
+        .await
+        .expect("status must not error on a never-issued row")
+        .expect("a never-issued row must not vanish from Status");
+    assert_eq!(status.ownership_token, None);
+}
+
+/// RULING B item 7: `readiness()` counts a never-issued row separately and no
+/// longer treats it as unfenced, and a single converted row must not block
+/// `enable_fencing`.
+///
+/// Scoped to a DELTA against a baseline read before the never-issued row
+/// exists, not a global `== 1`/`== 0` count: this file's cases are meant to
+/// run one-per-database under `run-lock-fencing-live.ps1`, but a shared
+/// database (e.g. a plain `cargo test -- --ignored` against one long-lived
+/// instance) would otherwise make this assertion depend on how many OTHER
+/// never-issued/unfenced rows already exist -- exactly the
+/// ordering-dependence `docs/developing/code-standards/testing.md` forbids.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn readiness_counts_a_never_issued_row_without_blocking_arming() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.lock_coordinator();
+    let direct = client(&url).await;
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let hash: [u8; 32] = rand::random();
+    let baseline = coordinator
+        .readiness()
+        .await
+        .expect("baseline readiness projection, before the never-issued row exists");
+
+    backfill_one_never_issued_row(
+        &store,
+        &direct,
+        &repository_id,
+        &branch_id,
+        &hash,
+        "wp121-readiness-owner",
+    )
+    .await;
+
+    let readiness = coordinator.readiness().await.expect("readiness projection");
+    assert_eq!(
+        readiness.never_issued_token_rows,
+        baseline.never_issued_token_rows + 1,
+        "converting exactly one row must advance never_issued_token_rows by exactly one"
+    );
+    assert_eq!(
+        readiness.unfenced_rows, baseline.unfenced_rows,
+        "a converted never-issued row must not count as unfenced"
+    );
+
+    coordinator
+        .enable_fencing_for_component_fixture(false)
+        .await
+        .expect("a never-issued row alone must not block arming");
+}
+
+/// Hand-regress a freshly bootstrapped SCHEMA-117 v2 `lore_locks` table to
+/// the exact revision-1 shape: no `token_never_issued` column, guarded by the
+/// superseded `lore_locks_fenced_shape` constraint instead of `..._v2`.
+/// Shared by every case below that needs to prove behaviour against a cell
+/// that has not yet run the RULING B migration.
+async fn regress_lock_table_to_v1_shape(direct: &Client) {
+    direct
+        .execute(
+            "ALTER TABLE lore_locks DROP CONSTRAINT lore_locks_fenced_shape_v2",
+            &[],
+        )
+        .await
+        .expect("drop the v2 constraint");
+    direct
+        .execute("ALTER TABLE lore_locks DROP COLUMN token_never_issued", &[])
+        .await
+        .expect("drop the token_never_issued column");
+    direct
+        .execute(
+            "ALTER TABLE lore_locks ADD CONSTRAINT lore_locks_fenced_shape CHECK ( \
+                (repository_lock_generation IS NULL \
+                 AND branch_lock_generation IS NULL \
+                 AND owner_issuer IS NULL AND owner_subject IS NULL \
+                 AND acting_issuer IS NULL AND acting_subject IS NULL \
+                 AND ownership_token IS NULL AND fence IS NULL \
+                 AND acquired_at IS NULL AND renewed_at IS NULL AND expires_at IS NULL) \
+             OR (repository_lock_generation >= 1 \
+                 AND branch_lock_generation >= 1 \
+                 AND owner_issuer IS NOT NULL AND owner_subject IS NOT NULL \
+                 AND octet_length(ownership_token) = 32 \
+                 AND fence >= 1 \
+                 AND acquired_at IS NOT NULL AND renewed_at IS NOT NULL \
+                 AND renewed_at >= acquired_at \
+                 AND (expires_at IS NULL OR expires_at > renewed_at)) \
+            )",
+            &[],
+        )
+        .await
+        .expect("re-add the superseded v1 constraint");
+}
+
+/// SOURCE FOLLOW-UP (blocking regression, found by an independent reviewer
+/// running executed probes): `readiness()` used to name `token_never_issued`
+/// after only a table-presence guard, so a binary carrying RULING B code
+/// aborted startup with `column "token_never_issued" does not exist` against
+/// a cell that had only reached SCHEMA-117 revision 1 -- the INV-EE P0-1
+/// shape (a genuine, boot-blocking cross-revision gap, not a hypothetical
+/// one). `readiness()` now probes the column via `column_present` first, and
+/// this pins the revision-1 answer directly: it must RETURN rather than
+/// error, with `never_issued_token_rows == 0` (a revision-1 cell cannot hold
+/// such a row) and the revision-1 unfenced predicate still counting a plain
+/// legacy row as unfenced. This case must fail if the probe is ever deleted
+/// and the column name goes back to being read unconditionally.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn readiness_on_a_revision_one_cell_returns_instead_of_erroring_on_the_missing_column() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = PostgresDomainStore::connect(&url, 4, &TlsConfig::default())
+        .await
+        .expect("connect domain store");
+    let coordinator = store.lock_coordinator();
+    coordinator
+        .bootstrap()
+        .await
+        .expect("install SCHEMA-117 v2 on a fresh database");
+    let direct = client(&url).await;
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let hash: [u8; 32] = rand::random();
+    insert_legacy_lock(
+        &direct,
+        &repository_id,
+        &branch_id,
+        &hash,
+        "wp121-rev1-owner",
+    )
+    .await;
+
+    regress_lock_table_to_v1_shape(&direct).await;
+    direct
+        .execute(
+            "UPDATE lore_domain_lock_schema_state SET schema_version = 1 WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("regress schema_version to 1");
+
+    let readiness = coordinator
+        .readiness()
+        .await
+        .expect("readiness on a revision-1 cell must return, not error on the missing column");
+    assert_eq!(
+        readiness.never_issued_token_rows, 0,
+        "a revision-1 cell cannot hold a never-issued row -- the column doesn't exist yet"
+    );
+    assert_eq!(
+        readiness.unfenced_rows, 1,
+        "the revision-1 unfenced predicate must still count the plain legacy row"
+    );
+}
+
+/// SOURCE FOLLOW-UP (documented behaviour, not a hole -- an independent
+/// reviewer executed the legacy unlock SQL against a converted row and
+/// confirmed it, so this pins it rather than leaving it unasserted). Between
+/// a real `backfill` and `arm_fenced_routing`, lock RPCs still route to the
+/// legacy `store::lock_store::PostgresLockStore`, which matches a release
+/// purely on the row's plain `owner` text column and knows nothing about
+/// `ownership_token`/`token_never_issued`. So a never-issued row IS
+/// releasable through that legacy route by its own owner -- the "only
+/// `force_release` can clear one" claim in RULING B item 3/4's doc comments
+/// is scoped to an ARMED cell, not to every cell holding a never-issued row.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn legacy_route_releases_a_never_issued_row_before_fencing_is_armed() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let direct = client(&url).await;
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let hash: [u8; 32] = rand::random();
+    backfill_one_never_issued_row(
+        &store,
+        &direct,
+        &repository_id,
+        &branch_id,
+        &hash,
+        "wp121-legacy-route-owner",
+    )
+    .await;
+    // Deliberately never armed in this test: `enable_fencing`/
+    // `enable_fencing_for_component_fixture` is never called, so lock RPCs at
+    // this point still route through the legacy store, exactly as they do
+    // between a real backfill and cutover.
+
+    let lock_store = PostgresLockStore::connect(&url, 4, &TlsConfig::default())
+        .await
+        .expect("connect legacy lock store");
+    let released = lock_store
+        .unlock_resources(
+            "wp121-legacy-route-owner",
+            true,
+            repository_id.into(),
+            &[LockResource {
+                branch: branch_id.into(),
+                hash: hash.into(),
+                description: "legacy route probe".to_owned(),
+            }],
+        )
+        .await
+        .expect(
+            "the legacy route matches on plain owner text and knows nothing of tokens, so it \
+             must release a never-issued row same as any other",
+        );
+    assert_eq!(released.len(), 1);
+
+    let remaining: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_locks WHERE repository=$1 AND branch=$2 AND hash=$3",
+            &[
+                &repository_id.as_slice(),
+                &branch_id.as_slice(),
+                &hash.as_slice(),
+            ],
+        )
+        .await
+        .expect("count the row after the legacy release")
+        .get(0);
+    assert_eq!(
+        remaining, 0,
+        "the legacy route must actually delete the row, not merely leave it unchanged"
+    );
+}
+
+/// RULING B item 8: an in-place upgrade from the v1 shape (`lore_locks`
+/// without `token_never_issued`, guarded by the superseded
+/// `lore_locks_fenced_shape`) to v2 must add the column, install
+/// `lore_locks_fenced_shape_v2`, drop the v1 constraint, advance
+/// `schema_version` to 2, preserve a pre-existing legacy row untouched, and
+/// stay idempotent on a second run.
+#[tokio::test]
+#[ignore = "run with tests/run-lock-fencing-live.ps1"]
+async fn bootstrap_upgrades_a_v1_shape_lock_table_in_place() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = PostgresDomainStore::connect(&url, 4, &TlsConfig::default())
+        .await
+        .expect("connect domain store");
+    let coordinator = store.lock_coordinator();
+    coordinator
+        .bootstrap()
+        .await
+        .expect("install SCHEMA-117 v2 on a fresh database");
+    let direct = client(&url).await;
+    let (repository_id, branch_id) = create_repository(&store).await;
+    let hash: [u8; 32] = rand::random();
+    insert_legacy_lock(
+        &direct,
+        &repository_id,
+        &branch_id,
+        &hash,
+        "wp121-upgrade-owner",
+    )
+    .await;
+
+    regress_lock_table_to_v1_shape(&direct).await;
+    direct
+        .execute(
+            "UPDATE lore_domain_lock_schema_state SET schema_version = 1 WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("regress schema_version to 1");
+
+    coordinator
+        .bootstrap()
+        .await
+        .expect("re-running bootstrap must upgrade the v1 shape in place");
+
+    let column_exists: bool = direct
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+              WHERE table_name = 'lore_locks' AND column_name = 'token_never_issued')",
+            &[],
+        )
+        .await
+        .expect("check column existence")
+        .get(0);
+    assert!(
+        column_exists,
+        "token_never_issued must exist after the upgrade"
+    );
+    let v2_exists: bool = direct
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint \
+              WHERE conname = 'lore_locks_fenced_shape_v2')",
+            &[],
+        )
+        .await
+        .expect("check v2 constraint existence")
+        .get(0);
+    assert!(
+        v2_exists,
+        "lore_locks_fenced_shape_v2 must exist after the upgrade"
+    );
+    let v1_exists: bool = direct
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'lore_locks_fenced_shape')",
+            &[],
+        )
+        .await
+        .expect("check v1 constraint absence")
+        .get(0);
+    assert!(
+        !v1_exists,
+        "the v1 constraint must be replaced, not left alongside v2"
+    );
+    let schema_version: i64 = direct
+        .query_one(
+            "SELECT schema_version FROM lore_domain_lock_schema_state WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("read schema_version")
+        .get(0);
+    assert_eq!(schema_version, lock_schema::LOCK_SCHEMA_VERSION);
+
+    let survived: i64 = direct
+        .query_one(
+            "SELECT count(*)::bigint FROM lore_locks WHERE repository=$1 AND branch=$2 AND hash=$3",
+            &[
+                &repository_id.as_slice(),
+                &branch_id.as_slice(),
+                &hash.as_slice(),
+            ],
+        )
+        .await
+        .expect("count the surviving legacy row")
+        .get(0);
+    assert_eq!(
+        survived, 1,
+        "the pre-existing legacy row must survive the in-place upgrade"
+    );
+
+    coordinator
+        .bootstrap()
+        .await
+        .expect("a second bootstrap after the upgrade must be a no-op");
 }

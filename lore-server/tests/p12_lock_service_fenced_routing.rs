@@ -460,6 +460,30 @@ fn admin_token(subject: &str) -> AuthorizationToken {
     }
 }
 
+/// RULING A: `ForceUnlock`'s gate. `owner` alone, with no `migrate` claim at
+/// all, is exactly the shape RULING A requires be sufficient.
+fn owner_permission_token(subject: &str) -> AuthorizationToken {
+    AuthorizationToken {
+        issuer: "https://issuer.example".to_owned(),
+        user_id: subject.to_owned(),
+        resources: Some(vec![ResourcePermission {
+            resource_id: "urc-*".to_owned(),
+            permission: vec!["owner".to_owned()],
+        }]),
+        ..Default::default()
+    }
+}
+
+/// A verified caller with no administrative permission claim at all -- not
+/// `owner`, not `migrate`.
+fn no_admin_permission_token(subject: &str) -> AuthorizationToken {
+    AuthorizationToken {
+        issuer: "https://issuer.example".to_owned(),
+        user_id: subject.to_owned(),
+        ..Default::default()
+    }
+}
+
 /// THE security assertion: `Query` and `Status` never expose an ownership
 /// token, including on the caller's own lock. The token is the bearer secret
 /// that authorizes releasing a row; these two RPCs read OTHER people's locks
@@ -535,12 +559,13 @@ async fn queried_and_status_locks_never_expose_an_ownership_token() {
 }
 
 /// `ForceUnlock` is the only way to take someone else's fenced lock, and it is
-/// a genuinely different transition from `Unlock`: it needs the `migrate`
-/// permission (same bar as `AdminLock`), it names the owner being released
-/// explicitly, and -- unlike an ordinary release -- it does NOT require the
-/// resource's ownership token, because an administrator legitimately holds
-/// none (`ForceUnlockRequest`'s own doc comment; `fenced_batch(resources,
-/// false)` in `fenced_force_release`).
+/// a genuinely different transition from `Unlock`: RULING A gates it on the
+/// `owner` permission (NOT `migrate`, which is `AdminLock`'s independent
+/// bar -- see the pair of refusal tests below), it names the owner being
+/// released explicitly, and -- unlike an ordinary release -- it does NOT
+/// require the resource's ownership token, because an administrator
+/// legitimately holds none (`ForceUnlockRequest`'s own doc comment;
+/// `fenced_batch(resources, false)` in `fenced_force_release`).
 #[tokio::test]
 #[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
 async fn admin_force_unlock_releases_another_owners_lock_without_a_token() {
@@ -555,7 +580,8 @@ async fn admin_force_unlock_releases_another_owners_lock_without_a_token() {
         user_id: "wp120-force-unlock-owner".to_owned(),
         ..Default::default()
     };
-    let admin = admin_token("wp120-force-unlock-admin");
+    // RULING A: `owner`, not `migrate`, is ForceUnlock's bar.
+    let admin = owner_permission_token("wp120-force-unlock-admin");
     let resource = resource_for_branch(&branch_id);
 
     service
@@ -581,7 +607,7 @@ async fn admin_force_unlock_releases_another_owners_lock_without_a_token() {
             &admin,
         ))
         .await
-        .expect("an administrator with migrate permission must force-release without a token")
+        .expect("an administrator with owner permission must force-release without a token")
         .into_inner();
     assert_eq!(forced.resources.len(), 1);
 
@@ -606,7 +632,10 @@ async fn force_unlock_with_no_fenced_coordinator_is_refused() {
         .await
         .expect("connect legacy lock store");
     let repository_id: [u8; 16] = rand::random();
-    let admin = admin_token("wp120-unarmed-admin");
+    // RULING A: `owner`, not `migrate`, is ForceUnlock's bar -- this caller
+    // must clear the permission gate to reach the fenced-routing refusal
+    // this test is actually about.
+    let admin = owner_permission_token("wp120-unarmed-admin");
 
     let service = LoreLockService::new(
         Arc::new(lock_store),
@@ -713,5 +742,130 @@ async fn unarmed_legacy_route_succeeds_and_appends_nothing() {
         0,
         "the legacy lock_store path has no fence, no generation, and no domain transaction \
          to append an outbox row inside"
+    );
+}
+
+/// RULING A: `ForceUnlock`'s gate is `owner`, and `migrate` (the bar for
+/// `AdminLock`) does not satisfy it. Proves the two gates are independent
+/// rather than one subsuming the other -- the mirror case,
+/// `admin_lock_is_refused_for_a_caller_holding_owner_but_not_migrate` below,
+/// proves the same independence from the other side.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn force_unlock_is_refused_for_a_caller_holding_migrate_but_not_owner() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let (service, _coordinator, _verifier, repository_id, branch_id) = armed_service(&url).await;
+    let owner_token = AuthorizationToken {
+        issuer: "https://issuer.example".to_owned(),
+        user_id: "wp121-migrate-only-target-owner".to_owned(),
+        ..Default::default()
+    };
+    let migrate_only = admin_token("wp121-migrate-only-caller");
+    let resource = resource_for_branch(&branch_id);
+
+    service
+        .lock(authenticated_request(
+            LockRequest {
+                resources: vec![resource.clone()],
+            },
+            &repository_id,
+            &owner_token,
+        ))
+        .await
+        .expect("owner's acquire must succeed");
+
+    let error = service
+        .force_unlock(authenticated_request(
+            ForceUnlockRequest {
+                resources: vec![resource],
+                owner: owner_token.user_id.clone(),
+            },
+            &repository_id,
+            &migrate_only,
+        ))
+        .await
+        .expect_err("migrate alone must not satisfy ForceUnlock's owner-permission gate");
+    assert_eq!(error.code(), Code::PermissionDenied);
+}
+
+/// RULING A's mirror on `AdminLock`: a caller holding only `owner` (the new
+/// `ForceUnlock` bar) is refused `PermissionDenied` on `AdminLock`, which
+/// still requires `migrate` unchanged. Together with
+/// `admin_lock_on_behalf_of_another_subject_issues_that_subjects_ownership_token`
+/// (migrate alone succeeds) this pins both halves of AdminLock's gate being
+/// untouched by RULING A.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn admin_lock_is_refused_for_a_caller_holding_owner_but_not_migrate() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let (service, _coordinator, _verifier, repository_id, branch_id) = armed_service(&url).await;
+    let owner_only = owner_permission_token("wp121-owner-only-caller");
+
+    let error = service
+        .admin_lock(authenticated_request(
+            AdminLockRequest {
+                resources: vec![resource_for_branch(&branch_id)],
+                owner: "wp121-admin-lock-target".to_owned(),
+            },
+            &repository_id,
+            &owner_only,
+        ))
+        .await
+        .expect_err("owner alone must not satisfy AdminLock's migrate-permission gate");
+    assert_eq!(error.code(), Code::PermissionDenied);
+}
+
+/// RULING A ordering requirement: the permission check runs BEFORE any
+/// cell-state disclosure. A caller with neither `owner` nor `migrate` is
+/// refused `PermissionDenied` even against an unarmed cell that would
+/// otherwise answer `FailedPrecondition` naming fenced routing --
+/// `force_unlock_with_no_fenced_coordinator_is_refused` above proves that
+/// `FailedPrecondition` shape for a caller that DOES hold `owner`, so the
+/// only variable here is the permission claim.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn force_unlock_permission_check_precedes_fenced_routing_disclosure() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let lock_store = PostgresLockStore::connect(&url, 4, &TlsConfig::default())
+        .await
+        .expect("connect legacy lock store");
+    let repository_id: [u8; 16] = rand::random();
+    let no_permission = no_admin_permission_token("wp121-no-permission-caller");
+
+    let service = LoreLockService::new(
+        Arc::new(lock_store),
+        Arc::new(NotificationSender::default()),
+        Arc::new(HookDispatcher::empty()),
+        Duration::from_secs(60),
+        false,
+    );
+
+    let error = service
+        .force_unlock(authenticated_request(
+            ForceUnlockRequest {
+                resources: vec![one_resource()],
+                owner: "someone".to_owned(),
+            },
+            &repository_id,
+            &no_permission,
+        ))
+        .await
+        .expect_err(
+            "a caller with neither owner nor migrate must be refused before any cell-state check",
+        );
+
+    assert_eq!(
+        error.code(),
+        Code::PermissionDenied,
+        "must never leak FailedPrecondition/fenced-routing detail to an unpermitted caller"
     );
 }

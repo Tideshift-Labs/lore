@@ -82,7 +82,17 @@ $inventory = @(
             'a_replayed_receipt_appends_no_second_row',
             'an_empty_resource_release_appends_no_row',
             'a_mixed_batch_of_the_callers_own_current_and_stale_generation_rows_is_a_renewal',
-            'a_stale_generation_row_held_by_a_different_owner_is_a_takeover'
+            'a_stale_generation_row_held_by_a_different_owner_is_a_takeover',
+            'backfill_converts_a_legacy_row_to_a_never_issued_token',
+            'fenced_shape_v2_check_rejects_every_invalid_token_shape',
+            'a_never_issued_row_refuses_release_from_its_own_owner_with_or_without_a_token',
+            'a_never_issued_row_refuses_acquire_or_renew_from_its_own_owner_with_or_without_a_token',
+            'force_release_clears_a_never_issued_row_with_an_empty_aggregate_identity',
+            'query_and_status_still_return_a_never_issued_row_with_no_token',
+            'readiness_counts_a_never_issued_row_without_blocking_arming',
+            'readiness_on_a_revision_one_cell_returns_instead_of_erroring_on_the_missing_column',
+            'legacy_route_releases_a_never_issued_row_before_fencing_is_armed',
+            'bootstrap_upgrades_a_v1_shape_lock_table_in_place'
         )
     },
     [pscustomobject]@{
