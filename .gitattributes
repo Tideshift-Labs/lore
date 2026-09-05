@@ -12,3 +12,8 @@ lore-object-dispatch/migrations/*.sql text eol=lf
 # the server, so only function and trigger bodies expose this. A migration file
 # that declares none can be CRLF for years and look fine.
 lore-postgres/migrations/*.sql text eol=lf
+
+# Rust sources are LF in history. Without this rule a Windows checkout can hold
+# CRLF copies that `git status` still reports clean, and the next edit to such a
+# file commits the whole file as CRLF (rustfmt then reformats every line).
+*.rs text eol=lf
