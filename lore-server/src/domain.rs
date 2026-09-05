@@ -2558,6 +2558,11 @@ pub fn reject_unwired_governed_operation(admitted: &AdmittedOperation, method: &
     )
 }
 
+/// WP-120's real `DomainBackfillSource` over one live cell's stores.
+pub mod backfill_source;
+/// WP-120's `loreserver domain <status|cutover>` operator surface.
+pub mod operator;
+
 #[cfg(test)]
 mod p12_tests;
 
@@ -2794,17 +2799,22 @@ fn resolve_cell_id(settings: &Settings) -> Result<Option<String>> {
     Ok(Some(cell_id.to_owned()))
 }
 
-fn resolve_lock_fencing(readiness: &LockFencingReadiness, settings: &Settings) -> Result<bool> {
-    if !readiness.fencing_enabled {
-        info!(
-            provisioned = readiness.provisioned,
-            schema_version = readiness.schema_version,
-            backfill_state = readiness.backfill_state,
-            "Fenced lock routing is off; the public lock service remains on its legacy store"
-        );
-        return Ok(false);
-    }
-
+/// The settings a cell must carry before fenced lock routing may be armed.
+///
+/// Extracted from [`resolve_lock_fencing`] so WP-120's `loreserver domain
+/// cutover` can check it **before** it changes anything. Arming fencing is a
+/// durable database fact; if these settings do not hold, the very next boot
+/// reads `fencing_enabled = true` here and refuses readiness, which turns a
+/// successful-looking cutover into a cell that will not start.
+///
+/// Each refusal names its own condition. A shared message would let a
+/// transposed check pass review.
+///
+/// # Errors
+/// Absent JWT authentication, an absent JWK verifier, an absent or empty issuer
+/// policy, `enforce_write_permission = false`, or a lock store that is not
+/// Postgres.
+pub fn lock_fencing_settings_preconditions(settings: &Settings) -> Result<()> {
     let auth = settings.server.auth.as_ref().ok_or_else(|| {
         anyhow!("Lock fencing is enabled but JWT authentication is not configured")
     })?;
@@ -2832,6 +2842,21 @@ fn resolve_lock_fencing(readiness: &LockFencingReadiness, settings: &Settings) -
             "Lock fencing is enabled but the configured lock store is not Postgres"
         ));
     }
+    Ok(())
+}
+
+fn resolve_lock_fencing(readiness: &LockFencingReadiness, settings: &Settings) -> Result<bool> {
+    if !readiness.fencing_enabled {
+        info!(
+            provisioned = readiness.provisioned,
+            schema_version = readiness.schema_version,
+            backfill_state = readiness.backfill_state,
+            "Fenced lock routing is off; the public lock service remains on its legacy store"
+        );
+        return Ok(false);
+    }
+
+    lock_fencing_settings_preconditions(settings)?;
     if readiness.schema_version != lore_postgres::domain::locks::schema::LOCK_SCHEMA_VERSION
         || readiness.backfill_state != lore_postgres::domain::locks::schema::BACKFILL_COMPLETE
         || !readiness.same_database

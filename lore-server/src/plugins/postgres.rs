@@ -915,6 +915,36 @@ pub(crate) async fn connect_domain_store(
         })
 }
 
+/// Build the concrete Postgres mutable store from the plugin configuration.
+///
+/// Offline maintenance needs the same store normal startup publishes behind
+/// `Arc<dyn MutableStore>`: WP-120's `loreserver domain cutover` reads the
+/// cell's real repositories and branches through `lore-revision`, which reaches
+/// them through this trait. Built through the shared `parse_config`/`build_tls`
+/// path so the connection shape and TLS material cannot drift from the serving
+/// one — a maintenance command that reached a different database than the
+/// server would arm a cell nobody is serving.
+///
+/// `ensure_schema` runs here as it does at startup, which is also why the
+/// cutover command opens this store *before* the domain backfill's verification:
+/// that verification reads `lore_mutable`, and this is what creates it.
+pub(crate) async fn connect_mutable_store(
+    config: &toml::Value,
+) -> Result<PostgresMutableStore, PluginError> {
+    let plugin_name = PLUGIN_NAME;
+    let cfg = parse_config(plugin_name, config)?;
+    let tls = build_tls(plugin_name, &cfg)?;
+
+    PostgresMutableStore::connect(&cfg.url, cfg.pool_max, &tls)
+        .await
+        .map_err(|e| {
+            PluginError::from(PluginInitError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("Failed to create Postgres mutable store: {e}"),
+            })
+        })
+}
+
 /// Build a small dedicated pool on the cell database for CR-032's relay worker
 /// (WP-119 Step B).
 ///

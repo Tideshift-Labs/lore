@@ -21,6 +21,7 @@ use std::time::Duration;
 use anyhow::Result;
 use anyhow::anyhow;
 use clap::Parser;
+use clap::Subcommand;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::LoreTaskLifecycleEvent;
@@ -172,7 +173,31 @@ pub struct Cli {
     /// recovery surface is a subcommand rather than another flag beside
     /// `--rebuild-postgres-metering`.
     #[command(subcommand)]
-    pub command: Option<crate::event_relay::operator::MaintenanceCommand>,
+    pub command: Option<MaintenanceOperation>,
+}
+
+/// Every maintenance operation this binary can run instead of serving.
+///
+/// One enum per owning subsystem, gathered here rather than in either of them:
+/// `event_relay::operator` owns CR-032's outbox surface and `domain::operator`
+/// owns CR-029's domain surface, and neither should have to name the other to
+/// be reachable from the command line.
+///
+/// The outbox arm is `#[command(flatten)]`ed so its own `outbox` subcommand
+/// keeps the exact spelling and help text it already had. Its enum and its
+/// `run` signature are untouched, so nothing that already drives that surface
+/// changes.
+#[derive(Debug, Subcommand)]
+pub enum MaintenanceOperation {
+    /// CR-032's transactional event outbox (`loreserver outbox ...`).
+    #[command(flatten)]
+    Outbox(crate::event_relay::operator::MaintenanceCommand),
+    /// CR-029's domain state: report it, or arm this cell.
+    Domain {
+        /// The operation to run.
+        #[command(subcommand)]
+        command: crate::domain::operator::DomainCommand,
+    },
 }
 
 fn ensure_postgres_rebuild_mode(mode: &str) -> Result<()> {
@@ -286,11 +311,33 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
                 // deployment scripts can parse it without depending on the tracing format.
                 println!("{associated_hash_count}");
                 Ok(())
-            } else if let Some(command) = maintenance.as_ref() {
-                // CR-032's operator recovery surface (WP-119 Phase 8). One
-                // bounded operation against the configured cell, then exit; no
-                // endpoint is bound and no relay worker starts.
-                crate::event_relay::operator::run(command, &settings).await
+            } else if let Some(operation) = maintenance {
+                // One bounded operation against the configured cell, then exit;
+                // no endpoint is bound and no relay worker starts.
+                match operation {
+                    // CR-032's operator recovery surface (WP-119 Phase 8).
+                    MaintenanceOperation::Outbox(command) => {
+                        crate::event_relay::operator::run(&command, &settings).await
+                    }
+                    // CR-029/CR-030's cell arming surface (WP-120).
+                    //
+                    // Spawned rather than awaited inline, because `block_on`
+                    // polls on the process's MAIN thread and `cutover` opens the
+                    // Postgres immutable store, whose S3 client construction is
+                    // a very deep async call in a debug build. Inline it
+                    // overflowed the main thread's stack on Windows (1 MiB by
+                    // default) before it could report anything; a runtime worker
+                    // gets tokio's own, larger stack. Neither `Box::pin` nor the
+                    // enclosing `#[allow(clippy::large_futures)]` helps — the
+                    // cost is in the poll frames, not in the future's size.
+                    MaintenanceOperation::Domain { command } => lore_spawn!(async move {
+                        crate::domain::operator::run(&command, &settings).await
+                    })
+                    .await
+                    .map_err(|error| {
+                        anyhow!("The domain maintenance task did not complete: {error}")
+                    })?,
+                }
             } else {
                 async_main((settings, settings_hash), config).await
             }
@@ -525,7 +572,16 @@ async fn launch_quinn_server(
 
 /// Returns the optional build features and active runtime capabilities exposed
 /// through `ServerInfo`.
-fn compiled_features(domain_operation_service_available: bool) -> Vec<String> {
+///
+/// The two domain capabilities do **not** share one condition. Mounting the
+/// private service is what makes the proof-namespace lifecycle reachable, but a
+/// receipt is only written by a governed mutation, and a cell with enforcement
+/// off performs none — see
+/// [`crate::grpc::server::domain_operation_receipt_capability_available`].
+fn compiled_features(
+    domain_operation_service_available: bool,
+    domain_enforcement_enabled: bool,
+) -> Vec<String> {
     let mut features = Vec::new();
     if cfg!(feature = "failure_generator") {
         features.push("failure_generator".to_string());
@@ -536,8 +592,13 @@ fn compiled_features(domain_operation_service_available: bool) -> Vec<String> {
     if cfg!(feature = "seeding") {
         features.push("seeding".to_string());
     }
-    if domain_operation_service_available {
+    if crate::grpc::server::domain_operation_receipt_capability_available(
+        domain_operation_service_available,
+        domain_enforcement_enabled,
+    ) {
         features.push("domain_operation_receipt_v2".to_string());
+    }
+    if domain_operation_service_available {
         features.push("domain_operation_proof_namespace_lifecycle_v1".to_string());
     }
     features
@@ -599,7 +660,12 @@ async fn launch_grpc_server(
                 .and_then(|endpoint| endpoint.auth_url.as_deref()),
             jwt_verifier.is_some(),
         );
-    let features_list = compiled_features(domain_operation_service_available);
+    let features_list = compiled_features(
+        domain_operation_service_available,
+        domain_context
+            .as_ref()
+            .is_some_and(|domain| domain.enforcement_enabled()),
+    );
 
     let (cert_path, key_path, cert_chain_path) =
         if let Some(cert_settings) = grpc_settings.certificate {
@@ -2782,8 +2848,8 @@ fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, mess
 mod tests {
     #[test]
     fn compiled_features_advertise_domain_rails_only_when_service_is_available() {
-        let enabled = super::compiled_features(true);
-        let disabled = super::compiled_features(false);
+        let enabled = super::compiled_features(true, true);
+        let disabled = super::compiled_features(false, false);
 
         for capability in [
             "domain_operation_receipt_v2",
@@ -2800,6 +2866,55 @@ mod tests {
             assert!(
                 !disabled.iter().any(|feature| feature == capability),
                 "unavailable domain service must not advertise {capability}"
+            );
+        }
+    }
+
+    /// WP-120. A mounted service on an unarmed cell advertised
+    /// `domain_operation_receipt_v2`, so a client expected receipts the cell
+    /// files none of. The proof-namespace capability keeps the mount condition,
+    /// because that rail does not depend on enforcement.
+    #[test]
+    fn the_receipt_capability_additionally_requires_enforcement() {
+        let unenforcing = super::compiled_features(true, false);
+        assert!(
+            !unenforcing
+                .iter()
+                .any(|feature| feature == "domain_operation_receipt_v2"),
+            "a cell with enforcement off files no receipt and must not advertise the rail"
+        );
+        assert!(
+            unenforcing
+                .iter()
+                .any(|feature| feature == "domain_operation_proof_namespace_lifecycle_v1"),
+            "the proof-namespace rail is mounted and reachable without enforcement"
+        );
+
+        // Enforcement alone is not enough either: with no service mounted there
+        // is nothing to look a receipt up through.
+        let unmounted = super::compiled_features(false, true);
+        assert!(
+            !unmounted
+                .iter()
+                .any(|feature| feature.starts_with("domain_operation_")),
+            "an unmounted service advertises neither domain rail"
+        );
+    }
+
+    #[test]
+    fn the_receipt_capability_predicate_needs_both_halves() {
+        use crate::grpc::server::domain_operation_receipt_capability_available;
+
+        for (service, enforcement, expected) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                domain_operation_receipt_capability_available(service, enforcement),
+                expected,
+                "service={service} enforcement={enforcement}"
             );
         }
     }

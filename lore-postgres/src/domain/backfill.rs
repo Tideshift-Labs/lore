@@ -473,31 +473,45 @@ impl<'a> DomainBackfill<'a> {
                 hex::encode(&foreign[0].partition)
             )));
         }
-        let client = self
+        let mut client = self
             .pool
             .get()
             .await
             .map_err(|e| DomainError::from_pool("backfill complete pool", e))?;
-        client
-            .execute(
-                "UPDATE lore_domain_schema_state \
+        // One transaction, because the two writes are one decision.
+        //
+        // They stay two statements: the second is a CAS whose predicate is the
+        // state the first sets, which is what makes VERIFIED a real precondition
+        // for CUTOVER rather than an assumption. But committing them separately
+        // left a window in which a crash between them stranded the cell at
+        // VERIFIED — a state `mark_running` refuses to start from and no code
+        // path could advance, so the only recovery was hand-written SQL against
+        // a live cell.
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("backfill complete transaction", e))?;
+        tx.execute(
+            "UPDATE lore_domain_schema_state \
                  SET backfill_state = $1, backfill_version = $2, residue_classified = true, \
                      updated_at = clock_timestamp() \
                  WHERE id = 1",
-                &[&schema::BACKFILL_VERIFIED, &BACKFILL_VERSION],
-            )
-            .await
-            .map_err(|e| DomainError::from_pg("backfill mark verified", e))?;
-        client
-            .execute(
-                "UPDATE lore_domain_schema_state \
+            &[&schema::BACKFILL_VERIFIED, &BACKFILL_VERSION],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("backfill mark verified", e))?;
+        tx.execute(
+            "UPDATE lore_domain_schema_state \
                  SET backfill_state = $1, cutover_at = clock_timestamp(), \
                      updated_at = clock_timestamp() \
                  WHERE id = 1 AND backfill_state = $2 AND residue_classified = true",
-                &[&schema::BACKFILL_CUTOVER, &schema::BACKFILL_VERIFIED],
-            )
+            &[&schema::BACKFILL_CUTOVER, &schema::BACKFILL_VERIFIED],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("backfill set cutover", e))?;
+        tx.commit()
             .await
-            .map_err(|e| DomainError::from_pg("backfill set cutover", e))?;
+            .map_err(|e| DomainError::from_pg("backfill complete commit", e))?;
         Ok(())
     }
 

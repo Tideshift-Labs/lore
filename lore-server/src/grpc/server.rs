@@ -105,6 +105,32 @@ pub(crate) fn domain_operation_service_available(
     has_domain_context && auth_url.is_some() && auth_enabled
 }
 
+/// Whether `domain_operation_receipt_v2` may be advertised.
+///
+/// The service being mounted is not enough, and WP-120's live proof is what
+/// showed the difference. `domain_operation_receipt_v2` tells a client that a
+/// mutation on this cell files an attempt receipt it can later look up. A cell
+/// whose domain enforcement is off files none: `internal_admission_reason`
+/// returns `Ok(None)` on `!self.enforcement`, so every mutation takes the legacy
+/// path and no receipt ever exists. A client trusting the advertised capability
+/// then waits for, or reconciles against, a receipt that cannot be written —
+/// and the cell looks healthy the whole time, because refusing to file a receipt
+/// it was never asked for is correct behaviour for an unarmed cell.
+///
+/// Deliberately narrower than the mount predicate rather than replacing it. The
+/// service's other methods are the maintenance rail over the mediated proof
+/// catalog; those neither depend on enforcement nor promise a receipt, so
+/// unmounting the service on an unenforcing cell would withdraw working
+/// operations to fix a claim about a different one.
+/// `domain_operation_proof_namespace_lifecycle_v1` keeps the mount predicate for
+/// exactly that reason.
+pub(crate) fn domain_operation_receipt_capability_available(
+    service_available: bool,
+    enforcement_enabled: bool,
+) -> bool {
+    service_available && enforcement_enabled
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct GrpcServiceSettings {
     // max size of response payloads
