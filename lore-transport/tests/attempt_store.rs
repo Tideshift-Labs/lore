@@ -511,6 +511,85 @@ async fn ownership_is_keyed_by_branch_and_resource_not_by_attempt() {
     );
 }
 
+/// `clear_ownership` is the release path's counterpart to `record_ownership`, called by whoever
+/// later releases a lock (usually a different attempt than the one that acquired it). Clearing a
+/// resource this client holds no token for must not be an error -- a release racing an eviction,
+/// or simply released by a process that never durably recorded the acquire, is not a fault.
+#[tokio::test]
+async fn clearing_a_resource_with_no_held_token_is_not_an_error() {
+    let store = VolatileAttemptStore::new();
+    let branch = Context::from([0x11u8; 16]);
+    let resource_hash = Hash::from([0x22u8; 32]);
+
+    store
+        .clear_ownership(&branch, &resource_hash)
+        .await
+        .expect("clearing an untracked resource must succeed, not error");
+
+    assert_eq!(
+        store.ownership_for(&branch, &resource_hash).await.unwrap(),
+        None
+    );
+}
+
+/// `clear_ownership` removes only the named `(branch, resource_hash)` -- a different resource
+/// held on the same branch, and the same resource hash held on a different branch, must survive.
+#[tokio::test]
+async fn clear_ownership_removes_only_the_named_resource() {
+    let store = VolatileAttemptStore::new();
+    let attempt = AttemptId::new();
+    let branch = Context::from([0x11u8; 16]);
+    let other_branch = Context::from([0x33u8; 16]);
+    let cleared_resource = Hash::from([0x22u8; 32]);
+    let other_resource = Hash::from([0x44u8; 32]);
+
+    for (branch, resource_hash) in [
+        (branch, cleared_resource),
+        (branch, other_resource),
+        (other_branch, cleared_resource),
+    ] {
+        store
+            .record_ownership(&LockOwnership {
+                attempt_id: attempt,
+                branch,
+                resource_hash,
+                token: Bytes::from_static(b"token"),
+            })
+            .await
+            .unwrap();
+    }
+
+    store
+        .clear_ownership(&branch, &cleared_resource)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .ownership_for(&branch, &cleared_resource)
+            .await
+            .unwrap(),
+        None,
+        "the named resource must be cleared"
+    );
+    assert!(
+        store
+            .ownership_for(&branch, &other_resource)
+            .await
+            .unwrap()
+            .is_some(),
+        "a different resource on the same branch must survive"
+    );
+    assert!(
+        store
+            .ownership_for(&other_branch, &cleared_resource)
+            .await
+            .unwrap()
+            .is_some(),
+        "the same resource hash on a different branch must survive"
+    );
+}
+
 /// Priority 8: `receipt: None` is a deliberate statement -- this operation family has no
 /// authoritative receipt to look up -- not a stand-in for "not yet known". Nothing enforces
 /// that distinction structurally, so this documents both cases surviving a round trip
