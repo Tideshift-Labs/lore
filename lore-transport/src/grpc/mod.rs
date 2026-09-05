@@ -355,6 +355,27 @@ pub fn inject_repository(
     Ok(())
 }
 
+/// Stamp the current dispatch's attempt id onto the request, when there is one.
+///
+/// Silent no-op for a read, which has no attempt id. A malformed value is dropped rather than
+/// failing the call: the header is additive carriage that an older server ignores, and refusing
+/// to dispatch a mutation because a header would not encode would trade a working call for a
+/// certain failure.
+pub fn inject_attempt_id(request: &mut tonic::Request<()>) -> Result<(), tonic::Status> {
+    let Some(attempt) = crate::outcome::current_dispatch_attempt() else {
+        return Ok(());
+    };
+    match MetadataValue::from_str(&attempt.to_string()) {
+        Ok(value) => {
+            request
+                .metadata_mut()
+                .insert(crate::outcome::ATTEMPT_ID_METADATA_KEY, value);
+        }
+        Err(err) => lore_debug!("Dropping unrepresentable attempt id header: {err}"),
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct CorrelationInterceptor;
 
@@ -380,6 +401,7 @@ impl Interceptor for AuthnInterceptor {
     ) -> Result<tonic::Request<()>, tonic::Status> {
         inject_correlation_id(&mut request)?;
         inject_authorization(&mut request, self.auth.read().authentication_token.as_str())?;
+        inject_attempt_id(&mut request)?;
         Ok(request)
     }
 }
@@ -398,6 +420,7 @@ impl Interceptor for AuthzInterceptor {
         inject_correlation_id(&mut request)?;
         inject_authorization(&mut request, self.auth.read().authorization_token.as_str())?;
         inject_repository(&mut request, self.repository)?;
+        inject_attempt_id(&mut request)?;
         Ok(request)
     }
 }
@@ -1331,7 +1354,11 @@ where
         ReplayClass::ReadRetryable => with_reconnect(connection, op, rebuild).await,
         ReplayClass::MutableNoReplay => {
             let attempt = AttemptId::new();
-            match op().await {
+            // Scoped around the dispatch so the interceptor stamps this attempt onto the
+            // request. The id the server persists is therefore the same one this client names in
+            // the error it raises when the answer never arrives, which is the whole point: a
+            // reconciler looks the receipt up under the identity it already journaled.
+            match crate::outcome::with_dispatch_attempt(attempt, op()).await {
                 Err(ProtocolError::Disconnected(_)) => {
                     Err(outcome_unknown(rpc.wire_name(), &attempt))
                 }

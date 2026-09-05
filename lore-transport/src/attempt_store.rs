@@ -182,6 +182,24 @@ pub trait AttemptStore: Send + Sync {
         resource_hash: &Hash,
     ) -> Result<Option<LockOwnership>, ProtocolError>;
 
+    /// Forget the token for one resource, once the server has confirmed the lock is gone.
+    ///
+    /// The release path's counterpart to [`Self::record_ownership`], and separate from
+    /// [`Self::resolve`] because the two answer different questions. `resolve` settles the
+    /// attempt that *acquired* a lock and drops what that attempt was holding; this is called by
+    /// whoever later releases the lock, which is usually a different attempt in a different
+    /// process lifetime, and which is the only party that knows the release succeeded.
+    ///
+    /// Call it only on a confirmed release. A release whose outcome is unknown must leave the
+    /// token exactly where it is: discarding it on a maybe would strand a lock that is still held
+    /// with no token left to release it, which is the one failure CR-030's token exists to
+    /// prevent. Clearing a resource this client holds no token for is not an error.
+    async fn clear_ownership(
+        &self,
+        branch: &Context,
+        resource_hash: &Hash,
+    ) -> Result<(), ProtocolError>;
+
     /// Settle an attempt and release any lock ownership it held.
     ///
     /// Moves the record to [`AttemptState::Resolved`] and *keeps* it. Nothing removes a record:
@@ -288,6 +306,17 @@ impl AttemptStore for VolatileAttemptStore {
             .iter()
             .find(|s| s.branch == *branch && s.resource_hash == *resource_hash)
             .cloned())
+    }
+
+    async fn clear_ownership(
+        &self,
+        branch: &Context,
+        resource_hash: &Hash,
+    ) -> Result<(), ProtocolError> {
+        self.ownership
+            .lock()
+            .retain(|held| !(held.branch == *branch && held.resource_hash == *resource_hash));
+        Ok(())
     }
 
     async fn resolve(

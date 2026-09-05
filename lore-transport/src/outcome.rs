@@ -71,6 +71,21 @@ pub const OUTCOME_UNKNOWN_OPERATION_KEY: &str = "lore-outcome-unknown-operation"
 /// Companion header naming the attempt the server lost the outcome of.
 pub const OUTCOME_UNKNOWN_ATTEMPT_KEY: &str = "lore-outcome-unknown-attempt";
 
+/// Request header carrying this client's attempt identity *to* the server. PIN(WP-120,
+/// 2026-09-05).
+///
+/// The three keys above are response metadata: they are how a server tells a client it lost an
+/// outcome. This one runs the other way, and it exists because the other three could not do the
+/// job alone. The server mints its own operation id at internal prepare and files the receipt
+/// under it, and the client only ever learns that id from the response — which, in the case that
+/// matters, is the response that went missing. Nothing the server already holds can join the two.
+/// So the client sends an identity it minted itself, before dispatch, and the server persists it
+/// alongside the receipt.
+///
+/// Plain ASCII, so no `-bin` suffix: the value is the hyphenated lowercase UUID that
+/// [`AttemptId`]'s `Display` renders, and a `-bin` key would make tonic expect base64.
+pub const ATTEMPT_ID_METADATA_KEY: &str = "lore-attempt-id";
+
 /// The identity one attempt at a mutable operation was dispatched under.
 ///
 /// UUIDv7 so it sorts by mint time, which is what makes a journal of unresolved attempts
@@ -97,6 +112,33 @@ impl fmt::Display for AttemptId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+tokio::task_local! {
+    /// The attempt the dispatch on this task was minted for.
+    static DISPATCH_ATTEMPT: AttemptId;
+}
+
+/// Run one dispatch with its attempt id visible to the interceptor that stamps the request.
+///
+/// A task-local rather than a parameter because the request is built deep inside a per-service
+/// client and the header is added by a `tonic` interceptor, and there is no seam between the two
+/// to thread a value through. The scope covers exactly the awaited dispatch, so an id cannot
+/// leak onto an unrelated call on the same task.
+pub async fn with_dispatch_attempt<F>(attempt: AttemptId, dispatch: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    DISPATCH_ATTEMPT.scope(attempt, dispatch).await
+}
+
+/// The attempt this dispatch was minted for, if it is one that has an identity.
+///
+/// `None` for a read. Only a mutation gets an attempt id, because only a mutation has an outcome
+/// worth reconciling, and stamping reads would put an identity on the wire for calls the server
+/// files no receipt for.
+pub fn current_dispatch_attempt() -> Option<AttemptId> {
+    DISPATCH_ATTEMPT.try_with(|attempt| *attempt).ok()
 }
 
 /// Build the public unknown-outcome error for one named operation and attempt.
