@@ -792,6 +792,38 @@ mod live_tests {
         assert!(receipt.state.is_attributive());
     }
 
+    /// Companion to `mod tests`'s `a_not_applied_receipt_without_a_reason_version_is_refused` at
+    /// the wire level: only this suite can build an unversioned `NOT_APPLIED` as bytes a real
+    /// server would put on the wire and drive it through the actual `tonic` decode path, rather
+    /// than constructing the in-memory response struct directly. WP-120 makes `NOT_APPLIED`
+    /// decisive only when versioned; an unversioned one is a response the contract does not
+    /// describe, and this client must refuse it rather than resolve a durable record on it.
+    #[tokio::test]
+    async fn an_unversioned_not_applied_is_refused_over_a_real_wire_round_trip() {
+        let mut committed = wire_response(DomainOperationReceiptStatus::Committed);
+        committed.outcome = DomainOperationOutcome::NotApplied as i32;
+        committed.reason_version = None;
+        committed.reason = "BRANCH_PROTECTED".to_string();
+
+        let harness = start_test_domain_operations(
+            ReceiptGetBehavior::Respond(committed),
+            "test-lore-jwt",
+            RepositoryId::from([0x01u8; 16]),
+        )
+        .await;
+
+        let error = harness
+            .client
+            .receipt_get(&query())
+            .await
+            .expect_err("an unversioned NOT_APPLIED must not decode as a successful receipt");
+
+        assert!(
+            format!("{error}").contains("no reason version"),
+            "expected the missing-reason-version refusal, got: {error}"
+        );
+    }
+
     /// The real server rejects a caller whose verified JWT is not the control-plane service
     /// account (`lore-server/src/grpc/domain/v1/service.rs`'s `authenticated_service`), which is
     /// exactly what a human-principal desktop caller is against this RPC today. That refusal
