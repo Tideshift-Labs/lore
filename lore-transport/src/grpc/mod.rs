@@ -81,6 +81,48 @@ const RETRY_MAX_BACKOFF_MS: u64 = 10_000;
 const RETRY_MAX_ATTEMPTS: usize = 60;
 const GRPC_CONNECT_TIMEOUT_SECS: u64 = 5;
 
+/// [`RETRY_MAX_BACKOFF_MS`] as a `Duration`, which is also the ceiling a
+/// server-supplied retry hint is clamped to. See [`retry_delay_hint`].
+const RETRY_MAX_BACKOFF: Duration = Duration::from_millis(RETRY_MAX_BACKOFF_MS);
+
+/// The client's `RESOURCE_EXHAUSTED` backoff schedule: 50 ms doubling to a 10 s
+/// ceiling, over 60 attempts, with up to 100 ms of jitter per wait added by
+/// [`crate::util::Retry`].
+///
+/// # The per-RPC budget, measured rather than assumed
+///
+/// This schedule is bounded but not short, and the number is written down here
+/// because a server-side constant once justified itself against a client that
+/// did not exist. `lore-server`'s
+/// `measure_the_real_lore_client_resource_exhausted_retry_budget`
+/// (`lore-server/tests/outbox_load_proof.rs`) drives *this* schedule under a
+/// paused clock and pins the three constants above against this file, so a
+/// change here trips that test rather than silently invalidating its number.
+///
+/// | | attempts | elapsed per refused RPC |
+/// | --- | --- | --- |
+/// | no server hint | 60 | 532.8 s to 539.0 s |
+/// | honouring a 10 s `RetryInfo` | 60 | 600.0 s to 605.2 s |
+///
+/// The hinted row's arithmetic: attempts 1 to 8 have a base step below 10 s, so
+/// the hint dominates at exactly 10,000 ms each (80.0 s); attempts 9 to 60 sit
+/// at the 10,000 ms ceiling plus jitter, so the base step dominates
+/// (520.0 s to 525.2 s).
+///
+/// **Honouring the hint lengthens the worst case by about a minute, and that is
+/// the trade being made.** What it buys is that no retry lands before the server
+/// has had a chance to re-examine its answer. Unhinted, the first eight attempts
+/// all fall inside 12.75 s, and CR-032's admission gate serves a verdict its
+/// readiness tick refreshes every five seconds — so those attempts were
+/// guaranteed to re-read the identical cached refusal. Trading a minute of tail
+/// latency for eight pointless round trips against an already-loaded cell is the
+/// right direction.
+///
+/// **This is a floor, not a ceiling, in two ways that still hold.** It counts
+/// only the waits, not the round trips between them; and `grpc_retry()` is built
+/// per RPC, so an operation issuing several refused RPCs pays the budget several
+/// times over. Nothing above truncates it: the endpoint carries no request
+/// timeout, and [`GRPC_CONNECT_TIMEOUT_SECS`] bounds channel setup only.
 fn grpc_retry() -> crate::util::Retry {
     crate::util::retry(
         RETRY_START_BACKOFF_MS,
@@ -847,10 +889,127 @@ pub async fn connect(
     Ok(connection)
 }
 
+/// The canonical type URL a `google.rpc.RetryInfo` is packed under.
+const RETRY_INFO_TYPE_URL: &str = "type.googleapis.com/google.rpc.RetryInfo";
+
+/// The `google.rpc.Status` carried in the `grpc-status-details-bin` trailer.
+///
+/// Only `details` is transcribed. prost skips fields a message does not declare,
+/// and the trailer's `code` and `message` duplicate what the gRPC status line
+/// already carries — this decoder reads neither. Hand-written for the same two
+/// reasons the server hand-writes the matching encoder
+/// (`lore-server/src/event_relay/retry_info.rs`): `protoc` is optional in this
+/// workspace, and this is a decade-frozen schema of three fields.
+#[derive(Clone, PartialEq, prost::Message)]
+struct RpcStatusDetails {
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<prost_types::Any>,
+}
+
+/// `google.rpc.RetryInfo`.
+#[derive(Clone, PartialEq, prost::Message)]
+struct RetryInfo {
+    #[prost(message, optional, tag = "1")]
+    retry_delay: Option<prost_types::Duration>,
+}
+
+/// The server's requested retry delay, clamped to this client's own ceiling.
+///
+/// `None` whenever there is no usable hint, and that covers more than an absent
+/// trailer. **The `details` field on this fork is not reliably a
+/// `google.rpc.Status`**: several handlers in `lore-server`'s `grpc::mod` put
+/// their own opaque bytes there instead, which the admission gate's encoder
+/// records as `PIN(WP-119)`. So arbitrary bytes have to decode to "no hint"
+/// rather than to a wrong duration or a panic, and every step below is fallible
+/// on purpose — a bad decode, a missing detail, a missing delay, or a negative
+/// one all return `None` and leave the caller on its own schedule.
+///
+/// The clamp to [`RETRY_MAX_BACKOFF`] is what keeps a remote from setting this
+/// client's wait: a server asking for an hour gets the same ten seconds a server
+/// asking for ten does. The hint can only ever move a wait *up to* the ceiling
+/// this client already shipped, never past it.
+///
+/// `pub` only so `lore-server`'s load proof and this crate's own retry-budget
+/// suite can drive it from outside; `handle_error` is the sole production
+/// caller. Hidden from the rendered docs to keep it off the crate's advertised
+/// surface.
+#[doc(hidden)]
+pub fn retry_delay_hint(status: &Status) -> Option<Duration> {
+    use prost::Message as _;
+
+    let trailer = status.details();
+    if trailer.is_empty() {
+        return None;
+    }
+
+    let decoded = RpcStatusDetails::decode(trailer).ok()?;
+    let any = decoded
+        .details
+        .iter()
+        .find(|any| any.type_url == RETRY_INFO_TYPE_URL)?;
+    let delay = RetryInfo::decode(&any.value[..]).ok()?.retry_delay?;
+
+    // A `google.protobuf.Duration` is signed. A negative one is not a delay this
+    // client can honour, and saturating it to zero would silently turn a
+    // malformed hint into "retry immediately" — the one direction that makes
+    // things worse for a server already refusing.
+    let seconds = u64::try_from(delay.seconds).ok()?;
+    let nanos = u32::try_from(delay.nanos).ok()?;
+
+    // Saturating rather than `Duration::new`, which panics on overflow.
+    let hint = Duration::from_secs(seconds).saturating_add(Duration::from_nanos(u64::from(nanos)));
+    Some(hint.min(RETRY_MAX_BACKOFF))
+}
+
+/// Wait out one retry attempt, never returning sooner than the server asked.
+///
+/// The wait is `max(this client's own next backoff step, hint)`, and it costs
+/// **exactly one attempt** — the hint changes how long an attempt waits, never
+/// how many attempts remain. [`crate::util::Retry`] owns the sleeping, the
+/// jitter and the counting; all this adds is the remainder, and only when the
+/// step it already slept fell short of the hint. With `hint` of `None` that
+/// remainder is never computed and the behaviour is exactly `retry.wait()`.
+///
+/// Taking the maximum rather than the hint is deliberate in both directions. The
+/// hint is a floor the server is entitled to set, so a 50 ms opening step must
+/// not race ahead of it; and the client's own late-schedule steps are a ceiling
+/// the server is not entitled to lower, so a small hint cannot pull an
+/// exhausted-looking client back into hammering.
+///
+/// An exhausted budget returns `false` without sleeping the remainder: there is
+/// no attempt left for it to belong to.
+///
+/// `pub` and `#[doc(hidden)]` for the same reason as [`retry_delay_hint`]: it is
+/// a test seam, not advertised surface.
+#[doc(hidden)]
+pub async fn wait_with_hint(retry: &mut crate::util::Retry, hint: Option<Duration>) -> bool {
+    let started = tokio::time::Instant::now();
+    if !retry.wait().await {
+        return false;
+    }
+    if let Some(hint) = hint
+        && let Some(remainder) = hint.checked_sub(started.elapsed())
+    {
+        tokio::time::sleep(remainder).await;
+    }
+    true
+}
+
+/// Decide whether a failed RPC is worth another attempt, and wait if it is.
+///
+/// **Only `RESOURCE_EXHAUSTED` is retried here, and that is unchanged.**
+/// [`retry_delay_hint`] does not look at the status code, so a hint would be
+/// honoured on any code this arm grew to cover — but growing it is a separate
+/// decision with a separate cost. `UNAVAILABLE` in particular is not retryable
+/// from this seam: it can follow a request that already reached the server, and
+/// re-issuing one of those is the redispatch that [`with_reconnect_classified`]
+/// exists to refuse. A hint in the trailer is a request for patience, never a
+/// warrant to send a mutation twice.
 async fn handle_error(retry: &mut crate::util::Retry, status: Status) -> Result<(), ProtocolError> {
     match status.code() {
         tonic::Code::ResourceExhausted => {
-            if !retry.wait().await {
+            let hint = retry_delay_hint(&status);
+            if !wait_with_hint(retry, hint).await {
                 return Err(ProtocolError::from(status));
             }
         }

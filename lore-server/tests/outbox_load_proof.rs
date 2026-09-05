@@ -199,6 +199,7 @@ use lore_server::event_relay::RetentionConfig;
 use lore_server::event_relay::RowOutcome;
 use lore_server::event_relay::admission::ADMISSION_RETRY_DELAY;
 use lore_server::event_relay::readiness::REASON_OLDEST_UNPUBLISHED;
+use lore_server::event_relay::retry_info::retry_info_details;
 use lore_server::plugins::remote_notification::client::GrpcPublishTransport;
 use lore_server::plugins::remote_notification::client::PrivateGatewayClient;
 use lore_server::plugins::remote_notification::client::PublishTransport;
@@ -1576,18 +1577,26 @@ async fn time_admission_probe(client: &tokio_postgres::Client) -> f64 {
 /// can exceed that budget; fixing that requires a reviewed client-path change
 /// rather than multiplying retries."
 ///
-/// So the budget question has to be answered against the **real** client
-/// policy, not a hypothetical one. This measures it.
+/// That reviewed client-path change has since been made. `lore-transport`'s
+/// `handle_error` now reads this gate's `RetryInfo` and waits
+/// `max(its own backoff step, the hint)` per attempt, counting it as one
+/// attempt. So the budget question is answered against the **real** client
+/// policy in its current shape, and this case measures both halves: what a
+/// refused client does with our hint, and what it would still do without one.
 ///
-/// Two things make the measurement sound rather than a restatement of source:
+/// Three things make the measurement sound rather than a restatement of source:
 ///
-/// * the schedule is driven through `lore_transport::util::Retry` itself --
-///   the same type `lore-transport`'s `handle_error` waits on -- under a paused
-///   tokio clock, so the total is the policy's own arithmetic and not this
-///   file's; and
-/// * the three constants that parameterise it are **pinned against the source
-///   file**, so a policy change breaks this case instead of silently
-///   invalidating the number.
+/// * the schedule is driven through `lore_transport`'s own `wait_with_hint` and
+///   `util::Retry` -- the same code path `handle_error` runs -- under a paused
+///   tokio clock, so the totals are the policy's own arithmetic and not this
+///   file's;
+/// * the hint is not hand-fed. It is encoded by *this crate's*
+///   `retry_info_details`, attached to a real `tonic::Status`, and read back by
+///   the client's own `retry_delay_hint`, so the two halves of the contract are
+///   joined on real bytes rather than on a shared assumption; and
+/// * the constants and the call sites that parameterise it are **pinned against
+///   the source file**, so a policy change on either side breaks this case
+///   instead of silently invalidating the numbers.
 ///
 /// This case needs no infrastructure and is therefore NOT `#[ignore]`d: it
 /// runs in the ordinary `cargo test -p lore-server` gate, where a client-path
@@ -1603,59 +1612,132 @@ async fn measure_the_real_lore_client_resource_exhausted_retry_budget() {
         "const RETRY_MAX_BACKOFF_MS: u64 = 10_000;",
         "const RETRY_MAX_ATTEMPTS: usize = 60;",
         "tonic::Code::ResourceExhausted => {",
-        "if !retry.wait().await {",
+        // The hint read, and the wait that honours it. Both, because a decoder
+        // that nothing calls would leave the old budget in force while looking
+        // like the new one.
+        "pub fn retry_delay_hint(status: &Status) -> Option<Duration> {",
+        "let hint = retry_delay_hint(&status);",
+        "if !wait_with_hint(retry, hint).await {",
+        // Everything that is not RESOURCE_EXHAUSTED still fails immediately.
+        // The hint reader does not look at the status code, so this arm is the
+        // only thing keeping UNAVAILABLE out of the retry path -- and a retried
+        // UNAVAILABLE would redispatch a mutation, not merely lengthen a wait.
+        "_ => return Err(ProtocolError::from(status)),",
     ] {
         assert!(
             source.contains(pin),
             "lore-transport's RESOURCE_EXHAUSTED retry policy has changed: {pin:?} is no longer in \
              lore-transport/src/grpc/mod.rs. Re-measure this budget and update CR-032's record \
-             before assuming the number below still holds."
+             before assuming the numbers below still hold."
         );
     }
-    // The client's backoff is its own. It never reads the server's RetryInfo,
-    // which is why the measured total below is not a multiple of
-    // ADMISSION_RETRY_DELAY. Pinned, because "the client honours our retry
-    // hint" is exactly the kind of claim that gets assumed.
-    // Deliberately trips on a mere mention, comment included. A mention means
-    // someone has been in this code thinking about the server's hint, and the
-    // budget below has to be re-derived either way; a pin that only fired on a
-    // call site would miss a half-finished change.
+    // Nothing in THIS file truncates the retry loop. The budget below counts
+    // waits under the assumption that a refused RPC runs to the end of its
+    // schedule; a per-request deadline would cut it short and make these numbers
+    // an over-estimate rather than a floor.
+    //
+    // Scope, stated because the pin is narrower than the claim it supports: this
+    // reads `grpc/mod.rs` only. A deadline introduced on the `Endpoint` in
+    // `lore-transport/src/connection.rs`, in a tower layer, or in one of the
+    // per-verb client files under `lore-transport/src/grpc/` would not trip it.
+    // The pin is worth having anyway -- `grpc/mod.rs` is where the endpoint is
+    // actually built (`connect_to_endpoint`), so it is where such a deadline
+    // would most likely land -- but it is not a proof that no deadline exists
+    // anywhere, and it must not be read as one.
     assert!(
-        !source.contains("RetryInfo"),
-        "lore-transport's gRPC layer now mentions RetryInfo. If the client began honouring the \
-         server's hint -- or is part way to doing so -- this whole budget calculation changes and \
-         must be re-derived rather than re-asserted."
+        !source.contains(".timeout("),
+        "lore-transport/src/grpc/mod.rs now sets a request timeout. That truncates the retry \
+         budget measured below, which is derived as an untruncated floor -- re-derive it rather \
+         than re-asserting it."
     );
 
-    // -- drive the real waiter under a paused clock ------------------------
+    // -- join the two halves on real bytes ---------------------------------
+    // This gate's own encoder, through a real status, into the client's own
+    // decoder. A hand-built Duration here would prove only that arithmetic
+    // works; this proves the client reads what this gate actually sends.
+    let refusal = tonic::Status::with_details(
+        tonic::Code::ResourceExhausted,
+        "the backlog is too old",
+        retry_info_details(ADMISSION_RETRY_DELAY, "the backlog is too old"),
+    );
+    let hint = lore_transport::grpc::retry_delay_hint(&refusal);
+    assert_eq!(
+        hint,
+        Some(ADMISSION_RETRY_DELAY),
+        "the client's retry_delay_hint did not read this gate's own RetryInfo bytes"
+    );
+
+    // -- the hinted budget: what a refused client actually does now ---------
     let mut retry = lore_transport::util::retry(50, 10_000, 60);
     let started = tokio::time::Instant::now();
     let mut attempts = 0_usize;
     let mut first_waits = Vec::new();
-    while retry.wait().await {
+    let mut previous = Duration::ZERO;
+    while lore_transport::grpc::wait_with_hint(&mut retry, hint).await {
         attempts += 1;
-        if first_waits.len() < 5 {
-            first_waits.push(started.elapsed());
+        let elapsed = started.elapsed();
+        if first_waits.len() < 8 {
+            first_waits.push(elapsed - previous);
         }
+        previous = elapsed;
     }
     let total = started.elapsed();
 
     assert_eq!(attempts, 60, "the shipped attempt limit is 60");
-    assert_eq!(retry.counter(), 60);
-    // Base schedule is 50+100+200+400+800+1600+3200+6400 = 12,750 ms, then 52
-    // waits capped at 10,000 ms = 520,000 ms, so 532.75 s before jitter; jitter
-    // adds at most 100 ms per wait.
+    assert_eq!(
+        retry.counter(),
+        60,
+        "honouring the hint must lengthen an attempt, never consume an extra one"
+    );
+    // The first eight waits are the ones the hint changes: unhinted they would
+    // be 50, 100, 200, 400, 800, 1600, 3200 and 6400 ms, every one of them
+    // shorter than a readiness interval.
+    for (index, wait) in first_waits.iter().enumerate() {
+        assert!(
+            *wait >= ADMISSION_RETRY_DELAY,
+            "hinted wait {index} was {wait:?}, shorter than the {ADMISSION_RETRY_DELAY:?} this \
+             gate asked for"
+        );
+    }
+    // Attempts 1-8 have a base step below the hint, so the hint dominates at
+    // exactly 10,000 ms each = 80,000 ms. Attempts 9-60 (52 of them) sit at the
+    // client's own 10,000 ms ceiling, where the base step dominates and jitter
+    // adds at most 100 ms per wait = 520,000 to 525,200 ms.
     assert!(
-        total >= Duration::from_millis(532_750) && total <= Duration::from_secs(539),
-        "measured retry budget {total:?} is outside the schedule the pinned constants imply; the \
-         policy or the jitter rule has changed"
+        total >= Duration::from_millis(600_000) && total <= Duration::from_millis(605_200),
+        "measured hinted retry budget {total:?} is outside the schedule the pinned constants and \
+         ADMISSION_RETRY_DELAY imply; the policy, the hint or the jitter rule has changed"
+    );
+
+    // -- the unhinted baseline, still reachable and still measured ---------
+    // A server that sends no RetryInfo -- every server on this wire but the
+    // admission gate -- gets the client's own schedule unchanged. Pinned so the
+    // hint path cannot quietly become the only path.
+    let mut baseline = lore_transport::util::retry(50, 10_000, 60);
+    let baseline_started = tokio::time::Instant::now();
+    let mut baseline_attempts = 0_usize;
+    while lore_transport::grpc::wait_with_hint(&mut baseline, None).await {
+        baseline_attempts += 1;
+    }
+    let baseline_total = baseline_started.elapsed();
+
+    assert_eq!(baseline_attempts, 60);
+    // 50+100+200+400+800+1600+3200+6400 = 12,750 ms, then 52 waits capped at
+    // 10,000 ms = 520,000 ms, so 532.75 s before jitter.
+    assert!(
+        baseline_total >= Duration::from_millis(532_750)
+            && baseline_total <= Duration::from_secs(539),
+        "measured unhinted retry budget {baseline_total:?} is outside the schedule the pinned \
+         constants imply; honouring the hint must not have changed the no-hint path"
     );
 
     let attempts_inside_one_minute = {
         let mut probe = lore_transport::util::retry(50, 10_000, 60);
         let start = tokio::time::Instant::now();
         let mut n = 0_usize;
-        while start.elapsed() < Duration::from_secs(60) && probe.wait().await {
+        while start.elapsed() < Duration::from_secs(60)
+            && lore_transport::grpc::wait_with_hint(&mut probe, hint).await
+        {
             n += 1;
         }
         n
@@ -1664,32 +1746,43 @@ async fn measure_the_real_lore_client_resource_exhausted_retry_budget() {
     println!("=== the real Lore client's RESOURCE_EXHAUSTED retry budget ===");
     println!("policy source          lore-transport/src/grpc/mod.rs (grpc_retry)");
     println!("start / cap / attempts 50ms / 10,000ms / 60");
-    println!("honours server RetryInfo?  NO -- handle_error waits on its own backoff");
-    println!("server RetryInfo hint  {:?}", ADMISSION_RETRY_DELAY);
+    println!("honours server RetryInfo?  YES -- max(own backoff step, hint), hint clamped to cap");
+    println!("server RetryInfo hint  {ADMISSION_RETRY_DELAY:?}");
+    println!("  read back by the client's own decoder from this crate's own encoder: {hint:?}");
     println!(
-        "measured total elapsed {:.1}s over {attempts} attempts",
+        "measured HINTED total  {:.1}s over {attempts} attempts",
         total.as_secs_f64()
     );
-    println!("attempts inside 60s    {attempts_inside_one_minute}");
-    println!("first five waits at    {first_waits:?}");
     println!(
-        "VERDICT: a generic client refused continuously retries for about {:.0} seconds \
-         ({:.1} minutes) before giving up. ADMISSION_RETRY_DELAY's doc comment reasons about a \
-         'six-attempt client inside one minute of elapsed time'; the shipped client is a \
-         sixty-attempt client. CR-032 requires one documented maximum elapsed/attempt budget to \
-         cover this, and blocks activation if the generic retry can exceed it. RECORDED AS \
-         EVIDENCE, not fixed here: the limit is unchanged and the client path is not this file's \
-         to edit.",
+        "measured UNHINTED total {:.1}s over {baseline_attempts} attempts (unchanged path)",
+        baseline_total.as_secs_f64()
+    );
+    println!("attempts inside 60s    {attempts_inside_one_minute}");
+    println!("first eight waits      {first_waits:?}");
+    println!(
+        "VERDICT: a client refused continuously now retries for about {:.0} seconds ({:.1} \
+         minutes) before giving up, against {:.0} seconds unhinted. Honouring the hint made the \
+         worst case LONGER by about {:.0} seconds -- that is the trade, and it is the right one: \
+         unhinted, the first eight attempts all landed inside 12.75 s and were guaranteed to \
+         re-read the identical cached verdict, because this gate refreshes on a five-second \
+         readiness tick. Every retry now arrives after at least one whole refresh. \
+         ADMISSION_RETRY_DELAY's doc comment used to reason about 'a six-attempt client inside \
+         one minute'; with the hint honoured that client finally exists -- {} attempts inside the \
+         first minute -- but it does not stop there, and 600 s per refused RPC is the number \
+         CR-032's activation gate has to accept or refuse.",
         total.as_secs_f64(),
-        total.as_secs_f64() / 60.0
+        total.as_secs_f64() / 60.0,
+        baseline_total.as_secs_f64(),
+        total.as_secs_f64() - baseline_total.as_secs_f64(),
+        attempts_inside_one_minute
     );
     println!(
         "  This is a FLOOR, not a ceiling, in three ways. It counts only the waits, not the RPC \
          round trips between them. `grpc_retry()` is constructed per RPC, so a client operation \
          that issues several refused RPCs pays this budget several times over. And nothing \
-         truncates it: the endpoint carries no request timeout, and GRPC_CONNECT_TIMEOUT_SECS \
-         bounds channel setup only. The activation question CR-032 asks is therefore answered a \
-         fortiori."
+         truncates it: the endpoint carries no request timeout (pinned above), and \
+         GRPC_CONNECT_TIMEOUT_SECS bounds channel setup only. The activation question CR-032 asks \
+         is therefore answered a fortiori."
     );
     measured(CASE);
 }

@@ -15,6 +15,7 @@ lore-credential = { workspace = true }
 
 async-trait = { workspace = true }
 async-stream = { workspace = true }
+prost = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
@@ -37,6 +38,15 @@ url = { workspace = true }
 uuid = { workspace = true, features = ["std"] }
 webpki-roots = { workspace = true }
 zerocopy = { workspace = true }
+
+[dev-dependencies]
+# Paused/advanceable clock for the retry-budget tests in
+# `tests/grpc_retry_hint.rs`. `grpc_retry()`'s schedule runs for over ten
+# minutes of wall time across its sixty attempts, so measuring it against a real
+# clock is not an option; `start_paused = true` makes the total the policy's own
+# arithmetic and the test instant. Same reason, and same one-feature addition,
+# as `lore-server`'s dev-dependency on it.
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 trace_log = ["lore-base/trace_log"]

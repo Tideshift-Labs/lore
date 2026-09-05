@@ -130,13 +130,64 @@ use crate::event_relay::retry_info;
 /// several batches at any rate in this neighbourhood, which both biases leave
 /// true.
 ///
-/// # The ceiling
+/// # The ceiling, against the real client rather than an assumed one
 ///
 /// CR-032 caps the delay by the documented client retry budget: activation is
-/// blocked if a generic client's `RESOURCE_EXHAUSTED` retry can exceed it. Ten
-/// seconds leaves a six-attempt client inside one minute of elapsed time, which
-/// is well inside any budget the real Lore client policy could document.
-/// Raising it further is a reviewed change, not a tuning knob.
+/// blocked if a generic client's `RESOURCE_EXHAUSTED` retry can exceed it. This
+/// paragraph used to reason about "a six-attempt client inside one minute of
+/// elapsed time". **No such client ever existed.** The shipped Lore client's
+/// `grpc_retry()` (`lore-transport/src/grpc/mod.rs`) is a sixty-attempt client,
+/// and WP-119 Phase 8's load proof measured it retrying one refused RPC for 538
+/// seconds while never reading this hint at all — nine minutes against a
+/// rationale written for one.
+///
+/// The client now honours the hint (`retry_delay_hint`/`wait_with_hint`, same
+/// file), waiting `max(its own backoff step, this delay)` per attempt and
+/// counting it as one attempt. So the budget this value implies is arithmetic
+/// rather than assumption:
+///
+/// | | |
+/// | --- | --- |
+/// | attempts per refused RPC | 60 |
+/// | elapsed per refused RPC | 600.0 s to 605.2 s |
+///
+/// Attempts 1 to 8 have a client backoff step below ten seconds, so this delay
+/// dominates at exactly 10 s each (80.0 s). Attempts 9 to 60 sit at the client's
+/// own 10 s ceiling plus up to 100 ms of jitter, so the client's step dominates
+/// (520.0 s to 525.2 s). It is a **floor**: it counts the waits and not the
+/// round trips between them, the client builds a fresh retry per RPC, and no
+/// request timeout truncates it.
+///
+/// **This describes a fork-built client, and not every client is one.** The
+/// hint-honouring change lives in our `lore-transport`; a stock Epic-built
+/// `lore` CLI does not have it and still runs the unhinted schedule — 538 s over
+/// 60 attempts, with its first eight crowded inside 12.75 seconds. So this gate
+/// faces two client populations, and the activation reasoning below must not
+/// assume the hint is read. What survives either way is the ceiling: 538 s is
+/// inside 600 s, so the fork-built client is the worse case and budgeting for it
+/// covers both.
+///
+/// Two consequences worth stating plainly.
+///
+/// **Honouring the hint made the worst case longer, not shorter** — 600 s where
+/// an unhinted client took 538 s. What it bought, for the clients that do read
+/// it, is that every retry lands after at least one whole
+/// `readiness_probe_interval`, so it reads a verdict that was re-examined. The
+/// eight attempts an unhinted client crowds into the first 12.75 seconds are
+/// guaranteed to re-read the identical cached refusal.
+///
+/// **600 seconds per refused RPC is the number CR-032's activation gate has to
+/// accept or refuse.** It is not obviously inside any budget; it is merely
+/// measured, bounded, and now derived from both halves of the relationship
+/// instead of one. Changing this constant changes that budget directly, at 60
+/// seconds of client elapsed per second added, so raising it is a reviewed
+/// change and not a tuning knob.
+///
+/// `lore-server/tests/outbox_load_proof.rs`'s
+/// `measure_the_real_lore_client_resource_exhausted_retry_budget` pins the
+/// client constants, the presence of the hint read, and the absence of a
+/// request timeout against `lore-transport`'s source, so a drift on either side
+/// trips a test here rather than quietly re-opening this gap.
 pub const ADMISSION_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 /// Consecutive failed refreshes after which a standing `Reject` is dropped.
