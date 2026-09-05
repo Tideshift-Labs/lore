@@ -3538,7 +3538,14 @@ pub async fn resolve_by_name(
     }
 }
 
-#[cfg(test)]
+/// Construction helpers for a `RepositoryContext` a test assembles by hand.
+///
+/// Widened from `#[cfg(test)]` to also cover `test_seams` (WP-120). The builder below is the only
+/// way to put a real `Arc<Connection>` on a context, and the tests that need to do that live in
+/// other crates, where a `#[cfg(test)]` module of this one is unreachable. For a context whose
+/// remote resolves through the production handshake instead of being handed a connection, use
+/// [`crate::live_fixture::LiveRepository`].
+#[cfg(any(test, feature = "test_seams"))]
 pub mod test_helpers {
     use std::sync::Arc;
 

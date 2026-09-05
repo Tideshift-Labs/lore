@@ -52,3 +52,8 @@ swfs = ["lore-revision/swfs"]
 rand = { workspace = true }
 serial_test = { workspace = true }
 lore-transport = { workspace = true, features = ["test_seams"] }
+# The live-connected repository fixture (WP-120). `lore`'s attempt-store entry points are the
+# unproven link between a caller's store and the dispatches inside an operation, and proving it
+# needs a remote that answers. Unifies with the plain `lore-revision` dependency above for
+# `cargo test`, exactly as the `lore-transport` line does.
+lore-revision = { workspace = true, features = ["test_seams"] }

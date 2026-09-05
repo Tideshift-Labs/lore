@@ -93,6 +93,12 @@ integration_tests = []
 compile_fail_tests = []
 failure_generator = []
 seeding = []
+# The live-connected repository fixture (WP-120), plus the `RepositoryContext` construction
+# helpers it and its callers need. Behind a feature for the reason `lore-transport`'s own
+# `test_seams` is: production must not link an in-process gRPC server, and a `#[cfg(test)]` module
+# is unreachable from another crate's tests, which is where the proofs this fixture exists for
+# live. Enabled for `lore`'s dev build through its dev-dependency on this crate.
+test_seams = ["lore-transport/test_seams"]
 trace_log = ["lore-base/trace_log"]
 vfs = []
 swfs = []

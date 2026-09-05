@@ -28,6 +28,12 @@ pub mod instance;
 pub mod interface;
 pub mod layer;
 pub mod link;
+/// A repository whose remote actually answers, for tests that need one (WP-120).
+///
+/// Behind `test_seams` because production must never link an in-process server. See the module's
+/// own docs for why the remote is a `tonic` stub rather than a loreserver.
+#[cfg(any(test, feature = "test_seams"))]
+pub mod live_fixture;
 pub mod lock;
 pub mod logging;
 pub mod shared_store;
