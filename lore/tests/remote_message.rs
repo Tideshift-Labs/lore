@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore::lock::LoreLockFileAcquireArgs;
+use lore::lock::LoreLockFileReleaseArgs;
 use lore::remote::command::LoreCommand;
 use lore::remote::message::MessageError;
 use lore::remote::message::MessageToServer;
@@ -82,6 +84,53 @@ async fn message_to_server_to_and_from_bytes() {
         _ => {
             panic!("Unexpected command");
         }
+    }
+}
+
+/// CR-030, WP-120: the `LORE_USE_SERVICE` delegation path must never carry a lock ownership
+/// token. The design is that it carries no field for one at all -- the delegated process derives
+/// its own `.lore/`-backed store from the same repository path a direct call would use, so a
+/// delegated acquire and a delegated release agree with each other the same way two direct calls
+/// would. Constructing these args with every field named explicitly (no `..`) is itself part of
+/// the proof: a future edit that added a token field to either struct would fail to compile here
+/// rather than pass silently.
+#[tokio::test]
+async fn lock_acquire_and_release_args_carry_no_ownership_token_across_the_service_boundary() {
+    let acquire = LoreLockFileAcquireArgs {
+        paths: LoreArray::from_vec(vec![LoreString::from_str("Content/Model.uasset")]),
+        branch: LoreString::from_str("main"),
+    };
+    let release = LoreLockFileReleaseArgs {
+        paths: LoreArray::from_vec(vec![LoreString::from_str("Content/Model.uasset")]),
+        branch: LoreString::from_str("main"),
+        owner: LoreString::from_str("wp120-test-owner"),
+        owner_id: LoreString::from_str("wp120-test-owner-id"),
+    };
+
+    for command in [
+        LoreCommand::LockFileAcquire(acquire),
+        LoreCommand::LockFileRelease(release),
+    ] {
+        // Scoped to the `command` payload alone, not the whole `MessageToServer`: `globals`
+        // legitimately carries `identity_token`/`access_token` (the caller's OWN auth
+        // credentials, unrelated to CR-030's lock ownership token) on every message, and a
+        // substring search over the full wire buffer would false-positive on those.
+        let command_json =
+            serde_json::to_string(&command).expect("serialize the command payload alone");
+        assert!(
+            !command_json.to_ascii_lowercase().contains("token"),
+            "a lock command sent over LORE_USE_SERVICE must carry no token field at all: \
+             {command_json}"
+        );
+
+        // The full message must still round-trip normally -- the point is that it carries no
+        // token, not that it fails to serialize.
+        let message = MessageToServer {
+            globals: LoreGlobalArgs::default(),
+            command,
+        };
+        write_v1_message(message, SerializationType::Json)
+            .expect("the delegated message must still serialize as a whole");
     }
 }
 
