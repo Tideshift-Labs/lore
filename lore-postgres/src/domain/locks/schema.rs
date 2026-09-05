@@ -16,33 +16,37 @@ pub const LOCK_SCHEMA_VERSION: i64 = 1;
 /// compile-time constant rather than configuration: no operator action may
 /// reach the armed state before the code that makes it serviceable exists.
 ///
-/// # What WP-120 built, and why this is still `false`
+/// # Why this is now `true`
 ///
-/// WP-120 (2026-09-04) built the whole SERVER half.
-/// `lore-server/src/grpc/lock_service.rs` now routes all three mutations
-/// through [`crate::domain::locks::PostgresLockCoordinator`]: `Lock` and
-/// `AdminLock` return each row's 32-byte ownership token to the caller that
-/// acquired it, `Unlock` requires that token and reaches `release`, and the new
-/// `ForceUnlock` RPC reaches `force_release`, which deliberately does **not**
-/// require a token so an administrator can always clear a row.
+/// WP-120 (2026-09-04) built the SERVER half.
+/// `lore-server/src/grpc/lock_service.rs` routes all three mutations through
+/// [`crate::domain::locks::PostgresLockCoordinator`]: `Lock` and `AdminLock`
+/// return each row's 32-byte ownership token to the caller that acquired it,
+/// `Unlock` requires that token and reaches `release`, and the `ForceUnlock` RPC
+/// reaches `force_release`, which deliberately does **not** require a token so
+/// an administrator can always clear a row.
 ///
-/// It stays `false` because the **client** half does not exist. `lore/src` has
-/// no use of `ownership_token` anywhere: `lore lock acquire` drops the token the
-/// server returns, and `lore lock release` re-derives the resource from its path
-/// with nothing to present. There is no client-side lock record at all to keep a
-/// token in. So on an armed cell the shipped client's `Unlock` sends no token
-/// and is refused, and a re-`Lock` over a row it already holds is refused too —
-/// every lock becomes owner-unreleasable, which is the same INV-EE P0-2 shape
-/// this constant has always guarded, reached by a different road.
+/// The follow-on lane (2026-09-05) built the CLIENT half, which is what this
+/// constant was waiting for. `lore-revision/src/attempt_store.rs` gives the CLI
+/// and the embedding library a durable `AttemptStore` in the repository's
+/// `.lore/` directory; `lore lock acquire` records every token the server issues
+/// before it reports success, and presents a stored one when it re-locks a row
+/// it already holds; `lore lock release` presents the stored token per resource
+/// and clears it only on a confirmed release. The desktop injects its own
+/// implementation of the same trait over the journal it already keeps.
 ///
-/// PIN(WP-120, 2026-09-04): the lane that lands the client-side ownership-token
-/// handling flips this, in that same change. It is not an increment on the
-/// server work — it needs a new durable artefact under `.lore/` holding a bearer
-/// secret, which wants its own format decision and its own security review, and
-/// it should share a store with CR-029's client receipt rail rather than grow a
-/// second one.
+/// So an armed cell's `Unlock` now arrives carrying the token the acquire was
+/// issued, which is the property whose absence this constant guarded: the
+/// INV-EE P0-2 shape of a lock nobody but an administrator can release.
 ///
-/// # A second residual, which that flip will not close either
+/// One thing the flip does **not** claim. A client that predates the token
+/// contract — a stock upstream build, or an older fork build — still sends no
+/// token, and its `Unlock` is refused on an armed cell with a message naming
+/// `ForceUnlock` as the remedy. That is a version floor for a cell an operator
+/// chooses to arm, not a residual defect: the refusal is decisive, it happens
+/// before any mutation, and it names what to do.
+///
+/// # The residual this flip does not close
 ///
 /// BLOCKED(WP-120): a **cutover-converted** row is not releasable by its own
 /// owner even once the client can present tokens.
@@ -64,15 +68,19 @@ pub const LOCK_SCHEMA_VERSION: i64 = 1;
 /// accept it from any caller, handing everyone the authority to release every
 /// converted lock. That is a SCHEMA-117 amendment plus a CR-030 amendment, both
 /// on the owner list, neither frozen here.
-pub const PUBLIC_MUTATION_CONTRACT_AVAILABLE: bool = false;
+///
+/// This constant no longer gates that residual, so the operator precondition
+/// above is now a **cutover** precondition an operator has to meet, rather than
+/// something the build refuses on their behalf.
+pub const PUBLIC_MUTATION_CONTRACT_AVAILABLE: bool = true;
 
 /// The reason `enable_fencing` gives while [`PUBLIC_MUTATION_CONTRACT_AVAILABLE`]
 /// is false. Named so a test can assert the refusal rather than match prose.
 ///
-/// Reworded by WP-120, because the old text named a cause that no longer holds:
-/// fenced `Lock`/`Unlock`/`AdminLock` no longer return `FAILED_PRECONDITION`,
-/// and `release`/`force_release` now have wire callers. What is missing is the
-/// client half, so the refusal says that instead.
+/// Kept, and kept accurate, though nothing reaches it on this build. The
+/// constant it explains is the arming gate, and a gate whose refusal message was
+/// deleted the first time it opened is a gate that cannot be closed again
+/// without re-deciding what it should say.
 pub const PUBLIC_MUTATION_CONTRACT_MISSING: &str = concat!(
     "fenced lock routing cannot be armed until a client that keeps and presents per-resource ",
     "lock ownership tokens ships: the server half is built, but a released client sends no ",

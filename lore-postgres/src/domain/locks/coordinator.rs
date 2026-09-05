@@ -1469,10 +1469,12 @@ impl PostgresLockCoordinator {
 
     /// Enable fenced routing only after all schema evidence passes.
     ///
-    /// Refuses outright until WP-120's public mutation contract exists: see
-    /// [`schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE`] for why arming first
-    /// produces a cell whose locks are unreleasable while readiness is green.
-    /// The check is first so no evidence query can be read as permission.
+    /// The [`schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE`] gate is satisfied on
+    /// this build — the client that keeps and presents ownership tokens shipped
+    /// with the flip — so what remains here is the schema evidence itself. The
+    /// gate check stays, and stays first: it is the seam that says arming is a
+    /// property of the code rather than of an operator's confidence, and no
+    /// evidence query below it may be read as permission.
     pub async fn enable_fencing(&self, lease_enabled: bool) -> Result<(), DomainError> {
         if !schema::PUBLIC_MUTATION_CONTRACT_AVAILABLE {
             return Err(DomainError::NotReady(
@@ -1487,10 +1489,13 @@ impl PostgresLockCoordinator {
     ///
     /// Every schema, backfill, quarantine, database-identity, and sequence-
     /// headroom check still runs, so a fixture proves the same evidence a real
-    /// cutover would. This exists because the armed state must stay reachable
-    /// under test while [`enable_fencing`](Self::enable_fencing) refuses it in
-    /// production; `lore-server/tests/wp117_push_witness_wiring.rs` asserts no
-    /// non-test source calls it.
+    /// cutover would. It existed because the armed state had to stay reachable
+    /// under test while [`enable_fencing`](Self::enable_fencing) refused it in
+    /// production, and it is kept now that the gate is open for the same reason
+    /// the refusal message is kept: the gate can close again, and a fixture that
+    /// had been deleted in between would have to be rebuilt under pressure.
+    /// `lore-server/tests/wp117_push_witness_wiring.rs` asserts no non-test
+    /// source calls it.
     #[doc(hidden)]
     pub async fn enable_fencing_for_component_fixture(
         &self,
