@@ -70,16 +70,12 @@ fn dispatch_attempt(globals: &LoreGlobalArgs) -> Result<Option<AttemptId>, Inval
 /// none is present, so entering here is what makes the caller's own identity the one the server
 /// files its receipt under. Without a supplied id this is exactly the future it was given.
 ///
-/// It returns a future rather than being an `async fn`, and clippy will tell you that is
-/// needless. It is not. The result of this call is handed straight to `LORE_CONTEXT.scope`,
-/// whose `Send`-ness the compiler proves structurally through the future it wraps; an `async fn`
-/// here erases that proof and every caller in `auth.rs`, `branch.rs` and their siblings fails
-/// with "implementation of `Send` is not general enough". Measured, not guessed: written as an
-/// `async fn` first, and that is the error it produced.
-#[expect(
-    clippy::manual_async_fn,
-    reason = "an async fn breaks Send inference for the enclosing LORE_CONTEXT scope"
-)]
+/// It returns a future rather than being an `async fn`, which is not cosmetic. The result is
+/// handed straight to `LORE_CONTEXT.scope`, whose `Send`-ness the compiler proves structurally
+/// through the future it wraps; an `async fn` here erases that proof and every caller in
+/// `auth.rs`, `branch.rs` and their siblings fails with "implementation of `Send` is not general
+/// enough". Measured, not guessed: written as an `async fn` first, and that is the error it
+/// produced.
 fn in_dispatch_attempt<F>(
     attempt: Option<AttemptId>,
     operation: F,
@@ -87,14 +83,24 @@ fn in_dispatch_attempt<F>(
 where
     F: Future,
 {
-    async move {
+    // Boxed, and this is a stack-budget fix rather than a style choice. Every one of the four
+    // `repository_call_*` sites wraps its whole command future in this, so an inline async block
+    // adds the command's frame to the enclosing one; the lock lane measured the desktop's deepest
+    // in-process test crossing the 2 MiB test-thread limit because of it, and passing at 2.5 MiB,
+    // which is an overrun rather than recursion. Boxing costs one allocation per repository call,
+    // which is nothing beside the operation it wraps, and the wrapper contributes a pointer
+    // instead of a frame.
+    //
+    // `Box::pin` of a concrete async block rather than a `Pin<Box<dyn Future>>`: the erased form
+    // would drop the `Send` proof this function exists to preserve.
+    Box::pin(async move {
         match attempt {
             Some(attempt) => {
                 lore_transport::outcome::with_dispatch_attempt(attempt, operation).await
             }
             None => operation.await,
         }
-    }
+    })
 }
 
 pub fn setup_execution(
