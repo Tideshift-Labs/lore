@@ -65,6 +65,9 @@
 // this attempt did. Retrying is the one response that is always wrong.
 #define LORE_STATUS_OUTCOME_UNKNOWN 193
 
+// The exact width CR-030 mints and the server's request normalisation admits.
+#define OwnershipToken_LEN 32
+
 // The kind of value held by a metadata entry.
 //
 // This is both the tag a caller passes across the API and the tag written into
@@ -3822,6 +3825,25 @@ typedef struct lore_global_args_t {
   // Supplying either token puts the call in external-credential mode: `identity`
   // must be left empty, since it is read from the token.
   struct lore_string_t access_token;
+  // The attempt identity this call's mutations are dispatched under, as a
+  // hyphenated lowercase UUIDv7. Empty for every caller that does not track
+  // attempts, which is the CLI and every embedder that has not opted in.
+  // PIN(WP-120, 2026-09-05).
+  //
+  // Supply it when the caller keeps its own durable record of what it
+  // dispatched and intends to reconcile a lost response against an
+  // authoritative receipt later. The value travels to the server, which files
+  // the receipt under it, so the caller can find that receipt again using an
+  // identity it wrote down before dispatching rather than one it could only
+  // have learned from the response that went missing.
+  //
+  // It must be the id the caller already recorded, never a fresh one minted
+  // for the call. An id minted here would name an attempt the caller's own
+  // journal has no row for, and the resulting lookup would answer "no such
+  // receipt" forever while appearing to work.
+  //
+  // Appended to this struct rather than inserted, so the layout only grows.
+  struct lore_string_t attempt_id;
 } lore_global_args_t;
 
 // Arguments for resolving user IDs to display names via the remote auth service.
