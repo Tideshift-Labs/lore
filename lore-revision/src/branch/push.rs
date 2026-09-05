@@ -332,6 +332,20 @@ pub(crate) struct PushStatistics {
 /// the entire reason any of this exists. Any other error means the transport either held proof
 /// the request never left or carried back the server's own refusal, and both are decisively
 /// not-applied.
+/// PIN(WP-120, 2026-09-05): this helper is wired at the push dispatches in this file and nowhere
+/// else, and that is the whole desktop surface rather than a partial rollout. Every other
+/// `MutableNoReplay` domain dispatch on the client path is unwired because `lore-engine` in
+/// lorehub-desktop reaches none of them: `branch::merge_into`'s pushes (`branch/merge.rs:4000`
+/// and `:4383`, whose only caller anywhere is the CLI entry point in `lore/src/branch.rs`),
+/// `revision::restore`'s push (`revision/restore.rs:556`, where the desktop's Restore stays a
+/// local anchor and calls only `file_unstage` and `file_reset`), `branch_delete`
+/// (`branch.rs:2030`), the two metadata compare-and-swaps (`metadata/branch.rs:243` and
+/// `metadata/repository.rs:235`), `RepositoryCreate` and `RepositoryDelete` (create is the
+/// platform's claim rail, delete is not a desktop operation), and `AdminObliterate`.
+///
+/// Wiring any of them is a few lines with this helper, but do it when a caller that reconciles
+/// appears, not before: an attempt record no reconciler ever reads is a durable write that stays
+/// unresolved forever.
 async fn under_own_attempt<T, Fut>(
     attempts: Option<&Arc<dyn AttemptStore>>,
     repository: RepositoryId,
