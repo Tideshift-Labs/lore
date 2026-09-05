@@ -286,10 +286,16 @@ mod tests {
         );
     }
 
-    /// `resolve()` moves the record to `Resolved` and keeps it (never deletes), and releases only
-    /// the ownership *that attempt* held -- a different attempt's held lock must survive.
+    /// `resolve()` moves the record to `Resolved` and keeps it (never deletes), and leaves EVERY
+    /// ownership row alone, including the resolving attempt's own.
+    ///
+    /// Inverted after the lock lane's finding. Settling an attempt says its outcome is known; it
+    /// says nothing about whether a lock that attempt took is still held. Dropping the token here
+    /// would strand a live lock behind an administrator the moment a lock acquire adopts the
+    /// dispatch attempt id, which is the natural fix for the receipt-matching gap pinned in the
+    /// acquire path. Only `clear_ownership`, on a confirmed release, removes a row.
     #[tokio::test]
-    async fn resolve_keeps_the_record_as_resolved_and_drops_only_its_own_ownership() {
+    async fn resolve_keeps_the_record_as_resolved_and_leaves_ownership_alone() {
         let dir = generate_tempdir();
         let store = RepositoryAttemptStore::in_directory(dir.path());
         let resolved_attempt = AttemptId::new();
@@ -344,13 +350,13 @@ mod tests {
                 .all(|record| record.attempt_id != resolved_attempt),
             "a resolved attempt must not appear in unresolved()"
         );
-        assert_eq!(
+        assert!(
             store
                 .ownership_for(&branch, &resolved_resource)
                 .await
-                .unwrap(),
-            None,
-            "resolving an attempt must clear the ownership it held"
+                .unwrap()
+                .is_some(),
+            "resolving an attempt must NOT clear the lock it took; the lock outlives the attempt"
         );
         assert!(
             store

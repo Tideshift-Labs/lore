@@ -343,12 +343,28 @@ pub trait AttemptStore: Send + Sync {
         Ok(())
     }
 
-    /// Settle an attempt and release any lock ownership it held.
+    /// Settle an attempt.
     ///
     /// Moves the record to [`AttemptState::Resolved`] and *keeps* it. Nothing removes a record:
     /// there is no expiry, no eviction, and no delete. An unresolved attempt is precisely the one
     /// that must not be forgotten, and a resolved one is the lineage that stops a late callback
     /// or a restored snapshot from offering a retry for a mutation that already happened.
+    ///
+    /// **This touches no lock ownership, and that is load-bearing rather than an omission.** It
+    /// used to drop every ownership row held by the resolving attempt, on the reasoning that a
+    /// settled attempt should not still be holding something. That conflates two lifetimes. An
+    /// attempt is settled when its outcome is known; a lock is held until somebody releases it,
+    /// and outliving the attempt that took it is the entire purpose of a lock.
+    ///
+    /// The cost of the old rule was not theoretical. The moment a lock acquire adopts the
+    /// dispatch attempt id — which is the natural fix for the receipt-matching gap pinned in
+    /// `lore-revision`'s acquire path — a decisive `NotApplied` resolution would delete the
+    /// ownership token for a lock the caller still holds, leaving a row only an administrator can
+    /// release. That is precisely the failure CR-030's token exists to prevent, reached
+    /// sideways. Found by the lock lane before either half shipped.
+    ///
+    /// Ownership rows are removed by [`Self::clear_ownership`] alone, and only on a release the
+    /// server confirmed.
     ///
     /// Compaction of long-settled lineage is an implementation's own business, and any
     /// implementation that does it owes the same argument this trait makes: that nothing which
@@ -470,9 +486,8 @@ impl AttemptStore for VolatileAttemptStore {
         if let Some(stored) = self.attempts.lock().get_mut(&attempt.as_uuid()) {
             stored.state = AttemptState::Resolved(resolution);
         }
-        self.ownership
-            .lock()
-            .retain(|held| held.attempt_id.as_uuid() != attempt.as_uuid());
+        // Ownership is deliberately untouched; see the trait method's docs. A lock outlives the
+        // attempt that took it, and dropping the token here would strand a held lock.
         Ok(())
     }
 }

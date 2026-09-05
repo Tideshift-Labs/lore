@@ -416,19 +416,17 @@ async fn record_batch_ownership(
         // around the dispatch here and record that one; until then nothing may treat this field
         // as a receipt key. It identifies which local acquire took the lock, and no more.
         //
-        // **Read this before closing that PIN.** The obvious fix — making the acquire adopt the
-        // transport's dispatch attempt so the ids agree — is also what arms a trap.
-        // [`AttemptStore::resolve`] settles a record *and* drops every ownership row held by that
-        // attempt id; both implementations do it, because the trait says so. Today no lock id is
-        // ever passed to `resolve`, because this one is minted here and nothing else sees it. The
-        // moment a lock acquire shares an id with an attempt something resolves — and the receipt
-        // rail resolves a decisive failure as `NotApplied` — that call silently deletes the token
-        // for a lock the caller still holds, leaving a row only an administrator can release.
-        // That is the exact failure CR-030's token exists to prevent, reached from the side.
+        // **The trap this PIN used to carry is disarmed, and it is worth knowing it existed.**
+        // `AttemptStore::resolve` used to settle a record *and* drop every ownership row held by
+        // that attempt id. Making the acquire adopt the transport's dispatch attempt — the obvious
+        // way to close this PIN — would then have let a decisive `NotApplied` resolution silently
+        // delete the token for a lock the caller still held, leaving a row only an administrator
+        // can release: the exact failure CR-030's token exists to prevent, reached from the side.
         //
-        // So closing this PIN means also doing one of: stop `resolve` dropping ownership, or keep
-        // lock ownership under an id nothing resolves. Sharing the id without deciding that is a
-        // silent, unreproducible lock leak.
+        // `resolve` now settles the record only. Ownership rows are removed by `clear_ownership`
+        // alone, on a release the server confirmed, because a lock outlives the attempt that took
+        // it. So sharing the id is safe from that angle, and whoever closes this PIN has one
+        // problem rather than two.
         let record = LockOwnership {
             attempt_id: AttemptId::new(),
             branch: acquired.lock.resource.branch,

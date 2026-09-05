@@ -513,7 +513,10 @@ impl AttemptStore for RepositoryAttemptStore {
             {
                 existing.state = state;
             }
-            document.ownership.retain(|held| held.attempt_id != attempt);
+            // Ownership is deliberately untouched. Settling an attempt says its outcome is known;
+            // it says nothing about whether a lock that attempt took is still held, and dropping
+            // the token here would strand a live lock behind an administrator. Only
+            // `clear_ownership`, on a confirmed release, removes a row. See the trait docs.
         })
         .await
     }

@@ -237,10 +237,18 @@ fn is_unresolved_is_false_only_for_resolved() {
     }
 }
 
-/// Priority 4: `resolve()` releases the ownership token the resolved attempt held, and only
-/// that one -- a different attempt's held lock must survive.
+/// Priority 4, INVERTED after the lock lane's finding: `resolve()` leaves EVERY ownership row
+/// alone, including the resolving attempt's own.
+///
+/// This case previously asserted the opposite, and the opposite was a live hazard. Settling an
+/// attempt says its outcome is known; it says nothing about whether a lock that attempt took is
+/// still held. The moment a lock acquire adopts the dispatch attempt id, which is the natural fix
+/// for the receipt-matching gap pinned in the acquire path, a decisive `NotApplied` resolution
+/// would have deleted the token for a lock the caller still held, leaving a row only an
+/// administrator could release -- the exact failure CR-030's token exists to prevent, reached
+/// sideways. Only `clear_ownership`, on a release the server confirmed, removes a row.
 #[tokio::test]
-async fn resolve_clears_the_lock_ownership_that_attempt_held_and_leaves_others_alone() {
+async fn resolve_leaves_lock_ownership_alone_including_the_resolving_attempts_own() {
     let store = VolatileAttemptStore::new();
     let resolved_attempt = AttemptId::new();
     let other_attempt = AttemptId::new();
@@ -281,13 +289,14 @@ async fn resolve_clears_the_lock_ownership_that_attempt_held_and_leaves_others_a
         .await
         .unwrap();
 
-    assert_eq!(
+    assert!(
         store
             .ownership_for(&branch, &resolved_resource)
             .await
-            .unwrap(),
-        None,
-        "resolving an attempt must clear the ownership it held"
+            .unwrap()
+            .is_some(),
+        "resolving an attempt must NOT clear the lock it took; the lock outlives the attempt, and \
+         dropping the token here strands a held lock behind an administrator"
     );
     assert!(
         store
