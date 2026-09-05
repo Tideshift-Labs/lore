@@ -2235,23 +2235,27 @@ async fn an_absent_schema_routes_legacy_but_a_partial_one_is_refused() {
     );
 }
 
-/// The cutover entry point must succeed once WP-120 publishes the public
-/// mutation contract.
+/// The cutover entry point must refuse while the state it produces is
+/// unserviceable.
 ///
-/// Superseded shape (2026-09-04): before WP-120, this case proved the exact
-/// opposite -- that `enable_fencing` refused arming with `NotReady` even
-/// though every evidence check passed, because arming a cell with no
-/// release/force-release wire caller would strand every fenced lock
-/// unreleasable (INV-EE P0-2). `PUBLIC_MUTATION_CONTRACT_AVAILABLE` is now
-/// `true` (`lore-postgres/src/domain/locks/schema.rs`), the served `Lock`/
-/// `Unlock`/`AdminLock`/`ForceUnlock` gRPC path exists
-/// (`lore-server/src/grpc/lock_service.rs`), and the real arming path must
-/// now succeed on the same evidence the fixture path always accepted --
-/// proving `enable_fencing` and `enable_fencing_for_component_fixture` agree
-/// once the contract is real, not just during the gap.
+/// This case is a tripwire on `PUBLIC_MUTATION_CONTRACT_AVAILABLE`: it fails
+/// the day a follow-on lane flips that constant, which is when its first
+/// assertion stops describing the contract and must be rewritten rather than
+/// deleted.
+///
+/// WP-120 (`9a6d5e0`) built the whole SERVER half: fenced `Lock`/`Unlock`/
+/// `AdminLock`/`ForceUnlock` are served (`lore-server/src/grpc/lock_service.rs`)
+/// and issue/consume a per-resource ownership token. But `lore/src` cannot
+/// yet keep or present that token, so arming today would still strand every
+/// fenced lock unreleasable by its owner (INV-EE P0-2) -- a follow-on lane
+/// builds the client half and flips the constant in that change
+/// (`PUBLIC_MUTATION_CONTRACT_AVAILABLE` stays `false` in
+/// `lore-postgres/src/domain/locks/schema.rs` until then). The refusal is
+/// the WP-120 gate and nothing else: the same evidence arms successfully
+/// through the fixture path.
 #[tokio::test]
 #[ignore = "run with tests/run-lock-fencing-live.ps1"]
-async fn arming_succeeds_once_the_public_mutation_contract_exists() {
+async fn arming_is_refused_until_the_public_mutation_contract_exists() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -2263,26 +2267,35 @@ async fn arming_succeeds_once_the_public_mutation_contract_exists() {
         .await
         .expect("complete empty backfill");
 
+    let refused = coordinator.enable_fencing(false).await;
+    match refused {
+        Err(DomainError::NotReady(reason)) => assert_eq!(
+            reason,
+            lore_postgres::domain::locks::schema::PUBLIC_MUTATION_CONTRACT_MISSING,
+            "the refusal must name the missing WP-120 contract, not an evidence gap"
+        ),
+        other => panic!("arming must be refused before WP-120, got {other:?}"),
+    }
     assert!(
         !coordinator
             .readiness()
             .await
-            .expect("readiness before arming")
+            .expect("readiness after a refused arming")
             .fencing_enabled,
-        "fencing must be off before arming"
+        "a refused arming must leave the cell on the legacy route"
     );
 
+    // Every evidence check passed; only the contract gate refused.
     coordinator
-        .enable_fencing(false)
+        .enable_fencing_for_component_fixture(false)
         .await
-        .expect("arming must succeed once WP-120's public mutation contract exists");
+        .expect("the same evidence must arm through the fixture path");
     assert!(
         coordinator
             .readiness()
             .await
-            .expect("readiness after arming")
-            .fencing_enabled,
-        "a successful arming must flip the cell onto the fenced route"
+            .expect("readiness after fixture arming")
+            .fencing_enabled
     );
 }
 
