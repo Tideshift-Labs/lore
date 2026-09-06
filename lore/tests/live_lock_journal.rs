@@ -12,6 +12,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_revision::interface::LoreArray;
+use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreEventCallbackConfig;
 use lore_revision::interface::LoreString;
 use lore_revision::live_fixture::LiveRepository;
@@ -576,6 +577,12 @@ fn nothing_is_journalled_when_the_remote_never_resolves() {
 /// to guess about. The policy forces every row down the tokenless path (`mint_ownership_tokens:
 /// false`), refuses the ordinary `Unlock` so the escalation is reached, and grants the
 /// `ForceUnlock` that follows it.
+///
+/// This is also the positive half of a pair with
+/// `a_lost_answer_on_the_unlock_is_not_escalated_to_a_force_release`: a DECISIVE refusal still
+/// escalates. That is what makes the sibling test's empty force-unlock log mean "the non-decisive
+/// case was declined" rather than "escalation is broken here altogether" -- without this test, an
+/// implementation that never escalates at all would make the sibling's empty log vacuous.
 #[test]
 fn the_force_release_escalation_is_journalled() {
     let runtime = lore::runtime();
@@ -655,6 +662,231 @@ fn the_force_release_escalation_is_journalled() {
         force_records[0].2,
         Some(call_index(&server.calls(), LockRpc::ForceUnlock)),
         "the record must have been written before the takeover reached the server"
+    );
+}
+
+/// A lost answer on the `Unlock` call must not be escalated to a `ForceUnlock` takeover.
+///
+/// This is a near-copy of `the_force_release_escalation_is_journalled`, differing in exactly ONE
+/// input: the `unlock` policy answers `RpcOutcome::LoseTheAnswer` instead of
+/// `RpcOutcome::Refuse(Refusal::PermissionDenied)`. That one-input difference is the whole point.
+/// Paired with `the_force_release_escalation_is_journalled` (a decisive refusal still escalates),
+/// this test shows the escalation is declined specifically because the outcome was non-decisive,
+/// not because escalation is broken or because this policy shape can never reach it.
+///
+/// A version of this test that only checked `status != 0` would still pass on the buggy
+/// implementation, which also fails the release (by way of the second, escalated mutation
+/// failing or succeeding for the wrong reason) -- the status must be the exact `OutcomeUnknown`
+/// code, and the force-unlock log must be provably empty, not merely "the release failed somehow".
+#[test]
+fn a_lost_answer_on_the_unlock_is_not_escalated_to_a_force_release() {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start_with_policy(LockPolicy {
+        mint_ownership_tokens: false,
+        unlock: RpcOutcome::LoseTheAnswer,
+        force_unlock: RpcOutcome::Grant,
+        ..LockPolicy::default()
+    }));
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create(&server.remote_url()).await
+    }));
+
+    // The escalation needs a known owner, which only a `Query` response provides -- naming the
+    // committed file exactly as the release path will rebuild it. Set after the fixture exists,
+    // matching `the_force_release_escalation_is_journalled`'s own two-step policy setup.
+    server.set_policy(LockPolicy {
+        mint_ownership_tokens: false,
+        unlock: RpcOutcome::LoseTheAnswer,
+        force_unlock: RpcOutcome::Grant,
+        query_result: vec![(
+            fixture.committed_files[0].clone(),
+            "someone-else".to_owned(),
+        )],
+        ..LockPolicy::default()
+    });
+
+    let spy = Arc::new(JournalSpy::new(server.probe()));
+    let attempts: Arc<dyn AttemptStore> = spy.clone();
+
+    let mut globals = fixture.globals();
+    globals.force = 1;
+
+    // `--force` with no explicit paths is the only shape that can escalate at all, because it is
+    // the only one that learns an owner from a `Query`.
+    let status = runtime.block_on(lore::lock::file_release_with_attempt_store(
+        globals,
+        lore::lock::LoreLockFileReleaseArgs {
+            paths: LoreArray::default(),
+            branch: LoreString::default(),
+            owner: LoreString::default(),
+            owner_id: LoreString::default(),
+        },
+        no_callback(),
+        attempts,
+    ));
+
+    assert_eq!(
+        status,
+        LoreError::OutcomeUnknown as i32,
+        "a lost answer on the unlock must surface as the named OutcomeUnknown code, not merely a \
+         nonzero status -- a nonzero-only assertion would pass on the buggy code path too"
+    );
+
+    let force_unlocks = server.calls_for(LockRpc::ForceUnlock);
+    assert!(
+        force_unlocks.is_empty(),
+        "a non-decisive lost answer must never trigger a second irreversible mutation on a maybe \
+         -- an administrative takeover is not a safe response to an unlock whose outcome is \
+         unknown. Got {:?}",
+        server.calls()
+    );
+
+    let unlocks = server.calls_for(LockRpc::Unlock);
+    assert_eq!(
+        unlocks.len(),
+        1,
+        "exactly one Unlock dispatch must have reached the server, got {:?}",
+        server.calls()
+    );
+
+    let records = spy.record_entries();
+    assert_eq!(
+        records.len(),
+        1,
+        "the release must journal exactly one attempt, under the unlock operation name, got \
+         {records:?}"
+    );
+    assert_eq!(
+        records[0].1,
+        GrpcRpc::LockUnlock.wire_name(),
+        "the journalled attempt must be the unlock dispatch itself"
+    );
+
+    let resolves = spy.resolve_entries();
+    assert!(
+        resolves.is_empty(),
+        "a lost answer must leave its attempt unresolved rather than resolving it, got \
+         {resolves:?}"
+    );
+    let unresolved = runtime
+        .block_on(spy.inner.unresolved())
+        .expect("unresolved() must succeed on a fresh store");
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "exactly the one lost-answer attempt must remain standing for later reconciliation, got \
+         {unresolved:?}"
+    );
+}
+
+/// A lost answer on the `Unlock` for a lock this client actually holds a token for must leave
+/// that lock's ownership row standing.
+///
+/// This is a regression pin, not a proof of the escalation fix: a reviewer confirmed this test
+/// PASSES against `release.rs` reverted to HEAD (pre-fix), because the `held` path never
+/// populates `unlocks` when the lone batch fails -- decisively refused or non-decisively lost, the
+/// clear list is empty either way, so the row survives for a reason this change did not
+/// introduce. `a_lost_answer_on_the_unlock_is_not_escalated_to_a_force_release` is the sibling
+/// that genuinely fails on pre-fix code and is the real proof of the fix. This test is kept
+/// because the `held` path is where a future change (e.g. clearing ownership unconditionally
+/// rather than only for what the server confirmed) would most plausibly break the row's
+/// survival, and a version of this test that only checked the returned status would not catch
+/// that either -- discarding a token does not itself change the release's status.
+#[test]
+fn a_lost_answer_on_the_unlock_leaves_the_held_locks_ownership_row_standing() {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start());
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create(&server.remote_url()).await
+    }));
+
+    // Default policy: tokens minted. Acquire with a throwaway store; only the release under test
+    // needs the spy.
+    let acquire_attempts: Arc<dyn AttemptStore> = Arc::new(VolatileAttemptStore::new());
+    let acquire_status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        no_callback(),
+        acquire_attempts,
+    ));
+    assert_eq!(acquire_status, 0, "acquiring the file must succeed");
+    assert_eq!(
+        ownership_row_count(&fixture.path),
+        1,
+        "the acquire must have minted and stored its own ownership row"
+    );
+
+    server.set_policy(LockPolicy {
+        unlock: RpcOutcome::LoseTheAnswer,
+        ..LockPolicy::default()
+    });
+
+    let spy = Arc::new(JournalSpy::new(server.probe()));
+    let attempts: Arc<dyn AttemptStore> = spy.clone();
+
+    // Explicit paths, no force: the shape that goes entirely through the `held` set.
+    let release_status = runtime.block_on(lore::lock::file_release_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileReleaseArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+            owner: LoreString::default(),
+            owner_id: LoreString::default(),
+        },
+        no_callback(),
+        attempts,
+    ));
+
+    assert_eq!(
+        release_status,
+        LoreError::OutcomeUnknown as i32,
+        "a lost answer on the unlock must surface as OutcomeUnknown to the caller"
+    );
+
+    assert_eq!(
+        ownership_row_count(&fixture.path),
+        1,
+        "the held lock's ownership row must survive a release whose own attempt's outcome is \
+         unknown -- zero would mean a token was discarded for a lock that may still be held, \
+         leaving nothing able to release it"
+    );
+
+    let force_unlocks = server.calls_for(LockRpc::ForceUnlock);
+    assert!(
+        force_unlocks.is_empty(),
+        "the held path has no escalation branch to reach in the first place; assert it stays \
+         that way. Got {:?}",
+        server.calls()
+    );
+
+    let records = spy.record_entries();
+    assert_eq!(
+        records.len(),
+        1,
+        "the release must journal exactly one LockUnlock attempt, got {records:?}"
+    );
+    assert_eq!(
+        records[0].1,
+        GrpcRpc::LockUnlock.wire_name(),
+        "the journalled attempt must name the unlock dispatch"
+    );
+
+    assert!(
+        spy.resolve_entries().is_empty(),
+        "a lost answer must leave the attempt unresolved, got {:?}",
+        spy.resolve_entries()
+    );
+    let unresolved = runtime
+        .block_on(spy.inner.unresolved())
+        .expect("unresolved() must succeed on a fresh store");
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "exactly the one lost-answer attempt must remain standing for reconciliation, got \
+         {unresolved:?}"
     );
 }
 

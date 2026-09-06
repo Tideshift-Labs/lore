@@ -129,7 +129,9 @@ pub struct LockCall {
 /// are the main reason this fixture exists.
 ///
 /// Every variant here is decisive: the client retries only `ResourceExhausted`, which is
-/// deliberately not offered, so a refusal fixture always terminates on the first answer.
+/// deliberately not offered, so a refusal fixture always terminates on the first answer. The
+/// non-decisive case is deliberately not one of these — it is [`RpcOutcome::LoseTheAnswer`], a
+/// sibling of `Refuse` rather than a variant of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// The caller may not do this. The ordinary shape of a fenced cell turning down a tokenless
@@ -159,6 +161,36 @@ pub enum RpcOutcome {
     Grant,
     /// Answer with a refusal.
     Refuse(Refusal),
+    /// Receive and record the request, then never answer it.
+    ///
+    /// The one outcome that is not decisive, and the reason it is a sibling of [`Self::Refuse`]
+    /// rather than another [`Refusal`] variant: every refusal is the server saying what it did,
+    /// and this is the server saying nothing at all. A caller cannot tell a lost answer from a
+    /// mutation that applied, which is what makes it the interesting case for anything that
+    /// decides whether to act again.
+    ///
+    /// Produced as `Unavailable` rather than by severing the socket, and the two are the same
+    /// thing from the client's side of this contract: `lore-transport`'s `error.rs` maps
+    /// `Unavailable` (and `Unknown`) to `ProtocolError::Disconnected`, and
+    /// `with_reconnect_classified` turns a `Disconnected` on a `MutableNoReplay` RPC into
+    /// `ProtocolError::OutcomeUnknown` without reissuing it. Severing the connection reaches the
+    /// caller through that same pair of steps. It is also what
+    /// `lore-transport`'s own `the_servers_captured_attempt_id_matches_the_clients_outcome_unknown_error`
+    /// uses, and `grpc_mutation_dispatch_loss_test.rs` records why the obvious alternative does
+    /// not work here: aborting a `tonic` accept loop does not sever a connection it has already
+    /// accepted, so a fixture that tried it would hang rather than lose an answer.
+    ///
+    /// On a `ReadRetryable` RPC this is a reconnect-and-reissue instead, so it says nothing
+    /// useful there. Point it at a mutation.
+    LoseTheAnswer,
+}
+
+/// The status a [`RpcOutcome::LoseTheAnswer`] answer carries.
+///
+/// One function rather than a literal at each of the six dispatch sites, so the code that decides
+/// what a lost answer looks like on the wire cannot drift between them.
+fn lost_answer() -> Status {
+    Status::unavailable("fixture: the answer is lost")
 }
 
 /// The stub's per-RPC policy, changeable while the server is running.
@@ -526,6 +558,7 @@ impl LockService for StubLockService {
         self.record(LockRpc::Lock, &request, &resources, "");
         match self.outcome(LockRpc::Lock) {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
+            RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::Grant => Ok(Response::new(LockResponse {
                 locks: self.grant(resources, "fixture-owner"),
             })),
@@ -571,6 +604,7 @@ impl LockService for StubLockService {
         self.record(LockRpc::Unlock, &request, &resources, "");
         match self.outcome(LockRpc::Unlock) {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
+            RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::Grant => {
                 let echo = self.state.policy.lock().unlock_echo;
                 let confirmed = match echo {
@@ -594,6 +628,7 @@ impl LockService for StubLockService {
         self.record(LockRpc::AdminLock, &request, &resources, &owner);
         match self.outcome(LockRpc::AdminLock) {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
+            RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::Grant => Ok(Response::new(AdminLockResponse {
                 locks: self.grant(resources, &owner),
             })),
@@ -609,6 +644,7 @@ impl LockService for StubLockService {
         self.record(LockRpc::ForceUnlock, &request, &resources, &owner);
         match self.outcome(LockRpc::ForceUnlock) {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
+            RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::Grant => Ok(Response::new(ForceUnlockResponse { resources })),
         }
     }
@@ -650,6 +686,7 @@ impl RevisionService for StubRevisionService {
         let outcome = self.state.revision_policy.lock().branch_create;
         match outcome {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
+            RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::Grant => {
                 let body = request.into_inner();
                 // The branch point the caller named, echoed back as the created tip. A push that
@@ -721,6 +758,7 @@ impl RevisionService for StubRevisionService {
         let outcome = self.state.revision_policy.lock().branch_push;
         match outcome {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
+            RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::Grant => Ok(Response::new(BranchPushResponse {
                 revision_signature: request.into_inner().revision_signature,
                 ..BranchPushResponse::default()
