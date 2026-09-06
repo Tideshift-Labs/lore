@@ -62,26 +62,24 @@ impl From<tonic::Status> for ProtocolError {
         match value.code() {
             tonic::Code::Unavailable | tonic::Code::Unknown => ProtocolError::from(Disconnected),
             tonic::Code::Unauthenticated => {
-                // `NotAuthenticated` is a unit struct with a fixed message, so the
-                // server's own text has nowhere to travel on the returned error and
-                // the caller sees only "Not authenticated". That silence cost a full
-                // diagnosis session on WP-120: an enforcing cell refusing a push for
-                // a precise, actionable reason reached the operator as three
-                // characterless words.
+                // The server's own words are the whole diagnostic value of this
+                // arm, so they are CARRIED, not merely logged. An enforcing cell
+                // refuses a push for a precise, actionable cause ("bearer audience
+                // ... is not the human authn audience"); before `NotAuthenticated`
+                // had a reason field that cause died here and the operator saw
+                // three characterless words, which cost a full diagnosis session
+                // on WP-120.
                 //
-                // Logged rather than carried, deliberately. Giving the variant a
-                // context field the way `Oversized` and `NotSupported` have one
-                // means widening `lore_base::error::NotAuthenticated`, which is
-                // named in roughly sixty error-set declarations across
-                // `lore-revision`, `lore-storage` and `lore`, in the FFI code table,
-                // and in the CLI's Python error map. That is a `[CLIENT]`
-                // public-API change gated on an upstream merge, not a line in a
-                // status mapping.
-                lore_base::lore_warn!(
-                    "Server refused the request as unauthenticated: {}",
-                    value.message()
-                );
-                ProtocolError::from(NotAuthenticated)
+                // A status with no message still has to produce a readable error,
+                // so an empty one falls back to the named constant rather than
+                // rendering "Not authenticated: ".
+                let message = value.message();
+                let reason = if message.trim().is_empty() {
+                    lore_base::error::UNSTATED_REFUSAL
+                } else {
+                    message
+                };
+                ProtocolError::from(NotAuthenticated::new(reason))
             }
             tonic::Code::PermissionDenied => ProtocolError::from(NotAuthorized),
             tonic::Code::NotFound => ProtocolError::from(NotFound),

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 /// Auth exchange integration tests.
 ///
@@ -54,7 +55,11 @@ mod tests {
 
         fn always_not_authenticated() -> Self {
             Self {
-                exchange_result: Box::new(|_| Err(ProtocolError::from(NotAuthenticated))),
+                exchange_result: Box::new(|_| {
+                    Err(ProtocolError::from(NotAuthenticated::new(
+                        "no authentication token is stored for this identity",
+                    )))
+                }),
             }
         }
     }

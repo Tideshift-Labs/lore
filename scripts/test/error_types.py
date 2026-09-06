@@ -1,4 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# Copyright 2026 Khurram Virani
 # SPDX-License-Identifier: MIT
 import re
 from subprocess import CalledProcessError
@@ -162,7 +163,13 @@ class MissingIdentityError(LoreException):
 class NotAuthenticatedError(LoreException):
     """Raised when an operation needs authentication the caller does not have,
     e.g. a server-hitting command run against an auth-configured server with no
-    stored token (logged out)."""
+    stored token (logged out).
+
+    The CLI now renders this as ``Not authenticated: <reason>`` — the deciding
+    party's own words, which for a server refusal is its gRPC status message
+    (``lore-base/src/error.rs``'s ``NotAuthenticated``). Match on the fixed
+    prefix, never on the reason: it is server-supplied text that changes without
+    a client release."""
 
 
 class NotSupportedError(LoreException):
@@ -172,6 +179,29 @@ class NotSupportedError(LoreException):
 
 
 ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
+    # Hoisted above every generic substring below, and anchored, on purpose.
+    # `NotAuthenticated` now renders as `Not authenticated: <reason>` where the
+    # reason is text the SERVER chose, so it can quote any other entry's
+    # substring ("Not authorized to access repository", "Not found", ...). An
+    # unanchored entry sitting at the tail would then lose to whichever generic
+    # pattern the reason happened to contain. Matching the error's own line
+    # prefix beats matching words quoted inside its reason.
+    #
+    # Two things the anchor has to survive, both of which an obvious `^\[.*\]`
+    # would miss:
+    #  - The CLI colors its output UNCONDITIONALLY. `lore-client/src/cli/logging.rs`
+    #    prints `{color}{message}{reset}` and anstyle renders with no TTY or
+    #    NO_COLOR gate, so a captured line starts with SGR escapes, not with `[`.
+    #    Without the escape group this pattern never matches real output at all
+    #    and the hoist is inert. `test_link.py` strips ANSI for the same reason.
+    #  - The level tag is matched EXACTLY as `[Error]`, not as any bracketed
+    #    word. `(?m)^` matches every line of the captured stdout+stderr, so a
+    #    permissive tag would let an incidental `[Warn] Not authenticated:
+    #    retrying` line steal the classification from the real failure below it.
+    (
+        re.compile(r"(?m)^(?:\x1b\[[0-9;]*m)*(?:\[Error\]\s*)?Not authenticated\b"),
+        NotAuthenticatedError,
+    ),
     ("Unable to commit", CommitFailed),
     (
         "Target branch to merge into has a newer revision, merge target branch first",
@@ -232,6 +262,10 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Local modifications prevent synchronization", LocalModificationsError),
     ("No commit identity configured", MissingIdentityError),
     ("Operation not supported", NotSupportedError),
+    # Kept, not dead. The anchored entry at the top of this list only matches the
+    # error at the start of its own line; this one still catches a build or a code
+    # path that mentions the failure mid-line. It sits at the tail so a generic
+    # pattern above it wins on the rare output that contains both.
     ("Not authenticated", NotAuthenticatedError),
 ]
 

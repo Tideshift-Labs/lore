@@ -133,10 +133,50 @@ pub struct NotSupported {
 // operation.
 // ---------------------------------------------------------------------------
 
+/// What a refusal reads as when the deciding party named no reason.
+///
+/// Deliberately not an empty string. The reason renders after a colon, and an
+/// empty one leaves a dangling `Not authenticated: ` that reads as a bug in the
+/// client rather than as a server that said nothing.
+pub const UNSTATED_REFUSAL: &str = "the server stated no reason";
+
+/// The caller's identity is missing, unusable, or was refused.
+///
+/// FORK-LOCAL (Tideshift): `reason` carries the deciding party's own words —
+/// usually a server's gRPC status message, threaded through
+/// `lore-transport`'s status mapping. It exists because the fixed-message unit
+/// struct this replaced silently discarded that text: an enforcing cell
+/// refusing a push for a precise, actionable cause reached the operator as
+/// three characterless words, which cost a full diagnosis session on WP-120.
+///
+/// The detail crosses the C boundary in the existing `LoreErrorDetail.message`
+/// field, which is this type's `Display`. The FFI code stays 16 and no header
+/// shape changes, so a consumer that only branches on the code is unaffected.
+/// A consumer that shows the message now sees the cause.
+///
+/// The field follows the sibling precedent in this same registry —
+/// `NotConnected { reason }`, `Oversized { context }`, `NotSupported
+/// { operation }` — rather than inventing a shape.
 #[derive(Debug, Clone, Error, FfiError)]
-#[error("Not authenticated")]
+#[error("Not authenticated: {reason}")]
 #[ffi_code(16)]
-pub struct NotAuthenticated;
+pub struct NotAuthenticated {
+    /// Why the caller is not authenticated, in the deciding party's words.
+    ///
+    /// Never empty in practice: a construction site with nothing to say uses
+    /// [`UNSTATED_REFUSAL`] rather than the empty string.
+    pub reason: String,
+}
+
+impl NotAuthenticated {
+    /// Build the error with a reason. The ergonomic spelling for the many call
+    /// sites that hold a `&str` literal.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Error, FfiError)]
 #[error("Not authorized to access repository")]
@@ -637,7 +677,11 @@ mod tests {
                 Group::Input,
                 NotSupported { operation: text() }.ffi_code(),
             ),
-            ("NotAuthenticated", Group::Auth, NotAuthenticated.ffi_code()),
+            (
+                "NotAuthenticated",
+                Group::Auth,
+                NotAuthenticated { reason: text() }.ffi_code(),
+            ),
             ("NotAuthorized", Group::Auth, NotAuthorized.ffi_code()),
             ("TokenNotFound", Group::Auth, TokenNotFound.ffi_code()),
             ("WriteRequired", Group::Auth, WriteRequired.ffi_code()),

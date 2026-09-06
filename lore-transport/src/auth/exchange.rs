@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::time::Duration;
@@ -379,7 +380,10 @@ pub async fn exchange(
     }
     if identity.is_empty() {
         lore_debug!("No identity, unable to perform authz exchange");
-        return Err(NotAuthenticated.into());
+        return Err(NotAuthenticated::new(format!(
+            "no identity is configured for repository {repository}; sign in first"
+        ))
+        .into());
     }
 
     let auth_domain = get_domain_or_empty(auth_url);
@@ -450,7 +454,10 @@ pub async fn exchange(
     .await
     else {
         lore_debug!("Not authenticated, unable to perform authz exchange");
-        return Err(NotAuthenticated.into());
+        return Err(NotAuthenticated::new(format!(
+            "no authentication token is stored for identity {identity} at {auth_url}; sign in again"
+        ))
+        .into());
     };
     lore_trace!("Authorizing using endpoint: {auth_url}");
 
@@ -550,7 +557,10 @@ pub async fn exchange_custom_resource(
     }
     if identity.is_empty() {
         lore_debug!("No identity, unable to perform authz exchange");
-        return Err(NotAuthenticated.into());
+        return Err(NotAuthenticated::new(format!(
+            "no identity is configured for resource {resource_id}; sign in first"
+        ))
+        .into());
     }
     if resource_id.is_empty() {
         lore_debug!("No resource_id, unable to perform authz exchange");
@@ -626,7 +636,10 @@ pub async fn exchange_custom_resource(
     .await
     else {
         lore_debug!("Not authenticated, unable to perform authz exchange");
-        return Err(NotAuthenticated.into());
+        return Err(NotAuthenticated::new(format!(
+            "no authentication token is stored for identity {identity} at {auth_url}; sign in again"
+        ))
+        .into());
     };
     lore_trace!("Authorizing using endpoint: {auth_url}");
 
@@ -1561,7 +1574,7 @@ mod tests {
         let auth_url = "refresh-rejected://auth.example.com";
         store_pair(auth_url, "alice", &current).await;
         let provider = Arc::new(TestAuthentication::failing(ProtocolError::from(
-            NotAuthenticated,
+            NotAuthenticated::new("refresh rejected"),
         )));
         authentication::add("refresh-rejected", provider).expect("register provider");
 

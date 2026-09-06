@@ -373,7 +373,11 @@ async fn connect_impl(
                 if has_identities {
                     return Err(ProtocolError::from(lore_base::error::NotAuthorized));
                 }
-                return Err(ProtocolError::from(lore_base::error::NotAuthenticated));
+                return Err(ProtocolError::from(
+                    lore_base::error::NotAuthenticated::new(format!(
+                        "no identity could be resolved for {remote_domain} at {auth_url}"
+                    )),
+                ));
             }
         } else if access_token.is_empty() {
             // With an access token there is no authentication token to find:
@@ -397,7 +401,9 @@ async fn connect_impl(
                 // NotAuthenticated rather than an internal failure.
                 if err.is_token_not_found() {
                     lore_debug!("No token stored for identity {identity} at {auth_url}");
-                    ProtocolError::from(lore_base::error::NotAuthenticated)
+                    ProtocolError::from(lore_base::error::NotAuthenticated::new(format!(
+                        "no token stored for identity {identity} at {auth_url}; sign in again"
+                    )))
                 } else {
                     ProtocolError::internal_with_context(err, "loading user token")
                 }
@@ -1684,7 +1690,7 @@ mod tests {
                 NotAuthorized
             )));
             assert!(super::super::refusal_is_final(&ProtocolError::from(
-                NotAuthenticated
+                NotAuthenticated::new("test")
             )));
         }
 
