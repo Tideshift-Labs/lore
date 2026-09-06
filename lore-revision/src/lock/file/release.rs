@@ -29,8 +29,12 @@ use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lock;
+use crate::lock::util::BatchSetError;
+use crate::lock::util::BatchSetLabels;
 use crate::lock::util::LOCK_BATCH_SIZE;
+use crate::lock::util::SetFailure;
 use crate::lock::util::assemble_resource_for_path;
+use crate::lock::util::classify_batch_set;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
@@ -430,112 +434,48 @@ pub async fn release(
 
 /// Whether an `Unlock` failure settles what happened to the request.
 ///
-/// The line drawn here is the transport's, restated because it changes what this file does next.
-/// [`crate::dispatch::under_own_attempt`] draws the same one for the attempt journal: an
-/// `OutcomeUnknown` means the answer was lost, so its record is deliberately left standing for a
-/// later authoritative read, while any other error means the transport either held proof the
-/// request never left or carried back the server's own refusal. The two must agree — journalling
-/// an attempt as unresolved and then acting as though it decisively failed is exactly the
-/// contradiction this function exists to prevent.
-///
-/// One `matches!` rather than a check at each caller, so a future non-decisive variant has one
-/// place to be added.
-fn is_decisive(error: &ReleaseError) -> bool {
-    !matches!(error, ReleaseError::OutcomeUnknown(_))
+/// See [`BatchSetError`] for the rule and why it is one `matches!` per verb.
+impl BatchSetError for ReleaseError {
+    fn is_decisive(&self) -> bool {
+        !matches!(self, ReleaseError::OutcomeUnknown(_))
+    }
+
+    fn set_failed(message: &'static str) -> Self {
+        ReleaseError::internal(message)
+    }
 }
+
+/// What this verb calls its batched dispatch, in the shared verdict's log line and fallback.
+const UNLOCK_SET_LABELS: BatchSetLabels = BatchSetLabels {
+    verb: "lock-release",
+    fallback: "Failed to release the lock",
+};
 
 /// Why one set of `Unlock` batches did not complete, and whether the answer settles anything.
-///
-/// The second field is what the caller needs and a bare [`ReleaseError`] cannot carry. Escalating
-/// to a takeover is a second irreversible mutation, and it may only follow an answer that
-/// decisively says the first one did not happen.
-#[derive(Debug)]
-struct UnlockSetFailure {
-    error: ReleaseError,
-    /// True only when every batch in the set answered decisively.
-    ///
-    /// The whole set, not the one batch that failed, because the escalation re-sends every
-    /// resource in the set rather than only the ones a batch failed on. One unknown batch — or one
-    /// batch task that never produced an answer at all — is therefore enough to make the set
-    /// unsafe to escalate.
-    decisive: bool,
-}
+type UnlockSetFailure = SetFailure<ReleaseError>;
 
-/// Turn one set's per-batch outcomes into the set's verdict.
+/// Turn one `Unlock` set's per-batch outcomes into the set's verdict.
 ///
-/// Split out of [`unlock_batches`] because this is where a set's decisiveness is decided, and
-/// deciding it needs no connection, no runtime and no server. The two rules that are easiest to
-/// get wrong live here and are not reachable through the live fixture, whose stub answers one
-/// policy per RPC and so cannot make two batches of one set differ: an unknown batch outranks a
-/// decisive refusal in the same set, and a lost batch task must not shadow a real lost answer.
+/// The rules live in [`classify_batch_set`], which `acquire` uses too — the two verbs decide
+/// decisiveness identically, and the second copy of that decision is how `acquire` came to discard
+/// the classified errors this one acts on. This wrapper is this verb's labels and nothing else.
 ///
-/// `task_failure` describes batches whose task never produced an outcome — a panic or a
-/// cancellation. Neither says whether the request reached the server, so it makes the set
-/// non-decisive just as an unknown answer does.
+/// The batch-success count the shared helper returns is discarded here: `release` tolerates a
+/// partly successful set, and only `acquire` acts on the difference.
 fn classify_set(
     outcomes: Vec<Result<Vec<LockResource>, ReleaseError>>,
     task_failure: Option<ReleaseError>,
     num_batches: usize,
     released: &mut Vec<LockResource>,
 ) -> Result<(), UnlockSetFailure> {
-    let mut num_batch_success = 0usize;
-    // Counted from what is missing rather than tallied at the join, so a second lost task is still
-    // reported even though the first one already supplied the error value.
-    let mut num_batch_failed = num_batches.saturating_sub(outcomes.len());
-    let mut first_decisive_failure: Option<ReleaseError> = None;
-    let mut first_unknown_failure: Option<ReleaseError> = None;
-
-    // Appended as the outcomes are read, so the caller keeps what a partly successful set released
-    // even when the set as a whole fails. Those rows are gone on the server, and their tokens have
-    // to be cleared whatever else went wrong.
-    for outcome in outcomes {
-        match outcome {
-            Ok(mut results) => {
-                released.append(&mut results);
-                num_batch_success += 1;
-            }
-            Err(error) => {
-                num_batch_failed += 1;
-                if is_decisive(&error) {
-                    first_decisive_failure = first_decisive_failure.or(Some(error));
-                } else {
-                    first_unknown_failure = first_unknown_failure.or(Some(error));
-                }
-            }
-        }
-    }
-
-    if num_batch_failed > 0 {
-        lore_error!("Failed to lock-release {num_batch_failed} batch(es) out of {num_batches}");
-    }
-
-    // Checked before the all-failed test, and ahead of any decisive failure the same set may also
-    // carry. A set holding one unknown batch and one refusal is not a refused set: acting on the
-    // refusal would escalate over resources whose release may already have happened.
-    if first_unknown_failure.is_some() || task_failure.is_some() {
-        return Err(UnlockSetFailure {
-            // A real lost answer is preferred over a lost task, and the order matters. An
-            // `OutcomeUnknown` names the attempt a reconciler has to look up. A lost task says
-            // only that this client stopped watching, and no attempt id survives it — the one that
-            // task minted died with it, already unresolved in the store, which is where a
-            // reconciler finds it anyway. Minting a fresh `OutcomeUnknown` here to make the shape
-            // tidier would name an attempt the server filed nothing under.
-            error: first_unknown_failure
-                .or(task_failure)
-                .unwrap_or_else(|| ReleaseError::internal("Failed to release the lock")),
-            decisive: false,
-        });
-    }
-
-    if num_batch_success == 0 {
-        return Err(UnlockSetFailure {
-            error: first_decisive_failure
-                .unwrap_or_else(|| ReleaseError::internal("Failed to release the lock")),
-            decisive: true,
-        });
-    }
-
-    Ok(())
+    classify_batch_set(
+        outcomes,
+        task_failure,
+        num_batches,
+        &UNLOCK_SET_LABELS,
+        released,
+    )
+    .map(|_| ())
 }
 
 /// Release one set of resources through `Unlock`, in batches, concurrently.
@@ -1068,7 +1008,7 @@ mod tests {
                  followed it: {error}"
             );
             assert!(
-                !is_decisive(&error),
+                !error.is_decisive(),
                 "the error the caller receives must be the non-decisive one"
             );
             assert_eq!(

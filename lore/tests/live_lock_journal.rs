@@ -1253,6 +1253,499 @@ fn release_clears_ownership_for_exactly_what_the_server_confirmed_and_resolve_cl
     );
 }
 
+/// A lost answer on the `Lock` call itself must not be rolled back, and must surface as the named
+/// `OutcomeUnknown` code rather than a generic internal failure.
+///
+/// `LiveRepository::create` commits exactly one file, and `LOCK_BATCH_SIZE` is 100, so this
+/// acquire is one batch, one dispatch. **What this test proves, and what it does not:** the exact
+/// status code (`LoreError::OutcomeUnknown as i32`, asserted with `assert_eq!`, never a
+/// `assert_ne!(status, 0)` that would also pass on the pre-fix `Internal` code path) plus the
+/// surviving unresolved journal record together prove the answer was classified as ambiguous
+/// rather than as a decisive failure. The empty `Unlock`/`ForceUnlock` assertions below are a
+/// forward-guard against a future change to the join loop, **not** proof of the fix by
+/// themselves: with a single batch, an all-failed acquire set never reaches any rollback arm
+/// today, under either the pre-fix or the post-fix code, because the join loop's rollback branch
+/// only runs when `0 < num_batch_success < num_batches` -- a wholly failed one-batch set is
+/// `num_batch_success == 0`, which takes the earlier, non-rollback return in both versions. This
+/// test does not claim a rollback used to happen here and was suppressed by the fix; there was
+/// never a rollback to suppress at this batch count.
+#[test]
+fn a_lost_answer_on_the_acquire_is_not_rolled_back_and_surfaces_outcome_unknown() {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start_with_policy(LockPolicy {
+        lock: RpcOutcome::LoseTheAnswer,
+        ..LockPolicy::default()
+    }));
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create(&server.remote_url()).await
+    }));
+
+    let spy = Arc::new(JournalSpy::new(server.probe()));
+    let attempts: Arc<dyn AttemptStore> = spy.clone();
+
+    let status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        no_callback(),
+        attempts,
+    ));
+
+    assert_eq!(
+        status,
+        LoreError::OutcomeUnknown as i32,
+        "a lost answer on the acquire must surface as the named OutcomeUnknown code, not merely a \
+         nonzero status -- a nonzero-only assertion would pass on the pre-fix code path too, \
+         which fabricated a generic Internal failure"
+    );
+
+    let locks = server.calls_for(LockRpc::Lock);
+    assert_eq!(
+        locks.len(),
+        1,
+        "exactly one Lock dispatch must have reached the server, got {:?}",
+        server.calls()
+    );
+
+    assert!(
+        server.calls_for(LockRpc::Unlock).is_empty(),
+        "a non-decisive lost answer must never trigger a rollback release -- an administrative \
+         mutation is not a safe response to an acquire whose outcome is unknown. Got {:?}",
+        server.calls()
+    );
+    assert!(
+        server.calls_for(LockRpc::ForceUnlock).is_empty(),
+        "a non-decisive lost answer must never trigger a force-release either. Got {:?}",
+        server.calls()
+    );
+
+    let records = spy.record_entries();
+    assert_eq!(
+        records.len(),
+        1,
+        "the acquire must journal exactly one attempt, got {records:?}"
+    );
+    let server_attempt_id = locks[0]
+        .attempt_id
+        .clone()
+        .expect("the dispatch must have carried an attempt id to the server");
+    assert_eq!(
+        records[0].1,
+        GrpcRpc::LockLock.wire_name(),
+        "the journalled attempt must name the Lock dispatch"
+    );
+    assert_eq!(
+        records[0].0, server_attempt_id,
+        "the id the caller journalled must be the exact id that reached the server"
+    );
+
+    assert!(
+        spy.resolve_entries().is_empty(),
+        "a lost answer must leave its attempt unresolved rather than resolving it, got {:?}",
+        spy.resolve_entries()
+    );
+    let unresolved = runtime
+        .block_on(spy.inner.unresolved())
+        .expect("unresolved() must succeed on a fresh store");
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "exactly the one lost-answer attempt must remain standing for later reconciliation, got \
+         {unresolved:?}"
+    );
+}
+
+/// An acquire answered `Status::cancelled` must not be rolled back either, and must surface as the
+/// same named `OutcomeUnknown` code.
+///
+/// A near-copy of `a_lost_answer_on_the_acquire_is_not_rolled_back_and_surfaces_outcome_unknown`,
+/// differing in exactly ONE input: `RpcOutcome::LoseTheAnswerCancelled` in place of
+/// `RpcOutcome::LoseTheAnswer`. This is the shape the defect actually reported -- a mid-flight
+/// reset or an expired handler deadline answers `Status::cancelled`, not a severed channel -- so
+/// this test, not its `LoseTheAnswer` sibling above, is the one that exercises
+/// `lore-transport/src/error.rs`'s `AnswerLostInTransit` marker at all. The same honesty note
+/// applies here as on the sibling: the empty rollback-call assertions are a forward-guard, not the
+/// proof; the proof is the exact status code plus the unresolved record, unreachable by any
+/// rollback arm at this batch count regardless of which code path produced it.
+#[test]
+fn an_acquire_answered_with_cancelled_is_not_rolled_back_and_surfaces_outcome_unknown() {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start_with_policy(LockPolicy {
+        lock: RpcOutcome::LoseTheAnswerCancelled,
+        ..LockPolicy::default()
+    }));
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create(&server.remote_url()).await
+    }));
+
+    let spy = Arc::new(JournalSpy::new(server.probe()));
+    let attempts: Arc<dyn AttemptStore> = spy.clone();
+
+    let status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        no_callback(),
+        attempts,
+    ));
+
+    assert_eq!(
+        status,
+        LoreError::OutcomeUnknown as i32,
+        "an acquire answered Cancelled must surface as the named OutcomeUnknown code, not merely \
+         a nonzero status -- a nonzero-only assertion would pass on the pre-fix code path too, \
+         which read a mid-flight reset as a decisive Internal failure"
+    );
+
+    let locks = server.calls_for(LockRpc::Lock);
+    assert_eq!(
+        locks.len(),
+        1,
+        "exactly one Lock dispatch must have reached the server, got {:?}",
+        server.calls()
+    );
+
+    assert!(
+        server.calls_for(LockRpc::Unlock).is_empty(),
+        "a non-decisive Cancelled answer must never trigger a rollback release. Got {:?}",
+        server.calls()
+    );
+    assert!(
+        server.calls_for(LockRpc::ForceUnlock).is_empty(),
+        "a non-decisive Cancelled answer must never trigger a force-release either. Got {:?}",
+        server.calls()
+    );
+
+    let records = spy.record_entries();
+    assert_eq!(
+        records.len(),
+        1,
+        "the acquire must journal exactly one attempt, got {records:?}"
+    );
+    let server_attempt_id = locks[0]
+        .attempt_id
+        .clone()
+        .expect("the dispatch must have carried an attempt id to the server");
+    assert_eq!(
+        records[0].1,
+        GrpcRpc::LockLock.wire_name(),
+        "the journalled attempt must name the Lock dispatch"
+    );
+    assert_eq!(
+        records[0].0, server_attempt_id,
+        "the id the caller journalled must be the exact id that reached the server"
+    );
+
+    assert!(
+        spy.resolve_entries().is_empty(),
+        "a lost answer must leave its attempt unresolved rather than resolving it, got {:?}",
+        spy.resolve_entries()
+    );
+    let unresolved = runtime
+        .block_on(spy.inner.unresolved())
+        .expect("unresolved() must succeed on a fresh store");
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "exactly the one lost-answer attempt must remain standing for later reconciliation, got \
+         {unresolved:?}"
+    );
+}
+
+/// A decisive refusal on the acquire stays decisive, resolves `NotApplied`, and sends no
+/// rollback -- the negative control for the two lost-answer tests above.
+///
+/// Without this test, an implementation that classified EVERY acquire failure as non-decisive
+/// (for example, one that mapped every `AcquireError` variant to `OutcomeUnknown` rather than
+/// only the genuinely ambiguous one) would still pass both lost-answer tests. This is what proves
+/// the fix actually discriminates ambiguous outcomes from decisive ones, rather than just always
+/// answering `OutcomeUnknown`.
+#[test]
+fn a_decisive_refusal_on_the_acquire_stays_decisive_and_sends_no_rollback() {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start_with_policy(LockPolicy {
+        lock: RpcOutcome::Refuse(Refusal::PermissionDenied),
+        ..LockPolicy::default()
+    }));
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create(&server.remote_url()).await
+    }));
+
+    let spy = Arc::new(JournalSpy::new(server.probe()));
+    let attempts: Arc<dyn AttemptStore> = spy.clone();
+
+    let status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        no_callback(),
+        attempts,
+    ));
+
+    assert_ne!(
+        status,
+        LoreError::OutcomeUnknown as i32,
+        "a decisive permission-denied refusal must not surface as OutcomeUnknown"
+    );
+    assert_ne!(
+        status, 0,
+        "a permission-denied refusal must fail the acquire"
+    );
+
+    let records = spy.record_entries();
+    assert_eq!(
+        records.len(),
+        1,
+        "the refused dispatch must still be journalled once, got {records:?}"
+    );
+
+    let resolves = spy.resolve_entries();
+    assert_eq!(
+        resolves.len(),
+        1,
+        "a decisive refusal must resolve the record rather than leaving it unresolved, got \
+         {resolves:?}"
+    );
+    assert_eq!(
+        resolves[0].0, records[0].0,
+        "the same attempt id must both be recorded and resolved"
+    );
+    assert_eq!(
+        resolves[0].1,
+        AttemptResolution::NotApplied,
+        "a decisive refusal is a decisively not-applied attempt"
+    );
+
+    let unresolved = runtime
+        .block_on(spy.inner.unresolved())
+        .expect("unresolved() must succeed on a fresh store");
+    assert!(
+        unresolved.is_empty(),
+        "a decisively resolved attempt must not still count as unresolved, got {unresolved:?}"
+    );
+
+    assert!(
+        server.calls_for(LockRpc::Unlock).is_empty(),
+        "a decisive refusal must not send any rollback release. Got {:?}",
+        server.calls()
+    );
+    assert!(
+        server.calls_for(LockRpc::ForceUnlock).is_empty(),
+        "a decisive refusal must not send any force-release either. Got {:?}",
+        server.calls()
+    );
+}
+
+/// 101 file names -- one more than `LOCK_BATCH_SIZE` (100), so a fixture built from these commits
+/// exactly two batches, which is the only way this fixture can make one acquire's batches answer
+/// differently: `LockPolicy::lock_after_first` numbers arrivals under the stub server's own calls
+/// lock and switches the answer after the first, so the two multi-batch tests below assert how
+/// many calls got which answer, never which resources were in which batch -- which arrives first
+/// is not fixed.
+fn multi_batch_file_names() -> Vec<String> {
+    (0..101).map(|index| format!("f{index:03}.file")).collect()
+}
+
+/// A multi-batch acquire where one batch is granted and the other's answer is lost must not be
+/// rolled back, and must surface the exact `OutcomeUnknown` code.
+///
+/// Unlike the single-batch acquire tests above, this is a genuinely PARTIAL set: one of the two
+/// batches was granted. Pre-fix, `acquire`'s join loop counted this as
+/// `0 < num_batch_success < num_batches` and took the rollback arm, dispatching a release for
+/// every requested path -- `Unlock` calls reached the server. Post-fix, a set carrying a
+/// non-decisive batch never returns `Ok` from the shared verdict at all, so the rollback arm is
+/// structurally unreachable. That makes the empty `Unlock` log here actual proof of the fix, not
+/// the forward-guard the single-batch tests' empty logs are.
+#[test]
+fn a_multi_batch_acquire_with_one_lost_answer_is_not_rolled_back() {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start_with_policy(LockPolicy {
+        lock: RpcOutcome::Grant,
+        lock_after_first: Some(RpcOutcome::LoseTheAnswer),
+        ..LockPolicy::default()
+    }));
+    let names = multi_batch_file_names();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create_with_files(&server.remote_url(), &name_refs).await
+    }));
+
+    let spy = Arc::new(JournalSpy::new(server.probe()));
+    let attempts: Arc<dyn AttemptStore> = spy.clone();
+
+    let status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        no_callback(),
+        attempts,
+    ));
+
+    assert_eq!(
+        status,
+        LoreError::OutcomeUnknown as i32,
+        "a partial set carrying a lost answer must surface as the named OutcomeUnknown code, not \
+         merely a nonzero status -- a nonzero-only assertion would pass on the pre-fix rollback \
+         path too"
+    );
+
+    let locks = server.calls_for(LockRpc::Lock);
+    assert_eq!(
+        locks.len(),
+        2,
+        "101 committed files must split into exactly two batches, got {:?}",
+        server.calls()
+    );
+
+    assert!(
+        server.calls_for(LockRpc::Unlock).is_empty(),
+        "a non-decisive partial set must never trigger a rollback release -- this is the real \
+         discriminator for this test, not a forward-guard: the pre-fix join loop took exactly \
+         this rollback arm on exactly this shape (one success, one failure). Got {:?}",
+        server.calls()
+    );
+    assert!(
+        server.calls_for(LockRpc::ForceUnlock).is_empty(),
+        "a non-decisive partial set must never trigger a force-release either. Got {:?}",
+        server.calls()
+    );
+
+    let records = spy.record_entries();
+    assert_eq!(
+        records.len(),
+        2,
+        "both batches must journal their own attempt, got {records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .all(|(_, operation, _)| operation == GrpcRpc::LockLock.wire_name()),
+        "both journalled attempts must name the Lock dispatch, got {records:?}"
+    );
+
+    let resolves = spy.resolve_entries();
+    assert_eq!(
+        resolves.len(),
+        1,
+        "only the granted batch's attempt may resolve, got {resolves:?}"
+    );
+    assert_eq!(
+        resolves[0].1,
+        AttemptResolution::Applied,
+        "the granted batch is a decisively applied attempt"
+    );
+
+    let unresolved = runtime
+        .block_on(spy.inner.unresolved())
+        .expect("unresolved() must succeed on a fresh store");
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "exactly the lost-answer batch's attempt must remain standing for reconciliation, got \
+         {unresolved:?}"
+    );
+}
+
+/// A multi-batch acquire mixing a decisive refusal and a lost answer in the same set must surface
+/// the lost answer's `OutcomeUnknown` code, not the refusal's.
+///
+/// This is the live proof of the unit-level claim in `acquire::tests::set_verdict`'s
+/// `an_unknown_batch_outranks_a_refusal_in_the_same_set`: pre-fix, this returned
+/// `LoreError::Internal as i32` (the refusal, or a fabricated internal failure), because the join
+/// loop discarded each batch's classified error. A caller acting on a decisive-looking refusal
+/// here would conclude the whole acquire was cleanly refused and might retry it, when in fact one
+/// of the two locks it asked for may already be held.
+#[test]
+fn a_multi_batch_acquire_mixing_a_refusal_and_a_lost_answer_surfaces_the_lost_answer() {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start_with_policy(LockPolicy {
+        lock: RpcOutcome::Refuse(Refusal::PermissionDenied),
+        lock_after_first: Some(RpcOutcome::LoseTheAnswer),
+        ..LockPolicy::default()
+    }));
+    let names = multi_batch_file_names();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create_with_files(&server.remote_url(), &name_refs).await
+    }));
+
+    let spy = Arc::new(JournalSpy::new(server.probe()));
+    let attempts: Arc<dyn AttemptStore> = spy.clone();
+
+    let status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        no_callback(),
+        attempts,
+    ));
+
+    assert_eq!(
+        status,
+        LoreError::OutcomeUnknown as i32,
+        "the lost answer must outrank the decisive refusal in the same set -- pre-fix this \
+         returned the Internal code instead"
+    );
+
+    let locks = server.calls_for(LockRpc::Lock);
+    assert_eq!(
+        locks.len(),
+        2,
+        "101 committed files must split into exactly two batches, got {:?}",
+        server.calls()
+    );
+    assert!(
+        server.calls_for(LockRpc::Unlock).is_empty(),
+        "an all-failed set (refused plus lost) never reaches the rollback arm at any batch count \
+         -- this assertion is a forward-guard, not the proof here. Got {:?}",
+        server.calls()
+    );
+    assert!(
+        server.calls_for(LockRpc::ForceUnlock).is_empty(),
+        "Got {:?}",
+        server.calls()
+    );
+
+    let records = spy.record_entries();
+    assert_eq!(
+        records.len(),
+        2,
+        "both batches must journal their own attempt, got {records:?}"
+    );
+
+    let resolves = spy.resolve_entries();
+    assert_eq!(
+        resolves.len(),
+        1,
+        "only the refused batch's attempt may resolve, got {resolves:?}"
+    );
+    assert_eq!(
+        resolves[0].1,
+        AttemptResolution::NotApplied,
+        "the refused batch is a decisively not-applied attempt"
+    );
+
+    let unresolved = runtime
+        .block_on(spy.inner.unresolved())
+        .expect("unresolved() must succeed on a fresh store");
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "exactly the lost-answer batch's attempt must remain standing for reconciliation, got \
+         {unresolved:?}"
+    );
+}
+
 /// Count the `ownership` rows in the live fixture's on-disk attempt-store document.
 ///
 /// Reads `<repository path>/.lore/attempts` directly rather than through any `AttemptStore`

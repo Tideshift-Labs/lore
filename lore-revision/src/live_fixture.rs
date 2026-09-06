@@ -216,6 +216,21 @@ fn lost_answer_cancelled() -> Status {
 #[derive(Clone, Debug)]
 pub struct LockPolicy {
     pub lock: RpcOutcome,
+    /// How the stub answers the SECOND and every later `Lock` call, when that differs from the
+    /// first.
+    ///
+    /// The only way this fixture can make two batches of ONE set differ. Every other field here is
+    /// per-RPC, so it answers every batch of a set identically — and a set whose batches disagree
+    /// is exactly what a set verdict is about: one batch's lost answer must outrank another's
+    /// decisive refusal, and a partial set holding one lost answer must not be rolled back. Neither
+    /// claim is reachable without this.
+    ///
+    /// A batched acquire dispatches its batches concurrently, so *which* batch arrives first is not
+    /// fixed. What is fixed is the shape: exactly one call is answered by `lock` and the rest by
+    /// this. A test may assert how many calls got which answer, never which resources were in them.
+    ///
+    /// `None` leaves every `Lock` answered by `lock`, which is what every existing caller gets.
+    pub lock_after_first: Option<RpcOutcome>,
     pub admin_lock: RpcOutcome,
     pub unlock: RpcOutcome,
     pub force_unlock: RpcOutcome,
@@ -250,6 +265,7 @@ impl Default for LockPolicy {
     fn default() -> Self {
         Self {
             lock: RpcOutcome::Grant,
+            lock_after_first: None,
             admin_lock: RpcOutcome::Grant,
             unlock: RpcOutcome::Grant,
             force_unlock: RpcOutcome::Grant,
@@ -498,20 +514,26 @@ struct StubLockService {
 }
 
 impl StubLockService {
+    /// Record one arriving request, and answer where it sits in that RPC's own arrival order.
+    ///
+    /// The ordinal is computed while the calls lock is held, so two batches of one set that arrive
+    /// concurrently are numbered 1 and 2 rather than both reading the same count after both have
+    /// pushed. Every caller but [`LockService::lock`] ignores it.
     fn record<T>(
         &self,
         rpc: LockRpc,
         request: &Request<T>,
         resources: &[lore_proto::lock::Resource],
         owner: &str,
-    ) {
+    ) -> usize {
         let attempt_id = request
             .metadata()
             .get(ATTEMPT_ID_METADATA_KEY)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
 
-        self.state.calls.lock().push(LockCall {
+        let mut calls = self.state.calls.lock();
+        calls.push(LockCall {
             rpc,
             attempt_id,
             descriptions: resources
@@ -524,6 +546,7 @@ impl StubLockService {
                     .iter()
                     .all(|resource| !resource.expected_ownership_token.is_empty()),
         });
+        calls.iter().filter(|call| call.rpc == rpc).count()
     }
 
     /// Grant every requested resource, minting a distinct token per row when the policy says the
@@ -574,8 +597,14 @@ impl StubLockService {
 impl LockService for StubLockService {
     async fn lock(&self, request: Request<LockRequest>) -> Result<Response<LockResponse>, Status> {
         let resources = request.get_ref().resources.clone();
-        self.record(LockRpc::Lock, &request, &resources, "");
-        match self.outcome(LockRpc::Lock) {
+        let ordinal = self.record(LockRpc::Lock, &request, &resources, "");
+        // Read before `outcome`, never while holding the policy lock, which `outcome` takes too.
+        let follow_up = self.state.policy.lock().lock_after_first;
+        let outcome = match follow_up {
+            Some(follow_up) if ordinal > 1 => follow_up,
+            _ => self.outcome(LockRpc::Lock),
+        };
+        match outcome {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
