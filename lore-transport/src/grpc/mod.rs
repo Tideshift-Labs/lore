@@ -1565,6 +1565,28 @@ impl GRPCAdmin {
 
 #[async_trait]
 impl Admin for GRPCAdmin {
+    /// `with_reconnect`, not `with_reconnect_classified`.
+    ///
+    /// The reconnect is not optional: `handle_error` retries only
+    /// `ResourceExhausted`, so a dropped channel surfaces as
+    /// `ProtocolError::Disconnected` and the client's own `grpc_retry` never sees
+    /// it. Without this wrapper `server_info` would be the one `Admin` verb that
+    /// fails permanently after a drop on a long-lived connection while
+    /// `obliterate` recovers.
+    ///
+    /// The *classified* wrapper is what this does not need. That one decides
+    /// whether an interrupted dispatch may be replayed; `ServerInfo` mutates
+    /// nothing, so there is no outcome to classify and no `GrpcRpc` variant or
+    /// replay class to add.
+    async fn server_info(&self) -> Result<ServerInfo, ProtocolError> {
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.server_info().await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
+    }
+
     async fn obliterate(&self, address: Address) -> Result<(), ProtocolError> {
         with_reconnect_classified(
             &self.connection,

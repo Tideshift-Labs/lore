@@ -5,6 +5,32 @@ use lore_base::types::*;
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
+// Server identity
+// ---------------------------------------------------------------------------
+
+/// What a server tells a client about itself through `AdminService.ServerInfo`.
+///
+/// Only the two fields a client can act on. `settings` and `host` are operator
+/// diagnostics and stay off this type until something needs them, so a caller
+/// cannot come to depend on a shape we have no reason to keep stable.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ServerInfo {
+    /// The server's build version, e.g. `0.9.1-nightly+0`.
+    pub version: String,
+    /// The capabilities this server advertises.
+    ///
+    /// A capability ABSENT here is the only honest way for a client to learn
+    /// that a rail it wants is not served — the alternative is attempting the
+    /// operation and reading a refusal, or worse, taking a silent legacy path.
+    ///
+    /// Point-in-time, not live: loreserver computes this list once, when it
+    /// builds its gRPC endpoint, so a server whose configuration changed while
+    /// running keeps reporting what it started with until it restarts. Read a
+    /// present capability as present; read an absent one as "not at boot".
+    pub features: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Environment types
 // ---------------------------------------------------------------------------
 

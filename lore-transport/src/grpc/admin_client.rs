@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -8,6 +9,7 @@ use lore_base::types::Address;
 use lore_base::types::RepositoryId;
 use lore_proto::AdminServiceClient;
 use lore_proto::ObliterateRequest;
+use lore_proto::rpc::ServerInfoRequest;
 
 use super::AuthorizedService;
 use super::AuthzInterceptor;
@@ -18,6 +20,7 @@ use super::grpc_retry;
 use super::handle_error;
 use super::inject_authn_bearer;
 use crate::error::ProtocolError;
+use crate::types::ServerInfo;
 
 #[derive(Clone)]
 pub struct AdminService {
@@ -43,6 +46,37 @@ impl AdminService {
             auth,
             request_inflight: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Read the server's advertised version and capabilities.
+    ///
+    /// No `inject_authn_bearer`, unlike `obliterate`: this is a read, not a
+    /// governed direct family, and the server mounts `AdminService` with no
+    /// interceptor at all. Stamping a human authentication bearer on it would
+    /// imply an authorization decision that nothing here makes.
+    pub async fn server_info(&self) -> Result<ServerInfo, ProtocolError> {
+        lore_debug!("Reading remote server info");
+
+        let mut retry = grpc_retry();
+        let response = loop {
+            let _counter = RequestScopedCounter::new(self.request_inflight.clone());
+
+            let mut client = self.client.clone();
+
+            match client.server_info(ServerInfoRequest {}).await {
+                Ok(response) => {
+                    break response.into_inner();
+                }
+                Err(status) => {
+                    handle_error(&mut retry, status).await?;
+                }
+            }
+        };
+
+        Ok(ServerInfo {
+            version: response.version,
+            features: response.features,
+        })
     }
 
     pub async fn obliterate(&self, address: Address) -> Result<(), ProtocolError> {

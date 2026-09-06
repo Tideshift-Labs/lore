@@ -522,6 +522,21 @@ pub trait Repository: Send + Sync {
 pub trait Admin: Send + Sync {
     /// Obliterate the payloads and fragments for an address
     async fn obliterate(&self, address: Address) -> Result<(), ProtocolError>;
+
+    /// Read the server's advertised version and capability list.
+    ///
+    /// A read, not a mutation: no attempt id, no receipt, nothing to reconcile
+    /// if the answer is lost. The server mounts `AdminService` without an
+    /// interceptor, so this answers on a connection that has no repository
+    /// authorization yet.
+    ///
+    /// Required rather than defaulted, deliberately. A default body would have
+    /// to answer something, and an implementor that silently inherits it reports
+    /// a capability list the server never sent — the same silent-inheritance
+    /// shape that let a wrapping store report `Unimplemented` for a capability
+    /// its backend provided. There is one implementor in this workspace, so the
+    /// cost of requiring it is a compile error at exactly the right place.
+    async fn server_info(&self) -> Result<ServerInfo, ProtocolError>;
 }
 
 /// Domain-operation receipt protocol (CR-029, WP-120).

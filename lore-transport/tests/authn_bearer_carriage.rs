@@ -293,15 +293,20 @@ impl RepositoryServiceV1 for RecordingRepository {
 
 struct RecordingAdmin {
     log: CaptureLog,
+    /// What `server_info` answers with. Configurable per-server so tests can
+    /// pin both a non-empty and a genuinely empty `features` list against the
+    /// same real gRPC round trip.
+    server_info_response: ServerInfoResponse,
 }
 
 #[tonic::async_trait]
 impl AdminServiceV1 for RecordingAdmin {
     async fn server_info(
         &self,
-        _request: Request<ServerInfoRequest>,
+        request: Request<ServerInfoRequest>,
     ) -> Result<Response<ServerInfoResponse>, Status> {
-        Err(Status::unimplemented("not used by this test"))
+        record(&self.log, "admin.server_info", request.metadata());
+        Ok(Response::new(self.server_info_response.clone()))
     }
 
     async fn obliterate(
@@ -370,8 +375,29 @@ struct TestServer {
     log: CaptureLog,
 }
 
+/// The default `ServerInfo` stub used by every test that doesn't need a specific shape:
+/// non-empty `version` and a multi-entry `features` list, including
+/// `domain_operation_receipt_v2` -- the capability lorehub-desktop actually checks for.
+fn default_server_info_response() -> ServerInfoResponse {
+    ServerInfoResponse {
+        version: "1.2.3-test".to_string(),
+        features: vec![
+            "domain_operation_receipt_v2".to_string(),
+            "some_other_feature".to_string(),
+        ],
+        settings: HashMap::new(),
+        host: None,
+    }
+}
+
 impl TestServer {
     async fn start() -> Self {
+        Self::start_with_server_info(default_server_info_response()).await
+    }
+
+    /// Like [`Self::start`], but with a caller-chosen `ServerInfo` stub -- used to pin the
+    /// empty-`features` round trip independent of the default multi-entry shape.
+    async fn start_with_server_info(server_info_response: ServerInfoResponse) -> Self {
         let log: CaptureLog = Arc::new(Mutex::new(HashMap::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -380,7 +406,10 @@ impl TestServer {
 
         let revision = RecordingRevision { log: log.clone() };
         let repository = RecordingRepository { log: log.clone() };
-        let admin = RecordingAdmin { log: log.clone() };
+        let admin = RecordingAdmin {
+            log: log.clone(),
+            server_info_response,
+        };
         let lock = RecordingLock { log: log.clone() };
 
         // `lore_base::lore_spawn!` rather than a bare `tokio::spawn`: with a
@@ -752,6 +781,101 @@ async fn lock_query_carries_no_authn_bearer_header() {
         .captured("lock.query")
         .expect("query must have been recorded");
     assert_eq!(captured.authn_bearer, None);
+}
+
+// ---------------------------------------------------------------------------------------
+// AdminService.ServerInfo: a read, not a governed direct family -- the one thing this
+// file most wants to pin is the NEGATIVE, next to the positives above. `ServerInfo` is
+// dispatched through the same `AdminService` client as `obliterate` (see
+// `admin_client.rs`), so proving it never picks up `lore-authn-bearer` is the difference
+// between "a read" and "a governed dispatch" for this client, not an accident of a
+// separate code path.
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn server_info_carries_no_authn_bearer_header() {
+    let server = TestServer::start().await;
+    let connection = server.connect(AUTHN_TOKEN, AUTHZ_TOKEN).await;
+    let admin = connection
+        .admin(test_repository())
+        .await
+        .expect("admin client");
+
+    admin.server_info().await.expect("server_info must succeed");
+
+    let captured = server
+        .captured("admin.server_info")
+        .expect("server_info must have been recorded");
+    assert_eq!(
+        captured.authn_bearer, None,
+        "ServerInfo is a read with no governed dispatch -- it must never carry \
+         lore-authn-bearer, unlike obliterate on the same AdminService client"
+    );
+}
+
+#[tokio::test]
+async fn server_info_returns_the_advertised_version_and_features_with_no_repository_authorization()
+{
+    let server = TestServer::start().await;
+    // Empty identity token AND empty access token: the desktop's actual case for this call
+    // -- it probes ServerInfo before any sign-in has happened. Per the module doc comment,
+    // `auth_exchange_for_identity` short-circuits to all-empty tokens rather than attempting
+    // a real exchange when both are empty, so this connects and dispatches with no
+    // repository authorization at all (no auth endpoint needed either).
+    let connection = server.connect("", "").await;
+    let admin = connection
+        .admin(test_repository())
+        .await
+        .expect("admin client");
+
+    let info = admin
+        .server_info()
+        .await
+        .expect("server_info must succeed with no authorization on the connection");
+
+    assert_eq!(info.version, "1.2.3-test");
+    assert_eq!(
+        info.features,
+        vec![
+            "domain_operation_receipt_v2".to_string(),
+            "some_other_feature".to_string(),
+        ],
+        "a multi-entry features list must round-trip verbatim, in order"
+    );
+
+    let captured = server
+        .captured("admin.server_info")
+        .expect("server_info must have been recorded");
+    assert_eq!(
+        captured.authorization, None,
+        "no repository authorization token was exchanged for this call"
+    );
+    assert_eq!(captured.authn_bearer, None);
+}
+
+#[tokio::test]
+async fn server_info_round_trips_an_empty_features_list_as_empty() {
+    let server = TestServer::start_with_server_info(ServerInfoResponse {
+        version: "0.0.0-empty".to_string(),
+        features: Vec::new(),
+        settings: HashMap::new(),
+        host: None,
+    })
+    .await;
+    let connection = server.connect(AUTHN_TOKEN, AUTHZ_TOKEN).await;
+    let admin = connection
+        .admin(test_repository())
+        .await
+        .expect("admin client");
+
+    let info = admin.server_info().await.expect("server_info must succeed");
+
+    assert_eq!(info.version, "0.0.0-empty");
+    assert_eq!(
+        info.features,
+        Vec::<String>::new(),
+        "an empty features list must round-trip as empty, not as an error or a missing field"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
