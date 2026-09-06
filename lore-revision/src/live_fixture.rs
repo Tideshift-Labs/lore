@@ -183,6 +183,16 @@ pub enum RpcOutcome {
     /// On a `ReadRetryable` RPC this is a reconnect-and-reissue instead, so it says nothing
     /// useful there. Point it at a mutation.
     LoseTheAnswer,
+    /// Receive and record the request, then answer `Status::cancelled` -- the actual defect shape
+    /// a mid-flight stream reset produces, as opposed to [`Self::LoseTheAnswer`]'s severed-channel
+    /// shape. Both are non-decisive for the same reason (the request reached the server and no
+    /// verdict came back), but they exercise different code in `lore-transport`: `LoseTheAnswer`'s
+    /// `Unavailable` maps straight to `ProtocolError::Disconnected`, while `Cancelled` has to be
+    /// recognised by `crate::error`'s `AnswerLostInTransit` marker before
+    /// `with_reconnect_classified` will treat it as non-decisive rather than a server refusal. A
+    /// fixture that only offered `LoseTheAnswer` could not express the bug this variant was added
+    /// to catch a regression of.
+    LoseTheAnswerCancelled,
 }
 
 /// The status a [`RpcOutcome::LoseTheAnswer`] answer carries.
@@ -191,6 +201,15 @@ pub enum RpcOutcome {
 /// what a lost answer looks like on the wire cannot drift between them.
 fn lost_answer() -> Status {
     Status::unavailable("fixture: the answer is lost")
+}
+
+/// The status a [`RpcOutcome::LoseTheAnswerCancelled`] answer carries.
+///
+/// Mirrors [`lost_answer`]'s one-function convention. `lore-server`'s own `timeout_grpc`
+/// (`lore-server/src/grpc/mod.rs`) answers exactly this code and message for a lock handler that
+/// exceeds its deadline, so this is not a synthetic shape -- it is what a real cell sends.
+fn lost_answer_cancelled() -> Status {
+    Status::cancelled("Request handler timeout exceeded")
 }
 
 /// The stub's per-RPC policy, changeable while the server is running.
@@ -559,6 +578,7 @@ impl LockService for StubLockService {
         match self.outcome(LockRpc::Lock) {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
+            RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
             RpcOutcome::Grant => Ok(Response::new(LockResponse {
                 locks: self.grant(resources, "fixture-owner"),
             })),
@@ -605,6 +625,7 @@ impl LockService for StubLockService {
         match self.outcome(LockRpc::Unlock) {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
+            RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
             RpcOutcome::Grant => {
                 let echo = self.state.policy.lock().unlock_echo;
                 let confirmed = match echo {
@@ -629,6 +650,7 @@ impl LockService for StubLockService {
         match self.outcome(LockRpc::AdminLock) {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
+            RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
             RpcOutcome::Grant => Ok(Response::new(AdminLockResponse {
                 locks: self.grant(resources, &owner),
             })),
@@ -645,6 +667,7 @@ impl LockService for StubLockService {
         match self.outcome(LockRpc::ForceUnlock) {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
+            RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
             RpcOutcome::Grant => Ok(Response::new(ForceUnlockResponse { resources })),
         }
     }
@@ -687,6 +710,7 @@ impl RevisionService for StubRevisionService {
         match outcome {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
+            RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
             RpcOutcome::Grant => {
                 let body = request.into_inner();
                 // The branch point the caller named, echoed back as the created tip. A push that
@@ -759,6 +783,7 @@ impl RevisionService for StubRevisionService {
         match outcome {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
+            RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
             RpcOutcome::Grant => Ok(Response::new(BranchPushResponse {
                 revision_signature: request.into_inner().revision_signature,
                 ..BranchPushResponse::default()

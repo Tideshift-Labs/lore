@@ -46,6 +46,20 @@ use crate::replay::ReplayClass;
 
 /// Translate a response's in-band `status` into a [`ProtocolError`], or `None` when the item
 /// succeeded. Absence means `OK`, so a peer that predates the field reads as success.
+///
+/// **This is a server verdict wearing a transport type, and the difference matters here.**
+/// [`ProtocolError::from`] reads a `Cancelled`, `DeadlineExceeded`, or sourced `Internal` as
+/// proof that the *call* failed and the answer may be lost, because that is what those codes
+/// mean when `tonic` raises them. An in-band item status means the opposite: the server
+/// answered, per item, and named this code itself.
+///
+/// The mislabel is inert today and only by accident of wiring — every verb reaching here goes
+/// through [`super::GRPCStorage::with_reconnect_dispatch_aware`], which branches on
+/// `Disconnected` alone, and [`StreamCache::request`] filters on `is_disconnected` alone, so a
+/// marked item status is returned to the caller exactly as it was before the marker existed.
+/// Moving any stream verb onto `with_reconnect_classified` would arm it into a false unknown
+/// outcome. There is a standing test pinning the inertness; the real fix, if a verb ever moves,
+/// is to map the item's code here without going through the transport classifier.
 fn item_status_error(
     status: Option<&lore_proto::lore::model::v1::ItemStatus>,
 ) -> Option<ProtocolError> {
@@ -1340,6 +1354,11 @@ mod tests {
         RefuseFirstOpen,
         /// Answer with a populated fragment and payload *and* a failure status.
         ErrorBesidePayload,
+        /// Answer with a populated fragment and payload *and* an in-band `ItemStatus` carrying
+        /// `Code::Cancelled` -- the code `item_status_error`'s doc comment warns is a server
+        /// verdict wearing a transport type. A stream-backed verb must read this as the decisive
+        /// per-item answer it is, not as proof the call itself failed.
+        ErrorBesidePayloadCancelled,
     }
 
     /// Kills the first `Get` stream it accepts, then serves every later stream normally.
@@ -1383,6 +1402,11 @@ mod tests {
                         lore_proto::lore::model::v1::ItemStatus {
                             code: i32::from(tonic::Code::NotFound) as u32,
                             message: "gone".to_string(),
+                        }
+                    } else if matches!(kill_mode, KillMode::ErrorBesidePayloadCancelled) {
+                        lore_proto::lore::model::v1::ItemStatus {
+                            code: i32::from(tonic::Code::Cancelled) as u32,
+                            message: "mid-flight stream reset".to_string(),
                         }
                     } else {
                         lore_proto::lore::model::v1::ItemStatus::ok()
@@ -1739,6 +1763,46 @@ mod tests {
         assert!(
             err.is_not_found(),
             "the server's code must survive, got {err:?}",
+        );
+    }
+
+    /// An in-band `ItemStatus` of `Cancelled` on a stream-backed verb must not become
+    /// `OutcomeUnknown`, and must not be mistaken for a stream death.
+    ///
+    /// A standing inertness guard, not a regression pin against the `error.rs` fix under test
+    /// elsewhere in this crate: `item_status_error`'s doc comment already establishes that this
+    /// path is inert to the `Cancelled | DeadlineExceeded` marker by construction, because
+    /// `StreamCache::request`'s `server_verdict` filter (below) and
+    /// `super::GRPCStorage::with_reconnect_dispatch_aware` both branch on `Disconnected` alone.
+    /// This test would still pass with that marker arm removed from `error.rs` -- it is not what
+    /// discriminates the fix, it is what proves the fix's split does not leak into a path that
+    /// never asked for it.
+    ///
+    /// `get_against_stream_killing_server` always forces one kill on the FIRST accepted stream
+    /// before a server double ever reads a request (`StreamKillingServer::get`'s `if attempt == 0
+    /// { ...; return; }`, unconditional across every `KillMode`), so 2 accepted streams is the
+    /// floor here, not evidence of anything about this test. The number that matters is that it
+    /// is not 3: `StreamCache::request` reissues a THIRD time only when it reads the answer as a
+    /// stream death (`server_verdict` filtered out, `Get` is `ReadRetryable` so it does not stop
+    /// at the `MutableNoReplay` arm, `handle.opened` already true) rather than as the server's
+    /// decisive verdict on this one item.
+    #[tokio::test]
+    async fn an_in_band_cancelled_item_status_stays_decisive_and_is_not_reissued() {
+        let (result, streams) =
+            get_against_stream_killing_server(KillMode::ErrorBesidePayloadCancelled).await;
+
+        let err = result.expect_err(
+            "a Cancelled item status must still surface as an error, not a served fragment",
+        );
+        assert!(
+            !err.is_outcome_unknown(),
+            "an in-band per-item Cancelled verdict must never become OutcomeUnknown: {err:?}"
+        );
+        assert_eq!(
+            streams, 2,
+            "2 is the forced-first-kill floor every KillMode pays here, not a reissue; 3 would \
+             mean the Cancelled item status was mistaken for a stream death and reissued a third \
+             time, got {streams}"
         );
     }
 
