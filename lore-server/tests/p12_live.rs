@@ -46,6 +46,7 @@ use lore_server::domain::PLATFORM_METHOD_REPOSITORY_OBLITERATE;
 use lore_server::domain::RepositoryCreatePublication;
 use lore_server::domain_intent::CanonicalIntent;
 use lore_server::domain_intent::canonical_intent_digest;
+use lore_server::grpc::domain_operation_metadata::AUTHN_BEARER_KEY;
 use lore_server::grpc::domain_operation_metadata::DomainOperationMetadata;
 use lore_server::grpc::domain_operation_metadata::FINGERPRINT_KEY;
 use lore_server::grpc::domain_operation_metadata::FINGERPRINT_V1_LEN;
@@ -1220,14 +1221,25 @@ async fn released_client_push_with_no_carriage_commits_one_branch_pushed_row_via
     })
     .expect("branch push intent must hash");
 
-    // No carriage headers, but the caller's own bearer IS present: the
-    // internal path forwards this exact value to the direct-authorization
-    // verifier as the human's own JWT, and the entry gate refuses to fire
-    // without it (`internal_admission_reason`'s condition 3).
+    // No carriage headers, but the caller's own bearer IS present on
+    // `lore-authn-bearer`: the internal path forwards THAT value (never
+    // `authorization`) to the direct-authorization verifier as the human's
+    // own JWT, and the entry gate refuses to fire without it
+    // (`internal_admission_reason`'s condition 6). `authorization` carries a
+    // deliberately DIFFERENT value here, matching `domain.rs`'s own fixture
+    // discipline, so a regression that forwarded the wrong header would have
+    // a distinguishable value to be caught with, even though this file's
+    // `DirectEchoVerifier` does not itself assert which one it received.
     let mut metadata = MetadataMap::new();
     metadata.insert(
         "authorization",
-        "Bearer wp120-released-client-jwt"
+        "Bearer wp120-released-client-authz-jwt"
+            .parse()
+            .expect("ascii header"),
+    );
+    metadata.insert(
+        AUTHN_BEARER_KEY,
+        "Bearer wp120-released-client-authn-jwt"
             .parse()
             .expect("ascii header"),
     );

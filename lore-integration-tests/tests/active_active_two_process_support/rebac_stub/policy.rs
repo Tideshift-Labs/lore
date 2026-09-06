@@ -85,6 +85,34 @@ pub const DIRECT_MUTATION_METHODS: [&str; 10] = [
 /// absent from the table, so a denial is legible.
 pub const MEDIATED_ONLY_METHOD: &str = "repository.create";
 
+/// The audience a genuine human authn JWT carries
+/// (`lorehub/apps/auth-grpc/src/service-authn.ts:55-76`,
+/// `lorehub/packages/mint/src/verify.ts:62,73`). An exchanged multiresource
+/// token carries a *different* audience (`["lore-storage", <host>]` in
+/// production) and must never authenticate a direct-human mutation, however
+/// validly signed it is.
+pub const AUTHN_AUDIENCE: &str = "commit0-cli";
+
+/// Is a decoded bearer's `aud` claim exactly the human authn audience?
+///
+/// PIN(WP-120, 2026-09-05): equality against the single-element authn
+/// audience, never a "contains" check -- an exchanged token whose `aud` array
+/// happens to also list [`AUTHN_AUDIENCE`] alongside the storage audience
+/// would otherwise slip through. No real token shape does that today, but the
+/// check should not depend on that staying true.
+pub fn bearer_audience_is_authn(aud: &[String]) -> bool {
+    aud == [AUTHN_AUDIENCE]
+}
+
+/// Does a decoded bearer carry a `resources` claim that must never
+/// authenticate a human?
+///
+/// Any non-empty count refuses, including a single entry: the platform's own
+/// refusal is on the claim's PRESENCE, not on how many resources it names.
+pub fn bearer_carries_resources_claim(resource_count: usize) -> bool {
+    resource_count > 0
+}
+
 /// The revision every direct authorization carries.
 ///
 /// PIN(WP-120, 2026-09-04): 1, always. A direct authorization is minted straight

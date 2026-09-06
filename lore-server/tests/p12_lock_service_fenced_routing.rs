@@ -70,6 +70,7 @@ use lore_server::auth::jwt::ResourcePermission;
 use lore_server::authnz::rebac::RepositoryOperationAuthorizationVerifier;
 use lore_server::domain::DomainContext;
 use lore_server::domain::PLATFORM_METHOD_REPOSITORY_CREATE;
+use lore_server::grpc::domain_operation_metadata::AUTHN_BEARER_KEY;
 use lore_server::grpc::lock_service::LoreLockService;
 use lore_server::hooks::HookDispatcher;
 use lore_server::notification::local::NotificationSender;
@@ -116,8 +117,15 @@ fn request_with_repository<T>(body: T, repository_id: &[u8; 16]) -> Request<T> {
 }
 
 /// A request carrying both a verified human [`AuthorizationToken`] extension
-/// (what `get_authorization` reads) and the raw bearer metadata header (what
-/// WP-120's internal prepare forwards to the direct-authorization verifier).
+/// (what `get_authorization` reads), the exchanged `authorization` header, and
+/// the raw `lore-authn-bearer` header (what WP-120's internal prepare forwards
+/// to the direct-authorization verifier, NOT `authorization`).
+///
+/// The two headers carry deliberately DIFFERENT values so
+/// `DirectEchoVerifier::authorize_direct_repository_operation`'s assertion can
+/// discriminate which one was actually forwarded -- with one shared value in
+/// play, a regression that forwarded `authorization` instead of
+/// `lore-authn-bearer` would pass unnoticed.
 fn authenticated_request<T>(
     body: T,
     repository_id: &[u8; 16],
@@ -126,7 +134,15 @@ fn authenticated_request<T>(
     let mut request = request_with_repository(body, repository_id);
     request.metadata_mut().insert(
         "authorization",
-        "Bearer wp120-test-bearer".parse().expect("ascii header"),
+        "Bearer wp120-test-authz-bearer"
+            .parse()
+            .expect("ascii header"),
+    );
+    request.metadata_mut().insert(
+        AUTHN_BEARER_KEY,
+        "Bearer wp120-test-authn-bearer"
+            .parse()
+            .expect("ascii header"),
     );
     request.extensions_mut().insert(token.clone());
     request
@@ -207,8 +223,9 @@ impl RepositoryOperationAuthorizationVerifier for DirectEchoVerifier {
             .and_then(|value| value.to_str().ok());
         assert_eq!(
             bearer,
-            Some("Bearer wp120-test-bearer"),
-            "the internal prepare must forward the caller's own bearer token"
+            Some("Bearer wp120-test-authn-bearer"),
+            "the internal prepare must forward the lore-authn-bearer value to the verifier, \
+             not the authorization value"
         );
         let request = request.into_inner();
         Ok(AuthorizeDirectRepositoryOperationResponse {

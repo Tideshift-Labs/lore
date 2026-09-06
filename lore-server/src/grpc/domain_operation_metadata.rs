@@ -76,6 +76,31 @@ pub const MEDIATED_SCOPE_KEY: &str = "lore-domain-mediated-scope-bin";
 /// The client's own attempt identity for one mutating dispatch.
 pub const ATTEMPT_ID_KEY: &str = "lore-attempt-id";
 
+// PIN(WP-120, 2026-09-05): the human's own authentication JWT, carried beside
+// `authorization` on a governed mutation.
+//
+// Plain ASCII for the same reason `lore-attempt-id` is: the value is a bearer
+// string, and a `-bin` key would make tonic expect base64. The client half is
+// `lore-transport`'s `AUTHN_BEARER_METADATA_KEY`; the two literals must stay
+// equal.
+//
+// Why this header exists at all, when the call already carries `authorization`.
+// The internal prepare forwards a bearer to the platform's repository-operation
+// verifier, which authenticates the HUMAN rather than trusting this server's
+// report of identity (CR-029). On every service under the repo-scoped
+// `JWTInterceptor`, `authorization` carries the client's *exchanged*
+// multiresource authorization token: audience `["lore-storage", <host>]`, with a
+// `resources` claim. The verifier requires the human authentication JWT and
+// refuses a token carrying a `resources` claim outright, so lifting
+// `authorization` made every released-client governed mutation on an armed cell
+// fail UNAUTHENTICATED. The two credentials answer different questions and are
+// carried separately.
+//
+// It is a credential, never an identity assertion by this server. Nothing here
+// reads its claims; it is relayed to the verifier, which verifies it itself.
+/// The human's own authentication bearer, forwarded to the operation verifier.
+pub const AUTHN_BEARER_KEY: &str = "lore-authn-bearer";
+
 /// A UUID is 16 bytes. Any other length is rejected, never padded or truncated.
 pub const OPERATION_ID_LEN: usize = 16;
 /// `PrepareResult::Prepared.token` is `[u8; 32]`.
@@ -426,6 +451,55 @@ pub fn extract_attempt_id(
     }
     Ok(Some(attempt))
 }
+
+/// Read the human's forwarded authentication bearer.
+///
+/// Returns the header VERBATIM, `Bearer ` framing included, because the verifier
+/// is handed exactly what the human's client sent and re-verifies it itself.
+/// Nothing here parses or trusts its contents.
+///
+/// A blank or whitespace-only value reads as absent rather than as a bearer.
+/// Forwarding it would reach the verifier as an empty credential and come back
+/// as an authentication failure, which reads to an operator as "your login is
+/// wrong" when the real fact is that the client sent no credential at all. The
+/// caller's own refusal names that fact.
+///
+/// Divergent duplicates are refused by [`read_ascii`], as they are for every
+/// other header here: two different credentials on one call is not a request
+/// this server gets to pick a winner for.
+pub fn extract_authn_bearer(
+    metadata: &MetadataMap,
+) -> Result<Option<String>, DomainOperationMetadataError> {
+    Ok(read_ascii(metadata, AUTHN_BEARER_KEY)?
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty()))
+}
+
+/// The one refusal for a governed mutation that arrived without [`AUTHN_BEARER_KEY`].
+///
+/// `FAILED_PRECONDITION`, not `UNAUTHENTICATED`: the caller's credentials may be
+/// perfectly good. What is missing is carriage this server needs, and the fix is
+/// a newer client rather than a fresh login — so the status has to send the
+/// operator to the right place, and the message names the header outright.
+///
+/// There is deliberately **no fallback to `authorization`**. That fallback is
+/// the defect: it silently forwards the exchanged multiresource token, which the
+/// verifier refuses, and turns a missing header into an authentication failure
+/// nobody can trace back to carriage.
+pub fn missing_authn_bearer() -> Status {
+    Status::failed_precondition(MISSING_AUTHN_BEARER_MESSAGE)
+}
+
+/// The exact text of [`missing_authn_bearer`]. Named so tests can pin it.
+///
+/// Names both causes rather than only the expected one. A client that predates
+/// this carriage and a client authenticating with a delegated credential that
+/// holds no human token produce an identical absent header, and telling the
+/// second to upgrade sends it after a fix it already has.
+pub const MISSING_AUTHN_BEARER_MESSAGE: &str = "Governed mutations require the human authentication bearer in the lore-authn-bearer \
+     metadata header, and this call carried none. Either the client predates WP-120 \
+     authn-bearer carriage and sends only the exchanged authorization token, or it is \
+     authenticating with a delegated credential that holds no human authentication token.";
 
 /// Check RFC 9562 version and variant bits. A 16-byte value that is not a
 /// UUIDv7 is rejected rather than accepted as an opaque identifier, because the

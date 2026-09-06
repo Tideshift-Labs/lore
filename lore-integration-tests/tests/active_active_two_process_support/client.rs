@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: MIT
 //! Ordinary, ungoverned gRPC clients: create, read, lock, obliterate.
 //!
-//! Everything here is a stock request — a bearer token and the repository in
-//! binary metadata, nothing else. That is deliberate: these are the calls a
-//! released client can actually make, so a case built on them is evidence about
-//! the product rather than about the harness. The one call that needs more,
-//! the governed push, lives in [`super::carriage`] and says why.
+//! Everything here is a stock request — a bearer token, the repository in
+//! binary metadata, and, for the ten governed direct families (the lock RPCs
+//! and `branch_push_no_carriage`), the human's own authn JWT in
+//! [`AUTHN_BEARER_KEY`]. That is deliberate: these are the calls a released
+//! client can actually make, so a case built on them is evidence about the
+//! product rather than about the harness. The one call that needs more, the
+//! governed (carriage-bearing) push, lives in [`super::carriage`] and says
+//! why.
 
 use lore_proto::LockServiceClient;
 use lore_proto::lock::LockRequest;
@@ -28,12 +31,30 @@ use tonic::metadata::BinaryMetadataValue;
 const PARTITION_ID_KEY: &str = "lore-partition-bin";
 const REPOSITORY_ID_KEY: &str = "urc-repository-id-bin";
 
+/// The metadata key a released client's `AuthzInterceptor` stamps in ADDITION
+/// to `authorization`, carrying the human's own authn JWT rather than the
+/// exchanged multiresource token `authorization` carries. Only the ten
+/// governed direct families (branch.push, branch.metadata-set,
+/// repository.metadata-set, repository.delete, repository.obliterate, and the
+/// four lock RPCs) send it; a plain ASCII value, `Bearer <jwt>`, never `-bin`.
+const AUTHN_BEARER_KEY: &str = "lore-authn-bearer";
+
 /// Attach the bearer token, and the repository when the call is repo-scoped.
 ///
 /// `RepositoryCreate` runs under the authn-only interceptor and reads its
 /// target from the body, so it needs no repository metadata; sending it anyway
 /// is harmless and keeps one helper instead of two that could drift.
-fn decorate<T>(request: &mut Request<T>, token: &str, repository: Option<&[u8]>) {
+///
+/// `authn_token`, when present, is stamped into [`AUTHN_BEARER_KEY`] alongside
+/// `authorization` -- the shape a governed direct mutation needs. `None` for
+/// every ungoverned call, which must carry `authorization` alone exactly as a
+/// released client does today.
+fn decorate<T>(
+    request: &mut Request<T>,
+    token: &str,
+    repository: Option<&[u8]>,
+    authn_token: Option<&str>,
+) {
     let metadata = request.metadata_mut();
     metadata.insert(
         "authorization",
@@ -49,6 +70,14 @@ fn decorate<T>(request: &mut Request<T>, token: &str, repository: Option<&[u8]>)
         metadata.insert_bin(
             REPOSITORY_ID_KEY,
             BinaryMetadataValue::from_bytes(repository),
+        );
+    }
+    if let Some(authn_token) = authn_token {
+        metadata.insert(
+            AUTHN_BEARER_KEY,
+            format!("Bearer {authn_token}")
+                .parse()
+                .expect("a bearer header is ASCII"),
         );
     }
 }
@@ -74,7 +103,7 @@ pub async fn repository_create(
         default_branch_name: default_branch_name.to_owned(),
         creator: Some("wp109-harness".to_owned()),
     });
-    decorate(&mut request, token, Some(repository_id));
+    decorate(&mut request, token, Some(repository_id), None);
     client
         .repository_create(request)
         .await
@@ -95,7 +124,7 @@ pub async fn repository_get(
             repository_id.to_vec().into(),
         )),
     });
-    decorate(&mut request, token, Some(repository_id));
+    decorate(&mut request, token, Some(repository_id), None);
     client
         .repository_get(request)
         .await
@@ -107,9 +136,16 @@ pub async fn repository_get(
 /// A refusal is a gRPC status, not a field on the response
 /// (`lore-server/src/grpc/lock_service.rs:87` maps `LockNotOwned` to
 /// `FAILED_PRECONDITION`), so the `Result` is returned rather than unwrapped.
+///
+/// `authn_token`: `None` on the legacy/unfenced (`Arming::PublicLocks`) path,
+/// which never reaches the direct rail. A fenced acquire (`Arming::
+/// GovernedOutbox`) needs `Some` — the human's own authn JWT, not the bearer
+/// in `token` — or the tightened rebac stub refuses it.
+#[allow(clippy::too_many_arguments)]
 pub async fn lock_acquire(
     endpoint: String,
     token: &str,
+    authn_token: Option<&str>,
     repository_id: &[u8],
     branch_id: &[u8],
     hash: &[u8],
@@ -128,7 +164,7 @@ pub async fn lock_acquire(
             expected_ownership_token: Default::default(),
         }],
     });
-    decorate(&mut request, token, Some(repository_id));
+    decorate(&mut request, token, Some(repository_id), authn_token);
     client
         .lock(request)
         .await
@@ -141,10 +177,12 @@ pub async fn lock_acquire(
 /// lock store ignores the field entirely. An armed cell REQUIRES it and answers
 /// `INVALID_ARGUMENT` without one; a case that arms fenced routing takes the token off the
 /// acquire response's `Lock.ownership_token` and threads it here (CR-030, WP-120).
+/// `authn_token`: see [`lock_acquire`]'s doc for when this must be `Some`.
 #[allow(clippy::too_many_arguments)]
 pub async fn lock_release(
     endpoint: String,
     token: &str,
+    authn_token: Option<&str>,
     repository_id: &[u8],
     branch_id: &[u8],
     hash: &[u8],
@@ -161,7 +199,7 @@ pub async fn lock_release(
             expected_ownership_token: ownership_token.to_vec().into(),
         }],
     });
-    decorate(&mut request, token, Some(repository_id));
+    decorate(&mut request, token, Some(repository_id), authn_token);
     client
         .unlock(request)
         .await
@@ -182,9 +220,16 @@ pub async fn lock_release(
 /// and parses it with `Uuid::parse_str`. It must be a UUIDv7 — the receipt rail
 /// classifies replay by the embedded timestamp, so a non-v7 value is refused
 /// rather than filed as an identity nothing can order.
+///
+/// `authn_token`: `branch.push` is one of the ten governed direct families, so
+/// an enforcing cell needs the human's own authn JWT in
+/// [`AUTHN_BEARER_KEY`] -- the tightened rebac stub refuses `authorization`'s
+/// exchanged bearer for this purpose.
+#[allow(clippy::too_many_arguments)]
 pub async fn branch_push_no_carriage(
     endpoint: String,
     token: &str,
+    authn_token: Option<&str>,
     repository_id: &[u8],
     branch_id: &[u8],
     revision: &[u8],
@@ -202,7 +247,7 @@ pub async fn branch_push_no_carriage(
         force: false,
         fast_forward_merge: false,
     });
-    decorate(&mut request, token, Some(repository_id));
+    decorate(&mut request, token, Some(repository_id), authn_token);
     request.metadata_mut().insert(
         ATTEMPT_ID_KEY,
         attempt_id
@@ -242,8 +287,9 @@ pub async fn attempt_receipt_get(
         },
     );
     // No repository metadata: this RPC is scoped by the verified principal, not
-    // by a partition, and sending one would suggest otherwise.
-    decorate(&mut request, token, None);
+    // by a partition, and sending one would suggest otherwise. Not a governed
+    // direct family either, so no authn bearer.
+    decorate(&mut request, token, None, None);
     client
         .domain_operation_attempt_receipt_get(request)
         .await
@@ -271,6 +317,6 @@ pub async fn obliterate(
             context: context.to_vec().into(),
         }),
     });
-    decorate(&mut request, token, Some(repository_id));
+    decorate(&mut request, token, Some(repository_id), None);
     client.obliterate(request).await.map(|_| ())
 }

@@ -470,6 +470,23 @@ fn outcome_fields(
     }
 }
 
+// PIN(WP-120, 2026-09-05): every handler below forwards the call's own
+// `authorization` header to the verifier, and that is CORRECT here — unlike the
+// two direct-rail sites, which now forward `lore-authn-bearer` instead.
+//
+// The difference is which credential `authorization` actually holds. This is the
+// private, control-plane-only mediated rail: `authenticated_service` admits only
+// a service principal, so the header carries the control plane's own service
+// credential, which is exactly what the verifier must authenticate for a
+// mediated operation. The direct rail's callers sit behind `AuthzInterceptor`,
+// where `authorization` is the client's EXCHANGED multiresource authorization
+// token — a credential the verifier refuses for carrying a `resources` claim.
+// Lifting it there is the defect WP-120 fixed.
+//
+// So the rule is not "never forward `authorization`". It is: forward it only
+// where the service in front of the handler guarantees which credential it is.
+// If this service is ever placed behind a repo-scoped interceptor, these six
+// lifts become the same bug.
 #[tonic::async_trait]
 impl DomainOperationService for LoreDomainOperationV1Service {
     async fn domain_operation_clock_get(

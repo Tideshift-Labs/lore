@@ -551,6 +551,7 @@ mod active_active_two_process_tests {
         client::lock_acquire(
             a.grpc_endpoint(),
             &token_a,
+            None,
             &repository,
             &branch,
             &resource,
@@ -570,6 +571,7 @@ mod active_active_two_process_tests {
         let refused = client::lock_acquire(
             b.grpc_endpoint(),
             &token_b,
+            None,
             &repository,
             &branch,
             &resource,
@@ -591,6 +593,7 @@ mod active_active_two_process_tests {
         client::lock_release(
             a.grpc_endpoint(),
             &token_a,
+            None,
             &repository,
             &branch,
             &resource,
@@ -606,6 +609,7 @@ mod active_active_two_process_tests {
         client::lock_acquire(
             b.grpc_endpoint(),
             &token_b,
+            None,
             &repository,
             &branch,
             &resource,
@@ -1476,6 +1480,11 @@ mod active_active_two_process_tests {
         // pass against this harness and be refused by the real platform.
         let owner = direct_subject();
         let token = fixture.minter.mint(&owner);
+        // `lore-authn-bearer` -- the human's own authn JWT, distinct from
+        // `token`'s exchanged multiresource shape. WP-120's direct rail
+        // requires this on every governed lock RPC; the tightened rebac stub
+        // refuses `token` alone for that purpose.
+        let authn_token = fixture.minter.mint_authn(&owner);
 
         let (repository, branch, _) = governed_repository(&fixture, &a, &token, &owner, "h").await;
         // The floor, not a blanket owner. `lock.acquire` and `lock.release` are
@@ -1488,6 +1497,7 @@ mod active_active_two_process_tests {
         let acquired = client::lock_acquire(
             a.grpc_endpoint(),
             &token,
+            Some(&authn_token),
             &repository,
             &branch,
             &resource,
@@ -1510,6 +1520,7 @@ mod active_active_two_process_tests {
         let refused = client::lock_release(
             b.grpc_endpoint(),
             &token,
+            Some(&authn_token),
             &repository,
             &branch,
             &resource,
@@ -1533,6 +1544,7 @@ mod active_active_two_process_tests {
         client::lock_release(
             b.grpc_endpoint(),
             &token,
+            Some(&authn_token),
             &repository,
             &branch,
             &resource,
@@ -1635,6 +1647,10 @@ mod active_active_two_process_tests {
         let writer = direct_subject();
         let outsider = direct_subject();
         let token = fixture.minter.mint(&writer);
+        // The human's own authn JWT for `lore-authn-bearer` -- distinct from
+        // `token`'s exchanged multiresource shape, which the tightened rebac
+        // stub now refuses as the direct-rail bearer.
+        let authn_token = fixture.minter.mint_authn(&writer);
         let stranger = fixture.minter.mint(&outsider);
 
         // The repository itself still comes through the mediated rail: a
@@ -1662,6 +1678,7 @@ mod active_active_two_process_tests {
         client::branch_push_no_carriage(
             a.grpc_endpoint(),
             &token,
+            Some(&authn_token),
             &repository,
             &branch,
             candidate.as_ref(),

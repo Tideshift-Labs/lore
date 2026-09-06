@@ -559,4 +559,57 @@ mod rebac_stub_policy_tests {
             "a direct authorization is minted at VERIFIED with no earlier state to advance from"
         );
     }
+
+    // --- 8. the two direct-operation bearer refusals (WP-120, 2026-09-05) ----
+    //
+    // `StubState::authenticate_direct_operation` is private and needs a real
+    // signed JWT to exercise end to end, so these two pure predicates -- the
+    // exact logic it defers to -- are what this offline suite can pin. The
+    // two-process live harness (`active_active_two_process_test.rs`, cases H
+    // and I) is what proves the predicates are wired to the right refusal at
+    // the right call site.
+
+    #[test]
+    fn bearer_audience_is_authn_requires_exactly_the_single_authn_audience() {
+        assert!(
+            bearer_audience_is_authn(&[AUTHN_AUDIENCE.to_owned()]),
+            "the single-element authn audience must be accepted"
+        );
+        assert!(
+            !bearer_audience_is_authn(&[]),
+            "an empty audience must be refused"
+        );
+        assert!(
+            !bearer_audience_is_authn(&["lore-storage".to_owned()]),
+            "the exchanged/storage audience alone must be refused"
+        );
+        assert!(
+            !bearer_audience_is_authn(&["lore-storage".to_owned(), "some-host.example".to_owned()]),
+            "the real exchanged multiresource audience shape must be refused"
+        );
+        // PIN(WP-120, 2026-09-05): a token naming BOTH audiences must still be
+        // refused. The check is exact equality to the single-element authn
+        // audience, never "contains", so a multiresource token cannot pass by
+        // also listing the authn audience alongside the storage one.
+        assert!(
+            !bearer_audience_is_authn(&[AUTHN_AUDIENCE.to_owned(), "lore-storage".to_owned()]),
+            "an audience naming the authn audience ALONGSIDE another must still be refused"
+        );
+    }
+
+    #[test]
+    fn bearer_carries_resources_claim_refuses_any_non_empty_count() {
+        assert!(
+            !bearer_carries_resources_claim(0),
+            "an empty resources claim must not be refused on this axis"
+        );
+        assert!(
+            bearer_carries_resources_claim(1),
+            "even a single resources entry must be refused; the refusal is on presence, not count"
+        );
+        assert!(
+            bearer_carries_resources_claim(2),
+            "a multi-entry resources claim must be refused"
+        );
+    }
 }

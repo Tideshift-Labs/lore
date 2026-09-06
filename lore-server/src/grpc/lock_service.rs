@@ -373,7 +373,14 @@ struct FencedCall {
     /// let a service account through the check meant to stop it.
     authorization: crate::auth::jwt::AuthorizationToken,
     caller: VerifiedLockOwner,
-    bearer: String,
+    /// The human's forwarded authentication bearer, when the client sent one.
+    ///
+    /// Optional here rather than resolved-or-refused, so that the refusal for an
+    /// absent bearer lands in `prepare_direct`, AFTER the service-account
+    /// exclusion and the verifier check. Refusing at resolution time told a
+    /// service account — which may not take this rail at all — to upgrade a
+    /// client that was already current.
+    bearer: Option<String>,
     /// The client's own attempt identity, when it sent one. PIN(WP-120, 2026-09-05).
     ///
     /// Resolved here with everything else the request supplies, because this is where the
@@ -404,11 +411,16 @@ impl LoreLockService {
             ));
         };
         let authorization = get_authorization(extensions)?;
-        let bearer = metadata
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned)
-            .ok_or_else(|| Status::unauthenticated("Missing authorization"))?;
+        // PIN(WP-120, 2026-09-05): the forwarded bearer is the human's own
+        // authentication JWT from `lore-authn-bearer`, NOT the call's
+        // `authorization` header, and there is deliberately no fallback between
+        // them. `LockService` runs under `AuthzInterceptor`, so `authorization`
+        // holds the exchanged multiresource authorization token — the credential
+        // the platform's operation verifier refuses outright for carrying a
+        // `resources` claim. The same lift on the branch-push path is what made a
+        // released client's governed mutation on an armed cell fail
+        // UNAUTHENTICATED; the fenced lock verbs had it too.
+        let bearer = crate::grpc::domain_operation_metadata::extract_authn_bearer(metadata)?;
         let caller = VerifiedLockOwner {
             verified_issuer: authorization.issuer.clone(),
             authenticated_subject: authorization.user_id.clone(),
@@ -473,7 +485,7 @@ impl LoreLockService {
             .domain
             .prepare_direct_lock_operation(
                 &call.authorization,
-                &call.bearer,
+                call.bearer.as_deref(),
                 repository.as_ref(),
                 &batch.branch_id,
                 binding,
@@ -525,7 +537,7 @@ impl LoreLockService {
             .domain
             .prepare_direct_lock_operation(
                 &call.authorization,
-                &call.bearer,
+                call.bearer.as_deref(),
                 repository.as_ref(),
                 &batch.branch_id,
                 binding,
@@ -584,7 +596,7 @@ impl LoreLockService {
             .domain
             .prepare_direct_lock_operation(
                 &call.authorization,
-                &call.bearer,
+                call.bearer.as_deref(),
                 repository.as_ref(),
                 &batch.branch_id,
                 binding,

@@ -92,10 +92,13 @@ use lore_base::lore_spawn;
 use rand::RngCore;
 use tonic::Status;
 
+use self::policy::AUTHN_AUDIENCE;
 use self::policy::DIRECT_AUTHORIZATION_REVISION;
 use self::policy::DirectAuthorizationBinding;
 use self::policy::MEDIATED_ONLY_METHOD;
 use self::policy::Role;
+use self::policy::bearer_audience_is_authn;
+use self::policy::bearer_carries_resources_claim;
 use self::policy::bound_fields_digest;
 use self::policy::contains_bytes;
 use self::policy::method_permits_role;
@@ -178,12 +181,23 @@ pub(crate) struct StubState {
 }
 
 /// The claims this stub reads out of a forwarded bearer.
+///
+/// `aud` and `resources` exist only for
+/// [`StubState::authenticate_direct_operation`]'s two extra refusals; the
+/// shared [`StubState::authenticate`] path (`CheckUserPermission`,
+/// `CreateResource`, `DeleteResource`) never inspects either field, because
+/// the exchanged multiresource shape is exactly what a released client's
+/// `authorization` header legitimately carries on those calls in production.
 #[derive(serde::Deserialize)]
 struct StubClaims {
     sub: String,
     iss: String,
     #[serde(default)]
     is_service_account: bool,
+    #[serde(default)]
+    aud: Vec<String>,
+    #[serde(default)]
+    resources: Vec<serde_json::Value>,
 }
 
 /// A verified human principal.
@@ -228,27 +242,60 @@ impl StubState {
         self.refuse(reason, status)
     }
 
-    /// Authenticate the forwarded bearer ourselves.
+    /// Pull the bearer token out of the forwarded `authorization` header.
     ///
-    /// This is the whole security argument of the direct rail: loreserver
-    /// cannot assert who the human is, it can only relay a credential the
-    /// authorizer verifies. The echoed identity fields are checked against what
-    /// this returns and never used to select authority.
-    fn authenticate(&self, metadata: &tonic::metadata::MetadataMap) -> Result<Principal, Status> {
+    /// loreserver forwards the header VERBATIM, so it arrives as `Bearer
+    /// <jwt>`. A bare token is tolerated so a future caller that forwards only
+    /// the credential is not a mystery failure.
+    fn bearer_token<'a>(
+        &self,
+        metadata: &'a tonic::metadata::MetadataMap,
+    ) -> Result<&'a str, Status> {
         let header = metadata
             .get("authorization")
             .and_then(|value| value.to_str().ok())
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| self.unauthenticated("no bearer token was forwarded".to_owned()))?;
-        // loreserver forwards the header VERBATIM, so it arrives as
-        // `Bearer <jwt>`. A bare token is tolerated so a future caller that
-        // forwards only the credential is not a mystery failure.
-        let token = header
+        Ok(header
             .strip_prefix("Bearer ")
             .or_else(|| header.strip_prefix("bearer "))
             .unwrap_or(header)
-            .trim();
+            .trim())
+    }
+
+    /// The two refusals every decoded bearer shares, regardless of which RPC
+    /// is authenticating it.
+    fn reject_non_human(&self, claims: &StubClaims) -> Result<(), Status> {
+        // Humans only. A service account here would be the control plane taking
+        // a second, ticket-free route to an authorization, which is exactly what
+        // the mediated rail's committed preclaim ticket exists to prevent. The
+        // named refusal is belt and braces for a token that simply omits the
+        // claim.
+        if claims.is_service_account {
+            return Err(self.denied("the bearer is a service account"));
+        }
+        if claims.sub == CONTROL_PLANE_SERVICE_SUBJECT {
+            return Err(self.denied("the bearer is the control-plane service subject"));
+        }
+        Ok(())
+    }
+
+    /// Authenticate the forwarded bearer ourselves.
+    ///
+    /// This is the whole security argument of the direct rail: loreserver
+    /// cannot assert who the human is, it can only relay a credential the
+    /// authorizer verifies. The echoed identity fields are checked against what
+    /// this returns and never used to select authority.
+    ///
+    /// Used by `CheckUserPermission`, `CreateResource`, and `DeleteResource`
+    /// only. It deliberately does NOT reject a `resources` claim or check for
+    /// the human authn audience: those calls are precisely where a released
+    /// client's exchanged multiresource bearer belongs in production. See
+    /// [`Self::authenticate_direct_operation`] for the bearer
+    /// `AuthorizeDirectRepositoryOperation` requires instead.
+    fn authenticate(&self, metadata: &tonic::metadata::MetadataMap) -> Result<Principal, Status> {
+        let token = self.bearer_token(metadata)?;
 
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
         validation.set_issuer(&[self.issuer.as_str()]);
@@ -256,17 +303,58 @@ impl StubState {
         let decoded = jsonwebtoken::decode::<StubClaims>(token, &self.decoding_key, &validation)
             .map_err(|error| self.unauthenticated(format!("bearer rejected: {error}")))?;
 
-        // Humans only. A service account here would be the control plane taking
-        // a second, ticket-free route to an authorization, which is exactly what
-        // the mediated rail's committed preclaim ticket exists to prevent. The
-        // named refusal is belt and braces for a token that simply omits the
-        // claim.
-        if decoded.claims.is_service_account {
-            return Err(self.denied("the bearer is a service account"));
+        self.reject_non_human(&decoded.claims)?;
+        Ok(Principal {
+            subject: decoded.claims.sub,
+            issuer: decoded.claims.iss,
+        })
+    }
+
+    /// Authenticate the bearer `AuthorizeDirectRepositoryOperation` requires:
+    /// the human's own authn JWT, never an exchanged multiresource token.
+    ///
+    /// PIN(WP-120, 2026-09-05): mirrors the real refusal
+    /// `lorehub/apps/auth-grpc/src/service-authn.ts:55-76` and
+    /// `lorehub/packages/mint/src/verify.ts:62,73` make for the same reason —
+    /// an exchanged token (audience `["lore-storage", <host>]`, a non-empty
+    /// `resources` claim) must never authenticate a direct-human mutation,
+    /// however validly signed it is. Before WP-120's `lore-authn-bearer`
+    /// header, loreserver forwarded whatever arrived in `authorization`
+    /// verbatim, which is exactly the exchanged shape a released client's
+    /// `AuthzInterceptor` puts there — this is the check that catches that
+    /// class of defect returning.
+    fn authenticate_direct_operation(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<Principal, Status> {
+        let token = self.bearer_token(metadata)?;
+
+        // Audience is checked BY HAND against the fixed human-authn literal,
+        // never against `self.audience` (the exchanged/storage audience every
+        // other bearer on this stub carries) -- library-level `set_audience`
+        // would only ever check the one value this stub was configured with.
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.set_issuer(&[self.issuer.as_str()]);
+        validation.validate_aud = false;
+        let decoded = jsonwebtoken::decode::<StubClaims>(token, &self.decoding_key, &validation)
+            .map_err(|error| self.unauthenticated(format!("bearer rejected: {error}")))?;
+
+        if !bearer_audience_is_authn(&decoded.claims.aud) {
+            return Err(self.unauthenticated(format!(
+                "bearer audience {:?} is not the human authn audience {AUTHN_AUDIENCE:?}; an \
+                 exchanged multiresource token must never authenticate a direct-human mutation",
+                decoded.claims.aud
+            )));
         }
-        if decoded.claims.sub == CONTROL_PLANE_SERVICE_SUBJECT {
-            return Err(self.denied("the bearer is the control-plane service subject"));
+        if bearer_carries_resources_claim(decoded.claims.resources.len()) {
+            return Err(self.unauthenticated(format!(
+                "bearer carries a non-empty resources claim ({} entries); an exchanged \
+                 multiresource token must never authenticate a human",
+                decoded.claims.resources.len()
+            )));
         }
+
+        self.reject_non_human(&decoded.claims)?;
         Ok(Principal {
             subject: decoded.claims.sub,
             issuer: decoded.claims.iss,
@@ -292,7 +380,7 @@ impl StubState {
         request: lore_proto::rebac::AuthorizeDirectRepositoryOperationRequest,
     ) -> Result<lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse, Status> {
         self.authorize_calls.fetch_add(1, Ordering::SeqCst);
-        let principal = self.authenticate(metadata)?;
+        let principal = self.authenticate_direct_operation(metadata)?;
 
         // -- shape, before anything is looked up ---------------------------
         if request.verified_issuer.is_empty()

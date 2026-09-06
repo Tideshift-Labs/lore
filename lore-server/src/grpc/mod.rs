@@ -530,6 +530,21 @@ pub fn extract_correlation_id<B>(request: &tonic::Request<B>) -> Option<String> 
     }
 }
 
+/// The call's correlation id, read from metadata alone.
+///
+/// For a seam that is handed a `MetadataMap` rather than the whole `Request` and
+/// still has to name the call it is refusing. Falls back to the same sentinel the
+/// per-RPC spans use, so a log line never renders an empty field and "absent" is
+/// distinguishable from "blank".
+pub fn correlation_id_of(metadata: &tonic::metadata::MetadataMap) -> String {
+    metadata
+        .get(CORRELATION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(crate::quic::NO_CORRELATION_ID)
+        .to_owned()
+}
+
 pub fn extract_authorization_header<B>(request: &tonic::Request<B>) -> Option<String> {
     request
         .metadata()

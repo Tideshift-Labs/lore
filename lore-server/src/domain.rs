@@ -105,9 +105,14 @@ const CONTROL_PLANE_SERVICE_SUBJECT: &str = "lorehub-control-plane";
 // * No `consumed_ticket_sha256` and no `expected_claim_identity_digest`. A
 //   direct human operation has no preclaim ticket and no platform claim, and
 //   sending either would file it as a mediated operation.
-// * The caller's own bearer token is forwarded on the call's `authorization`
-//   metadata. The verifier authenticates the human itself; the echoed issuer and
-//   subject are for agreement-checking, never for authentication.
+// * The caller's own bearer token — the human's authentication JWT, taken from
+//   the call's `lore-authn-bearer` metadata and sent as the `authorization`
+//   metadata of the verifier call. Two different headers, and WP-120 changed
+//   which one this reads: the incoming `authorization` carries the client's
+//   exchanged multiresource authorization token on every service behind the
+//   repo-scoped interceptor, which the verifier refuses outright. The verifier
+//   authenticates the human itself; the echoed issuer and subject are for
+//   agreement-checking, never for authentication.
 
 /// Domain separator for the fingerprint a loreserver-internal prepare mints.
 ///
@@ -547,17 +552,11 @@ impl DomainContext {
         if self.operation_verifier.is_none() {
             return Ok(None);
         }
-        // 3. A verified principal, and its raw bearer token. The token is
-        //    forwarded to auth-grpc so the verifier re-verifies the JWT itself
-        //    rather than trusting this server's report of who the caller is.
+        // 3. A verified principal. Its raw bearer is resolved at the end, from
+        //    the caller's own authentication header rather than from
+        //    `authorization` — see the lift below for why the two are not the
+        //    same credential.
         let Some(token) = authorization else {
-            return Ok(None);
-        };
-        let Some(bearer) = metadata
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned)
-        else {
             return Ok(None);
         };
         // 4. A human. The control-plane service principal always carries its own
@@ -603,6 +602,38 @@ impl DomainContext {
             }
         };
         let tenant_scope_key = scope.tenant_scope_key()?;
+        // 6. The human's own authentication bearer, forwarded to auth-grpc so the
+        //    verifier re-verifies the JWT itself rather than trusting this
+        //    server's report of who the caller is.
+        //
+        //    Lifted LAST, after every gate above has said this caller really is
+        //    taking the internal path. Checked earlier, a service account or a
+        //    `repository.create` — both of which fall through to `Ok(None)` and
+        //    their pre-WP-120 outcome — would instead be met with a refusal about
+        //    carriage they were never going to need.
+        //
+        //    PIN(WP-120, 2026-09-05): this reads `lore-authn-bearer`, NOT
+        //    `authorization`, and there is deliberately no fallback between them.
+        //    Under `AuthzInterceptor` — which every governed family except the two
+        //    repository verbs runs behind — `authorization` carries the exchanged
+        //    multiresource authorization token, and the platform verifier refuses a
+        //    token carrying a `resources` claim. Lifting `authorization` here is
+        //    what made a released client's push on an armed cell fail
+        //    UNAUTHENTICATED with no server-side trace. Restoring the fallback
+        //    reopens exactly that.
+        let Some(bearer) = domain_operation_metadata::extract_authn_bearer(metadata)? else {
+            // WARN, not silence. The old code propagated the verifier's
+            // UNAUTHENTICATED with a bare `?` and logged nothing, so the cell's own
+            // logs held no record that a governed mutation had been refused or why.
+            warn!(
+                header = domain_operation_metadata::AUTHN_BEARER_KEY,
+                subject = %token.user_id,
+                issuer = %token.issuer,
+                correlation_id = %crate::grpc::correlation_id_of(metadata),
+                "Refusing a governed mutation that carried no human authentication bearer"
+            );
+            return Err(domain_operation_metadata::missing_authn_bearer());
+        };
         Ok(Some((token, bearer, repository_id, tenant_scope_key)))
     }
 
@@ -703,7 +734,10 @@ impl DomainContext {
             binding,
             &internal.repository_id,
             &[],
-            &internal.bearer,
+            // Always `Some`: `internal_admission_reason` refuses an absent bearer
+            // at admission, before any authorization side effect (CR-029
+            // R-BLOCK-2), so this rail never reaches `prepare_direct`'s own check.
+            Some(internal.bearer.as_str()),
             internal.client_attempt_id,
         )
         .await
@@ -725,7 +759,7 @@ impl DomainContext {
     pub async fn prepare_direct_lock_operation(
         &self,
         token: &AuthorizationToken,
-        bearer: &str,
+        bearer: Option<&str>,
         repository_id: &[u8],
         branch_id: &[u8],
         binding: OperationBinding,
@@ -775,7 +809,7 @@ impl DomainContext {
         binding: OperationBinding,
         repository_id: &[u8],
         branch_id: &[u8],
-        bearer: &str,
+        bearer: Option<&str>,
         client_attempt_id: Option<Uuid>,
     ) -> Result<GovernedOperation, Status> {
         let verifier = self.operation_verifier.as_ref().ok_or_else(|| {
@@ -783,6 +817,30 @@ impl DomainContext {
                 "Internal domain prepare requires a configured repository-operation verifier",
             )
         })?;
+        // Checked here, after the verifier, so the two rails that reach this
+        // function agree on when an absent bearer is the caller's problem.
+        //
+        // The branch/repository rail has already refused it at admission and can
+        // only pass `Some`. The lock rail deliberately defers to here, because
+        // `prepare_direct_lock_operation`'s service-account exclusion runs above
+        // and a service account must be told it may not take this rail at all —
+        // not told to upgrade a client that is already current. A cell with no
+        // verifier is likewise a cell fault and outranks a client one.
+        let Some(bearer) = bearer else {
+            // No `correlation_id` field here, unlike the admission-site WARN: this
+            // runs inside the per-RPC `lore_tracing` span, which already records
+            // the call's correlation id, service and method
+            // (`grpc/tower/tracing.rs`). The admission site names it explicitly
+            // because it holds the metadata anyway.
+            warn!(
+                header = domain_operation_metadata::AUTHN_BEARER_KEY,
+                method = %binding.method,
+                subject = %key.authenticated_subject,
+                issuer = %key.verified_issuer,
+                "Refusing a governed mutation that carried no human authentication bearer"
+            );
+            return Err(domain_operation_metadata::missing_authn_bearer());
+        };
         let fingerprint_version = u32::try_from(binding.fingerprint_version)
             .map_err(|_| Status::internal("fingerprint version is not representable"))?;
         let request = create_request_with_authorization(
@@ -4042,18 +4100,57 @@ mod tests {
         GovernedScope::TargetRepository { repository_id }
     }
 
-    /// The bearer this cell's JWT interceptor would have verified.
+    /// The bearer this cell's JWT interceptor would have verified, carried on
+    /// `authorization`.
     pub(crate) const TEST_BEARER: &str = "Bearer released-desktop-jwt";
 
-    /// Request metadata carrying the caller's own `authorization` header and
-    /// nothing else.
+    /// The human's own authentication bearer, carried on `lore-authn-bearer`.
+    ///
+    /// PIN(WP-120, 2026-09-05): deliberately a DIFFERENT literal from
+    /// [`TEST_BEARER`]. Before this fix, `authorization` was the only credential
+    /// in play anywhere in these fixtures, so a test asserting "the verifier got
+    /// the right bearer" could not tell "it got `lore-authn-bearer`" apart from
+    /// "it got whatever `authorization` happened to hold" -- that
+    /// indistinguishability is exactly what let the underlying defect ship
+    /// undetected. Every fixture exercising internal admission or internal
+    /// prepare must keep the two values distinct so a wrong-header regression
+    /// actually fails a test.
+    pub(crate) const TEST_AUTHN_BEARER: &str = "Bearer released-desktop-authn-jwt";
+
+    /// Request metadata carrying the caller's own `authorization` header and a
+    /// DISTINCT `lore-authn-bearer` header, and nothing else.
     ///
     /// An empty `MetadataMap` beside a verified `AuthorizationToken` is a shape
-    /// the real server never emits: the interceptor derives that token FROM this
-    /// header, so one cannot exist without the other. The internal path forwards
-    /// this exact value to auth-grpc as the human's bearer, so a fixture without
-    /// it exercises the no-bearer refusal rather than the case it names.
+    /// the real server never emits: the interceptor derives that token FROM the
+    /// `authorization` header, so one cannot exist without the other.
+    ///
+    /// PIN(WP-120, 2026-09-05): the internal path forwards `lore-authn-bearer`
+    /// -- NOT `authorization` -- to auth-grpc as the human's bearer, and there is
+    /// deliberately no fallback between them (see `internal_admission_reason`).
+    /// A fixture missing `lore-authn-bearer` exercises the no-bearer refusal
+    /// rather than the gate-open case most callers here want; use
+    /// [`human_metadata_missing_authn_bearer`] when that refusal, or an
+    /// earlier-gate outcome unaffected by it, is the point of the test.
     fn human_metadata() -> MetadataMap {
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            "authorization",
+            TEST_BEARER.parse().expect("a static header value parses"),
+        );
+        metadata.insert(
+            domain_operation_metadata::AUTHN_BEARER_KEY,
+            TEST_AUTHN_BEARER
+                .parse()
+                .expect("a static header value parses"),
+        );
+        metadata
+    }
+
+    /// [`human_metadata`] with `lore-authn-bearer` withheld -- the shape a
+    /// pre-WP-120 client, or any caller an earlier gate already turns away,
+    /// presents. Used only where the point of the test is that outcome, not the
+    /// bearer forwarding this file otherwise pins.
+    fn human_metadata_missing_authn_bearer() -> MetadataMap {
         let mut metadata = MetadataMap::new();
         metadata.insert(
             "authorization",
@@ -4253,6 +4350,225 @@ mod tests {
         assert_ne!(first.key.operation_id, second.key.operation_id);
     }
 
+    // --- 6a-bis. WP-120 `lore-authn-bearer` carriage at the entry gate -------
+
+    // The one refusal a released client sees on an armed cell that has no
+    // `lore-authn-bearer` at all: `FAILED_PRECONDITION` naming the header, not
+    // the pre-fix `UNAUTHENTICATED` and not the pre-WP-120 `INVALID_ARGUMENT`.
+    #[test]
+    fn internal_admission_refuses_a_governed_mutation_missing_the_authn_bearer_header() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let token = human_token();
+
+        let err = ctx
+            .admit(
+                &human_metadata_missing_authn_bearer(),
+                Some(&token),
+                direct_scope_ctx(&repository_id),
+            )
+            .expect_err("a governed mutation with no lore-authn-bearer must be refused");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_ne!(
+            err.code(),
+            Code::Unauthenticated,
+            "must not resurrect the pre-fix UNAUTHENTICATED failure this change replaces"
+        );
+        assert_ne!(
+            err.code(),
+            Code::InvalidArgument,
+            "must not fall back to the pre-WP-120 absent-carriage code either"
+        );
+        assert_eq!(
+            err.message(),
+            domain_operation_metadata::MISSING_AUTHN_BEARER_MESSAGE
+        );
+    }
+
+    // A whitespace-only value is not a credential -- `extract_authn_bearer`
+    // trims and empties it, and the gate must refuse it exactly like absence,
+    // never forward it to the verifier as an empty bearer.
+    #[test]
+    fn internal_admission_treats_a_blank_authn_bearer_as_absent() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let token = human_token();
+        let mut metadata = human_metadata_missing_authn_bearer();
+        metadata.insert(
+            domain_operation_metadata::AUTHN_BEARER_KEY,
+            "   ".parse().expect("ascii header"),
+        );
+
+        let err = ctx
+            .admit(&metadata, Some(&token), direct_scope_ctx(&repository_id))
+            .expect_err("a whitespace-only lore-authn-bearer must be treated as absent");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            domain_operation_metadata::MISSING_AUTHN_BEARER_MESSAGE
+        );
+    }
+
+    // Two divergent values for the same header are ambiguous, not a value to
+    // pick between -- refused as the pre-existing `extract_*` contract already
+    // refuses every other divergent-duplicate domain-operation header.
+    #[test]
+    fn internal_admission_refuses_a_divergent_duplicate_authn_bearer_header() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let token = human_token();
+        let mut metadata = human_metadata_missing_authn_bearer();
+        metadata.append(
+            domain_operation_metadata::AUTHN_BEARER_KEY,
+            "Bearer first-value".parse().expect("ascii header"),
+        );
+        metadata.append(
+            domain_operation_metadata::AUTHN_BEARER_KEY,
+            "Bearer second-value".parse().expect("ascii header"),
+        );
+
+        let err = ctx
+            .admit(&metadata, Some(&token), direct_scope_ctx(&repository_id))
+            .expect_err("divergent duplicate lore-authn-bearer values must be refused");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    // --- The ordering property: an earlier gate's outcome must survive the
+    // --- bearer lift unchanged, whether or not the header is present. Each
+    // --- case below uses `human_metadata_missing_authn_bearer` specifically
+    // --- so a regression that moved the bearer check earlier than these gates
+    // --- would flip its outcome to `FAILED_PRECONDITION` and fail here.
+
+    #[test]
+    fn internal_admission_with_enforcement_off_ignores_a_missing_authn_bearer() {
+        let ctx = context(false)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let token = human_token();
+
+        let result = ctx.admit(
+            &human_metadata_missing_authn_bearer(),
+            Some(&token),
+            direct_scope_ctx(&repository_id),
+        );
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn internal_admission_with_no_verifier_configured_falls_through_to_invalid_argument_even_without_an_authn_bearer()
+     {
+        let ctx = context(true);
+        let repository_id = test_repository_id();
+        let token = human_token();
+
+        let err = ctx
+            .admit(
+                &human_metadata_missing_authn_bearer(),
+                Some(&token),
+                direct_scope_ctx(&repository_id),
+            )
+            .expect_err("no verifier configured must fall through to the pre-WP-120 refusal");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn internal_admission_excludes_a_service_account_even_without_an_authn_bearer() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let service_account = AuthorizationToken {
+            issuer: "https://issuer.example".to_owned(),
+            user_id: "some-other-service-account".to_owned(),
+            is_service_account: Some(true),
+            ..Default::default()
+        };
+
+        let err = ctx
+            .admit(
+                &human_metadata_missing_authn_bearer(),
+                Some(&service_account),
+                direct_scope_ctx(&repository_id),
+            )
+            .expect_err(
+                "a service account must keep its pre-WP-120 outcome regardless of the authn bearer",
+            );
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn internal_admission_excludes_the_control_plane_subject_even_without_an_authn_bearer() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let control_plane = AuthorizationToken {
+            issuer: "https://issuer.example".to_owned(),
+            user_id: CONTROL_PLANE_SERVICE_SUBJECT.to_owned(),
+            is_service_account: Some(true),
+            ..Default::default()
+        };
+
+        let err = ctx
+            .admit(
+                &human_metadata_missing_authn_bearer(),
+                Some(&control_plane),
+                direct_scope_ctx(&repository_id),
+            )
+            .expect_err(
+                "the control-plane principal must keep its pre-WP-120 outcome regardless of the \
+                 authn bearer",
+            );
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    // `internal_admission_reason`'s own gate 5 returns `Ok(None)` for
+    // `RepositoryCreate` -- but that is not what `admit()` reports, because
+    // reaching gate 5 at all means gate 1 (enforcement) already passed.
+    // `admit_internal`'s `None` handling then takes its `self.enforcement`
+    // branch, which re-derives the identical pre-WP-120 outcome through
+    // `require(metadata)` -- the same `INVALID_ARGUMENT` an absent-carriage
+    // caller with no verifier configured gets, not `Ok(None)`. The property
+    // under test is unchanged either way: whichever code this caller got
+    // before WP-120, it still gets, and specifically NOT the new
+    // `FAILED_PRECONDITION` refusal.
+    #[test]
+    fn internal_admission_falls_through_to_invalid_argument_for_repository_create_scope_even_without_an_authn_bearer()
+     {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let token = human_token();
+
+        let err = ctx
+            .admit(
+                &human_metadata_missing_authn_bearer(),
+                Some(&token),
+                GovernedScope::RepositoryCreate {
+                    repository_id: &repository_id,
+                },
+            )
+            .expect_err(
+                "repository.create must keep its pre-WP-120 outcome regardless of the authn \
+                 bearer",
+            );
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_ne!(
+            err.code(),
+            Code::FailedPrecondition,
+            "the bearer lift must not have moved earlier than repository.create's own exclusion"
+        );
+    }
+
     // --- 6b. WP-120 complete_governed / internal_prepare --------------------
 
     // Carriage still wins: `complete_governed` on a `Carried` admission never
@@ -4383,10 +4699,23 @@ mod tests {
         let ctx = preparing_context().with_operation_verifier(Some(verifier.clone()));
         let repository_id = test_repository_id();
         let token = human_token();
+        // Deliberately two DIFFERENT values on `authorization` and
+        // `lore-authn-bearer`: with only one value in play this test cannot
+        // discriminate which header the verifier actually received, which is
+        // exactly the gap that let the pre-fix code forward `authorization`
+        // undetected (see `human_metadata`'s doc comment).
         let mut metadata = MetadataMap::new();
         metadata.insert(
             "authorization",
-            "Bearer released-client-jwt".parse().expect("ascii header"),
+            "Bearer released-client-authz-jwt"
+                .parse()
+                .expect("ascii header"),
+        );
+        metadata.insert(
+            domain_operation_metadata::AUTHN_BEARER_KEY,
+            "Bearer released-client-authn-jwt"
+                .parse()
+                .expect("ascii header"),
         );
 
         let admitted = ctx
@@ -4405,8 +4734,14 @@ mod tests {
 
         assert_eq!(
             verifier.forwarded_bearer(),
-            Some("Bearer released-client-jwt".to_owned()),
-            "the verifier must receive the caller's own bearer, unaltered"
+            Some("Bearer released-client-authn-jwt".to_owned()),
+            "the verifier must receive the lore-authn-bearer value, unaltered"
+        );
+        assert_ne!(
+            verifier.forwarded_bearer(),
+            Some("Bearer released-client-authz-jwt".to_owned()),
+            "the verifier must never receive the authorization header's value -- that is the \
+             WP-120 defect this test exists to catch"
         );
         assert_eq!(
             governed.prepare_token, PREPARED_TEST_TOKEN,
@@ -4472,7 +4807,7 @@ mod tests {
         let error = ctx
             .prepare_direct_lock_operation(
                 &token,
-                "Bearer x",
+                Some("Bearer x"),
                 &repository_id,
                 &branch_id,
                 binding,
@@ -4510,7 +4845,7 @@ mod tests {
         let error = ctx
             .prepare_direct_lock_operation(
                 &service_account,
-                "Bearer x",
+                Some("Bearer x"),
                 &repository_id,
                 &branch_id,
                 binding,
@@ -4520,6 +4855,122 @@ mod tests {
             .expect_err("a service account must be refused a direct fenced lock");
 
         assert_eq!(error.code(), Code::PermissionDenied);
+    }
+
+    // --- 6b-bis. WP-120 `prepare_direct`'s bearer check on the lock rail,
+    // --- and the ordering property the reviewer's finding is about: the
+    // --- bearer check runs LAST, after the verifier-presence check and after
+    // --- `prepare_direct_lock_operation`'s own service-account exclusion, so
+    // --- neither an unconfigured cell nor a service account is told to
+    // --- upgrade a client that is already current.
+
+    fn lock_binding() -> OperationBinding {
+        OperationBinding {
+            method: "lock.acquire".to_owned(),
+            scope: vec![0x44u8; 16],
+            fingerprint_version: 1,
+            fingerprint: vec![0x55u8; 32],
+            canonical_intent_digest: vec![0x66u8; 32],
+        }
+    }
+
+    // The bearer check itself: a human principal with a configured verifier
+    // but no bearer is refused exactly like the branch/repository rail is.
+    #[tokio::test]
+    async fn prepare_direct_lock_operation_refuses_an_absent_bearer_for_a_human_principal() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let token = human_token();
+        let repository_id = test_repository_id();
+        let branch_id = test_repository_id();
+
+        let error = ctx
+            .prepare_direct_lock_operation(
+                &token,
+                None,
+                &repository_id,
+                &branch_id,
+                lock_binding(),
+                None,
+            )
+            .await
+            .expect_err("an absent bearer must be refused for a human principal");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            domain_operation_metadata::MISSING_AUTHN_BEARER_MESSAGE
+        );
+    }
+
+    // Ordering, half 1: a service account with NO bearer at all must still see
+    // the service-account exclusion, not the carriage refusal -- proving the
+    // exclusion (which runs before `prepare_direct` is ever called) wins.
+    #[tokio::test]
+    async fn prepare_direct_lock_operation_excludes_a_service_account_even_with_no_bearer() {
+        let ctx = context(true)
+            .with_operation_verifier(Some(std::sync::Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let branch_id = test_repository_id();
+        let service_account = AuthorizationToken {
+            issuer: "https://issuer.example".to_owned(),
+            user_id: "some-service-account".to_owned(),
+            is_service_account: Some(true),
+            ..Default::default()
+        };
+
+        let error = ctx
+            .prepare_direct_lock_operation(
+                &service_account,
+                None,
+                &repository_id,
+                &branch_id,
+                lock_binding(),
+                None,
+            )
+            .await
+            .expect_err("a service account must be refused regardless of the bearer");
+
+        assert_eq!(error.code(), Code::PermissionDenied);
+        assert_ne!(
+            error.message(),
+            domain_operation_metadata::MISSING_AUTHN_BEARER_MESSAGE,
+            "a service account must be told it may not take this rail at all, not to upgrade a \
+             client that is already current"
+        );
+    }
+
+    // Ordering, half 2: a cell with no verifier configured refuses on THAT
+    // ground, not the carriage ground, even for a human principal with no
+    // bearer -- proving the verifier-presence check (at the top of
+    // `prepare_direct`) wins over the bearer check (at the bottom of it).
+    #[tokio::test]
+    async fn prepare_direct_lock_operation_with_no_verifier_configured_refuses_before_the_bearer_check()
+     {
+        let ctx = context(true); // no verifier attached
+        let token = human_token();
+        let repository_id = test_repository_id();
+        let branch_id = test_repository_id();
+
+        let error = ctx
+            .prepare_direct_lock_operation(
+                &token,
+                None,
+                &repository_id,
+                &branch_id,
+                lock_binding(),
+                None,
+            )
+            .await
+            .expect_err("no verifier configured must refuse before ever inspecting the bearer");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_ne!(
+            error.message(),
+            domain_operation_metadata::MISSING_AUTHN_BEARER_MESSAGE,
+            "the verifier-missing refusal must win over the carriage refusal when both \
+             conditions hold"
+        );
     }
 
     // --- 6c. internal_prepare_fingerprint determinism -----------------------

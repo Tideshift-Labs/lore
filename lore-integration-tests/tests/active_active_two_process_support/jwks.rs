@@ -28,6 +28,7 @@ use lore_base::lore_spawn;
 use serde::Serialize;
 
 use super::Env;
+use super::rebac_stub::policy::AUTHN_AUDIENCE;
 
 /// One entry of the token's `resources` claim.
 ///
@@ -176,8 +177,26 @@ impl TokenMinter {
     /// Sufficient for every RPC whose permission check goes through
     /// `has_required_permission`, which honours the wildcard. It is NOT
     /// sufficient for obliterate — see [`Self::mint_for_repository`].
+    ///
+    /// This is the EXCHANGED multiresource shape (audience `self.audience`,
+    /// non-empty `resources`) — what a released client's `AuthzInterceptor`
+    /// puts in `authorization` on every call. It must never be accepted as a
+    /// direct-human authn bearer; see [`Self::mint_authn`] for that shape.
     pub fn mint(&self, subject: &str) -> String {
         self.mint_with(subject, Vec::new())
+    }
+
+    /// A human AUTHN-shaped token for `subject`: audience `AUTHN_AUDIENCE`,
+    /// no `resources` claim.
+    ///
+    /// This is the shape `lore-authn-bearer` must carry
+    /// (`lorehub/apps/auth-grpc/src/service-authn.ts:55-76`,
+    /// `lorehub/packages/mint/src/verify.ts:62,73`) — distinct from
+    /// [`Self::mint`]'s exchanged multiresource shape, which carries a
+    /// `resources` claim and audience `["lore-storage", <host>]` and must be
+    /// refused by `rebac_stub`'s direct-operation authenticator.
+    pub fn mint_authn(&self, subject: &str) -> String {
+        self.mint_full(subject, Vec::new(), vec![AUTHN_AUDIENCE.to_owned()])
     }
 
     /// A token that also names one repository EXACTLY, with the obliterate
@@ -212,21 +231,27 @@ impl TokenMinter {
     }
 
     fn mint_with(&self, subject: &str, extra: Vec<Resource>) -> String {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock follows the epoch")
-            .as_secs();
         let mut resources = vec![Resource {
             resource_id: "urc-*".to_owned(),
             permission: vec!["read".to_owned(), "write".to_owned()],
         }];
         resources.extend(extra);
+        self.mint_full(subject, resources, vec![self.audience.clone()])
+    }
+
+    /// The shared tail of every mint call: everything but the `resources` and
+    /// `aud` claims is identical across the exchanged and authn shapes.
+    fn mint_full(&self, subject: &str, resources: Vec<Resource>, aud: Vec<String>) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock follows the epoch")
+            .as_secs();
         let claims = Claims {
             sub: subject.to_owned(),
             iss: self.issuer.clone(),
             iat: now,
             exp: now + 3600,
-            aud: vec![self.audience.clone()],
+            aud,
             env: "test".to_owned(),
             name: subject.to_owned(),
             preferred_username: subject.to_owned(),
