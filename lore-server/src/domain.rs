@@ -2903,6 +2903,94 @@ pub fn lock_fencing_settings_preconditions(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+/// The one action that clears every arming refusal in this module.
+///
+/// Spelled once and shared by both refusals because they are cleared by the same
+/// command: boot never migrates either schema (CR-030 N-7 for the lock schema),
+/// so an operator reading either message has exactly one next step and should
+/// not have to infer it from a field dump.
+const CUTOVER_HINT: &str = "run `loreserver domain cutover` (idempotent - it resumes from \
+                            wherever a prior attempt stopped) before starting this binary";
+
+/// Which SCHEMA-117 terms are missing, each as a sentence rather than a field name.
+///
+/// A list, not the first failure: more than one term can be short at once, and
+/// naming only one sends an operator back round the boot loop to discover the
+/// next. Empty means the evidence is complete.
+///
+/// The revision term is the one that bites in practice. A fork merge that bumps
+/// `LOCK_SCHEMA_VERSION` leaves every armed cell one revision behind, and the
+/// next binary built from that fork refuses to boot until cutover rolls the
+/// cell forward in place — see the Lorehub learning
+/// `a-lock-schema-version-bump-bricks-an-armed-cell-on-the-next-dev-rebuild.md`.
+fn lock_fencing_evidence_gaps(readiness: &LockFencingReadiness) -> Vec<String> {
+    let compiled_schema = lore_postgres::domain::locks::schema::LOCK_SCHEMA_VERSION;
+    let complete_backfill = lore_postgres::domain::locks::schema::BACKFILL_COMPLETE;
+    let mut gaps = Vec::new();
+    if readiness.schema_version != compiled_schema {
+        gaps.push(format!(
+            "lock schema revision {} on disk, this binary compiles revision {compiled_schema}",
+            readiness.schema_version
+        ));
+    }
+    if readiness.backfill_state != complete_backfill {
+        gaps.push(format!(
+            "lock backfill state is {}, complete is {complete_backfill}",
+            readiness.backfill_state
+        ));
+    }
+    if !readiness.same_database {
+        gaps.push(
+            "the fenced lock tables are not in the database this cell recorded at bootstrap"
+                .to_owned(),
+        );
+    }
+    if !readiness.sequence_headroom {
+        gaps.push("the fencing sequence is not reserved above every persisted fence".to_owned());
+    }
+    if readiness.quarantined_rows != 0 {
+        gaps.push(format!(
+            "{} lock row(s) are quarantined",
+            readiness.quarantined_rows
+        ));
+    }
+    if readiness.unfenced_rows != 0 {
+        gaps.push(format!(
+            "{} legacy lock row(s) are still unfenced",
+            readiness.unfenced_rows
+        ));
+    }
+    gaps
+}
+
+/// Which enforcement precondition is missing, each as a sentence.
+///
+/// Same shape and same reason as [`lock_fencing_evidence_gaps`]: the terms are
+/// `DomainSchemaState::ready_for_enforcement`'s, and an operator needs to know
+/// which one is short, not that "the cell is not ready".
+///
+/// Unlike the lock list, this one does NOT replace its guard — the authority is
+/// `ready_for_enforcement` in `lore-postgres`, a different crate. A term added
+/// there and not here would make this list empty on a genuinely unready cell, so
+/// the caller must handle an empty list as "unnamed", never as "nothing wrong".
+fn domain_enforcement_gaps(state: &DomainSchemaState) -> Vec<String> {
+    let cutover = lore_postgres::domain::schema::BACKFILL_CUTOVER;
+    let mut gaps = Vec::new();
+    if state.backfill_state != cutover {
+        gaps.push(format!(
+            "domain backfill state is {}, cutover is {cutover}",
+            state.backfill_state
+        ));
+    }
+    if !state.residue_classified {
+        gaps.push("the backfill's residue has not been classified".to_owned());
+    }
+    if state.cutover_at.is_none() {
+        gaps.push("no cutover marker is recorded".to_owned());
+    }
+    gaps
+}
+
 fn resolve_lock_fencing(readiness: &LockFencingReadiness, settings: &Settings) -> Result<bool> {
     if !readiness.fencing_enabled {
         info!(
@@ -2915,17 +3003,13 @@ fn resolve_lock_fencing(readiness: &LockFencingReadiness, settings: &Settings) -
     }
 
     lock_fencing_settings_preconditions(settings)?;
-    if readiness.schema_version != lore_postgres::domain::locks::schema::LOCK_SCHEMA_VERSION
-        || readiness.backfill_state != lore_postgres::domain::locks::schema::BACKFILL_COMPLETE
-        || !readiness.same_database
-        || !readiness.sequence_headroom
-        || readiness.quarantined_rows != 0
-        || readiness.unfenced_rows != 0
-    {
+    let gaps = lock_fencing_evidence_gaps(readiness);
+    if !gaps.is_empty() {
         return Err(anyhow!(
-            "Lock fencing is enabled without complete SCHEMA-117 evidence \
-             (schema_version={}, backfill_state={}, same_database={}, sequence_headroom={}, \
-              quarantined_rows={}, unfenced_rows={})",
+            "Lock fencing is enabled without complete SCHEMA-117 evidence: {}. To fix this, \
+             {CUTOVER_HINT}. Full readiness: (schema_version={}, backfill_state={}, \
+             same_database={}, sequence_headroom={}, quarantined_rows={}, unfenced_rows={})",
+            gaps.join("; "),
             readiness.schema_version,
             readiness.backfill_state,
             readiness.same_database,
@@ -2966,10 +3050,22 @@ fn resolve_enforcement(state: &DomainSchemaState) -> Result<bool> {
         return Ok(false);
     }
     if !state.ready_for_enforcement() {
+        let gaps = domain_enforcement_gaps(state);
+        // An empty list here means `ready_for_enforcement` grew a term this module
+        // does not enumerate. Say that, rather than emitting a confidently blank
+        // clause — an admittedly unnamed refusal is still readable; an empty one
+        // reads as though nothing is wrong, which is worse than the field dump
+        // this message replaced.
+        let named = if gaps.is_empty() {
+            "a readiness term this message does not enumerate".to_owned()
+        } else {
+            gaps.join("; ")
+        };
         return Err(anyhow!(
-            "Domain enforcement is enabled but this cell is not ready for it \
-             (backfill_state={}, residue_classified={}, cutover_at={:?}); \
-             refusing readiness rather than enforcing over an incomplete backfill",
+            "Domain enforcement is enabled but this cell is not ready for it: {}. To fix this, \
+             {CUTOVER_HINT}. Refusing readiness rather than enforcing over an incomplete \
+             backfill. Full state: (backfill_state={}, residue_classified={}, cutover_at={:?})",
+            named,
             state.backfill_state,
             state.residue_classified,
             state.cutover_at
@@ -5099,7 +5195,15 @@ mod tests {
         let err = resolve_enforcement(&state)
             .expect_err("an unready cell with enforcement requested must refuse readiness");
 
-        assert!(err.to_string().contains("refusing readiness"));
+        // Case-insensitive: the message now leads with "Refusing readiness"
+        // as a new sentence following the cutover hint, not lowercase mid-
+        // sentence as before -- the substantive claim under test is the
+        // phrase itself, not its capitalization.
+        assert!(
+            err.to_string()
+                .to_lowercase()
+                .contains("refusing readiness")
+        );
     }
 
     #[test]
@@ -5109,6 +5213,166 @@ mod tests {
         let enforcement = resolve_enforcement(&state).expect("a ready cell must enforce");
 
         assert!(enforcement);
+    }
+
+    /// Each `ready_for_enforcement` term, failing alone, names only itself and
+    /// still names the fix. A transposed check (naming the wrong gap for the
+    /// wrong condition) must not pass review.
+    ///
+    /// Tuple-array shape (case label, mutator, its own expected fragment) in
+    /// one literal per case, matching `lock_fencing_each_evidence_gap_names_itself_and_not_the_others`
+    /// below -- a case added here without its fragment fails to compile
+    /// instead of silently dropping out of a separately `zip`'d fragments
+    /// list.
+    #[test]
+    fn domain_enforcement_each_gap_names_itself_and_the_fix() {
+        type GapCase = (&'static str, fn(&mut DomainSchemaState), &'static str);
+        let cases: [GapCase; 3] = [
+            (
+                "backfill_state",
+                |s| s.backfill_state = BACKFILL_NOT_STARTED,
+                "domain backfill state is",
+            ),
+            (
+                "residue_classified",
+                |s| s.residue_classified = false,
+                "the backfill's residue has not been classified",
+            ),
+            (
+                "cutover_at",
+                |s| s.cutover_at = None,
+                "no cutover marker is recorded",
+            ),
+        ];
+        let every_fragment = [
+            "domain backfill state is",
+            "the backfill's residue has not been classified",
+            "no cutover marker is recorded",
+        ];
+
+        for (label, mutate, own_fragment) in cases {
+            let mut state = schema_state(true, BACKFILL_CUTOVER, true, Some(SystemTime::now()));
+            mutate(&mut state);
+
+            let Err(err) = resolve_enforcement(&state) else {
+                panic!("{label} alone must refuse readiness");
+            };
+            let message = err.to_string();
+
+            assert!(
+                message.contains(own_fragment),
+                "{label}: message did not name its own gap ({own_fragment}): {message}"
+            );
+            for other in every_fragment.iter().filter(|f| **f != own_fragment) {
+                assert!(
+                    !message.contains(other),
+                    "{label}: message wrongly named an unrelated gap ({other}): {message}"
+                );
+            }
+            assert!(
+                message.contains("domain cutover"),
+                "{label}: message did not name the fix: {message}"
+            );
+        }
+    }
+
+    /// The drift guard itself (see [`domain_enforcement_gaps`]'s doc comment):
+    /// whatever combination of the three `ready_for_enforcement` terms is
+    /// short, `resolve_enforcement` must refuse with a non-empty, named
+    /// clause -- never the blank-looking fallback text substituting for real
+    /// silence. Exhaustive over all three terms (skipping the one
+    /// fully-ready combination) so a future term added to
+    /// `ready_for_enforcement` without a matching branch here would leave
+    /// that new combination refusing with an empty gap list -- caught here
+    /// as a non-empty-but-generic clause, not this test alone, but this is
+    /// the assertion that pins the fallback substitution never degrades to
+    /// the blank clause it replaced.
+    #[test]
+    fn domain_enforcement_never_prints_a_blank_clause_across_every_unready_combination() {
+        for &backfill_state in &[BACKFILL_NOT_STARTED, BACKFILL_CUTOVER] {
+            for residue_classified in [false, true] {
+                for cutover_at in [None, Some(SystemTime::now())] {
+                    let ready = backfill_state == BACKFILL_CUTOVER
+                        && residue_classified
+                        && cutover_at.is_some();
+                    if ready {
+                        continue;
+                    }
+
+                    let state = schema_state(true, backfill_state, residue_classified, cutover_at);
+                    let err = resolve_enforcement(&state)
+                        .expect_err("an unready combination must refuse readiness");
+                    let message = err.to_string();
+
+                    assert!(
+                        !message.contains("not ready for it: ."),
+                        "blank clause for backfill_state={backfill_state}, \
+                         residue_classified={residue_classified}, \
+                         cutover_at={cutover_at:?}: {message}"
+                    );
+                    assert!(
+                        !message.contains("not ready for it: To fix"),
+                        "blank clause for backfill_state={backfill_state}, \
+                         residue_classified={residue_classified}, \
+                         cutover_at={cutover_at:?}: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Two terms missing at once must both be named, joined the same way as
+    // the lock-side refusal, and the full-state dump must still survive at
+    // the end of the message -- no diagnostic detail was traded away when
+    // the message gained named gaps.
+    #[test]
+    fn domain_enforcement_two_gaps_at_once_names_both_and_keeps_the_full_state_dump() {
+        let state = schema_state(true, BACKFILL_NOT_STARTED, false, Some(SystemTime::now()));
+
+        let err =
+            resolve_enforcement(&state).expect_err("two missing terms must still refuse readiness");
+        let message = err.to_string();
+
+        assert!(message.contains("domain backfill state is"));
+        assert!(message.contains("the backfill's residue has not been classified"));
+        assert!(
+            message.contains(&format!(
+                "domain backfill state is {BACKFILL_NOT_STARTED}, cutover is {}; the backfill's \
+                 residue has not been classified",
+                lore_postgres::domain::schema::BACKFILL_CUTOVER
+            )),
+            "message did not join the two gaps with \"; \" in order: {message}"
+        );
+        assert!(
+            message.contains("Full state: (backfill_state="),
+            "message dropped the full state dump: {message}"
+        );
+        assert!(
+            message.trim_end().ends_with(')'),
+            "message did not end with the full-state parenthetical: {message}"
+        );
+    }
+
+    /// Enforcement-off is `Ok(false)` with no error, whatever the backfill
+    /// state, residue-classified flag, or cutover marker say.
+    #[test]
+    fn domain_enforcement_off_is_ok_false_for_every_backfill_state_and_residue_combination() {
+        let backfill_states = [
+            BACKFILL_NOT_STARTED,
+            lore_postgres::domain::schema::BACKFILL_RUNNING,
+            lore_postgres::domain::schema::BACKFILL_VERIFIED,
+            BACKFILL_CUTOVER,
+        ];
+        for &backfill_state in &backfill_states {
+            for residue_classified in [false, true] {
+                for cutover_at in [None, Some(SystemTime::now())] {
+                    let state = schema_state(false, backfill_state, residue_classified, cutover_at);
+                    let enforcement = resolve_enforcement(&state)
+                        .expect("enforcement off must never fail regardless of backfill state");
+                    assert!(!enforcement);
+                }
+            }
+        }
     }
 
     fn lock_ready() -> LockFencingReadiness {
@@ -5212,6 +5476,200 @@ mod tests {
         for readiness in cases {
             assert!(resolve_lock_fencing(&readiness, &settings).is_err());
         }
+    }
+
+    // The exact incident this change exists for: a fork merge bumps
+    // `LOCK_SCHEMA_VERSION` and the next binary boots against a cell one
+    // revision behind. The refusal must name both revisions, not just report
+    // a mismatch, and must name the fix.
+    #[test]
+    fn lock_fencing_one_schema_revision_behind_names_both_revisions_and_the_fix() {
+        let mut readiness = lock_ready();
+        readiness.schema_version -= 1;
+        let settings = fenced_settings();
+
+        let err = resolve_lock_fencing(&readiness, &settings)
+            .expect_err("a stale lock schema revision must refuse readiness");
+        let message = err.to_string();
+
+        assert!(
+            message.contains(&format!(
+                "lock schema revision {} on disk",
+                readiness.schema_version
+            )),
+            "message did not name the on-disk revision: {message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "this binary compiles revision {}",
+                lore_postgres::domain::locks::schema::LOCK_SCHEMA_VERSION
+            )),
+            "message did not name the compiled revision: {message}"
+        );
+        assert!(
+            message.contains("domain cutover"),
+            "message did not name the fix: {message}"
+        );
+    }
+
+    /// Each remaining SCHEMA-117 term, failing alone, names only itself. A
+    /// transposed check (naming the wrong gap for the wrong condition) must
+    /// not pass review.
+    #[test]
+    fn lock_fencing_each_evidence_gap_names_itself_and_not_the_others() {
+        type GapCase = (&'static str, fn(&mut LockFencingReadiness), &'static str);
+        let cases: [GapCase; 5] = [
+            (
+                "backfill_state",
+                |r| r.backfill_state = lore_postgres::domain::locks::schema::BACKFILL_RUNNING,
+                "lock backfill state is",
+            ),
+            (
+                "same_database",
+                |r| r.same_database = false,
+                "not in the database this cell recorded at bootstrap",
+            ),
+            (
+                "sequence_headroom",
+                |r| r.sequence_headroom = false,
+                "not reserved above every persisted fence",
+            ),
+            (
+                "quarantined_rows",
+                |r| r.quarantined_rows = 1,
+                "lock row(s) are quarantined",
+            ),
+            (
+                "unfenced_rows",
+                |r| r.unfenced_rows = 1,
+                "legacy lock row(s) are still unfenced",
+            ),
+        ];
+        let every_fragment = [
+            "lock schema revision",
+            "lock backfill state is",
+            "not in the database this cell recorded at bootstrap",
+            "not reserved above every persisted fence",
+            "lock row(s) are quarantined",
+            "legacy lock row(s) are still unfenced",
+        ];
+
+        let settings = fenced_settings();
+        for (label, mutate, own_fragment) in cases {
+            let mut readiness = lock_ready();
+            mutate(&mut readiness);
+
+            let Err(err) = resolve_lock_fencing(&readiness, &settings) else {
+                panic!("{label} alone must refuse readiness");
+            };
+            let message = err.to_string();
+
+            assert!(
+                message.contains(own_fragment),
+                "{label}: message did not name its own gap: {message}"
+            );
+            for other in every_fragment.iter().filter(|f| **f != own_fragment) {
+                assert!(
+                    !message.contains(other),
+                    "{label}: message wrongly named an unrelated gap ({other}): {message}"
+                );
+            }
+        }
+    }
+
+    // Two terms missing at once must both be named, not just the first --
+    // otherwise an operator clears one gap, reboots, and discovers the second
+    // only on the next failed boot.
+    #[test]
+    fn lock_fencing_two_gaps_at_once_names_both() {
+        let mut readiness = lock_ready();
+        readiness.same_database = false;
+        readiness.quarantined_rows = 3;
+        let settings = fenced_settings();
+
+        let err = resolve_lock_fencing(&readiness, &settings)
+            .expect_err("two missing terms must still refuse readiness");
+        let message = err.to_string();
+
+        assert!(message.contains("not in the database this cell recorded at bootstrap"));
+        assert!(message.contains("3 lock row(s) are quarantined"));
+        // The join separator itself: two gaps must read as one sentence
+        // joined by "; ", not merely both be present somewhere in the
+        // message (which would also pass if they were concatenated with no
+        // separator, or in the wrong order).
+        assert!(
+            message.contains(
+                "the fenced lock tables are not in the database this cell recorded at \
+                 bootstrap; 3 lock row(s) are quarantined"
+            ),
+            "message did not join the two gaps with \"; \" in order: {message}"
+        );
+        // The full readiness dump was deliberately kept alongside the named
+        // gaps -- no diagnostic detail was traded for readability. Prove it
+        // still survives to the end of the message.
+        assert!(
+            message.contains("Full readiness: (schema_version="),
+            "message dropped the full readiness dump: {message}"
+        );
+        assert!(
+            message.trim_end().ends_with(')'),
+            "message did not end with the full-readiness parenthetical: {message}"
+        );
+    }
+
+    // The settings preconditions are configuration problems, not migration
+    // problems -- pointing an operator at `domain cutover` for a missing JWK
+    // or a non-Postgres lock store would send them chasing the wrong fix.
+    #[test]
+    fn lock_fencing_settings_precondition_refusals_do_not_carry_the_cutover_hint() {
+        let readiness = lock_ready();
+
+        let mut no_auth = fenced_settings();
+        no_auth.server.auth = None;
+        let err = resolve_lock_fencing(&readiness, &no_auth).expect_err("missing auth must refuse");
+        assert!(!err.to_string().contains("domain cutover"), "{err}");
+
+        let mut no_jwk = fenced_settings();
+        no_jwk.server.auth.as_mut().expect("auth").jwk = None;
+        let err = resolve_lock_fencing(&readiness, &no_jwk).expect_err("missing jwk must refuse");
+        assert!(!err.to_string().contains("domain cutover"), "{err}");
+
+        let mut no_issuer = fenced_settings();
+        no_issuer.server.auth.as_mut().expect("auth").jwt_issuer = None;
+        let err =
+            resolve_lock_fencing(&readiness, &no_issuer).expect_err("missing issuer must refuse");
+        assert!(!err.to_string().contains("domain cutover"), "{err}");
+
+        let mut no_write_enforcement = fenced_settings();
+        no_write_enforcement
+            .server
+            .auth
+            .as_mut()
+            .expect("auth")
+            .enforce_write_permission = false;
+        let err = resolve_lock_fencing(&readiness, &no_write_enforcement)
+            .expect_err("enforce_write_permission=false must refuse");
+        assert!(!err.to_string().contains("domain cutover"), "{err}");
+
+        let mut wrong_store = fenced_settings();
+        wrong_store.lock_store.as_mut().expect("lock store").mode = "local".to_owned();
+        let err = resolve_lock_fencing(&readiness, &wrong_store)
+            .expect_err("a non-Postgres lock store must refuse");
+        assert!(!err.to_string().contains("domain cutover"), "{err}");
+    }
+
+    // The lease refusal is also a configuration/rollout problem (no client
+    // renews a lease yet), not a migration gap -- it must not carry the
+    // cutover hint either.
+    #[test]
+    fn lock_fencing_lease_enabled_refusal_does_not_carry_the_cutover_hint() {
+        let mut readiness = lock_ready();
+        readiness.lease_enabled = true;
+        let settings = fenced_settings();
+
+        let err = resolve_lock_fencing(&readiness, &settings)
+            .expect_err("finite leases without a renewal cadence must refuse");
+        assert!(!err.to_string().contains("domain cutover"), "{}", err);
     }
 
     // --- 8. Boot against a cell the SCHEMA-117 migration never touched ------
