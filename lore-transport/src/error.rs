@@ -61,7 +61,28 @@ impl From<tonic::Status> for ProtocolError {
         }
         match value.code() {
             tonic::Code::Unavailable | tonic::Code::Unknown => ProtocolError::from(Disconnected),
-            tonic::Code::Unauthenticated => ProtocolError::from(NotAuthenticated),
+            tonic::Code::Unauthenticated => {
+                // `NotAuthenticated` is a unit struct with a fixed message, so the
+                // server's own text has nowhere to travel on the returned error and
+                // the caller sees only "Not authenticated". That silence cost a full
+                // diagnosis session on WP-120: an enforcing cell refusing a push for
+                // a precise, actionable reason reached the operator as three
+                // characterless words.
+                //
+                // Logged rather than carried, deliberately. Giving the variant a
+                // context field the way `Oversized` and `NotSupported` have one
+                // means widening `lore_base::error::NotAuthenticated`, which is
+                // named in roughly sixty error-set declarations across
+                // `lore-revision`, `lore-storage` and `lore`, in the FFI code table,
+                // and in the CLI's Python error map. That is a `[CLIENT]`
+                // public-API change gated on an upstream merge, not a line in a
+                // status mapping.
+                lore_base::lore_warn!(
+                    "Server refused the request as unauthenticated: {}",
+                    value.message()
+                );
+                ProtocolError::from(NotAuthenticated)
+            }
             tonic::Code::PermissionDenied => ProtocolError::from(NotAuthorized),
             tonic::Code::NotFound => ProtocolError::from(NotFound),
             tonic::Code::ResourceExhausted => ProtocolError::from(SlowDown),

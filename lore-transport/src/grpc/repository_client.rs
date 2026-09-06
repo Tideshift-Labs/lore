@@ -14,6 +14,7 @@ use super::Channel;
 use super::GRPCAuthRef;
 use super::grpc_retry;
 use super::handle_error;
+use super::inject_authn_bearer;
 use crate::error::ProtocolError;
 use crate::types::MetadataSetResult;
 use crate::types::RepositoryData;
@@ -21,13 +22,25 @@ use crate::types::RepositoryData;
 #[derive(Clone)]
 pub struct RepositoryService {
     client: RepositoryServiceClient<AuthenticatedService>,
+    /// Kept beside the client so a governed mutation can stamp the human's own
+    /// authentication bearer per dispatch.
+    ///
+    /// This service runs under [`AuthnInterceptor`], so its `authorization`
+    /// header already carries that same token. The header is sent anyway: the
+    /// server reads one key for every governed family, and leaving these two
+    /// verbs to be recognised by which interceptor happens to sit in front of
+    /// them is exactly the coupling that produced the defect this fixes.
+    auth: GRPCAuthRef,
 }
 
 impl RepositoryService {
     pub fn new(channel: Channel, auth: GRPCAuthRef) -> Self {
-        let client = RepositoryServiceClient::with_interceptor(channel, AuthnInterceptor { auth });
+        let client = RepositoryServiceClient::with_interceptor(
+            channel,
+            AuthnInterceptor { auth: auth.clone() },
+        );
 
-        Self { client }
+        Self { client, auth }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -77,7 +90,10 @@ impl RepositoryService {
     pub async fn delete(&self, id: RepositoryId) -> Result<(), ProtocolError> {
         let mut retry = grpc_retry();
         let _response = loop {
-            let request = repository_v1::RepositoryDeleteRequest { id: id.into() };
+            // `repository.delete` is a governed direct family.
+            let mut request =
+                tonic::Request::new(repository_v1::RepositoryDeleteRequest { id: id.into() });
+            inject_authn_bearer(&mut request, &self.auth)?;
 
             let mut client = self.client.clone();
 
@@ -211,11 +227,13 @@ impl RepositoryService {
     ) -> Result<MetadataSetResult, ProtocolError> {
         let mut retry = grpc_retry();
         let response = loop {
-            let request = repository_v1::RepositoryMetadataSetRequest {
+            // `repository.metadata-set` is a governed direct family.
+            let mut request = tonic::Request::new(repository_v1::RepositoryMetadataSetRequest {
                 id: id.into(),
                 expected: expected.into(),
                 updated: new.into(),
-            };
+            });
+            inject_authn_bearer(&mut request, &self.auth)?;
 
             let mut client = self.client.clone();
 

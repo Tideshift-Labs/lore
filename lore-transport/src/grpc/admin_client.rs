@@ -16,21 +16,31 @@ use super::GRPCAuthRef;
 use super::RequestScopedCounter;
 use super::grpc_retry;
 use super::handle_error;
+use super::inject_authn_bearer;
 use crate::error::ProtocolError;
 
 #[derive(Clone)]
 pub struct AdminService {
     client: AdminServiceClient<AuthorizedService>,
+    /// Kept beside the client so a governed mutation can stamp the human's own
+    /// authentication bearer per dispatch.
+    auth: GRPCAuthRef,
     pub request_inflight: Arc<AtomicU64>,
 }
 
 impl AdminService {
     pub fn new(channel: Channel, repository: RepositoryId, auth: GRPCAuthRef) -> Self {
-        let client =
-            AdminServiceClient::with_interceptor(channel, AuthzInterceptor { repository, auth });
+        let client = AdminServiceClient::with_interceptor(
+            channel,
+            AuthzInterceptor {
+                repository,
+                auth: auth.clone(),
+            },
+        );
 
         Self {
             client,
+            auth,
             request_inflight: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -42,9 +52,11 @@ impl AdminService {
         let _response = loop {
             let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
-            let request = ObliterateRequest {
+            // `repository.obliterate` is a governed direct family.
+            let mut request = tonic::Request::new(ObliterateRequest {
                 address: Some(address.into()),
-            };
+            });
+            inject_authn_bearer(&mut request, &self.auth)?;
 
             let mut client = self.client.clone();
 

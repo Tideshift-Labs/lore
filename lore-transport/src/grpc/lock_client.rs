@@ -24,6 +24,7 @@ use super::GRPCAuthRef;
 use super::RequestScopedCounter;
 use super::grpc_retry;
 use super::handle_error;
+use super::inject_authn_bearer;
 use crate::attempt_store::AcquiredLock;
 use crate::attempt_store::FencedLockResource;
 use crate::attempt_store::OwnershipToken;
@@ -57,17 +58,27 @@ fn wire_to_acquired_lock(lock: lore_proto::lock::Lock) -> Result<AcquiredLock, P
 #[derive(Debug, Clone)]
 pub struct LockService {
     client: LockServiceClient<AuthorizedService>,
+    /// Kept beside the client so a governed mutation can stamp the human's own
+    /// authentication bearer per dispatch. The lock reads on this same client
+    /// (`query`, `status`) deliberately do not.
+    auth: GRPCAuthRef,
     pub request_inflight: Arc<AtomicU64>,
 }
 
 impl LockService {
     pub fn new(channel: Channel, repository: RepositoryId, auth: GRPCAuthRef) -> Self {
-        let client =
-            LockServiceClient::with_interceptor(channel, AuthzInterceptor { repository, auth })
-                .max_decoding_message_size(32 * 1024 * 1024); // 32MiB
+        let client = LockServiceClient::with_interceptor(
+            channel,
+            AuthzInterceptor {
+                repository,
+                auth: auth.clone(),
+            },
+        )
+        .max_decoding_message_size(32 * 1024 * 1024); // 32MiB
 
         Self {
             client,
+            auth,
             request_inflight: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -85,11 +96,14 @@ impl LockService {
         let locks = loop {
             let resources = resources.iter().map(fenced_resource_to_wire).collect();
 
+            // Both arms are governed direct families: `lock.admin-acquire` when
+            // the caller locks on another's behalf, `lock.acquire` otherwise.
             if let Some(owner) = owner {
-                let request = AdminLockRequest {
+                let mut request = tonic::Request::new(AdminLockRequest {
                     resources,
                     owner: owner.to_string(),
-                };
+                });
+                inject_authn_bearer(&mut request, &self.auth)?;
 
                 let mut client = self.client.clone();
                 match client.admin_lock(request).await {
@@ -99,7 +113,8 @@ impl LockService {
                     Err(status) => handle_error(&mut retry, status).await?,
                 }
             } else {
-                let request = LockRequest { resources };
+                let mut request = tonic::Request::new(LockRequest { resources });
+                inject_authn_bearer(&mut request, &self.auth)?;
 
                 let mut client = self.client.clone();
                 match client.lock(request).await {
@@ -178,9 +193,11 @@ impl LockService {
 
         let mut retry = grpc_retry();
         let resources = loop {
-            let request = UnlockRequest {
+            // `lock.release` is a governed direct family.
+            let mut request = tonic::Request::new(UnlockRequest {
                 resources: resources.iter().map(fenced_resource_to_wire).collect(),
-            };
+            });
+            inject_authn_bearer(&mut request, &self.auth)?;
 
             let mut client = self.client.clone();
 
@@ -221,10 +238,12 @@ impl LockService {
 
         let mut retry = grpc_retry();
         let resources = loop {
-            let request = ForceUnlockRequest {
+            // `lock.force-release` is a governed direct family.
+            let mut request = tonic::Request::new(ForceUnlockRequest {
                 resources: resources.iter().map(Into::into).collect(),
                 owner: owner.to_string(),
-            };
+            });
+            inject_authn_bearer(&mut request, &self.auth)?;
 
             let mut client = self.client.clone();
 

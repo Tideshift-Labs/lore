@@ -78,6 +78,27 @@ pub const REPOSITORY_ID_KEY: &str = "urc-repository-id-bin";
 pub const CORRELATION_ID_HEADER: &str = "x-epic-correlation-id";
 pub const REVISION_LIST_STRATEGY_HEADER: &str = "x-lore-revision-list-strategy";
 
+// PIN(WP-120, 2026-09-05): the human's own authentication JWT, sent beside
+// `authorization` on a governed mutation. Plain ASCII, so no `-bin` suffix, and
+// the value carries the same `Bearer <jwt>` framing `authorization` does so a
+// server can forward it verbatim. Documented beside `lore-attempt-id`; the
+// server half is `lore-server`'s `domain_operation_metadata::AUTHN_BEARER_KEY`
+// and the two literals must stay equal.
+//
+// Why a second header rather than reusing `authorization`: on every service
+// under [`AuthzInterceptor`], `authorization` carries the *exchanged*
+// multiresource authorization token — audience `["lore-storage", <host>]` and a
+// `resources` claim. A governed mutation's internal prepare forwards a bearer to
+// the platform's repository-operation verifier, which authenticates the *human*
+// and refuses a token carrying a `resources` claim outright. The two credentials
+// have different audiences and different jobs, so they need different carriage;
+// overwriting `authorization` would break the repo-scoped authz check that
+// header exists for.
+//
+// It is a credential, never an identity assertion by this client: the server
+// relays it to the verifier, which re-verifies it independently.
+pub const AUTHN_BEARER_METADATA_KEY: &str = "lore-authn-bearer";
+
 const RETRY_START_BACKOFF_MS: u64 = 50;
 const RETRY_MAX_BACKOFF_MS: u64 = 10_000;
 const RETRY_MAX_ATTEMPTS: usize = 60;
@@ -254,6 +275,33 @@ pub struct GRPCAuth {
     pub refresher: Option<JoinHandle<()>>,
 }
 
+/// Hand-written, and never `#[derive]`d: both token fields are live bearer
+/// credentials, and a derived `Debug` would print them in full anywhere a holder
+/// of this type is formatted — which is now every governed-mutation client,
+/// since each keeps its own handle. The fields are named so a reader can still
+/// tell which credentials are populated.
+impl std::fmt::Debug for GRPCAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn presence(token: &str) -> &'static str {
+            if token.is_empty() {
+                "<absent>"
+            } else {
+                "<redacted>"
+            }
+        }
+
+        f.debug_struct("GRPCAuth")
+            .field("remote_domain", &self.remote_domain)
+            .field(
+                "authentication_token",
+                &presence(&self.authentication_token),
+            )
+            .field("authorization_token", &presence(&self.authorization_token))
+            .field("refresher", &self.refresher.is_some())
+            .finish()
+    }
+}
+
 impl GRPCAuth {
     async fn new(
         auth_url: &str,
@@ -360,7 +408,7 @@ impl GRPCAuth {
     }
 }
 
-type GRPCAuthRef = Arc<parking_lot::RwLock<GRPCAuth>>;
+pub type GRPCAuthRef = Arc<parking_lot::RwLock<GRPCAuth>>;
 
 /// How long a refresher waits before re-deriving its tokens, absent a rotation.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -494,6 +542,39 @@ pub fn inject_authorization(
         .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
     value.set_sensitive(true);
     request.metadata_mut().insert(AUTHORIZATION.as_str(), value);
+    Ok(())
+}
+
+/// Stamp the human's own authentication bearer onto one governed mutation.
+///
+/// Called per dispatch rather than from an interceptor, because a tonic
+/// interceptor is handed a `Request<()>` with no method on it and every
+/// [`AuthzInterceptor`] client mixes governed mutations with ordinary reads on
+/// one channel. Stamping it at the call site is what keeps the credential off
+/// the reads.
+///
+/// A silent no-op when the credential store holds no authentication token. That
+/// is the service-delegation and raw-supplied-token case: those callers never
+/// had a human JWT to send, and failing the dispatch here would turn a working
+/// call into a certain failure over carriage the server treats as additive. An
+/// enforcing cell refuses the mutation on its own terms instead, which is where
+/// the refusal can name what is missing.
+pub fn inject_authn_bearer<T>(
+    request: &mut tonic::Request<T>,
+    auth: &GRPCAuthRef,
+) -> Result<(), tonic::Status> {
+    // Cloned out under the lock rather than formatted under it: the read guard
+    // is a `parking_lot` lock shared with the refresher task.
+    let token = auth.read().authentication_token.clone();
+    if token.is_empty() {
+        return Ok(());
+    }
+    let mut value = MetadataValue::from_str(&format!("Bearer {token}"))
+        .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
+    value.set_sensitive(true);
+    request
+        .metadata_mut()
+        .insert(AUTHN_BEARER_METADATA_KEY, value);
     Ok(())
 }
 

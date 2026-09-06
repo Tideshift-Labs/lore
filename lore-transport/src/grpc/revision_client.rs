@@ -23,6 +23,7 @@ use super::REVISION_LIST_STRATEGY_HEADER;
 use super::RequestScopedCounter;
 use super::grpc_retry;
 use super::handle_error;
+use super::inject_authn_bearer;
 use crate::error::ProtocolError;
 use crate::types::BranchListResponse;
 use crate::types::BranchPushResponse;
@@ -36,17 +37,27 @@ use crate::types::RevisionListStart;
 pub struct RevisionService {
     client: RevisionServiceClient<AuthorizedService>,
     repository: RepositoryId,
+    /// Kept beside the client so a governed mutation can stamp the human's own
+    /// authentication bearer per dispatch. The interceptor holds its own clone
+    /// and keeps sending the exchanged authorization token on every RPC.
+    auth: GRPCAuthRef,
     pub request_inflight: Arc<AtomicU64>,
 }
 
 impl RevisionService {
     pub fn new(channel: Channel, repository: RepositoryId, auth: GRPCAuthRef) -> Self {
-        let client =
-            RevisionServiceClient::with_interceptor(channel, AuthzInterceptor { repository, auth });
+        let client = RevisionServiceClient::with_interceptor(
+            channel,
+            AuthzInterceptor {
+                repository,
+                auth: auth.clone(),
+            },
+        );
 
         Self {
             client,
             repository,
+            auth,
             request_inflight: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -96,7 +107,17 @@ impl RevisionService {
 
         let mut retry = grpc_retry();
         let _response = loop {
-            let request = revision_v1::BranchDeleteRequest { id: branch.into() };
+            // Not one of the ten families the platform's operation verifier
+            // accepts, and yet it carries the bearer, because the header tracks
+            // which calls enter loreserver's admission gate rather than which
+            // families the verifier names. `branch_delete`'s handler calls
+            // `admit_at_entry` exactly as `branch_push` does (WP-119 writer
+            // inventory B4). Omitting the header here would replace WP-116's
+            // "this family is not wired" refusal with a carriage refusal telling
+            // the operator to upgrade a client that is already current.
+            let mut request =
+                tonic::Request::new(revision_v1::BranchDeleteRequest { id: branch.into() });
+            inject_authn_bearer(&mut request, &self.auth)?;
 
             let mut client = self.client.clone();
 
@@ -233,12 +254,16 @@ impl RevisionService {
 
         let mut retry = grpc_retry();
         let response = loop {
-            let request = revision_v1::BranchPushRequest {
+            // `branch.push` is a governed direct family, so it carries the human
+            // authn bearer beside the exchanged authorization token. Built inside
+            // the loop so a token the refresher replaced mid-retry is picked up.
+            let mut request = tonic::Request::new(revision_v1::BranchPushRequest {
                 id: branch.into(),
                 revision_signature: revision.into(),
                 force,
                 fast_forward_merge,
-            };
+            });
+            inject_authn_bearer(&mut request, &self.auth)?;
 
             let mut client = self.client.clone();
             match client.branch_push(request).await {
@@ -352,11 +377,13 @@ impl RevisionService {
 
         let mut retry = grpc_retry();
         let response = loop {
-            let request = revision_v1::BranchMetadataSetRequest {
+            // `branch.metadata-set` is a governed direct family. See `branch_push`.
+            let mut request = tonic::Request::new(revision_v1::BranchMetadataSetRequest {
                 id: branch.into(),
                 expected: expected.into(),
                 updated: new.into(),
-            };
+            });
+            inject_authn_bearer(&mut request, &self.auth)?;
 
             let mut client = self.client.clone();
 
