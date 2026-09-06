@@ -520,8 +520,8 @@ fn classify_set(
             // task minted died with it, already unresolved in the store, which is where a
             // reconciler finds it anyway. Minting a fresh `OutcomeUnknown` here to make the shape
             // tidier would name an attempt the server filed nothing under.
-            error: task_failure
-                .or(first_unknown_failure)
+            error: first_unknown_failure
+                .or(task_failure)
                 .unwrap_or_else(|| ReleaseError::internal("Failed to release the lock")),
             decisive: false,
         });
