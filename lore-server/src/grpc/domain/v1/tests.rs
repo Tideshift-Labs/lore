@@ -38,6 +38,9 @@ use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptKey;
 use lore_postgres::domain::receipts::ReceiptLookup;
+use lore_postgres::domain::receipts::WIRE_TERMINAL_OUTCOME_APPLIED;
+use lore_postgres::domain::receipts::WIRE_TERMINAL_OUTCOME_NOT_APPLIED;
+use lore_postgres::domain::receipts::WireTerminalOutcome;
 use lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetRequest;
 use lore_proto::lore::domain::v1::DomainOperationClockGetRequest;
 use lore_proto::lore::domain::v1::DomainOperationOutcome;
@@ -118,6 +121,10 @@ struct RecordingStore {
     /// request itself could name) is only checkable if the double records what it received.
     last_attempt_receipt_call: Mutex<Option<(String, String, Uuid)>>,
     recorded_prepare: Mutex<Option<RecordedPrepare>>,
+    /// The exact `TerminalStatusAttachInput` the handler most recently handed the coordinator --
+    /// the seam this file's `terminal_attach_hands_the_coordinator_the_wire_terminal_outcome_unchanged`
+    /// proves: the gRPC layer carries the WIRE-domain outcome through untranslated.
+    recorded_terminal_attach: Mutex<Option<TerminalStatusAttachInput>>,
 }
 
 impl RecordingStore {
@@ -149,6 +156,7 @@ impl RecordingStore {
             attempt_receipt_owner: Mutex::new(None),
             last_attempt_receipt_call: Mutex::new(None),
             recorded_prepare: Mutex::new(None),
+            recorded_terminal_attach: Mutex::new(None),
         }
     }
 
@@ -255,6 +263,10 @@ impl DomainTransactionStore for RecordingStore {
         input: &TerminalStatusAttachInput,
     ) -> Result<TerminalStatusAttachmentAck, DomainError> {
         self.terminal_attach_calls.fetch_add(1, Ordering::SeqCst);
+        *self
+            .recorded_terminal_attach
+            .lock()
+            .expect("recorded terminal attach lock") = Some(input.clone());
         Ok(TerminalStatusAttachmentAck {
             status: lore_postgres::domain::maintenance::TerminalStatusAttachStatus::Mismatch,
             fields: std::array::from_fn(|_| None),
@@ -1199,6 +1211,56 @@ async fn maintenance_verifier_binding_stops_before_store() {
     );
 }
 
+/// The gRPC seam must hand the coordinator the WIRE-domain `terminal_outcome` unchanged -- no
+/// translation to the storage encoding happens here. `service.rs`'s
+/// `TerminalStatusAttachInput.terminal_outcome` is built directly from the validated wire i32
+/// (`i16::try_from(request.terminal_outcome)`), so `DomainOperationOutcome::Applied` (wire 1) must
+/// arrive at the coordinator as `WireTerminalOutcome::APPLIED` and `DomainOperationOutcome::NotApplied`
+/// (wire 2) as `WireTerminalOutcome::NOT_APPLIED`. The storage-domain mapping (`receipt_outcome()`)
+/// is the coordinator's own responsibility, pinned separately in `lore-postgres`.
+#[tokio::test]
+async fn terminal_attach_hands_the_coordinator_the_wire_terminal_outcome_unchanged() {
+    let (service, store, _verifier) = service();
+
+    let mut applied = valid_terminal_attach_phase1();
+    applied.terminal_outcome = DomainOperationOutcome::Applied as i32;
+    service
+        .domain_operation_terminal_status_attach(authenticated(applied))
+        .await
+        .expect("terminal attach with a valid wire-applied outcome succeeds");
+    let recorded_applied = store
+        .recorded_terminal_attach
+        .lock()
+        .expect("recorded terminal attach lock")
+        .clone()
+        .expect("terminal attach recorded");
+    assert_eq!(
+        recorded_applied.terminal_outcome,
+        WireTerminalOutcome::APPLIED,
+        "wire APPLIED must arrive at the coordinator untranslated (as_wire() == 1)"
+    );
+    assert_eq!(recorded_applied.terminal_outcome.as_wire(), 1);
+
+    let mut not_applied = valid_terminal_attach_phase1();
+    not_applied.terminal_outcome = DomainOperationOutcome::NotApplied as i32;
+    service
+        .domain_operation_terminal_status_attach(authenticated(not_applied))
+        .await
+        .expect("terminal attach with a valid wire-not-applied outcome succeeds");
+    let recorded_not_applied = store
+        .recorded_terminal_attach
+        .lock()
+        .expect("recorded terminal attach lock")
+        .clone()
+        .expect("terminal attach recorded");
+    assert_eq!(
+        recorded_not_applied.terminal_outcome,
+        WireTerminalOutcome::NOT_APPLIED,
+        "wire NOT_APPLIED must arrive at the coordinator untranslated (as_wire() == 2)"
+    );
+    assert_eq!(recorded_not_applied.terminal_outcome.as_wire(), 2);
+}
+
 #[tokio::test]
 async fn missing_claim_identity_digest_is_reported_as_verifier_version_skew() {
     let (service, store, verifier) = service();
@@ -1464,6 +1526,52 @@ async fn receipt_maps_terminal_and_future_marker_results_exactly() {
     assert_eq!(response.reason_version, Some(1));
     assert_eq!(response.reason, "UUID_FUTURE_HORIZON_EXCEEDED_V1");
     assert!(response.from_future_marker);
+}
+
+/// The send side (`service.rs`'s private `outcome_fields`, exercised here only through the public
+/// handler, since it is not itself `pub`) must put the SAME wire constants on the wire that the
+/// receive side (`lore-postgres`'s `WireTerminalOutcome`) reads back on the private maintenance
+/// rail. `DomainOperationOutcome::Applied as i32`/`NotApplied as i32` are pinned as 1/2 by
+/// `lore-proto/tests/v1_domain_operation.rs`, but nothing before this test tied that proto tag to
+/// `lore_postgres::domain::receipts::WIRE_TERMINAL_OUTCOME_APPLIED`/`_NOT_APPLIED` directly, so the
+/// two crates' constants could drift apart from each other without either crate's own tests
+/// noticing.
+#[tokio::test]
+async fn receipt_get_sends_the_same_wire_constants_the_maintenance_rail_reads() {
+    let (service, store, _) = service();
+
+    *store.receipt_result.lock().expect("receipt result") = ReceiptLookup::Committed {
+        outcome: DomainOutcome::Applied,
+        from_future_marker: false,
+    };
+    let applied = service
+        .domain_operation_receipt_get(authenticated(valid_receipt_get()))
+        .await
+        .expect("receipt lookup succeeds")
+        .into_inner();
+    assert_eq!(
+        applied.outcome,
+        i32::from(WIRE_TERMINAL_OUTCOME_APPLIED),
+        "the send side must encode Applied as the same wire tag the receive side maps back"
+    );
+
+    *store.receipt_result.lock().expect("receipt result") = ReceiptLookup::Committed {
+        outcome: DomainOutcome::NotApplied {
+            reason_version: 1,
+            reason: "SOME_REASON_V1".into(),
+        },
+        from_future_marker: false,
+    };
+    let not_applied = service
+        .domain_operation_receipt_get(authenticated(valid_receipt_get()))
+        .await
+        .expect("receipt lookup succeeds")
+        .into_inner();
+    assert_eq!(
+        not_applied.outcome,
+        i32::from(WIRE_TERMINAL_OUTCOME_NOT_APPLIED),
+        "the send side must encode NotApplied as the same wire tag the receive side maps back"
+    );
 }
 
 // -------------------------------------------------------------------------------------------

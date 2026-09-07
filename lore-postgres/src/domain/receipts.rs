@@ -61,6 +61,75 @@ pub const UUID_FUTURE_HORIZON_EXCEEDED_V1: &str = "UUID_FUTURE_HORIZON_EXCEEDED_
 /// An unconsumed prepared row that reached its hard TTL.
 pub const PREPARED_HARD_TTL_EXPIRED_V1: &str = "PREPARED_HARD_TTL_EXPIRED_V1";
 
+// --- Terminal outcome: the wire domain, and the one mapping onto storage ----
+
+/// CR-029 wire tag 10 (`lore.domain.v1.DomainOperationOutcome`): APPLIED.
+///
+/// The wire enum reserves 0 for `UNSPECIFIED`, so its APPLIED/NOT_APPLIED pair
+/// is 1/2 while this crate's receipt column stores 0/1
+/// (`schema::RECEIPT_OUTCOME_*`). The two encodings are different bases on
+/// purpose and a raw comparison between them is always wrong.
+pub const WIRE_TERMINAL_OUTCOME_APPLIED: i16 = 1;
+/// CR-029 wire tag 10 (`lore.domain.v1.DomainOperationOutcome`): NOT_APPLIED.
+pub const WIRE_TERMINAL_OUTCOME_NOT_APPLIED: i16 = 2;
+
+/// A terminal outcome still in the CR-029 **wire** encoding.
+///
+/// A caller that received a terminal outcome over the private maintenance rail
+/// holds a wire value, not a storage code, and must say so in the type. The two
+/// encodings overlap without agreeing, so comparing them raw is wrong in both
+/// directions: wire APPLIED (1) never equals stored APPLIED (0), which refused
+/// every honest attach, and wire APPLIED (1) *does* equal stored NOT_APPLIED
+/// (1), which accepted an attach that disagreed with its own receipt. Keeping
+/// the domains distinct in the type is also what stops a hand-built fixture
+/// from carrying a storage-encoded outcome into an input the gRPC layer could
+/// never produce — the reason the suite stayed green while the cell refused
+/// every claim.
+///
+/// The value stays in the wire domain for every digest and every stored copy
+/// (both sides of those comparisons are wire-encoded and self-consistent).
+/// `receipt_outcome` is the single translation onto the receipt column. It is
+/// the receive-side counterpart of the send side, which spans two halves in two
+/// crates: `committed_outcome` below decodes the column into a `DomainOutcome`,
+/// and `lore-server`'s `outcome_fields` encodes that onto the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireTerminalOutcome(i16);
+
+impl WireTerminalOutcome {
+    /// The wire APPLIED tag.
+    pub const APPLIED: Self = Self(WIRE_TERMINAL_OUTCOME_APPLIED);
+    /// The wire NOT_APPLIED tag.
+    pub const NOT_APPLIED: Self = Self(WIRE_TERMINAL_OUTCOME_NOT_APPLIED);
+
+    /// Wrap a raw wire value.
+    ///
+    /// A value outside the frozen pair is kept as it arrived rather than
+    /// coerced or rejected here: the strict codec refuses it at the wire, and
+    /// any other caller is answered `Mismatch` at comparison time, so an
+    /// unknown tag can never be silently read as either outcome.
+    #[must_use]
+    pub const fn from_wire(value: i16) -> Self {
+        Self(value)
+    }
+
+    /// The raw wire value, for digests and stored copies.
+    #[must_use]
+    pub const fn as_wire(self) -> i16 {
+        self.0
+    }
+
+    /// The receipt-column code this wire outcome denotes, or `None` when the
+    /// value is outside the frozen CR-029 pair.
+    #[must_use]
+    pub const fn receipt_outcome(self) -> Option<i16> {
+        match self.0 {
+            WIRE_TERMINAL_OUTCOME_APPLIED => Some(schema::RECEIPT_OUTCOME_APPLIED),
+            WIRE_TERMINAL_OUTCOME_NOT_APPLIED => Some(schema::RECEIPT_OUTCOME_NOT_APPLIED),
+            _ => None,
+        }
+    }
+}
+
 /// The four-part receipt key. The verified issuer, authenticated subject, and
 /// tenant scope select the namespace; they are **never** serialized into the
 /// fingerprint bytes, so the same canonical intent under another issuer,

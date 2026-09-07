@@ -19,6 +19,7 @@ use crate::domain::receipts;
 use crate::domain::receipts::AuthorizationWitness;
 use crate::domain::receipts::OperationBinding;
 use crate::domain::receipts::ReceiptKey;
+use crate::domain::receipts::WireTerminalOutcome;
 use crate::domain::schema;
 use crate::domain::schema_mediated;
 
@@ -83,7 +84,10 @@ pub struct TerminalStatusAttachInput {
     pub authorization_revision: i64,
     pub claim_id: Vec<u8>,
     pub claim_revision: i64,
-    pub terminal_outcome: i16,
+    /// The platform's terminal outcome **as it arrived on the wire** (CR-029
+    /// tag 10: APPLIED = 1, NOT_APPLIED = 2). It is digested and stored in that
+    /// encoding; only the receipt-column comparison translates it.
+    pub terminal_outcome: WireTerminalOutcome,
     pub terminal_receipt_sha256: Vec<u8>,
     pub platform_terminal_status_revision: i64,
     pub acknowledged_at: SystemTime,
@@ -273,7 +277,7 @@ fn completion_request_binding(input: &TerminalStatusAttachInput) -> Result<Vec<u
             &input.authorization_revision.to_be_bytes(),
             &input.claim_id,
             &input.claim_revision.to_be_bytes(),
-            &input.terminal_outcome.to_be_bytes(),
+            &input.terminal_outcome.as_wire().to_be_bytes(),
             &input.terminal_receipt_sha256,
             &input.platform_terminal_status_revision.to_be_bytes(),
             &acknowledged_at,
@@ -1572,7 +1576,7 @@ fn canonical_terminal_ack(input: &TerminalStatusAttachInput) -> Result<Vec<u8>, 
         input.authorization_revision.to_be_bytes().as_slice(),
         input.claim_id.as_slice(),
         input.claim_revision.to_be_bytes().as_slice(),
-        input.terminal_outcome.to_be_bytes().as_slice(),
+        input.terminal_outcome.as_wire().to_be_bytes().as_slice(),
         input.terminal_receipt_sha256.as_slice(),
         input
             .platform_terminal_status_revision
@@ -1961,7 +1965,7 @@ pub async fn terminal_status_attach(
                         == input.release_proof_reservation_revision
                     && row.get::<_, Vec<u8>>("release_proof_reservation_nonce")
                         == input.release_proof_reservation_nonce
-                    && row.get::<_, i16>("terminal_outcome") == input.terminal_outcome
+                    && row.get::<_, i16>("terminal_outcome") == input.terminal_outcome.as_wire()
                     && row.get::<_, Vec<u8>>("terminal_receipt_sha256")
                         == input.terminal_receipt_sha256
                     && row.get::<_, i64>("platform_terminal_status_revision")
@@ -1996,8 +2000,22 @@ pub async fn terminal_status_attach(
                 empty_terminal_ack(TerminalStatusAttachStatus::Mismatch),
             );
         };
+        // The attach arrives in the CR-029 wire encoding (APPLIED = 1,
+        // NOT_APPLIED = 2); the receipt column stores 0/1. Translate through
+        // the one canonical mapping before comparing, and refuse a value
+        // outside the frozen pair rather than reading it as either outcome.
+        // The refusal is `Mismatch`, not `InvalidInput`, deliberately: the
+        // strict codec already rejects an out-of-domain tag at the wire, so
+        // this arm answers a caller that bypassed it with the same
+        // non-disclosing verdict every other failed conjunct gives.
+        let Some(expected_receipt_outcome) = input.terminal_outcome.receipt_outcome() else {
+            return finish_terminal_ack(
+                input,
+                empty_terminal_ack(TerminalStatusAttachStatus::Mismatch),
+            );
+        };
         let exact = receipt.get::<_, i16>("state") == schema::RECEIPT_STATE_COMMITTED
-            && receipt.get::<_, Option<i16>>("outcome") == Some(input.terminal_outcome)
+            && receipt.get::<_, Option<i16>>("outcome") == Some(expected_receipt_outcome)
             && receipt
                 .get::<_, Option<Vec<u8>>>("authorization_id")
                 .as_deref()
@@ -2105,6 +2123,9 @@ pub async fn terminal_status_attach(
                 input.key.operation_id.as_bytes(),
             ],
         )?;
+        // The tombstone keeps the wire encoding: every later replay and
+        // conflict check compares it against another wire value.
+        let terminal_outcome_wire = input.terminal_outcome.as_wire();
         let inserted = tx.query_opt(
             "INSERT INTO lore_domain_operation_reserve_release_tombstones (verified_issuer, \
                 authenticated_subject, tenant_scope_key, operation_id, method, scope, fingerprint_version, \
@@ -2125,7 +2146,7 @@ pub async fn terminal_status_attach(
               &input.claim_id,&input.claim_revision,&input.reserve_charge_revision,&input.reserve_charge_nonce,
               &input.tombstone_reservation_revision,&input.tombstone_reservation_nonce,&terminal_ack,
               &receipt_prune,&fence_prune,&phase1_response,&input.request_digest,&input.verification_digest,
-              &input.terminal_outcome,&input.terminal_receipt_sha256,&input.platform_terminal_status_revision,
+              &terminal_outcome_wire,&input.terminal_receipt_sha256,&input.platform_terminal_status_revision,
               &acknowledged_at,&input.release_proof_reservation_revision,
               &input.release_proof_reservation_nonce,&clock,&compact_after,&final_prune_after,&tombstone_digest],
         ).await.map_err(|e| DomainError::from_pg("terminal attachment tombstone insert", e))?;
@@ -2168,7 +2189,7 @@ pub async fn terminal_status_attach(
                     == input.release_proof_reservation_revision
                 && conflict.get::<_, Vec<u8>>("release_proof_reservation_nonce")
                     == input.release_proof_reservation_nonce
-                && conflict.get::<_, i16>("terminal_outcome") == input.terminal_outcome
+                && conflict.get::<_, i16>("terminal_outcome") == terminal_outcome_wire
                 && conflict.get::<_, Vec<u8>>("terminal_receipt_sha256")
                     == input.terminal_receipt_sha256
                 && conflict.get::<_, i64>("platform_terminal_status_revision")
@@ -2381,7 +2402,7 @@ pub async fn terminal_status_attach(
             != input.release_proof_reservation_revision
         || tombstone.get::<_, Vec<u8>>("release_proof_reservation_nonce")
             != input.release_proof_reservation_nonce
-        || tombstone.get::<_, i16>("terminal_outcome") != input.terminal_outcome
+        || tombstone.get::<_, i16>("terminal_outcome") != input.terminal_outcome.as_wire()
         || tombstone.get::<_, Vec<u8>>("terminal_receipt_sha256") != input.terminal_receipt_sha256
         || tombstone.get::<_, i64>("platform_terminal_status_revision")
             != input.platform_terminal_status_revision

@@ -1025,8 +1025,15 @@ impl DomainOperationService for LoreDomainOperationV1Service {
             claim_id: request.claim_id.to_vec(),
             claim_revision: i64::try_from(request.claim_revision)
                 .map_err(|_| Status::invalid_argument("claim revision exceeds i64"))?,
-            terminal_outcome: i16::try_from(request.terminal_outcome)
-                .map_err(|_| Status::invalid_argument("terminal outcome exceeds i16"))?,
+            // Carried in the wire encoding, never translated here. The
+            // coordinator owns the one mapping onto the receipt column, and it
+            // also digests and stores this value in the wire encoding, so a
+            // translation at this seam would move a frozen digest. Translating
+            // in neither place is the defect this type now prevents.
+            terminal_outcome: lore_postgres::domain::receipts::WireTerminalOutcome::from_wire(
+                i16::try_from(request.terminal_outcome)
+                    .map_err(|_| Status::invalid_argument("terminal outcome exceeds i16"))?,
+            ),
             terminal_receipt_sha256: request.terminal_receipt_sha256.to_vec(),
             platform_terminal_status_revision: i64::try_from(
                 request.platform_terminal_status_revision,

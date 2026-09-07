@@ -34,9 +34,14 @@ use lore_postgres::domain::receipts::ConsumeResult;
 use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptKey;
+use lore_postgres::domain::receipts::WIRE_TERMINAL_OUTCOME_APPLIED;
+use lore_postgres::domain::receipts::WIRE_TERMINAL_OUTCOME_NOT_APPLIED;
+use lore_postgres::domain::receipts::WireTerminalOutcome;
 use lore_postgres::domain::receipts::admission_clock;
 use lore_postgres::domain::receipts::commit_terminal;
 use lore_postgres::domain::receipts::consume;
+use lore_postgres::domain::schema::RECEIPT_OUTCOME_APPLIED;
+use lore_postgres::domain::schema::RECEIPT_OUTCOME_NOT_APPLIED;
 use lore_postgres::pool::TlsConfig;
 use tokio_postgres::Client;
 use uuid::NoContext;
@@ -139,6 +144,27 @@ async fn prepare_terminal_fixture_by_the_rail(
     client: &mut Client,
     stale: &VerifiedStaleFinalizeInput,
 ) -> Vec<u8> {
+    prepare_terminal_fixture_by_the_rail_with_outcome(
+        store,
+        client,
+        stale,
+        &DomainOutcome::Applied,
+        b"rail-produced-applied-receipt-v1",
+    )
+    .await
+}
+
+/// Same rail-produced fixture as [`prepare_terminal_fixture_by_the_rail`], but committed with a
+/// caller-chosen STORAGE-domain outcome. Exists so a Phase-1 exactness case can pin the wire/storage
+/// mapping against a receipt stored `NotApplied` (storage `1`) as well as the default `Applied`
+/// (storage `0`).
+async fn prepare_terminal_fixture_by_the_rail_with_outcome(
+    store: &PostgresDomainStore,
+    client: &mut Client,
+    stale: &VerifiedStaleFinalizeInput,
+    outcome: &DomainOutcome,
+    public_result: &[u8],
+) -> Vec<u8> {
     let tx = client.transaction().await.expect("begin rail fixture tx");
     let clock = admission_clock(&tx).await.expect("read admission clock");
     tx.rollback().await.expect("finish clock sample");
@@ -157,7 +183,7 @@ async fn prepare_terminal_fixture_by_the_rail(
         panic!("rail terminal fixture must prepare, got {prepared:?}");
     };
 
-    let public_result = b"rail-produced-applied-receipt-v1".to_vec();
+    let public_result = public_result.to_vec();
     let tx = client.transaction().await.expect("begin rail terminal tx");
     let consumed = consume(&tx, &current_key, &stale.binding, &token)
         .await
@@ -168,7 +194,7 @@ async fn prepare_terminal_fixture_by_the_rail(
     commit_terminal(
         &tx,
         &current_key,
-        &DomainOutcome::Applied,
+        outcome,
         Some(&public_result),
         consumed.admission_clock,
     )
@@ -235,7 +261,7 @@ fn terminal_phase1_input(
         authorization_revision: stale.witness.authorization_revision,
         claim_id: rand::random::<[u8; 16]>().to_vec(),
         claim_revision: 17,
-        terminal_outcome: 0,
+        terminal_outcome: WireTerminalOutcome::APPLIED,
         terminal_receipt_sha256: ring::digest::digest(&ring::digest::SHA256, public_result)
             .as_ref()
             .to_vec(),
@@ -1226,6 +1252,232 @@ async fn terminal_phase1_mismatch_leaves_the_dispatch_fence_untouched() {
             && fence.get::<_, Option<i64>>(1).is_none()
             && fence.get::<_, Option<SystemTime>>(2).is_none(),
         "Mismatch must not acknowledge or otherwise mutate the dispatch fence"
+    );
+}
+
+/// Pure, offline pin over `WireTerminalOutcome` alone -- no `LORE_TEST_PG_URL` needed, so this
+/// runs (and would fail) with a plain `cargo test -p lore-postgres`, unlike every case around it
+/// that silently skips without a live Postgres.
+///
+/// The defect this whole cluster of tests guards against was not merely "every honest attach gets
+/// refused". A raw `stored_outcome_i16 == wire_terminal_outcome_i16` compare is wrong in BOTH
+/// directions: `WIRE_TERMINAL_OUTCOME_APPLIED` (1) never equals `RECEIPT_OUTCOME_APPLIED` (0), so
+/// an honest APPLIED attach against a receipt stored APPLIED was always refused -- but
+/// `WIRE_TERMINAL_OUTCOME_APPLIED` (1) and `RECEIPT_OUTCOME_NOT_APPLIED` (1) are the SAME number,
+/// so the same raw compare would have silently ACCEPTED a platform claiming APPLIED against a
+/// receipt this crate had actually committed NOT_APPLIED. That numeric collision, not just the
+/// refusal, is why the mapping has to be a real function and not a raw integer compare.
+#[test]
+fn wire_terminal_outcome_never_matches_the_receipt_column_raw() {
+    // Round trip: as_wire is the exact inverse of from_wire over the frozen pair.
+    assert_eq!(WireTerminalOutcome::from_wire(1).as_wire(), 1);
+    assert_eq!(WireTerminalOutcome::from_wire(2).as_wire(), 2);
+    assert_eq!(
+        WireTerminalOutcome::APPLIED.as_wire(),
+        WIRE_TERMINAL_OUTCOME_APPLIED
+    );
+    assert_eq!(
+        WireTerminalOutcome::NOT_APPLIED.as_wire(),
+        WIRE_TERMINAL_OUTCOME_NOT_APPLIED
+    );
+
+    // The one canonical mapping onto the storage domain.
+    assert_eq!(
+        WireTerminalOutcome::APPLIED.receipt_outcome(),
+        Some(RECEIPT_OUTCOME_APPLIED)
+    );
+    assert_eq!(
+        WireTerminalOutcome::NOT_APPLIED.receipt_outcome(),
+        Some(RECEIPT_OUTCOME_NOT_APPLIED)
+    );
+
+    // Everything outside the frozen wire pair maps to None, never silently coerced to either
+    // storage code.
+    for out_of_domain in [0_i16, 3, -1, i16::MIN, i16::MAX] {
+        assert_eq!(
+            WireTerminalOutcome::from_wire(out_of_domain).receipt_outcome(),
+            None,
+            "wire value {out_of_domain} must not resolve to a storage outcome"
+        );
+    }
+
+    // The two encodings are different bases; the same raw integer never means the same thing in
+    // both, and one specific number means opposite things in each.
+    assert_ne!(WIRE_TERMINAL_OUTCOME_APPLIED, RECEIPT_OUTCOME_APPLIED);
+    assert_eq!(
+        WIRE_TERMINAL_OUTCOME_APPLIED, RECEIPT_OUTCOME_NOT_APPLIED,
+        "this collision is exactly why a raw compare would have accepted a wire-APPLIED attach \
+         against a receipt actually stored NOT_APPLIED"
+    );
+}
+
+/// CR-029's Phase-1 exactness compare must resolve the caller's WIRE-domain `terminal_outcome`
+/// (`WireTerminalOutcome::APPLIED` == 1) to the STORAGE-domain code the receipt was actually
+/// committed under (`RECEIPT_OUTCOME_APPLIED` == 0) before comparing, rather than comparing the raw
+/// wire value against the raw stored column. A correct platform sending wire APPLIED against a
+/// receipt this rail commits with `DomainOutcome::Applied` must be accepted.
+#[tokio::test]
+#[ignore = "needs live Postgres env; run this test target serially with -- --ignored --test-threads=1"]
+async fn terminal_attach_accepts_wire_applied_against_stored_applied_receipt() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let mut direct = client(&url).await;
+    let clock = store.domain_operation_clock_get().await.expect("DB clock");
+    let stale = stale_input(clock);
+    let public_result = prepare_terminal_fixture_by_the_rail_with_outcome(
+        &store,
+        &mut direct,
+        &stale,
+        &DomainOutcome::Applied,
+        b"wire-applied-vs-stored-applied-v1",
+    )
+    .await;
+    let mut phase1 = terminal_phase1_input(&stale, &public_result);
+    phase1.terminal_outcome = WireTerminalOutcome::APPLIED;
+
+    let ack = store
+        .domain_operation_terminal_status_attach(&phase1)
+        .await
+        .expect("attach a wire-applied outcome against a stored-applied receipt");
+    assert_eq!(
+        ack.status,
+        TerminalStatusAttachStatus::Phase1PendingRetention,
+        "a correct platform-sent wire APPLIED must be accepted against a receipt stored APPLIED"
+    );
+}
+
+/// Companion to the APPLIED acceptance case: wire NOT_APPLIED (2) must resolve to the storage code
+/// `RECEIPT_OUTCOME_NOT_APPLIED` (1) and be accepted against a receipt this rail commits with
+/// `DomainOutcome::NotApplied`.
+#[tokio::test]
+#[ignore = "needs live Postgres env; run this test target serially with -- --ignored --test-threads=1"]
+async fn terminal_attach_accepts_wire_not_applied_against_stored_not_applied_receipt() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let mut direct = client(&url).await;
+    let clock = store.domain_operation_clock_get().await.expect("DB clock");
+    let stale = stale_input(clock);
+    let stored_outcome = DomainOutcome::NotApplied {
+        reason_version: 1,
+        reason: "WIRE_ATTACH_TEST_NOT_APPLIED_V1".into(),
+    };
+    let public_result = prepare_terminal_fixture_by_the_rail_with_outcome(
+        &store,
+        &mut direct,
+        &stale,
+        &stored_outcome,
+        b"wire-not-applied-vs-stored-not-applied-v1",
+    )
+    .await;
+    let mut phase1 = terminal_phase1_input(&stale, &public_result);
+    phase1.terminal_outcome = WireTerminalOutcome::NOT_APPLIED;
+
+    let ack = store
+        .domain_operation_terminal_status_attach(&phase1)
+        .await
+        .expect("attach a wire-not-applied outcome against a stored-not-applied receipt");
+    assert_eq!(
+        ack.status,
+        TerminalStatusAttachStatus::Phase1PendingRetention,
+        "a correct platform-sent wire NOT_APPLIED must be accepted against a receipt stored \
+         NOT_APPLIED"
+    );
+}
+
+/// `WireTerminalOutcome::from_wire(0)` is the STORAGE encoding for APPLIED, and is unreachable from
+/// the wire (the gRPC seam only ever produces 1 or 2; `strict_codec.rs` refuses anything else before
+/// this coordinator is ever called). This is exactly the value the fixture used to hand-build before
+/// this fix -- pin that it is now refused, not silently accepted by a raw-value coincidence.
+#[tokio::test]
+#[ignore = "needs live Postgres env; run this test target serially with -- --ignored --test-threads=1"]
+async fn terminal_attach_refuses_a_storage_encoded_terminal_outcome() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let mut direct = client(&url).await;
+    let clock = store.domain_operation_clock_get().await.expect("DB clock");
+    let stale = stale_input(clock);
+    let public_result = prepare_terminal_fixture_by_the_rail(&store, &mut direct, &stale).await;
+    let mut phase1 = terminal_phase1_input(&stale, &public_result);
+    phase1.terminal_outcome = WireTerminalOutcome::from_wire(0);
+
+    let ack = store
+        .domain_operation_terminal_status_attach(&phase1)
+        .await
+        .expect("attach a storage-encoded outcome against a stored-applied receipt");
+    assert_eq!(
+        ack.status,
+        TerminalStatusAttachStatus::Mismatch,
+        "a storage-encoded value is unreachable from the wire and must be refused"
+    );
+}
+
+/// Two more refusal pins: wire APPLIED against a receipt actually stored NOT_APPLIED must be
+/// Mismatch (the two are genuinely different outcomes, not a coincidental raw-value collision like
+/// the storage-encoding case above), and an out-of-domain wire value (neither 1 nor 2) must be
+/// Mismatch regardless of what the receipt stores, because `WireTerminalOutcome::receipt_outcome()`
+/// returns `None` for it before the stored-outcome compare ever runs.
+#[tokio::test]
+#[ignore = "needs live Postgres env; run this test target serially with -- --ignored --test-threads=1"]
+async fn terminal_attach_refuses_a_wire_outcome_disagreeing_with_the_stored_receipt() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let mut direct = client(&url).await;
+    let clock = store.domain_operation_clock_get().await.expect("DB clock");
+
+    // wire APPLIED=1 against a receipt stored NotApplied(1) must be Mismatch.
+    let cross_stale = stale_input(clock);
+    let cross_outcome = DomainOutcome::NotApplied {
+        reason_version: 1,
+        reason: "WIRE_ATTACH_TEST_CROSS_MISMATCH_V1".into(),
+    };
+    let cross_public_result = prepare_terminal_fixture_by_the_rail_with_outcome(
+        &store,
+        &mut direct,
+        &cross_stale,
+        &cross_outcome,
+        b"wire-applied-vs-stored-not-applied-v1",
+    )
+    .await;
+    let mut cross_phase1 = terminal_phase1_input(&cross_stale, &cross_public_result);
+    cross_phase1.terminal_outcome = WireTerminalOutcome::APPLIED;
+    let cross_ack = store
+        .domain_operation_terminal_status_attach(&cross_phase1)
+        .await
+        .expect("attach a wire-applied outcome against a stored-not-applied receipt");
+    assert_eq!(
+        cross_ack.status,
+        TerminalStatusAttachStatus::Mismatch,
+        "wire APPLIED disagreeing with a stored NOT_APPLIED receipt must be refused"
+    );
+
+    // An out-of-domain wire value (3) must be refused before the stored-outcome compare, on an
+    // otherwise-exact fixture.
+    let out_of_domain_stale = stale_input(clock);
+    let out_of_domain_public_result =
+        prepare_terminal_fixture_by_the_rail(&store, &mut direct, &out_of_domain_stale).await;
+    let mut out_of_domain_phase1 =
+        terminal_phase1_input(&out_of_domain_stale, &out_of_domain_public_result);
+    out_of_domain_phase1.terminal_outcome = WireTerminalOutcome::from_wire(3);
+    let out_of_domain_ack = store
+        .domain_operation_terminal_status_attach(&out_of_domain_phase1)
+        .await
+        .expect("attach an out-of-domain wire outcome");
+    assert_eq!(
+        out_of_domain_ack.status,
+        TerminalStatusAttachStatus::Mismatch,
+        "an out-of-domain wire outcome must be refused regardless of the stored receipt"
     );
 }
 
