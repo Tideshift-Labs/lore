@@ -71,6 +71,21 @@ pub(crate) struct SetFailure<E> {
     pub decisive: bool,
 }
 
+/// What a set that did not fail produced.
+///
+/// Two fields rather than a bare count, because a partly successful set carries a failure the
+/// caller still has to report. Dropping it made `acquire` tell a caller `Internal` for a batch the
+/// server had refused with a reason.
+#[derive(Debug)]
+pub(crate) struct SetSuccess<E> {
+    /// How many batches answered successfully. Fewer than `num_batches` means the set succeeded
+    /// only in part, which is the difference `release` tolerates and `acquire` undoes.
+    pub num_batch_success: usize,
+    /// The first decisive failure a partly successful set carried, or `None` when every batch
+    /// succeeded.
+    pub first_decisive_failure: Option<E>,
+}
+
 /// Turn one set's per-batch outcomes into the set's verdict.
 ///
 /// Shared by `acquire` and `release` rather than written once per verb. The two rules that are
@@ -84,20 +99,25 @@ pub(crate) struct SetFailure<E> {
 /// cancellation. Neither says whether the request reached the server, so it makes the set
 /// non-decisive just as an unknown answer does.
 ///
-/// On success the count of batches that answered successfully is returned, because a set can
-/// succeed partially: `release` tolerates that and `acquire` rolls it back, and only the caller
-/// knows which.
+/// On success a [`SetSuccess`] is returned rather than nothing, because a set can succeed
+/// partially: `release` tolerates that and `acquire` undoes it, and only the caller knows which.
 pub(crate) fn classify_batch_set<T, E: BatchSetError>(
     outcomes: Vec<Result<Vec<T>, E>>,
     task_failure: Option<E>,
     num_batches: usize,
     labels: &BatchSetLabels,
     succeeded: &mut Vec<T>,
-) -> Result<usize, SetFailure<E>> {
+) -> Result<SetSuccess<E>, SetFailure<E>> {
     let mut num_batch_success = 0usize;
-    // Counted from what is missing rather than tallied at the join, so a second lost task is still
-    // reported even though the first one already supplied the error value.
-    let mut num_batch_failed = num_batches.saturating_sub(outcomes.len());
+    // Batches that produced no outcome at all. Counted from what is missing rather than tallied at
+    // the join for two reasons. A second lost task is still reported even though the first one
+    // already supplied the error value — and, found in review, a caller that loses an outcome
+    // WITHOUT also setting `task_failure` still makes the set non-decisive here rather than
+    // reaching the success arm on a set whose fate this function was never told. The guarantee
+    // that a non-decisive set can never be acted on again must not rest on every caller's join
+    // loop remembering to report its own `JoinError`.
+    let num_batch_missing = num_batches.saturating_sub(outcomes.len());
+    let mut num_batch_failed = num_batch_missing;
     let mut first_decisive_failure: Option<E> = None;
     let mut first_unknown_failure: Option<E> = None;
 
@@ -129,7 +149,7 @@ pub(crate) fn classify_batch_set<T, E: BatchSetError>(
     // Checked before the all-failed test, and ahead of any decisive failure the same set may also
     // carry. A set holding one unknown batch and one refusal is not a refused set: acting on the
     // refusal would re-send resources whose own mutation may already have happened.
-    if first_unknown_failure.is_some() || task_failure.is_some() {
+    if first_unknown_failure.is_some() || task_failure.is_some() || num_batch_missing > 0 {
         return Err(SetFailure {
             // A real lost answer is preferred over a lost task, and the order matters. An
             // `OutcomeUnknown` names the attempt a reconciler has to look up. A lost task says
@@ -144,12 +164,18 @@ pub(crate) fn classify_batch_set<T, E: BatchSetError>(
         });
     }
 
-    if num_batch_success == 0 {
+    // Both halves are load-bearing. `num_batch_success == 0` alone would call a set of NO batches
+    // a decisive failure, which is a lie about a set in which nothing was ever dispatched; neither
+    // verb can reach that today, and neither should have to know it.
+    if num_batch_failed > 0 && num_batch_success == 0 {
         return Err(SetFailure {
             error: first_decisive_failure.unwrap_or_else(|| E::set_failed(labels.fallback)),
             decisive: true,
         });
     }
 
-    Ok(num_batch_success)
+    Ok(SetSuccess {
+        num_batch_success,
+        first_decisive_failure,
+    })
 }

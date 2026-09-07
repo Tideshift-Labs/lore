@@ -229,6 +229,12 @@ pub struct LockPolicy {
     /// fixed. What is fixed is the shape: exactly one call is answered by `lock` and the rest by
     /// this. A test may assert how many calls got which answer, never which resources were in them.
     ///
+    /// **"First" counts over the server's whole lifetime, not per acquire**, because the ordinal is
+    /// this RPC's position in the server's arrival log. A test that acquires twice against one
+    /// server gets the follow-up answer for every call of the second acquire, including its first
+    /// batch. Give each acquire its own [`LockServer`], or assert against the arrival log rather
+    /// than assuming a fresh count.
+    ///
     /// `None` leaves every `Lock` answered by `lock`, which is what every existing caller gets.
     pub lock_after_first: Option<RpcOutcome>,
     pub admin_lock: RpcOutcome,

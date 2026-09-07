@@ -460,8 +460,9 @@ type UnlockSetFailure = SetFailure<ReleaseError>;
 /// decisiveness identically, and the second copy of that decision is how `acquire` came to discard
 /// the classified errors this one acts on. This wrapper is this verb's labels and nothing else.
 ///
-/// The batch-success count the shared helper returns is discarded here: `release` tolerates a
-/// partly successful set, and only `acquire` acts on the difference.
+/// The [`crate::lock::util::SetSuccess`] the shared helper returns is discarded here: `release`
+/// tolerates a partly successful set and reports it as a success, and only `acquire` acts on the
+/// difference.
 fn classify_set(
     outcomes: Vec<Result<Vec<LockResource>, ReleaseError>>,
     task_failure: Option<ReleaseError>,
@@ -561,7 +562,7 @@ async fn unlock_batches(
 ///
 /// A third condition declines the escalation before this function is entered at all, and it is
 /// the caller's because only the caller can see it: a set whose `Unlock` outcome is not decisive
-/// is never escalated. See [`UnlockSetFailure`] and [`is_decisive`].
+/// is never escalated. See [`UnlockSetFailure`] and [`BatchSetError::is_decisive`].
 ///
 /// Two further conditions decline it from in here and re-raise the original refusal instead,
 /// because in both the escalation would be a guess:

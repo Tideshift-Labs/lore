@@ -1746,6 +1746,124 @@ fn a_multi_batch_acquire_mixing_a_refusal_and_a_lost_answer_surfaces_the_lost_an
     );
 }
 
+/// A multi-batch acquire whose every failure is decisive -- one batch granted, the other
+/// refused -- must still roll back the granted batch.
+///
+/// This is the positive control the two non-decisive multi-batch tests above need to mean
+/// anything: without it, an implementation that never rolled back at all would still pass
+/// `a_multi_batch_acquire_with_one_lost_answer_is_not_rolled_back` and
+/// `a_multi_batch_acquire_mixing_a_refusal_and_a_lost_answer_surfaces_the_lost_answer`, because
+/// both of those assert an EMPTY `Unlock` log. This test asserts a non-empty one on the sibling
+/// shape where every failure is decisive, which is End state 2's own reachable case: a partial
+/// set whose failed batch answered with certainty, not a maybe.
+///
+/// Per the fixture trap noted in review: `lock_after_first` numbers arrivals over the server's
+/// whole lifetime, not per acquire, so this test gets its own fresh `LockServer`.
+#[test]
+fn a_multi_batch_acquire_with_a_decisive_refusal_still_rolls_back() {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start_with_policy(LockPolicy {
+        lock: RpcOutcome::Grant,
+        lock_after_first: Some(RpcOutcome::Refuse(Refusal::PermissionDenied)),
+        ..LockPolicy::default()
+    }));
+    let names = multi_batch_file_names();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create_with_files(&server.remote_url(), &name_refs).await
+    }));
+
+    let status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        no_callback(),
+        Arc::new(VolatileAttemptStore::new()),
+    ));
+
+    assert_ne!(
+        status,
+        LoreError::OutcomeUnknown as i32,
+        "a set whose every failure is decisive must not surface as OutcomeUnknown"
+    );
+    assert_ne!(status, 0, "the refused batch must fail the acquire overall");
+
+    let locks = server.calls_for(LockRpc::Lock);
+    assert_eq!(
+        locks.len(),
+        2,
+        "101 committed files must split into exactly two batches, got {:?}",
+        server.calls()
+    );
+
+    let unlocks = server.calls_for(LockRpc::Unlock);
+    assert!(
+        !unlocks.is_empty(),
+        "a decisive partial failure must still trigger the rollback release -- this is the \
+         positive control for the non-decisive multi-batch tests' empty Unlock log: without this \
+         test, an implementation that never rolls back at all would still pass them. Got {:?}",
+        server.calls()
+    );
+}
+
+/// The rollback release's own answer can be lost in turn, and the caller must be told
+/// `OutcomeUnknown` for it rather than a decisive acquire failure.
+///
+/// `acquire` forwards the rollback's `ReleaseError` with `.forward::<AcquireError>(...)`, and
+/// this pins that the `OutcomeUnknown` variant survives that forward intact -- proving what a
+/// probe confirmed by inspection, rather than leaving it unpinned.
+#[test]
+fn a_lost_answer_on_the_rollback_release_surfaces_outcome_unknown() {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start_with_policy(LockPolicy {
+        lock: RpcOutcome::Grant,
+        lock_after_first: Some(RpcOutcome::Refuse(Refusal::PermissionDenied)),
+        unlock: RpcOutcome::LoseTheAnswer,
+        ..LockPolicy::default()
+    }));
+    let names = multi_batch_file_names();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create_with_files(&server.remote_url(), &name_refs).await
+    }));
+
+    let status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        no_callback(),
+        Arc::new(VolatileAttemptStore::new()),
+    ));
+
+    assert_eq!(
+        status,
+        LoreError::OutcomeUnknown as i32,
+        "a rollback release whose own answer is lost must surface as OutcomeUnknown, not a \
+         decisive acquire failure -- some of the requested locks may still be held and the \
+         caller has to reconcile rather than assume the acquire cleanly failed"
+    );
+
+    let locks = server.calls_for(LockRpc::Lock);
+    assert_eq!(
+        locks.len(),
+        2,
+        "101 committed files must split into exactly two batches, got {:?}",
+        server.calls()
+    );
+
+    assert!(
+        !server.calls_for(LockRpc::Unlock).is_empty(),
+        "the rollback must actually have been attempted -- a rollback that never ran would also \
+         produce a non-OutcomeUnknown status for a different reason, and the empty log would make \
+         that ambiguity invisible. Got {:?}",
+        server.calls()
+    );
+}
+
 /// Count the `ownership` rows in the live fixture's on-disk attempt-store document.
 ///
 /// Reads `<repository path>/.lore/attempts` directly rather than through any `AttemptStore`

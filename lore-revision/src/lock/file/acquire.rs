@@ -32,6 +32,7 @@ use crate::lock::file::release::release;
 use crate::lock::util::BatchSetError;
 use crate::lock::util::BatchSetLabels;
 use crate::lock::util::LOCK_BATCH_SIZE;
+use crate::lock::util::SetSuccess;
 use crate::lock::util::assemble_resource_for_path;
 use crate::lock::util::classify_batch_set;
 use crate::lore::execution_context;
@@ -358,21 +359,28 @@ pub async fn acquire(
     // The rollback below rides on the same verdict, for the same reason: it re-sends every
     // requested resource as a release, which is a second irreversible mutation, and performing one
     // over a maybe is exactly what a non-decisive set forbids.
-    let num_batch_success = match classify_batch_set(
+    let SetSuccess {
+        num_batch_success,
+        first_decisive_failure,
+    } = match classify_batch_set(
         batches_results,
         task_failure,
         num_batches,
         &ACQUIRE_SET_LABELS,
         &mut locks,
     ) {
-        Ok(num_batch_success) => num_batch_success,
+        Ok(verdict) => verdict,
         // Handed back as it is, both when it is decisive (nothing was acquired, and the server's
         // own refusal is more useful than a message this file invented) and when it is not (the
         // caller is told `OutcomeUnknown`, naming the attempt whose journal record
         // `under_own_attempt` deliberately left unresolved for a later authoritative read).
+        //
         // Whatever the successful batches did acquire stays acquired and stays recorded in
         // `ownership`: rolling it back would be the mutation-on-a-maybe this guards against, and
-        // the caller reconciles from the attempt instead.
+        // the caller reconciles from the attempt instead. Those locks are deliberately NOT
+        // reported as acquire events — the operation failed, and the event stream is its report —
+        // so the record of what this client now holds is the ownership store, which is where the
+        // release path reads it from anyway.
         Err(failure) => return Err(failure.error),
     };
 
@@ -398,7 +406,13 @@ pub async fn acquire(
             .await
             .forward::<AcquireError>("Failed to acquire the lock")?;
 
-        return Err(AcquireError::internal("Failed to acquire the lock"));
+        // The refusal that failed the set, not a message invented here. A caller told `Internal`
+        // for a batch the server turned down with a reason has to guess at the remedy the server
+        // already named. `first_decisive_failure` is `Some` for every set that reaches this arm —
+        // a set with no failure at all has `num_batch_success == num_batches` — so the fallback is
+        // unreachable rather than a second-choice message.
+        return Err(first_decisive_failure
+            .unwrap_or_else(|| AcquireError::internal("Failed to acquire the lock")));
     }
 
     locks.sort_by(|lock_a, lock_b| {
@@ -769,7 +783,7 @@ mod tests {
         #[test]
         fn a_partly_successful_decisive_set_reports_its_success_count() {
             let mut locks = Vec::new();
-            let num_batch_success = classify_batch_set(
+            let verdict = classify_batch_set(
                 vec![Ok(vec![lock_named("a.file")]), Err(refusal())],
                 None,
                 2,
@@ -779,17 +793,24 @@ mod tests {
             .expect("a set with at least one success is a success");
 
             assert_eq!(
-                num_batch_success, 1,
+                verdict.num_batch_success, 1,
                 "exactly one of the two batches answered successfully"
+            );
+            assert!(
+                verdict.first_decisive_failure.is_some(),
+                "the refused batch's own error must survive into the verdict -- this is what lets \
+                 acquire's rollback arm re-raise the server's own refusal instead of inventing an \
+                 internal message"
             );
             assert_eq!(descriptions(&locks), vec!["a.file".to_owned()]);
         }
 
-        /// A set every batch of which succeeded returns every batch, in order.
+        /// A set every batch of which succeeded returns every batch, in order, with no failure
+        /// carried.
         #[test]
         fn a_fully_answered_set_returns_every_batch() {
             let mut locks = Vec::new();
-            let num_batch_success = classify_batch_set(
+            let verdict = classify_batch_set(
                 vec![
                     Ok(vec![lock_named("a.file")]),
                     Ok(vec![lock_named("b.file")]),
@@ -801,11 +822,64 @@ mod tests {
             )
             .expect("a set every batch of which succeeded is a success");
 
-            assert_eq!(num_batch_success, 2);
+            assert_eq!(verdict.num_batch_success, 2);
+            assert!(
+                verdict.first_decisive_failure.is_none(),
+                "a set with no failed batch must carry no failure"
+            );
             assert_eq!(
                 descriptions(&locks),
                 vec!["a.file".to_owned(), "b.file".to_owned()]
             );
+        }
+
+        /// A set whose `outcomes` hold fewer entries than `num_batches` is non-decisive even when
+        /// `task_failure` is `None`.
+        ///
+        /// The structural guarantee that a non-decisive set can never be acted on again must not
+        /// rest on a caller's join loop remembering to report its own `JoinError` into
+        /// `task_failure` -- a caller that simply dropped an outcome (rather than reporting it as a
+        /// task failure) must still be refused the success arm.
+        #[test]
+        fn a_short_outcome_list_is_non_decisive_even_with_no_task_failure() {
+            let mut locks: Vec<AcquiredLock> = Vec::new();
+            let failure = classify_batch_set(
+                vec![Ok(vec![lock_named("a.file")])],
+                None::<AcquireError>,
+                2,
+                &ACQUIRE_SET_LABELS,
+                &mut locks,
+            )
+            .expect_err("a set missing an outcome for one of its two batches fails");
+
+            assert!(
+                !failure.decisive,
+                "a missing outcome is exactly as unsafe to act on again as a reported task \
+                 failure or a lost answer"
+            );
+            assert_eq!(
+                descriptions(&locks),
+                vec!["a.file".to_owned()],
+                "the one batch that did answer must still be accounted for"
+            );
+        }
+
+        /// A set of zero batches succeeds with a zero count, rather than a fabricated decisive
+        /// failure.
+        ///
+        /// Unreachable from either verb today -- both `resources.is_empty()` early-return before
+        /// ever building a set -- but pinned so the helper's own contract for the boundary is
+        /// explicit rather than implied by what happens to call it.
+        #[test]
+        fn a_set_of_zero_batches_succeeds_with_a_zero_count() {
+            let mut locks: Vec<AcquiredLock> = Vec::new();
+            let outcomes: Vec<Result<Vec<AcquiredLock>, AcquireError>> = Vec::new();
+            let verdict = classify_batch_set(outcomes, None, 0, &ACQUIRE_SET_LABELS, &mut locks)
+                .expect("a set of zero batches has nothing to fail on");
+
+            assert_eq!(verdict.num_batch_success, 0);
+            assert!(verdict.first_decisive_failure.is_none());
+            assert!(locks.is_empty());
         }
     }
 }
