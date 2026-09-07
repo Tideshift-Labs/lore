@@ -232,6 +232,9 @@ pub const CELL_RETENTION_API_REVISION_V1: &str = "object-store-dispatch-cell-ret
 /// The reviewed batch ceiling, and 0024's own additional check on the prune's batch.
 pub const MAX_CELL_RETENTION_BATCH: u32 = 1000;
 
+// Put composite-returning procedures in FROM so PostgreSQL evaluates one row
+// once. A flattened SELECT subquery can call a STABLE procedure separately for
+// each projected field, mixing clocks from different backlog observations.
 const PRUNE_SQL: &str = "SELECT
   (r).result_code,
   (r).examined,
@@ -243,9 +246,9 @@ const PRUNE_SQL: &str = "SELECT
   (r).pruned_charge_grants,
   (r).horizon_unix_ms,
   (r).database_now_unix_ms
-FROM (SELECT object_store_retention.object_store_dispatch_cell_retention_prune_v1(
+FROM object_store_retention.object_store_dispatch_cell_retention_prune_v1(
   $1, $2, $3
-) AS r) q";
+) AS r";
 
 const BACKLOG_SQL: &str = "SELECT
   (r).result_code,
@@ -254,18 +257,18 @@ const BACKLOG_SQL: &str = "SELECT
   (r).grant_backlog,
   (r).horizon_unix_ms,
   (r).database_now_unix_ms
-FROM (SELECT object_store_retention.object_store_dispatch_cell_retention_backlog_v1(
+FROM object_store_retention.object_store_dispatch_cell_retention_backlog_v1(
   $1, $2, $3
-) AS r) q";
+) AS r";
 
 const READ_STATE_SQL: &str = "SELECT
   (r).result_code,
   (r).schema_revision,
   ((r).install_revision)::text,
   (r).installed_at_unix_ms
-FROM (SELECT object_store_retention.object_store_dispatch_cell_retention_read_state_v1(
+FROM object_store_retention.object_store_dispatch_cell_retention_read_state_v1(
   $1
-) AS r) q";
+) AS r";
 
 /// Reason the retention facet reports false. Fixed strings; never interpolated.
 pub const REASON_NO_OBSERVATION: &str = "no_cell_retention_observation";

@@ -35,14 +35,13 @@ drift guard over the surviving proto source in the same commit as any further pr
 
 ## Embedded migration
 
-The cell install set is migrations 0002 and 0003 (`retention_schema`/`retention_provisioning`, the
-verified install prerequisites for the chain below) plus 0007 through 0022 (`local_authority_*`),
-eighteen artifacts in total. Migrations 0004 through 0006
+The cell install set includes migrations 0002/0003, the local-authority chain and cell retention
+0023/0024. Migrations 0004 through 0006
 (`retention_readback`/`retention_mutations`/`retention_prune_receipts`)
 are deferred and not installed, alongside the pure compact-receipt, full-to-compact, and
 compact-prune planners in `compaction.rs`, `full_to_compact.rs`, and `compact_prune.rs`: correct,
-tested, sized for the former global ledger's row volume, and uncalled until CR-033 D5's cell-scale
-retention sizing lands. Runtime never auto-installs any migration; a migrator role installs out of
+tested, sized for the former global ledger and replaced by bounded cell retention. Runtime never
+auto-installs any migration; a migrator role installs out of
 band, through the concrete `cell-schema-install` binary described below (WP-114 CD-1), not by
 hand.
 
@@ -301,11 +300,8 @@ frozen audit predicate instead of restating it.
 boundary and one request; there is no `Default`. `execute` refuses an attempt naming a different
 boundary or request with `LedgerRequestMismatch`, checked before the poison and no-dispatch guards
 and before anything is charged or sent, without closing the ledger. `audit_for(logical_request_id)`
-replaced `audit()` for the same reason, but it is a check, not a binding: `audit_for` refuses to
-hand an audit to a caller naming the wrong request, yet `ObjectStoreProviderAttemptAudit` is a
-public struct of public counters that `ObjectStoreCompactReceiptInput` accepts beside a
-`logical_request_id` it never compares it against, so a correct audit can still attach to the wrong
-receipt. Closing that is WP-114 CD-8's obligation. `GovernedProviderClient::authorize` is now
+replaced `audit()` for the same reason and mints `BoundProviderAttemptAudit`, required by the
+compact-receipt input so an audit cannot attach to another request. `GovernedProviderClient::authorize` is
 crate-private; `validate_attempt` (returning `()`) is its public replacement, and
 `ProviderChargeRequest` has no public constructor and is deliberately not `Clone`, so a charge
 authority cannot retain a chargeable value past the call — charging outside a ledger is unreachable
@@ -493,6 +489,9 @@ tests/run-cell-schema-install-live.ps1
 # Shared-limiter and charge-before-send live tier (WP-114 CD-4/CD-5): exact named
 # cases against disposable PostgreSQL 16
 tests/run-provider-charge-live.ps1
+
+# Bounded cell retention through the supported installer, pinned CA and runtime role
+tests/run-cell-retention-live.ps1
 ```
 
 The library suite validates cell-authority configuration, canonical request fingerprinting, UUIDv7
@@ -518,12 +517,13 @@ revision/fence grammar, exact publication replay, stage-3 configuration checks, 
 checked-arithmetic edges, and the real PostgreSQL authority's charge-before-send integration. It
 uses no provider endpoint, credential, route, or concrete production budget pin.
 
-`run-local-authority-live.ps1` (WP-114 CD-2, Lore `1bb4ff7`) is the checked-in provisioning
-harness for this tier, modeled on the retention client's runner
-(`tests/run-retention-client-live.ps1`). It grew from nine tests and ten databases to eleven and
-twelve at WP-114 CD-3 (migrations 0018/0019's schema and provisioning live cases), then to twelve
-and thirteen when the same step added the typed-client case, and is currently
-12/12 PASS, exit 0, container removed, dangling-volume count unchanged. It installs the CD-1 set
+`run-cell-retention-live.ps1` checks its compiled case inventory and gives each case a disposable
+Postgres database. It proves atomic request/child removal, retention and replay floors, bounded
+backlog, task readiness and recovery. Request/child rows are schema-valid seeds; provider charge
+grants come from the real charge API through a governed client with scripted transport. Fixture SQL
+controls aging. This does not prove the reserve/submit/ACK lifecycle, provider policy or activation.
+
+`run-local-authority-live.ps1` is the provisioning harness for the authority tier. It installs the set
 into a dedicated `local_install_chain_proof` database to run the WP-114 CD-1 inert-state assertion;
 the `local_authority_put_spool_ready_mutation` live test separately self-installs the full chain via
 compile-time `include_str!`. Full verification detail is in CR-033's "Verification: the retained
