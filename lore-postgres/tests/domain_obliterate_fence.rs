@@ -298,6 +298,7 @@ async fn begin_obliterate_and_branch_push_commit_agree_on_the_repository_generat
     // Stale push: still carries the pre-obliteration repository generation.
     let stale_push_op = admitted_operation(&url, "lore.domain.v1.test/ObliteratePushStale").await;
     let stale_push_input = BranchPushCommitInput {
+        fragment_witness: None,
         repository_id: repository_id.to_vec(),
         branch_id: branch_id.to_vec(),
         expected_repository_generation: 1,
@@ -340,6 +341,7 @@ async fn begin_obliterate_and_branch_push_commit_agree_on_the_repository_generat
     let correct_push_op =
         admitted_operation(&url, "lore.domain.v1.test/ObliteratePushCorrect").await;
     let correct_push_input = BranchPushCommitInput {
+        fragment_witness: None,
         repository_id: repository_id.to_vec(),
         branch_id: branch_id.to_vec(),
         expected_repository_generation: 2,

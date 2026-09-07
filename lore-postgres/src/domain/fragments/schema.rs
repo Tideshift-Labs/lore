@@ -124,18 +124,27 @@ pub const FRAGMENT_SCHEMA: &str = r#"
 -- CR-031 fragment lifecycle authority (SCHEMA-118)
 -- ---------------------------------------------------------------------------
 
--- The two push witnesses are columns on the existing repository row, not a new
+-- The three push scalars are columns on the existing repository row, not a new
 -- lockable row class: F-032-3's order gains no position from them, and a push
--- that already locks the repository row reads both for free.
+-- that already locks the repository row reads them without another row lock.
 --
 -- `content_association_generation` moves on association create/copy/tombstone.
+-- `content_membership_invalidation_generation` excludes fresh absent-key additions.
 -- `fragment_lifecycle_generation` moves on a readable/unreadable transition of
 -- any fragment this repository has a live association to.
 ALTER TABLE lore_domain_repositories
+    ADD COLUMN IF NOT EXISTS content_membership_invalidation_generation bigint NOT NULL DEFAULT 0
+        CHECK (content_membership_invalidation_generation >= 0),
     ADD COLUMN IF NOT EXISTS content_association_generation bigint NOT NULL DEFAULT 1
         CHECK (content_association_generation >= 1),
     ADD COLUMN IF NOT EXISTS fragment_lifecycle_generation bigint NOT NULL DEFAULT 1
         CHECK (fragment_lifecycle_generation >= 1);
+
+-- Empty until the explicit, irreversible membership writer fencing step.
+CREATE TABLE IF NOT EXISTS lore_fragment_membership_protocol (
+    id smallint PRIMARY KEY CHECK (id = 1),
+    revision bigint NOT NULL CHECK (revision = 1)
+);
 
 -- One monotonic source for every fragment epoch and every operation fence.
 -- Gaps are valid: a fence is an ordering token, not a count.

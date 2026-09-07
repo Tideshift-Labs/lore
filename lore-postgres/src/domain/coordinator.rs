@@ -408,6 +408,9 @@ pub struct MetadataCasInput {
 /// Publish one branch tip.
 #[derive(Debug, Clone)]
 pub struct BranchPushCommitInput {
+    /// Original server-side content witness, captured before traversal. Absent
+    /// only while fragment push enforcement has not been activated.
+    pub fragment_witness: Option<crate::domain::fragments::PushGenerationWitness>,
     /// Target repository.
     pub repository_id: Vec<u8>,
     /// Target branch.

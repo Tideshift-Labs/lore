@@ -194,6 +194,7 @@ pub struct DomainContext {
     store: Arc<dyn DomainTransactionStore>,
     enforcement: bool,
     lock_coordinator: Option<Arc<PostgresLockCoordinator>>,
+    fragment_coordinator: Option<Arc<PostgresFragmentCoordinator>>,
     cell_id: Option<String>,
     /// CR-032's required-event admission gate, present only on a cell whose
     /// relay was built and passed every startup precondition.
@@ -222,6 +223,7 @@ impl DomainContext {
             store,
             enforcement,
             lock_coordinator: None,
+            fragment_coordinator: None,
             cell_id: None,
             admission: OnceLock::new(),
             operation_verifier: None,
@@ -240,6 +242,7 @@ impl DomainContext {
             store,
             enforcement,
             lock_coordinator: Some(lock_coordinator),
+            fragment_coordinator: None,
             cell_id: None,
             admission: OnceLock::new(),
             operation_verifier: None,
@@ -308,6 +311,21 @@ impl DomainContext {
     /// Active fenced-lock coordinator, absent until SCHEMA-117 cutover.
     pub fn lock_coordinator(&self) -> Option<&Arc<PostgresLockCoordinator>> {
         self.lock_coordinator.as_ref()
+    }
+
+    /// Attach the content authority after its push protocol has been enabled.
+    #[must_use]
+    pub fn with_fragment_coordinator(
+        mut self,
+        coordinator: Arc<PostgresFragmentCoordinator>,
+    ) -> Self {
+        self.fragment_coordinator = Some(coordinator);
+        self
+    }
+
+    /// Content authority for capturing the original push witness.
+    pub fn fragment_coordinator(&self) -> Option<&Arc<PostgresFragmentCoordinator>> {
+        self.fragment_coordinator.as_ref()
     }
 
     /// Attach CR-032's required-event admission gate.
@@ -2831,6 +2849,25 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
     }
     .with_cell_id(cell_id)
     .with_operation_verifier(operation_verifier);
+    let context = if fragment_coordinator
+        .push_membership_enabled()
+        .await
+        .map_err(|e| anyhow!("Failed to attest fragment push protocol: {e}"))?
+    {
+        if settings.immutable_store.mode != POSTGRES_MODE {
+            return Err(anyhow!(
+                "fragment push protocol requires immutable_store.mode = 'postgres'"
+            ));
+        }
+        if !enforcement || !lock_fencing {
+            return Err(anyhow!(
+                "fragment push protocol requires domain and lock enforcement"
+            ));
+        }
+        context.with_fragment_coordinator(Arc::new(fragment_coordinator.clone()))
+    } else {
+        context
+    };
     Ok(ConfiguredDomainContext {
         context: Some(Arc::new(context)),
         mutable_enforcement: Some(mutable_enforcement),

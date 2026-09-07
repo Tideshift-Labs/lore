@@ -75,6 +75,15 @@ async fn apply_projection(
     tx: &Transaction<'_>,
     writes: &[ProjectionWrite],
 ) -> Result<(), DomainError> {
+    crate::domain::fragments::membership::allow_publication(tx).await?;
+    apply_projection_without_authorizing(tx, writes).await
+}
+
+/// Pushes must obtain their publication marker from witness validation only.
+async fn apply_projection_without_authorizing(
+    tx: &Transaction<'_>,
+    writes: &[ProjectionWrite],
+) -> Result<(), DomainError> {
     let mut ordered = writes.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| {
         (&left.partition, left.key_type, &left.key).cmp(&(
@@ -1215,6 +1224,27 @@ impl DomainTransactionStore for PostgresDomainStore {
         )
         .await?;
 
+        if let Some(captured) = input.fragment_witness {
+            if let crate::domain::fragments::PushWitnessVerdict::Aborted { reason } =
+                crate::domain::fragments::PostgresFragmentCoordinator::revalidate_generation_witness(
+                    &tx, &input.repository_id, captured,
+                ).await?
+            {
+                let result = MutationResult::rejected(reason);
+                receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
+                classify_commit(tx.commit().await, "push membership refusal commit")?;
+                return Ok(result);
+            }
+            crate::domain::fragments::membership::allow_publication(&tx).await?;
+        } else if crate::domain::fragments::membership::enabled(&tx).await? {
+            let result = MutationResult::rejected(
+                crate::domain::fragments::REQUIRED_FRAGMENT_PROOF_UNAVAILABLE,
+            );
+            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
+            classify_commit(tx.commit().await, "push missing membership witness commit")?;
+            return Ok(result);
+        }
+
         // **The current-head no-op suppression point** (CR-032's "Current-head
         // push and exact create/delete retry: no new event"; WP-119 inventory
         // disagreement C1).
@@ -1256,7 +1286,7 @@ impl DomainTransactionStore for PostgresDomainStore {
         .await
         .map_err(|e| DomainError::from_pg("branch tip publish", e))?;
 
-        apply_projection(&tx, &input.projection).await?;
+        apply_projection_without_authorizing(&tx, &input.projection).await?;
         append_event(
             &tx,
             &mut sequence,

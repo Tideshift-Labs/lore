@@ -84,6 +84,7 @@ pub mod coordinator;
 #[cfg(feature = "failure_generator")]
 pub mod failpoints;
 pub mod masks;
+pub mod membership;
 pub mod provider;
 pub mod schema;
 pub mod states;
@@ -171,6 +172,7 @@ pub use coordinator::PostgresFragmentCoordinator;
 pub use coordinator::PushGenerationWitness;
 pub use coordinator::PushWitnessVerdict;
 pub use coordinator::REQUIRED_FRAGMENT_CHANGED;
+pub use coordinator::REQUIRED_FRAGMENT_PROOF_UNAVAILABLE;
 pub use coordinator::REQUIRED_FRAGMENT_REVALIDATION_LIMIT;
 pub use coordinator::RequiredFragment;
 pub use coordinator::STAGED_LEASE_ALREADY_RELEASED;

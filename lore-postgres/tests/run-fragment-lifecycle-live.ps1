@@ -54,6 +54,10 @@ $inventory = @(
         Exact         = $true
         ExactPrefixes = @()
         Cases         = @(
+            'domain_fragment_membership::fresh_exact_keys_preserve_invalidation_but_rebind_and_recreate_advance_it',
+            'domain_fragment_membership::guarded_binding_classifies_absence_and_replacement_and_fenced_calls_change_nothing',
+            'domain_fragment_membership::both_obliterate_retirement_paths_advance_invalidation_with_retained_payload_control',
+            'domain_fragment_membership::invalidation_overflow_rolls_back_rebind_and_retirement_without_wrapping',
             'normal_direct_write_uses_legacy_key_and_missing_reoffer_uses_repair_epoch_key',
             'payload_free_coordinated_preflight_distinguishes_exact_readable_from_new_publication',
             'durable_write_claims_bind_replay_authorize_settle_and_expiry_to_database_state',
@@ -101,16 +105,16 @@ $inventory = @(
             'a_promotion_round_trip_allocates_a_new_epoch_and_publishes_under_remote_authority',
             # INV-EF P1-2/P1-3: the six previously-untested public entry points.
             'revalidate_push_witness_reports_unchanged_when_neither_scalar_moved',
-            'revalidate_push_witness_is_satisfied_by_the_fallback_when_the_lifecycle_scalar_moved_and_required_fragments_are_still_readable',
+            'revalidate_push_witness_refuses_missing_proof_when_lifecycle_moves_despite_readable_dependencies',
             'revalidate_push_witness_aborts_when_a_required_fragment_is_no_longer_readable',
             'revalidate_push_witness_aborts_when_a_required_fragments_epoch_advanced',
-            'revalidate_push_witness_refuses_over_the_revalidation_limit_before_locking_any_fragment_row',
+            'revalidate_push_witness_refuses_missing_proof_for_oversized_input_before_fragment_locks',
             # CR-031:266 (INV-EF P2-2): the semantically-equivalent-epoch push fallback allowance.
-            'revalidate_push_witness_accepts_a_required_fragment_promoted_to_a_semantically_equivalent_epoch',
+            'revalidate_push_witness_refuses_missing_proof_after_equivalent_promotion_and_lifecycle_movement',
             'revalidate_push_witness_aborts_when_the_new_epoch_describes_different_content',
             # Pre-Phase-5 hardening review: equivalent_epochs' all-or-nothing rule over a real
             # two-fragment batch, plus a required fragment whose captured epoch was never published.
-            'revalidate_push_witness_all_or_nothing_over_a_mixed_divergent_batch',
+            'revalidate_push_witness_refuses_missing_proof_for_equivalent_and_mixed_batches',
             'revalidate_push_witness_aborts_when_the_captured_epoch_was_never_published',
             # WP-118 fix-round hardening review: the association-precedence case, the only case
             # in the file that moves BOTH push-witness scalars for the same required fragment.
@@ -149,11 +153,11 @@ $inventory = @(
             # fanout cost characterization (INV-EF P2-7), and the copy path's association-
             # generation bump. The fanout case is a measurement: its numbers are printed, not
             # asserted, so it is listed in $printOutputCases below.
-            'same_repo_lifecycle_traffic_does_not_starve_branch_push'
+            'same_repo_lifecycle_traffic_requires_complete_proof'
             'cross_repo_bulk_upload_does_not_abort_unrelated_push'
             # Item 1b: the literal association-traffic scenario as a CHARACTERIZATION. It asserts
             # only that the starvation is observable; its rate numbers are printed, not gated.
-            'characterize_same_repo_association_traffic_push_aborts'
+            'fresh_same_repo_association_traffic_preserves_the_scalar_fast_path'
             'shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increasing_fanout'
             'create_association_if_current_bumps_the_association_generation_on_every_admitted_copy'
             # WP-118 backfill cursor. NOT Phase 8, which remains stopped on a real staging cell:
@@ -202,9 +206,9 @@ $inventory = @(
 # have its numbers swallowed, which is the one thing it exists to produce.
 $printOutputCases = @(
     'shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increasing_fanout',
-    'same_repo_lifecycle_traffic_does_not_starve_branch_push',
+    'same_repo_lifecycle_traffic_requires_complete_proof',
     'cross_repo_bulk_upload_does_not_abort_unrelated_push',
-    'characterize_same_repo_association_traffic_push_aborts'
+    'fresh_same_repo_association_traffic_preserves_the_scalar_fast_path'
 )
 
 $results = @(

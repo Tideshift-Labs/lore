@@ -84,9 +84,9 @@ use crate::domain::outbox::builders;
 use crate::domain::outbox::version::AggregateVersion;
 use crate::domain::schema::STATE_LIVE;
 
-/// Fixed for WP-118 by CR-031's F-031 amendment. A push whose lifecycle scalar
-/// moved may revalidate at most this many exact required fragments; a larger
-/// request is refused **before any fragment row is locked**.
+/// Reserved limit for a future certified complete membership proof under
+/// CR-031's F-031 amendment. Selective fallback is disabled; the scalar-only
+/// fast path has no dependency-count limit.
 pub const MAX_PUSH_FRAGMENT_REVALIDATIONS: usize = 4_096;
 
 /// Admission bound on shared-hash fanout for a readable/unreadable transition.
@@ -1123,9 +1123,9 @@ pub enum IoObservation {
 // Push witness
 // ---------------------------------------------------------------------------
 
-/// The two per-repository scalars F-031-1 freezes as the entire push witness.
+/// The repository scalars captured before push preflight (CR-031, 2026-09-07).
 ///
-/// Both are columns on the repository row, so they add no lock position to
+/// All are columns on the repository row, so they add no lock position to
 /// F-032-3 and a push that already locks that row reads them for free.
 ///
 /// The cell-global variant this replaced was measured starving: 65 to 102
@@ -1136,6 +1136,9 @@ pub enum IoObservation {
 pub struct PushGenerationWitness {
     /// Moves on association create, copy, and tombstone.
     pub content_association_generation: i64,
+    /// Moves when an existing content binding is retired or replaced, but not
+    /// when a previously absent exact key is added.
+    pub content_membership_invalidation_generation: i64,
     /// Moves on a readable/unreadable transition of any fragment this
     /// repository has a live association to.
     pub fragment_lifecycle_generation: i64,
@@ -1144,16 +1147,15 @@ pub struct PushGenerationWitness {
 /// What a final push transaction may do given its witness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushWitnessVerdict {
-    /// Neither scalar moved. Commit with no fragment-row read at all.
+    /// Invalidation and lifecycle stayed equal. No fragment-row read is needed.
     Unchanged,
-    /// The lifecycle scalar moved and every exact required fragment is still
-    /// readable, at its captured epoch or at a semantically equivalent one.
-    /// The push may commit.
+    /// Reserved for a future certified complete membership proof. The current
+    /// validator never returns this verdict; lifecycle movement refuses.
     FallbackSatisfied {
         /// How many fragment rows the fallback actually revalidated.
         revalidated: usize,
     },
-    /// A required fragment became missing, deleting, tombstoned, or different.
+    /// Membership invalidation or lifecycle movement prevents publication.
     /// Known `ABORTED`; take a fresh preflight.
     Aborted {
         /// Frozen reason code.
@@ -1161,15 +1163,16 @@ pub enum PushWitnessVerdict {
     },
 }
 
-/// Reason code for a changed-scalar push whose required set exceeds
-/// [`MAX_PUSH_FRAGMENT_REVALIDATIONS`]. Returned **before any fragment row is
-/// locked**, so it is a known no-commit refusal rather than an ambiguous abort.
+/// Reserved reason for a future complete proof exceeding
+/// [`MAX_PUSH_FRAGMENT_REVALIDATIONS`]. The scalar-only path has no such cap.
 pub const REQUIRED_FRAGMENT_REVALIDATION_LIMIT: &str = "required_fragment_revalidation_limit";
 
-/// Reason code for a required fragment that is no longer readable, or is
-/// readable only at an epoch that is not semantically equivalent to the one
-/// preflight captured.
+/// Reason code for membership invalidation since preflight. The first slice
+/// conservatively refuses even when the changed binding is unrelated.
 pub const REQUIRED_FRAGMENT_CHANGED: &str = "required_fragment_changed";
+
+/// Lifecycle movement cannot be accepted without a complete membership proof.
+pub const REQUIRED_FRAGMENT_PROOF_UNAVAILABLE: &str = "required_fragment_proof_unavailable";
 
 /// A fragment the push requires, at the exact epoch preflight resolved it to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3049,6 +3052,8 @@ impl PostgresFragmentCoordinator {
             return Ok(CommitVerdict::Fenced);
         }
         sequence.enter(LockClass::Associations)?;
+        let invalidates_binding = association_key_exists(&tx, hash, repository_id, context).await?;
+        super::membership::allow_association(&tx).await?;
         let association_epoch = next_fence(&tx).await?;
         tx.execute(
             "INSERT INTO lore_fragment_associations ( \
@@ -3070,7 +3075,7 @@ impl PostgresFragmentCoordinator {
         )
         .await
         .map_err(|error| DomainError::from_pg("association create insert", error))?;
-        let advance = bump_association_generation(&tx, repository_id).await?;
+        let advance = bump_association_generation(&tx, repository_id, invalidates_binding).await?;
         append_association_summary(
             &tx,
             &mut sequence,
@@ -3117,6 +3122,9 @@ impl PostgresFragmentCoordinator {
             return Ok(CommitVerdict::Fenced);
         }
         sequence.enter(LockClass::Associations)?;
+        let invalidates_binding =
+            association_key_exists(&tx, &witness.hash, repository_id, context).await?;
+        super::membership::allow_association(&tx).await?;
         let association_epoch = next_fence(&tx).await?;
         tx.execute(
             "INSERT INTO lore_fragment_associations ( \
@@ -3138,7 +3146,7 @@ impl PostgresFragmentCoordinator {
         )
         .await
         .map_err(|error| DomainError::from_pg("guarded association insert", error))?;
-        let advance = bump_association_generation(&tx, repository_id).await?;
+        let advance = bump_association_generation(&tx, repository_id, invalidates_binding).await?;
         append_association_summary(
             &tx,
             &mut sequence,
@@ -3174,6 +3182,7 @@ impl PostgresFragmentCoordinator {
             return Ok(CommitVerdict::Fenced);
         }
         failpoint!("association.tombstone.locked")?;
+        super::membership::allow_association(&tx).await?;
         sequence.enter(LockClass::Associations)?;
         // `RETURNING` the epoch rather than a row count: the predicate names the
         // full primary key, so at most one row moves, and the summary event
@@ -3200,7 +3209,7 @@ impl PostgresFragmentCoordinator {
             return Ok(CommitVerdict::Fenced);
         };
         let association_epoch: i64 = updated.get("association_epoch");
-        let advance = bump_association_generation(&tx, repository_id).await?;
+        let advance = bump_association_generation(&tx, repository_id, true).await?;
         append_association_summary(
             &tx,
             &mut sequence,
@@ -3336,6 +3345,7 @@ impl PostgresFragmentCoordinator {
             })?
             .get(0);
         if live_association_count > 1 {
+            super::membership::allow_association(&tx).await?;
             sequence.enter(LockClass::Associations)?;
             let association_fence = next_fence(&tx).await?;
             let updated = tx
@@ -3359,7 +3369,7 @@ impl PostgresFragmentCoordinator {
                     "the exact fragment association moved while it was locked".to_owned(),
                 ));
             }
-            let advance = bump_association_generation(&tx, repository_id).await?;
+            let advance = bump_association_generation(&tx, repository_id, true).await?;
             append_association_summary(
                 &tx,
                 &mut sequence,
@@ -3401,6 +3411,7 @@ impl PostgresFragmentCoordinator {
         .await?;
         let blocked_until = obliterate_blocked_until_locked(&tx, &intent).await?;
         sequence.enter(LockClass::Associations)?;
+        super::membership::allow_association(&tx).await?;
         let updated_association = tx
             .execute(
                 "UPDATE lore_fragment_associations \
@@ -3446,7 +3457,7 @@ impl PostgresFragmentCoordinator {
                 "the fragment head moved while it was locked".to_owned(),
             ));
         }
-        let association_advance = bump_association_generation(&tx, repository_id).await?;
+        let association_advance = bump_association_generation(&tx, repository_id, true).await?;
         let lifecycle_advances = if head.state.is_readable() {
             apply_lifecycle_generation(&tx, &confirmed).await?
         } else {
@@ -3701,7 +3712,29 @@ impl PostgresFragmentCoordinator {
     // Push witness
     // -----------------------------------------------------------------------
 
-    /// Read the two per-repository scalars a push preflight captures.
+    /// Whether the committed writer fences permit membership-aware publication.
+    pub async fn push_membership_enabled(&self) -> Result<bool, DomainError> {
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("membership readiness begin", e))?;
+        super::membership::enabled(&tx).await
+    }
+
+    /// Explicit maintenance cutover. Installs persistent old-writer fences;
+    /// disabling admission later must leave these fences in place.
+    pub async fn activate_push_membership(&self) -> Result<(), DomainError> {
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("membership activation begin", e))?;
+        super::membership::activate(&tx).await?;
+        classify_commit(tx.commit().await, "membership activation commit")
+    }
+
+    /// Read the three per-repository scalars captured before push preflight.
     pub async fn capture_push_witness(
         &self,
         repository_id: &[u8],
@@ -3709,7 +3742,7 @@ impl PostgresFragmentCoordinator {
         let client = self.checkout().await?;
         let row = client
             .query_opt(
-                "SELECT content_association_generation, fragment_lifecycle_generation \
+                "SELECT content_association_generation, content_membership_invalidation_generation, fragment_lifecycle_generation \
                    FROM lore_domain_repositories WHERE repository_id = $1",
                 &[&repository_id],
             )
@@ -3717,41 +3750,37 @@ impl PostgresFragmentCoordinator {
             .map_err(|error| DomainError::from_pg("push witness capture", error))?;
         Ok(row.map(|row| PushGenerationWitness {
             content_association_generation: row.get("content_association_generation"),
+            content_membership_invalidation_generation: row
+                .get("content_membership_invalidation_generation"),
             fragment_lifecycle_generation: row.get("fragment_lifecycle_generation"),
         }))
     }
 
-    /// Revalidate a captured push witness **inside the caller's final-push
-    /// transaction**, after its receptor, repository, and branch locks.
-    ///
-    /// This takes a borrowed transaction rather than opening its own precisely
-    /// because it must be atomic with the push's own publication; it is the one
-    /// method here that does not own its transaction, and it takes no lock
-    /// class earlier than `Fragments`, so it cannot invert F-032-3.
-    ///
-    /// The unchanged fast path reads no fragment row at all. A changed
-    /// lifecycle scalar permits only the bounded exact-required-fragment
-    /// fallback, in sorted hash order, in one set-based query. A request above
-    /// [`MAX_PUSH_FRAGMENT_REVALIDATIONS`] is refused **before** any fragment
-    /// row is taken, so the refusal is known-no-commit rather than ambiguous.
-    ///
-    /// A required fragment satisfies the fallback when its head is readable
-    /// **and** its current epoch is the one preflight captured *or one
-    /// semantically equivalent to it* — CR-031:266's allowance, decided by
-    /// [`equivalent_epochs`], which is what lets a push survive an unrelated
-    /// `Staged`->`Remote` promotion of a fragment it requires. Deciding it
-    /// costs one extra statement and only when an epoch actually moved.
+    /// Validate inside the caller's publication transaction, with Repository
+    /// already locked. An ordinary fragment list cannot certify completeness;
+    /// this compatibility entry point never treats it as a fallback proof.
     pub async fn revalidate_push_witness(
         &self,
         tx: &Transaction<'_>,
-        sequence: &mut LockSequence,
+        _sequence: &mut LockSequence,
         repository_id: &[u8],
         captured: PushGenerationWitness,
-        required: &[RequiredFragment],
+        _required: &[RequiredFragment],
+    ) -> Result<PushWitnessVerdict, DomainError> {
+        Self::revalidate_generation_witness(tx, repository_id, captured).await
+    }
+
+    /// Scalar-only publication check. Caller holds the Repository lock until
+    /// publication commits. Additions need no fragment reads, at any size.
+    /// Lifecycle movement refuses until a complete membership proof exists.
+    pub async fn revalidate_generation_witness(
+        tx: &Transaction<'_>,
+        repository_id: &[u8],
+        captured: PushGenerationWitness,
     ) -> Result<PushWitnessVerdict, DomainError> {
         let Some(row) = tx
             .query_opt(
-                "SELECT content_association_generation, fragment_lifecycle_generation \
+                "SELECT content_association_generation, content_membership_invalidation_generation, fragment_lifecycle_generation \
                    FROM lore_domain_repositories WHERE repository_id = $1",
                 &[&repository_id],
             )
@@ -3764,107 +3793,18 @@ impl PostgresFragmentCoordinator {
         };
         let current = PushGenerationWitness {
             content_association_generation: row.get("content_association_generation"),
+            content_membership_invalidation_generation: row
+                .get("content_membership_invalidation_generation"),
             fragment_lifecycle_generation: row.get("fragment_lifecycle_generation"),
         };
-        // One pure decision rather than two ordered `if`s. The precedence — an
-        // association move outranks a lifecycle move even when both happened —
-        // is what keeps obliterate-then-recreate out of reach of the
-        // equivalence allowance, and as two positional branches it was
-        // protected only by a comment and provably untested. As an enum it is
-        // pinnable offline, which `classify_push_witness` tests do.
-        match classify_push_witness(captured, current) {
-            PushWitnessChange::Neither => return Ok(PushWitnessVerdict::Unchanged),
-            PushWitnessChange::AssociationMoved => {
-                // The association set itself moved. The fallback revalidates
-                // representations, not membership, so it cannot cover this.
-                return Ok(PushWitnessVerdict::Aborted {
-                    reason: REQUIRED_FRAGMENT_CHANGED,
-                });
-            }
-            PushWitnessChange::LifecycleOnly => {}
-        }
-        // Count first. This is the whole reason the limit is a known refusal:
-        // it is checked before a single fragment row is locked, so a refused
-        // push has provably mutated nothing.
-        if required.len() > MAX_PUSH_FRAGMENT_REVALIDATIONS {
-            return Ok(PushWitnessVerdict::Aborted {
-                reason: REQUIRED_FRAGMENT_REVALIDATION_LIMIT,
-            });
-        }
-        if required.is_empty() {
-            return Ok(PushWitnessVerdict::FallbackSatisfied { revalidated: 0 });
-        }
-        sequence.enter(LockClass::Fragments)?;
-        // Sorted hash order, so two transactions over an overlapping required
-        // set acquire the overlap in the same sequence (F-032-3's within-class
-        // rule). One set-based query, never a row at a time, because CR-031
-        // fixes that shape for the push path.
-        //
-        // This deliberately differs from `lock_lifecycle_fanout`, which
-        // locks its rows one at a time, and the difference is worth stating
-        // because it looks like an inconsistency. Postgres does not *guarantee*
-        // that `ORDER BY ... FOR UPDATE` acquires locks in the sorted order:
-        // under a concurrent update it can re-fetch a row and emit it later.
-        // Here that is acceptable, because every transaction reaching this
-        // statement scans the same primary-key index ascending over its own
-        // subset, so two overlapping sets still meet the overlap in the same
-        // relative order; and the only other lock class this transaction may
-        // still take is the outbox insert, which is last. The fanout path has
-        // neither property — it locks `lore_domain_repositories`, a class that
-        // sits *earlier* in F-032-3 than the fragment rows a concurrent
-        // transition may already hold — so it cannot rely on executor order and
-        // takes its rows explicitly instead.
-        let mut sorted: Vec<&RequiredFragment> = required.iter().collect();
-        sorted.sort_by(|left, right| left.hash.cmp(&right.hash));
-        let hashes: Vec<Vec<u8>> = sorted.iter().map(|item| item.hash.clone()).collect();
-        let rows = tx
-            .query(
-                "SELECT hash, current_epoch, state FROM lore_fragment_lifecycle \
-                  WHERE hash = ANY($1) ORDER BY hash FOR UPDATE",
-                &[&hashes],
-            )
-            .await
-            .map_err(|error| DomainError::from_pg("push fallback revalidate", error))?;
-        let mut observed: BTreeMap<Vec<u8>, (i64, i16)> = BTreeMap::new();
-        for row in rows {
-            observed.insert(
-                row.get("hash"),
-                (row.get("current_epoch"), row.get("state")),
-            );
-        }
-        // Required fragments whose head is readable but at a *different* epoch
-        // than preflight saw. CR-031:266 allows these through only when the new
-        // epoch is semantically equivalent; `equivalent_epochs` below decides
-        // that, and the common case leaves this empty and issues no extra
-        // query at all.
-        let mut divergent: Vec<DivergentEpoch<'_>> = Vec::new();
-        for item in &sorted {
-            let Some((epoch, state)) = observed.get(&item.hash) else {
-                return Ok(PushWitnessVerdict::Aborted {
-                    reason: REQUIRED_FRAGMENT_CHANGED,
-                });
-            };
-            let state = FragmentLifecycleState::from_bits(*state)?;
-            if !state.is_readable() {
-                return Ok(PushWitnessVerdict::Aborted {
-                    reason: REQUIRED_FRAGMENT_CHANGED,
-                });
-            }
-            if *epoch != item.epoch {
-                divergent.push(DivergentEpoch {
-                    hash: &item.hash,
-                    captured: item.epoch,
-                    current: *epoch,
-                });
-            }
-        }
-        if !divergent.is_empty() && !equivalent_epochs(tx, captured, current, &divergent).await? {
-            return Ok(PushWitnessVerdict::Aborted {
+        Ok(match classify_push_witness(captured, current) {
+            PushWitnessChange::Neither => PushWitnessVerdict::Unchanged,
+            PushWitnessChange::AssociationMoved => PushWitnessVerdict::Aborted {
                 reason: REQUIRED_FRAGMENT_CHANGED,
-            });
-        }
-        Ok(PushWitnessVerdict::FallbackSatisfied {
-            revalidated: sorted.len(),
+            },
+            PushWitnessChange::LifecycleOnly => PushWitnessVerdict::Aborted {
+                reason: REQUIRED_FRAGMENT_PROOF_UNAVAILABLE,
+            },
         })
     }
 
@@ -5557,39 +5497,23 @@ fn valid_write_authority_revision(value: &str) -> bool {
 /// order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PushWitnessChange {
-    /// Neither scalar moved. The fast path commits with no fragment-row read.
+    /// Invalidation and lifecycle stayed equal, permitting the fast path.
     Neither,
-    /// The association scalar moved, whether or not the lifecycle scalar did
-    /// too. Always an abort.
+    /// A binding was invalidated, whether or not lifecycle also moved.
     AssociationMoved,
-    /// The lifecycle scalar moved and the association scalar did not. The only
-    /// case the bounded fallback may attempt.
+    /// Lifecycle moved without membership invalidation. Complete proof is absent.
     LifecycleOnly,
 }
 
-/// Classify one push witness against its captured value.
-///
-/// # The precedence is the point
-///
-/// `AssociationMoved` outranks `LifecycleOnly` when **both** scalars moved, and
-/// that ordering is load-bearing for the CR-031:266 equivalence allowance
-/// rather than a stylistic choice. An obliterate-then-recreate moves both: it
-/// tombstones associations (association scalar) and crosses readability
-/// (lifecycle scalar). If such a witness were routed to the fallback, the
-/// recreated fragment could present content columns equal to the captured
-/// epoch's and be accepted as "semantically equivalent" — committing a push
-/// against an association set that no longer contains what it required.
-///
-/// As two positional `if`s this was protected by nothing but a comment: the
-/// association branch could be deleted outright with every live push case and
-/// every library test still green, because every one of those cases associates
-/// before capturing its witness, so that scalar never moves. Making it a value
-/// is what lets `an_association_move_outranks_a_lifecycle_move` pin it offline.
+/// Destructive membership movement wins over lifecycle movement. Fresh additions
+/// do not disturb continuity, regardless of the ordinary association scalar.
 fn classify_push_witness(
     captured: PushGenerationWitness,
     current: PushGenerationWitness,
 ) -> PushWitnessChange {
-    if current.content_association_generation != captured.content_association_generation {
+    if current.content_membership_invalidation_generation
+        != captured.content_membership_invalidation_generation
+    {
         return PushWitnessChange::AssociationMoved;
     }
     if current.fragment_lifecycle_generation != captured.fragment_lifecycle_generation {
@@ -5708,161 +5632,6 @@ async fn lock_lease_member_heads(
         }
     }
     Ok(())
-}
-
-/// One required fragment whose current epoch is not the one preflight
-/// captured.
-///
-/// Named fields rather than a tuple because the two `i64`s are trivially
-/// transposable and a transposition here would compare the wrong pair of epoch
-/// rows without failing anything loudly.
-struct DivergentEpoch<'a> {
-    /// The FragmentId.
-    hash: &'a [u8],
-    /// The epoch preflight saw.
-    captured: i64,
-    /// The epoch the head names now.
-    current: i64,
-}
-
-/// Decide CR-031:266's "semantically equivalent current epoch" for every
-/// required fragment whose epoch moved between preflight and the final push.
-///
-/// # The rule
-///
-/// Two epochs of one FragmentId are semantically equivalent when their
-/// `lore_fragment_epochs` rows describe the **same content**: identical
-/// `decoded_hash`, `size_content`, `size_payload`, and `payload_flags`. None of
-/// those four columns is ever rewritten after publication — `disposition` and
-/// `validated_at` are the only mutable columns on the row, so "the epoch row is
-/// immutable" is too strong a claim, but the compared columns are.
-///
-/// Comparing `decoded_hash` is load-bearing rather than belt-and-braces:
-/// nothing in this module enforces that two epochs of one FragmentId decode to
-/// the same content, so it cannot be assumed from the hash alone.
-///
-/// The two epochs may differ in `authority` and `object_key`, and that
-/// difference is the whole point — it is exactly a `Staged`->`Remote`
-/// promotion, which re-publishes the same bytes under a new epoch because
-/// epoch rows are immutable and the remote object is a different
-/// representation of the same fragment (see
-/// [`PostgresFragmentCoordinator::begin_promotion`]).
-///
-/// `manifest_id` is deliberately **not** compared. It is a caller-supplied
-/// opaque identity for one representation, so a promotion may legitimately
-/// carry a new one; requiring equality there would leave the allowance dead in
-/// the one case CR-031 names.
-///
-/// # What still aborts
-///
-/// Everything else. A repair successor that re-encoded the payload moves
-/// `payload_flags` or `size_payload` and is "different". A required fragment
-/// with no row at its captured epoch is "different" — that row is retained
-/// through quarantine and purge, so its absence means the caller's epoch was
-/// never real here. The readability check in the caller runs first and is
-/// untouched, so missing, deleting, and tombstoned heads never reach this.
-///
-/// This is a strict widening of what commits: every set this accepts was
-/// previously an `ABORTED` the caller had to re-preflight for, and no set it
-/// rejects was previously accepted.
-///
-/// # Why the allowance is safe, and what it depends on
-///
-/// The caller aborts unconditionally when the **association** scalar moved,
-/// before the count check and long before this runs. That is load-bearing
-/// rather than incidental: it is what keeps an obliterate-then-recreate — which
-/// tombstones associations and so always moves that scalar — out of reach of
-/// this function. Equivalence over content columns alone would not be enough.
-///
-/// That dependency is no longer positional. This function takes both witnesses
-/// and `debug_assert_eq!`s the association scalar itself, so the precondition is
-/// an argument it checks rather than an ordering a reader has to notice, and
-/// [`classify_push_witness`] makes the precedence a value rather than a branch
-/// order.
-///
-/// # Where each guarantee is actually pinned — measured, not assumed
-///
-/// An earlier version of this comment claimed the assertion "makes a reordering
-/// fail a `cargo test` run instead of only the live tier". **That is false and
-/// is retracted.** This function is unreachable without a database, so with the
-/// `AssociationMoved` arm stubbed to fall through, `cargo test -p lore-postgres`
-/// stays fully green and only the live tier fails — measured both with and
-/// without the assertion present. The three guards partition as:
-///
-/// * [`classify_push_witness`]'s unit tests are the **only** offline pin, and
-///   their scope is the classifier itself, not its use.
-/// * The live case is what **detects** a consumer that skips the abort arm. It
-///   does so with or without the assertion.
-/// * This assertion is a live-tier **tripwire**: it fires one frame earlier than
-///   the verdict assertion, naming the violated invariant instead of leaving a
-///   wrong verdict to be interpreted. Diagnosis, not detection.
-///
-/// **A release build is fully sufficient without it.** The `AssociationMoved`
-/// arm returns `Aborted` unconditionally and no assertion sits in that path, so
-/// release enforces the precedence exactly as debug does. Compiling the
-/// assertion out costs nothing.
-///
-/// Quarantine cannot forge equivalence either: a publication quarantines only
-/// epochs below the one it publishes, so a readable head's current epoch is
-/// never quarantined or purged.
-///
-/// # Cost
-///
-/// One extra statement, and only when at least one epoch actually moved. The
-/// unchanged fast path and the all-epochs-match fallback issue nothing.
-///
-/// It takes no lock of its own, and does not need one. The caller already holds
-/// `FOR UPDATE` on every head it is asking about, so the `current_epoch` values
-/// this statement is keyed on cannot move underneath it; the compared columns
-/// are never rewritten; and at READ COMMITTED this statement sees one coherent
-/// snapshot of rows that were already committed when the head lock was taken.
-/// It therefore adds no lock class and cannot invert F-032-3.
-async fn equivalent_epochs(
-    tx: &Transaction<'_>,
-    captured: PushGenerationWitness,
-    current: PushGenerationWitness,
-    divergent: &[DivergentEpoch<'_>],
-) -> Result<bool, DomainError> {
-    // The precondition, checked here rather than left to a reader noticing the
-    // caller's branch order. Taking both witnesses turns "the association check
-    // happens earlier in the function" from an ordering into an argument this
-    // function verifies.
-    //
-    // This is a live-tier tripwire, NOT offline coverage: reaching this line
-    // needs a database, so a consumer that skips the abort arm is detected by
-    // the live case either way. What the assertion adds is the diagnosis —
-    // it fires one frame before the verdict assertion and names the invariant.
-    // See this function's doc for the measurement.
-    debug_assert_eq!(
-        captured.content_association_generation, current.content_association_generation,
-        "equivalent_epochs must never see a witness whose association scalar moved: the fallback \
-         revalidates representations, not membership, so an obliterate-then-recreate could present \
-         equal content columns and be accepted against an association set that no longer holds it"
-    );
-    let hashes: Vec<&[u8]> = divergent.iter().map(|item| item.hash).collect();
-    let captured: Vec<i64> = divergent.iter().map(|item| item.captured).collect();
-    let current: Vec<i64> = divergent.iter().map(|item| item.current).collect();
-    let matched: i64 = tx
-        .query_one(
-            "SELECT count(*)::bigint FROM unnest($1::bytea[], $2::bigint[], $3::bigint[]) \
-                    AS required(hash, captured_epoch, current_epoch) \
-                    JOIN lore_fragment_epochs AS was \
-                      ON was.hash = required.hash AND was.epoch = required.captured_epoch \
-                    JOIN lore_fragment_epochs AS now \
-                      ON now.hash = required.hash AND now.epoch = required.current_epoch \
-              WHERE was.decoded_hash  = now.decoded_hash \
-                AND was.size_content  = now.size_content \
-                AND was.size_payload  = now.size_payload \
-                AND was.payload_flags = now.payload_flags",
-            &[&hashes, &captured, &current],
-        )
-        .await
-        .map_err(|error| DomainError::from_pg("push fallback epoch equivalence", error))?
-        .get(0);
-    // All or nothing: one non-equivalent member aborts the whole push. Compare
-    // in `i64` rather than narrowing `matched` to `usize`, so an impossible
-    // negative count cannot be flattened into a silent abort.
-    Ok(i64::try_from(divergent.len()).is_ok_and(|expected| matched == expected))
 }
 
 /// Refuse a wrong-length `lease_id` before any database work.
@@ -6045,6 +5814,25 @@ async fn stamp_operation_fence(
     Ok(())
 }
 
+/// Classify the exact key while its Repository row is already locked.
+async fn association_key_exists(
+    tx: &Transaction<'_>,
+    hash: &[u8],
+    repository_id: &[u8],
+    context: &[u8],
+) -> Result<bool, DomainError> {
+    // Caller holds Repository, which serializes every coordinated writer of
+    // this repository's keys. Include tombstoned rows: recreation invalidates.
+    tx.query_one(
+        "SELECT EXISTS (SELECT 1 FROM lore_fragment_associations \
+         WHERE hash = $1 AND repository_id = $2 AND context = $3)",
+        &[&hash, &repository_id, &context],
+    )
+    .await
+    .map(|row| row.get(0))
+    .map_err(|error| DomainError::from_pg("association key classification", error))
+}
+
 /// Move one repository's association scalar. The row is already locked by the
 /// caller's `lock_repository`, so this takes no new lock class.
 /// **PRECONDITION: the caller already holds this repository row `FOR UPDATE`.**
@@ -6072,14 +5860,17 @@ async fn stamp_operation_fence(
 async fn bump_association_generation(
     tx: &Transaction<'_>,
     repository_id: &[u8],
+    invalidates_binding: bool,
 ) -> Result<Option<AssociationAdvance>, DomainError> {
     let row = tx
         .query_opt(
             "UPDATE lore_domain_repositories \
-                SET content_association_generation = content_association_generation + 1 \
+                SET content_association_generation = content_association_generation + 1, \
+                    content_membership_invalidation_generation = \
+                        content_membership_invalidation_generation + $2::bigint \
               WHERE repository_id = $1 \
           RETURNING generation, content_association_generation",
-            &[&repository_id],
+            &[&repository_id, &i64::from(invalidates_binding)],
         )
         .await
         .map_err(|error| DomainError::from_pg("association generation bump", error))?;
@@ -6725,6 +6516,7 @@ mod tests {
     fn push_witness(association: i64, lifecycle: i64) -> PushGenerationWitness {
         PushGenerationWitness {
             content_association_generation: association,
+            content_membership_invalidation_generation: association,
             fragment_lifecycle_generation: lifecycle,
         }
     }
@@ -6769,6 +6561,32 @@ mod tests {
                 change == PushWitnessChange::LifecycleOnly,
                 association == 1 && lifecycle != 1,
                 "({association}, {lifecycle}) classified as {change:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_association_moves_preserve_the_scalar_fast_path() {
+        let captured = push_witness(7, 11);
+        for association in [8, 4097, i64::MAX] {
+            let current = PushGenerationWitness {
+                content_association_generation: association,
+                ..captured
+            };
+            assert_eq!(
+                classify_push_witness(captured, current),
+                PushWitnessChange::Neither
+            );
+        }
+        for invalidation in [6, 8, i64::MAX] {
+            let current = PushGenerationWitness {
+                content_membership_invalidation_generation: invalidation,
+                fragment_lifecycle_generation: 12,
+                ..captured
+            };
+            assert_eq!(
+                classify_push_witness(captured, current),
+                PushWitnessChange::AssociationMoved
             );
         }
     }

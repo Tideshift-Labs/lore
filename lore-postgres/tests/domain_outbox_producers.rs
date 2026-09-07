@@ -1953,6 +1953,7 @@ async fn branch_push_current_head_noop_leaves_no_row_even_with_event_supplied() 
 
     let (push_op, _w) = admitted_operation(&store, "branch_push_commit").await;
     let push_input = BranchPushCommitInput {
+        fragment_witness: None,
         repository_id: repository_id.clone(),
         branch_id,
         expected_repository_generation: 1,
@@ -2009,6 +2010,7 @@ async fn branch_push_tip_advance_commits_exactly_one_row_with_branch_generation_
     let new_head = rand::random::<[u8; 32]>().to_vec();
     let (push_op, _w) = admitted_operation(&store, "branch_push_commit").await;
     let push_input = BranchPushCommitInput {
+        fragment_witness: None,
         repository_id: repository_id.clone(),
         branch_id,
         expected_repository_generation: 1,
@@ -2082,6 +2084,7 @@ async fn branch_push_cas_mismatch_leaves_no_row() {
 
     let (push_op, _w) = admitted_operation(&store, "branch_push_commit").await;
     let push_input = BranchPushCommitInput {
+        fragment_witness: None,
         repository_id: repository_id.clone(),
         branch_id,
         expected_repository_generation: 1,

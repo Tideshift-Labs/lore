@@ -15,6 +15,8 @@
 #[path = "common/case_namespace.rs"]
 mod case_namespace;
 
+mod domain_fragment_membership;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ops::Deref;
@@ -55,7 +57,7 @@ use lore_postgres::domain::fragments::MissingDiagnostic;
 use lore_postgres::domain::fragments::PostgresFragmentCoordinator;
 use lore_postgres::domain::fragments::PushWitnessVerdict;
 use lore_postgres::domain::fragments::REQUIRED_FRAGMENT_CHANGED;
-use lore_postgres::domain::fragments::REQUIRED_FRAGMENT_REVALIDATION_LIMIT;
+use lore_postgres::domain::fragments::REQUIRED_FRAGMENT_PROOF_UNAVAILABLE;
 use lore_postgres::domain::fragments::RequiredFragment;
 use lore_postgres::domain::fragments::STAGED_LEASE_ALREADY_RELEASED;
 use lore_postgres::domain::fragments::STAGED_LEASE_MEMBER_NOT_STAGED;
@@ -4408,13 +4410,11 @@ async fn revalidate_push_witness_reports_unchanged_when_neither_scalar_moved() {
     assert_eq!(verdict, PushWitnessVerdict::Unchanged);
 }
 
-/// P1-2 item 1b: `FallbackSatisfied`. The lifecycle scalar moves via a
-/// bystander fragment's readable-to-unreadable transition; the two required
-/// fragments are untouched and still readable at their captured epoch, so the
-/// bounded fallback revalidates and satisfies the push.
+/// A bystander lifecycle transition refuses without a complete membership
+/// proof, even when both listed dependencies remain readable at their epochs.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn revalidate_push_witness_is_satisfied_by_the_fallback_when_the_lifecycle_scalar_moved_and_required_fragments_are_still_readable()
+async fn revalidate_push_witness_refuses_missing_proof_when_lifecycle_moves_despite_readable_dependencies()
  {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
@@ -4530,12 +4530,14 @@ async fn revalidate_push_witness_is_satisfied_by_the_fallback_when_the_lifecycle
         .expect("revalidate must not error");
     assert_eq!(
         verdict,
-        PushWitnessVerdict::FallbackSatisfied { revalidated: 2 }
+        PushWitnessVerdict::Aborted {
+            reason: REQUIRED_FRAGMENT_PROOF_UNAVAILABLE
+        }
     );
 }
 
-/// P1-2 item 1c (first `Aborted` shape): a required fragment that has become
-/// unreadable (here, `Missing`) since preflight.
+/// A required fragment becomes Missing after preflight. Lifecycle movement
+/// refuses for unavailable proof before inspecting the listed dependencies.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn revalidate_push_witness_aborts_when_a_required_fragment_is_no_longer_readable() {
@@ -4612,14 +4614,13 @@ async fn revalidate_push_witness_aborts_when_a_required_fragment_is_no_longer_re
     assert_eq!(
         verdict,
         PushWitnessVerdict::Aborted {
-            reason: REQUIRED_FRAGMENT_CHANGED
+            reason: REQUIRED_FRAGMENT_PROOF_UNAVAILABLE
         }
     );
 }
 
-/// P1-2 item 1c (second `Aborted` shape): a required fragment whose epoch
-/// advanced (a repair successor) since preflight, even though it is still
-/// readable.
+/// A repair advances a required fragment's epoch. The lifecycle change refuses
+/// for unavailable proof even though the successor is readable.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn revalidate_push_witness_aborts_when_a_required_fragments_epoch_advanced() {
@@ -4720,33 +4721,17 @@ async fn revalidate_push_witness_aborts_when_a_required_fragments_epoch_advanced
     assert_eq!(
         verdict,
         PushWitnessVerdict::Aborted {
-            reason: REQUIRED_FRAGMENT_CHANGED
+            reason: REQUIRED_FRAGMENT_PROOF_UNAVAILABLE
         }
     );
 }
 
-/// P1-2 item 1d: the 4,097-synthetic-fragment refusal. `MAX_PUSH_FRAGMENT_REVALIDATIONS`
-/// is a count check on the caller's slice, reachable with fabricated hashes
-/// that were never inserted -- this is the case INV-EF's own record wrongly
-/// attributed to needing real upload traffic. Proven behaviorally (`Aborted`)
-/// and structurally: the refusal happens before `LockClass::Fragments` is
-/// ever entered.
-///
-/// **No push-witness before/after comparison here on purpose.**
-/// `revalidate_push_witness` has no code path, in this or any other verdict,
-/// that writes to `lore_domain_repositories` -- it only ever reads that table
-/// and, past the count check, takes `FOR UPDATE` locks on
-/// `lore_fragment_lifecycle`. A witness-unchanged assertion would therefore
-/// hold no matter what this function did, which is the same
-/// cannot-fail-regardless-of-behavior shape INV-EF's own P2-11 flagged
-/// elsewhere -- caught here by a reviewer pass rather than shipped. The
-/// `LockClass::Repository` re-entry below is the one proof that actually
-/// discriminates: it could not succeed if `Fragments` had already been
-/// entered.
+/// An oversized, uncertified dependency list cannot bypass proof refusal after
+/// lifecycle movement. This pins proof unavailability, not a size-limit verdict.
+/// Repository re-entry proves the refusal never enters the Fragments lock class.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn revalidate_push_witness_refuses_over_the_revalidation_limit_before_locking_any_fragment_row()
- {
+async fn revalidate_push_witness_refuses_missing_proof_for_oversized_input_before_fragment_locks() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -4827,7 +4812,7 @@ async fn revalidate_push_witness_refuses_over_the_revalidation_limit_before_lock
     assert_eq!(
         verdict,
         PushWitnessVerdict::Aborted {
-            reason: REQUIRED_FRAGMENT_REVALIDATION_LIMIT
+            reason: REQUIRED_FRAGMENT_PROOF_UNAVAILABLE
         }
     );
 
@@ -4837,20 +4822,17 @@ async fn revalidate_push_witness_refuses_over_the_revalidation_limit_before_lock
     // entered Fragments, re-entering Repository here would be rejected as a
     // lock-order inversion.
     sequence.enter(LockClass::Repository).expect(
-        "the revalidation-limit refusal must return before locking any fragment row; if \
+        "the proof-unavailable refusal must return before locking any fragment row; if \
          LockClass::Fragments had been entered, this would be a lock-order violation",
     );
     drop(tx); // never committed; the function made no writes to roll back
 }
 
-/// CR-031:266 (INV-EF P2-2): a required fragment promoted from `Staged` to a
-/// `Remote` epoch that is semantically equivalent -- same `decoded_hash`,
-/// `size_content`, `size_payload`, and `payload_flags` -- must satisfy the
-/// push fallback even though its epoch genuinely advanced and its
-/// `object_key`/`manifest_id` changed (deliberately not compared).
+/// Equivalent promotion does not certify a complete membership proof. A
+/// separate lifecycle change still refuses despite representation equivalence.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn revalidate_push_witness_accepts_a_required_fragment_promoted_to_a_semantically_equivalent_epoch()
+async fn revalidate_push_witness_refuses_missing_proof_after_equivalent_promotion_and_lifecycle_movement()
  {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
@@ -4956,8 +4938,7 @@ async fn revalidate_push_witness_accepts_a_required_fragment_promoted_to_a_seman
         CommitVerdict::Published
     );
 
-    // Move the lifecycle scalar so the call reaches the fallback rather than
-    // short-circuiting on `Unchanged`.
+    // Move lifecycle generation so unavailable proof refuses the call.
     let resolved_bystander = coordinator
         .resolve(
             &repository_id,
@@ -5009,14 +4990,14 @@ async fn revalidate_push_witness_accepts_a_required_fragment_promoted_to_a_seman
         .expect("revalidate must not error");
     assert_eq!(
         verdict,
-        PushWitnessVerdict::FallbackSatisfied { revalidated: 1 }
+        PushWitnessVerdict::Aborted {
+            reason: REQUIRED_FRAGMENT_PROOF_UNAVAILABLE
+        }
     );
 }
 
-/// CR-031:266's equivalence allowance is narrow: a successor epoch whose
-/// manifest differs in `decoded_hash` or `payload_flags` describes different
-/// content and must abort, even though the head is still readable and
-/// `size_content`/`size_payload` are unchanged.
+/// Content-divergent successors also refuse on lifecycle movement without a
+/// complete membership proof. The current gate does not compare these epochs.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn revalidate_push_witness_aborts_when_the_new_epoch_describes_different_content() {
@@ -5161,8 +5142,7 @@ async fn revalidate_push_witness_aborts_when_the_new_epoch_describes_different_c
         CommitVerdict::Published
     );
 
-    // Move the lifecycle scalar so both revalidations below reach the
-    // fallback branch rather than short-circuiting on `Unchanged`.
+    // Move lifecycle generation so both calls require complete proof.
     let resolved_bystander = coordinator
         .resolve(
             &repository_id,
@@ -5217,9 +5197,9 @@ async fn revalidate_push_witness_aborts_when_the_new_epoch_describes_different_c
         assert_eq!(
             verdict,
             PushWitnessVerdict::Aborted {
-                reason: REQUIRED_FRAGMENT_CHANGED
+                reason: REQUIRED_FRAGMENT_PROOF_UNAVAILABLE
             },
-            "{label} divergence must abort the push, not fall through the equivalence allowance"
+            "{label}: lifecycle movement requires a complete membership proof"
         );
     }
 }
@@ -7502,12 +7482,8 @@ async fn acquire_staged_leases_refuses_a_duplicate_hash_batch_and_an_empty_batch
     );
 }
 
-/// A required fragment whose CAPTURED epoch was never published for that hash
-/// at all (not merely superseded) must abort, even though the head is
-/// genuinely readable at some other epoch. `equivalent_epochs` joins
-/// `lore_fragment_epochs` on the captured epoch; when that row does not
-/// exist, the join drops the pair, `matched` falls short of `divergent.len()`,
-/// and the all-or-nothing rule aborts the whole push.
+/// An unpublished captured epoch cannot bypass proof refusal after lifecycle
+/// movement. The current gate does not reach physical epoch comparison.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn revalidate_push_witness_aborts_when_the_captured_epoch_was_never_published() {
@@ -7556,8 +7532,7 @@ async fn revalidate_push_witness_aborts_when_the_captured_epoch_was_never_publis
         .expect("capture witness")
         .expect("repository must exist");
 
-    // Move the lifecycle scalar via a bystander so the call reaches the
-    // fallback rather than short-circuiting on `Unchanged`.
+    // Move lifecycle generation via a bystander so the call requires proof.
     let bystander_hash = random_hash();
     let BeginOutcome::Admitted(bystander_intent) = coordinator
         .begin_direct_write(&bystander_hash, &legacy_key(&bystander_hash))
@@ -7628,21 +7603,16 @@ async fn revalidate_push_witness_aborts_when_the_captured_epoch_was_never_publis
     assert_eq!(
         verdict,
         PushWitnessVerdict::Aborted {
-            reason: REQUIRED_FRAGMENT_CHANGED
+            reason: REQUIRED_FRAGMENT_PROOF_UNAVAILABLE
         }
     );
 }
 
-/// `equivalent_epochs`' all-or-nothing rule (`matched == divergent.len()`)
-/// cannot be discriminated by a one-element `required` slice -- both branches
-/// of the boolean collapse to the same answer at `len() == 1`. A genuine
-/// two-fragment batch is required: two fragments both promoted equivalently
-/// pins the exact `revalidated: 2` count, and swapping one of them for a
-/// non-equivalent promotion must abort the WHOLE push, not just the one
-/// fragment that diverged.
+/// Both an equivalent two-fragment batch and a mixed batch refuse after
+/// lifecycle movement because neither list certifies complete membership.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn revalidate_push_witness_all_or_nothing_over_a_mixed_divergent_batch() {
+async fn revalidate_push_witness_refuses_missing_proof_for_equivalent_and_mixed_batches() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -7796,8 +7766,7 @@ async fn revalidate_push_witness_all_or_nothing_over_a_mixed_divergent_batch() {
         CommitVerdict::Published
     );
 
-    // Move the lifecycle scalar so both revalidations below reach the
-    // fallback branch rather than short-circuiting on `Unchanged`.
+    // Move lifecycle generation so both calls require complete proof.
     let resolved_bystander = coordinator
         .resolve(
             &repository_id,
@@ -7837,9 +7806,7 @@ async fn revalidate_push_witness_all_or_nothing_over_a_mixed_divergent_batch() {
         );
     }
 
-    // Part 1: two REQUIRED fragments, both promoted equivalently -- the
-    // fallback's exact revalidated count is pinned at 2, not just some
-    // positive number, or the length of an incidentally-1-element slice.
+    // Part 1: representation equivalence alone cannot authorize fallback.
     let both_equivalent = vec![
         RequiredFragment {
             hash: hash_a.clone(),
@@ -7868,22 +7835,15 @@ async fn revalidate_push_witness_all_or_nothing_over_a_mixed_divergent_batch() {
         .expect("revalidate must not error");
     assert_eq!(
         verdict,
-        PushWitnessVerdict::FallbackSatisfied { revalidated: 2 }
+        PushWitnessVerdict::Aborted {
+            reason: REQUIRED_FRAGMENT_PROOF_UNAVAILABLE
+        }
     );
-    // Neither `tx` nor `tx_client` was ever committed, so `tx`'s `FOR UPDATE`
-    // lock on hash_a's and hash_b's rows is still held until dropped. Part 2
-    // below re-locks hash_a in a SEPARATE transaction on a separate pool --
-    // without an explicit drop here, shadowing `tx`/`tx_client` with new `let`
-    // bindings does not free them (Rust drops shadowed values at end of
-    // scope, not at shadowing), and Part 2 would block forever waiting on a
-    // lock this same test still holds. Revert-checked: removing these two
-    // `drop`s reproduces the hang deterministically.
+    // End the first validation transaction before exercising the mixed batch.
     drop(tx);
     drop(tx_client);
 
-    // Part 2: swap B for C (non-equivalent). One equivalent member and one
-    // non-equivalent member in the SAME batch must abort the whole push, not
-    // just skip the bad one.
+    // Part 2: a mixed batch has the same missing-proof refusal.
     let mixed = vec![
         RequiredFragment {
             hash: hash_a,
@@ -7907,9 +7867,9 @@ async fn revalidate_push_witness_all_or_nothing_over_a_mixed_divergent_batch() {
     assert_eq!(
         verdict,
         PushWitnessVerdict::Aborted {
-            reason: REQUIRED_FRAGMENT_CHANGED
+            reason: REQUIRED_FRAGMENT_PROOF_UNAVAILABLE
         },
-        "one non-equivalent member in an otherwise-equivalent batch must abort the whole push"
+        "a mixed batch cannot certify complete membership"
     );
 }
 
@@ -8290,8 +8250,8 @@ fn summarize_pushes(samples: &[PushSample]) -> String {
 /// things: publishes a brand-new fragment (pure upload volume, associated with
 /// nothing), drives one of its own already-associated fragments readable to
 /// unreadable, and re-uploads it unreadable to readable through the repair
-/// path. Those two transitions move `fragment_lifecycle_generation`, the
-/// scalar the bounded push fallback exists to survive.
+/// path. Those two transitions move `fragment_lifecycle_generation` and make
+/// stale captures require a complete membership proof.
 ///
 /// Under [`UploaderTraffic::PublishAndAssociate`] each iteration publishes a
 /// fresh fragment and associates it into the repository, which is what a real
@@ -8528,63 +8488,15 @@ async fn uploader_hash_set(
     hashes
 }
 
-/// Three disjoint same-repository uploaders active for at least ten seconds,
-/// 100 pushes whose required sets are at most
-/// `MAX_PUSH_FRAGMENT_REVALIDATIONS` fragments, each committing on its
-/// **first** final-transaction attempt with no fallback-induced `ABORTED`,
-/// under a 30-second suite watchdog.
-///
-/// # This is NOT CR-031's `same_repo_bulk_upload_does_not_starve_branch_push`
-///
-/// That name is the CR's normative acceptance test, and it is deliberately
-/// **not implemented**, because it is unsatisfiable against the frozen
-/// contract: a real bulk upload creates associations, and the association arm
-/// admits no fallback. Nothing in this file may wear that name while testing
-/// something narrower. What stands in its place is
-/// [`characterize_same_repo_association_traffic_push_aborts`], which runs the
-/// literal scenario as a measurement of what the push path actually returns.
-///
-/// This case covers the neighbouring property that *is* satisfiable and that
-/// nothing else pins: the bounded fallback carrying a push through sustained
-/// same-repository **lifecycle** churn.
-///
-/// # What the uploader traffic deliberately is, and is not
-///
-/// The uploaders move the pushing repository's **lifecycle** scalar: they
-/// publish fresh fragments and drive their own disjoint, already-associated
-/// hashes readable to unreadable to readable. That is the exact contention the
-/// bounded fallback was added for, and every push here must therefore reach
-/// `Unchanged` or `FallbackSatisfied`.
-///
-/// They deliberately do **not** create new associations in the pushing
-/// repository, and this case does not cover that traffic. `create_association`
-/// and `create_association_if_current` both move
-/// `content_association_generation`, and `classify_push_witness` gives
-/// `AssociationMoved` precedence over `LifecycleOnly` and admits no fallback
-/// for it (CR-031:258-267 grants the bounded fallback only for a changed
-/// lifecycle scalar). A same-repository uploader that creates associations
-/// therefore aborts a push whose preflight predates it, by contract rather than
-/// by defect. Read this green as covering lifecycle-scalar contention only;
-/// association-creating same-repository traffic is measured separately by
-/// [`characterize_same_repo_association_traffic_push_aborts`], which is a
-/// characterization rather than an acceptance case.
-///
-/// # Timing regime
-///
-/// This runs against a local disposable PostgreSQL with no object store, so it
-/// is a different timing regime from production, not a scaled model of one.
-/// Both sides move: with no provider I/O the uploader cycle is faster (more
-/// scalar movement per second, harsher for the push), and the push's own
-/// capture-to-revalidate window is also shorter (fewer chances to be
-/// invalidated). Which effect dominates depends on the ratio between the two,
-/// and **nobody has measured it** -- so do not read this tier as either
-/// conservative or optimistic relative to a deployed cell. The case prints the
-/// achieved uploader rate, both scalars' movement, the verdict distribution,
-/// and the observed push window precisely so the regime a given run was
-/// produced in is on the record instead of being described.
+/// Three uploaders cycle already-associated fragments through readable and
+/// unreadable states for at least ten seconds while 100 push validations run.
+/// Lifecycle movement must refuse without a complete membership proof;
+/// captures that remain current may use the scalar fast path.
+/// This local PostgreSQL fixture reports its timing regime and does not model
+/// provider latency or the separate fresh-association acceptance scenario.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn same_repo_lifecycle_traffic_does_not_starve_branch_push() {
+async fn same_repo_lifecycle_traffic_requires_complete_proof() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -8729,7 +8641,7 @@ async fn same_repo_lifecycle_traffic_does_not_starve_branch_push() {
     assert!(
         lifecycle_moves > 0,
         "the pushing repository's lifecycle scalar must actually have moved during the window; \
-         at zero movement this case proves nothing about the bounded fallback however green it is"
+         at zero movement this case proves nothing about lifecycle proof refusal"
     );
     assert_eq!(
         association_moves, 0,
@@ -8752,20 +8664,17 @@ async fn same_repo_lifecycle_traffic_does_not_starve_branch_push() {
         .filter(|verdict| matches!(verdict, PushWitnessVerdict::Aborted { .. }))
         .collect();
     assert!(
-        aborted.is_empty(),
-        "CR-031 requires all {SUSTAINED_PUSH_COUNT} pushes to commit on the first \
-         final-transaction attempt with no fallback-induced ABORTED; {} aborted: {aborted:?}",
-        aborted.len()
+        !aborted.is_empty(),
+        "live lifecycle traffic must invalidate some captured witnesses"
     );
+    assert!(aborted.iter().all(|verdict| matches!(verdict, PushWitnessVerdict::Aborted { reason } if *reason == REQUIRED_FRAGMENT_PROOF_UNAVAILABLE)));
     let fallbacks = samples
         .iter()
         .filter(|sample| matches!(sample.verdict, PushWitnessVerdict::FallbackSatisfied { .. }))
         .count();
-    assert!(
-        fallbacks >= 1,
-        "at least one push must have raced a lifecycle bump into its own preflight window and \
-         been carried by the bounded fallback; {SUSTAINED_PUSH_COUNT} `Unchanged` verdicts would \
-         mean this case never exercised the fallback at all"
+    assert_eq!(
+        fallbacks, 0,
+        "the first slice has no complete-proof producer"
     );
     for sample in &samples {
         if let PushWitnessVerdict::FallbackSatisfied { revalidated } = &sample.verdict {
@@ -8787,7 +8696,7 @@ async fn same_repo_lifecycle_traffic_does_not_starve_branch_push() {
 /// re-measuring latency.
 ///
 /// The timing-regime caveat on
-/// [`same_repo_lifecycle_traffic_does_not_starve_branch_push`] applies here too: this
+/// [`same_repo_lifecycle_traffic_requires_complete_proof`] applies here too: this
 /// is a different regime from production in both directions at once, and which
 /// dominates is unmeasured. The printed rate, scalar movement, verdict
 /// distribution, and push window record the regime this run was produced in.
@@ -9378,58 +9287,14 @@ async fn create_association_if_current_bumps_the_association_generation_on_every
 /// produces is the output, and running out is itself a reportable answer.
 const QUIET_SCALAR_WAIT_BUDGET: Duration = Duration::from_secs(20);
 
-/// **Characterization, not acceptance.** CR-031's literal
-/// `same_repo_bulk_upload_does_not_starve_branch_push` shape -- three
-/// same-repository uploaders doing what a real bulk upload does, which includes
-/// creating associations -- and a measurement of what the push path actually
-/// returns under it.
-///
-/// This case exists because that literal shape is unsatisfiable against the
-/// frozen contract, and an owner deciding between amending the test spec and
-/// narrowing the association check needs measured evidence rather than an
-/// argument. The chain, all verified in source:
-///
-/// * a real upload ends in `create_association` (`store/immutable_store.rs`) or
-///   `create_association_if_current`, and both call
-///   `bump_association_generation` unconditionally;
-/// * that moves `content_association_generation` on the uploaded-into
-///   repository;
-/// * `classify_push_witness` returns `AssociationMoved`, which outranks
-///   `LifecycleOnly` and returns `Aborted { required_fragment_changed }` with no
-///   fallback -- CR-031's F-031-3 grants the bounded fallback only for a changed
-///   *lifecycle* scalar.
-///
-/// So a same-repository push racing genuine upload traffic aborts, while
-/// CR-031's own acceptance text requires zero fallback-induced `ABORTED` under
-/// exactly that traffic. The over-strictness *is* the starvation the CR says
-/// must not happen.
-///
-/// **The precedence is deliberate and is not a defect to fix from here.**
-/// `revalidate_push_witness`'s own comment records that association precedence
-/// is what keeps obliterate-then-recreate out of reach of the
-/// semantically-equivalent-epoch allowance. Loosening it is a frozen-contract
-/// decision with a real safety rationale behind it, and it belongs to the CR's
-/// owner.
-///
-/// # What is asserted, and what is only reported
-///
-/// The only assertion is that **at least one** push aborted with exactly
-/// `REQUIRED_FRAGMENT_CHANGED`. That cannot flake upward: the mechanism is
-/// deterministic given any association bump inside any push's window, and the
-/// case fails loudly if the traffic never got going. Everything else -- the
-/// abort rate, how many pushes commit first-attempt, and how long a push must
-/// wait for a quiet association scalar -- is printed, not asserted, because a
-/// rate measured on this rig is a property of this rig's timing regime.
-///
-/// The timing-regime caveat on
-/// [`same_repo_lifecycle_traffic_does_not_starve_branch_push`] applies in full: with
-/// no object-store latency the uploaders cycle faster *and* the push window is
-/// shorter, the two push the abort rate in opposite directions, and which one
-/// dominates has not been measured. Do not read the printed rate as a
-/// production estimate in either direction.
+/// Three same-repository uploaders create fresh exact association keys while
+/// 100 push validations run. Association generation moves, but destructive
+/// membership and lifecycle generations do not, so every validation must use
+/// the scalar fast path without an abort. Timing output characterizes this
+/// local PostgreSQL fixture, not production provider latency.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
-async fn characterize_same_repo_association_traffic_push_aborts() {
+async fn fresh_same_repo_association_traffic_preserves_the_scalar_fast_path() {
     let Some(url) = pg_url() else {
         panic!("runner must set LORE_TEST_PG_URL")
     };
@@ -9551,17 +9416,8 @@ async fn characterize_same_repo_association_traffic_push_aborts() {
     );
     println!("WP118-P7-ASSOC-CHAR {}", summarize_pushes(&samples));
 
-    // Attribution note, because this filter does NOT by itself prove which arm
-    // fired. `REQUIRED_FRAGMENT_CHANGED` is emitted by five arms of
-    // `revalidate_push_witness` (`coordinator.rs:3129`, `:3148`, `:3211`,
-    // `:3217`, `:3230`) -- an absent repository row, the association-moved
-    // precedence, a required fragment whose row vanished, one that is no longer
-    // readable, and a non-equivalent epoch. The attribution to the
-    // association arm is INDIRECT and rests on the two assertions below:
-    // `lifecycle_moves == 0` rules out every readability-driven arm (no
-    // fragment this repository is associated with crossed the boundary, and
-    // the required set is never touched by the uploaders), and the repository
-    // demonstrably exists. Do not read this filter as direct proof of the arm.
+    // Fresh keys must produce no membership-change refusal. The final
+    // all-Unchanged assertion also excludes every other refusal reason.
     let aborted = samples
         .iter()
         .filter(|sample| {
@@ -9628,35 +9484,25 @@ async fn characterize_same_repo_association_traffic_push_aborts() {
          of the aborts to the association scalar would not hold"
     );
 
-    // Non-vacuity pin, and it is load-bearing rather than decorative. Under
-    // the current contract an association-moved witness NEVER reaches the
-    // bounded fallback, so the fallback count must be zero. Without this,
-    // loosening the association precedence -- the exact change this case exists
-    // to inform -- would turn most of these aborts into `FallbackSatisfied`
-    // while leaving a handful of aborts from other causes, and the case would
-    // survive the very change it was written to characterize.
+    // Fresh-key traffic must succeed through scalar equality, without fallback.
     assert_eq!(
         samples
             .iter()
             .filter(|sample| matches!(sample.verdict, PushWitnessVerdict::FallbackSatisfied { .. }))
             .count(),
         0,
-        "an association-moved witness must never reach the bounded fallback under the current \
-         contract; a nonzero count here means the precedence changed and this characterization \
-         is stale, not passing"
+        "fresh-key additions must use the scalar fast path without fallback"
     );
 
-    // The finding itself. Given any association bump landing inside any of 100
-    // push windows this is deterministic; if it ever fails, either the traffic
-    // stopped or the association precedence changed, and both are things the
-    // owner needs to know.
+    // Association movement alone must not invalidate captured membership.
+    assert_eq!(
+        aborted, 0,
+        "fresh-key uploads must not invalidate captured membership"
+    );
     assert!(
-        aborted >= 1,
-        "the association-precedence starvation must be observable: with {association_moves} \
-         association bumps against {} pushes, at least one push must have aborted with \
-         `{REQUIRED_FRAGMENT_CHANGED}`. Zero aborts means either the uploaders never contended \
-         or the contract changed",
-        samples.len()
+        samples
+            .iter()
+            .all(|sample| sample.verdict == PushWitnessVerdict::Unchanged)
     );
 }
 

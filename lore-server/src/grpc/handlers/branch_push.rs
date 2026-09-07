@@ -366,6 +366,7 @@ pub(crate) struct GovernedPushCommit {
     branch_generation: i64,
     expected_latest_hash: Vec<u8>,
     lock_witness: PushLockWitness,
+    fragment_witness: Option<lore_postgres::domain::fragments::PushGenerationWitness>,
     pub(crate) owner: VerifiedLockOwner,
     /// The branch's authored name, carried for the event's bounded payload.
     ///
@@ -416,7 +417,24 @@ pub(crate) async fn prepare_governed_push(
         .await
         .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?;
     let Some(admitted) = admitted else {
+        if domain.fragment_coordinator().is_some() {
+            return Err(Status::failed_precondition(
+                "fragment push requires governed admission",
+            ));
+        }
         return Ok(None);
+    };
+
+    let fragment_witness = if let Some(coordinator) = domain.fragment_coordinator() {
+        Some(
+            coordinator
+                .capture_push_witness(repository_id.as_ref())
+                .await
+                .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?
+                .ok_or_else(|| Status::not_found("Repository not found"))?,
+        )
+    } else {
+        None
     };
 
     let repository = domain
@@ -457,6 +475,7 @@ pub(crate) async fn prepare_governed_push(
         branch_generation: branch.generation,
         expected_latest_hash: branch.latest_hash,
         lock_witness,
+        fragment_witness,
         owner,
         branch_name: branch.name,
     }))
@@ -566,6 +585,7 @@ impl GovernedPushCommit {
             (Some(_), true) | (None, _) => None,
         };
         let input = BranchPushCommitInput {
+            fragment_witness: self.fragment_witness,
             repository_id: repository.id.as_ref().to_vec(),
             branch_id: branch.as_ref().to_vec(),
             expected_repository_generation: self.repository_generation,
@@ -601,6 +621,10 @@ impl GovernedPushCommit {
                 lore_postgres::domain::coordinator::GENERATION_MISMATCH_V1
                 | lore_postgres::domain::coordinator::CAS_MISMATCH_V1 => {
                     Err(Status::aborted("Branch preflight changed; rerun preflight"))
+                }
+                lore_postgres::domain::fragments::REQUIRED_FRAGMENT_CHANGED
+                | lore_postgres::domain::fragments::REQUIRED_FRAGMENT_PROOF_UNAVAILABLE => {
+                    Err(Status::aborted(reason))
                 }
                 _ => Err(Status::failed_precondition(reason)),
             },

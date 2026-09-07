@@ -76,6 +76,8 @@ use crate::plugins::remote_notification::factory::create_with_transport;
 use crate::plugins::remote_notification::fake_gateway::FakeGateway;
 use crate::plugins::remote_notification::fake_gateway::ScriptedResponse;
 
+mod membership_tests;
+
 // ---------------------------------------------------------------------------
 // Shared fixtures — live Postgres (Section A/C)
 // ---------------------------------------------------------------------------
@@ -715,6 +717,7 @@ fn build_governed(
     branch_generation: i64,
 ) -> GovernedPushCommit {
     GovernedPushCommit {
+        fragment_witness: None,
         domain,
         operation: dummy_operation(),
         repository_generation,
@@ -1326,6 +1329,25 @@ async fn prepare_and_build_push_request(
     requested_revision: Hash,
     pusher_token: &AuthorizationToken,
 ) -> Request<BranchPushRequest> {
+    prepare_and_build_push_request_with_options(
+        store,
+        repository_id_bytes,
+        branch_id_bytes,
+        requested_revision,
+        pusher_token,
+        false,
+    )
+    .await
+}
+
+async fn prepare_and_build_push_request_with_options(
+    store: &Arc<dyn DomainTransactionStore>,
+    repository_id_bytes: [u8; 16],
+    branch_id_bytes: [u8; 16],
+    requested_revision: Hash,
+    pusher_token: &AuthorizationToken,
+    fast_forward_merge: bool,
+) -> Request<BranchPushRequest> {
     let operation_id = Uuid::now_v7();
     let fingerprint: [u8; FINGERPRINT_V1_LEN] = rand::random();
     let tenant_scope_key = scope_key_target_repository(&repository_id_bytes)
@@ -1335,7 +1357,7 @@ async fn prepare_and_build_push_request(
         branch_id: &branch_id_bytes,
         requested_revision: requested_revision.as_ref(),
         force: false,
-        fast_forward_merge: false,
+        fast_forward_merge,
     })
     .expect("branch push intent must hash");
     let key = ReceiptKey {
@@ -1345,7 +1367,7 @@ async fn prepare_and_build_push_request(
         operation_id,
     };
     let binding = OperationBinding {
-        method: "branch_push_commit".to_owned(),
+        method: crate::domain::PLATFORM_METHOD_BRANCH_PUSH.to_owned(),
         scope: tenant_scope_key,
         fingerprint_version: 1,
         fingerprint: fingerprint.to_vec(),
@@ -1363,7 +1385,7 @@ async fn prepare_and_build_push_request(
         branch: BranchId::from(branch_id_bytes).into(),
         revision: requested_revision.into(),
         force: false,
-        fast_forward_merge: false,
+        fast_forward_merge,
     });
     request.metadata_mut().insert_bin(
         REPOSITORY_ID_KEY,

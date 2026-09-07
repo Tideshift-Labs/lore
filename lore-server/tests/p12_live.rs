@@ -1279,6 +1279,7 @@ async fn released_client_push_with_no_carriage_commits_one_branch_pushed_row_via
     )
     .expect("build the branch.pushed event");
     let push_input = BranchPushCommitInput {
+        fragment_witness: None,
         repository_id: repository_id.to_vec(),
         branch_id: branch_id.to_vec(),
         expected_repository_generation: 1,
