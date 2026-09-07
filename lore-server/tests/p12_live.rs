@@ -162,6 +162,7 @@ async fn create_repository(
         prepare_token: token,
     };
     let input = RepositoryCreateInput {
+        metadata_witnesses: Vec::new(),
         repository_id: repository_id.to_vec(),
         name: format!("p12-live-{operation_id}"),
         metadata_hash: rand::random::<[u8; 32]>().to_vec(),
@@ -1141,6 +1142,7 @@ async fn released_client_push_with_no_carriage_commits_one_branch_pushed_row_via
     let fixture_principal = principal_namespace(Uuid::now_v7());
     let create_key = mediated_key(create_operation_id, &rand::random(), &fixture_principal);
     let create_input = RepositoryCreateInput {
+        metadata_witnesses: Vec::new(),
         repository_id: repository_id.to_vec(),
         name: format!("wp120-push-{:016x}", rand::random::<u64>()),
         metadata_hash: rand::random::<[u8; 32]>().to_vec(),

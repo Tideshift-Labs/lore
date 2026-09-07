@@ -510,7 +510,7 @@ fn direct_put_claim_is_authorized_immediately_before_the_bounded_send() {
 #[test]
 fn every_coordinated_direct_put_claims_before_provider_io_while_get_stays_unmetered() {
     let source = immutable_store_source();
-    let put = function(&source, "async fn put_coordinated(");
+    let put = function(&source, "async fn upload_coordinated_representation(");
     assert_eq!(put.matches("FragmentWriteClaimInput::new(").count(), 1);
     assert_eq!(put.matches(".begin_direct_write(").count(), 1);
     assert_eq!(put.matches(".issue_direct_put(").count(), 1);

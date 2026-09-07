@@ -1873,6 +1873,14 @@ impl GovernedRepositoryCreate {
         &self,
         publication: &RepositoryCreatePublication<'_>,
     ) -> Result<RepositoryCreateOutcome, Status> {
+        self.commit_with_metadata(publication, &[]).await
+    }
+
+    pub(crate) async fn commit_with_metadata(
+        &self,
+        publication: &RepositoryCreatePublication<'_>,
+        metadata_witnesses: &[lore_postgres::domain::fragments::EpochWitness],
+    ) -> Result<RepositoryCreateOutcome, Status> {
         // CR-032 classifies a repository create as two committed transitions,
         // not one: "Repository live publication" and "Branch create". The
         // reservation and verification work that precedes it — the private
@@ -1904,6 +1912,7 @@ impl GovernedRepositoryCreate {
             None => Vec::new(),
         };
         let input = RepositoryCreateInput {
+            metadata_witnesses: metadata_witnesses.to_vec(),
             repository_id: publication.repository_id.to_vec(),
             name: publication.name.to_owned(),
             metadata_hash: publication.metadata_hash.to_vec(),
@@ -1941,12 +1950,11 @@ impl GovernedRepositoryCreate {
         // retry of a create whose metadata has since moved, the domain row is
         // the repository that exists and the published hash is stale.
         //
-        // Deliberately best-effort. The transaction has already committed, so a
-        // failure here says nothing about the mutation, and turning it into an
-        // error would report a durable success as a failure — the one thing
-        // CR-029's outcome rules never permit. A read failure or a missing row
-        // falls back to the pointer this call published, which is exactly right
-        // on the fresh-create path and at worst stale on a retry.
+        // A coordinated retry may have uploaded speculative metadata that the
+        // replay did not bind. Never report that pointer as a successful result.
+        // A failed readback leaves the receipt Applied but the response pointer
+        // unavailable; callers must reconcile instead of treating it as a
+        // rejected mutation. Preserve the legacy store's fallback separately.
         let metadata_hash = match self
             .domain
             .store()
@@ -1954,8 +1962,21 @@ impl GovernedRepositoryCreate {
             .await
         {
             Ok(Some(snapshot)) => Hash::from(snapshot.metadata_hash.as_slice()),
+            Ok(None) if !metadata_witnesses.is_empty() => {
+                return Err(Status::aborted(
+                    "Repository creation is applied, but its metadata pointer is unavailable; \
+                     reconcile the attempt receipt and repository before retrying",
+                ));
+            }
             Ok(None) => Hash::from(publication.metadata_hash),
             Err(error) => {
+                if !metadata_witnesses.is_empty() {
+                    warn!(%error, "Repository creation applied, but metadata readback failed");
+                    return Err(Status::aborted(
+                        "Repository creation is applied, but its metadata pointer is unavailable; \
+                         reconcile the attempt receipt and repository before retrying",
+                    ));
+                }
                 warn!(
                     %error,
                     "Governed repository create committed, but reading its metadata pointer back \
@@ -2684,6 +2705,7 @@ pub fn reject_unwired_governed_operation(admitted: &AdmittedOperation, method: &
 
 /// WP-120's real `DomainBackfillSource` over one live cell's stores.
 pub mod backfill_source;
+mod creation_metadata;
 pub mod fragment_operator;
 /// WP-120's `loreserver domain <status|cutover>` operator surface.
 pub mod operator;
@@ -3635,11 +3657,15 @@ pub(crate) mod test_support {
 
     /// A scriptable coordinator for `branch_push.rs`'s `GovernedPushCommit::publish`
     /// tests (INV-EE P1-5): records every `branch_push_commit` call's input and
-    /// returns a caller-supplied scripted [`MutationResult`] for it. Every other
-    /// method is `unreachable!()`, mirroring [`UnreachableDomainStore`] so a
+    /// returns a caller-supplied scripted [`MutationResult`] for it. Create tests
+    /// explicitly install a snapshot script; otherwise create remains unreachable.
+    /// Other methods are `unreachable!()`, mirroring [`UnreachableDomainStore`] so a
     /// signature drift fails to compile rather than silently inheriting a body.
     pub(crate) struct ScriptedDomainStore {
         result: MutationResult,
+        pub(crate) create_snapshot:
+            std::sync::Mutex<Option<Result<Option<RepositorySnapshot>, DomainError>>>,
+        pub(crate) create_calls: std::sync::Mutex<Vec<RepositoryCreateInput>>,
         calls: std::sync::Mutex<Vec<BranchPushCommitInput>>,
     }
 
@@ -3648,6 +3674,8 @@ pub(crate) mod test_support {
         pub(crate) fn new(result: MutationResult) -> Self {
             Self {
                 result,
+                create_snapshot: std::sync::Mutex::new(None),
+                create_calls: std::sync::Mutex::new(Vec::new()),
                 calls: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -3739,7 +3767,11 @@ pub(crate) mod test_support {
             &self,
             _repository_id: &[u8],
         ) -> Result<Option<RepositorySnapshot>, DomainError> {
-            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+            self.create_snapshot
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted create snapshot")
         }
 
         async fn branch_snapshot(
@@ -3753,9 +3785,14 @@ pub(crate) mod test_support {
         async fn repository_create(
             &self,
             _operation: &GovernedOperation,
-            _input: &RepositoryCreateInput,
+            input: &RepositoryCreateInput,
         ) -> Result<MutationResult, DomainError> {
-            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+            assert!(
+                self.create_snapshot.lock().unwrap().is_some(),
+                "repository_create must be explicitly scripted"
+            );
+            self.create_calls.lock().unwrap().push(input.clone());
+            Ok(self.result.clone())
         }
 
         async fn repository_delete(
@@ -6167,6 +6204,7 @@ mod tests {
                 prepare_token: token,
             };
             let input = RepositoryCreateInput {
+                metadata_witnesses: Vec::new(),
                 repository_id: repository_id.to_vec(),
                 name: format!("wp116-gap-{operation_id}"),
                 metadata_hash: rand::random::<[u8; 32]>().to_vec(),
@@ -6230,3 +6268,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "domain/creation_readback_tests.rs"]
+mod creation_readback_tests;

@@ -241,8 +241,8 @@ async fn clean_initialized_normal_provider_upload_query_read_and_grants_are_live
     assert_eq!(
         direct
             .query_one(
-                "SELECT count(*) FROM lore_fragment_write_claims WHERE state=2",
-                &[]
+                "SELECT count(*) FROM lore_fragment_write_claims WHERE state=2 AND hash=$1",
+                &[&hash.data().as_slice()]
             )
             .await
             .unwrap()
@@ -263,6 +263,9 @@ async fn clean_initialized_normal_provider_upload_query_read_and_grants_are_live
         payload
     );
 }
+
+#[path = "../../../lore-postgres/tests/common/create_metadata_witness.rs"]
+mod create_metadata_witness;
 
 async fn create_repository(store: &lore_postgres::domain::PostgresDomainStore) -> [u8; 16] {
     use lore_postgres::domain::coordinator::DomainTransactionStore;
@@ -302,14 +305,23 @@ async fn create_repository(store: &lore_postgres::domain::PostgresDomainStore) -
         panic!("repository create receipt must prepare")
     };
     let repository = *uuid::Uuid::now_v7().as_bytes();
+    // Repository metadata is a coordinator fixture observation here; the payload roundtrip
+    // above still uses the actual provider and charges. The RPC tier proves actual create uploads.
+    let metadata_hash = uuid::Uuid::now_v7().as_bytes().repeat(2);
+    let branch_metadata_hash = uuid::Uuid::now_v7().as_bytes().repeat(2);
+    let metadata_witnesses = vec![
+        create_metadata_witness::publish(store, &metadata_hash).await,
+        create_metadata_witness::publish(store, &branch_metadata_hash).await,
+    ];
     let input = RepositoryCreateInput {
+        metadata_witnesses,
         repository_id: repository.to_vec(),
         name: "clean-init-roundtrip".into(),
-        metadata_hash: vec![1; 32],
+        metadata_hash,
         default_branch_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
         default_branch_name: "main".into(),
-        default_branch_metadata_hash: vec![2; 32],
-        default_branch_latest_hash: vec![3; 32],
+        default_branch_metadata_hash: branch_metadata_hash,
+        default_branch_latest_hash: vec![0; 32],
         creation_fingerprint: vec![4; 32],
         creation_fingerprint_version: 1,
         projection: vec![],
@@ -332,3 +344,7 @@ async fn create_repository(store: &lore_postgres::domain::PostgresDomainStore) -
     );
     repository
 }
+
+#[cfg(feature = "failure_generator")]
+#[path = "clean_init_publication_race.rs"]
+mod publication_race;

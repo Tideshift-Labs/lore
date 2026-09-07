@@ -2,36 +2,29 @@
 # SPDX-License-Identifier: MIT
 <#
 .SYNOPSIS
-Run clean-cell initialization tests against owned PostgreSQL and MinIO containers.
+Run WP118 single-server authenticated RPC proof against owned PostgreSQL and MinIO.
 .DESCRIPTION
 Every ignored case receives an empty database. Operator cases create their own buckets.
 The compiled catalog must agree with the test source. Zero-test runs fail.
 #>
 [CmdletBinding()]
-param([switch]$KeepOnFailure, [switch]$PublicationRaceOnly)
+param([switch]$KeepOnFailure, [switch]$SkipBuild)
 
 $ErrorActionPreference = 'Stop'
 $loreRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $runId = [Guid]::NewGuid().ToString('N')
-$label = 'com.tideshift.lore.clean-init-tests'
-$pgName = "lore-clean-init-pg-$runId"
-$s3Name = "lore-clean-init-s3-$runId"
-$tlsRoot = Join-Path ([IO.Path]::GetTempPath()) "lore-clean-init-tls-$runId"
+$label = 'com.tideshift.lore.single-rpc-tests'
+$pgName = "lore-single-rpc-pg-$runId"
+$s3Name = "lore-single-rpc-s3-$runId"
+$tlsRoot = Join-Path ([IO.Path]::GetTempPath()) "lore-single-rpc-tls-$runId"
 $owned = [Collections.Generic.List[string]]::new()
 $passed = $false
 $results = [Collections.Generic.List[object]]::new()
 $targets = @(
-    @{ Package = 'lore-postgres'; Target = 'domain_fragment_clean_init'; Kind = 'test'; Prefix = ''; Source = 'lore-postgres/tests/domain_fragment_clean_init.rs' },
-    @{ Package = 'lore-server'; Target = 'fragment_clean_init_operator'; Kind = 'test'; Prefix = ''; Source = 'lore-server/tests/fragment_clean_init_operator.rs' },
-    @{ Package = 'lore-server'; Target = 'lore_server'; Kind = 'lib'; Prefix = 'plugins::postgres::clean_init_construction_tests::'; Source = 'lore-server/tests/common/clean_init_construction.rs' }
+    @{ Package = 'lore-server'; Target = 'clean_init_single_server_rpc'; Kind = 'test'; Prefix = ''; Source = 'lore-server/tests/clean_init_single_server_rpc.rs' }
 )
-$featureArgs = @()
-if ($PublicationRaceOnly) {
-    $featureArgs = @('--features', 'failure_generator')
-    $targets = @(@{ Package = 'lore-server'; Target = 'lore_server'; Kind = 'lib'; Prefix = 'plugins::postgres::clean_init_construction_tests::publication_race::'; Source = 'lore-server/tests/common/clean_init_publication_race.rs' })
-}
 $savedEnv = @{}
-foreach ($key in @('LORE_FRAGMENT_FAILPOINTS', 'LORE_FRAGMENT_FAILPOINT_DIR', 'LORE_TEST_PG_URL', 'LORE_TEST_S3_ENDPOINT', 'LORE_TEST_S3_REGION', 'LORE_TEST_CLEAN_INIT_CA_PATH', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_EC2_METADATA_DISABLED')) {
+foreach ($key in @('LORE_TEST_SINGLE_RPC_SERVER', 'LORE_TEST_SINGLE_RPC_LOG', 'LORE_TEST_PG_URL', 'LORE_TEST_S3_ENDPOINT', 'LORE_TEST_S3_REGION', 'LORE_TEST_CLEAN_INIT_CA_PATH', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_EC2_METADATA_DISABLED')) {
     $savedEnv[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
 }
 
@@ -49,13 +42,14 @@ function Invoke-CargoCaptured([string[]]$ArgumentList) {
 
 Push-Location $loreRoot
 try {
-    if ($PublicationRaceOnly) {
-        $env:LORE_FRAGMENT_FAILPOINTS = 'publication.commit.settled=pause'
-        $env:LORE_FRAGMENT_FAILPOINT_DIR = $tlsRoot
-    }
+    if (-not $SkipBuild) { $null = Invoke-CargoCaptured @('build', '-p', 'lore-server', '--release', '--bin', 'loreserver', '-j', '4') }
+    $env:LORE_TEST_SINGLE_RPC_SERVER = Join-Path $loreRoot 'target/release/loreserver.exe'
+    if (-not (Test-Path -LiteralPath $env:LORE_TEST_SINGLE_RPC_SERVER)) { throw 'release loreserver missing' }
+    Write-Host ('Server release SHA256: ' + (Get-FileHash -Algorithm SHA256 -LiteralPath $env:LORE_TEST_SINGLE_RPC_SERVER).Hash)
+    $env:LORE_TEST_SINGLE_RPC_LOG = Join-Path (Split-Path -Parent $loreRoot) '.codex/tmp/single-rpc-server.log'
     foreach ($target in $targets) {
         $targetArgs = if ($target.Kind -eq 'lib') { @('--lib') } else { @('--test', $target.Target) }
-        $arguments = @('test', '-j', '4', '-p', $target.Package) + $targetArgs + $featureArgs + @('--', '--ignored', '--list')
+        $arguments = @('test', '-j', '4', '-p', $target.Package) + $targetArgs + @('--', '--ignored', '--list')
         $catalog = Invoke-CargoCaptured $arguments
         $names = @([regex]::Matches($catalog, '(?m)^([A-Za-z0-9_:]+): test\r?$') | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_.StartsWith($target.Prefix) })
         $source = Get-Content -Raw (Join-Path $loreRoot $target.Source)
@@ -85,7 +79,7 @@ try {
         Start-Sleep -Milliseconds 200
     } while ($true)
     # Only the dispatch pool requires pinned TLS. Domain/store fixture clients keep their
-    # plaintext local setup path so the lost-COMMIT proxy can inspect protocol frames.
+    # plaintext local setup path; the serving dispatch client verifies the fixture CA.
     New-Item -ItemType Directory -Path $tlsRoot | Out-Null
     $caKey = Join-Path $tlsRoot 'ca.key'
     $ca = Join-Path $tlsRoot 'ca.crt'
@@ -141,12 +135,13 @@ try {
     $index = 0
     foreach ($result in $results) {
         $database = "clean_init_$index"
+        $env:LORE_TEST_SINGLE_RPC_LOG = Join-Path (Split-Path -Parent $loreRoot) ".codex/tmp/single-rpc-server-$index.log"
         $index++
         Invoke-Checked docker @('exec', $pgName, 'createdb', '-U', 'postgres', $database)
         $env:LORE_TEST_PG_URL = "postgresql://postgres@127.0.0.1:$pgPort/$database`?sslmode=disable"
         try {
             $targetArgs = if ($result.Kind -eq 'lib') { @('--lib') } else { @('--test', $result.Target) }
-            $arguments = @('test', '-j', '4', '-p', $result.Package) + $targetArgs + $featureArgs + @('--', '--ignored', '--exact', $result.Test, '--nocapture')
+            $arguments = @('test', '-j', '4', '-p', $result.Package) + $targetArgs + @('--', '--ignored', '--exact', $result.Test, '--nocapture')
             $output = Invoke-CargoCaptured $arguments
             Write-Host $output
             if ($output -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw 'expected exactly one executed test' }
@@ -178,7 +173,7 @@ finally {
         $expected = [IO.Path]::GetFullPath($tlsRoot)
         $parent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\','/')
         if ($resolved -ne $expected -or (Split-Path -Parent $resolved) -ne $parent) { throw 'TLS fixture cleanup escaped owned temporary directory' }
-        foreach ($file in @('ca.key','ca.crt','ca.srl','server.key','server.csr','server.crt','server.ext','publication.commit.settled.hold','publication.commit.settled.reached')) {
+        foreach ($file in @('ca.key','ca.crt','ca.srl','server.key','server.csr','server.crt','server.ext')) {
             $ownedFile = Join-Path $resolved $file
             if (Test-Path -LiteralPath $ownedFile -PathType Leaf) { Remove-Item -LiteralPath $ownedFile -Force }
         }

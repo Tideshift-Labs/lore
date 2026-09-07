@@ -186,6 +186,7 @@ async fn create_repository(store: &PostgresDomainStore) -> ([u8; 16], [u8; 16]) 
     let branch_id: [u8; 16] = rand::random();
     let operation = prepare_create_operation(store).await;
     let input = RepositoryCreateInput {
+        metadata_witnesses: Vec::new(),
         repository_id: repository_id.to_vec(),
         name: format!("wp117-lock-{:016x}", rand::random::<u64>()),
         metadata_hash: rand::random::<[u8; 32]>().to_vec(),

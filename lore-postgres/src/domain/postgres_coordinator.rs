@@ -577,6 +577,9 @@ impl DomainTransactionStore for PostgresDomainStore {
             return Ok(result);
         }
 
+        tx.batch_execute("SAVEPOINT repository_create_fresh")
+            .await
+            .map_err(|e| DomainError::from_pg("repository create savepoint", e))?;
         tx.execute(
             "INSERT INTO lore_domain_repositories ( \
                  repository_id, state, generation, name, metadata_hash, default_branch_id, \
@@ -661,7 +664,51 @@ impl DomainTransactionStore for PostgresDomainStore {
         .await
         .map_err(|e| DomainError::from_pg("default branch name insert", e))?;
 
+        let metadata_events = match crate::domain::fragments::coordinator::bind_creation_metadata(
+            &tx,
+            &mut sequence,
+            input,
+        )
+        .await
+        {
+            Ok(events) => events,
+            Err(DomainError::PreconditionRejected {
+                reason,
+                reason_version,
+            }) => {
+                // A raced or absent metadata witness is a decisive rejection. Undo the private
+                // fresh rows while retaining the admitted receipt, then record that outcome.
+                tx.batch_execute("ROLLBACK TO SAVEPOINT repository_create_fresh")
+                    .await
+                    .map_err(|e| DomainError::from_pg("repository create metadata rollback", e))?;
+                let result = MutationResult {
+                    outcome: DomainOutcome::NotApplied {
+                        reason,
+                        reason_version,
+                    },
+                    repository_generation: None,
+                    branch_generation: None,
+                    observed_pointer: None,
+                };
+                receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock)
+                    .await?;
+                classify_commit(
+                    tx.commit().await,
+                    "repository create metadata rejection commit",
+                )?;
+                return Ok(result);
+            }
+            Err(error) => return Err(error),
+        };
         apply_projection(&tx, &input.projection).await?;
+        metadata_events
+            .append(
+                &tx,
+                &mut sequence,
+                input.events.first().map(|e| e.cell_id.as_str()),
+                &input.repository_id,
+            )
+            .await?;
         append_events(
             &tx,
             &mut sequence,

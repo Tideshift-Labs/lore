@@ -115,6 +115,7 @@ use crate::domain::fragments::decodable_encoding;
 use crate::domain::fragments::read_fragment_write_capability;
 
 pub mod clean_namespace;
+pub mod creation_metadata;
 
 /// Self-bootstrapping schema. The `(hash, repository, context)` primary key is
 /// the association identity; its B-tree also serves the leftmost-prefix
@@ -1445,6 +1446,29 @@ impl PostgresImmutableStore {
                 )),
             };
         };
+        let witness = self
+            .upload_coordinated_representation(coordinator, provider, address, fragment, payload)
+            .await?;
+        match coordinator
+            .create_association_if_current(&witness, repository.data(), address.context.data())
+            .await
+            .map_err(domain_store_err)?
+        {
+            CommitVerdict::Published => Ok(()),
+            CommitVerdict::Fenced | CommitVerdict::Abandoned => Err(StoreError::from(SlowDown)),
+        }
+    }
+
+    /// Upload bytes without granting any repository association. Only the bounded, server-side
+    /// create-metadata capability uses this directly; ordinary PUT binds the returned witness.
+    async fn upload_coordinated_representation(
+        &self,
+        coordinator: &PostgresFragmentCoordinator,
+        provider: CoordinatedProvider<'_>,
+        address: Address,
+        fragment: Fragment,
+        payload: Bytes,
+    ) -> Result<crate::domain::fragments::EpochWitness, StoreError> {
         let preflight_manifest = FragmentManifest {
             authority: EpochAuthority::Remote,
             object_key: String::new(),
@@ -1482,22 +1506,7 @@ impl PostgresImmutableStore {
             .await
             .map_err(domain_store_err)?;
         let intent = match begin {
-            BeginOutcome::AlreadyReadable(witness) => {
-                return match coordinator
-                    .create_association_if_current(
-                        &witness,
-                        repository.data(),
-                        address.context.data(),
-                    )
-                    .await
-                    .map_err(domain_store_err)?
-                {
-                    CommitVerdict::Published => Ok(()),
-                    CommitVerdict::Fenced | CommitVerdict::Abandoned => {
-                        Err(StoreError::from(SlowDown))
-                    }
-                };
-            }
+            BeginOutcome::AlreadyReadable(witness) => return Ok(*witness),
             BeginOutcome::Fenced(_) => return Err(StoreError::from(SlowDown)),
             BeginOutcome::WriteClaimBlocked { .. } => {
                 return Err(StoreError::from(SlowDown));
@@ -1533,18 +1542,17 @@ impl PostgresImmutableStore {
         if !published_readable {
             return Err(StoreError::from(SlowDown));
         }
-        match coordinator
-            .create_association(
-                address.hash.data(),
-                repository.data(),
-                address.context.data(),
-            )
+        let witness = coordinator
+            .capture_current_readable_epoch(address.hash.data())
             .await
             .map_err(domain_store_err)?
+            .ok_or_else(|| StoreError::from(SlowDown))?;
+        if witness.epoch != intent.epoch
+            || witness.manifest_id.as_ref() != Some(&manifest.manifest_id)
         {
-            CommitVerdict::Published => Ok(()),
-            CommitVerdict::Fenced | CommitVerdict::Abandoned => Err(StoreError::from(SlowDown)),
+            return Err(StoreError::from(SlowDown));
         }
+        Ok(witness)
     }
 
     /// Fetch the payload and its authoritative fragment from one `GetObject` response.

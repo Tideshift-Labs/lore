@@ -102,6 +102,10 @@ const PAUSE_POLL: Duration = Duration::from_millis(5);
 /// "left over". An anchor with no entry here is not reachable through
 /// [`hit`] — the configuration parser drops it.
 const ANCHORS: &[(&str, &str)] = &[
+    (
+        "repository_create.metadata_bound",
+        "WP-118 single-server create: failure between metadata associations must roll back the entire publication",
+    ),
     // ---- publication ---------------------------------------------------
     (
         "publication.begin.entry",

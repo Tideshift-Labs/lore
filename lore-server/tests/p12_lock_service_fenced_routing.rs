@@ -357,6 +357,7 @@ async fn create_repository_and_branch(store: &PostgresDomainStore) -> ([u8; 16],
         panic!("fixture repository create must prepare");
     };
     let input = RepositoryCreateInput {
+        metadata_witnesses: Vec::new(),
         repository_id: repository_id.to_vec(),
         name: format!("wp120-lock-{:016x}", rand::random::<u64>()),
         metadata_hash: rand::random::<[u8; 32]>().to_vec(),

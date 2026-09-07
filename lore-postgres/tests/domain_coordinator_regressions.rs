@@ -120,6 +120,7 @@ async fn admitted_operation(
 
 fn repository_create_input(name: String) -> RepositoryCreateInput {
     RepositoryCreateInput {
+        metadata_witnesses: Vec::new(),
         repository_id: rand::random::<[u8; 16]>().to_vec(),
         name,
         metadata_hash: rand::random::<[u8; 32]>().to_vec(),

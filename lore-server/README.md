@@ -58,6 +58,11 @@ later uploads. The exclusion flag records an operator attestation; it does not r
 Use the [initialization runbook](../../lorehub/docs/runbooks/clean-cell-fragment-initialization.md)
 for prerequisites, configuration order and recovery. No serving endpoint is opened by the command.
 
+Coordinated repository creation binds its uploaded metadata with the repository transaction.
+Metadata-upload throttling returns `RESOURCE_EXHAUSTED`. If creation is already Applied but its
+authoritative metadata cannot be read, `ABORTED` requires receipt reconciliation; it does not mean
+the committed repository was rolled back. Ordinary uploads still require an existing repository.
+
 ## Plugin System
 
 The Lore Server uses a plugin system for swappable storage backends and topology discovery.

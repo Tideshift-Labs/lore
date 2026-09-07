@@ -283,6 +283,7 @@ fn repository_create_input(
     event: Option<PendingEvent>,
 ) -> RepositoryCreateInput {
     RepositoryCreateInput {
+        metadata_witnesses: Vec::new(),
         repository_id,
         name,
         metadata_hash: rand::random::<[u8; 32]>().to_vec(),

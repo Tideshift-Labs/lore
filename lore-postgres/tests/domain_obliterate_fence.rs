@@ -154,6 +154,7 @@ fn repository_create_input(
     default_branch_latest_hash: &[u8; 32],
 ) -> RepositoryCreateInput {
     RepositoryCreateInput {
+        metadata_witnesses: Vec::new(),
         repository_id: repository_id.to_vec(),
         name,
         metadata_hash: rand::random::<[u8; 32]>().to_vec(),

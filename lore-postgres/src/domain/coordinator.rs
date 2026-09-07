@@ -125,6 +125,9 @@ pub struct GovernedOperation {
 /// Create one repository and its default branch, atomically.
 #[derive(Debug, Clone)]
 pub struct RepositoryCreateInput {
+    /// Exact uploaded metadata epochs, bound atomically on fresh coordinated creation.
+    /// Empty only before fragment lifecycle activation; exact replays do not consume these.
+    pub metadata_witnesses: Vec<super::fragments::EpochWitness>,
     /// 16-byte repository identity, chosen by the caller.
     pub repository_id: Vec<u8>,
     /// Exact name to claim.

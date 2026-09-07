@@ -59,8 +59,9 @@ use std::path::PathBuf;
 /// deliberately absent, and it is the ONLY exemption: it holds
 /// only re-exports and the `DomainError` conversion, and it cannot reach a
 /// provider because this crate cannot name the types that would let it.
-const SCANNED_FILES: [&str; 8] = [
+const SCANNED_FILES: [&str; 9] = [
     "coordinator.rs",
+    "creation.rs",
     "failpoints.rs",
     "initialization.rs",
     "masks.rs",
@@ -72,8 +73,9 @@ const SCANNED_FILES: [&str; 8] = [
 
 /// Every `.rs` file expected in the package, so a new one cannot appear and
 /// escape the scan by not being listed.
-const PACKAGE_FILES: [&str; 9] = [
+const PACKAGE_FILES: [&str; 10] = [
     "coordinator.rs",
+    "creation.rs",
     "failpoints.rs",
     "initialization.rs",
     "masks.rs",
@@ -229,11 +231,20 @@ fn the_scanned_file_list_is_what_the_package_compiles() {
         })
         .collect();
     declared.push("mod.rs".to_string());
+    let coordinator_source = strip_line_comments(&read("coordinator.rs"));
+    assert_eq!(
+        coordinator_source
+            .lines()
+            .filter(|line| line.trim() == "mod creation;")
+            .count(),
+        1
+    );
+    declared.push("creation.rs".to_string());
     declared.sort();
     assert_eq!(
         declared,
         PACKAGE_FILES.map(str::to_string).to_vec(),
-        "mod.rs's module declarations must match the scanned file list exactly",
+        "root and explicitly pinned sibling module declarations must match the scanned file list exactly",
     );
 
     // Every package file is scanned except the ones this list names, and the
@@ -499,7 +510,14 @@ fn every_failpoint_anchor_is_declared_even_in_a_default_build() {
 #[test]
 fn the_package_splices_in_no_source_from_outside_itself() {
     for file in PACKAGE_FILES {
-        let found = hits(&strip_line_comments(&read(file)), &["include!", "#[path"]);
+        let mut source = strip_line_comments(&read(file));
+        if file == "coordinator.rs" {
+            // This sibling is explicitly included in PACKAGE_FILES and scanned above.
+            let local_creation = "#[path = \"creation.rs\"]";
+            assert_eq!(source.matches(local_creation).count(), 1);
+            source = source.replace(local_creation, "");
+        }
+        let found = hits(&source, &["include!", "#[path"]);
         assert!(
             found.is_empty(),
             "{file} names {found:?}, which compiles source this guard never reads",

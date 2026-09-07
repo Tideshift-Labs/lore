@@ -89,6 +89,10 @@ fn coordinated_put_and_direct_provider_io_hold_no_store_connection_transaction_o
             function(&immutable, "async fn put_coordinated("),
         ),
         (
+            "upload_coordinated_representation",
+            function(&immutable, "async fn upload_coordinated_representation("),
+        ),
+        (
             "issue_direct_put",
             function(&immutable, "async fn issue_direct_put("),
         ),
@@ -111,7 +115,14 @@ fn coordinated_put_and_direct_provider_io_hold_no_store_connection_transaction_o
 #[test]
 fn ordinary_direct_write_supplies_the_legacy_hash_key_but_missing_uses_a_repair_epoch_key() {
     let immutable = source("src/store/immutable_store.rs");
-    let coordinated = function(&immutable, "async fn put_coordinated(");
+    let ordinary = function(&immutable, "async fn put_coordinated(");
+    assert!(ordinary.contains(
+        ".upload_coordinated_representation(coordinator, provider, address, fragment, payload)"
+    ));
+    assert!(ordinary.contains(
+        ".create_association_if_current(&witness, repository.data(), address.context.data())"
+    ));
+    let coordinated = function(&immutable, "async fn upload_coordinated_representation(");
     assert!(coordinated.contains("let legacy_key = Self::hash_key(address.hash);"));
     assert!(
         coordinated.contains(".begin_direct_write(address.hash.data(), &legacy_key, write_claim)")
@@ -137,7 +148,7 @@ fn persisted_direct_write_lineage_drives_retry_traffic_class_and_uncertainty_com
     assert!(issue.contains("Some(DirectWriteKind::Repair) => ProviderTrafficClass::Repair"));
     assert!(issue.contains("None =>"));
 
-    let coordinated = function(&immutable, "async fn put_coordinated(");
+    let coordinated = function(&immutable, "async fn upload_coordinated_representation(");
     let begin = coordinated
         .find(".begin_direct_write(address.hash.data(), &legacy_key, write_claim)")
         .expect("durable begin/resume");
@@ -162,7 +173,7 @@ fn coordinated_put_without_payload_is_db_only_and_requires_an_exact_readable_ass
         .find("let Some(payload) = payload else")
         .expect("None branch");
     let preflight = coordinated
-        .find("let preflight_manifest")
+        .find("let witness = self")
         .expect("payload path");
     let none_branch = &coordinated[none..preflight];
 
@@ -404,7 +415,7 @@ fn ambiguous_conditional_put_verifies_once_by_unmetered_get_before_any_remote_or
         );
     }
 
-    let coordinated = function(&immutable, "async fn put_coordinated(");
+    let coordinated = function(&immutable, "async fn upload_coordinated_representation(");
     let provider_io = coordinated
         .find(".issue_direct_put(")
         .expect("conditional provider PUT");

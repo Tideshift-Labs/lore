@@ -56,11 +56,14 @@
 //! purge, backfill) wait on WP-114's CD-1/CD-3/CD-4/CD-5 and are not here.
 
 use std::collections::BTreeMap;
+#[path = "creation.rs"]
+mod creation;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
+pub(crate) use creation::bind_creation_metadata;
 use deadpool_postgres::Pool;
 use deadpool_postgres::Transaction;
 
@@ -4608,7 +4611,7 @@ impl FragmentHeadLock {
 /// exist. Any future caller that proceeds on `None` must re-derive that
 /// argument rather than inherit it.
 async fn lock_fragment_head(
-    tx: &Transaction<'_>,
+    tx: &tokio_postgres::Transaction<'_>,
     sequence: &mut LockSequence,
     hash: &[u8],
 ) -> Result<Option<FragmentHeadLock>, DomainError> {
@@ -5791,7 +5794,7 @@ async fn replay_staged_lease(
 }
 
 /// Allocate one monotonic epoch or fence. Gaps are valid.
-async fn next_fence(tx: &Transaction<'_>) -> Result<i64, DomainError> {
+async fn next_fence(tx: &tokio_postgres::Transaction<'_>) -> Result<i64, DomainError> {
     tx.query_one("SELECT nextval('lore_fragment_fence_seq')::bigint", &[])
         .await
         .map_err(|error| DomainError::from_pg("fragment fence allocation", error))
@@ -5836,7 +5839,7 @@ async fn stamp_operation_fence(
 
 /// Classify the exact key while its Repository row is already locked.
 async fn association_key_exists(
-    tx: &Transaction<'_>,
+    tx: &tokio_postgres::Transaction<'_>,
     hash: &[u8],
     repository_id: &[u8],
     context: &[u8],
@@ -5878,7 +5881,7 @@ async fn association_key_exists(
 /// synthesised so a future caller that skips the lock produces no event instead
 /// of an event keyed on a guessed version.
 async fn bump_association_generation(
-    tx: &Transaction<'_>,
+    tx: &tokio_postgres::Transaction<'_>,
     repository_id: &[u8],
     invalidates_binding: bool,
 ) -> Result<Option<AssociationAdvance>, DomainError> {
@@ -6101,7 +6104,7 @@ async fn apply_lifecycle_generation(
 /// `CommittedVersions::branch_generation` is always `None` here and both
 /// summary builders name an `Exact` ordinal.
 async fn append_summary_event(
-    tx: &Transaction<'_>,
+    tx: &tokio_postgres::Transaction<'_>,
     sequence: &mut LockSequence,
     repository_id: &[u8],
     repository_generation: i64,
@@ -6198,7 +6201,7 @@ async fn append_lifecycle_summaries(
 /// stored on the row, which keeps the event honest; closing D8 is a writer
 /// change in this coordinator, not something the event can paper over.
 async fn append_association_summary(
-    tx: &Transaction<'_>,
+    tx: &tokio_postgres::Transaction<'_>,
     sequence: &mut LockSequence,
     cell_id: Option<&str>,
     repository_id: &[u8],

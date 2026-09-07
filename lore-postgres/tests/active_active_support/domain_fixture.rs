@@ -137,6 +137,7 @@ pub fn create_input(
     ids: &mut Identities,
 ) -> RepositoryCreateInput {
     RepositoryCreateInput {
+        metadata_witnesses: Vec::new(),
         repository_id: repository_id.to_vec(),
         name,
         metadata_hash: ids.id32().to_vec(),

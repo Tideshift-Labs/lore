@@ -429,8 +429,10 @@ async fn repository_create(
 ///
 /// Only then does the coordinator open its transaction, which writes the
 /// repository row, the default-branch row, both name rows, all five
-/// `lore_mutable` projection rows, and both classified outbox events — or none
-/// of them.
+/// `lore_mutable` projection rows, and both classified outbox events. With the
+/// coordinated fragment store, it also validates the uploaded epochs and binds
+/// their repository associations and summary events atomically with those rows.
+/// A refusal publishes none of them.
 ///
 /// The blob writes are before rather than after on purpose: the transaction
 /// then only ever commits pointers to content that already exists. The cost is
@@ -526,6 +528,10 @@ pub(crate) async fn governed_repository_create(
             .await?;
     }
 
+    let creation_metadata = governed.metadata_upload_context(&repository)?;
+    let metadata_repository = creation_metadata
+        .as_ref()
+        .map_or_else(|| repository.clone(), |context| context.repository.clone());
     let metadata = RepositoryMetadata {
         name: name.to_string(),
         description: description.to_string(),
@@ -534,9 +540,12 @@ pub(crate) async fn governed_repository_create(
         creator: repository_creator.to_string(),
         created,
     };
-    let metadata_hash = repository::metadata_store(repository.clone(), metadata.clone())
+    let metadata_hash = repository::metadata_store(metadata_repository.clone(), metadata.clone())
         .await
         .warn_map_err(|err| {
+            if err.is_slow_down() {
+                return Status::resource_exhausted("Repository metadata upload requires retry");
+            }
             Status::internal(format!("Failed to serialize repository metadata: {err}"))
         })?;
 
@@ -559,9 +568,12 @@ pub(crate) async fn governed_repository_create(
         })
     })?;
     let branch_metadata_hash = branch_metadata
-        .serialize(repository.clone())
+        .serialize(metadata_repository)
         .await
         .warn_map_err(|err| {
+            if err.is_slow_down() {
+                return Status::resource_exhausted("Default branch metadata upload requires retry");
+            }
             Status::internal(format!(
                 "Failed to serialize default branch metadata: {err}"
             ))
@@ -572,18 +584,25 @@ pub(crate) async fn governed_repository_create(
     // sentinel, which is why the projection row for it is a delete rather than
     // a row of zero bytes.
     let default_branch_latest_hash = lore_storage::Hash::default();
+    let metadata_witnesses = match &creation_metadata {
+        Some(context) => context.uploads.witnesses().await,
+        None => Vec::new(),
+    };
 
     let outcome = governed
-        .commit(&RepositoryCreatePublication {
-            salt: repository.salt(),
-            repository_id: repository.id.data(),
-            name,
-            metadata_hash: metadata_hash.as_ref(),
-            default_branch_id: default_branch_id.data(),
-            default_branch_name,
-            default_branch_metadata_hash: branch_metadata_hash.as_ref(),
-            default_branch_latest_hash: default_branch_latest_hash.as_ref(),
-        })
+        .commit_with_metadata(
+            &RepositoryCreatePublication {
+                salt: repository.salt(),
+                repository_id: repository.id.data(),
+                name,
+                metadata_hash: metadata_hash.as_ref(),
+                default_branch_id: default_branch_id.data(),
+                default_branch_name,
+                default_branch_metadata_hash: branch_metadata_hash.as_ref(),
+                default_branch_latest_hash: default_branch_latest_hash.as_ref(),
+            },
+            &metadata_witnesses,
+        )
         .await?;
 
     info!(
@@ -600,6 +619,12 @@ pub(crate) async fn governed_repository_create(
     let committed = repository::metadata(repository, outcome.metadata_hash)
         .await
         .warn_map_err(|err| {
+            if creation_metadata.is_some() {
+                return Status::aborted(
+                    "Repository creation is applied, but its metadata could not be read; \
+                     reconcile the attempt receipt and repository before retrying",
+                );
+            }
             Status::internal(format!(
                 "Failed to load committed repository metadata: {err}"
             ))
