@@ -57,6 +57,7 @@ struct Claims {
     env: String,
     name: String,
     preferred_username: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     resources: Vec<Resource>,
     groups: Vec<String>,
     is_service_account: bool,
@@ -146,6 +147,37 @@ pub struct TokenMinter {
     header: jsonwebtoken::Header,
     issuer: String,
     audience: String,
+}
+
+#[test]
+fn authn_minter_omits_resources_while_storage_minter_preserves_them() {
+    let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../lorehub/docker/test-fixtures");
+    let minter = TokenMinter {
+        key: jsonwebtoken::EncodingKey::from_rsa_pem(
+            &std::fs::read(fixtures.join("jwt-private-key.pem")).unwrap(),
+        )
+        .unwrap(),
+        header: jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+        issuer: "https://fixture.invalid".into(),
+        audience: "lore-storage".into(),
+    };
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation.insecure_disable_signature_validation();
+    validation.validate_aud = false;
+    for (token, expected_resources) in [
+        (minter.mint_authn("test"), false),
+        (minter.mint("test"), true),
+    ] {
+        let claims = jsonwebtoken::decode::<serde_json::Value>(
+            &token,
+            &jsonwebtoken::DecodingKey::from_secret(&[]),
+            &validation,
+        )
+        .unwrap()
+        .claims;
+        assert_eq!(claims.get("resources").is_some(), expected_resources);
+    }
 }
 
 impl TokenMinter {

@@ -63,6 +63,9 @@ Metadata-upload throttling returns `RESOURCE_EXHAUSTED`. If creation is already 
 authoritative metadata cannot be read, `ABORTED` requires receipt reconciliation; it does not mean
 the committed repository was rolled back. Ordinary uploads still require an existing repository.
 
+Run `pwsh -NoProfile -File lore-server/tests/run-clean-init-actual-cli-live.ps1` from the repository
+root for the disposable actual-CLI happy-path proof. Its auth callbacks are test doubles.
+
 ## Plugin System
 
 The Lore Server uses a plugin system for swappable storage backends and topology discovery.

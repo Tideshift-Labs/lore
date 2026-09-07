@@ -598,18 +598,30 @@ mod rebac_stub_policy_tests {
     }
 
     #[test]
-    fn bearer_carries_resources_claim_refuses_any_non_empty_count() {
-        assert!(
-            !bearer_carries_resources_claim(0),
-            "an empty resources claim must not be refused on this axis"
-        );
-        assert!(
-            bearer_carries_resources_claim(1),
-            "even a single resources entry must be refused; the refusal is on presence, not count"
-        );
-        assert!(
-            bearer_carries_resources_claim(2),
-            "a multi-entry resources claim must be refused"
-        );
+    fn bearer_carries_resources_claim_refuses_presence() {
+        assert!(!bearer_carries_resources_claim(false));
+        assert!(bearer_carries_resources_claim(true));
+    }
+
+    #[test]
+    fn configured_authn_hosts_are_bounded_and_do_not_change_defaults() {
+        let hosts = vec!["localhost".to_string()];
+        let valid = vec![AUTHN_AUDIENCE.to_string(), "localhost".to_string()];
+        assert!(bearer_audience_is_authn_with_hosts(&valid, &hosts));
+        assert!(!bearer_audience_is_authn_with_hosts(&valid, &[]));
+        assert!(!bearer_audience_is_authn(&valid));
+        for invalid in [
+            vec!["localhost"],
+            vec![AUTHN_AUDIENCE, "unknown.invalid"],
+            vec![AUTHN_AUDIENCE, "lore-storage"],
+            vec!["lore-storage", "localhost"],
+        ] {
+            let invalid: Vec<String> = invalid.into_iter().map(String::from).collect();
+            assert!(!bearer_audience_is_authn_with_hosts(&invalid, &hosts));
+        }
+        assert!(!bearer_audience_is_authn_with_hosts(
+            &[AUTHN_AUDIENCE.into(), "lore-storage".into()],
+            &["lore-storage".into()]
+        ));
     }
 }

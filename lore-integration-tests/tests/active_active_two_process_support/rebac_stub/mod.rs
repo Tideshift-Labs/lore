@@ -97,7 +97,6 @@ use self::policy::DIRECT_AUTHORIZATION_REVISION;
 use self::policy::DirectAuthorizationBinding;
 use self::policy::MEDIATED_ONLY_METHOD;
 use self::policy::Role;
-use self::policy::bearer_audience_is_authn;
 use self::policy::bearer_carries_resources_claim;
 use self::policy::bound_fields_digest;
 use self::policy::contains_bytes;
@@ -156,6 +155,7 @@ pub(crate) struct StubState {
     /// different trust root than the one minting these tokens.
     issuer: String,
     audience: String,
+    authn_hosts: Vec<String>,
     /// The public half of the harness's TEST signing key, read from the same
     /// JWKS document both loreserver processes fetch.
     decoding_key: jsonwebtoken::DecodingKey,
@@ -196,8 +196,28 @@ struct StubClaims {
     is_service_account: bool,
     #[serde(default)]
     aud: Vec<String>,
-    #[serde(default)]
-    resources: Vec<serde_json::Value>,
+    #[serde(default, rename = "resources", deserialize_with = "claim_present")]
+    resources_present: bool,
+}
+
+fn claim_present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    let _ = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(true)
+}
+
+#[test]
+fn direct_claim_decode_distinguishes_absent_empty_and_null_resources() {
+    for (suffix, expected) in [
+        ("", false),
+        (",\"resources\":[]", true),
+        (",\"resources\":null", true),
+        (",\"resources\":[{}]", true),
+    ] {
+        let claims: StubClaims =
+            serde_json::from_str(&format!("{{\"sub\":\"test\",\"iss\":\"test\"{suffix}}}"))
+                .unwrap();
+        assert_eq!(claims.resources_present, expected);
+    }
 }
 
 /// A verified human principal.
@@ -329,7 +349,8 @@ impl StubState {
     ) -> Result<Principal, Status> {
         let token = self.bearer_token(metadata)?;
 
-        // Audience is checked BY HAND against the fixed human-authn literal,
+        // Audience is checked BY HAND against the human-authn literal plus
+        // explicitly configured fixture hosts (empty by default),
         // never against `self.audience` (the exchanged/storage audience every
         // other bearer on this stub carries) -- library-level `set_audience`
         // would only ever check the one value this stub was configured with.
@@ -339,19 +360,15 @@ impl StubState {
         let decoded = jsonwebtoken::decode::<StubClaims>(token, &self.decoding_key, &validation)
             .map_err(|error| self.unauthenticated(format!("bearer rejected: {error}")))?;
 
-        if !bearer_audience_is_authn(&decoded.claims.aud) {
+        if !policy::bearer_audience_is_authn_with_hosts(&decoded.claims.aud, &self.authn_hosts) {
             return Err(self.unauthenticated(format!(
                 "bearer audience {:?} is not the human authn audience {AUTHN_AUDIENCE:?}; an \
                  exchanged multiresource token must never authenticate a direct-human mutation",
                 decoded.claims.aud
             )));
         }
-        if bearer_carries_resources_claim(decoded.claims.resources.len()) {
-            return Err(self.unauthenticated(format!(
-                "bearer carries a non-empty resources claim ({} entries); an exchanged \
-                 multiresource token must never authenticate a human",
-                decoded.claims.resources.len()
-            )));
+        if bearer_carries_resources_claim(decoded.claims.resources_present) {
+            return Err(self.unauthenticated("bearer carries a resources claim; an exchanged multiresource token must never authenticate a human".into()));
         }
 
         self.reject_non_human(&decoded.claims)?;
@@ -717,6 +734,11 @@ impl RebacStub {
     /// failed to bind is reported here rather than as an unexplained
     /// `UNAVAILABLE` deep inside a mutation.
     pub async fn start(env: &Env, port: u16) -> Self {
+        Self::start_with_authn_hosts(env, port, &[]).await
+    }
+
+    /// Explicit CLI-only functional-plus-DNS audience configuration.
+    pub async fn start_with_authn_hosts(env: &Env, port: u16, hosts: &[String]) -> Self {
         let document = std::fs::read_to_string(&env.jwks_json).unwrap_or_else(|error| {
             panic!(
                 "read the JWKS document {}: {error}",
@@ -731,6 +753,7 @@ impl RebacStub {
         let state = Arc::new(StubState {
             issuer: env.jwt_issuer.clone(),
             audience: env.jwt_audience.clone(),
+            authn_hosts: hosts.to_vec(),
             decoding_key,
             org_uuid,
             grants: Mutex::new(HashMap::new()),

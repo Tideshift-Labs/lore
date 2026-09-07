@@ -104,13 +104,28 @@ pub fn bearer_audience_is_authn(aud: &[String]) -> bool {
     aud == [AUTHN_AUDIENCE]
 }
 
+/// CLI fixtures may name explicitly configured DNS hosts alongside the functional
+/// authn audience, supporting the functional-plus-DNS shape minted by the
+/// platform. Storage and unknown
+/// audiences remain refused; the default harness keeps its exact legacy shape.
+/// This is stricter than production's audience intersection: every extra value
+/// must be an explicitly configured fixture host.
+pub fn bearer_audience_is_authn_with_hosts(aud: &[String], hosts: &[String]) -> bool {
+    if hosts.is_empty() {
+        return bearer_audience_is_authn(aud);
+    }
+    aud.iter().any(|value| value == AUTHN_AUDIENCE)
+        && aud.iter().all(|value| {
+            value == AUTHN_AUDIENCE || (value != "lore-storage" && hosts.contains(value))
+        })
+}
+
 /// Does a decoded bearer carry a `resources` claim that must never
 /// authenticate a human?
 ///
-/// Any non-empty count refuses, including a single entry: the platform's own
-/// refusal is on the claim's PRESENCE, not on how many resources it names.
-pub fn bearer_carries_resources_claim(resource_count: usize) -> bool {
-    resource_count > 0
+/// The platform refuses presence, including an empty array or null value.
+pub fn bearer_carries_resources_claim(present: bool) -> bool {
+    present
 }
 
 /// The revision every direct authorization carries.
