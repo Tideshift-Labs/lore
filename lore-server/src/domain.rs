@@ -2684,6 +2684,7 @@ pub fn reject_unwired_governed_operation(admitted: &AdmittedOperation, method: &
 
 /// WP-120's real `DomainBackfillSource` over one live cell's stores.
 pub mod backfill_source;
+pub mod fragment_operator;
 /// WP-120's `loreserver domain <status|cutover>` operator surface.
 pub mod operator;
 

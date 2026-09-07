@@ -108,7 +108,7 @@ fn stored_state_shape_and_barrier_index_match_the_closed_typed_vocabulary() {
         "provider_write_authority_revision text",
         "write_claims_required_at timestamptz",
         "lore_fragment_write_capability_shape",
-        "2                                                                       AS schema_version",
+        "3                                                                       AS schema_version",
     ] {
         assert!(
             FRAGMENT_SCHEMA.contains(required),

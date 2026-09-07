@@ -104,7 +104,7 @@ pub(crate) async fn activate(tx: &Transaction<'_>) -> Result<(), DomainError> {
             "SELECT EXISTS (SELECT 1 FROM lore_domain_schema_state WHERE enforcement_enabled) \
          AND EXISTS (SELECT 1 FROM lore_domain_lock_schema_state WHERE fencing_enabled) \
          AND EXISTS (SELECT 1 FROM lore_fragment_schema_state WHERE lifecycle_enabled \
-           AND backfill_state = 3 AND write_capability = 1)",
+           AND (backfill_state = 3 OR (to_jsonb(lore_fragment_schema_state)->>'clean_initialized_at') IS NOT NULL) AND write_capability = 1)",
             &[],
         )
         .await

@@ -15,11 +15,11 @@
 //! and they were deleted rather than carried. The seam's own remaining rules
 //! live in `lore-fragment-provider/tests/seam_source_pins.rs`.
 //!
-//! What is left is CR-031's no-private-provider-client rule for the seven files
-//! that stayed: `coordinator.rs`, `failpoints.rs`, `masks.rs`, `membership.rs`, `mod.rs`,
+//! What is left is CR-031's no-private-provider-client rule for the database-owned files:
+//! `coordinator.rs`, `failpoints.rs`, `initialization.rs`, `masks.rs`, `membership.rs`, `mod.rs`,
 //! `schema.rs` and `states.rs`. That cannot be a dependency-graph fact here,
 //! because this crate legitimately depends on `aws-sdk-s3` for the legacy CR-007
-//! immutable store. It is a scan over seven files that construct no provider
+//! immutable store. It is a scan over files that construct no provider
 //! client at all — a far smaller surface than the package-wide version it
 //! replaces, and the honest statement is that it is regression detection, not a
 //! proof.
@@ -59,9 +59,10 @@ use std::path::PathBuf;
 /// deliberately absent, and it is the ONLY exemption: it holds
 /// only re-exports and the `DomainError` conversion, and it cannot reach a
 /// provider because this crate cannot name the types that would let it.
-const SCANNED_FILES: [&str; 7] = [
+const SCANNED_FILES: [&str; 8] = [
     "coordinator.rs",
     "failpoints.rs",
+    "initialization.rs",
     "masks.rs",
     "membership.rs",
     "mod.rs",
@@ -71,9 +72,10 @@ const SCANNED_FILES: [&str; 7] = [
 
 /// Every `.rs` file expected in the package, so a new one cannot appear and
 /// escape the scan by not being listed.
-const PACKAGE_FILES: [&str; 8] = [
+const PACKAGE_FILES: [&str; 9] = [
     "coordinator.rs",
     "failpoints.rs",
+    "initialization.rs",
     "masks.rs",
     "membership.rs",
     "mod.rs",

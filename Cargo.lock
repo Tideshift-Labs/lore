@@ -2991,6 +2991,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "aws-sdk-s3",
  "axum",
  "axum-test",
  "base64 0.22.1",

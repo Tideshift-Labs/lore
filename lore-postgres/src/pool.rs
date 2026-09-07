@@ -85,7 +85,7 @@ pub struct TlsConfig {
 /// "duplicate key … pg_type"), which bites when multiple loreserver replicas in
 /// a cell boot at once. The value is arbitrary but must be stable across the
 /// fleet.
-const SCHEMA_LOCK_KEY: i64 = 0x_6C6F_7265_7067; // "lorepg"
+pub(crate) const SCHEMA_LOCK_KEY: i64 = 0x_6C6F_7265_7067; // "lorepg"
 
 /// Provision a store's schema under the shared advisory lock so concurrent
 /// boots (multi-replica cells) can't race the `IF NOT EXISTS` DDL. The lock is

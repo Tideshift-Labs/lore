@@ -83,6 +83,7 @@
 pub mod coordinator;
 #[cfg(feature = "failure_generator")]
 pub mod failpoints;
+pub mod initialization;
 pub mod masks;
 pub mod membership;
 pub mod provider;

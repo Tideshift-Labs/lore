@@ -1840,19 +1840,8 @@ $outbox_dead_letter_replay_constraints$;
 
 -- ---------------------------------------------------------------------------
 -- CR-031 fragment lifecycle authority (SCHEMA-118)
---
--- Byte-equivalent copy of the runtime DDL declared in:
---   src/domain/fragments/schema.rs  (FRAGMENT_SCHEMA)
---
--- Migration-owned. Deliberately NOT part of the immutable store's legacy
--- self-bootstrap SCHEMA above, and not applied by PostgresDomainStore::connect:
--- a cell this migration has not reached must boot and answer on the legacy
--- route rather than silently cut over on a binary roll.
---
--- As with every other block here, a schema change is TWO edits in one commit:
--- the Rust const and this file. tests/domain_migration_parity.rs applies each
--- path to its own database and compares the resulting catalog.
 -- ---------------------------------------------------------------------------
+
 -- The three push scalars are columns on the existing repository row, not a new
 -- lockable row class: F-032-3's order gains no position from them, and a push
 -- that already locks the repository row reads them without another row lock.
@@ -2100,6 +2089,37 @@ CREATE TABLE IF NOT EXISTS lore_fragment_schema_state (
     )
 );
 
+-- Clean initialization is distinct from the preserved-data backfill state machine.
+-- These ALTERs also upgrade a migration-provisioned, inactive revision-2 cell.
+ALTER TABLE lore_fragment_schema_state
+    ADD COLUMN IF NOT EXISTS clean_initialized_at timestamptz,
+    ADD COLUMN IF NOT EXISTS clean_namespace_identity text;
+ALTER TABLE lore_fragment_schema_state
+    DROP CONSTRAINT IF EXISTS lore_fragment_schema_cutover_shape,
+    DROP CONSTRAINT IF EXISTS lore_fragment_schema_enable_shape,
+    DROP CONSTRAINT IF EXISTS lore_fragment_clean_initialization_shape;
+ALTER TABLE lore_fragment_schema_state
+    ADD CONSTRAINT lore_fragment_clean_initialization_shape CHECK (
+        (clean_initialized_at IS NULL AND clean_namespace_identity IS NULL)
+        OR (clean_initialized_at IS NOT NULL AND clean_namespace_identity IS NOT NULL
+            AND length(clean_namespace_identity) BETWEEN 1 AND 512
+            AND schema_version >= 3 AND backfill_state = 0 AND backfill_version = 0
+            AND backfill_cursor IS NULL AND verified_fragments = 0 AND cutover_at IS NULL
+            AND residue_classified AND sequence_headroom_fence IS NOT NULL
+            AND lifecycle_enabled AND write_capability = 1)
+    ),
+    ADD CONSTRAINT lore_fragment_schema_cutover_shape CHECK (
+        (backfill_state = 3 AND cutover_at IS NOT NULL AND residue_classified
+            AND sequence_headroom_fence IS NOT NULL AND clean_initialized_at IS NULL)
+        OR (backfill_state <> 3 AND cutover_at IS NULL
+            AND (lifecycle_enabled = false OR clean_initialized_at IS NOT NULL))
+    ),
+    ADD CONSTRAINT lore_fragment_schema_enable_shape CHECK (
+        lifecycle_enabled = false OR clean_initialized_at IS NOT NULL
+        OR (backfill_state = 3 AND cutover_at IS NOT NULL AND residue_classified
+            AND sequence_headroom_fence IS NOT NULL)
+    );
+
 INSERT INTO lore_fragment_schema_state (
     id, schema_version, backfill_version, backfill_state, database_identity, updated_at
 )
@@ -2108,7 +2128,7 @@ INSERT INTO lore_fragment_schema_state (
 -- seed cannot, and parity compares catalog shape rather than row contents -- so without
 -- that test a version bump would diverge silently between the two paths (INV-EF P2-9).
 SELECT 1                                                                       AS id,
-       2                                                                       AS schema_version,
+       3                                                                       AS schema_version,
        0                                                                       AS backfill_version,
        0                                                                       AS backfill_state,
        control.system_identifier::text || ':' || database.oid::text || ':' || current_database()

@@ -698,6 +698,47 @@ fn build_tls(name: &str, cfg: &PostgresStoreConfig) -> Result<TlsConfig, PluginE
     })
 }
 
+/// Open only the read-only object namespace inspector for offline initialization.
+/// The enabled provider and authority revision must match the future serving route.
+pub(crate) async fn connect_clean_namespace_inspector(
+    config: &toml::Value,
+    authority_revision: &str,
+) -> Result<
+    lore_postgres::store::immutable_store::clean_namespace::CleanObjectNamespaceInspector,
+    PluginError,
+> {
+    let cfg = parse_config(PLUGIN_NAME, config)?;
+    let provider = enabled_fragment_provider_config(PLUGIN_NAME, &cfg)?.ok_or_else(|| {
+        config_error(
+            PLUGIN_NAME,
+            "clean initialization requires enabled fragment_provider",
+        )
+    })?;
+    if provider.provider_write_authority_revision.as_deref() != Some(authority_revision) {
+        return Err(config_error(
+            PLUGIN_NAME,
+            "clean initialization authority revision must match fragment_provider.provider_write_authority_revision",
+        ));
+    }
+    validate_fragment_put_bound(PLUGIN_NAME, &cfg)?;
+    let object = cfg
+        .object_store
+        .ok_or_else(|| config_error(PLUGIN_NAME, "clean initialization requires object_store"))?;
+    lore_postgres::store::immutable_store::clean_namespace::CleanObjectNamespaceInspector::connect(
+        ObjectStoreSettings {
+            bucket: object.bucket,
+            endpoint_url: object.endpoint_url,
+            region: object.region,
+            force_path_style: object.force_path_style,
+            slow_operation_threshold_millis: object.slow_operation_threshold_millis,
+            timeout_millis: object.timeout_millis,
+            validate_bucket_on_startup: object.validate_bucket_on_startup,
+        },
+    )
+    .await
+    .map_err(|error| config_error(PLUGIN_NAME, error.to_string()))
+}
+
 /// Build the concrete Postgres immutable store from the plugin configuration.
 ///
 /// Both normal server startup and offline maintenance use this path so config
@@ -754,6 +795,10 @@ pub(crate) async fn connect_immutable_store(
         validate_bucket_on_startup: object.validate_bucket_on_startup,
     };
 
+    // Compute without a second SDK client or provider call. Legacy cells do not
+    // require explicit namespace fields, so defer any refusal until clean state.
+    let configured_clean_namespace =
+        lore_postgres::store::immutable_store::clean_namespace::clean_namespace_identity(&object);
     let store = PostgresImmutableStore::connect(&cfg.url, cfg.pool_max, &tls, object)
         .await
         .map_err(|e| {
@@ -838,6 +883,45 @@ pub(crate) async fn connect_immutable_store(
             plugin_name,
             "fragment_provider provider_write_authority_revision does not match the claims-required database capability",
         ));
+    }
+
+    if readiness.clean_initialized {
+        let identity = configured_clean_namespace
+            .map_err(|error| config_error(plugin_name, error.to_string()))?;
+        let revision = fragment_provider
+            .provider_write_authority_revision
+            .as_ref()
+            .ok_or_else(|| {
+                config_error(
+                    plugin_name,
+                    "clean initialized fragment route requires a provider authority revision",
+                )
+            })?;
+        let input = lore_postgres::domain::fragments::initialization::CleanCellInitialization::new(
+            identity,
+            revision.clone(),
+        )
+        .map_err(|error| {
+            config_error(
+                plugin_name,
+                format!("invalid clean initialization binding: {error}"),
+            )
+        })?;
+        let completed = coordinator
+            .initialization_status(&input)
+            .await
+            .map_err(|error| {
+                config_error(
+                    plugin_name,
+                    format!("clean fragment namespace attestation failed: {error}"),
+                )
+            })?;
+        if !completed {
+            return Err(config_error(
+                plugin_name,
+                "clean fragment namespace has no matching completed initialization",
+            ));
+        }
     }
 
     // The server configuration never exposes plaintext dispatch mode. The
@@ -1190,6 +1274,10 @@ fn warn_if_fragment_failpoints_are_compiled() {
         eprintln!("{FRAGMENT_FAILPOINTS_COMPILED_BANNER}");
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/common/clean_init_construction.rs"]
+mod clean_init_construction_tests;
 
 #[cfg(test)]
 mod tests {

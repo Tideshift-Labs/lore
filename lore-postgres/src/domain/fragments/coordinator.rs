@@ -169,8 +169,8 @@ pub const MAX_STAGED_LEASE_MEMBERS: usize = MAX_PUSH_FRAGMENT_REVALIDATIONS;
 /// replicas for test purposes, which is the composition CR-031 has to survive.
 #[derive(Clone)]
 pub struct PostgresFragmentCoordinator {
-    pool: Pool,
-    database_identity: String,
+    pub(super) pool: Pool,
+    pub(super) database_identity: String,
     /// Trusted cell identity stamped on the CR-032 summary events this
     /// coordinator appends, or `None` to append none.
     ///
@@ -303,6 +303,8 @@ pub struct FragmentLifecycleReadiness {
     pub schema_version: i64,
     /// Backfill state, one of the `BACKFILL_*` constants.
     pub backfill_state: i16,
+    /// An explicit empty-cell initialization, never a completed data migration.
+    pub clean_initialized: bool,
     /// Whether the cutover marker is set.
     pub cutover_at_present: bool,
     /// Whether lifecycle routing is enabled.
@@ -330,6 +332,7 @@ impl FragmentLifecycleReadiness {
             provisioned: false,
             schema_version: 0,
             backfill_state: schema::BACKFILL_NOT_STARTED,
+            clean_initialized: false,
             cutover_at_present: false,
             lifecycle_enabled: false,
             write_capability: FragmentWriteCapability::Optional,
@@ -351,8 +354,12 @@ impl FragmentLifecycleReadiness {
         self.provisioned
             && self.schema_version >= 1
             && self.schema_version <= schema::FRAGMENT_SCHEMA_VERSION
-            && self.backfill_state == schema::BACKFILL_CUTOVER
-            && self.cutover_at_present
+            && ((self.backfill_state == schema::BACKFILL_CUTOVER && self.cutover_at_present)
+                || (self.clean_initialized
+                    && self.backfill_state == schema::BACKFILL_NOT_STARTED
+                    && self.schema_version >= 3
+                    && self.lifecycle_enabled
+                    && self.write_capability.claims_required()))
             && self.same_database
             && self.sequence_headroom
             && self.unresolved_rows == 0
@@ -1239,7 +1246,7 @@ pub struct StagedReaderLease {
 // ---------------------------------------------------------------------------
 
 impl PostgresFragmentCoordinator {
-    /// Install SCHEMA-118 for isolated component fixtures.
+    /// Install SCHEMA-118 for explicit offline provisioning or isolated fixtures.
     ///
     /// **Production construction does not call this method**, and that is the
     /// point rather than an omission. CR-031 keeps the lifecycle DDL
@@ -1284,7 +1291,7 @@ impl PostgresFragmentCoordinator {
     /// routing around one would silently return a cut-over cell to the legacy
     /// split-truth path this package exists to remove.
     pub async fn readiness(&self) -> Result<FragmentLifecycleReadiness, DomainError> {
-        let client = self.checkout().await?;
+        let mut client = self.checkout().await?;
         match fragment_schema_presence(&client).await? {
             FragmentSchemaPresence::Absent => {
                 return Ok(FragmentLifecycleReadiness::not_provisioned());
@@ -1304,8 +1311,9 @@ impl PostgresFragmentCoordinator {
             .query_opt(
                 "SELECT schema_version, backfill_state, cutover_at, lifecycle_enabled, \
                         write_capability, provider_write_authority_revision, \
-                        database_identity, sequence_headroom_fence \
-                   FROM lore_fragment_schema_state WHERE id = 1",
+                        database_identity, sequence_headroom_fence, \
+                        (to_jsonb(s)->>'clean_initialized_at') IS NOT NULL AS clean_initialized \
+                   FROM lore_fragment_schema_state s WHERE id = 1",
                 &[],
             )
             .await
@@ -1392,10 +1400,18 @@ impl PostgresFragmentCoordinator {
             row.get("provider_write_authority_revision"),
         )?;
 
+        if row.get::<_, bool>("clean_initialized") {
+            let tx = client.transaction().await.map_err(|error| {
+                DomainError::from_pg("clean readiness fence transaction", error)
+            })?;
+            super::initialization::attest_clean_fences(&tx).await?;
+        }
+
         Ok(FragmentLifecycleReadiness {
             provisioned: true,
             schema_version: row.get("schema_version"),
             backfill_state: row.get("backfill_state"),
+            clean_initialized: row.get("clean_initialized"),
             cutover_at_present: cutover_at.is_some(),
             lifecycle_enabled: row.get("lifecycle_enabled"),
             write_capability,
@@ -1435,19 +1451,23 @@ impl PostgresFragmentCoordinator {
         }
         if !readiness.ready_for_lifecycle() {
             return Err(DomainError::NotReady(format!(
-                "provisioned={} schema_version={} backfill_state={} cutover={} \
+                "provisioned={} schema_version={} backfill_state={} clean_initialized={} cutover={} \
                  same_database={} sequence_headroom={} unresolved_rows={}; \
-                 lifecycle routing requires a completed backfill, a classified residue set, \
+                 lifecycle routing requires clean initialization or a completed backfill, a classified residue set, \
                  the cutover marker, proved sequence headroom, and a positive same-database \
                  match",
                 readiness.provisioned,
                 readiness.schema_version,
                 readiness.backfill_state,
+                readiness.clean_initialized,
                 readiness.cutover_at_present,
                 readiness.same_database,
                 readiness.sequence_headroom,
                 readiness.unresolved_rows
             )));
+        }
+        if readiness.lifecycle_enabled {
+            return Ok(());
         }
         let client = self.checkout().await?;
         // This is a single autocommit UPDATE rather than a transaction, so its
@@ -6423,6 +6443,7 @@ mod tests {
             provisioned: true,
             schema_version: schema::FRAGMENT_SCHEMA_VERSION,
             backfill_state: schema::BACKFILL_CUTOVER,
+            clean_initialized: false,
             cutover_at_present: true,
             lifecycle_enabled: false,
             same_database: true,

@@ -114,6 +114,8 @@ use crate::domain::fragments::coordinator::DirectWriteKind;
 use crate::domain::fragments::decodable_encoding;
 use crate::domain::fragments::read_fragment_write_capability;
 
+pub mod clean_namespace;
+
 /// Self-bootstrapping schema. The `(hash, repository, context)` primary key is
 /// the association identity; its B-tree also serves the leftmost-prefix
 /// existence reads (`hash`, `(hash, repository)`, full) and the by-hash refcount.
@@ -340,6 +342,36 @@ impl FragmentState {
     }
 }
 
+/// Shared configuration and credential construction for serving and offline probes.
+async fn build_object_client(
+    object: &ObjectStoreSettings,
+) -> Result<S3Impl, Box<dyn std::error::Error + Send + Sync>> {
+    let http_settings = HttpClientSettings::default();
+    let builder = Box::pin(
+        AwsClientBuilder::builder()
+            .with_http_settings(&http_settings)
+            .maybe_endpoint(object.endpoint_url.clone())
+            .maybe_region(object.region.clone())
+            .with_timeout_config(
+                TimeoutConfig::builder()
+                    .operation_timeout(Duration::from_millis(object.timeout_millis))
+                    .build(),
+            )
+            .build_config(),
+    )
+    .await
+    .with_slow_operation_threshold(object.slow_operation_threshold_millis)
+    .s3_with_path_style(object.force_path_style);
+    let builder = if object.validate_bucket_on_startup {
+        builder.ensure_bucket(&object.bucket)
+    } else {
+        builder
+    };
+    Box::pin(builder.build())
+        .await
+        .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+}
+
 impl PostgresImmutableStore {
     /// Build the Postgres pool (ensuring the schema) and the S3-compatible byte
     /// client, then return a ready store.
@@ -359,30 +391,9 @@ impl PostgresImmutableStore {
         // policy. Coordinated mode derives its separate retry-disabled client
         // from this client's resolved configuration only when that route is
         // selected.
-        let http_settings = HttpClientSettings::default();
-        let builder = Box::pin(
-            AwsClientBuilder::builder()
-                .with_http_settings(&http_settings)
-                .maybe_endpoint(object.endpoint_url.clone())
-                .maybe_region(object.region.clone())
-                .with_timeout_config(
-                    TimeoutConfig::builder()
-                        .operation_timeout(Duration::from_millis(object.timeout_millis))
-                        .build(),
-                )
-                .build_config(),
-        )
-        .await
-        .with_slow_operation_threshold(object.slow_operation_threshold_millis)
-        .s3_with_path_style(object.force_path_style);
-        let builder = if object.validate_bucket_on_startup {
-            builder.ensure_bucket(&object.bucket)
-        } else {
-            builder
-        };
-        let s3 = Box::pin(builder.build())
+        let s3 = build_object_client(&object)
             .await
-            .map_err(|e| format!("failed to build S3 client: {e}"))?;
+            .map_err(|error| format!("failed to build S3 client: {error}"))?;
 
         let io_timeout = Duration::from_millis(object.timeout_millis);
         Ok(Self {

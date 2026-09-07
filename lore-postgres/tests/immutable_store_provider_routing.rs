@@ -437,9 +437,15 @@ fn ambiguous_conditional_put_verifies_once_by_unmetered_get_before_any_remote_or
 fn governed_provider_disables_sdk_retry_without_changing_the_legacy_client_policy() {
     let immutable = source("src/store/immutable_store.rs");
     let connect = function(&immutable, "pub async fn connect(");
-    assert!(connect.contains("let http_settings = HttpClientSettings::default();"));
+    assert!(connect.contains("build_object_client(&object)"));
+    assert!(connect.contains(".await") && connect.contains(".map_err("));
+    let builder = function(&immutable, "async fn build_object_client(");
+    assert!(builder.contains("let http_settings = HttpClientSettings::default();"));
     assert!(
-        !connect.contains("RetryMode::Disabled") && !connect.contains("RetryConfig::disabled()"),
+        !connect.contains("RetryMode::Disabled")
+            && !connect.contains("RetryConfig::disabled()")
+            && !builder.contains("RetryMode::Disabled")
+            && !builder.contains("RetryConfig::disabled()"),
         "legacy construction must retain lore-aws's prior resolved retry policy"
     );
 

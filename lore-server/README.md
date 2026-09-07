@@ -44,6 +44,20 @@ See the `examples/` directory for complete configuration examples:
 - `config-consul.toml` - Consul service discovery
 - `config-hooks.toml` - Hook configuration examples
 
+### Initialize an empty Postgres cell
+
+After the supported domain/lock cutover and external exclusion of old writers, run:
+
+```powershell
+loreserver domain initialize-fragments --provider-write-authority-revision REV --confirm-legacy-writers-excluded --json
+```
+
+The offline command reads the configured whole bucket and atomically enables fragment safeguards
+only for an empty database/namespace. It preserves data on refusal and permits exact reruns after
+later uploads. The exclusion flag records an operator attestation; it does not revoke credentials.
+Use the [initialization runbook](../../lorehub/docs/runbooks/clean-cell-fragment-initialization.md)
+for prerequisites, configuration order and recovery. No serving endpoint is opened by the command.
+
 ## Plugin System
 
 The Lore Server uses a plugin system for swappable storage backends and topology discovery.

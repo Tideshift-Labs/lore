@@ -150,6 +150,18 @@ const BACKFILL_BRANCH_DOMAIN_V1: &[u8] = b"lore-domain-backfill-branch-v1\0";
 /// A maintenance operation on this cell's CR-029 domain state.
 #[derive(Debug, Subcommand)]
 pub enum DomainCommand {
+    /// Initialize fragment lifecycle for a deliberately empty cell after domain cutover.
+    InitializeFragments {
+        /// Revision of fresh scoped credentials whose old writers have been excluded.
+        #[arg(long, value_name = "REV")]
+        provider_write_authority_revision: String,
+        /// Attest that legacy writers are stopped and their provider write authority revoked.
+        #[arg(long)]
+        confirm_legacy_writers_excluded: bool,
+        /// Print one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
     /// Report this cell's domain and SCHEMA-117 lock cutover state.
     Status {
         /// Print one JSON object instead of the human-readable report.
@@ -201,6 +213,19 @@ pub enum DomainCommand {
 /// precondition this command refuses rather than forces, or a database failure.
 pub async fn run(command: &DomainCommand, settings: &Settings) -> Result<()> {
     match command {
+        DomainCommand::InitializeFragments {
+            provider_write_authority_revision,
+            confirm_legacy_writers_excluded,
+            json,
+        } => {
+            crate::domain::fragment_operator::initialize(
+                settings,
+                provider_write_authority_revision,
+                *confirm_legacy_writers_excluded,
+                *json,
+            )
+            .await
+        }
         DomainCommand::Status { json } => {
             let context = DomainOperatorContext::open(settings).await?;
             let status = context.status().await?;
