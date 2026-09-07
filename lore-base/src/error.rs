@@ -554,6 +554,30 @@ pub struct OutcomeUnknown {
     pub attempt_id: String,
 }
 
+/// The server granted a resource this call cannot name, so it cannot undo it.
+///
+/// Allocated from this block rather than from a failure group because the range's
+/// meaning is exactly right: the caller learns the outcome is unresolved. A lock
+/// is held, the operation did not succeed, and the client has no path to release
+/// it with — reporting a decisive failure would say the request is over and
+/// nothing is outstanding, which is the one reading this block exists to prevent.
+///
+/// It carries NO attempt identity, and that is the difference from
+/// [`OutcomeUnknown`] rather than an omission. There is nothing to look up: the
+/// resource was granted by a batch that answered, so its attempt resolved, and
+/// what is unresolved is the client's ability to name the row at all. An
+/// `attempt_id` here would send a reconciler to a receipt that settles nothing.
+/// `resource` is what a human needs instead, in whatever terms the server used.
+#[derive(Debug, Clone, Error, FfiError)]
+#[error(
+    "granted a resource this call cannot name and cannot release ({resource}); release it by name or ask an administrator"
+)]
+#[ffi_code(194)]
+pub struct UnnameableResource {
+    /// The resource as the server described it, which is all the caller has.
+    pub resource: String,
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::RangeInclusive;
@@ -855,6 +879,11 @@ mod tests {
                     attempt_id: text(),
                 }
                 .ffi_code(),
+            ),
+            (
+                "UnnameableResource",
+                Group::Outcome,
+                UnnameableResource { resource: text() }.ffi_code(),
             ),
         ]
     }

@@ -69,6 +69,7 @@ pub(crate) use lore_base::error::RevisionNotFound;
 pub(crate) use lore_base::error::SharedStoreNotFound;
 pub(crate) use lore_base::error::SlowDown;
 pub(crate) use lore_base::error::TokenNotFound;
+pub(crate) use lore_base::error::UnnameableResource;
 pub(crate) use lore_base::error::WriteRequired;
 
 #[error_set]
