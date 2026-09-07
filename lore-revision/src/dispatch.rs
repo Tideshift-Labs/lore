@@ -2,10 +2,15 @@
 // SPDX-License-Identifier: MIT
 //! Attempt identity for the client's irreversible dispatches (WP-120).
 //!
-//! One helper, shared by every operation family that reaches a `MutableNoReplay` dispatch a caller
-//! may need to reconcile: `branch::push` and the two lock verbs. It lived inside `branch/push.rs`
-//! while push was the only family wired, and moved here rather than being copied when locks were
-//! wired, because two copies of a mint-record-scope-resolve sequence drift and the drift is silent.
+//! Shared by every operation family that reaches a `MutableNoReplay` dispatch a caller may need to
+//! reconcile: `branch::push` and the two lock verbs. It lived inside `branch/push.rs` while push
+//! was the only family wired, and moved here rather than being copied when locks were wired,
+//! because two copies of a mint-record-scope-resolve sequence drift and the drift is silent.
+//!
+//! Two entry points over one sequence, differing only in who chooses the id.
+//! [`under_own_attempt`] mints it, which is right when the caller has no use for the value.
+//! [`under_named_attempt`] takes it, for the one caller that has to be able to name the dispatch
+//! after the fact even if the task carrying it dies.
 //!
 //! See [`under_own_attempt`] for the granularity rule, which is the part that is easy to get wrong.
 
@@ -70,29 +75,64 @@ where
         return dispatch.await;
     };
 
-    let attempt = AttemptId::new();
+    under_named_attempt(Some(store), AttemptId::new(), repository, rpc, dispatch).await
+}
+
+/// Dispatch one irreversible submutation under an attempt identity the CALLER minted (WP-120).
+///
+/// [`under_own_attempt`] mints inside itself, which is right whenever the caller has no use for
+/// the id. One caller does: `lock::file::acquire` spawns its batches, and a batch task that never
+/// runs to completion cannot report the id it would have minted — the id dies with the task, and
+/// the `JoinError` left behind is then indistinguishable from a request that never left. Minting
+/// in the parent, before the spawn, is what lets the join loop name the attempt whose record is
+/// sitting unresolved in the caller's store.
+///
+/// **The dispatch scope is entered whether or not a store is present**, and that is the one
+/// behavioural difference from [`under_own_attempt`]'s no-store path. It is what makes naming the
+/// id honest for a caller that journals nothing: with no store the id is recorded nowhere locally,
+/// but it is still the one stamped on the request as `lore-attempt-id`, so it still names the
+/// receipt the server filed. The transport would otherwise have minted an equivalent id itself and
+/// told nobody which — so nothing on the wire changes shape, only who chose the value.
+///
+/// The caller is responsible for minting one id per dispatch. Reusing one across two dispatches
+/// reintroduces the defect [`under_own_attempt`] documents: the server files several receipts
+/// under one id and `attempt_receipt_get` answers `NotFound` for all of them.
+pub(crate) async fn under_named_attempt<T, Fut>(
+    attempts: Option<&Arc<dyn AttemptStore>>,
+    attempt: AttemptId,
+    repository: RepositoryId,
+    rpc: GrpcRpc,
+    dispatch: Fut,
+) -> Result<T, ProtocolError>
+where
+    Fut: Future<Output = Result<T, ProtocolError>>,
+{
     // Recorded before the dispatch, never after. A record written afterwards cannot describe an
     // attempt whose response was lost, which is the only case that needs one.
-    store
-        .record(&AttemptRecord {
-            attempt_id: attempt,
-            state: AttemptState::Unresolved,
-            operation: rpc.wire_name().to_owned(),
-            repository,
-            recorded_at_unix_millis: unix_millis_now(),
-            receipt: None,
-        })
-        .await?;
+    if let Some(store) = attempts {
+        store
+            .record(&AttemptRecord {
+                attempt_id: attempt,
+                state: AttemptState::Unresolved,
+                operation: rpc.wire_name().to_owned(),
+                repository,
+                recorded_at_unix_millis: unix_millis_now(),
+                receipt: None,
+            })
+            .await?;
+    }
 
     let result = with_dispatch_attempt(attempt, dispatch).await;
 
-    let resolution = match &result {
-        Ok(_) => Some(AttemptResolution::Applied),
-        Err(ProtocolError::OutcomeUnknown(_)) => None,
-        Err(_) => Some(AttemptResolution::NotApplied),
-    };
-    if let Some(resolution) = resolution {
-        store.resolve(&attempt, resolution).await?;
+    if let Some(store) = attempts {
+        let resolution = match &result {
+            Ok(_) => Some(AttemptResolution::Applied),
+            Err(ProtocolError::OutcomeUnknown(_)) => None,
+            Err(_) => Some(AttemptResolution::NotApplied),
+        };
+        if let Some(resolution) = resolution {
+            store.resolve(&attempt, resolution).await?;
+        }
     }
     result
 }
@@ -253,6 +293,30 @@ mod tests {
             .expect("the dispatch succeeds");
 
             assert!(seen.is_none(), "no store must leave the scope untouched");
+        }
+
+        /// `under_named_attempt`'s one behavioural difference from `under_own_attempt`'s no-store
+        /// path (see its own doc comment): the dispatch scope is entered whether or not a store is
+        /// present, because the caller-minted id is what reaches the wire either way. With no
+        /// store, `under_own_attempt` above leaves the scope untouched and the transport mints its
+        /// own id; `under_named_attempt` must still stamp the CALLER's id on the request, which
+        /// only happens if the scope carries it.
+        #[tokio::test]
+        async fn without_a_store_the_dispatch_scope_is_still_entered_with_the_named_id() {
+            let attempt = AttemptId::new();
+            let seen = under_named_attempt(None, attempt, repository(), GrpcRpc::LockLock, async {
+                Ok::<_, ProtocolError>(lore_transport::outcome::current_dispatch_attempt())
+            })
+            .await
+            .expect("the dispatch succeeds");
+
+            assert_eq!(
+                seen,
+                Some(attempt),
+                "with no store to record it, the scope is the only thing that makes the \
+                 caller-chosen id -- rather than one the transport would otherwise mint itself -- \
+                 the one stamped on the request"
+            );
         }
     }
 }

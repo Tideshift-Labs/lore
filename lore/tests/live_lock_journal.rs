@@ -2,17 +2,23 @@
 // SPDX-License-Identifier: MIT
 //! The lock verbs' attempt journal, driven against a remote that answers (WP-120).
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use lore::interface::LoreEventCallback;
+use lore_base::error::NotAuthorized;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_revision::attempt_store::repository_attempt_store;
+use lore_revision::event::LoreCompleteEventData;
+use lore_revision::instance::load_current_anchor;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreError;
+use lore_revision::interface::LoreEvent;
 use lore_revision::interface::LoreEventCallbackConfig;
 use lore_revision::interface::LoreString;
 use lore_revision::live_fixture::LiveRepository;
@@ -24,11 +30,14 @@ use lore_revision::live_fixture::Refusal;
 use lore_revision::live_fixture::RpcOutcome;
 use lore_revision::live_fixture::UnlockEcho;
 use lore_revision::live_fixture::fixture_execution_context;
+use lore_revision::lock::util::assemble_resource_for_path;
+use lore_revision::repository::RepositoryAccess;
 use lore_transport::VolatileAttemptStore;
 use lore_transport::attempt_store::AttemptRecord;
 use lore_transport::attempt_store::AttemptResolution;
 use lore_transport::attempt_store::AttemptStore;
 use lore_transport::attempt_store::LockOwnership;
+use lore_transport::attempt_store::OwnershipToken;
 use lore_transport::error::ProtocolError;
 use lore_transport::outcome::AttemptId;
 use lore_transport::outcome::GrpcRpc;
@@ -38,6 +47,22 @@ fn no_callback() -> LoreEventCallback {
         user_context: 0,
         func: None,
     })
+}
+
+/// A real callback that captures the operation's `LoreEvent::Complete` data -- the only place the
+/// error detail's `operation`/`attempt_id` fields (and the exact per-variant FFI code, distinct
+/// from the coarse `translated()` code) are observable at all. `no_callback()` above throws every
+/// event away, including this one, so a test that needs to read the detail rather than only the
+/// plain status integer a call returns must use this instead.
+fn capture_complete() -> (LoreEventCallback, Arc<Mutex<Option<LoreCompleteEventData>>>) {
+    let captured: Arc<Mutex<Option<LoreCompleteEventData>>> = Arc::new(Mutex::new(None));
+    let sink = captured.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+        if let LoreEvent::Complete(data) = event {
+            *sink.lock().expect("the capture mutex must not be poisoned") = Some(data.clone());
+        }
+    }));
+    (callback, captured)
 }
 
 // A smoke test lived here, asserting that an acquire reached the server carrying an attempt id.
@@ -265,6 +290,134 @@ impl AttemptStore for JournalSpy {
                 resolution,
             });
         self.inner.resolve(attempt, resolution)
+    }
+}
+
+/// An [`AttemptStore`] that panics inside `resolve()`, before ever touching the real store
+/// underneath -- everything else delegates to a genuine [`VolatileAttemptStore`].
+///
+/// The panic is placed in `resolve()` specifically so it can only be reached AFTER a real dispatch
+/// has already succeeded: `under_named_attempt` calls `record()` (delegated, so the attempt's
+/// Unresolved record is genuinely written) and dispatches the real RPC BEFORE ever calling
+/// `resolve()` on success. So a batch task built on this double panics only once its own request
+/// has already been granted by the server -- simulating a batch task that dies for a reason wholly
+/// unrelated to whether the request reached the remote, which is exactly the ambiguity
+/// `lost_batch_task` exists to name rather than paper over.
+///
+/// Panicking BEFORE delegating to `self.inner.resolve(...)` is deliberate, not incidental: it means
+/// `self.inner`'s own `std::sync::Mutex` is never locked by the panicking call, so it cannot be
+/// left poisoned, and the test can still read every other method on `self.inner` after the
+/// panicking task has unwound.
+struct PanicOnResolve {
+    inner: VolatileAttemptStore,
+}
+
+impl PanicOnResolve {
+    fn new() -> Self {
+        Self {
+            inner: VolatileAttemptStore::new(),
+        }
+    }
+}
+
+impl AttemptStore for PanicOnResolve {
+    fn record<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        record: &'life1 AttemptRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProtocolError>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.record(record)
+    }
+
+    fn lookup<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        attempt: &'life1 AttemptId,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<AttemptRecord>, ProtocolError>> + Send + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.lookup(attempt)
+    }
+
+    fn unresolved<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<AttemptRecord>, ProtocolError>> + Send + 'async_trait>,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.unresolved()
+    }
+
+    fn record_ownership<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        ownership: &'life1 LockOwnership,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProtocolError>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.record_ownership(ownership)
+    }
+
+    fn ownership_for<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        branch: &'life1 Context,
+        resource_hash: &'life2 Hash,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<LockOwnership>, ProtocolError>> + Send + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.ownership_for(branch, resource_hash)
+    }
+
+    fn clear_ownership<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        branch: &'life1 Context,
+        resource_hash: &'life2 Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProtocolError>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.clear_ownership(branch, resource_hash)
+    }
+
+    fn resolve<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _attempt: &'life1 AttemptId,
+        _resolution: AttemptResolution,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProtocolError>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        panic!(
+            "PanicOnResolve: simulated batch task death after a real dispatch already succeeded"
+        );
     }
 }
 
@@ -1861,6 +2014,400 @@ fn a_lost_answer_on_the_rollback_release_surfaces_outcome_unknown() {
          produce a non-OutcomeUnknown status for a different reason, and the empty log would make \
          that ambiguity invisible. Got {:?}",
         server.calls()
+    );
+}
+
+/// A batch task that panics AFTER its own dispatch was already granted must surface as
+/// `OutcomeUnknown`, naming the exact attempt id its own record was recorded under -- not a
+/// generic internal failure that reads as "provably did not happen".
+///
+/// `PanicOnResolve` panics inside `resolve()`, reached only once `under_named_attempt` sees the
+/// real `Lock` RPC succeed, so the panic here happens on the far side of a real grant: the fixture
+/// server actually locked the file, and only the CLIENT's own bookkeeping died afterward. Pre-fix,
+/// `acquire`'s join loop had no id to report for a dead batch task and fell back to a flat
+/// `Internal` -- indistinguishable, to a caller, from a request that never left. This test proves
+/// the fix by three independent facts none of which is provable from the status code alone: the
+/// exact `OutcomeUnknown` status (via a real `LoreEventCallback`, since the plain returned integer
+/// carries the status but not the `operation`/`attempt_id` detail fields this test also checks);
+/// the store still holding exactly the one record `record()` wrote before the dispatch (proving
+/// `resolve()` really never ran, not merely that this test forgot to check); and that record's own
+/// id being the exact one the error names, which is what makes the id actionable rather than a
+/// number that merely happens to be present.
+///
+/// `LiveRepository::create` commits exactly one file, and `LOCK_BATCH_SIZE` is 100, so this
+/// acquire is one batch -- the whole request fails when its only batch panics.
+#[test]
+fn a_panicking_batch_task_surfaces_outcome_unknown_naming_its_own_recorded_attempt() {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start());
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create(&server.remote_url()).await
+    }));
+
+    let attempts: Arc<dyn AttemptStore> = Arc::new(PanicOnResolve::new());
+    let (callback, captured) = capture_complete();
+
+    let status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        callback,
+        attempts.clone(),
+    ));
+
+    assert_eq!(
+        status,
+        LoreError::OutcomeUnknown as i32,
+        "a batch task that panicked after its own dispatch was granted must surface as \
+         OutcomeUnknown, not the pre-fix flat Internal fallback with no attempt id to name"
+    );
+
+    let complete = captured
+        .lock()
+        .expect("the capture mutex must not be poisoned")
+        .take()
+        .expect("a Complete event must have been emitted");
+    assert_eq!(
+        complete.status,
+        LoreError::OutcomeUnknown as i32,
+        "the Complete event's own status must agree with the returned status"
+    );
+    assert_eq!(
+        complete.error.operation.as_str(),
+        GrpcRpc::LockLock.wire_name(),
+        "the error detail must name the Lock RPC that actually panicked"
+    );
+
+    let unresolved = runtime
+        .block_on(attempts.unresolved())
+        .expect("unresolved() must succeed on a fresh store");
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "the panicking batch's own record must be the only one left standing -- resolve() never \
+         ran, so nothing settled it. Got {unresolved:?}"
+    );
+    assert_eq!(
+        complete.error.attempt_id.as_str(),
+        unresolved[0].attempt_id.to_string(),
+        "the id named in the error must be the exact id whose record survived unresolved -- \
+         anything else would send a reconciler looking for the wrong receipt"
+    );
+}
+
+/// The exact status a caller receives for a partial acquire whose failing batch was a decisive
+/// server refusal, pinned to the refusal's own `#[ffi_code]` rather than merely `!= 0` and
+/// `!= OutcomeUnknown`.
+///
+/// This is the case commit 9106c1c's `first_decisive_failure` carry-back exists for: pre-fix,
+/// `acquire`'s rollback arm re-raised a flat `AcquireError::internal("Failed to acquire the
+/// lock")`, which translates to `Internal`'s code (-1, CLI exit 255) regardless of what the
+/// server actually said. Every existing acquire test in this file asserts `assert_ne!` against 0
+/// and 193 (`LoreError::OutcomeUnknown as i32`) for exactly this reason: that assertion shape
+/// stays green whether the carry-back exists or not, because both `Internal` and `NotAuthorized`
+/// satisfy it. Asserting the exact code is what a revert of the carry-back turns red.
+///
+/// The 101-file two-batch fixture is the same shape `a_multi_batch_acquire_with_a_decisive_refusal_
+/// still_rolls_back` uses: one batch granted, the other refused with `PermissionDenied`, so the
+/// refusal survives as `AcquireError::NotAuthorized`, whose own `#[ffi_code(17)]` is what must
+/// reach the caller -- not the fallback message's `Internal`.
+#[test]
+fn a_decisive_refusal_in_a_partial_acquire_surfaces_the_refusals_own_ffi_code() {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start_with_policy(LockPolicy {
+        lock: RpcOutcome::Grant,
+        lock_after_first: Some(RpcOutcome::Refuse(Refusal::PermissionDenied)),
+        ..LockPolicy::default()
+    }));
+    let names = multi_batch_file_names();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create_with_files(&server.remote_url(), &name_refs).await
+    }));
+
+    let (callback, captured) = capture_complete();
+
+    let status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        callback,
+        Arc::new(VolatileAttemptStore::new()),
+    ));
+
+    assert_eq!(
+        status,
+        NotAuthorized::FFI_CODE,
+        "a PermissionDenied refusal in a partial acquire must surface NotAuthorized's own ffi \
+         code, not the pre-9106c1c Internal fallback -- got {status}, Internal is {}",
+        LoreError::Internal as i32
+    );
+    assert_ne!(
+        status,
+        LoreError::Internal as i32,
+        "the discriminating fact: the pre-fix fallback and the fixed code must differ"
+    );
+
+    let complete = captured
+        .lock()
+        .expect("the capture mutex must not be poisoned")
+        .take()
+        .expect("a Complete event must have been emitted");
+    assert_eq!(
+        complete.status,
+        NotAuthorized::FFI_CODE,
+        "the Complete event's own status must agree with the returned status"
+    );
+
+    let locks = server.calls_for(LockRpc::Lock);
+    assert_eq!(
+        locks.len(),
+        2,
+        "101 committed files must split into exactly two batches, got {:?}",
+        server.calls()
+    );
+}
+
+/// One arbitrary but well-formed ownership token for a seeded pre-held row.
+///
+/// The value is never asserted on anywhere -- only that a row holding one is present or absent --
+/// so every seeded row reuses this same one rather than minting something distinguishable.
+fn seed_token() -> OwnershipToken {
+    OwnershipToken::from_wire(&[0xEEu8; OwnershipToken::LEN])
+        .expect("32 bytes must decode")
+        .expect("32 bytes must produce a token, not None")
+}
+
+/// Seed pre-held ownership rows for a set of committed files, directly through
+/// `RepositoryAttemptStore` and the same `assemble_resource_for_path` keying `acquire` itself
+/// calls -- rather than dispatched through a real prior `acquire`.
+///
+/// **Why not a real prior acquire:** `LockPolicy::lock_after_first`'s ordinal counts `Lock`
+/// arrivals over the server's WHOLE lifetime, not per acquire (see its own doc comment). A prior
+/// acquire of enough files to matter would consume ordinals before the acquire under test ever
+/// dispatches, landing ITS batches past the "first" boundary and refusing every one of them --
+/// `num_batch_success` would be 0, and the rollback path these tests exist to pin would never run
+/// at all (a wholly failed set takes the non-rollback return). A second `LockServer` would reset
+/// the ordinal, but the fixture repository's remote address is fixed at creation with no public
+/// way to repoint it. Seeding directly sidesteps the ordinal question entirely: the acquire under
+/// test dispatches the first `Lock` calls this server ever sees.
+///
+/// Dropped before returning: holding the connection open would contend with `load_and_connect`'s
+/// own acquisition inside the real acquire call that follows, matching
+/// `LiveRepository::create_with_files`'s own convention.
+fn seed_pre_held_ownership(
+    runtime: &tokio::runtime::Handle,
+    fixture: &LiveRepository,
+    names: &[String],
+) {
+    runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        let repository = fixture.connect(RepositoryAccess::ReadOnly).await;
+        let (_, branch) = load_current_anchor(&repository)
+            .await
+            .expect("reading the fixture's current anchor");
+        let ownership = repository_attempt_store(&repository);
+        for name in names {
+            let resource = assemble_resource_for_path(name, branch);
+            ownership
+                .record_ownership(&LockOwnership {
+                    attempt_id: AttemptId::new(),
+                    branch: resource.branch,
+                    resource_hash: resource.hash,
+                    token: seed_token(),
+                })
+                .await
+                .expect("seeding a pre-held ownership row");
+        }
+        drop(repository);
+    }));
+}
+
+/// A PURE renewal -- every requested row already held before the call -- releases NOTHING.
+///
+/// This is the discriminating case for `rollback_set`'s `pre_held` exclusion, distinct from
+/// (and superseding) an earlier version of this test that expected the rollback to release the
+/// granted batch's own rows: a reviewer pass found that a granted lock does not distinguish a
+/// first acquire from a renewal (the fenced coordinator reports both in one `committed` set), so
+/// the correct rollback excludes anything the client already held, not merely "whatever this
+/// call's own batches happened to grant". With all 101 rows pre-held, the granted batch's rows are
+/// ALL excluded, so the rollback releases zero locks -- proving three implementations apart at
+/// once: the original pre-fix code released all 101 (blanket `options.paths`), an intermediate
+/// version released the granted batch's own rows regardless of prior ownership, and this one
+/// releases none.
+#[test]
+fn a_pure_renewals_rollback_releases_nothing() {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start_with_policy(LockPolicy {
+        lock: RpcOutcome::Grant,
+        lock_after_first: Some(RpcOutcome::Refuse(Refusal::PermissionDenied)),
+        ..LockPolicy::default()
+    }));
+    let names = multi_batch_file_names();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create_with_files(&server.remote_url(), &name_refs).await
+    }));
+
+    seed_pre_held_ownership(&runtime, &fixture, &fixture.committed_files);
+    assert_eq!(
+        ownership_row_count(&fixture.path),
+        101,
+        "every one of the 101 rows must hold a pre-existing token before the renewal -- that is \
+         what makes this call a pure renewal"
+    );
+
+    let status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        no_callback(),
+        Arc::new(VolatileAttemptStore::new()),
+    ));
+    assert_ne!(
+        status, 0,
+        "the renewal must fail: one of its two batches is a decisive refusal"
+    );
+
+    let locks = server.calls_for(LockRpc::Lock);
+    assert_eq!(
+        locks.len(),
+        2,
+        "the renewal's own 101 paths must split into exactly two batches, and nothing else may \
+         have dispatched a Lock before it -- seeding wrote the store directly. Got {:?}",
+        server.calls()
+    );
+
+    assert!(
+        server.calls_for(LockRpc::Unlock).is_empty(),
+        "every row was already held, so the correct rollback releases nothing -- against the \
+         pre-fix code (blanket options.paths) or the intermediate one (the whole granted batch \
+         regardless of prior ownership), this would be non-empty. Got {:?}",
+        server.calls()
+    );
+    assert_eq!(
+        ownership_row_count(&fixture.path),
+        101,
+        "no row's token may be cleared by a rollback that released nothing"
+    );
+}
+
+/// A MIXED renewal -- some rows already held, some genuinely new -- releases exactly the granted
+/// batch's own new rows, and never a pre-held one.
+///
+/// 50 of the 101 files are seeded pre-held; the other 51 are new to this call. Whichever of the
+/// renewal's two batches (100 resources, 1 resource -- `chunks(LOCK_BATCH_SIZE)` on 101 items is
+/// always that split) wins the race to be granted, the correct release set is that batch's own
+/// members MINUS whichever of them were already held -- never the whole batch (that would leak a
+/// pre-held release, the intermediate version's bug) and never a description outside that batch.
+/// Because which specific file lands in the size-1 batch is a hash-order accident this test does
+/// not control, every assertion below computes its expectation from the granted batch's own
+/// observed membership rather than assuming a fixed composition -- the discriminating fact is
+/// still real in every draw: a batch containing a held row must not release it, and one containing
+/// a new row must.
+///
+/// The final row count is the one invariant that holds regardless of the draw: whatever this call
+/// newly acquired and then rolled back nets to zero (recorded, then cleared), so exactly the 50
+/// originally seeded rows -- untouched or merely renewed -- remain.
+#[test]
+fn a_mixed_renewal_releases_only_the_granted_batchs_new_rows() {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start_with_policy(LockPolicy {
+        lock: RpcOutcome::Grant,
+        lock_after_first: Some(RpcOutcome::Refuse(Refusal::PermissionDenied)),
+        ..LockPolicy::default()
+    }));
+    let names = multi_batch_file_names();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create_with_files(&server.remote_url(), &name_refs).await
+    }));
+
+    let held_names: BTreeSet<String> = fixture.committed_files[..50].iter().cloned().collect();
+    seed_pre_held_ownership(
+        &runtime,
+        &fixture,
+        &held_names.iter().cloned().collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        ownership_row_count(&fixture.path),
+        50,
+        "exactly the first 50 rows must be pre-held before this renewal"
+    );
+
+    let status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        no_callback(),
+        Arc::new(VolatileAttemptStore::new()),
+    ));
+    assert_ne!(
+        status, 0,
+        "the renewal must fail: one of its two batches is a decisive refusal"
+    );
+
+    let locks = server.calls_for(LockRpc::Lock);
+    assert_eq!(
+        locks.len(),
+        2,
+        "the renewal's own 101 paths must split into exactly two batches. Got {:?}",
+        server.calls()
+    );
+
+    let unlocked_descriptions: BTreeSet<String> = server
+        .calls_for(LockRpc::Unlock)
+        .into_iter()
+        .flat_map(|call| call.descriptions)
+        .collect();
+    assert!(
+        unlocked_descriptions.is_disjoint(&held_names),
+        "a pre-held row must never be released by this renewal's rollback -- got these held \
+         names among the unlocked descriptions: {:?}",
+        unlocked_descriptions
+            .intersection(&held_names)
+            .collect::<Vec<_>>()
+    );
+
+    // Whichever batch was granted, the released set is exactly that batch's own new (non-held)
+    // members -- computed from the batch's real, observed membership, not assumed.
+    if !unlocked_descriptions.is_empty() {
+        let matching_lock = locks
+            .iter()
+            .find(|call| {
+                let call_set: BTreeSet<String> = call.descriptions.iter().cloned().collect();
+                unlocked_descriptions.is_subset(&call_set)
+            })
+            .expect(
+                "a non-empty released set must be a subset of exactly one Lock call's \
+                 descriptions -- the renewal's two batches partition the 101 files disjointly",
+            );
+        let expected: BTreeSet<String> = matching_lock
+            .descriptions
+            .iter()
+            .filter(|description| !held_names.contains(*description))
+            .cloned()
+            .collect();
+        assert_eq!(
+            unlocked_descriptions, expected,
+            "the released set must be exactly the granted batch's new rows, neither more (that \
+             would be the intermediate version's whole-batch bug) nor fewer"
+        );
+    }
+
+    assert_eq!(
+        ownership_row_count(&fixture.path),
+        50,
+        "whatever this call newly acquired and then rolled back nets to zero, so exactly the 50 \
+         originally pre-held rows remain -- the pre-fix code (blanket options.paths) would have \
+         cleared some or all of those 50 too, landing below 50"
     );
 }
 

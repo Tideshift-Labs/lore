@@ -59,6 +59,14 @@ pub(crate) struct BatchSetLabels {
 /// take on top of a failed set — `release`'s escalation to an administrative takeover, `acquire`'s
 /// rollback of a partial set — is a SECOND irreversible mutation, and it may only follow an answer
 /// that decisively says the first one did not happen.
+///
+/// Note what this type does NOT carry, because it is easy to read a failed set as having produced
+/// nothing: whatever the batches that DID answer produced is appended into the `succeeded`
+/// accumulator the caller passed [`classify_batch_set`], on the failure path exactly as on the
+/// success path. Those effects happened on the server whatever else went wrong, and a verb that
+/// read only this value would be accounting for less than it caused. `acquire` reads that
+/// accumulator to scope its rollback to what it actually took; `release` reads it to clear the
+/// tokens of what the server confirmed released.
 #[derive(Debug)]
 pub(crate) struct SetFailure<E> {
     pub error: E,
@@ -116,6 +124,15 @@ pub(crate) fn classify_batch_set<T, E: BatchSetError>(
     // reaching the success arm on a set whose fate this function was never told. The guarantee
     // that a non-decisive set can never be acted on again must not rest on every caller's join
     // loop remembering to report its own `JoinError`.
+    // Saturating because a caller that somehow produced MORE outcomes than it dispatched batches
+    // must still be given a verdict rather than an underflow panic in release. In a debug build
+    // that caller is a bug worth stopping on: the count it passed does not describe the set it
+    // handed over, and every judgement below is derived from the two agreeing.
+    debug_assert!(
+        outcomes.len() <= num_batches,
+        "a set of {num_batches} batch(es) produced {} outcome(s)",
+        outcomes.len()
+    );
     let num_batch_missing = num_batches.saturating_sub(outcomes.len());
     let mut num_batch_failed = num_batch_missing;
     let mut first_decisive_failure: Option<E> = None;

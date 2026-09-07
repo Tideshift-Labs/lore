@@ -2,8 +2,10 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_transport::attempt_store::AcquiredLock;
@@ -18,7 +20,7 @@ use tokio::task::JoinSet;
 
 use crate::attempt_store::held_tokens;
 use crate::branch;
-use crate::dispatch::under_own_attempt;
+use crate::dispatch::under_named_attempt;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
@@ -35,8 +37,11 @@ use crate::lock::util::LOCK_BATCH_SIZE;
 use crate::lock::util::SetSuccess;
 use crate::lock::util::assemble_resource_for_path;
 use crate::lock::util::classify_batch_set;
+use crate::lore::BranchId;
+use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::lore_debug;
+use crate::lore_error;
 use crate::lore_trace;
 use crate::repository::RepositoryContext;
 use crate::state;
@@ -204,6 +209,11 @@ pub async fn acquire(
     };
 
     let mut resources = HashMap::<String, lock::LockResource>::with_capacity(options.paths.len());
+    // The path the USER named, per resource, kept only so a rollback can hand `release` the same
+    // strings this acquire was given rather than re-deriving them from a server-echoed
+    // description. `release` resolves a path exactly as the loop below does, so feeding it the
+    // original spelling is the one form guaranteed to resolve back to the same resource.
+    let mut requested_paths = HashMap::<String, String>::with_capacity(options.paths.len());
     let state = state::State::deserialize(repository.clone(), staged_revision)
         .await
         .forward::<AcquireError>("Failed to deserialize state")?;
@@ -236,6 +246,7 @@ pub async fn acquire(
         }
 
         let resource = assemble_resource_for_path(relative_path.as_str(), branch);
+        requested_paths.insert(relative_path.to_string(), path.to_string());
         resources.insert(relative_path.to_string(), resource);
     }
 
@@ -281,6 +292,20 @@ pub async fn acquire(
     let tokens = held_tokens(&ownership, &keys)
         .await
         .forward::<AcquireError>("Failed to read the held lock ownership")?;
+    // The rows this client already held when the call started, which a rollback must leave alone:
+    // releasing one would put the caller BELOW the state it was in before it asked, and clear a
+    // token it needs. A granted lock is not proof this call took the row — the fenced coordinator
+    // reports a renewal in the same `committed` set as a first acquire — so the request side is
+    // the only place the difference is visible.
+    //
+    // On a cell that issues no tokens at all every entry here is `None`, so a renewal is
+    // indistinguishable from a first acquire and lands in the rollback. That is what this client
+    // can know, and it is still strictly narrower than releasing every requested path.
+    let pre_held = keys
+        .iter()
+        .zip(tokens.iter())
+        .filter_map(|(key, token)| token.as_ref().map(|_| *key))
+        .collect::<HashSet<(BranchId, Hash)>>();
     let resources_values = requested
         .into_iter()
         .zip(tokens)
@@ -292,6 +317,14 @@ pub async fn acquire(
 
     let mut batches: JoinSet<Result<Vec<AcquiredLock>, AcquireError>> = JoinSet::new();
     let mut batches_results = Vec::with_capacity(num_batches);
+    // Which attempt each batch task dispatches under, keyed by the task's own id.
+    //
+    // A batch that never runs to completion leaves a `JoinError` and nothing else. If the id were
+    // minted inside the task — as `under_own_attempt` mints it, and as this loop used to — it
+    // would die with the task, and the join loop below could only report that something went
+    // wrong internally for a request that may already have taken the locks. That is the exact
+    // reading the doc comment on `AcquireError::OutcomeUnknown` says a caller must never be given.
+    let mut batch_attempts = HashMap::<tokio::task::Id, AttemptId>::with_capacity(num_batches);
     for batch_resources in batch_iterator {
         let batch_resources = batch_resources.to_vec();
         let owner = owner.clone();
@@ -299,7 +332,11 @@ pub async fn acquire(
         let repository_id = repository.id;
         let ownership = ownership.clone();
         let attempts = attempts.cloned();
-        lore_spawn!(batches, async move {
+        // One id per batch, because each batch is a separate irreversible dispatch — the same rule
+        // that makes a push's several dispatches take several ids. Only the choice of the VALUE
+        // moves out here; the scope it is entered in stays inside the task below.
+        let batch_attempt = AttemptId::new();
+        let handle = lore_spawn!(batches, async move {
             let connection = remote
                 .lock(repository_id)
                 .await
@@ -309,12 +346,11 @@ pub async fn acquire(
 
             // Entered inside the spawned task, and that placement is load-bearing. `lore_spawn!`
             // re-scopes `LORE_CONTEXT` and nothing else, so the attempt task-local does not cross
-            // the spawn: a scope opened around this loop would be invisible in here, every batch
-            // would mint its own id anyway, and the caller's store would record none of them.
-            // Each batch is a separate irreversible dispatch and takes a separate id, for the
-            // same reason a push's several dispatches do.
-            let response = under_own_attempt(
+            // the spawn: a scope opened around this loop would be invisible in here, and the
+            // caller's store would record none of the batches' attempts.
+            let response = under_named_attempt(
                 attempts.as_ref(),
+                batch_attempt,
                 repository_id,
                 GrpcRpc::LockLock,
                 connection.lock(&batch_resources, owner.as_deref()),
@@ -330,6 +366,7 @@ pub async fn acquire(
 
             Ok(response)
         });
+        batch_attempts.insert(handle.id(), batch_attempt);
     }
 
     // A task that did not run to completion is not an answer. It panicked or was cancelled, and
@@ -340,9 +377,13 @@ pub async fn acquire(
     while let Some(task_result) = batches.join_next().await {
         match task_result {
             Ok(result) => batches_results.push(result),
-            Err(_) => {
-                task_failure = task_failure
-                    .or_else(|| Some(AcquireError::internal("Failed executing batch task")));
+            Err(join_error) => {
+                // Logged rather than dropped. `JoinError`'s own message is the only thing that
+                // separates a panic from a cancellation, and neither the set verdict nor the
+                // caller's error can carry it.
+                lore_error!("A lock-acquire batch task did not run to completion: {join_error}");
+                let attempt = batch_attempts.get(&join_error.id()).copied();
+                task_failure = task_failure.or_else(|| Some(lost_batch_task(attempt)));
             }
         }
     }
@@ -373,7 +414,7 @@ pub async fn acquire(
         // Handed back as it is, both when it is decisive (nothing was acquired, and the server's
         // own refusal is more useful than a message this file invented) and when it is not (the
         // caller is told `OutcomeUnknown`, naming the attempt whose journal record
-        // `under_own_attempt` deliberately left unresolved for a later authoritative read).
+        // `under_named_attempt` deliberately left unresolved for a later authoritative read).
         //
         // Whatever the successful batches did acquire stays acquired and stays recorded in
         // `ownership`: rolling it back would be the mutation-on-a-maybe this guards against, and
@@ -385,26 +426,58 @@ pub async fn acquire(
     };
 
     if num_batch_success < num_batches {
-        lore_debug!("Attempting releasing partial acquired locks.");
+        let rollback = rollback_set(&locks, &requested_paths, &pre_held);
 
-        let options = ReleaseOptions {
-            paths: options.paths,
-            branch: options.branch,
-            owner: String::default(),
-            owner_id: String::default(),
-        };
+        for description in &rollback.unnameable {
+            lore_error!(
+                "A granted lock names a path this acquire did not request, so it cannot be rolled \
+                 back: {description}"
+            );
+        }
 
-        // The same store the successful batches just wrote their tokens into, so the rollback
-        // presents them. Without this the rollback would release tokenlessly, which a fenced cell
-        // refuses — leaving exactly the half-acquired set this branch exists to undo.
-        //
-        // The rollback's own answer can be lost in turn, and `forward` carries that variant
-        // across: the caller is then told `OutcomeUnknown` for the release rather than a decisive
-        // failure for the acquire, which is the honest report — some of these locks are held and
-        // nothing here knows which.
-        release(repository.clone(), options, ownership.clone(), attempts)
-            .await
-            .forward::<AcquireError>("Failed to acquire the lock")?;
+        if rollback.paths.is_empty() {
+            lore_debug!("This call took no new lock, so there is nothing to roll back.");
+        } else {
+            lore_debug!(
+                "Releasing the {} lock(s) this partial acquire took.",
+                rollback.paths.len()
+            );
+
+            let options = ReleaseOptions {
+                paths: LoreArray::from_vec(rollback.paths),
+                branch: options.branch,
+                owner: String::default(),
+                owner_id: String::default(),
+            };
+
+            // The same store the successful batches just wrote their tokens into, so the rollback
+            // presents them. Without this the rollback would release tokenlessly, which a fenced
+            // cell refuses — leaving exactly the half-acquired set this branch exists to undo.
+            //
+            // The rollback's own answer can be lost in turn, and `forward` carries that variant
+            // across: the caller is then told `OutcomeUnknown` for the release rather than a
+            // decisive failure for the acquire, which is the honest report — some of these locks
+            // are held and nothing here knows which.
+            release(repository.clone(), options, ownership.clone(), attempts)
+                .await
+                .forward::<AcquireError>("Failed to acquire the lock")?;
+        }
+
+        // A lock this call holds and could not name is not a decisive failure, whatever the
+        // server said about the batch that failed. Reporting the refusal here would tell the
+        // caller the acquire is over and nothing is outstanding, while a row it cannot release
+        // stays taken — the same wrong reading a lost batch task used to produce, arrived at from
+        // the other side. Only the code carries that here: the attempt this lock was granted
+        // under is a per-batch identity, and `classify_batch_set` flattens the batches before this
+        // point, so no id survives to name. An empty one is the truth rather than a placeholder,
+        // and a reconciler that cannot key off it has to escalate to the user, which is the
+        // correct handling for a row nothing local can name.
+        if !rollback.unnameable.is_empty() {
+            return Err(AcquireError::from(OutcomeUnknown {
+                operation: GrpcRpc::LockLock.wire_name().to_owned(),
+                attempt_id: String::new(),
+            }));
+        }
 
         // The refusal that failed the set, not a message invented here. A caller told `Internal`
         // for a batch the server turned down with a reason has to guess at the remedy the server
@@ -455,6 +528,90 @@ pub async fn acquire(
     }
 
     Ok(())
+}
+
+/// What a partial acquire has to release to undo itself, and what it cannot.
+///
+/// Two fields rather than a path list, because the second one changes the error the caller is
+/// given rather than only what is released.
+struct RollbackSet {
+    /// The user paths to release: the locks the server granted THIS call, minus the ones it
+    /// already held.
+    paths: Vec<LoreString>,
+    /// Descriptions of granted locks no requested path accounts for. Non-empty means the rollback
+    /// is incomplete whatever else it managed, so the acquire's own report may not be decisive.
+    unnameable: Vec<String>,
+}
+
+/// Decide which of a partial acquire's granted locks must be released to undo it.
+///
+/// Extracted from `acquire` rather than left inline because it is the whole of a destructive
+/// decision, and inline it was reachable only against a live server with more than
+/// [`LOCK_BATCH_SIZE`] paths and a server that refuses exactly one batch.
+///
+/// Two exclusions, and both are the difference between undoing this call and damaging the caller:
+///
+/// * **a row this client already held** is skipped. A granted lock does not say whether the server
+///   created the row or renewed it — the fenced coordinator reports both in one `committed` set —
+///   so `pre_held`, built from the tokens the client presented on the way in, is the only evidence
+///   of the pre-call state. Releasing one would leave the caller worse off than if it had never
+///   asked, and clear the token it needs to release the row later.
+/// * **a description no requested path produced** cannot be released at all: `release` takes user
+///   paths and there is none to give it. Reported rather than dropped, because the row is held.
+fn rollback_set(
+    locks: &[AcquiredLock],
+    requested_paths: &HashMap<String, String>,
+    pre_held: &HashSet<(BranchId, Hash)>,
+) -> RollbackSet {
+    let mut paths = Vec::with_capacity(locks.len());
+    let mut unnameable = Vec::new();
+    for lock in locks {
+        let resource = &lock.lock.resource;
+        if pre_held.contains(&(resource.branch, resource.hash)) {
+            continue;
+        }
+        match requested_paths.get(&resource.description) {
+            Some(path) => paths.push(LoreString::from(path)),
+            None => unnameable.push(resource.description.clone()),
+        }
+    }
+    RollbackSet { paths, unnameable }
+}
+
+/// What the caller is told when one batch task never produced an answer (WP-120).
+///
+/// A `JoinError` means the task panicked or was cancelled. Neither says whether the batch's
+/// request reached the server, so this is an outstanding attempt rather than a failure. Reported
+/// as `Internal`, which is what this used to be, it read to a caller as an operation that provably
+/// did not happen: `EventError::translated` above maps everything but `OutcomeUnknown` to
+/// `LoreError::Internal`, and a desktop that adjudicates on `OutcomeUnknown` would have retried an
+/// acquire that may already have taken the locks.
+///
+/// **What the id does and does not promise.** It is the one the parent minted for that batch, so
+/// it is the id the batch dispatched under — `lore-attempt-id` on the request, and the key of the
+/// record `under_named_attempt` wrote before dispatching. Neither of those is guaranteed to exist
+/// by the time this runs: a caller passing no attempt store journals nothing (the CLI and FFI path
+/// in `lore::lock`), and a task that died inside the connect above never reached the dispatch at
+/// all. So a reconciler finding nothing under this id has learned that the request cannot be shown
+/// to have left, NOT that it did not happen. That is the whole reason the code is non-decisive:
+/// the absence is as ambiguous as the id.
+///
+/// `None` still reports an unknown outcome, with an empty id. It means only that this loop could
+/// not say WHICH batch died, which changes nothing about the batch having died: the request may
+/// still have left. Falling back to `Internal` here would answer a bookkeeping gap with the one
+/// claim this file exists to stop making. The status is the load-bearing half and the id is the
+/// convenience — a consumer of `#[ffi_outcome_identity]` reads the two as separate fields, and
+/// lorehub-desktop's adjudicator keys off the rows its own `AttemptStore` wrote before the
+/// dispatch rather than off this string, so an empty one costs it a label and not a lookup. The
+/// arm is unreachable anyway: every spawned handle's id is recorded, and `AbortHandle::id` and
+/// `JoinError::id` agree for both a panic and an abort.
+fn lost_batch_task(attempt: Option<AttemptId>) -> AcquireError {
+    AcquireError::from(OutcomeUnknown {
+        operation: GrpcRpc::LockLock.wire_name().to_owned(),
+        attempt_id: attempt
+            .map(|attempt| attempt.to_string())
+            .unwrap_or_default(),
+    })
 }
 
 /// Keep every ownership token one batch was issued.
@@ -625,6 +782,193 @@ mod tests {
         );
     }
 
+    /// `lost_batch_task` itself, pinned directly rather than only through `classify_batch_set` or
+    /// the live fixture.
+    ///
+    /// This is the unit-level guard on the exact mapping WP-120 depends on: it must fail if either
+    /// arm reverts to `AcquireError::internal(...)` -- `Some(attempt)`'s old fallback, or a
+    /// reintroduced special case for `None` -- even if every `set_verdict` case and every live test
+    /// happened to be skipped. Both arms return `OutcomeUnknown` now; the pair below shows the
+    /// attempt id is what's optional, not the status.
+    mod lost_batch_task_mapping {
+        use super::*;
+
+        /// `Some(id)` becomes `AcquireError::OutcomeUnknown`, translating to
+        /// `LoreError::OutcomeUnknown`, with the attempt id and the RPC's wire name both present in
+        /// the rendered message -- the two facts a reconciler reads out of the error.
+        #[test]
+        fn a_surviving_attempt_id_becomes_outcome_unknown_naming_the_attempt_and_the_rpc() {
+            let attempt = AttemptId::new();
+            let error = lost_batch_task(Some(attempt));
+
+            assert!(
+                matches!(error, AcquireError::OutcomeUnknown(_)),
+                "a surviving attempt id must map to the OutcomeUnknown variant: {error:?}"
+            );
+            assert!(
+                error.translated() == LoreError::OutcomeUnknown,
+                "the public translation must carry the unknown outcome through, not collapse it \
+                 to Internal: {:?}",
+                error.translated() as i32
+            );
+
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(&attempt.to_string()),
+                "the attempt id must be readable in the rendered message: {rendered}"
+            );
+            assert!(
+                rendered.contains(GrpcRpc::LockLock.wire_name()),
+                "the RPC's wire name must be readable in the rendered message: {rendered}"
+            );
+        }
+
+        /// `None` -- the join loop could not say WHICH batch died, not that no batch died -- still
+        /// becomes `AcquireError::OutcomeUnknown`, with an empty attempt id rather than no claim at
+        /// all. The status is the load-bearing half: whether this loop can name the batch changes
+        /// nothing about whether the request may have left, so answering `Internal` here would make
+        /// the one claim this whole change exists to stop making. The empty id costs a label, not a
+        /// lookup -- a reconciler builds its own record from what it journalled before the dispatch,
+        /// not by parsing this string.
+        #[test]
+        fn no_surviving_attempt_id_still_becomes_outcome_unknown_with_an_empty_id() {
+            let error = lost_batch_task(None);
+
+            assert!(
+                matches!(error, AcquireError::OutcomeUnknown(_)),
+                "an unnamed attempt must still surface as OutcomeUnknown: {error:?}"
+            );
+            assert!(
+                error.translated() == LoreError::OutcomeUnknown,
+                "the public translation must carry the unknown outcome through, not collapse it \
+                 to Internal: {:?}",
+                error.translated() as i32
+            );
+
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(GrpcRpc::LockLock.wire_name()),
+                "the RPC's wire name must still be readable in the rendered message: {rendered}"
+            );
+
+            let (operation, attempt_id) = error
+                .outcome_identity()
+                .expect("an OutcomeUnknown error must carry an outcome identity");
+            assert_eq!(operation, GrpcRpc::LockLock.wire_name());
+            assert_eq!(
+                attempt_id, "",
+                "no batch id survived, so the identity must carry an empty attempt id rather \
+                 than inventing or omitting one"
+            );
+        }
+    }
+
+    /// `rollback_set` itself, pinned directly: the pure destructive decision a partial acquire's
+    /// rollback now rides on. No fixture, no batching, no live server -- just the three inputs the
+    /// function actually reads.
+    mod rollback_set_tests {
+        use super::*;
+
+        /// A granted lock, distinguished only by branch/hash/description -- the fields
+        /// `rollback_set` reads. Token and owner are irrelevant to the function under test.
+        fn lock_named(branch: Context, hash: Hash, description: &str) -> AcquiredLock {
+            let mut lock = acquired_lock(hash, branch, Some(token(0x11)));
+            lock.lock.resource.description = description.to_owned();
+            lock
+        }
+
+        /// A granted lock whose resource is in `pre_held` is excluded entirely: it is not in
+        /// `paths`, and it is not `unnameable` either -- it is simply not this call's to release.
+        #[test]
+        fn a_pre_held_resource_is_excluded() {
+            let branch = Context::from([0x01u8; 16]);
+            let hash = Hash::from([0x02u8; 32]);
+            let locks = vec![lock_named(branch, hash, "held.file")];
+            let mut requested_paths = HashMap::new();
+            requested_paths.insert("held.file".to_owned(), "C:/repo/held.file".to_owned());
+            let mut pre_held = HashSet::new();
+            pre_held.insert((branch, hash));
+
+            let rollback = rollback_set(&locks, &requested_paths, &pre_held);
+
+            assert!(
+                rollback.paths.is_empty(),
+                "a row this client already held must never be released: {:?}",
+                rollback.paths
+            );
+            assert!(rollback.unnameable.is_empty());
+        }
+
+        /// A granted lock NOT in `pre_held` is included, using the ORIGINAL user path from
+        /// `requested_paths` -- never the server-echoed description, which may differ in spelling
+        /// (case, separators) from what the user actually typed.
+        #[test]
+        fn a_newly_granted_resource_is_included_using_the_original_user_path() {
+            let branch = Context::from([0x01u8; 16]);
+            let hash = Hash::from([0x02u8; 32]);
+            let locks = vec![lock_named(branch, hash, "relative/new.file")];
+            let mut requested_paths = HashMap::new();
+            requested_paths.insert(
+                "relative/new.file".to_owned(),
+                "C:/repo/relative/new.file".to_owned(),
+            );
+            let pre_held = HashSet::new();
+
+            let rollback = rollback_set(&locks, &requested_paths, &pre_held);
+
+            assert_eq!(
+                rollback.paths,
+                vec![LoreString::from("C:/repo/relative/new.file")],
+                "the released path must be the user's ORIGINAL spelling, not the description"
+            );
+            assert!(rollback.unnameable.is_empty());
+        }
+
+        /// A description no requested path produced lands in `unnameable`, never in `paths`.
+        #[test]
+        fn a_description_absent_from_requested_paths_is_unnameable() {
+            let branch = Context::from([0x01u8; 16]);
+            let hash = Hash::from([0x02u8; 32]);
+            let locks = vec![lock_named(branch, hash, "unexpected.file")];
+            let requested_paths = HashMap::new();
+            let pre_held = HashSet::new();
+
+            let rollback = rollback_set(&locks, &requested_paths, &pre_held);
+
+            assert!(rollback.paths.is_empty());
+            assert_eq!(rollback.unnameable, vec!["unexpected.file".to_owned()]);
+        }
+
+        /// A mixed set produces both: one pre-held resource excluded, one new resource released
+        /// under its original path, and one unnameable description -- all three rules in one pass.
+        #[test]
+        fn a_mixed_set_produces_both_a_released_path_and_an_unnameable_description() {
+            let branch = Context::from([0x01u8; 16]);
+            let held_hash = Hash::from([0x02u8; 32]);
+            let new_hash = Hash::from([0x03u8; 32]);
+            let unnameable_hash = Hash::from([0x04u8; 32]);
+            let locks = vec![
+                lock_named(branch, held_hash, "held.file"),
+                lock_named(branch, new_hash, "new.file"),
+                lock_named(branch, unnameable_hash, "unexpected.file"),
+            ];
+            let mut requested_paths = HashMap::new();
+            requested_paths.insert("held.file".to_owned(), "C:/repo/held.file".to_owned());
+            requested_paths.insert("new.file".to_owned(), "C:/repo/new.file".to_owned());
+            let mut pre_held = HashSet::new();
+            pre_held.insert((branch, held_hash));
+
+            let rollback = rollback_set(&locks, &requested_paths, &pre_held);
+
+            assert_eq!(
+                rollback.paths,
+                vec![LoreString::from("C:/repo/new.file")],
+                "only the new, non-held resource may be released"
+            );
+            assert_eq!(rollback.unnameable, vec!["unexpected.file".to_owned()]);
+        }
+    }
+
     /// The set verdict, decided from hand-built per-batch outcomes.
     ///
     /// `acquire` calls [`classify_batch_set`] directly, with its own [`ACQUIRE_SET_LABELS`], rather
@@ -751,8 +1095,16 @@ mod tests {
             );
         }
 
-        /// A lost batch task alone is non-decisive, even beside a batch that succeeded, and the
-        /// successful batch's locks are still accounted for.
+        /// The `lost_batch_task(None)` shape passed through unchanged.
+        ///
+        /// `None` is the unreachable fallback at `acquire`'s own call site -- every spawned
+        /// handle's id is recorded in `batch_attempts` before the join loop runs, so a real lost
+        /// batch task always has a surviving id today (see the sibling test below, which pins the
+        /// shape `acquire` actually builds). This case is really about `classify_batch_set` itself:
+        /// whatever `task_failure` a caller hands in, decisive or not, it must reach the verdict
+        /// unchanged rather than reshaped -- proven here against the one shape that is NOT
+        /// `OutcomeUnknown`, so a future change that always wraps `task_failure` in `OutcomeUnknown`
+        /// regardless of its input would fail this test.
         #[test]
         fn a_lost_batch_task_alone_is_non_decisive() {
             let mut locks = Vec::new();
@@ -769,6 +1121,36 @@ mod tests {
             assert!(
                 !matches!(failure.error, AcquireError::OutcomeUnknown(_)),
                 "no attempt id survived the lost task, so none may be named: {:?}",
+                failure.error
+            );
+            assert_eq!(descriptions(&locks), vec!["a.file".to_owned()]);
+        }
+
+        /// The `lost_batch_task(Some(id))` shape -- the one `acquire` actually builds -- passed
+        /// through unchanged.
+        ///
+        /// Sibling to the test above: together they cover both of `lost_batch_task`'s branches at
+        /// the `classify_batch_set` boundary, proving the helper reshapes neither. `unknown()` is
+        /// exactly the `AcquireError::OutcomeUnknown` shape `lost_batch_task(Some(id))` builds (see
+        /// `mod tests`'s own direct pin of that mapping), so passing it as `task_failure` here
+        /// stands in for a real panicking batch task without needing a live fixture.
+        #[test]
+        fn a_lost_batch_task_with_a_surviving_id_is_non_decisive_and_names_it() {
+            let mut locks = Vec::new();
+            let failure = classify_batch_set(
+                vec![Ok(vec![lock_named("a.file")])],
+                Some(unknown()),
+                2,
+                &ACQUIRE_SET_LABELS,
+                &mut locks,
+            )
+            .expect_err("a set with a lost task fails even though a batch succeeded");
+
+            assert!(!failure.decisive);
+            assert!(
+                matches!(failure.error, AcquireError::OutcomeUnknown(_)),
+                "the id the lost task's own record was minted under must reach the caller \
+                 unchanged: {:?}",
                 failure.error
             );
             assert_eq!(descriptions(&locks), vec!["a.file".to_owned()]);

@@ -542,7 +542,21 @@ async fn unlock_batches(
     while let Some(task_result) = batches.join_next().await {
         match task_result {
             Ok(result) => outcomes.push(result),
-            Err(_) => {
+            Err(join_error) => {
+                // Logged rather than dropped. `JoinError`'s own message is the only thing that
+                // separates a panic from a cancellation, and neither the set verdict nor the
+                // caller's error can carry it.
+                lore_error!("A lock-release batch task did not run to completion: {join_error}");
+                // PIN(WP-120, 2026-09-06): `acquire` names the lost batch's own attempt here and
+                // reports `OutcomeUnknown`; this verb still reports `Internal`, which tells a
+                // caller the release provably did not happen when nothing knows that. The harm is
+                // bounded to the reported code rather than a second mutation, because
+                // `classify_batch_set` already makes the set non-decisive on any `task_failure`
+                // and `release` escalates to `ForceUnlock` only on a decisive one. Closing it is
+                // `acquire`'s change applied here: mint the id per batch in `unlock_batches`
+                // before `lore_spawn!`, key it by the handle's `tokio::task::Id`, and dispatch
+                // through `under_named_attempt`. Left out of that round to keep one verb's control
+                // flow under review at a time.
                 task_failure = task_failure
                     .or_else(|| Some(ReleaseError::internal("Failed executing batch task")));
             }
