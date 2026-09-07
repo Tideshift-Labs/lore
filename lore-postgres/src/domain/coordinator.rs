@@ -550,6 +550,16 @@ pub trait DomainTransactionStore: Send + Sync {
         client_attempt_id: Option<uuid::Uuid>,
     ) -> Result<PrepareResult, DomainError>;
 
+    /// Prepare a direct-human receipt with verified, server-only authorization evidence.
+    /// Separate from mediated preparation so no fabricated claim fence is required.
+    async fn domain_operation_prepare_direct(
+        &self,
+        key: &ReceiptKey,
+        binding: &OperationBinding,
+        evidence: &crate::domain::receipts::DirectAuthorizationEvidence,
+        client_attempt_id: Option<uuid::Uuid>,
+    ) -> Result<PrepareResult, DomainError>;
+
     /// Load one receipt or compact future-rejection marker in its exact
     /// authenticated namespace. This never returns the consume token.
     async fn domain_operation_receipt_get(

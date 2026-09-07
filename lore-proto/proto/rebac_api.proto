@@ -213,6 +213,8 @@ message AuthorizeDirectRepositoryOperationResponse {
   bytes verification_nonce = 11;
   bytes bound_fields_digest = 12;
   bytes org_uuid = 13;
+  // P-029-5: exact repository authorized by this witness.
+  bytes repository_id = 14;
 }
 
 // Closed method discriminator for the four CR-029 maintenance verifier ports.

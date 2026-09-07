@@ -306,6 +306,27 @@ impl DomainTransactionStore for PostgresDomainStore {
         Ok(result)
     }
 
+    async fn domain_operation_prepare_direct(
+        &self,
+        key: &receipts::ReceiptKey,
+        binding: &receipts::OperationBinding,
+        evidence: &receipts::DirectAuthorizationEvidence,
+        client_attempt_id: Option<uuid::Uuid>,
+    ) -> Result<receipts::PrepareResult, DomainError> {
+        let _t = self
+            .instruments()
+            .start("domain_operation_prepare_direct", self.pool().status());
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("direct operation prepare transaction", e))?;
+        let result =
+            receipts::prepare_direct(&tx, key, binding, evidence, client_attempt_id).await?;
+        classify_commit(tx.commit().await, "direct operation prepare commit")?;
+        Ok(result)
+    }
+
     async fn domain_operation_attempt_receipt_get(
         &self,
         verified_issuer: &str,

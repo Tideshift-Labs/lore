@@ -633,6 +633,46 @@ ALTER TABLE lore_domain_operation_receipts
     ADD COLUMN IF NOT EXISTS client_attempt_id bytea
     CHECK (client_attempt_id IS NULL OR octet_length(client_attempt_id) = 16);
 
+-- CR-029 P-029-3: additive, server-only evidence for direct-human receipts.
+-- Historical rows remain NULL; no authorization evidence is fabricated.
+ALTER TABLE lore_domain_operation_receipts
+    ADD COLUMN IF NOT EXISTS direct_authorization_id bytea,
+    ADD COLUMN IF NOT EXISTS direct_authorization_revision numeric(20,0),
+    ADD COLUMN IF NOT EXISTS direct_verification_nonce bytea,
+    ADD COLUMN IF NOT EXISTS direct_bound_fields_digest bytea;
+DO $direct_evidence$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'lore_domain_operation_receipts'::regclass
+          AND conname = 'lore_domain_receipt_direct_evidence'
+    ) THEN
+        ALTER TABLE lore_domain_operation_receipts
+            ADD CONSTRAINT lore_domain_receipt_direct_evidence CHECK (
+                (direct_authorization_id IS NULL
+                 AND direct_authorization_revision IS NULL
+                 AND direct_verification_nonce IS NULL
+                 AND direct_bound_fields_digest IS NULL)
+                OR
+                (direct_authorization_id IS NOT NULL
+                 AND octet_length(direct_authorization_id) = 16
+                 AND direct_authorization_id = operation_id
+                 AND direct_authorization_revision IS NOT NULL
+                 AND direct_authorization_revision BETWEEN 1 AND 18446744073709551615
+                 AND direct_verification_nonce IS NOT NULL
+                 AND octet_length(direct_verification_nonce) = 32
+                 AND direct_bound_fields_digest IS NOT NULL
+                 AND octet_length(direct_bound_fields_digest) = 32
+                 AND authorization_id IS NULL
+                 AND authorization_revision IS NULL
+                 AND verification_nonce IS NULL
+                 AND bound_fields_digest IS NULL
+                 AND consumed_ticket_sha256 IS NULL)
+            );
+    END IF;
+END
+$direct_evidence$;
+
 -- Namespaced deliberately, and this is the security-bearing part of the change.
 --
 -- The lookup that uses this index resolves the principal from the caller's verified token and

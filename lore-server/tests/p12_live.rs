@@ -1,6 +1,9 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
+#[path = "support/direct_authorization.rs"]
+mod direct_authorization;
+
 use std::sync::Arc;
 
 use lore_base::types::KeyType;
@@ -1079,22 +1082,7 @@ impl RepositoryOperationAuthorizationVerifier for DirectEchoVerifier {
         request: Request<AuthorizeDirectRepositoryOperationRequest>,
     ) -> Result<AuthorizeDirectRepositoryOperationResponse, Status> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let request = request.into_inner();
-        Ok(AuthorizeDirectRepositoryOperationResponse {
-            verified_issuer: request.verified_issuer,
-            authenticated_subject: request.authenticated_subject,
-            operation_id: request.operation_id.clone(),
-            method: request.method,
-            scope: request.scope,
-            fingerprint_version: request.fingerprint_version,
-            fingerprint: request.fingerprint,
-            canonical_intent_digest: request.canonical_intent_digest,
-            authorization_id: request.operation_id,
-            authorization_revision: 1,
-            verification_nonce: bytes::Bytes::from_static(&[0x11u8; 32]),
-            bound_fields_digest: bytes::Bytes::from_static(&[0x22u8; 32]),
-            org_uuid: bytes::Bytes::new(),
-        })
+        Ok(direct_authorization::direct_echo(request.into_inner()))
     }
 }
 

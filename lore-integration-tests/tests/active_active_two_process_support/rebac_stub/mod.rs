@@ -534,6 +534,7 @@ impl StubState {
                 verification_nonce: bytes::Bytes::copy_from_slice(&minted.verification_nonce),
                 bound_fields_digest: bytes::Bytes::copy_from_slice(&minted.bound_fields_digest),
                 org_uuid: bytes::Bytes::copy_from_slice(&self.org_uuid),
+                repository_id: bytes::Bytes::copy_from_slice(&minted.repository_id),
             },
         )
     }

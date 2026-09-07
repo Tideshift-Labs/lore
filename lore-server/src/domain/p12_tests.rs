@@ -216,6 +216,16 @@ impl MetadataCasScriptedStore {
 
 #[async_trait]
 impl DomainTransactionStore for MetadataCasScriptedStore {
+    async fn domain_operation_prepare_direct(
+        &self,
+        _key: &ReceiptKey,
+        _binding: &OperationBinding,
+        _evidence: &lore_postgres::domain::receipts::DirectAuthorizationEvidence,
+        _client_attempt_id: Option<uuid::Uuid>,
+    ) -> Result<PrepareResult, DomainError> {
+        unreachable!("MetadataCasScriptedStore never prepares direct operations")
+    }
+
     // WP-120's public attempt lookup. Stated rather than defaulted: a store that answers
     // "no receipt" when it simply cannot look one up would report a real attempt as absent,
     // and absence is what tells a client to stop waiting.
@@ -511,6 +521,16 @@ struct RepositoryCreateScriptedStore {
 
 #[async_trait]
 impl DomainTransactionStore for RepositoryCreateScriptedStore {
+    async fn domain_operation_prepare_direct(
+        &self,
+        _key: &ReceiptKey,
+        _binding: &OperationBinding,
+        _evidence: &lore_postgres::domain::receipts::DirectAuthorizationEvidence,
+        _client_attempt_id: Option<uuid::Uuid>,
+    ) -> Result<PrepareResult, DomainError> {
+        unreachable!("RepositoryCreateScriptedStore never prepares direct operations")
+    }
+
     // WP-120's public attempt lookup. Stated rather than defaulted: a store that answers
     // "no receipt" when it simply cannot look one up would report a real attempt as absent,
     // and absence is what tells a client to stop waiting.

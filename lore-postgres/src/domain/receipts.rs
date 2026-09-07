@@ -319,7 +319,9 @@ async fn lock_receipt_row(
                     not_applied_reason, method, scope, fingerprint_version, fingerprint, \
                     canonical_intent_digest, public_result, \
                     prepared_at, hard_expires_at, committed_at, full_result_expires_at, \
-                    compact_expires_at, compacted \
+                    compact_expires_at, compacted, direct_authorization_id, \
+                    direct_authorization_revision::text AS direct_authorization_revision, \
+                    direct_verification_nonce, direct_bound_fields_digest \
              FROM lore_domain_operation_receipts \
              WHERE verified_issuer = $1 AND authenticated_subject = $2 \
                AND tenant_scope_key = $3 AND operation_id = $4 \
@@ -350,6 +352,10 @@ async fn lock_receipt_row(
         hard_expires_at: r.get("hard_expires_at"),
         committed_at: r.get("committed_at"),
         full_result_expires_at: r.get("full_result_expires_at"),
+        direct_authorization_id: r.get("direct_authorization_id"),
+        direct_authorization_revision: r.get("direct_authorization_revision"),
+        direct_verification_nonce: r.get("direct_verification_nonce"),
+        direct_bound_fields_digest: r.get("direct_bound_fields_digest"),
     }))
 }
 
@@ -369,6 +375,10 @@ struct ReceiptRow {
     hard_expires_at: SystemTime,
     committed_at: Option<SystemTime>,
     full_result_expires_at: Option<SystemTime>,
+    direct_authorization_id: Option<Vec<u8>>,
+    direct_authorization_revision: Option<String>,
+    direct_verification_nonce: Option<Vec<u8>>,
+    direct_bound_fields_digest: Option<Vec<u8>>,
 }
 
 impl ReceiptRow {
@@ -557,13 +567,51 @@ pub async fn prepare(
     witness: Option<&AuthorizationWitness>,
     client_attempt_id: Option<Uuid>,
 ) -> Result<PrepareResult, DomainError> {
+    prepare_with_evidence(tx, key, binding, witness, None, client_attempt_id).await
+}
+
+/// Prepare a direct-human operation with its separate, immutable authorization evidence.
+pub async fn prepare_direct(
+    tx: &Transaction<'_>,
+    key: &ReceiptKey,
+    binding: &OperationBinding,
+    evidence: &DirectAuthorizationEvidence,
+    client_attempt_id: Option<Uuid>,
+) -> Result<PrepareResult, DomainError> {
+    if evidence.authorization_id.as_slice() != key.operation_id.as_bytes()
+        || evidence.authorization_revision == 0
+        || evidence.verification_nonce.len() != 32
+        || evidence.bound_fields_digest.len() != 32
+    {
+        return Ok(PrepareResult::Mismatch);
+    }
+    prepare_with_evidence(tx, key, binding, None, Some(evidence), client_attempt_id).await
+}
+
+async fn prepare_with_evidence(
+    tx: &Transaction<'_>,
+    key: &ReceiptKey,
+    binding: &OperationBinding,
+    witness: Option<&AuthorizationWitness>,
+    direct: Option<&DirectAuthorizationEvidence>,
+    client_attempt_id: Option<Uuid>,
+) -> Result<PrepareResult, DomainError> {
     let clock = admission_clock(tx).await?;
     let uuid_ts = uuid_v7_timestamp(&key.operation_id)?;
 
     // Exact-load first: an existing row, terminal or prepared, is authoritative
     // and no classification can override it.
     if let Some(row) = lock_receipt_row(tx, key).await? {
-        if !row.matches(binding) {
+        if !row.matches(binding)
+            || row.direct_authorization_id.as_deref()
+                != direct.map(|e| e.authorization_id.as_slice())
+            || row.direct_authorization_revision
+                != direct.map(|e| e.authorization_revision.to_string())
+            || row.direct_verification_nonce.as_deref()
+                != direct.map(|e| e.verification_nonce.as_slice())
+            || row.direct_bound_fields_digest.as_deref()
+                != direct.map(|e| e.bound_fields_digest.as_slice())
+        {
             return Ok(PrepareResult::Mismatch);
         }
         if row.state == schema::RECEIPT_STATE_COMMITTED {
@@ -618,6 +666,7 @@ pub async fn prepare(
                 clock,
                 hard_expires_at,
                 client_attempt_id,
+                direct,
             )
             .await?;
             Ok(PrepareResult::Prepared {
@@ -643,6 +692,7 @@ pub async fn prepare(
                 clock,
                 hard_expires_at,
                 client_attempt_id,
+                direct,
             )
             .await?;
             let outcome = DomainOutcome::NotApplied {
@@ -664,6 +714,15 @@ pub async fn prepare(
 
 /// Server-only authorization/execution evidence recorded beside a receipt.
 /// Never a fingerprint input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectAuthorizationEvidence {
+    pub authorization_id: Vec<u8>,
+    pub authorization_revision: u64,
+    pub verification_nonce: Vec<u8>,
+    pub bound_fields_digest: Vec<u8>,
+}
+
+/// Mediated authorization evidence, including the claim's dispatch fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationWitness {
     /// Platform authorization row identity.
@@ -715,6 +774,7 @@ async fn insert_prepared(
     prepared_at: SystemTime,
     hard_expires_at: SystemTime,
     client_attempt_id: Option<Uuid>,
+    direct: Option<&DirectAuthorizationEvidence>,
 ) -> Result<(), DomainError> {
     // `client_attempt_id` is stored as raw bytes rather than a `uuid` column to match every other
     // identifier on this table, which is `bytea`. It is nullable because a client older than
@@ -727,9 +787,12 @@ async fn insert_prepared(
              state, consume_token, \
              authorization_id, authorization_revision, verification_nonce, \
              bound_fields_digest, consumed_ticket_sha256, \
-             uuid_timestamp, prepared_at, hard_expires_at, client_attempt_id \
+             uuid_timestamp, prepared_at, hard_expires_at, client_attempt_id, \
+             direct_authorization_id, direct_authorization_revision, \
+             direct_verification_nonce, direct_bound_fields_digest \
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                   $12, $13, $14, $15, $16, $17, $18, $19, $20)",
+                   $12, $13, $14, $15, $16, $17, $18, $19, $20, \
+                   $21, $22::text::numeric, $23, $24)",
         &[
             &key.verified_issuer,
             &key.authenticated_subject,
@@ -751,6 +814,10 @@ async fn insert_prepared(
             &prepared_at,
             &hard_expires_at,
             &client_attempt_id,
+            &direct.map(|e| e.authorization_id.clone()),
+            &direct.map(|e| e.authorization_revision.to_string()),
+            &direct.map(|e| e.verification_nonce.clone()),
+            &direct.map(|e| e.bound_fields_digest.clone()),
         ],
     )
     .await

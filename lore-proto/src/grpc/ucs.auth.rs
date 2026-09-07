@@ -251,6 +251,9 @@ pub struct AuthorizeDirectRepositoryOperationResponse {
     pub bound_fields_digest: ::prost::bytes::Bytes,
     #[prost(bytes = "bytes", tag = "13")]
     pub org_uuid: ::prost::bytes::Bytes,
+    /// P-029-5: exact repository authorized by this witness.
+    #[prost(bytes = "bytes", tag = "14")]
+    pub repository_id: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DomainOperationMaintenanceVerificationRequest {

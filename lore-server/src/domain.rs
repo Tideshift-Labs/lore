@@ -863,22 +863,19 @@ impl DomainContext {
         let response = verifier
             .authorize_direct_repository_operation(request)
             .await?;
-        verify_direct_echo(&key, &binding, &response)?;
+        verify_direct_echo(&key, &binding, repository_id, branch_id, &response)?;
 
-        // The witness is deliberately `None`. A present witness makes the
-        // receipt rail also write the **mediated** dispatch-possibility fence,
-        // which requires a 32-byte `expected_claim_identity_digest` minted by
-        // the platform's claim CAS. A direct human operation has no claim, so
-        // there is nothing to fence and nothing honest to put in that column.
-        //
-        // BLOCKED(WP-120): direct-authorization evidence is verified but not
-        // persisted beside the receipt. Recording it needs a receipt-schema
-        // column of its own and a CR-029/CR-030 amendment naming its contract;
-        // inventing values for the mediated columns would file a direct
-        // operation as a mediated one.
+        // P-029-3: direct evidence belongs beside the receipt, without a
+        // mediated claim or dispatch-possibility fence.
+        let evidence = lore_postgres::domain::receipts::DirectAuthorizationEvidence {
+            authorization_id: response.authorization_id.to_vec(),
+            authorization_revision: response.authorization_revision,
+            verification_nonce: response.verification_nonce.to_vec(),
+            bound_fields_digest: response.bound_fields_digest.to_vec(),
+        };
         let prepared = self
             .store
-            .domain_operation_prepare(&key, &binding, None, client_attempt_id)
+            .domain_operation_prepare_direct(&key, &binding, &evidence, client_attempt_id)
             .await
             .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?;
         match prepared {
@@ -957,6 +954,8 @@ fn internal_prepare_fingerprint(
 fn verify_direct_echo(
     key: &ReceiptKey,
     binding: &OperationBinding,
+    repository_id: &[u8],
+    branch_id: &[u8],
     response: &lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse,
 ) -> Result<(), Status> {
     let exact = response.verified_issuer == key.verified_issuer
@@ -971,7 +970,11 @@ fn verify_direct_echo(
         // that happens to agree today.
         && i64::from(response.fingerprint_version) == i64::from(binding.fingerprint_version)
         && response.fingerprint.as_ref() == binding.fingerprint
-        && response.canonical_intent_digest.as_ref() == binding.canonical_intent_digest;
+        && response.canonical_intent_digest.as_ref() == binding.canonical_intent_digest
+        && repository_id.len() == 16
+        && response.repository_id.as_ref() == repository_id
+        && response.authorization_id.as_ref() == key.operation_id.as_bytes()
+        && response.authorization_revision == 1;
     if !exact {
         return Err(Status::permission_denied(
             "Direct repository operation authorization binding mismatch",
@@ -992,7 +995,52 @@ fn verify_direct_echo(
             "Direct repository operation verifier returned invalid authorization_id",
         ));
     }
+    let expected =
+        direct_authorization_bound_fields_digest(key, binding, repository_id, branch_id, response)?;
+    if response.bound_fields_digest.as_ref() != expected {
+        return Err(Status::permission_denied(
+            "Direct repository operation authorization digest mismatch",
+        ));
+    }
     Ok(())
+}
+
+/// CR-029 P-029-5: recompute the platform witness from the actual mutation target.
+/// The preimage is shared with `directAuthorizationBoundFieldsDigest` in the platform.
+fn direct_authorization_bound_fields_digest(
+    key: &ReceiptKey,
+    binding: &OperationBinding,
+    repository_id: &[u8],
+    branch_id: &[u8],
+    response: &lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse,
+) -> Result<Vec<u8>, Status> {
+    let fingerprint_version = u32::try_from(binding.fingerprint_version)
+        .map_err(|_| Status::internal("fingerprint version is not representable"))?
+        .to_be_bytes();
+    let authorization_revision = response.authorization_revision.to_be_bytes();
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(b"repository-operation-direct-authorization-v1\0");
+    for component in [
+        key.verified_issuer.as_bytes(),
+        key.authenticated_subject.as_bytes(),
+        key.operation_id.as_bytes().as_slice(),
+        binding.method.as_bytes(),
+        binding.scope.as_slice(),
+        fingerprint_version.as_slice(),
+        binding.fingerprint.as_slice(),
+        binding.canonical_intent_digest.as_slice(),
+        repository_id,
+        branch_id,
+        response.authorization_id.as_ref(),
+        authorization_revision.as_slice(),
+        response.verification_nonce.as_ref(),
+    ] {
+        let length = u32::try_from(component.len())
+            .map_err(|_| Status::internal("direct authorization field exceeds frame width"))?;
+        digest.update(&length.to_be_bytes());
+        digest.update(component);
+    }
+    Ok(digest.finish().as_ref().to_vec())
 }
 
 /// A governed operation that passed the entry gate.
@@ -3224,6 +3272,16 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl DomainTransactionStore for UnreachableDomainStore {
+        async fn domain_operation_prepare_direct(
+            &self,
+            _key: &ReceiptKey,
+            _binding: &OperationBinding,
+            _evidence: &lore_postgres::domain::receipts::DirectAuthorizationEvidence,
+            _client_attempt_id: Option<uuid::Uuid>,
+        ) -> Result<PrepareResult, DomainError> {
+            unreachable!("UnreachableDomainStore never prepares direct operations")
+        }
+
         // WP-120's public attempt lookup. Stated rather than defaulted: a store that answers
         // "no receipt" when it simply cannot look one up would report a real attempt as absent,
         // and absence is what tells a client to stop waiting.
@@ -3359,7 +3417,7 @@ pub(crate) mod test_support {
     }
 
     /// [`UnreachableDomainStore`] with one method made reachable:
-    /// `domain_operation_prepare` returns a fixed `Prepared`.
+    /// `domain_operation_prepare_direct` captures evidence and returns a fixed `Prepared`.
     ///
     /// The internal-prepare tests that reach the coordinator are the ones whose
     /// verifier ACCEPTS. Every refusal case fails at the echo check, before the
@@ -3368,7 +3426,11 @@ pub(crate) mod test_support {
     /// receipt row could have been written. This double exists only for the
     /// happy path, and everything except prepare still panics, so a test that
     /// wanders past it fails loudly rather than silently exercising a stub.
-    pub(crate) struct PreparingDomainStore;
+    #[derive(Default)]
+    pub(crate) struct PreparingDomainStore {
+        pub(crate) direct_evidence:
+            std::sync::Mutex<Option<lore_postgres::domain::receipts::DirectAuthorizationEvidence>>,
+    }
 
     /// The token this double hands back, so a test can assert the governed
     /// operation carries the coordinator's token rather than anything the
@@ -3377,6 +3439,25 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl DomainTransactionStore for PreparingDomainStore {
+        async fn domain_operation_prepare_direct(
+            &self,
+            key: &ReceiptKey,
+            _binding: &OperationBinding,
+            evidence: &lore_postgres::domain::receipts::DirectAuthorizationEvidence,
+            _client_attempt_id: Option<uuid::Uuid>,
+        ) -> Result<PrepareResult, DomainError> {
+            assert_eq!(evidence.authorization_id, key.operation_id.as_bytes());
+            assert_eq!(evidence.authorization_revision, 1);
+            assert_eq!(evidence.verification_nonce, vec![0x11; 32]);
+            assert_eq!(evidence.bound_fields_digest.len(), 32);
+            *self.direct_evidence.lock().unwrap() = Some(evidence.clone());
+            Ok(PrepareResult::Prepared {
+                token: PREPARED_TEST_TOKEN,
+                hard_expires_at: std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(1),
+            })
+        }
+
         // WP-120's public attempt lookup. Stated rather than defaulted: a store that answers
         // "no receipt" when it simply cannot look one up would report a real attempt as absent,
         // and absence is what tells a client to stop waiting.
@@ -3393,23 +3474,10 @@ pub(crate) mod test_support {
             &self,
             _key: &ReceiptKey,
             _binding: &OperationBinding,
-            witness: Option<&AuthorizationWitness>,
+            _witness: Option<&AuthorizationWitness>,
             _client_attempt_id: Option<uuid::Uuid>,
         ) -> Result<PrepareResult, DomainError> {
-            // The direct rail must never write a mediated dispatch fence, and a
-            // present witness is what makes the real rail write one. Asserted
-            // here rather than documented, so a change that starts passing one
-            // fails this test instead of quietly filing a direct operation as a
-            // mediated one.
-            assert!(
-                witness.is_none(),
-                "a direct internal prepare must pass no authorization witness"
-            );
-            Ok(PrepareResult::Prepared {
-                token: PREPARED_TEST_TOKEN,
-                hard_expires_at: std::time::SystemTime::UNIX_EPOCH
-                    + std::time::Duration::from_secs(1),
-            })
+            unreachable!("direct internal prepare must use the evidence-carrying method")
         }
 
         async fn domain_operation_clock_get(&self) -> Result<std::time::SystemTime, DomainError> {
@@ -3524,7 +3592,7 @@ pub(crate) mod test_support {
 
     /// A context whose coordinator will serve one `domain_operation_prepare`.
     pub(crate) fn preparing_context() -> DomainContext {
-        DomainContext::new(Arc::new(PreparingDomainStore), true)
+        DomainContext::new(Arc::new(PreparingDomainStore::default()), true)
     }
 
     /// A scriptable coordinator for `branch_push.rs`'s `GovernedPushCommit::publish`
@@ -3557,6 +3625,16 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl DomainTransactionStore for ScriptedDomainStore {
+        async fn domain_operation_prepare_direct(
+            &self,
+            _key: &ReceiptKey,
+            _binding: &OperationBinding,
+            _evidence: &lore_postgres::domain::receipts::DirectAuthorizationEvidence,
+            _client_attempt_id: Option<uuid::Uuid>,
+        ) -> Result<PrepareResult, DomainError> {
+            unreachable!("ScriptedDomainStore never prepares direct operations")
+        }
+
         // WP-120's public attempt lookup. Stated rather than defaulted: a store that answers
         // "no receipt" when it simply cannot look one up would report a real attempt as absent,
         // and absence is what tells a client to stop waiting.
@@ -3744,6 +3822,94 @@ mod tests {
 
     fn test_repository_id() -> [u8; 16] {
         *Uuid::new_v4().as_bytes()
+    }
+
+    // Outputs of the real platform directAuthorizationBoundFieldsDigest, also
+    // pinned by packages/control-plane/test/mutation-authorization.test.ts.
+    fn platform_direct_vector(
+        branch: &[u8],
+        expected: &str,
+    ) -> (
+        ReceiptKey,
+        OperationBinding,
+        lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse,
+    ) {
+        let operation_id = Uuid::parse_str("01882f40-5b1c-71a9-8b3d-5e027791c466").unwrap();
+        let key = ReceiptKey {
+            verified_issuer: "https://id.commit0.localhost".into(),
+            authenticated_subject: "case-i-writer".into(),
+            operation_id,
+            tenant_scope_key: vec![0x30; 24],
+        };
+        let binding = OperationBinding {
+            method: "branch.push".into(),
+            scope: key.tenant_scope_key.clone(),
+            fingerprint_version: 1,
+            fingerprint: vec![0x11; 32],
+            canonical_intent_digest: vec![0x22; 32],
+        };
+        let response = lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse {
+            verified_issuer: key.verified_issuer.clone(),
+            authenticated_subject: key.authenticated_subject.clone(),
+            operation_id: key.operation_id.as_bytes().to_vec().into(),
+            method: binding.method.clone(),
+            scope: binding.scope.clone().into(),
+            fingerprint_version: 1,
+            fingerprint: binding.fingerprint.clone().into(),
+            canonical_intent_digest: binding.canonical_intent_digest.clone().into(),
+            authorization_id: key.operation_id.as_bytes().to_vec().into(),
+            authorization_revision: 1,
+            verification_nonce: vec![0x55; 32].into(),
+            bound_fields_digest: (0..expected.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&expected[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+                .into(),
+            repository_id: vec![0x33; 16].into(),
+            org_uuid: bytes::Bytes::new(),
+        };
+        assert_eq!(
+            direct_authorization_bound_fields_digest(
+                &key,
+                &binding,
+                &response.repository_id,
+                branch,
+                &response,
+            )
+            .unwrap(),
+            response.bound_fields_digest
+        );
+        (key, binding, response)
+    }
+
+    #[test]
+    fn direct_echo_accepts_platform_vectors_with_and_without_branch() {
+        for (branch, expected) in [
+            (
+                &[0x44; 16][..],
+                "a7941dfaea01b967312cd346d1154e12cd0a64dd4b96a5a03a6436c18771eb7e",
+            ),
+            (
+                &[][..],
+                "6ab0bde51f1c90376d3b33fb815a2ea0c9e7b57813a9fe3aea856604971c1f3a",
+            ),
+        ] {
+            let (key, binding, response) = platform_direct_vector(branch, expected);
+            verify_direct_echo(&key, &binding, &[0x33; 16], branch, &response).unwrap();
+        }
+    }
+
+    #[test]
+    fn direct_echo_binds_the_request_branch_and_rejects_branchless_substitution() {
+        let (key, binding, response) = platform_direct_vector(
+            &[0x44; 16],
+            "a7941dfaea01b967312cd346d1154e12cd0a64dd4b96a5a03a6436c18771eb7e",
+        );
+        for wrong_branch in [&[0x45; 16][..], &[][..]] {
+            let error = verify_direct_echo(&key, &binding, &[0x33; 16], wrong_branch, &response)
+                .expect_err("request branch must be bound by the platform witness");
+            assert_eq!(error.code(), Code::PermissionDenied);
+        }
     }
 
     // --- 1. GovernedScope::tenant_scope_key -------------------------------
@@ -4035,6 +4201,12 @@ mod tests {
         FingerprintVersion,
         Fingerprint,
         CanonicalIntentDigest,
+        RepositoryId,
+        MissingRepositoryId,
+        AuthorizationId,
+        AuthorizationRevision,
+        VerificationNonce,
+        BoundFieldsDigest,
     }
 
     impl DirectVerifierDouble {
@@ -4142,22 +4314,67 @@ mod tests {
                 return Err(status.clone());
             }
             let request = request.into_inner();
+            let key = ReceiptKey {
+                verified_issuer: request.verified_issuer.clone(),
+                authenticated_subject: request.authenticated_subject.clone(),
+                operation_id: Uuid::from_slice(&request.operation_id).expect("operation UUID"),
+                tenant_scope_key: request.scope.to_vec(),
+            };
+            let binding = OperationBinding {
+                method: request.method.clone(),
+                scope: request.scope.to_vec(),
+                fingerprint_version: request.fingerprint_version.try_into().expect("version"),
+                fingerprint: request.fingerprint.to_vec(),
+                canonical_intent_digest: request.canonical_intent_digest.to_vec(),
+            };
             let mut response = lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse {
                 verified_issuer: request.verified_issuer,
                 authenticated_subject: request.authenticated_subject,
-                operation_id: request.operation_id,
+                operation_id: request.operation_id.clone(),
                 method: request.method,
                 scope: request.scope,
                 fingerprint_version: request.fingerprint_version,
                 fingerprint: request.fingerprint,
                 canonical_intent_digest: request.canonical_intent_digest,
-                authorization_id: bytes::Bytes::from_static(&[0x77u8; 16]),
+                authorization_id: request.operation_id,
                 authorization_revision: 1,
                 verification_nonce: bytes::Bytes::from_static(&[0x11u8; 32]),
                 bound_fields_digest: bytes::Bytes::from_static(&[0x22u8; 32]),
                 org_uuid: bytes::Bytes::new(),
+                repository_id: request.repository_id.clone(),
             };
+            response.bound_fields_digest = direct_authorization_bound_fields_digest(
+                &key,
+                &binding,
+                &request.repository_id,
+                &request.branch_id,
+                &response,
+            )?
+            .into();
             match self.diverge {
+                Some(EchoDivergence::RepositoryId) => {
+                    response.repository_id = bytes::Bytes::from_static(&[0xFE; 16]);
+                    // Even a coherent digest for another repository cannot authorize this target.
+                    response.bound_fields_digest = direct_authorization_bound_fields_digest(
+                        &key,
+                        &binding,
+                        &response.repository_id,
+                        &request.branch_id,
+                        &response,
+                    )?
+                    .into();
+                }
+                Some(EchoDivergence::MissingRepositoryId) => response.repository_id.clear(),
+                Some(EchoDivergence::AuthorizationId) => {
+                    response.authorization_id = bytes::Bytes::from_static(&[0xFE; 16]);
+                }
+                Some(EchoDivergence::AuthorizationRevision) => response.authorization_revision += 1,
+                Some(EchoDivergence::VerificationNonce) => {
+                    response.verification_nonce = bytes::Bytes::from_static(&[0xFE; 32]);
+                }
+                Some(EchoDivergence::BoundFieldsDigest) => {
+                    response.bound_fields_digest = bytes::Bytes::from_static(&[0xFE; 32]);
+                }
                 Some(EchoDivergence::VerifiedIssuer) => {
                     response.verified_issuer = "wrong-issuer".to_owned();
                 }
@@ -4779,6 +4996,81 @@ mod tests {
     #[tokio::test]
     async fn internal_prepare_refuses_a_canonical_intent_digest_echo_divergence() {
         assert_echo_divergence_is_refused(EchoDivergence::CanonicalIntentDigest).await;
+    }
+
+    #[tokio::test]
+    async fn internal_prepare_refuses_wrong_repository_even_with_a_coherent_digest() {
+        assert_echo_divergence_is_refused(EchoDivergence::RepositoryId).await;
+    }
+
+    #[tokio::test]
+    async fn internal_prepare_refuses_an_old_response_without_repository_id() {
+        assert_echo_divergence_is_refused(EchoDivergence::MissingRepositoryId).await;
+    }
+
+    #[tokio::test]
+    async fn internal_prepare_refuses_changed_authorization_evidence_before_any_receipt_access() {
+        for divergence in [
+            EchoDivergence::AuthorizationId,
+            EchoDivergence::AuthorizationRevision,
+            EchoDivergence::VerificationNonce,
+            EchoDivergence::BoundFieldsDigest,
+        ] {
+            assert_echo_divergence_is_refused(divergence).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_prepare_forwards_all_four_verified_evidence_fields_to_the_store() {
+        let store = Arc::new(super::test_support::PreparingDomainStore::default());
+        let ctx = DomainContext::new(store.clone(), true)
+            .with_operation_verifier(Some(Arc::new(DirectVerifierDouble::echo())));
+        let repository_id = test_repository_id();
+        let admitted = ctx
+            .admit(
+                &human_metadata(),
+                Some(&human_token()),
+                direct_scope_ctx(&repository_id),
+            )
+            .unwrap()
+            .unwrap();
+        let governed = ctx
+            .complete_governed(
+                admitted,
+                PLATFORM_METHOD_REPOSITORY_METADATA_SET,
+                vec![0x11; 32],
+            )
+            .await
+            .unwrap();
+        let evidence = store
+            .direct_evidence
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("direct evidence captured");
+        assert_eq!(
+            evidence.authorization_id,
+            governed.key.operation_id.as_bytes()
+        );
+        assert_eq!(evidence.authorization_revision, 1);
+        assert_eq!(evidence.verification_nonce, vec![0x11; 32]);
+        let response = lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse {
+            authorization_id: evidence.authorization_id.clone().into(),
+            authorization_revision: 1,
+            verification_nonce: vec![0x11; 32].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            evidence.bound_fields_digest,
+            direct_authorization_bound_fields_digest(
+                &governed.key,
+                &governed.binding,
+                &repository_id,
+                &[],
+                &response,
+            )
+            .unwrap()
+        );
     }
 
     // The internal prepare forwards the caller's own bearer token to the
