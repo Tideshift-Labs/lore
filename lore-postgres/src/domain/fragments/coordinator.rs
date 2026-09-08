@@ -1,4 +1,5 @@
 // Copyright 2026 Tideshift Labs
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! CR-031's single Postgres fragment lifecycle coordinator.
 //!
@@ -4092,6 +4093,36 @@ impl PostgresFragmentCoordinator {
         claim_input: Option<&FragmentWriteClaimInput>,
         require_missing: bool,
     ) -> Result<BeginOutcome, DomainError> {
+        // Only a lost first-head insertion followed by an acknowledged rollback
+        // permits another pass. Errors, including uncertain commits, never retry here.
+        for _ in 0..2 {
+            if let Some(outcome) = self
+                .begin_publication_once(
+                    hash,
+                    authority,
+                    legacy_object_key,
+                    claim_input,
+                    require_missing,
+                )
+                .await?
+            {
+                return Ok(outcome);
+            }
+        }
+        Err(DomainError::Contention(
+            "fragment first-head insertion remained contended".to_owned(),
+        ))
+    }
+
+    // None means no head or claim was written and rollback was acknowledged.
+    async fn begin_publication_once(
+        &self,
+        hash: &[u8],
+        authority: EpochAuthority,
+        legacy_object_key: Option<&str>,
+        claim_input: Option<&FragmentWriteClaimInput>,
+        require_missing: bool,
+    ) -> Result<Option<BeginOutcome>, DomainError> {
         match (authority, claim_input) {
             (EpochAuthority::Remote, None) => {
                 return Err(DomainError::InvalidInput(
@@ -4128,10 +4159,10 @@ impl PostgresFragmentCoordinator {
                         && head.active_operation.as_deref()
                             == Some(DIRECT_WRITE_REPAIR_OPERATION.as_slice()) => {}
                 Some(head) => {
-                    return Ok(BeginOutcome::Fenced(format!(
+                    return Ok(Some(BeginOutcome::Fenced(format!(
                         "repair requires a Missing lineage; this head is {}",
                         head.state.label()
-                    )));
+                    ))));
                 }
             }
         }
@@ -4139,19 +4170,21 @@ impl PostgresFragmentCoordinator {
             if head.state.is_readable() {
                 // The dedup short-circuit. No epoch is consumed, no fence is
                 // issued, and the caller performs no I/O.
-                return Ok(BeginOutcome::AlreadyReadable(Box::new(EpochWitness {
-                    hash: hash.to_vec(),
-                    epoch: head.current_epoch,
-                    state: head.state,
-                    manifest_id: head.manifest_id.clone(),
-                    fence: head.last_fence,
-                })));
+                return Ok(Some(BeginOutcome::AlreadyReadable(Box::new(
+                    EpochWitness {
+                        hash: hash.to_vec(),
+                        epoch: head.current_epoch,
+                        state: head.state,
+                        manifest_id: head.manifest_id.clone(),
+                        fence: head.last_fence,
+                    },
+                ))));
             }
             if head.state.is_deleting() || head.state == FragmentLifecycleState::Tombstoned {
-                return Ok(BeginOutcome::Fenced(format!(
+                return Ok(Some(BeginOutcome::Fenced(format!(
                     "the head is {} and cannot accept a new representation",
                     head.state.label()
-                )));
+                ))));
             }
             if authority == EpochAuthority::Remote
                 && head.state == FragmentLifecycleState::PreparingRemote
@@ -4209,7 +4242,7 @@ impl PostgresFragmentCoordinator {
                     {
                         FragmentWriteClaimCreation::Created(claim) => claim,
                         FragmentWriteClaimCreation::BlockedUntil(hard_not_after) => {
-                            return Ok(BeginOutcome::WriteClaimBlocked { hard_not_after });
+                            return Ok(Some(BeginOutcome::WriteClaimBlocked { hard_not_after }));
                         }
                     };
                 let intent = FragmentIntent {
@@ -4223,7 +4256,7 @@ impl PostgresFragmentCoordinator {
                     captured,
                 };
                 classify_commit(tx.commit().await, "publication resume commit")?;
-                return Ok(BeginOutcome::Admitted(Box::new(intent)));
+                return Ok(Some(BeginOutcome::Admitted(Box::new(intent))));
             }
         }
         let epoch = next_fence(&tx).await?;
@@ -4248,8 +4281,29 @@ impl PostgresFragmentCoordinator {
             EpochAuthority::Staged => FragmentLifecycleState::PreparingStage,
             EpochAuthority::Remote => FragmentLifecycleState::PreparingRemote,
         };
-        tx.execute(
-            "INSERT INTO lore_fragment_lifecycle ( \
+        if existing.is_none() {
+            let inserted = tx
+                .execute(
+                    "INSERT INTO lore_fragment_lifecycle ( \
+                     hash, current_epoch, state, manifest_id, last_fence, active_operation \
+                 ) VALUES ($1, $2, $3, NULL, $4, $5) \
+                 ON CONFLICT (hash) DO NOTHING",
+                    &[&hash, &epoch, &preparing.bits(), &fence, &active_operation],
+                )
+                .await
+                .map_err(|error| DomainError::from_pg("first publication intent insert", error))?;
+            if inserted == 0 {
+                // SELECT FOR UPDATE cannot lock an absent row. The winner is
+                // authoritative; discard unused sequence values and reclassify
+                // its head in a fresh transaction, without issuing a write claim.
+                tx.rollback().await.map_err(|error| {
+                    DomainError::from_pg("first publication collision rollback", error)
+                })?;
+                return Ok(None);
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO lore_fragment_lifecycle ( \
                  hash, current_epoch, state, manifest_id, last_fence, active_operation \
              ) VALUES ($1, $2, $3, NULL, $4, $5) \
              ON CONFLICT (hash) DO UPDATE \
@@ -4260,10 +4314,11 @@ impl PostgresFragmentCoordinator {
                     active_operation = EXCLUDED.active_operation, \
                     diagnostic_class = 0, \
                     updated_at       = clock_timestamp()",
-            &[&hash, &epoch, &preparing.bits(), &fence, &active_operation],
-        )
-        .await
-        .map_err(|error| DomainError::from_pg("publication intent insert", error))?;
+                &[&hash, &epoch, &preparing.bits(), &fence, &active_operation],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("publication intent insert", error))?;
+        }
         let write_claim = if let Some(claim_input) = claim_input {
             let lineage = FragmentWriteClaimLineage {
                 hash,
@@ -4275,7 +4330,7 @@ impl PostgresFragmentCoordinator {
             match create_write_claim_locked(&tx, &mut sequence, lineage, claim_input).await? {
                 FragmentWriteClaimCreation::Created(claim) => Some(claim),
                 FragmentWriteClaimCreation::BlockedUntil(hard_not_after) => {
-                    return Ok(BeginOutcome::WriteClaimBlocked { hard_not_after });
+                    return Ok(Some(BeginOutcome::WriteClaimBlocked { hard_not_after }));
                 }
             }
         } else {
@@ -4286,7 +4341,7 @@ impl PostgresFragmentCoordinator {
         // intent this coordinator already owns and is not a new admission, so
         // it is deliberately not anchored.
         failpoint!("publication.begin.settled")?;
-        Ok(BeginOutcome::Admitted(Box::new(FragmentIntent {
+        Ok(Some(BeginOutcome::Admitted(Box::new(FragmentIntent {
             hash: hash.to_vec(),
             epoch,
             fence,
@@ -4301,7 +4356,7 @@ impl PostgresFragmentCoordinator {
                 manifest_id: head.manifest_id,
                 fence: head.last_fence,
             }),
-        })))
+        }))))
     }
 
     async fn commit_publication(

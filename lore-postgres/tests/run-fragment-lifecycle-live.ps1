@@ -58,6 +58,8 @@ $inventory = @(
             'domain_fragment_membership::guarded_binding_classifies_absence_and_replacement_and_fenced_calls_change_nothing',
             'domain_fragment_membership::both_obliterate_retirement_paths_advance_invalidation_with_retained_payload_control',
             'domain_fragment_membership::invalidation_overflow_rolls_back_rebind_and_retirement_without_wrapping',
+            'concurrent_absent_direct_writes_cannot_replace_the_first_lineage',
+            'direct_write_preserves_preexisting_deletion_and_tombstone_fences',
             'normal_direct_write_uses_legacy_key_and_missing_reoffer_uses_repair_epoch_key',
             'payload_free_coordinated_preflight_distinguishes_exact_readable_from_new_publication',
             'durable_write_claims_bind_replay_authorize_settle_and_expiry_to_database_state',

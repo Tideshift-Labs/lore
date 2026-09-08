@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! Real-Postgres proof for WP-118 Phases 2 and 3's fragment lifecycle
 //! coordinator (`lore-postgres/src/domain/fragments/`).
@@ -83,6 +84,166 @@ use uuid::Timestamp;
 use uuid::Uuid;
 
 const TEST_PROVIDER_WRITE_AUTHORITY_REVISION: &str = "write-claims-v1";
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn direct_write_preserves_preexisting_deletion_and_tombstone_fences() {
+    let url = pg_url().expect("owned LORE_TEST_PG_URL required");
+    let coordinator = store(&url).await.fragment_coordinator();
+    let direct = client(&url).await;
+    for state in [
+        FragmentLifecycleState::DeletingChildren,
+        FragmentLifecycleState::DeletingPayload,
+        FragmentLifecycleState::Tombstoned,
+    ] {
+        let hash = rand::random::<[u8; 32]>();
+        direct.execute("INSERT INTO lore_fragment_lifecycle (hash,current_epoch,state,last_fence) VALUES ($1,100,$2,200)", &[&hash.as_slice(), &state.bits()]).await.expect("seed preexisting fence");
+        assert!(matches!(
+            coordinator
+                .begin_direct_write(&hash, &legacy_key(&hash))
+                .await
+                .expect("fenced direct write"),
+            BeginOutcome::Fenced(_)
+        ));
+        let row = direct
+            .query_one(
+                "SELECT current_epoch,last_fence,state FROM lore_fragment_lifecycle WHERE hash=$1",
+                &[&hash.as_slice()],
+            )
+            .await
+            .expect("unchanged fence");
+        assert_eq!(row.get::<_, i64>(0), 100);
+        assert_eq!(row.get::<_, i64>(1), 200);
+        assert_eq!(row.get::<_, i16>(2), state.bits());
+        let claims: i64 = direct
+            .query_one(
+                "SELECT count(*) FROM lore_fragment_write_claims WHERE hash=$1",
+                &[&hash.as_slice()],
+            )
+            .await
+            .expect("no rejected writer claim")
+            .get(0);
+        assert_eq!(claims, 0);
+    }
+}
+
+/// The fixture trigger pauses INSERT, after each real coordinator has read the absent head.
+/// PostgreSQL must attest both waiters before release. No production failpoint or timed ordering.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn concurrent_absent_direct_writes_cannot_replace_the_first_lineage() {
+    let url = pg_url().expect("owned LORE_TEST_PG_URL required");
+    let first = store(&url).await.fragment_coordinator();
+    let second = store(&url).await.fragment_coordinator();
+    let observer = client(&url).await;
+    observer
+        .batch_execute("SET statement_timeout='10s'")
+        .await
+        .expect("bound observer");
+    let hash = rand::random::<[u8; 32]>();
+    let key = hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let gate_key = rand::random::<i64>();
+    let trigger = format!("absent_head_{}", &key[..16]);
+    observer.batch_execute(&format!(
+        "CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         IF NEW.hash = decode('{key}','hex') THEN PERFORM pg_advisory_xact_lock({gate_key}::bigint); END IF; \
+         RETURN NEW; END $$; CREATE TRIGGER {trigger} BEFORE INSERT ON lore_fragment_lifecycle \
+         FOR EACH ROW EXECUTE FUNCTION {trigger}();"
+    )).await.expect("install exact-hash fixture insertion gate");
+    let mut holder = client(&url).await;
+    let holder_pid: i32 = holder
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("holder identity")
+        .get(0);
+    let gate = holder.transaction().await.expect("hold insertion gate");
+    gate.query_one("SELECT pg_advisory_xact_lock($1)", &[&gate_key])
+        .await
+        .expect("take gate");
+    let (a, b, ()) = tokio::join!(
+        first.begin_direct_write(&hash, &key),
+        second.begin_direct_write(&hash, &key),
+        async {
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    let waiting: i64 = observer.query_one(
+                        "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() \
+                         AND $1::int = ANY(pg_blocking_pids(pid)) \
+                         AND query LIKE '%INSERT INTO lore_fragment_lifecycle%'",
+                        &[&holder_pid]
+                    ).await.expect("attest both inserts after absent reads").get(0);
+                    if waiting == 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("both absent readers must reach the INSERT gate");
+            let rows: i64 = observer
+                .query_one(
+                    "SELECT count(*) FROM lore_fragment_lifecycle WHERE hash=$1",
+                    &[&hash.as_slice()],
+                )
+                .await
+                .expect("absence while both inserts held")
+                .get(0);
+            assert_eq!(rows, 0);
+            gate.commit()
+                .await
+                .expect("release only after both absent reads are proven");
+        }
+    );
+    observer
+        .batch_execute(&format!(
+            "DROP TRIGGER {trigger} ON lore_fragment_lifecycle; DROP FUNCTION {trigger}();"
+        ))
+        .await
+        .expect("remove owned fixture gate");
+    let a = a.expect("first begin");
+    let b = b.expect("second begin");
+    let winner = match (a, b) {
+        (BeginOutcome::Admitted(winner), BeginOutcome::WriteClaimBlocked { .. })
+        | (BeginOutcome::WriteClaimBlocked { .. }, BeginOutcome::Admitted(winner)) => winner,
+        other => panic!("one original lineage and one blocked competitor required: {other:?}"),
+    };
+    let row = observer
+        .query_one(
+            "SELECT current_epoch,last_fence,state FROM lore_fragment_lifecycle WHERE hash=$1",
+            &[&hash.as_slice()],
+        )
+        .await
+        .expect("retained original lineage");
+    assert_eq!(row.get::<_, i64>(0), winner.epoch);
+    assert_eq!(row.get::<_, i64>(1), winner.fence);
+    assert_eq!(
+        row.get::<_, i16>(2),
+        FragmentLifecycleState::PreparingRemote.bits()
+    );
+    let count: i64 = observer
+        .query_one(
+            "SELECT count(*) FROM lore_fragment_write_claims WHERE hash=$1",
+            &[&hash.as_slice()],
+        )
+        .await
+        .expect("only winner has a send claim")
+        .get(0);
+    assert_eq!(count, 1, "loser must not mint a competing epoch or claim");
+    first
+        .authorize_write_claim(winner.write_claim().expect("winner claim"))
+        .await
+        .expect("original claim must remain authorizable");
+    first
+        .settle_write_claim(
+            winner.write_claim().expect("winner claim"),
+            FragmentWriteSettlement::NoSend,
+        )
+        .await
+        .expect("no provider I/O in this coordinator test");
+}
 
 fn write_claim() -> FragmentWriteClaimInput {
     FragmentWriteClaimInput::new(
