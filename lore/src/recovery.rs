@@ -11,9 +11,10 @@ pub async fn receipt_get(
     attempt: &AttemptId,
 ) -> Result<DomainAttemptReceipt, ProtocolError> {
     let binding = store.recovery_context(attempt).await?;
+    let dial_url = lore_transport::caller_operation::recovery_dial_url(&binding.endpoint)?;
     lore_transport::with_caller_recovery(binding.clone(), async {
         let connection = lore_transport::connection::connect(
-            &binding.endpoint,
+            &dial_url,
             "",
             binding.repository,
             lore_transport::connection::MAX_STORAGE_CONNECTIONS,

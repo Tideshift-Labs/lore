@@ -137,7 +137,10 @@ where
                     continue;
                 }
             };
-            if receipt.method != child.operation {
+            if !lore_transport::caller_operation::recovery_receipt_method_matches(
+                &child.operation,
+                &receipt.method,
+            ) {
                 blockers.push(format!(
                     "{source}: {} receipt method mismatch; remains blocked",
                     child.attempt_id

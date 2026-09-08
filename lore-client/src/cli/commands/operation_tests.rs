@@ -143,7 +143,7 @@ async fn exact_legacy_force_unlock_receipt_settles_original_child_and_parent() {
                     expected_namespace
                 );
                 Ok(DomainAttemptReceipt {
-                    method: "LockService.ForceUnlock".into(),
+                    method: "lock.force_release".into(),
                     state: DomainReceiptState::Committed {
                         outcome,
                         from_future_marker: false,
@@ -168,15 +168,15 @@ async fn exact_legacy_force_unlock_receipt_settles_original_child_and_parent() {
 async fn wrong_method_or_nonattributive_force_unlock_receipt_keeps_parent_blocked() {
     for (method, state) in [
         (
-            "LockService.Unlock",
+            "lock.release",
             DomainReceiptState::Committed {
                 outcome: DomainReceiptOutcome::Applied,
                 from_future_marker: false,
             },
         ),
-        ("LockService.ForceUnlock", DomainReceiptState::NotFound),
+        ("lock.force_release", DomainReceiptState::NotFound),
         (
-            "LockService.ForceUnlock",
+            "lock.force_release",
             DomainReceiptState::Prepared {
                 prepared_at_unix_millis: 1,
                 hard_expires_at_unix_millis: 2,
