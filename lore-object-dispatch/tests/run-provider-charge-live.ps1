@@ -26,7 +26,9 @@ $tests = @(
     'live_postgres_successor_fence_and_stage3_publication_matrix',
     'live_postgres_expired_exact_publication_replays_but_charge_fails_closed',
     'live_postgres_missing_malformed_and_stage3_inconsistent_configs_fail_closed',
-    'live_postgres_cd5_charge_before_send_conformance_and_authority_unavailable'
+    'live_postgres_cd5_charge_before_send_conformance_and_authority_unavailable',
+    'live_postgres_two_replica_charge_waits_before_snapshot_and_accounts_once',
+    'live_postgres_charge_lock_timeout_and_cancellation_retire_sessions_without_send'
 )
 
 function Invoke-Checked {

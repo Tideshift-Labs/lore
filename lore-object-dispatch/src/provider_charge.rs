@@ -58,6 +58,14 @@ const MUTATION_RETRY_SCHEDULE: [Option<Duration>; 3] = [
     None,
 ];
 
+// Match the charge/configuration functions' transaction advisory lock. Taking the same key on
+// this session before BEGIN prevents a waiter from retaining a snapshot older than the preceding
+// bucket debit. The function's transaction lock remains in place for all other callers.
+const CHARGE_BOUNDARY_LOCK_SQL: &str =
+    "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended($1, 1144))";
+const CHARGE_BOUNDARY_UNLOCK_SQL: &str =
+    "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 1144))";
+
 /// The CD-4 authority over one cell's shared dispatch-runtime pool.
 ///
 /// `UnwiredChargeAuthority` remains the shipped default. Constructing this value is explicit and
@@ -83,13 +91,46 @@ impl PostgresProviderChargeAuthority {
             self.pool.acquire().await.map_err(|_| {
                 ChargeExecutionError::Public(ProviderChargeError::AuthorityUnavailable)
             })?;
+        let deadline = tokio::time::Instant::now() + self.pool.operation_timeout();
+        // Until acquisition is acknowledged the session may already own the lock. An error,
+        // timeout, or cancellation must close it, never return it to the pool or guess ownership.
+        let acquired = tokio::time::timeout_at(deadline, async {
+            let client = lease.client().map_err(|_| ())?;
+            // Bound the wait on the server as well: a backend blocked on an advisory lock may
+            // not notice a disconnected client until the lock holder exits. A short setup
+            // transaction provides SET LOCAL timeouts without leaking session configuration.
+            // Its session lock survives COMMIT; the charge's Serializable snapshot starts later.
+            let setup = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::ReadCommitted)
+                .start()
+                .await
+                .map_err(|_| ())?;
+            setup
+                .batch_execute(&self.pool.bounded_execution_preamble())
+                .await
+                .map_err(|_| ())?;
+            setup
+                .query_one(CHARGE_BOUNDARY_LOCK_SQL, &[&request.provider_boundary_id()])
+                .await
+                .map_err(|_| ())?;
+            setup.commit().await.map_err(|_| ())?;
+            Ok::<(), ()>(())
+        })
+        .await;
+        if !matches!(acquired, Ok(Ok(()))) {
+            lease.poison();
+            return Err(ChargeExecutionError::SessionUnusable(
+                SessionUnusableChargeError::Public(ProviderChargeError::AuthorityUnavailable),
+            ));
+        }
         // Match the typed dispatch client's commit-phase tracking: a timeout before COMMIT is a
         // known no-commit authority failure, while a timeout after COMMIT entered the wire path is
         // ambiguous. In both cases the timed-out transaction leaves the session unsuitable for
         // reuse, so the lease is retired rather than returned to the shared pool.
         let commit_started = AtomicBool::new(false);
-        let outcome = match tokio::time::timeout(
-            self.pool.operation_timeout(),
+        let outcome = match tokio::time::timeout_at(
+            deadline,
             charge_on_lease(&self.pool, &mut lease, request, &commit_started),
         )
         .await
@@ -99,9 +140,29 @@ impl PostgresProviderChargeAuthority {
                 commit_started.load(Ordering::SeqCst),
             )),
         };
-        match outcome {
-            Err(ChargeExecutionError::SessionUnusable(_)) => lease.poison(),
-            _ => lease.release().await,
+        if matches!(outcome, Err(ChargeExecutionError::SessionUnusable(_))) {
+            lease.poison();
+        } else {
+            // COMMIT/ROLLBACK (or a known pre-transaction rejection) has completed. Only an
+            // acknowledged unlock permits reuse. Cleanup shares the original deadline; failure
+            // retires the connection without changing the already known accounting outcome.
+            let unlocked = tokio::time::timeout_at(deadline, async {
+                let client = lease.client().map_err(|_| ())?;
+                let row = client
+                    .query_one(
+                        CHARGE_BOUNDARY_UNLOCK_SQL,
+                        &[&request.provider_boundary_id()],
+                    )
+                    .await
+                    .map_err(|_| ())?;
+                row.try_get::<_, bool>(0).map_err(|_| ())
+            })
+            .await;
+            if matches!(unlocked, Ok(Ok(true))) {
+                lease.release().await;
+            } else {
+                lease.poison();
+            }
         }
         outcome
     }

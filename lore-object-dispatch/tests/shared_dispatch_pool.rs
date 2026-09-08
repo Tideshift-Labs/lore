@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 
 //! Offline proof that CD-3 readback/mutations and CD-4 charging compose over one runtime pool.
@@ -92,8 +93,8 @@ fn ambiguous_commit_and_dead_sessions_poison_while_retry_sleep_follows_release()
     assert_charge_session_disposition(CHARGE_SOURCE);
 
     let dead_session_bypass = CHARGE_SOURCE.replacen(
-        "Err(ChargeExecutionError::SessionUnusable(_)) => lease.poison(),",
-        "Err(ChargeExecutionError::SessionUnusable(_)) => lease.release().await,",
+        "if matches!(outcome, Err(ChargeExecutionError::SessionUnusable(_))) {\n            lease.poison();",
+        "if matches!(outcome, Err(ChargeExecutionError::SessionUnusable(_))) {\n            lease.release().await;",
         1,
     );
     let failure =
@@ -155,10 +156,20 @@ fn ambiguous_commit_and_dead_sessions_poison_while_retry_sleep_follows_release()
 fn outer_charge_timeout_distinguishes_precommit_from_commit_started_and_retires_the_session() {
     assert_charge_timeout_wall(CHARGE_SOURCE, POOL_SOURCE);
 
-    let no_outer_wall = CHARGE_SOURCE.replacen("tokio::time::timeout(", "missing_timeout(", 1);
+    let no_outer_wall = CHARGE_SOURCE.replacen("tokio::time::timeout_at(", "missing_timeout(", 1);
     let failure =
         std::panic::catch_unwind(|| assert_charge_timeout_wall(&no_outer_wall, POOL_SOURCE))
             .expect_err("removing the outer wall-clock bound must fail this proof");
+    assert!(panic_text(failure).contains("outer wall-clock timeout"));
+
+    let reset_deadline = CHARGE_SOURCE.replacen(
+        "timeout_at(\n            deadline,\n            charge_on_lease(",
+        "timeout_at(\n            tokio::time::Instant::now() + self.pool.operation_timeout(),\n            charge_on_lease(",
+        1,
+    );
+    let failure =
+        std::panic::catch_unwind(|| assert_charge_timeout_wall(&reset_deadline, POOL_SOURCE))
+            .expect_err("resetting the transaction deadline after lock wait must fail");
     assert!(panic_text(failure).contains("outer wall-clock timeout"));
 
     let inverted_commit_boundary = CHARGE_SOURCE.replacen(
@@ -185,8 +196,8 @@ fn outer_charge_timeout_distinguishes_precommit_from_commit_started_and_retires_
     );
 
     let reusable_timeout = CHARGE_SOURCE.replacen(
-        "Err(ChargeExecutionError::SessionUnusable(_)) => lease.poison(),",
-        "Err(ChargeExecutionError::SessionUnusable(_)) => lease.release().await,",
+        "if matches!(outcome, Err(ChargeExecutionError::SessionUnusable(_))) {\n            lease.poison();",
+        "if matches!(outcome, Err(ChargeExecutionError::SessionUnusable(_))) {\n            lease.release().await;",
         1,
     );
     let failure =
@@ -202,8 +213,14 @@ fn assert_charge_timeout_wall(charge_source: &str, pool_source: &str) {
         "\n}\n\nasync fn charge_on_lease",
     );
     assert!(
-        charge_once.contains("tokio::time::timeout(")
-            && charge_once.contains("self.pool.operation_timeout()")
+        charge_once.contains("let acquired = tokio::time::timeout_at(deadline, async")
+            && charge_once.contains(
+                "let deadline = tokio::time::Instant::now() + self.pool.operation_timeout();"
+            )
+            && charge_once.matches("tokio::time::Instant::now()").count() == 1
+            && charge_once
+                .contains("timeout_at(\n            deadline,\n            charge_on_lease(")
+            && charge_once.contains("let unlocked = tokio::time::timeout_at(deadline, async")
             && charge_once.contains("classify_charge_timeout("),
         "provider charge needs one outer wall-clock timeout around the leased transaction"
     );
@@ -215,7 +232,7 @@ fn assert_charge_timeout_wall(charge_source: &str, pool_source: &str) {
         "the actual COMMIT marker load must feed timeout classification"
     );
     assert!(
-        charge_once.contains("Err(ChargeExecutionError::SessionUnusable(_)) => lease.poison(),"),
+        charge_once.contains("if matches!(outcome, Err(ChargeExecutionError::SessionUnusable(_))) {\n            lease.poison();"),
         "timed-out and otherwise unusable sessions are retired"
     );
 
@@ -266,13 +283,11 @@ fn assert_charge_session_disposition(source: &str) {
         "async fn charge_once(",
         "\n}\n\nasync fn charge_on_lease",
     );
-    assert_eq!(
-        charge_once.matches("lease.poison()").count(),
-        1,
-        "every unusable session must poison the lease"
+    assert!(charge_once.contains("if matches!(outcome, Err(ChargeExecutionError::SessionUnusable(_))) {\n            lease.poison();"), "every unusable session must poison the lease");
+    assert!(
+        charge_once.contains("if !matches!(acquired, Ok(Ok(()))) {\n            lease.poison();")
     );
-    assert!(charge_once.contains("Err(ChargeExecutionError::SessionUnusable(_))"));
-    assert!(charge_once.contains("_ => lease.release().await"));
+    assert!(charge_once.contains("if matches!(unlocked, Ok(Ok(true))) {\n                lease.release().await;\n            } else {\n                lease.poison();"));
 
     let rollback = section(
         source,

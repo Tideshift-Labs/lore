@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 
 //! Live PostgreSQL 16 evidence for WP-114 CD-4's shared cell-local limiter.
@@ -979,6 +980,240 @@ async fn live_postgres_cd5_charge_before_send_conformance_and_authority_unavaila
         .batch_execute("ALTER ROLE object_dispatch_retention_runtime LOGIN")
         .await
         .expect("restore runtime login");
+}
+
+async fn governed_charge(
+    pool: Arc<DispatchRuntimePool>,
+    request: ProviderAttemptRequest,
+    calls: Arc<AtomicU32>,
+) -> Result<ProviderAttemptOutcome, ProviderClientError> {
+    let authority = PostgresProviderChargeAuthority::new(pool).unwrap();
+    let client = GovernedProviderClient::new(
+        live_boundary(),
+        ProviderCapabilities::none(),
+        ProviderRetryPolicy::disabled(),
+        authority,
+        CountingTransport(calls),
+    );
+    let mut ledger = ProviderAttemptLedger::new(BOUNDARY, &request.logical_request_id).unwrap();
+    let metered = MeteredProviderAttemptRequest::try_from(request).unwrap();
+    let result = client
+        .execute(&mut ledger, &metered, &())
+        .await
+        .map(|value| value.outcome);
+    if result.is_ok() {
+        assert_eq!(ledger.committed_grant_count(), 1);
+        assert_eq!(ledger.attempt_count(), 1);
+    } else {
+        assert_eq!(ledger.committed_grant_count(), 0);
+        assert_eq!(ledger.attempt_count(), 0);
+    }
+    result
+}
+
+async fn wait_charge_waiters(admin: &Client, count: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let rows = admin.query(
+                "SELECT query FROM pg_stat_activity
+                 WHERE datname = current_database() AND usename = 'object_dispatch_retention_runtime'
+                   AND wait_event_type = 'Lock' AND wait_event = 'advisory'", &[],
+            ).await.unwrap();
+            if rows.len() == count {
+                for row in rows {
+                    let query: String = row.get(0);
+                    assert!(query.contains("pg_advisory_lock"), "charge must wait at session admission, not inside its serializable mutation: {query}");
+                    assert!(!query.contains("charge_provider_attempt"));
+                    // Extended-query Bind/Execute timestamps need not coincide even for
+                    // autocommit. The actual wait statement distinguishes the old procedure
+                    // call, which acquired this same lock after opening SERIALIZABLE.
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("all owned runtime sessions must reach the held boundary");
+}
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database"]
+async fn live_postgres_two_replica_charge_waits_before_snapshot_and_accounts_once() {
+    let url = env::var("LORE_TEST_PROVIDER_CHARGE_ATOMICITY_PG_URL").unwrap();
+    let admin = connect(&url).await;
+    install(&admin).await;
+    seed_configuration(&admin).await;
+    admin
+        .batch_execute("SET statement_timeout = '10s'")
+        .await
+        .unwrap();
+    let identity = read_database_identity(&admin).await;
+    let pools: Vec<_> = (0..2)
+        .map(|_| {
+            Arc::new(
+                DispatchRuntimePool::new(pool_config(&url, Duration::from_secs(15), identity))
+                    .unwrap(),
+            )
+        })
+        .collect();
+    admin
+        .query_one(
+            "SELECT pg_advisory_lock(hashtextextended($1, 1144))",
+            &[&BOUNDARY],
+        )
+        .await
+        .unwrap();
+    let calls = Arc::new(AtomicU32::new(0));
+    let requests = [
+        live_request(Uuid::now_v7(), Uuid::now_v7()),
+        live_request(Uuid::now_v7(), Uuid::now_v7()),
+    ];
+    let mut tasks = Vec::new();
+    for (pool, request) in pools.iter().zip(requests.iter()) {
+        let pool = Arc::clone(pool);
+        let request = request.clone();
+        let calls = Arc::clone(&calls);
+        tasks.push(AbortOnDropHandle::new(lore_base::lore_spawn!(
+            "queued-provider-charge",
+            async move { governed_charge(pool, request, calls).await }
+        )));
+    }
+    wait_charge_waiters(&admin, 2).await;
+    assert_eq!(grant_count(&admin).await, 0);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no provider send before committed grant"
+    );
+    // Force a real committed bucket change while both callers wait. The old client
+    // had already opened SERIALIZABLE here and fails the observed admission assertion.
+    let before: String = admin.query_one("SELECT state_revision::text FROM object_store_retention.object_dispatch_budget_bucket_state WHERE cap_class=1", &[]).await.unwrap().get(0);
+    admin.batch_execute("UPDATE object_store_retention.object_dispatch_budget_bucket_state SET state_revision=state_revision+1 WHERE cap_class IN (1,2)").await.unwrap();
+    assert!(
+        admin
+            .query_one(
+                "SELECT pg_advisory_unlock(hashtextextended($1, 1144))",
+                &[&BOUNDARY]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    for task in tasks {
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Ok(ProviderAttemptOutcome::Decisive)
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(grant_count(&admin).await, 2);
+    let after: String = admin.query_one("SELECT state_revision::text FROM object_store_retention.object_dispatch_budget_bucket_state WHERE cap_class=1", &[]).await.unwrap().get(0);
+    assert_eq!(
+        after.parse::<u64>().unwrap(),
+        before.parse::<u64>().unwrap() + 3
+    );
+    for (pool, request) in pools.iter().zip(requests) {
+        let logical = Uuid::parse_str(&request.logical_request_id).unwrap();
+        let attempt = Uuid::parse_str(&request.attempt_id).unwrap();
+        let row = admin.query_one("SELECT count(*)::bigint, sum(charged_units)::text FROM object_store_retention.object_dispatch_provider_charge_grants WHERE logical_request_id=$1 AND attempt_id=$2 AND attempt_ordinal=1", &[&logical, &attempt]).await.unwrap();
+        assert_eq!(row.get::<_, i64>(0), 1);
+        assert_eq!(row.get::<_, String>(1), "1");
+        assert_eq!(
+            governed_charge(Arc::clone(pool), request, Arc::clone(&calls)).await,
+            Err(ProviderClientError::ChargeRefused(
+                ProviderChargeError::AttemptAlreadyCharged
+            ))
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(grant_count(&admin).await, 2);
+}
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database"]
+async fn live_postgres_charge_lock_timeout_and_cancellation_retire_sessions_without_send() {
+    let url = env::var("LORE_TEST_PROVIDER_CHARGE_ATOMICITY_PG_URL").unwrap();
+    let admin = connect(&url).await;
+    install(&admin).await;
+    seed_configuration(&admin).await;
+    admin
+        .batch_execute("SET statement_timeout = '10s'")
+        .await
+        .unwrap();
+    let mut config = pool_config(
+        &url,
+        Duration::from_millis(300),
+        read_database_identity(&admin).await,
+    );
+    config.lock_timeout = Duration::from_millis(100);
+    let pool = Arc::new(DispatchRuntimePool::new(config).unwrap());
+    let calls = Arc::new(AtomicU32::new(0));
+    admin
+        .query_one(
+            "SELECT pg_advisory_lock(hashtextextended($1, 1144))",
+            &[&BOUNDARY],
+        )
+        .await
+        .unwrap();
+    let request = live_request(Uuid::now_v7(), Uuid::now_v7());
+    let task_pool = Arc::clone(&pool);
+    let task_calls = Arc::clone(&calls);
+    let task_request = request.clone();
+    let timed = AbortOnDropHandle::new(lore_base::lore_spawn!(
+        "timed-provider-admission",
+        async move { governed_charge(task_pool, task_request, task_calls).await }
+    ));
+    wait_charge_waiters(&admin, 1).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), timed)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(ProviderClientError::ChargeRefused(
+            ProviderChargeError::AuthorityUnavailable
+        ))
+    );
+    assert_eq!(grant_count(&admin).await, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    // The holder remains locked. Client socket closure alone cannot make this
+    // pass: the configured server timeout must end the blocked SQL statement.
+    tokio::time::timeout(Duration::from_secs(2), wait_charge_waiters(&admin, 0))
+        .await
+        .expect("server-bound admission must drain while its blocker remains held");
+    let task_pool = Arc::clone(&pool);
+    let task_calls = Arc::clone(&calls);
+    let task_request = request.clone();
+    let cancelled = AbortOnDropHandle::new(lore_base::lore_spawn!(
+        "cancelled-provider-admission",
+        async move { governed_charge(task_pool, task_request, task_calls).await }
+    ));
+    wait_charge_waiters(&admin, 1).await;
+    drop(cancelled);
+    assert_eq!(grant_count(&admin).await, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    tokio::time::timeout(Duration::from_secs(2), wait_charge_waiters(&admin, 0))
+        .await
+        .expect("cancelled admission must drain while its blocker remains held");
+    assert!(
+        admin
+            .query_one(
+                "SELECT pg_advisory_unlock(hashtextextended($1, 1144))",
+                &[&BOUNDARY]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    wait_charge_waiters(&admin, 0).await;
+    assert_eq!(
+        governed_charge(Arc::clone(&pool), request, Arc::clone(&calls)).await,
+        Ok(ProviderAttemptOutcome::Decisive)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(grant_count(&admin).await, 1);
+    assert_eq!(admin.query_one("SELECT count(*)::bigint FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database())", &[]).await.unwrap().get::<_, i64>(0), 0, "no pooled session may retain boundary ownership");
 }
 
 struct CountingTransport(Arc<AtomicU32>);
