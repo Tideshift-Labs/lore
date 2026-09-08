@@ -1008,6 +1008,8 @@ dependencies = [
  "rustix",
  "rustls",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-postgres",
