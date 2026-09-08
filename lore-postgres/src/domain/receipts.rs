@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! Domain operation receipts: prepare, consume, commit, and lookup (CR-029).
 //!
@@ -10,7 +11,7 @@
 //! `NOT_APPLIED(reason_version, reason)`. A terminal row is immutable, and
 //! lookup never returns the token.
 //!
-//! **One `clock_timestamp()` is the sole time authority** for every admission,
+//! **PostgreSQL `clock_timestamp()` is the sole time authority** for every admission,
 //! expiry, and retention decision an operation makes. A process clock is never
 //! consulted, because two replicas with opposing skew must agree on whether a
 //! given UUIDv7 is stale, in-window, or beyond the horizon. UUIDv7 *syntax* is
@@ -602,41 +603,91 @@ async fn prepare_with_evidence(
     // Exact-load first: an existing row, terminal or prepared, is authoritative
     // and no classification can override it.
     if let Some(row) = lock_receipt_row(tx, key).await? {
-        if !row.matches(binding)
-            || row.direct_authorization_id.as_deref()
-                != direct.map(|e| e.authorization_id.as_slice())
-            || row.direct_authorization_revision
-                != direct.map(|e| e.authorization_revision.to_string())
-            || row.direct_verification_nonce.as_deref()
-                != direct.map(|e| e.verification_nonce.as_slice())
-            || row.direct_bound_fields_digest.as_deref()
-                != direct.map(|e| e.bound_fields_digest.as_slice())
-        {
-            return Ok(PrepareResult::Mismatch);
-        }
-        if row.state == schema::RECEIPT_STATE_COMMITTED {
-            return Ok(PrepareResult::Committed(row.committed_outcome()?));
-        }
-        if clock >= row.hard_expires_at {
-            return Ok(PrepareResult::Committed(
-                expire_prepared(tx, key, clock).await?,
-            ));
-        }
-        let token = row.consume_token.ok_or_else(|| {
-            DomainError::Internal(
-                "a PREPARED row without a consume token; the state CHECK should forbid it"
-                    .to_owned(),
-            )
-        })?;
-        let token: [u8; 32] = token.as_slice().try_into().map_err(|_| {
-            DomainError::Internal("stored consume token is not 32 bytes".to_owned())
-        })?;
-        return Ok(PrepareResult::Prepared {
-            token,
-            hard_expires_at: row.hard_expires_at,
-        });
+        return classify_existing_prepare(tx, key, binding, direct, row, clock).await;
     }
 
+    prepare_absent(
+        tx,
+        key,
+        binding,
+        witness,
+        direct,
+        client_attempt_id,
+        uuid_ts,
+        clock,
+    )
+    .await
+}
+
+async fn classify_existing_prepare(
+    tx: &Transaction<'_>,
+    key: &ReceiptKey,
+    binding: &OperationBinding,
+    direct: Option<&DirectAuthorizationEvidence>,
+    row: ReceiptRow,
+    clock: SystemTime,
+) -> Result<PrepareResult, DomainError> {
+    if !row.matches(binding)
+        || row.direct_authorization_id.as_deref() != direct.map(|e| e.authorization_id.as_slice())
+        || row.direct_authorization_revision != direct.map(|e| e.authorization_revision.to_string())
+        || row.direct_verification_nonce.as_deref()
+            != direct.map(|e| e.verification_nonce.as_slice())
+        || row.direct_bound_fields_digest.as_deref()
+            != direct.map(|e| e.bound_fields_digest.as_slice())
+    {
+        return Ok(PrepareResult::Mismatch);
+    }
+    if row.state == schema::RECEIPT_STATE_COMMITTED {
+        return Ok(PrepareResult::Committed(row.committed_outcome()?));
+    }
+    if clock >= row.hard_expires_at {
+        return Ok(PrepareResult::Committed(
+            expire_prepared(tx, key, clock).await?,
+        ));
+    }
+    let token = row.consume_token.ok_or_else(|| {
+        DomainError::Internal(
+            "a PREPARED row without a consume token; the state CHECK should forbid it".to_owned(),
+        )
+    })?;
+    let token: [u8; 32] = token
+        .as_slice()
+        .try_into()
+        .map_err(|_| DomainError::Internal("stored consume token is not 32 bytes".to_owned()))?;
+    Ok(PrepareResult::Prepared {
+        token,
+        hard_expires_at: row.hard_expires_at,
+    })
+}
+
+// The insertion winner alone owns its freshly generated token and evidence.
+// A conflict at READ COMMITTED requires another statement to see the winner;
+// stricter isolation can instead return Contention and must roll back normally.
+async fn classify_prepare_conflict(
+    tx: &Transaction<'_>,
+    key: &ReceiptKey,
+    binding: &OperationBinding,
+    direct: Option<&DirectAuthorizationEvidence>,
+) -> Result<PrepareResult, DomainError> {
+    let row = lock_receipt_row(tx, key).await?.ok_or_else(|| {
+        DomainError::Contention("receipt insert winner unavailable to locked lookup".to_owned())
+    })?;
+    // Discard the pre-wait classification, including its expiry clock.
+    let clock = admission_clock(tx).await?;
+    classify_existing_prepare(tx, key, binding, direct, row, clock).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_absent(
+    tx: &Transaction<'_>,
+    key: &ReceiptKey,
+    binding: &OperationBinding,
+    witness: Option<&AuthorizationWitness>,
+    direct: Option<&DirectAuthorizationEvidence>,
+    client_attempt_id: Option<Uuid>,
+    uuid_ts: SystemTime,
+    clock: SystemTime,
+) -> Result<PrepareResult, DomainError> {
     // No ordinary row. A compact future marker under the same key is itself a
     // complete decisive result and is consulted before classification.
     if let Some(marker) = load_future_marker(tx, key, binding).await? {
@@ -656,7 +707,7 @@ async fn prepare_with_evidence(
             let hard_expires_at = clock
                 .checked_add(PREPARED_HARD_TTL)
                 .ok_or_else(|| DomainError::Internal("prepared hard TTL overflows".to_owned()))?;
-            insert_prepared(
+            let inserted = insert_prepared(
                 tx,
                 key,
                 binding,
@@ -669,6 +720,9 @@ async fn prepare_with_evidence(
                 direct,
             )
             .await?;
+            if !inserted {
+                return classify_prepare_conflict(tx, key, binding, direct).await;
+            }
             Ok(PrepareResult::Prepared {
                 token,
                 hard_expires_at,
@@ -682,7 +736,7 @@ async fn prepare_with_evidence(
             let hard_expires_at = clock
                 .checked_add(PREPARED_HARD_TTL)
                 .ok_or_else(|| DomainError::Internal("prepared hard TTL overflows".to_owned()))?;
-            insert_prepared(
+            let inserted = insert_prepared(
                 tx,
                 key,
                 binding,
@@ -695,6 +749,9 @@ async fn prepare_with_evidence(
                 direct,
             )
             .await?;
+            if !inserted {
+                return classify_prepare_conflict(tx, key, binding, direct).await;
+            }
             let outcome = DomainOutcome::NotApplied {
                 reason_version: REASON_VERSION,
                 reason: UUID_TIME_OUT_OF_RANGE_V1.to_owned(),
@@ -775,13 +832,14 @@ async fn insert_prepared(
     hard_expires_at: SystemTime,
     client_attempt_id: Option<Uuid>,
     direct: Option<&DirectAuthorizationEvidence>,
-) -> Result<(), DomainError> {
+) -> Result<bool, DomainError> {
     // `client_attempt_id` is stored as raw bytes rather than a `uuid` column to match every other
     // identifier on this table, which is `bytea`. It is nullable because a client older than
     // WP-120 sends none, and a receipt without one is an ordinary receipt, not a defective one.
     let client_attempt_id = client_attempt_id.map(|id| id.as_bytes().to_vec());
-    tx.execute(
-        "INSERT INTO lore_domain_operation_receipts ( \
+    let inserted = tx
+        .execute(
+            "INSERT INTO lore_domain_operation_receipts ( \
              verified_issuer, authenticated_subject, tenant_scope_key, operation_id, \
              method, scope, fingerprint_version, fingerprint, canonical_intent_digest, \
              state, consume_token, \
@@ -792,41 +850,47 @@ async fn insert_prepared(
              direct_verification_nonce, direct_bound_fields_digest \
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
                    $12, $13, $14, $15, $16, $17, $18, $19, $20, \
-                   $21, $22::text::numeric, $23, $24)",
-        &[
-            &key.verified_issuer,
-            &key.authenticated_subject,
-            &key.tenant_scope_key,
-            &key.operation_id.as_bytes().as_slice(),
-            &binding.method,
-            &binding.scope,
-            &binding.fingerprint_version,
-            &binding.fingerprint,
-            &binding.canonical_intent_digest,
-            &schema::RECEIPT_STATE_PREPARED,
-            &token.as_slice(),
-            &witness.map(|w| w.authorization_id.clone()),
-            &witness.map(|w| w.authorization_revision),
-            &witness.map(|w| w.verification_nonce.clone()),
-            &witness.map(|w| w.bound_fields_digest.clone()),
-            &witness.map(|w| w.consumed_ticket_sha256.clone()),
-            &uuid_timestamp,
-            &prepared_at,
-            &hard_expires_at,
-            &client_attempt_id,
-            &direct.map(|e| e.authorization_id.clone()),
-            &direct.map(|e| e.authorization_revision.to_string()),
-            &direct.map(|e| e.verification_nonce.clone()),
-            &direct.map(|e| e.bound_fields_digest.clone()),
-        ],
-    )
-    .await
-    .map_err(|e| DomainError::from_pg("receipt prepare insert", e))?;
+                   $21, $22::text::numeric, $23, $24) \
+         ON CONFLICT (verified_issuer, authenticated_subject, tenant_scope_key, operation_id) \
+         DO NOTHING",
+            &[
+                &key.verified_issuer,
+                &key.authenticated_subject,
+                &key.tenant_scope_key,
+                &key.operation_id.as_bytes().as_slice(),
+                &binding.method,
+                &binding.scope,
+                &binding.fingerprint_version,
+                &binding.fingerprint,
+                &binding.canonical_intent_digest,
+                &schema::RECEIPT_STATE_PREPARED,
+                &token.as_slice(),
+                &witness.map(|w| w.authorization_id.clone()),
+                &witness.map(|w| w.authorization_revision),
+                &witness.map(|w| w.verification_nonce.clone()),
+                &witness.map(|w| w.bound_fields_digest.clone()),
+                &witness.map(|w| w.consumed_ticket_sha256.clone()),
+                &uuid_timestamp,
+                &prepared_at,
+                &hard_expires_at,
+                &client_attempt_id,
+                &direct.map(|e| e.authorization_id.clone()),
+                &direct.map(|e| e.authorization_revision.to_string()),
+                &direct.map(|e| e.verification_nonce.clone()),
+                &direct.map(|e| e.bound_fields_digest.clone()),
+            ],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("receipt prepare insert", e))?;
+
+    if inserted == 0 {
+        return Ok(false);
+    }
 
     if let Some(witness) = witness {
         insert_dispatch_possibility_fence(tx, key, binding, witness, prepared_at).await?;
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn insert_dispatch_possibility_fence(

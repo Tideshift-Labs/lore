@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! Integration tests for the domain operation receipt state machine
 //! (`lore-postgres/src/domain/receipts.rs`): `prepare`, `consume`,
@@ -22,6 +23,9 @@ use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::errors::DomainError;
 use lore_postgres::domain::errors::DomainOutcome;
+use lore_postgres::domain::outbox::OutboxEvent;
+use lore_postgres::domain::outbox::append;
+use lore_postgres::domain::outbox::version::AggregateVersion;
 use lore_postgres::domain::receipts::AttemptReceipt;
 use lore_postgres::domain::receipts::AuthorizationWitness;
 use lore_postgres::domain::receipts::ConsumeResult;
@@ -233,6 +237,325 @@ async fn capture_clock(client: &mut Client) -> SystemTime {
         .await
         .expect("roll back the read-only clock tx");
     clock
+}
+
+// These tests attest database boundaries, not OS-process crashes or lost gRPC responses.
+// A missing environment is a failure for this explicitly selected deterministic lane.
+async fn bounded_receipt_client(url: &str) -> Client {
+    let client = pg_client(url).await;
+    client
+        .batch_execute("SET statement_timeout = '15s'; SET lock_timeout = '12s'")
+        .await
+        .expect("bound test database work");
+    client
+}
+
+async fn receipt_backend_pid(client: &Client) -> i32 {
+    client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("owned backend PID")
+        .get(0)
+}
+
+async fn attest_receipt_blocker(observer: &Client, waiter: i32, holder: i32) {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let blocked: bool = observer
+                .query_one(
+                    "SELECT $2::int = ANY(pg_blocking_pids($1::int))",
+                    &[&waiter, &holder],
+                )
+                .await
+                .expect("attest exact admission blocker")
+                .get(0);
+            if blocked {
+                break;
+            }
+            // Polling only observes the lock condition; elapsed time never releases the gate.
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second admission must actually block on the first");
+}
+
+#[tokio::test]
+#[ignore = "requires owned live Postgres; deterministic receipt lane"]
+async fn deterministic_same_attempt_admission_waits_for_the_original_token() {
+    concurrent_receipt_admission(false, false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires owned live Postgres; deterministic receipt lane"]
+async fn deterministic_changed_intent_admission_cannot_obtain_the_original_token() {
+    concurrent_receipt_admission(true, false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires owned live Postgres; deterministic receipt lane"]
+async fn deterministic_serializable_admission_loser_returns_contention_without_token() {
+    concurrent_receipt_admission(false, true).await;
+}
+
+async fn concurrent_receipt_admission(change_intent: bool, serializable: bool) {
+    let url = pg_url().expect("LORE_TEST_PG_URL is required");
+    let _store = connect_domain_store(&url).await;
+    let mut first = bounded_receipt_client(&url).await;
+    let mut second = bounded_receipt_client(&url).await;
+    let observer = bounded_receipt_client(&url).await;
+    let first_pid = receipt_backend_pid(&first).await;
+    let second_pid = receipt_backend_pid(&second).await;
+    let key = isolated_key(uuid_v7_at(capture_clock(&mut first).await));
+    let intent = binding("lore.domain.v1.test/ConcurrentAdmission");
+    let mut competing_intent = intent.clone();
+    if change_intent {
+        competing_intent.canonical_intent_digest[0] ^= 0xff;
+    }
+    let tx = first
+        .transaction()
+        .await
+        .expect("first admission transaction");
+    let original = prepare(&tx, &key, &intent, None, None)
+        .await
+        .expect("first admission");
+    assert!(matches!(original, PrepareResult::Prepared { .. }));
+    let (retry, ()) = tokio::join!(
+        async {
+            let retry_tx = second
+                .build_transaction()
+                .isolation_level(if serializable {
+                    tokio_postgres::IsolationLevel::Serializable
+                } else {
+                    tokio_postgres::IsolationLevel::ReadCommitted
+                })
+                .start()
+                .await
+                .expect("second admission transaction");
+            let result = prepare(&retry_tx, &key, &competing_intent, None, None).await;
+            if serializable {
+                retry_tx
+                    .rollback()
+                    .await
+                    .expect("roll back strict-isolation loser");
+            } else {
+                retry_tx.commit().await.expect("commit concurrent retry");
+            }
+            result
+        },
+        async {
+            attest_receipt_blocker(&observer, second_pid, first_pid).await;
+            assert_eq!(
+                receipt_row_count(&observer, &key).await,
+                0,
+                "uncommitted admission is invisible"
+            );
+            tx.commit()
+                .await
+                .expect("release original admission only after overlap is proven");
+        }
+    );
+    if serializable {
+        assert!(
+            matches!(retry, Err(DomainError::Contention(_))),
+            "strict-isolation loser must refuse without a token: {retry:?}"
+        );
+    } else if change_intent {
+        assert_eq!(
+            retry.expect("changed-intent retry"),
+            PrepareResult::Mismatch,
+            "changed intent must never receive a token"
+        );
+    } else {
+        assert_eq!(
+            retry.expect("exact concurrent retry"),
+            original,
+            "same token and expiry, not a second admission"
+        );
+    }
+    assert_eq!(receipt_row_count(&observer, &key).await, 1);
+    let PrepareResult::Prepared { token, .. } = original else {
+        unreachable!()
+    };
+    assert_eq!(
+        fetch_receipt(&observer, &key).await.consume_token,
+        Some(token.to_vec())
+    );
+}
+
+async fn stage_receipt_and_event(
+    tx: &Transaction<'_>,
+    key: &ReceiptKey,
+    intent: &OperationBinding,
+    token: &[u8; 32],
+    cell: &str,
+) -> Uuid {
+    let ConsumeResult::Admitted(admission) = consume(tx, key, intent, token)
+        .await
+        .expect("consume owned attempt")
+    else {
+        panic!("owned fresh attempt must be admitted");
+    };
+    let version = AggregateVersion::ordinal_only(1).encode();
+    let event = OutboxEvent {
+        cell_id: cell,
+        repository_id: key.operation_id.as_bytes(),
+        repository_generation: 1,
+        event_kind: "branch.pushed",
+        aggregate_kind: "branch",
+        aggregate_id: key.operation_id.as_bytes(),
+        aggregate_version: &version,
+        payload_schema_version: 1,
+        payload: b"{}",
+    };
+    let appended = append(tx, &event)
+        .await
+        .expect("append same-transaction event");
+    assert!(appended.created);
+    commit_terminal(
+        tx,
+        key,
+        &DomainOutcome::Applied,
+        None,
+        admission.admission_clock,
+    )
+    .await
+    .expect("stage Applied receipt");
+    appended.event_id
+}
+
+async fn owned_event_ids(observer: &Client, cell: &str) -> Vec<Uuid> {
+    observer
+        .query(
+            "SELECT event_id FROM lore_outbox_events WHERE cell_id = $1",
+            &[&cell],
+        )
+        .await
+        .expect("read only owned events")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires owned live Postgres with backend termination privilege"]
+async fn deterministic_precommit_disconnect_keeps_prepared_and_no_event() {
+    let url = pg_url().expect("LORE_TEST_PG_URL is required");
+    let store = connect_domain_store(&url).await;
+    let mut writer = bounded_receipt_client(&url).await;
+    let observer = bounded_receipt_client(&url).await;
+    let pid = receipt_backend_pid(&writer).await;
+    let key = isolated_key(uuid_v7_at(capture_clock(&mut writer).await));
+    let intent = binding("lore.domain.v1.test/InterruptedBeforeCommit");
+    let PrepareResult::Prepared { token, .. } = store
+        .domain_operation_prepare(&key, &intent, None, None)
+        .await
+        .expect("durable admission")
+    else {
+        panic!("expected Prepared");
+    };
+    let cell = format!("receipt-precommit-{}", key.operation_id);
+    let tx = writer.transaction().await.expect("mutation transaction");
+    stage_receipt_and_event(&tx, &key, &intent, &token, &cell).await;
+    assert!(
+        owned_event_ids(&observer, &cell).await.is_empty(),
+        "event cannot escape before COMMIT"
+    );
+    let terminated: bool = observer
+        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+        .await
+        .expect("terminate only owned writer backend")
+        .get(0);
+    assert!(terminated, "interruption must actually occur");
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let alive: bool = observer
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)",
+                    &[&pid],
+                )
+                .await
+                .expect("attest owned writer termination")
+                .get(0);
+            if !alive {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned writer must exit before any COMMIT attempt");
+    assert!(
+        tx.commit().await.is_err(),
+        "terminated writer cannot acknowledge COMMIT"
+    );
+    assert!(matches!(
+        store
+            .domain_operation_receipt_get(&key, &intent)
+            .await
+            .expect("independent receipt lookup"),
+        ReceiptLookup::Prepared { .. }
+    ));
+    let retained = fetch_receipt(&observer, &key).await;
+    assert_eq!(retained.state, 0);
+    assert_eq!(retained.outcome, None);
+    assert_eq!(retained.consume_token.as_deref(), Some(token.as_slice()));
+    assert!(owned_event_ids(&observer, &cell).await.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires owned live Postgres; deterministic receipt lane"]
+async fn deterministic_postcommit_disconnect_reads_original_receipt_and_event_without_replay() {
+    let url = pg_url().expect("LORE_TEST_PG_URL is required");
+    let store = connect_domain_store(&url).await;
+    let mut writer = bounded_receipt_client(&url).await;
+    let key = isolated_key(uuid_v7_at(capture_clock(&mut writer).await));
+    let intent = binding("lore.domain.v1.test/InterruptedAfterCommit");
+    let PrepareResult::Prepared { token, .. } = store
+        .domain_operation_prepare(&key, &intent, None, None)
+        .await
+        .expect("durable admission")
+    else {
+        panic!("expected Prepared");
+    };
+    let cell = format!("receipt-postcommit-{}", key.operation_id);
+    let tx = writer.transaction().await.expect("mutation transaction");
+    let original_event = stage_receipt_and_event(&tx, &key, &intent, &token, &cell).await;
+    tx.commit()
+        .await
+        .expect("actual commit before producer is discarded");
+    // Discard producer state after a confirmed DB commit. This models an unavailable producer,
+    // not transport acknowledgement loss; recovery below makes exclusively read-only calls.
+    drop(writer);
+    drop(store);
+    let recovered = connect_domain_store(&url).await;
+    let observer = bounded_receipt_client(&url).await;
+    for _ in 0..2 {
+        assert_eq!(
+            recovered
+                .domain_operation_receipt_get(&key, &intent)
+                .await
+                .expect("read original receipt without replay"),
+            ReceiptLookup::Committed {
+                outcome: DomainOutcome::Applied,
+                from_future_marker: false
+            }
+        );
+        assert_eq!(
+            owned_event_ids(&observer, &cell).await,
+            vec![original_event]
+        );
+    }
+    assert_eq!(receipt_row_count(&observer, &key).await, 1);
+    let mut wrong = key.clone();
+    wrong.authenticated_subject.push_str("-unrelated");
+    assert_eq!(
+        recovered
+            .domain_operation_receipt_get(&wrong, &intent)
+            .await
+            .expect("unrelated principal lookup"),
+        ReceiptLookup::NotFound
+    );
 }
 
 // ─── PostgresDomainStore wrapper seam ───────────────────────────────────────

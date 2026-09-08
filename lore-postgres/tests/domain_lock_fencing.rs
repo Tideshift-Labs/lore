@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! Real-Postgres proof for WP-117's fenced lock coordinator.
 //!
 //! Every case is `#[ignore]` and is executed by `run-lock-fencing-live.ps1`,
 //! which gives each exact case a fresh PostgreSQL 16 database.
+
+#[path = "active_active_support/barrier.rs"]
+mod barrier;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -1132,20 +1136,23 @@ async fn two_coordinators_racing_one_resource_choose_exactly_one_owner_pair() {
     let owner_a = owner("https://issuer-a.example", "shared-subject");
     let owner_b = owner("https://issuer-b.example", "shared-subject");
     let hash: [u8; 32] = rand::random();
-    let input_a = acquire_input(
+    let mut input_a = acquire_input(
         &repository_id,
         &branch_id,
         owner_a.clone(),
         vec![resource(hash, None)],
         None,
     );
-    let input_b = acquire_input(
+    let mut input_b = acquire_input(
         &repository_id,
         &branch_id,
         owner_b.clone(),
         vec![resource(hash, None)],
         None,
     );
+    let cell_id = outbox_cell_id();
+    input_a.outbox_cell_id = Some(cell_id.clone());
+    input_b.outbox_cell_id = Some(cell_id.clone());
     let operation_a = prepare_bound_operation(
         &store_a,
         &owner_a,
@@ -1165,10 +1172,20 @@ async fn two_coordinators_racing_one_resource_choose_exactly_one_owner_pair() {
     let coordinator_a = store_a.lock_coordinator();
     let coordinator_b = store_b.lock_coordinator();
 
-    let (a, b) = tokio::join!(
-        coordinator_a.acquire_or_renew(&operation_a, &input_a),
-        coordinator_b.acquire_or_renew(&operation_b, &input_b),
-    );
+    let observer = barrier::observer(&url).await;
+    let mut gate_client = client(&url).await;
+    let gate = barrier::TableGate::take(&mut gate_client, "lore_locks").await;
+    let race = async {
+        tokio::join!(
+            coordinator_a.acquire_or_renew(&operation_a, &input_a),
+            coordinator_b.acquire_or_renew(&operation_b, &input_b),
+        )
+    };
+    let opening = async {
+        barrier::wait_for_lock_waiters(&observer, 2, "both ownership contenders").await;
+        gate.release().await;
+    };
+    let ((a, b), ()) = tokio::join!(race, opening);
     let a = a.expect("first race result");
     let b = b.expect("second race result");
     assert!(
@@ -1184,7 +1201,48 @@ async fn two_coordinators_racing_one_resource_choose_exactly_one_owner_pair() {
         .await
         .expect("query race winner");
     assert_eq!(rows.len(), 1);
-    assert!(rows[0].owner == owner_a || rows[0].owner == owner_b);
+    let winner = if a.rejection.is_none() { &a } else { &b };
+    let winner_owner = if a.rejection.is_none() {
+        &owner_a
+    } else {
+        &owner_b
+    };
+    assert_eq!(&rows[0].owner, winner_owner);
+    assert_eq!(rows[0].ownership_token, winner.locks[0].ownership_token);
+    assert_eq!(rows[0].fence, winner.locks[0].fence);
+    assert_eq!(
+        outbox_row_count_for_repository(&observer, &repository_id).await,
+        1
+    );
+    let event = one_outbox_row_for_repository(&observer, &repository_id).await;
+    assert_eq!(event.event_kind, "lock.acquired");
+    assert_eq!(event.cell_id, cell_id);
+    let version = AggregateVersion::decode(&event.aggregate_version).expect("winner event version");
+    assert_eq!(
+        version.identity,
+        rows[0].ownership_token.expect("winner token")
+    );
+    assert_eq!(
+        version.ordinal,
+        u64::try_from(rows[0].fence).expect("winner fence")
+    );
+    for (coordinator, operation, input, original) in [
+        (&coordinator_a, &operation_a, &input_a, &a),
+        (&coordinator_b, &operation_b, &input_b, &b),
+    ] {
+        let replay = coordinator
+            .acquire_or_renew(operation, input)
+            .await
+            .expect("exact receipt replay");
+        assert!(replay.replayed);
+        assert_eq!(replay.outcome, original.outcome);
+        // Receipt replay preserves the durable outcome, not the fresh-path convenience field.
+        assert_eq!(replay.rejection, None);
+    }
+    assert_eq!(
+        outbox_row_count_for_repository(&observer, &repository_id).await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -1201,20 +1259,23 @@ async fn racing_batches_are_all_or_nothing() {
     let common: [u8; 32] = rand::random();
     let only_a: [u8; 32] = rand::random();
     let only_b: [u8; 32] = rand::random();
-    let input_a = acquire_input(
+    let mut input_a = acquire_input(
         &repository_id,
         &branch_id,
         owner_a.clone(),
         vec![resource(only_a, None), resource(common, None)],
         None,
     );
-    let input_b = acquire_input(
+    let mut input_b = acquire_input(
         &repository_id,
         &branch_id,
         owner_b.clone(),
         vec![resource(common, None), resource(only_b, None)],
         None,
     );
+    let cell_id = outbox_cell_id();
+    input_a.outbox_cell_id = Some(cell_id.clone());
+    input_b.outbox_cell_id = Some(cell_id.clone());
     let operation_a = prepare_bound_operation(
         &store_a,
         &owner_a,
@@ -1234,10 +1295,20 @@ async fn racing_batches_are_all_or_nothing() {
     let coordinator_a = store_a.lock_coordinator();
     let coordinator_b = store_b.lock_coordinator();
 
-    let (a, b) = tokio::join!(
-        coordinator_a.acquire_or_renew(&operation_a, &input_a),
-        coordinator_b.acquire_or_renew(&operation_b, &input_b),
-    );
+    let observer = barrier::observer(&url).await;
+    let mut gate_client = client(&url).await;
+    let gate = barrier::TableGate::take(&mut gate_client, "lore_locks").await;
+    let race = async {
+        tokio::join!(
+            coordinator_a.acquire_or_renew(&operation_a, &input_a),
+            coordinator_b.acquire_or_renew(&operation_b, &input_b),
+        )
+    };
+    let opening = async {
+        barrier::wait_for_lock_waiters(&observer, 2, "both overlapping batch contenders").await;
+        gate.release().await;
+    };
+    let ((a, b), ()) = tokio::join!(race, opening);
     let a = a.expect("batch A result");
     let b = b.expect("batch B result");
     assert_eq!(
@@ -1267,6 +1338,50 @@ async fn racing_batches_are_all_or_nothing() {
                 && rows.iter().all(|row| row.owner == owner_b)),
         "rows must be one whole winning batch: {rows:?}"
     );
+    let winner_owner = if a.rejection.is_none() {
+        &owner_a
+    } else {
+        &owner_b
+    };
+    assert!(rows.iter().all(|row| &row.owner == winner_owner));
+    assert_eq!(
+        outbox_row_count_for_repository(&observer, &repository_id).await,
+        1
+    );
+    let event = one_outbox_row_for_repository(&observer, &repository_id).await;
+    assert_eq!(event.event_kind, "lock.acquired");
+    assert_eq!(event.cell_id, cell_id);
+    for (coordinator, operation, input, original) in [
+        (&coordinator_a, &operation_a, &input_a, &a),
+        (&coordinator_b, &operation_b, &input_b, &b),
+    ] {
+        let replay = coordinator
+            .acquire_or_renew(operation, input)
+            .await
+            .expect("exact batch receipt replay");
+        assert!(replay.replayed);
+        assert_eq!(replay.outcome, original.outcome);
+        // Receipt replay preserves the durable outcome, not the fresh-path convenience field.
+        assert_eq!(replay.rejection, None);
+    }
+    assert_eq!(
+        outbox_row_count_for_repository(&observer, &repository_id).await,
+        1
+    );
+    let after = coordinator_a
+        .query(&repository_id, Some(&branch_id), None)
+        .await
+        .expect("rows after receipts");
+    assert_eq!(after.len(), rows.len());
+    for row in &rows {
+        let retained = after
+            .iter()
+            .find(|after| after.resource_hash == row.resource_hash)
+            .expect("same winning resource");
+        assert_eq!(retained.owner, row.owner);
+        assert_eq!(retained.ownership_token, row.ownership_token);
+        assert_eq!(retained.fence, row.fence);
+    }
 }
 
 #[tokio::test]
@@ -1814,8 +1929,11 @@ async fn lease_clock_is_captured_after_the_namespace_lock_wait() {
         .await
         .expect("begin namespace blocker");
     blocker_tx.query_one("SELECT 1 FROM lore_domain_lock_namespaces WHERE repository_id=$1 AND branch_id=$2 FOR UPDATE", &[&repository_id.as_slice(), &branch_id.as_slice()]).await.expect("lock namespace row");
+    let observer = barrier::observer(&url).await;
     let acquire = coordinator.acquire_or_renew(&operation, &input);
     let release = async {
+        barrier::wait_for_lock_waiters(&observer, 1, "lease acquire behind namespace holder").await;
+        // Age the lease only after PostgreSQL proves the request is waiting.
         tokio::time::sleep(Duration::from_millis(500)).await;
         let released_at = SystemTime::now();
         blocker_tx
