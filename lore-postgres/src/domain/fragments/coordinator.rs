@@ -2350,9 +2350,27 @@ impl PostgresFragmentCoordinator {
                 })
         });
         if !lineage_matches {
+            let published_same_representation = match head.as_ref() {
+                Some(head)
+                    if head.state == FragmentLifecycleState::Remote
+                        && head.current_epoch == claim.epoch
+                        && head.active_operation.is_none() =>
+                {
+                    published_prepared_claim_matches(&tx, head, claim).await?
+                }
+                _ => false,
+            };
             settle_write_claim_locked(&tx, &mut sequence, claim, FragmentWriteSettlement::NoSend)
                 .await?;
             classify_commit(tx.commit().await, "fragment write lineage refusal commit")?;
+            if published_same_representation {
+                // The sibling finished the exact representation before this
+                // claim could send. Only a confirmed NoSend permits the caller
+                // to back off and perform fresh admission/readable-epoch checks.
+                return Err(DomainError::Contention(
+                    "fragment representation published before write authorization".to_owned(),
+                ));
+            }
             return Err(DomainError::PreconditionRejected {
                 reason: "fragment_write_lineage_moved".to_owned(),
                 reason_version: 1,
@@ -5454,6 +5472,49 @@ async fn lock_write_claim_identity(
         .await
         .map_err(|error| DomainError::from_pg("fragment write claim lock", error))?;
     row.map(decode_locked_write_claim).transpose()
+}
+
+// The lifecycle head lock serializes epoch and claim writers. This bounded
+// lookup grants no send authority and never treats a replacement epoch as reuse.
+async fn published_prepared_claim_matches(
+    tx: &Transaction<'_>,
+    head: &FragmentHeadLock,
+    claim: &FragmentWriteClaim,
+) -> Result<bool, DomainError> {
+    let body_size = i64::try_from(claim.body_size).map_err(|_| {
+        DomainError::InvalidInput("fragment write claim body size exceeds i64".to_owned())
+    })?;
+    let row = tx
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM lore_fragment_epochs AS epoch \
+           JOIN lore_fragment_write_claims AS claim \
+             ON claim.hash = epoch.hash AND claim.epoch = epoch.epoch \
+          WHERE epoch.hash = $1 AND epoch.epoch = $2 \
+            AND epoch.authority = $3 AND epoch.object_key = $4 \
+            AND epoch.provider_body_blake3 = $5 AND epoch.provider_body_size = $6 \
+            AND epoch.provider_claim_fence = $7 AND epoch.fence = $8 \
+            AND epoch.manifest_id = $9 AND epoch.decoded_hash = $1 \
+            AND epoch.disposition = $10 \
+            AND claim.logical_request_id = $11 AND claim.attempt_id = $12 \
+            AND claim.state = 0)",
+            &[
+                &claim.hash,
+                &claim.epoch,
+                &claim.authority.bits(),
+                &claim.object_key,
+                &claim.body_blake3.as_slice(),
+                &body_size,
+                &claim.fence,
+                &head.last_fence,
+                &head.manifest_id,
+                &schema::DISPOSITION_CURRENT_ELIGIBLE,
+                &claim.logical_request_id.as_slice(),
+                &claim.attempt_id.as_slice(),
+            ],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("published prepared fragment claim lookup", error))?;
+    Ok(row.get(0))
 }
 
 async fn settle_write_claim_locked(

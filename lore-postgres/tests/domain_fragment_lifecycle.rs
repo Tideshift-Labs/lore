@@ -85,6 +85,180 @@ use uuid::Uuid;
 
 const TEST_PROVIDER_WRITE_AUTHORITY_REVISION: &str = "write-claims-v1";
 
+async fn overlapping_direct_write_claims(
+    coordinator: &TestFragmentCoordinator,
+    hash: &[u8],
+) -> (Box<FragmentIntent>, Box<FragmentIntent>) {
+    let BeginOutcome::Admitted(first) = coordinator
+        .begin_direct_write(hash, &legacy_key(hash))
+        .await
+        .expect("first upload admission")
+    else {
+        panic!("first upload must be admitted");
+    };
+    let first_claim = first.write_claim().expect("first durable claim");
+    coordinator
+        .authorize_write_claim(first_claim)
+        .await
+        .expect("first provider authorization");
+    coordinator
+        .settle_write_claim(first_claim, FragmentWriteSettlement::Decisive)
+        .await
+        .expect("first provider response before publication");
+    let BeginOutcome::Admitted(lagging) = coordinator
+        .begin_direct_write(hash, &legacy_key(hash))
+        .await
+        .expect("lagging upload admission after settled send")
+    else {
+        panic!("settled first send permits a new exact-lineage claim");
+    };
+    assert_eq!(lagging.epoch, first.epoch);
+    assert_eq!(lagging.fence, first.fence);
+    (first, lagging)
+}
+
+async fn assert_claim_never_authorized(direct: &Client, intent: &FragmentIntent) {
+    let claim = intent.write_claim().expect("durable lagging claim");
+    let row = direct.query_one("SELECT state,authorized_at,settled_at FROM lore_fragment_write_claims WHERE logical_request_id=$1 AND attempt_id=$2", &[&claim.logical_request_id().as_slice(), &claim.attempt_id().as_slice()]).await.expect("exact lagging claim");
+    assert_eq!(row.get::<_, i16>(0), FragmentWriteClaimState::NoSend.bits());
+    assert_eq!(row.get::<_, Option<SystemTime>>(1), None);
+    assert!(row.get::<_, Option<SystemTime>>(2).is_some());
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn lagging_direct_upload_after_sibling_publication_is_no_send_and_readable_on_retry() {
+    let url = pg_url().expect("owned LORE_TEST_PG_URL required");
+    let coordinator = store(&url).await.fragment_coordinator();
+    let direct = client(&url).await;
+    let hash = random_hash();
+    let (first, lagging) = overlapping_direct_write_claims(&coordinator, &hash).await;
+    let mut published = manifest(&first.object_key, 0x71, EpochAuthority::Remote);
+    published.decoded_hash = hash.clone();
+    published.size_payload = 1;
+    published.size_content = 1;
+    let manifest_id = published.manifest_id.clone();
+    assert_eq!(
+        coordinator
+            .0
+            .commit_remote(
+                &first,
+                IoObservation::Valid(published),
+                FragmentWriteSettlement::Decisive
+            )
+            .await
+            .expect("sibling publication before lagging authorization"),
+        CommitVerdict::Published
+    );
+    let error = coordinator
+        .authorize_write_claim(lagging.write_claim().expect("lagging claim"))
+        .await
+        .expect_err("lagging upload must not receive send permission");
+    assert!(
+        matches!(error, DomainError::Contention(_)),
+        "published sibling must permit safe fresh lookup, not Internal/panic: {error:?}"
+    );
+    assert_claim_never_authorized(&direct, &lagging).await;
+    let BeginOutcome::AlreadyReadable(witness) = coordinator
+        .begin_direct_write(&hash, &legacy_key(&hash))
+        .await
+        .expect("fresh no-send retry")
+    else {
+        panic!("retry must reuse published representation without a provider claim");
+    };
+    assert_eq!(witness.epoch, first.epoch);
+    assert_eq!(witness.manifest_id, Some(manifest_id));
+    let count: i64 = direct
+        .query_one(
+            "SELECT count(*) FROM lore_fragment_write_claims WHERE hash=$1",
+            &[&hash],
+        )
+        .await
+        .expect("retry creates no claim")
+        .get(0);
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn lagging_direct_upload_cannot_reuse_deleted_or_replaced_lineage() {
+    let url = pg_url().expect("owned LORE_TEST_PG_URL required");
+    let coordinator = store(&url).await.fragment_coordinator();
+    let direct = client(&url).await;
+    for replacement in [false, true] {
+        let hash = random_hash();
+        let (_, lagging) = overlapping_direct_write_claims(&coordinator, &hash).await;
+        if replacement {
+            direct.execute("UPDATE lore_fragment_lifecycle SET current_epoch=current_epoch+1,last_fence=last_fence+1 WHERE hash=$1", &[&hash]).await.expect("fixture replacement lineage");
+        } else {
+            direct
+                .execute(
+                    "UPDATE lore_fragment_lifecycle SET state=$2 WHERE hash=$1",
+                    &[&hash, &FragmentLifecycleState::DeletingChildren.bits()],
+                )
+                .await
+                .expect("fixture destructive transition");
+        }
+        let error = coordinator
+            .authorize_write_claim(lagging.write_claim().expect("lagging claim"))
+            .await
+            .expect_err("destructive or replacement move must fence authorization");
+        assert!(
+            matches!(error, DomainError::PreconditionRejected { ref reason, .. } if reason == "fragment_write_lineage_moved"),
+            "must retain exact non-retryable fence: {error:?}"
+        );
+        assert_claim_never_authorized(&direct, &lagging).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn lagging_direct_upload_rejects_mismatched_published_evidence() {
+    let url = pg_url().expect("owned LORE_TEST_PG_URL required");
+    let coordinator = store(&url).await.fragment_coordinator();
+    let direct = client(&url).await;
+    for mutation in [
+        "provider_body_blake3=decode(repeat('00',32),'hex')",
+        "provider_claim_fence=provider_claim_fence+1",
+        "manifest_id=decode(repeat('00',32),'hex')",
+    ] {
+        let hash = random_hash();
+        let (first, lagging) = overlapping_direct_write_claims(&coordinator, &hash).await;
+        let mut published = manifest(&first.object_key, 0x72, EpochAuthority::Remote);
+        published.decoded_hash = hash.clone();
+        published.size_payload = 1;
+        published.size_content = 1;
+        assert_eq!(
+            coordinator
+                .0
+                .commit_remote(
+                    &first,
+                    IoObservation::Valid(published),
+                    FragmentWriteSettlement::Decisive
+                )
+                .await
+                .expect("publish sibling"),
+            CommitVerdict::Published
+        );
+        direct
+            .execute(
+                &format!("UPDATE lore_fragment_epochs SET {mutation} WHERE hash=$1 AND epoch=$2"),
+                &[&hash, &first.epoch],
+            )
+            .await
+            .expect("alter only fixture evidence");
+        let error = coordinator
+            .authorize_write_claim(lagging.write_claim().expect("lagging claim"))
+            .await
+            .expect_err("mismatched representation cannot authorize or imply safe retry");
+        assert!(
+            matches!(error, DomainError::PreconditionRejected { ref reason, .. } if reason == "fragment_write_lineage_moved"),
+            "evidence mutation {mutation} must retain hard fence: {error:?}"
+        );
+        assert_claim_never_authorized(&direct, &lagging).await;
+    }
+}
+
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn direct_write_preserves_preexisting_deletion_and_tombstone_fences() {
