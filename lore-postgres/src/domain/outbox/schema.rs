@@ -1027,4 +1027,18 @@ BEGIN
     END IF;
 END
 $outbox_dead_letter_replay_constraints$;
+
+-- Fresh empty-cell event provenance. Never manufactured for a retained cutover.
+CREATE TABLE IF NOT EXISTS lore_outbox_fresh_initialization (
+    id smallint NOT NULL PRIMARY KEY CHECK (id = 1),
+    contract_version integer NOT NULL CHECK (contract_version = 1),
+    cell_id text NOT NULL CHECK (cell_id ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$' AND octet_length(cell_id) <= 63),
+    stream_identity text NOT NULL CHECK (octet_length(stream_identity) BETWEEN 1 AND 128),
+    stream_epoch bigint NOT NULL CHECK (stream_epoch > 0),
+    placement_revision bigint NOT NULL CHECK (placement_revision = 1),
+    initial_broker_last_sequence bigint NOT NULL CHECK (initial_broker_last_sequence = 0),
+    database_identity text NOT NULL,
+    initialized_at timestamptz NOT NULL
+);
+
 "#;

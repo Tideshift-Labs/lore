@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 use futures::FutureExt;
 pub mod admin_service;
+pub mod caller_capabilities;
 pub mod domain;
 pub mod domain_operation_metadata;
 pub mod environment;

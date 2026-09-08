@@ -14,6 +14,8 @@ lore-proto = { workspace = true }
 lore-telemetry = { workspace = true }
 opentelemetry = { workspace = true }
 prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = "2"
 thiserror = { workspace = true }

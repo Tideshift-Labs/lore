@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -88,6 +89,8 @@ pub async fn handler(
     acceleration: crate::grpc::server::RevisionListAcceleration,
     instruments: &RevisionListInstruments,
 ) -> Result<Response<RevisionListResponse>, Status> {
+    let allow_repairs =
+        crate::grpc::caller_capabilities::read_repairs_allowed(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let user_id = get_user_id(request.extensions());
     let repository_id = get_repository(request.metadata())?;
@@ -123,14 +126,20 @@ pub async fn handler(
                     .output?
             };
 
-            let items =
-                walk_revisions(hash, &strategy, &repository, history_step_size, instruments)
-                    .observe_result(
-                        instruments.walk_duration.clone(),
-                        smallvec![KeyValue::new(METRICS_LIST_STRATEGY_KEY, strategy.as_str())],
-                    )
-                    .await
-                    .output?;
+            let items = walk_revisions(
+                hash,
+                &strategy,
+                &repository,
+                history_step_size,
+                instruments,
+                allow_repairs,
+            )
+            .observe_result(
+                instruments.walk_duration.clone(),
+                smallvec![KeyValue::new(METRICS_LIST_STRATEGY_KEY, strategy.as_str())],
+            )
+            .await
+            .output?;
 
             let mut response = Response::new(RevisionListResponse {
                 items,
@@ -245,6 +254,7 @@ async fn walk_revisions(
     repository: &Arc<RepositoryContext>,
     history_step_size: u64,
     instruments: &RevisionListInstruments,
+    allow_repairs: bool,
 ) -> Result<Vec<RevisionItem>, Status> {
     let mut items = Vec::with_capacity(MAX_REVISION_LIST_RESPONSE_ITEMS);
 
@@ -310,7 +320,8 @@ async fn walk_revisions(
         // so future lookups can use the HistoryStep strategy. The branch
         // is read from the revision metadata rather than carried from the
         // request identifier.
-        if matches!(strategy, RevisionListStrategy::FullIteration)
+        if allow_repairs
+            && matches!(strategy, RevisionListStrategy::FullIteration)
             && let Some((prev_number, prev_hash, prev_metadata_hash)) = prev_step_info
             && prev_number / history_step_size != current_number / history_step_size
             && let Ok(metadata) =

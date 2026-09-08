@@ -11,16 +11,21 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release --bin loreserver && \
-    cp /build/target/release/loreserver /build/loreserver-bin
+    cargo build --release --bin loreserver --bin cell-schema-install --bin cell-budget-configure && \
+    cp /build/target/release/loreserver /build/loreserver-bin && \
+    cp /build/target/release/cell-schema-install /build/cell-schema-install-bin && \
+    cp /build/target/release/cell-budget-configure /build/cell-budget-configure-bin
 
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/loreserver-bin /usr/local/bin/loreserver
+COPY --from=builder /build/cell-schema-install-bin /usr/local/bin/cell-schema-install
+COPY --from=builder /build/cell-budget-configure-bin /usr/local/bin/cell-budget-configure
 COPY --from=builder /build/lore-server/config/default.toml /etc/lore/config/default.toml
 
 # Docker environment config: local stores at /data. No QUIC certificate is

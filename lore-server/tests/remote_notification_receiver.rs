@@ -663,7 +663,7 @@ async fn a_placement_move_observed_at_the_readiness_cas_retires_and_a_fresh_gene
 // erroring:
 //   - the fresh `FakeDurableStream` in every case here is built with a
 //     `start_sequence` that disagrees with the correct resume position (900,
-//     6, or 3 below), so a resume that silently fell back to `capture_new`
+//     1, or 3 below), so a resume that silently fell back to `capture_new`
 //     would be caught by `captured.start_sequence` alone, without needing to
 //     inspect `resume_from` directly;
 //   - case 4's gap sits strictly below `highest_seen`, so a resume that used
@@ -674,9 +674,9 @@ async fn a_placement_move_observed_at_the_readiness_cas_retires_and_a_fresh_gene
 //     rather than a hang.
 
 /// A restart that finds its own generation already `ready`, with a real
-/// checkpoint behind it, must resume the SAME generation at the checkpoint's
-/// `contiguous_frontier + 1` -- never re-baseline, never re-apply the
-/// already-acknowledged range, and never allocate a new generation.
+/// checkpoint behind it, must resume the SAME generation with the original
+/// captured position and retain its local frontier. It takes a new baseline
+/// without re-applying acknowledged events or allocating a generation.
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
 async fn a_restart_after_readiness_resumes_the_same_generation_past_the_checkpointed_frontier() {
@@ -757,7 +757,7 @@ async fn a_restart_after_readiness_resumes_the_same_generation_past_the_checkpoi
 
     // The second "process": a fresh receiver over the SAME store and cell.
     // The fake stream's own default start (999) deliberately disagrees with
-    // the correct resume position (6), so a resume that fell back to
+    // the original capture position (1), so a resume that fell back to
     // `capture_new` would be caught here rather than by inspecting the
     // capture request directly.
     let stream2 = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 999);
@@ -783,9 +783,8 @@ async fn a_restart_after_readiness_resumes_the_same_generation_past_the_checkpoi
         "the restart must resume generation 1, never allocate a new one"
     );
     assert_eq!(
-        session2.captured.start_sequence, 6,
-        "the resumed capture must start at the checkpointed frontier plus one, not the stream's \
-         own default and not the original capture position"
+        session2.captured.start_sequence, 1,
+        "the resumed capture must retain the durable consumer's original start position"
     );
     assert_eq!(
         session2.contiguous_frontier(),

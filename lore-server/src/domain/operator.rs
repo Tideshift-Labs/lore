@@ -150,6 +150,20 @@ const BACKFILL_BRANCH_DOMAIN_V1: &[u8] = b"lore-domain-backfill-branch-v1\0";
 /// A maintenance operation on this cell's CR-029 domain state.
 #[derive(Debug, Subcommand)]
 pub enum DomainCommand {
+    /// Bind an empty cell to its observed fresh broker stream without declaring receivers ready.
+    InitializeEvents {
+        #[arg(long)]
+        stream_identity: String,
+        #[arg(long)]
+        stream_epoch: i64,
+        /// Actual broker last sequence; must be zero on first initialization.
+        #[arg(long)]
+        broker_last_sequence: i64,
+        #[arg(long)]
+        confirm_writers_stopped: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Initialize fragment lifecycle for a deliberately empty cell after domain cutover.
     InitializeFragments {
         /// Revision of fresh scoped credentials whose old writers have been excluded.
@@ -213,6 +227,23 @@ pub enum DomainCommand {
 /// precondition this command refuses rather than forces, or a database failure.
 pub async fn run(command: &DomainCommand, settings: &Settings) -> Result<()> {
     match command {
+        DomainCommand::InitializeEvents {
+            stream_identity,
+            stream_epoch,
+            broker_last_sequence,
+            confirm_writers_stopped,
+            json,
+        } => {
+            crate::domain::event_operator::initialize(
+                settings,
+                stream_identity,
+                *stream_epoch,
+                *broker_last_sequence,
+                *confirm_writers_stopped,
+                *json,
+            )
+            .await
+        }
         DomainCommand::InitializeFragments {
             provider_write_authority_revision,
             confirm_legacy_writers_excluded,

@@ -660,12 +660,19 @@ async fn launch_grpc_server(
                 .and_then(|endpoint| endpoint.auth_url.as_deref()),
             jwt_verifier.is_some(),
         );
-    let features_list = compiled_features(
+    let mut features_list = compiled_features(
         domain_operation_service_available,
         domain_context
             .as_ref()
             .is_some_and(|domain| domain.enforcement_enabled()),
     );
+
+    features_list.push("outcome_unknown_v1".to_string());
+    if grpc_settings.caller_capability_policy
+        == crate::grpc::caller_capabilities::CallerCapabilityPolicy::RequireOutcomeUnknownV1
+    {
+        features_list.push("requires_outcome_unknown_v1".to_string());
+    }
 
     let (cert_path, key_path, cert_chain_path) =
         if let Some(cert_settings) = grpc_settings.certificate {
@@ -716,6 +723,7 @@ async fn launch_grpc_server(
             user_agent_filter,
             forwarded_requests,
         )
+        .with_caller_capability_policy(grpc_settings.caller_capability_policy)
         .with_jwt_verifier(jwt_verifier, enforce_write_permission)?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
@@ -853,6 +861,7 @@ fn build_lore_http_settings(
     user_agent_filter: Arc<UserAgentFilter>,
 ) -> LoreHttpServerSettings {
     LoreHttpServerSettings {
+        caller_capability_policy: Default::default(),
         port: http_settings.port,
         host: http_settings.host.clone(),
         max_file_size: http_settings.max_file_size,
@@ -2076,6 +2085,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // Initialize metrics and tracing telemetry, returns a guard that will cleanup when it falls out
     // of scope
     let (settings, settings_hash) = settings;
+    crate::grpc::caller_capabilities::validate_settings(&settings)?;
     let runtime = runtime();
     let telemetry = settings.telemetry.clone().unwrap_or_default();
     let metrics_config = telemetry.metrics.clone().unwrap_or_default();
@@ -2266,6 +2276,16 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             (immutable_store, cell_retention_handle, configured_domain)
         };
 
+    // A retention handle is published only by the constructed Postgres store's
+    // coordinated route. Merely configuring a domain coordinator does not prove it.
+    if let Some(grpc) = &settings.server.grpc {
+        crate::grpc::caller_capabilities::validate_serving_fragment_route(
+            grpc.caller_capability_policy,
+            settings.immutable_store.mode == "postgres",
+            cell_retention_handle.is_some(),
+        )?;
+    }
+
     // CR-029: the domain coordinator is built before mutable-store publication
     // on both branches, so readiness still arms the one enforcement handle the
     // concrete Postgres mutable store must receive.
@@ -2291,6 +2311,17 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // off has no claims to prune and gets no task.
     let configured_fragment_coordinator = configured_domain.fragment_coordinator.clone();
     let domain_context = configured_domain.context;
+    if settings.server.grpc.as_ref().is_some_and(|grpc| {
+        grpc.caller_capability_policy
+            == crate::grpc::caller_capabilities::CallerCapabilityPolicy::RequireOutcomeUnknownV1
+    }) {
+        anyhow::ensure!(
+            domain_context
+                .as_ref()
+                .is_some_and(|domain| domain.enforcement_enabled()),
+            "required caller capability policy requires governed domain enforcement"
+        );
+    }
     // The internal forwarding endpoint reaches the same repository handlers, so
     // it gets the same coordinator handle rather than an ungoverned bypass.
     let internal_domain_context = domain_context.clone();
@@ -2744,8 +2775,14 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         if let Some(http_settings) = settings.server.http.as_ref()
             && http_settings.enabled
         {
-            let lore_http_settings =
+            let mut lore_http_settings =
                 build_lore_http_settings(http_settings, user_agent_filter.clone());
+            lore_http_settings.caller_capability_policy = settings
+                .server
+                .grpc
+                .as_ref()
+                .map(|grpc| grpc.caller_capability_policy)
+                .unwrap_or_default();
             let immutable_store = immutable_store.clone();
             let mutable_store = mutable_store.clone();
             let shutdown_rx = _shutdown_rx.clone();

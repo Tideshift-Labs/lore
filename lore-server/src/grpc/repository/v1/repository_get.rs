@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::str::FromStr;
 use std::sync::Arc;
@@ -44,6 +45,8 @@ pub async fn handler(
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryGetResponse>, Status> {
     let user_id = get_user_id(request.extensions());
+    let allow_repairs =
+        crate::grpc::caller_capabilities::read_repairs_allowed(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
@@ -68,21 +71,25 @@ pub async fn handler(
                 Query::Id(id) => {
                     let id: RepositoryId = Context::from(id).into();
                     debug!(%id, "Get repository by id");
-                    let (metadata, metadata_hash) =
-                        repository_load_id(repository.clone(), id, auth_url, authorization)
-                            .await
-                            .map_err(|_err| {
-                                Status::not_found(format!("Repository {id} not found"))
-                            })?;
+                    let (metadata, metadata_hash) = repository_load_id_with_repairs(
+                        repository.clone(),
+                        id,
+                        auth_url,
+                        authorization,
+                        allow_repairs,
+                    )
+                    .await
+                    .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
                     (id, metadata, metadata_hash)
                 }
                 Query::Name(name) => {
                     debug!(name, "Get repository by name");
-                    let (id, metadata, metadata_hash) = repository_load_name(
+                    let (id, metadata, metadata_hash) = repository_load_name_with_repairs(
                         repository.clone(),
                         name.as_str(),
                         auth_url,
                         authorization,
+                        allow_repairs,
                     )
                     .await
                     .map_err(|_err| Status::not_found(format!("Repository {name} not found")))?;
@@ -106,6 +113,17 @@ pub(super) async fn repository_load_id(
     id: RepositoryId,
     auth_url: Option<String>,
     authorization: Option<String>,
+) -> Result<(RepositoryMetadata, Hash), RepositoryError> {
+    repository_load_id_with_repairs(repository, id, auth_url, authorization, true).await
+}
+
+#[allow(clippy::map_err_ignore)]
+async fn repository_load_id_with_repairs(
+    repository: Arc<RepositoryContext>,
+    id: RepositoryId,
+    auth_url: Option<String>,
+    authorization: Option<String>,
+    allow_repairs: bool,
 ) -> Result<(RepositoryMetadata, Hash), RepositoryError> {
     if let Some(auth_url) = auth_url {
         check_repository_query_authorization(auth_url, authorization, id)
@@ -139,7 +157,7 @@ pub(super) async fn repository_load_id(
                 repository: id.to_string(),
             }));
         }
-        Err(_) => {
+        Err(_) if allow_repairs => {
             info!(
                 "Repairing missing name -> ID mapping: {} -> {}",
                 metadata.name, id
@@ -148,7 +166,7 @@ pub(super) async fn repository_load_id(
                 .await
                 .inspect_err(|err| warn!("Failed to repair name -> ID mapping: {err}"));
         }
-        Ok(_) => {}
+        Ok(_) | Err(_) => {}
     }
 
     Ok((metadata, metadata_hash))
@@ -165,9 +183,21 @@ pub(super) async fn repository_load_name(
     auth_url: Option<String>,
     authorization: Option<String>,
 ) -> Result<(RepositoryId, RepositoryMetadata, Hash), RepositoryError> {
+    repository_load_name_with_repairs(repository, name, auth_url, authorization, true).await
+}
+
+#[allow(clippy::map_err_ignore)]
+async fn repository_load_name_with_repairs(
+    repository: Arc<RepositoryContext>,
+    name: &str,
+    auth_url: Option<String>,
+    authorization: Option<String>,
+    allow_repairs: bool,
+) -> Result<(RepositoryId, RepositoryMetadata, Hash), RepositoryError> {
     if let Ok(id) = RepositoryId::from_str(name) {
         let (metadata, metadata_hash) =
-            repository_load_id(repository, id, auth_url, authorization).await?;
+            repository_load_id_with_repairs(repository, id, auth_url, authorization, allow_repairs)
+                .await?;
         return Ok((id, metadata, metadata_hash));
     }
 
@@ -200,9 +230,11 @@ pub(super) async fn repository_load_name(
             "Stale name -> ID mapping: {} maps to {} but metadata name is {}, deleting mapping",
             name, id, metadata.name
         );
-        let _ = repository::delete_name_to_id(repository.clone(), name)
-            .await
-            .inspect_err(|err| warn!("Failed to delete stale name -> ID mapping: {err}"));
+        if allow_repairs {
+            let _ = repository::delete_name_to_id(repository.clone(), name)
+                .await
+                .inspect_err(|err| warn!("Failed to delete stale name -> ID mapping: {err}"));
+        }
         return Err(RepositoryError::from(RepositoryNotFound {
             repository: name.to_string(),
         }));

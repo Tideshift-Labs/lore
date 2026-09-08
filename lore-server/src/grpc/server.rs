@@ -41,6 +41,8 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing::warn;
 
+use super::caller_capabilities::CallerCapabilityLayer;
+use super::caller_capabilities::CallerCapabilityPolicy;
 use super::lock_service::LoreLockService;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_interceptor::JWTAuthnInterceptor;
@@ -78,17 +80,23 @@ use crate::util::core_hop::CoreHopLayer;
 // Copy and paste from the rust compiler for sanity
 type GrpcRouter = tonic::transport::server::Router<
     Stack<
-        GrpcResponseTraceLayer,
+        CallerCapabilityLayer,
         Stack<
-            ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
+            GrpcResponseTraceLayer,
             Stack<
-                LoreTracingLayer,
+                ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
                 Stack<
+                    LoreTracingLayer,
                     Stack<
-                        TraceLayer<SharedClassifier<GrpcErrorsAsFailures>, MakeCorrelationIdSpan>,
-                        CorrelationIdLayer,
+                        Stack<
+                            TraceLayer<
+                                SharedClassifier<GrpcErrorsAsFailures>,
+                                MakeCorrelationIdSpan,
+                            >,
+                            CorrelationIdLayer,
+                        >,
+                        Stack<CoreHopLayer, tower::layer::util::Identity>,
                     >,
-                    Stack<CoreHopLayer, tower::layer::util::Identity>,
                 >,
             >,
         >,
@@ -564,11 +572,13 @@ impl GrpcServerBuilder<WantsHttp2Config> {
             service_settings,
             user_agent_filter,
             forwarded_requests,
+            caller_capability_policy: CallerCapabilityPolicy::default(),
         })
     }
 }
 
 pub struct MaybeJwtVerifier {
+    caller_capability_policy: CallerCapabilityPolicy,
     environment: EnvironmentConfig,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
@@ -590,6 +600,10 @@ pub struct MaybeJwtVerifier {
 }
 
 impl GrpcServerBuilder<MaybeJwtVerifier> {
+    pub fn with_caller_capability_policy(mut self, policy: CallerCapabilityPolicy) -> Self {
+        self.0.caller_capability_policy = policy;
+        self
+    }
     fn make_lock_service(
         services_settings: &Option<GrpcPublicServicesSettings>,
         inner: LoreLockService,
@@ -612,6 +626,11 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         jwt_verifier: Option<JwtVerifier>,
         enforce_write_permission: bool,
     ) -> Result<GrpcServerBuilder<WantsAddress>> {
+        anyhow::ensure!(
+            self.0.caller_capability_policy != CallerCapabilityPolicy::RequireOutcomeUnknownV1
+                || jwt_verifier.is_some(),
+            "required caller capability policy requires JWT authentication"
+        );
         // Auth-OFF wires services with no interceptor → no token in request
         // extensions, so write-permission enforcement no-ops regardless; pass
         // `false` for clarity when there's no verifier.
@@ -822,7 +841,8 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             )
             .layer(LoreTracingLayer {})
             .layer(metrics_layer)
-            .layer(GrpcResponseTraceLayer {});
+            .layer(GrpcResponseTraceLayer {})
+            .layer(CallerCapabilityLayer::new(self.0.caller_capability_policy));
 
         let mut router = router.add_service(AdminServiceServer::new(admin_svc));
 

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::future::Future;
 use std::net::SocketAddr;
@@ -149,6 +150,7 @@ pub struct PresignSettings {
 
 #[derive(Default)]
 pub struct LoreHttpServerSettings {
+    pub caller_capability_policy: crate::grpc::caller_capabilities::CallerCapabilityPolicy,
     pub host: String,
     pub port: i32,
     pub max_file_size: u64,
@@ -213,6 +215,10 @@ pub fn create_router(
         .route(
             "/event_readiness",
             routing::get(event_readiness::handler).with_state(server_health.clone()),
+        )
+        .route(
+            "/caller_capability_readiness",
+            routing::get(caller_capability_readiness).with_state(settings.caller_capability_policy),
         );
 
     crate::store::spawn_immutable_store_availability_monitor(server_health);
@@ -229,6 +235,10 @@ pub fn create_router(
     }
 
     router
+        .layer(middleware::from_fn_with_state(
+            settings.caller_capability_policy,
+            caller_capability_admission,
+        ))
         .layer(middleware::from_fn(lore_http_tracing))
         .layer(CorrelationIdLayerBuilder::new().with_http_tracer().build())
         .layer(HttpMetricsLayer::new(settings.user_agent_filter.clone()))
@@ -283,6 +293,54 @@ fn build_presign_config(settings: &PresignSettings) -> Result<Option<PresignConf
         )
         .map_err(|err| anyhow!("{} {err}", presign_content_type_field(err.field())))?,
     }))
+}
+
+/// Report the immutable policy held by this running HTTP surface.
+pub async fn caller_capability_readiness(
+    axum::extract::State(policy): axum::extract::State<
+        crate::grpc::caller_capabilities::CallerCapabilityPolicy,
+    >,
+) -> axum::Json<serde_json::Value> {
+    use crate::grpc::caller_capabilities::CallerCapabilityPolicy;
+    let required = policy == CallerCapabilityPolicy::RequireOutcomeUnknownV1;
+    let features = if required {
+        vec!["outcome_unknown_v1", "requires_outcome_unknown_v1"]
+    } else {
+        vec!["outcome_unknown_v1"]
+    };
+    axum::Json(serde_json::json!({
+        "policy": if required { "require_outcome_unknown_v1" } else { "compatible_single_replica" },
+        "features": features,
+        "contract": "grpc-caller-capability-admission-v1",
+    }))
+}
+
+/// HTTP content uploads share the pre-body declaration grammar with gRPC.
+/// Content reads and presign vending retain their existing access checks.
+pub async fn caller_capability_admission(
+    axum::extract::State(policy): axum::extract::State<
+        crate::grpc::caller_capabilities::CallerCapabilityPolicy,
+    >,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    use crate::grpc::caller_capabilities::ADMISSION_HEADER;
+    use crate::grpc::caller_capabilities::CallerCapabilityPolicy;
+    use crate::grpc::caller_capabilities::declares_outcome_unknown;
+    if policy == CallerCapabilityPolicy::RequireOutcomeUnknownV1
+        && request.method() == http::Method::PUT
+        && !matches!(declares_outcome_unknown(request.headers()), Ok(true))
+    {
+        return (
+            http::StatusCode::PRECONDITION_FAILED,
+            [(ADMISSION_HEADER, "unsupported-client")],
+            "unsupported client capability",
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 impl LoreHttpServer {

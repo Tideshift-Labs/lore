@@ -194,14 +194,12 @@ pub trait DurableStreamSource: Send + Sync + std::fmt::Debug {
     ///
     /// # The precondition every implementation owes
     ///
-    /// `start_sequence` must be the durable consumer's **first unacknowledged**
-    /// sequence, not the stream's live tail. The receiver's whole frontier
-    /// guarantee rests on it: it starts its frontier at `start_sequence - 1`
-    /// and reports that as proved, so a capture that returned the live edge
-    /// would have this receiver claim every sequence below the edge as
-    /// consumed, and WP-119's reaper would delete rows nobody read. It is also
-    /// the contract's own rule — a newly sampled live edge can never mark a
-    /// receiver caught up.
+    /// `start_sequence` is the durable consumer's original captured position,
+    /// fixed when it was created. A resume must echo that position unchanged,
+    /// even after acknowledgements advance the consumer. The receiver restores
+    /// its local frontier separately from its persisted checkpoint. Returning
+    /// a newly sampled live edge for an existing consumer would skip the proof
+    /// of events between its original capture and that edge.
     ///
     /// A capture is taken **once** per generation. An implementation must not
     /// move the position afterwards: the recorded capture is what the

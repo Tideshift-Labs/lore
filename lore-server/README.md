@@ -58,6 +58,21 @@ later uploads. The exclusion flag records an operator attestation; it does not r
 Use the [initialization runbook](../../lorehub/docs/runbooks/clean-cell-fragment-initialization.md)
 for prerequisites, configuration order and recovery. No serving endpoint is opened by the command.
 
+For a fresh event plane, `loreserver domain initialize-events` binds the stopped writers' cell
+to the observed broker identity and epoch. It does not synthesize receiver readiness. Use the
+[fresh event initialization contract](../../lorehub/docs/contracts/fresh-cell-event-initialization.md)
+for prerequisites and rerun rules.
+
+The server image also includes `cell-budget-configure <publish|verify|reconcile> <json-path>`.
+This operator uses `LORE_CELL_BUDGET_MAINTENANCE_URL` and `LORE_CELL_BUDGET_CA_PEM`; credentials
+and CA bytes are environment-only. The local launcher handles its policy and receipts through
+[the governed dev bootstrap](../../lorehub/docker/README.md#local-cell-topology-foundation-tests).
+
+The required caller policy enforces declarations before mutations and suppresses optional shared
+read repairs. Authenticated reads remain available.
+See the [caller admission contract](../../lorehub/docs/contracts/grpc-caller-capability-admission-v1.md)
+for the declaration and recovery requirements; enabling this policy does not upgrade clients.
+
 Coordinated repository creation binds its uploaded metadata with the repository transaction.
 Metadata-upload throttling returns `RESOURCE_EXHAUSTED`. If creation is already Applied but its
 authoritative metadata cannot be read, `ABORTED` requires receipt reconciliation; it does not mean

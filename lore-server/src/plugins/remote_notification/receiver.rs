@@ -24,9 +24,10 @@
 //! draining, and its captured identity and epoch still equal the cell's
 //! authoritative placement, the bootstrap resumes it: it reads that
 //! generation's PERSISTED frontier back through
-//! [`super::receiver_store::ReceiverStore::read_checkpoint`], captures with
-//! `captured_position` one past that frontier, takes a fresh baseline, and
-//! drains from there. It does not join, and it does not re-record the capture.
+//! [`super::receiver_store::ReceiverStore::read_checkpoint`], attaches with the
+//! original `captured_position`, and seeds its local frontier from that saved
+//! checkpoint. It takes a fresh baseline and drains pending deliveries without
+//! joining or re-recording the capture.
 //!
 //! The persisted frontier is the load-bearing part. The broker does not
 //! redeliver a sequence this generation already acknowledged, so a resume that
@@ -392,10 +393,12 @@ impl ReceiverSession {
 struct ResumableGeneration {
     /// The generation to resume. Already joined, already captured.
     membership_generation: i64,
+    /// The original durable capture, echoed unchanged by the gateway on resume.
+    captured_start_sequence: i64,
     /// The first sequence this bootstrap is responsible for: one past the
     /// persisted contiguous frontier, or the captured position when this
     /// generation never reported one.
-    start_sequence: i64,
+    frontier_start_sequence: i64,
 }
 
 /// The durable invalidation receiver.
@@ -632,13 +635,14 @@ impl DurableReceiver {
                     cell_id = %self.cell_id,
                     receiver_identity = %identity,
                     membership_generation = resume.membership_generation,
-                    start_sequence = resume.start_sequence,
+                    captured_start_sequence = resume.captured_start_sequence,
+                    frontier_start_sequence = resume.frontier_start_sequence,
                     "resuming this receiver's captured generation from its persisted position"
                 );
                 (
                     cell_membership_version,
                     resume.membership_generation,
-                    Some(resume.start_sequence),
+                    Some(resume.captured_start_sequence),
                 )
             } else if let Some(member) = reusable {
                 debug!(
@@ -712,15 +716,11 @@ impl DurableReceiver {
 
         // 3b. The resume echo, checked HERE and not only in the transport.
         //
-        //     The frontier this session reports is seeded from
-        //     `captured.start_sequence`, so a source that answered a resume
-        //     with a HIGHER position would have this generation claim every
-        //     sequence in between as proved, and WP-119's reaper would delete
-        //     rows nobody consumed. `GrpcDurableStream` already refuses a
-        //     mismatched echo, but `DurableStreamSource` is a trait and the
-        //     frontier guarantee belongs to the component that owns the
-        //     frontier. Retiring matches what the transport's own refusal
-        //     maps to.
+        //     A resume must attach to the original durable capture. The local
+        //     frontier is restored independently from its persisted checkpoint;
+        //     it does not authorize moving the broker's capture. The transport
+        //     already checks the echo, but the receiver also enforces it for
+        //     every implementation of `DurableStreamSource`.
         if let Some(requested) = resume_from
             && captured.start_sequence != requested
         {
@@ -740,11 +740,8 @@ impl DurableReceiver {
         //    generation, so this is where the ordering becomes a shape.
         //
         //    A resume skips it. The capture it would record is this
-        //    generation's ALREADY RECORDED position — that is what made the
-        //    generation resumable — and the resume's own start sequence is one
-        //    past the persisted frontier rather than that position. Writing it
-        //    would answer `AlreadyRecorded` and change nothing, so the call is
-        //    not made rather than made and ignored.
+        //    generation's ALREADY RECORDED position. The persisted frontier
+        //    restores local progress without changing that capture.
         if resume_from.is_none() {
             match self
                 .runtime
@@ -793,7 +790,11 @@ impl DurableReceiver {
         let mut session = ReceiverSession {
             membership_generation,
             membership_version: cell_membership_version,
-            frontier: AckFrontier::starting_at(captured.start_sequence),
+            frontier: AckFrontier::starting_at(
+                resumable.map_or(captured.start_sequence, |resume| {
+                    resume.frontier_start_sequence
+                }),
+            ),
             applied: AppliedVersions::new(),
             captured,
             ready: false,
@@ -1002,7 +1003,8 @@ impl DurableReceiver {
 
         Ok(Some(ResumableGeneration {
             membership_generation: latest.membership_generation,
-            start_sequence,
+            captured_start_sequence: captured.start_sequence,
+            frontier_start_sequence: start_sequence,
         }))
     }
 
@@ -1335,6 +1337,7 @@ mod tests {
     use super::super::envelope::EnvelopeCommon;
     use super::super::envelope::EventId;
     use super::super::receiver_store::InMemoryReceiverStore;
+    use super::super::receiver_store::ReceiverStore;
     use super::super::receiver_store::StoreCall;
     use super::super::stream::FakeDurableStream;
     use super::super::stream::StreamPlacement;
@@ -1743,9 +1746,8 @@ mod tests {
             .count()
     }
 
-    /// The whole point of the change: a restart resumes its own ready
-    /// generation one past the frontier it persisted, not at the stream's own
-    /// idea of where to start.
+    /// Resume binds the original capture while the local frontier preserves
+    /// progress made since that capture.
     #[tokio::test]
     async fn a_restart_resumes_its_captured_generation_past_the_persisted_frontier() {
         // 999 is deliberately not a plausible resume position, so a fallback
@@ -1768,7 +1770,7 @@ mod tests {
             .expect("a restart resumes rather than failing");
 
         assert_eq!(session.membership_generation, 1);
-        assert_eq!(session.captured.start_sequence, 906);
+        assert_eq!(session.captured.start_sequence, 900);
         assert_eq!(session.contiguous_frontier(), 905);
         assert!(session.ready);
         assert_eq!(joined(&harness.store), 0, "a resume never joins");
@@ -1780,6 +1782,144 @@ mod tests {
                 .iter()
                 .any(|call| matches!(call, StoreCall::Capture { .. })),
             "a resume never re-records a capture it did not take"
+        );
+    }
+
+    /// Model the gateway's immutable durable-consumer `opt_start_seq` check.
+    /// Delivery state survives reconnects, as it does at the broker.
+    #[derive(Debug)]
+    struct StrictCapturedStream {
+        stream: FakeDurableStream,
+        requests: std::sync::Mutex<Vec<CaptureRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DurableStreamSource for StrictCapturedStream {
+        async fn capture(
+            &self,
+            request: &CaptureRequest,
+        ) -> Result<CapturedStreamPosition, StreamError> {
+            {
+                let mut requests = self.requests.lock().expect("test request log");
+                let expected = (!requests.is_empty()).then_some(900);
+                requests.push(request.clone());
+                if request.resume_from != expected {
+                    return Err(super::super::stream::status_to_stream_error(
+                        &tonic::Status::failed_precondition("UNKNOWN_DURABLE_CONSUMER_V1"),
+                        &request.placement,
+                    ));
+                }
+            }
+            self.stream.capture(request).await
+        }
+
+        async fn next(&self) -> Result<StreamDelivery, StreamError> {
+            self.stream.next().await
+        }
+
+        async fn ack(&self, broker_sequence: i64) -> Result<(), StreamError> {
+            self.stream.ack(broker_sequence).await
+        }
+    }
+
+    #[tokio::test]
+    async fn progressed_restarts_keep_the_gateway_capture_and_advance_the_local_checkpoint() {
+        let store = InMemoryReceiverStore::new(CELL);
+        let stream = Arc::new(StrictCapturedStream {
+            stream: FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 900),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let make_receiver = |target: RecordingInvalidationTarget| {
+            DurableReceiver::new(
+                &config(),
+                ReceiverRuntime {
+                    store: Arc::new(store.clone()),
+                    stream: stream.clone(),
+                    target: Arc::new(target),
+                },
+            )
+            .expect("receiver config")
+        };
+        let first = make_receiver(RecordingInvalidationTarget::new());
+        let mut session = first.bootstrap().await.expect("fresh capture succeeds");
+        assert_eq!(session.captured.start_sequence, 900);
+        assert_eq!(session.contiguous_frontier(), 899);
+        for sequence in 900..=905 {
+            stream
+                .stream
+                .push_envelope(sequence, durable(0x9f, (sequence - 899) as u64, None));
+            assert_eq!(first.step(&mut session).await, StepOutcome::Applied);
+        }
+        store
+            .report_checkpoint(&session.checkpoint_report(IDENTITY))
+            .await
+            .expect("persist progress");
+        drop(session);
+        drop(first);
+
+        // Recreate receiver and baseline cache twice. The broker retains its
+        // consumer, while each local checkpoint advances beyond the capture.
+        for next in [906, 907] {
+            let target = RecordingInvalidationTarget::new();
+            let restarted = make_receiver(target.clone());
+            let mut session = restarted
+                .bootstrap()
+                .await
+                .expect("strict gateway accepts original capture");
+            assert!(session.ready);
+            assert_eq!(session.membership_generation, 1);
+            assert_eq!(session.captured.start_sequence, 900);
+            assert_eq!(session.contiguous_frontier(), next - 1);
+            assert_eq!(target.baselines(), 1);
+            assert!(
+                !target
+                    .calls()
+                    .iter()
+                    .any(|call| matches!(call, TargetCall::Apply { .. }))
+            );
+            let checkpoint = store
+                .read_checkpoint("DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
+                .await
+                .expect("read checkpoint")
+                .expect("checkpoint exists");
+            assert_eq!(
+                checkpoint.contiguous_frontier,
+                next - 1,
+                "empty reconnect drain must not regress persisted progress"
+            );
+            stream
+                .stream
+                .push_envelope(next, durable(0x9f, (next - 899) as u64, None));
+            assert_eq!(restarted.step(&mut session).await, StepOutcome::Applied);
+            assert_eq!(session.contiguous_frontier(), next);
+            assert!(
+                !session.has_blockers(),
+                "no artificial gap back to the original capture"
+            );
+            assert_eq!(
+                target
+                    .calls()
+                    .iter()
+                    .filter(|call| matches!(call, TargetCall::Apply { .. }))
+                    .count(),
+                1
+            );
+            store
+                .report_checkpoint(&session.checkpoint_report(IDENTITY))
+                .await
+                .expect("persist resumed progress");
+        }
+        assert_eq!(stream.stream.acked(), (900..=907).collect::<Vec<_>>());
+        assert_eq!(joined(&store), 1, "restarts keep the original membership");
+        assert_eq!(
+            stream
+                .requests
+                .lock()
+                .expect("request log")
+                .iter()
+                .map(|request| request.resume_from)
+                .collect::<Vec<_>>(),
+            vec![None, Some(900), Some(900)]
         );
     }
 

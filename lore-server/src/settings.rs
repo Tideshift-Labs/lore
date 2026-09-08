@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::env;
@@ -242,6 +243,9 @@ fn default_enforce_write_permission() -> bool {
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct GrpcSettings {
+    /// Frozen at process startup; required mode rejects undeclared mutations.
+    #[serde(default)]
+    pub caller_capability_policy: crate::grpc::caller_capabilities::CallerCapabilityPolicy,
     /// Whether to start this gRPC endpoint. Defaults to `false`
     #[serde(default)]
     pub enabled: bool,

@@ -50,6 +50,7 @@ pub mod builders;
 pub mod checkpoint;
 pub mod cutover;
 pub mod evaluator;
+pub mod initialization;
 pub mod membership;
 pub mod operator;
 pub mod prune;

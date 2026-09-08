@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -158,6 +159,16 @@ pub async fn handler(
     acceleration: crate::grpc::server::RevisionListAcceleration,
     instruments: &RevisionListInstruments,
 ) -> Result<Response<RevisionListResponse>, Status> {
+    // Reads under required admission must not backfill shared keys or fragments.
+    let acceleration =
+        if crate::grpc::caller_capabilities::read_repairs_allowed(request.extensions()) {
+            acceleration
+        } else {
+            crate::grpc::server::RevisionListAcceleration {
+                step_keys: false,
+                list_cache: false,
+            }
+        };
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
@@ -663,6 +674,7 @@ async fn forward_cursor(
 
 #[cfg(test)]
 mod test {
+    include!("caller_revision_list_tests.rs");
     use std::sync::Arc;
 
     use lore_base::runtime::LORE_CONTEXT;
