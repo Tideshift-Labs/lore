@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! `lore_storage_upload` — push locally-stored, not-yet-durable content to the remote store.
 //!
@@ -136,7 +137,10 @@ async fn upload_local(
                 let store = store.clone();
                 lore_spawn!(
                     tasks,
-                    async move { upload_item(store, item, session).await }
+                    lore_transport::with_optional_caller_operation(
+                        lore_transport::current_caller_operation(),
+                        async move { upload_item(store, item, session).await }
+                    )
                 );
             }
             let codes = crate::storage::drain_codes(tasks).await;

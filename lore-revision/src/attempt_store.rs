@@ -63,6 +63,8 @@ use lore_transport::attempt_store::AttemptState;
 use lore_transport::attempt_store::AttemptStore;
 use lore_transport::attempt_store::LockOwnership;
 use lore_transport::attempt_store::OwnershipToken;
+use lore_transport::caller_operation::CallerRecoveryContext;
+use lore_transport::caller_operation::ManagedAttemptIntent;
 use lore_transport::domain_receipt::DomainReceiptQuery;
 use lore_transport::error::ProtocolError;
 use lore_transport::outcome::AttemptId;
@@ -193,7 +195,7 @@ impl RepositoryAttemptStore {
         // An empty file is the one damaged shape that is safely read as empty: it is what a
         // crash between create and write leaves behind, and it holds nothing that could be lost.
         if bytes.is_empty() {
-            return Ok(StoredDocument::default());
+            return Err(ProtocolError::internal("empty attempt journal is corrupt"));
         }
 
         let Some((version, body)) = bytes.split_first() else {
@@ -356,6 +358,71 @@ fn sync_parent_directory(path: &Path) {
 
 #[async_trait]
 impl AttemptStore for RepositoryAttemptStore {
+    async fn record_managed(
+        &self,
+        record: &AttemptRecord,
+        intent: &ManagedAttemptIntent,
+    ) -> Result<(), ProtocolError> {
+        if intent.version != 1
+            || intent.repository != record.repository
+            || intent.rpc != record.operation
+        {
+            return Err(ProtocolError::internal("managed child identity mismatch"));
+        }
+        let _local = self.write_guard.lock().await;
+        let guard = self.guard().await?;
+        let mut document = self.load(&guard)?;
+        let namespace = ManagedNamespace {
+            repository: intent.repository.to_string(),
+            endpoint: intent.endpoint.clone(),
+            issuer: intent.verified_issuer.clone(),
+            subject: intent.authenticated_subject.clone(),
+            capabilities: intent.caller_capabilities.clone(),
+        };
+        let parent = document
+            .parents
+            .iter_mut()
+            .find(|parent| parent.id == intent.parent_id.to_string())
+            .ok_or_else(|| ProtocolError::internal("managed child has no durable parent"))?;
+        if parent.version != 1
+            || parent.complete
+            || parent
+                .namespace
+                .as_ref()
+                .is_some_and(|old| old != &namespace)
+        {
+            return Err(ProtocolError::internal(
+                "managed parent namespace changed or closed",
+            ));
+        }
+        parent.namespace = Some(namespace);
+        if document
+            .managed
+            .iter()
+            .any(|child| child.attempt == record.attempt_id.to_string())
+        {
+            return Err(ProtocolError::internal(
+                "managed child identity already dispatched",
+            ));
+        }
+        // Older intent-only rows are not upgraded into replayable managed children.
+        if document
+            .attempts
+            .iter()
+            .any(|child| child.attempt_id == record.attempt_id.to_string())
+        {
+            return Err(ProtocolError::internal("attempt identity already exists"));
+        }
+        document.managed.push(StoredManagedIntent {
+            attempt: record.attempt_id.to_string(),
+            parent: intent.parent_id.to_string(),
+            rpc: intent.rpc.clone(),
+            canonical_request: intent.canonical_request.clone(),
+        });
+        document.attempts.push(StoredAttempt::try_from(record)?);
+        self.store(&guard, &document)
+    }
+
     async fn record(&self, record: &AttemptRecord) -> Result<(), ProtocolError> {
         let stored = StoredAttempt::try_from(record)?;
         self.update(|document| {
@@ -543,9 +610,264 @@ pub fn repository_attempt_store(repository: &RepositoryContext) -> Arc<dyn Attem
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct StoredDocument {
     #[serde(default)]
+    parents: Vec<ManagedParent>,
+    #[serde(default)]
+    managed: Vec<StoredManagedIntent>,
+    #[serde(default)]
     attempts: Vec<StoredAttempt>,
     #[serde(default)]
     ownership: Vec<StoredOwnership>,
+}
+
+/// Durable parent identity. A missing namespace means no child was admitted yet.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ManagedParent {
+    pub version: u32,
+    pub id: String,
+    pub root: String,
+    pub operation: String,
+    pub normalized_intent: String,
+    pub namespace: Option<ManagedNamespace>,
+    pub complete: bool,
+    /// Parent uncertainty is independent of every named child receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_uncertainty_code: Option<i32>,
+    /// Recovery cannot infer that the workflow body returned from child settlement.
+    #[serde(default)]
+    pub body_completed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ManagedNamespace {
+    pub repository: String,
+    pub endpoint: String,
+    pub issuer: String,
+    pub subject: String,
+    pub capabilities: String,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+struct StoredManagedIntent {
+    attempt: String,
+    parent: String,
+    rpc: String,
+    canonical_request: Vec<u8>,
+}
+
+impl RepositoryAttemptStore {
+    pub async fn reconcile_parent(&self, parent: Uuid) -> Result<(), ProtocolError> {
+        let document = self.read().await?;
+        if !document
+            .managed
+            .iter()
+            .any(|child| child.parent == parent.to_string())
+        {
+            return Err(ProtocolError::internal(
+                "parent has no positive child settlement evidence",
+            ));
+        }
+        self.finish_parent(parent).await
+    }
+
+    /// Non-RPC steps share the same parent fence. Their stored intent never authorizes replay.
+    pub async fn record_workflow_child(
+        &self,
+        parent: Uuid,
+        attempt: AttemptId,
+        operation: String,
+        canonical_intent: Vec<u8>,
+    ) -> Result<(), ProtocolError> {
+        let _local = self.write_guard.lock().await;
+        let guard = self.guard().await?;
+        let mut document = self.load(&guard)?;
+        if !document
+            .parents
+            .iter()
+            .any(|held| held.id == parent.to_string() && !held.complete)
+            || document
+                .attempts
+                .iter()
+                .any(|held| held.attempt_id == attempt.to_string())
+        {
+            return Err(ProtocolError::internal(
+                "workflow parent missing or child already exists",
+            ));
+        }
+        document.managed.push(StoredManagedIntent {
+            attempt: attempt.to_string(),
+            parent: parent.to_string(),
+            rpc: operation.clone(),
+            canonical_request: canonical_intent,
+        });
+        document
+            .attempts
+            .push(StoredAttempt::try_from(&AttemptRecord {
+                attempt_id: attempt,
+                state: AttemptState::Unresolved,
+                operation,
+                repository: RepositoryId::from([0u8; 16]),
+                recorded_at_unix_millis: now_unix_millis(),
+                receipt: None,
+            })?);
+        self.store(&guard, &document)
+    }
+
+    pub async fn managed_parents(&self) -> Result<Vec<ManagedParent>, ProtocolError> {
+        let document = self.read().await?;
+        if document.parents.iter().any(|parent| parent.version != 1) {
+            return Err(ProtocolError::internal(
+                "unsupported managed parent version",
+            ));
+        }
+        Ok(document.parents)
+    }
+
+    pub async fn mark_parent_uncertain(&self, id: Uuid, code: i32) -> Result<(), ProtocolError> {
+        let _local = self.write_guard.lock().await;
+        let guard = self.guard().await?;
+        let mut document = self.load(&guard)?;
+        let parent = document
+            .parents
+            .iter_mut()
+            .find(|parent| parent.id == id.to_string())
+            .ok_or_else(|| ProtocolError::internal("managed parent is missing"))?;
+        parent.parent_uncertainty_code = Some(code);
+        parent.complete = false;
+        self.store(&guard, &document)
+    }
+
+    pub async fn complete_parent_body(&self, id: Uuid) -> Result<(), ProtocolError> {
+        let _local = self.write_guard.lock().await;
+        let guard = self.guard().await?;
+        let mut document = self.load(&guard)?;
+        let parent = document
+            .parents
+            .iter_mut()
+            .find(|parent| parent.id == id.to_string())
+            .ok_or_else(|| ProtocolError::internal("managed parent is missing"))?;
+        if parent.parent_uncertainty_code.is_some() {
+            return Err(ProtocolError::internal(
+                "parent uncertainty requires independent evidence",
+            ));
+        }
+        parent.body_completed = true;
+        self.store(&guard, &document)
+    }
+
+    pub async fn begin_parent(&self, parent: ManagedParent) -> Result<(), ProtocolError> {
+        let _local = self.write_guard.lock().await;
+        let guard = self.guard().await?;
+        let mut document = self.load(&guard)?;
+        if document
+            .parents
+            .iter()
+            .any(|old| !old.complete || old.id == parent.id)
+            || document
+                .attempts
+                .iter()
+                .any(|child| child.state.is_unresolved())
+        {
+            return Err(ProtocolError::internal(
+                "repository has an unresolved managed workflow",
+            ));
+        }
+        document.parents.push(parent);
+        self.store(&guard, &document)
+    }
+
+    /// Freeze the selected transport namespace before a workflow's local effects.
+    pub async fn bind_parent_namespace(
+        &self,
+        id: Uuid,
+        binding: &CallerRecoveryContext,
+    ) -> Result<(), ProtocolError> {
+        let _local = self.write_guard.lock().await;
+        let guard = self.guard().await?;
+        let mut document = self.load(&guard)?;
+        let namespace = ManagedNamespace {
+            repository: binding.repository.to_string(),
+            endpoint: binding.endpoint.clone(),
+            issuer: binding.verified_issuer.clone(),
+            subject: binding.authenticated_subject.clone(),
+            capabilities: binding.caller_capabilities.clone(),
+        };
+        let parent = document
+            .parents
+            .iter_mut()
+            .find(|parent| parent.id == id.to_string())
+            .ok_or_else(|| ProtocolError::internal("managed parent is missing"))?;
+        if parent.version != 1
+            || parent.complete
+            || parent
+                .namespace
+                .as_ref()
+                .is_some_and(|old| old != &namespace)
+        {
+            return Err(ProtocolError::internal(
+                "managed parent namespace changed or closed",
+            ));
+        }
+        parent.namespace = Some(namespace);
+        self.store(&guard, &document)
+    }
+
+    /// Called only by a live workflow after its future returned. Recovery cannot use zero children
+    /// as proof that an interrupted local operation did not run.
+    pub async fn finish_parent(&self, parent: Uuid) -> Result<(), ProtocolError> {
+        let _local = self.write_guard.lock().await;
+        let guard = self.guard().await?;
+        let mut document = self.load(&guard)?;
+        let id = parent.to_string();
+        if document
+            .attempts
+            .iter()
+            .any(|child| child.state.is_unresolved())
+        {
+            return Err(ProtocolError::internal(
+                "workflow outcome remains unknown; use operation status",
+            ));
+        }
+        let parent = document
+            .parents
+            .iter_mut()
+            .find(|parent| parent.id == id)
+            .ok_or_else(|| ProtocolError::internal("managed parent is missing"))?;
+        if parent.parent_uncertainty_code.is_some() || !parent.body_completed {
+            return Err(ProtocolError::internal(
+                "parent uncertainty requires independent body completion evidence",
+            ));
+        }
+        parent.complete = true;
+        self.store(&guard, &document)
+    }
+
+    pub async fn recovery_context(
+        &self,
+        attempt: &AttemptId,
+    ) -> Result<CallerRecoveryContext, ProtocolError> {
+        let document = self.read().await?;
+        let child = document
+            .managed
+            .iter()
+            .find(|child| child.attempt == attempt.to_string())
+            .ok_or_else(|| ProtocolError::internal("attempt has no managed namespace"))?;
+        let namespace = document
+            .parents
+            .iter()
+            .find(|parent| parent.id == child.parent)
+            .and_then(|parent| parent.namespace.as_ref())
+            .ok_or_else(|| ProtocolError::internal("parent namespace is missing"))?;
+        Ok(CallerRecoveryContext {
+            repository: namespace
+                .repository
+                .parse()
+                .map_err(|_| ProtocolError::internal("invalid repository identity"))?,
+            endpoint: namespace.endpoint.clone(),
+            verified_issuer: namespace.issuer.clone(),
+            authenticated_subject: namespace.subject.clone(),
+            caller_capabilities: namespace.capabilities.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -107,7 +107,7 @@ async fn file_acquire_journalled(
     callback: LoreEventCallback,
     attempts: Option<Arc<dyn AttemptStore>>,
 ) -> i32 {
-    repository_call_read(
+    crate::call::repository_call_mutation_read(
         globals,
         callback,
         args,
@@ -145,7 +145,7 @@ pub async fn file_acquire_as_owner(
     callback: LoreEventCallback,
     owner: LoreString,
 ) -> i32 {
-    repository_call_read(
+    crate::call::repository_call_mutation_read(
         globals,
         callback,
         args,
@@ -375,7 +375,7 @@ async fn file_release_journalled(
     callback: LoreEventCallback,
     attempts: Option<Arc<dyn AttemptStore>>,
 ) -> i32 {
-    repository_call_read(
+    crate::call::repository_call_mutation_read(
         globals,
         callback,
         args,
@@ -409,10 +409,9 @@ mod tests {
     use lore_error_set::FfiError;
     use lore_revision::interface::LoreEventCallbackConfig;
     use lore_transport::VolatileAttemptStore;
-    use serial_test::serial;
 
     use super::*;
-    use crate::call_delegation::tests::RestoreLoreUseService;
+    use crate::call_delegation::tests::service_env_child;
 
     /// The same status shape `crate::call_delegation::reject_call` uses for every other
     /// pre-command rejection, so this refusal cannot be told apart from one of those by a
@@ -438,9 +437,13 @@ mod tests {
     /// refusal ran too late, after the code had already started the operation it exists to
     /// prevent.
     #[test]
-    #[serial(lore_use_service)]
     fn file_acquire_with_attempt_store_refuses_when_delegation_is_requested() {
-        let _restore = RestoreLoreUseService::set("1");
+        if !service_env_child(
+            "lock::tests::file_acquire_with_attempt_store_refuses_when_delegation_is_requested",
+            &[Some("1")],
+        ) {
+            return;
+        }
 
         let globals = LoreGlobalArgs {
             repository_path: LoreString::from_str(
@@ -484,9 +487,13 @@ mod tests {
     /// tells the two apart, and the store assertion is what proves the refusal ran before the
     /// release ever touched anything.
     #[test]
-    #[serial(lore_use_service)]
     fn file_release_with_attempt_store_refuses_when_delegation_is_requested() {
-        let _restore = RestoreLoreUseService::set("1");
+        if !service_env_child(
+            "lock::tests::file_release_with_attempt_store_refuses_when_delegation_is_requested",
+            &[Some("1")],
+        ) {
+            return;
+        }
 
         let globals = LoreGlobalArgs {
             repository_path: LoreString::from_str(

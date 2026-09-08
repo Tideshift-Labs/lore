@@ -1285,6 +1285,19 @@ impl Connection {
         Ok(lock)
     }
 
+    /// Rebuild a fixture's eagerly opened lock service after selecting supplied credentials.
+    /// The replacement uses the normal protocol/auth constructor and dispatch path.
+    #[cfg(feature = "test_seams")]
+    pub async fn rebuild_lock_after_fixture_credentials(
+        self: &Arc<Self>,
+        repository: RepositoryId,
+    ) -> Result<(), ProtocolError> {
+        self.ensure_lock_connected().await?;
+        self.lock.remove(&repository);
+        self.lock(repository).await?;
+        Ok(())
+    }
+
     pub async fn connect_module(&self, module: RepositoryId) -> Result<Arc<Self>, ProtocolError> {
         // TODO(vri): UCS-19226 - Links: Connection reuse for already connected links
         let (identity_token, access_token) = self.credentials.tokens();

@@ -366,36 +366,40 @@ pub async fn acquire(
         // that makes a push's several dispatches take several ids. Only the choice of the VALUE
         // moves out here; the scope it is entered in stays inside the task below.
         let batch_attempt = AttemptId::new();
-        let handle = lore_spawn!(batches, async move {
-            let connection = remote
-                .lock(repository_id)
+        let caller_operation = lore_transport::current_caller_operation();
+        let handle = lore_spawn!(
+            batches,
+            lore_transport::with_optional_caller_operation(caller_operation, async move {
+                let connection = remote
+                    .lock(repository_id)
+                    .await
+                    .forward_with::<AcquireError, _>(|| {
+                        format!("Failed to connect to remote {}", remote.remote_url())
+                    })?;
+
+                // Entered inside the spawned task, and that placement is load-bearing. `lore_spawn!`
+                // re-scopes `LORE_CONTEXT` and nothing else, so the attempt task-local does not cross
+                // the spawn: a scope opened around this loop would be invisible in here, and the
+                // caller's store would record none of the batches' attempts.
+                let response = under_named_attempt(
+                    attempts.as_ref(),
+                    batch_attempt,
+                    repository_id,
+                    GrpcRpc::LockLock,
+                    connection.lock(&batch_resources, owner.as_deref()),
+                )
                 .await
-                .forward_with::<AcquireError, _>(|| {
-                    format!("Failed to connect to remote {}", remote.remote_url())
-                })?;
+                .forward::<AcquireError>("Failed to acquire the lock")?;
 
-            // Entered inside the spawned task, and that placement is load-bearing. `lore_spawn!`
-            // re-scopes `LORE_CONTEXT` and nothing else, so the attempt task-local does not cross
-            // the spawn: a scope opened around this loop would be invisible in here, and the
-            // caller's store would record none of the batches' attempts.
-            let response = under_named_attempt(
-                attempts.as_ref(),
-                batch_attempt,
-                repository_id,
-                GrpcRpc::LockLock,
-                connection.lock(&batch_resources, owner.as_deref()),
-            )
-            .await
-            .forward::<AcquireError>("Failed to acquire the lock")?;
+                // Recorded inside the batch task, before this batch is reported as successful, and
+                // deliberately not after the join. A partial acquire rolls back by *releasing* what
+                // succeeded, and that release needs these tokens; a store written after the join
+                // would be written after the rollback had already tried to run without them.
+                record_batch_ownership(&ownership, &response).await?;
 
-            // Recorded inside the batch task, before this batch is reported as successful, and
-            // deliberately not after the join. A partial acquire rolls back by *releasing* what
-            // succeeded, and that release needs these tokens; a store written after the join
-            // would be written after the rollback had already tried to run without them.
-            record_batch_ownership(&ownership, &response).await?;
-
-            Ok(response)
-        });
+                Ok(response)
+            })
+        );
         batch_attempts.insert(handle.id(), batch_attempt);
     }
 

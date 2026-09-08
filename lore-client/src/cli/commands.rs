@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 pub mod auth;
 pub mod branch;
@@ -9,6 +10,7 @@ pub mod link;
 pub mod lock;
 pub mod logfile;
 pub mod notification;
+pub mod operation;
 pub mod repository;
 pub mod revision;
 pub mod service;

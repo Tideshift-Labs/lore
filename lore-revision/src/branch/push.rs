@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::pin::Pin;
 use std::sync::Arc;
@@ -31,6 +32,7 @@ use crate::event::EventError;
 use crate::fragment;
 use crate::history;
 use crate::immutable;
+use crate::immutable::ImmutableError;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::layer;
@@ -1266,9 +1268,9 @@ async fn duplicate_association(
     repository: &Arc<RepositoryContext>,
     storage: &Arc<StorageSession>,
     address: Address,
-) -> bool {
+) -> Result<bool, ProtocolError> {
     if !storage.can_copy_from(repository.id).await {
-        return false;
+        return Ok(false);
     }
     if let Err(err) = storage
         .copy(
@@ -1278,8 +1280,11 @@ async fn duplicate_association(
         )
         .await
     {
+        if err.is_outcome_unknown() {
+            return Err(err);
+        }
         lore_debug!("Copy of {address} refused ({err:?}), uploading instead");
-        return false;
+        return Ok(false);
     }
 
     if let Ok(data) = repository
@@ -1290,11 +1295,22 @@ async fn duplicate_association(
     {
         mark_durable(repository, address, data.fragment).await;
     }
-    true
+    Ok(true)
 }
 
 /// Register every fragment the peer is missing, transferring a payload only where it has no
 /// association to duplicate.
+fn prefer_unknown(first: Option<PushError>, next: Option<PushError>) -> Option<PushError> {
+    if next
+        .as_ref()
+        .is_some_and(|error| error.is_outcome_unknown())
+    {
+        next
+    } else {
+        first.or(next)
+    }
+}
+
 pub(crate) async fn push_fragments(
     repository: Arc<RepositoryContext>,
     storage: Arc<StorageSession>,
@@ -1332,57 +1348,78 @@ pub(crate) async fn push_fragments(
         let repository = repository.clone();
         let storage = storage.clone();
         let stats = stats.clone();
-        lore_spawn!(tasks, async move {
-            if duplicable && duplicate_association(&repository, &storage, address).await {
-                stats.fragment_complete.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
+        let caller_operation = lore_transport::current_caller_operation();
+        lore_spawn!(
+            tasks,
+            lore_transport::with_optional_caller_operation(caller_operation, async move {
+                if duplicable
+                    && duplicate_association(&repository, &storage, address)
+                        .await
+                        .forward::<PushError>("duplicating association")?
+                {
+                    stats.fragment_complete.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
 
-            let (fragment, payload) = immutable::load_raw_store_retry(
-                repository.immutable_store(),
-                repository.id,
-                address,
-            )
-            .await
-            .forward::<PushError>("loading fragment payload")?;
+                let (fragment, payload) = immutable::load_raw_store_retry(
+                    repository.immutable_store(),
+                    repository.id,
+                    address,
+                )
+                .await
+                .forward::<PushError>("loading fragment payload")?;
 
-            let payload_size = payload.len() as u64;
-            stats.bytes_total.fetch_add(payload_size, Ordering::Relaxed);
+                let payload_size = payload.len() as u64;
+                stats.bytes_total.fetch_add(payload_size, Ordering::Relaxed);
 
-            immutable::store_raw_remote_retry(storage.clone(), address, fragment, Some(payload))
+                immutable::store_raw_remote_retry(
+                    storage.clone(),
+                    address,
+                    fragment,
+                    Some(payload),
+                )
                 .await
                 .map_err(|err| {
-                    if err.is_disconnected() {
+                    if let ImmutableError::OutcomeUnknown(unknown) = err {
+                        PushError::from(OutcomeUnknown::clone(&unknown))
+                    } else if err.is_disconnected() {
                         PushError::from(Disconnected)
                     } else {
                         PushError::internal_with_context(err, "putting fragment to remote")
                     }
                 })?;
 
-            stats
-                .bytes_transferred
-                .fetch_add(payload_size, Ordering::Relaxed);
+                stats
+                    .bytes_transferred
+                    .fetch_add(payload_size, Ordering::Relaxed);
 
-            mark_durable(&repository, address, fragment).await;
+                mark_durable(&repository, address, fragment).await;
 
-            stats.fragment_complete.fetch_add(1, Ordering::Relaxed);
+                stats.fragment_complete.fetch_add(1, Ordering::Relaxed);
 
-            Ok(())
-        });
+                Ok(())
+            })
+        );
 
         while let Some(result) = tasks.try_join_next() {
-            failure = failure.or(result
-                .map_err(|e| PushError::internal_with_context(e, "fragment task panicked"))
-                .flatten()
-                .err());
+            failure = prefer_unknown(
+                failure,
+                result
+                    .map_err(|e| PushError::internal_with_context(e, "fragment task panicked"))
+                    .flatten()
+                    .err(),
+            );
         }
         while tasks.len() > MAX_PARALLEL_PUT
             && let Some(result) = tasks.join_next().await
         {
-            failure = failure.or(result
-                .map_err(|e| PushError::internal_with_context(e, "fragment task panicked"))
-                .flatten()
-                .err());
+            failure = prefer_unknown(
+                failure,
+                result
+                    .map_err(|e| PushError::internal_with_context(e, "fragment task panicked"))
+                    .flatten()
+                    .err(),
+            );
         }
         if failure.is_some() {
             break;
@@ -1390,10 +1427,13 @@ pub(crate) async fn push_fragments(
     }
 
     while let Some(result) = tasks.join_next().await {
-        failure = failure.or(result
-            .map_err(|e| PushError::internal_with_context(e, "fragment task panicked"))
-            .flatten()
-            .err());
+        failure = prefer_unknown(
+            failure,
+            result
+                .map_err(|e| PushError::internal_with_context(e, "fragment task panicked"))
+                .flatten()
+                .err(),
+        );
     }
 
     if let Some(err) = failure {

@@ -358,10 +358,11 @@ pub(crate) async fn stage_filesystem_path(
     };
 
     let force = execution_context().globals().force();
-    if !force
-        && repository
-            .filter
-            .emit_excludes(&full_relative_path, true, FilterMode::Full)
+    if crate::repository_fence::is_workflow_path(full_relative_path.as_str())
+        || !force
+            && repository
+                .filter
+                .emit_excludes(&full_relative_path, true, FilterMode::Full)
     {
         lore_trace!("Path excluded by filter: {}", full_relative_path.as_str());
         return Ok(NodeLink::invalid());
@@ -648,10 +649,11 @@ pub(crate) async fn stage_single_node(
     );
 
     let force = execution_context().globals().force();
-    if !force
-        && repository
-            .filter
-            .emit_excludes(&relative_path, true, filter_mode)
+    if crate::repository_fence::is_workflow_path(relative_path.as_str())
+        || !force
+            && repository
+                .filter
+                .emit_excludes(&relative_path, true, filter_mode)
     {
         lore_trace!("Path excluded by filter: {}", relative_path.as_str());
         return Ok(NodeLink::invalid());
@@ -1774,10 +1776,11 @@ pub(crate) async fn stage_node_from_metadata(
 
     let force = execution_context().globals().force();
     let filter_path = base_relative_path.join(name.as_str());
-    if !force
-        && repository
-            .filter
-            .emit_excludes(&filter_path, true, FilterMode::Full)
+    if crate::repository_fence::is_workflow_path(filter_path.as_str())
+        || !force
+            && repository
+                .filter
+                .emit_excludes(&filter_path, true, FilterMode::Full)
     {
         lore_trace!("Node excluded by filter: {}", filter_path.as_str());
         return Ok(NodeLink::invalid());

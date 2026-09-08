@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use clap::Parser;
 use clap::Subcommand;
@@ -200,6 +201,8 @@ pub fn output_formatter() -> Option<LoreEventCallback> {
 
 #[derive(Subcommand)]
 pub enum LoreCommands {
+    /// Inspect and reconcile managed write workflows.
+    Operation(operation::OperationArgs),
     /// Repository commands
     Repository(repository::RepositoryArgs),
 
@@ -311,6 +314,7 @@ pub enum LoreCommands {
 
 pub fn handle_lore_commands(cmd: &LoreCommands, globals: LoreGlobalArgs) -> u8 {
     match cmd {
+        LoreCommands::Operation(args) => operation::handle(globals, args),
         LoreCommands::Repository(sub_cmd) => {
             repository::handle_repository_commands(&sub_cmd.command, globals)
         }

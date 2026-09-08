@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::path::Path;
 use std::sync::Arc;
@@ -443,6 +444,7 @@ async fn remote_put_retry(
 ///
 /// When `tracker` is `None`, the work runs inline (backward-compatible
 /// synchronous behavior).
+/// Managed remote writes also run inline, preserving their own caller scope and outcome.
 ///
 /// `permit` is the caller-held memory permit associated with `buffer`. If a
 /// leader is spawned, the permit moves into the leader task; if the call
@@ -482,6 +484,16 @@ pub async fn store_fragment(
     }
 
     let observer = tracker.clone();
+    // Managed uploads must retain their caller scope and report their own outcome. The
+    // shared in-flight map cannot attribute a follower to a parent or credential namespace.
+    // Run these writes inline so readers also cannot race a background write we do not track.
+    let tracker = if remote_session.is_some()
+        && lore_transport::caller_operation::current_caller_operation().is_some()
+    {
+        None
+    } else {
+        tracker
+    };
     let result = match tracker {
         None => {
             store_fragment_inline(
@@ -545,6 +557,7 @@ fn observed_fragment(fragment: Fragment, result: &StoreResult) -> Fragment {
 /// one wire call), which is moot for pure-local writes. Concurrent local writers may briefly
 /// do duplicate compression work, but the bucket-level write is content-addressed and
 /// idempotent. Items with no remote consult must not enter the dedup tracker.
+/// Managed writes also bypass shared in-flight dedup: its key has no caller identity.
 #[allow(clippy::too_many_arguments)]
 async fn store_fragment_inline(
     store: Arc<dyn ImmutableStore>,
@@ -578,9 +591,12 @@ async fn store_fragment_inline(
         });
     }
 
-    // Local-only fast path: skip STORE_IN_FLIGHT entirely. No follower notification needed,
-    // no leader-token rendezvous — just compress+write inline.
-    if remote_session.is_none() || publish.is_some() {
+    // Managed writes cannot borrow another caller's upload or journal entry. Publication
+    // and local-only writes also run without a shared leader-token rendezvous.
+    if remote_session.is_none()
+        || publish.is_some()
+        || lore_transport::caller_operation::current_caller_operation().is_some()
+    {
         let placement = leader_body(
             store,
             partition,
@@ -794,14 +810,14 @@ async fn copy_association(
     session: &Arc<StorageSession>,
     source: CopySource,
     address: Address,
-) -> bool {
+) -> Result<bool, StorageError> {
     if !session.can_copy_from(source.partition).await {
         lore_base::lore_trace!(
             "No claim to partition {} to copy {} from, uploading instead",
             source.partition,
             address.hash
         );
-        return false;
+        return Ok(false);
     }
 
     match session
@@ -815,15 +831,21 @@ async fn copy_association(
                 address,
                 source.partition
             );
-            true
+            Ok(true)
         }
         Err(err) => {
+            if lore_transport::caller_operation::current_caller_operation().is_some() {
+                return Err(crate::error::protocol_error_to_storage(err, address));
+            }
+            if let lore_transport::ProtocolError::OutcomeUnknown(unknown) = err {
+                return Err(lore_base::error::OutcomeUnknown::clone(&unknown).into());
+            }
             lore_base::lore_trace!(
                 "Copy of {} from partition {} refused ({err:?}), uploading instead",
                 address,
                 source.partition
             );
-            false
+            Ok(false)
         }
     }
 }
@@ -890,7 +912,7 @@ async fn leader_body(
         && let Some(session) = remote_session.as_ref()
         && let Some(source) = copy_source(&query, address)
     {
-        stored_durable = copy_association(session, source, address).await;
+        stored_durable = copy_association(session, source, address).await?;
     }
 
     let payload_wanted = !stored_durable || cache_local;
@@ -941,23 +963,22 @@ async fn leader_body(
 
     // Remote upload if session provided and not already durable
     if !stored_durable && let Some(session) = remote_session.clone() {
-        stored_durable = match publish {
+        let result = match publish {
             Some(key) => {
-                published = remote_put_resolved_retry(
-                    session,
-                    key,
-                    address,
-                    fragment,
-                    Some(buffer.clone()),
-                )
-                .await
-                .is_ok();
-                published
+                remote_put_resolved_retry(session, key, address, fragment, Some(buffer.clone()))
+                    .await
             }
-            None => remote_put_retry(session, address, fragment, Some(buffer.clone()))
-                .await
-                .is_ok(),
+            None => remote_put_retry(session, address, fragment, Some(buffer.clone())).await,
         };
+        // A managed parent cannot complete from a local fallback after its remote intent
+        // failed to journal, dispatch, or settle. Preserve the caller's exact failure.
+        stored_durable = if lore_transport::caller_operation::current_caller_operation().is_some() {
+            result?;
+            true
+        } else {
+            result.is_ok()
+        };
+        published = publish.is_some() && stored_durable;
     }
 
     if stored_durable {

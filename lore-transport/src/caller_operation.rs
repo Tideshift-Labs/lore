@@ -1,0 +1,358 @@
+// Copyright 2026 Khurram Virani
+// SPDX-License-Identifier: MIT
+//! Explicit managed product adoption, scoped to one durable parent operation.
+
+use std::future::Future;
+use std::sync::Arc;
+
+use lore_base::types::RepositoryId;
+use uuid::Uuid;
+
+use crate::ProtocolError;
+use crate::attempt_store::AttemptRecord;
+use crate::attempt_store::AttemptResolution;
+use crate::attempt_store::AttemptState;
+use crate::attempt_store::AttemptStore;
+use crate::outcome::AttemptId;
+use crate::outcome::GrpcRpc;
+use crate::outcome::OUTCOME_UNKNOWN_CAPABILITY_V1;
+
+pub const CALLER_CAPABILITIES_METADATA_KEY: &str = "lore-caller-capabilities-v1";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallerRecoveryContext {
+    pub repository: RepositoryId,
+    pub endpoint: String,
+    pub verified_issuer: String,
+    pub authenticated_subject: String,
+    pub caller_capabilities: String,
+}
+
+/// Read the exact repository credential selection without declaring or dispatching a mutation.
+/// The signature remains verified by the peer; this snapshot binds subsequent dispatches.
+pub async fn selected_caller_namespace(
+    connection: &Arc<crate::connection::Connection>,
+    repository: RepositoryId,
+) -> Result<CallerRecoveryContext, ProtocolError> {
+    if !matches!(connection.remote_url.scheme(), "grpc" | "grpcs") {
+        return Err(ProtocolError::internal(
+            "managed namespace binding requires gRPC",
+        ));
+    }
+    let grpc = crate::grpc::connect(
+        Arc::downgrade(connection),
+        connection.remote_url.as_str(),
+        true,
+    )
+    .await?;
+    let auth = grpc
+        .repository_authz(
+            &connection.auth_url,
+            &connection.identity,
+            repository,
+            connection.credentials(),
+        )
+        .await;
+    let authorization = crate::grpc::authorization_snapshot(&auth);
+    let claims = lore_credential::insecure_decode_token(&authorization)
+        .map_err(|_| ProtocolError::internal("selected credential namespace is unavailable"))?
+        .claims;
+    if claims.issuer.is_empty() || claims.user_id.is_empty() {
+        return Err(ProtocolError::internal(
+            "selected credential namespace is incomplete",
+        ));
+    }
+    Ok(CallerRecoveryContext {
+        repository,
+        endpoint: canonical_endpoint(grpc.selected_endpoint())?,
+        verified_issuer: claims.issuer,
+        authenticated_subject: claims.user_id,
+        caller_capabilities: OUTCOME_UNKNOWN_CAPABILITY_V1.to_owned(),
+    })
+}
+
+pub fn with_caller_recovery<F: Future>(
+    context: CallerRecoveryContext,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    CALLER_RECOVERY.scope(context, future)
+}
+
+pub(crate) fn current_caller_recovery() -> Option<CallerRecoveryContext> {
+    CALLER_RECOVERY.try_with(Clone::clone).ok()
+}
+
+pub(crate) fn canonical_endpoint(endpoint: &str) -> Result<String, ProtocolError> {
+    let mut url = url::Url::parse(endpoint)
+        .map_err(|_| ProtocolError::internal("invalid managed endpoint"))?;
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+/// Versioned, nonsecret canonical request binding persisted atomically with the child record.
+/// Canonical protobuf bytes exclude authentication, but retain protected ownership preconditions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedAttemptIntent {
+    pub version: u32,
+    pub parent_id: Uuid,
+    pub repository: RepositoryId,
+    pub rpc: String,
+    pub canonical_request: Vec<u8>,
+    pub endpoint: String,
+    /// Issuer claimed by the exact credential sent; the server verifies the signature.
+    pub verified_issuer: String,
+    pub authenticated_subject: String,
+    pub caller_capabilities: String,
+}
+
+/// Construct only at a managed product boundary whose journal belongs to this parent.
+/// A store by itself never declares adoption. No connection or session owns this context.
+#[derive(Clone)]
+pub struct CallerOperationContext {
+    parent_id: Uuid,
+    repository: RepositoryId,
+    attempts: Arc<dyn AttemptStore>,
+    binding: Arc<parking_lot::Mutex<Option<CallerRecoveryContext>>>,
+    latest_attempt: Arc<parking_lot::Mutex<Option<AttemptId>>>,
+}
+
+impl CallerOperationContext {
+    pub fn new(parent_id: Uuid, repository: RepositoryId, attempts: Arc<dyn AttemptStore>) -> Self {
+        Self {
+            parent_id,
+            repository,
+            attempts,
+            binding: Arc::new(parking_lot::Mutex::new(None)),
+            latest_attempt: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    pub fn parent_id(&self) -> Uuid {
+        self.parent_id
+    }
+    pub fn repository(&self) -> RepositoryId {
+        self.repository
+    }
+    pub fn attempts(&self) -> &Arc<dyn AttemptStore> {
+        &self.attempts
+    }
+    pub fn capabilities(&self) -> &'static str {
+        OUTCOME_UNKNOWN_CAPABILITY_V1
+    }
+    pub fn latest_attempt(&self) -> Option<AttemptId> {
+        *self.latest_attempt.lock()
+    }
+}
+
+tokio::task_local! {
+    static CALLER_OPERATION: Option<CallerOperationContext>;
+    static MANAGED_CALLER: (Uuid, Arc<dyn AttemptStore>);
+    static TRANSPORT_ENDPOINT: String;
+    static DISPATCH_AUTHORIZATION: String;
+    static CALLER_RECOVERY: CallerRecoveryContext;
+}
+
+pub(crate) fn with_transport_endpoint<F: Future>(
+    endpoint: String,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    TRANSPORT_ENDPOINT.scope(endpoint, future)
+}
+
+pub(crate) fn current_transport_endpoint() -> String {
+    TRANSPORT_ENDPOINT
+        .try_with(Clone::clone)
+        .unwrap_or_default()
+}
+
+pub(crate) fn current_dispatch_authorization() -> Option<String> {
+    DISPATCH_AUTHORIZATION.try_with(Clone::clone).ok()
+}
+
+/// Explicit adoption boundary for callers that have not opened the repository yet.
+/// Lore binds the actual repository id before invoking its command.
+pub fn with_managed_caller<F: Future>(
+    parent_id: Uuid,
+    attempts: Arc<dyn AttemptStore>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    MANAGED_CALLER.scope((parent_id, attempts), future)
+}
+
+pub fn caller_operation_for_repository(repository: RepositoryId) -> Option<CallerOperationContext> {
+    current_caller_operation().or_else(|| {
+        MANAGED_CALLER
+            .try_with(|(parent_id, attempts)| {
+                CallerOperationContext::new(*parent_id, repository, attempts.clone())
+            })
+            .ok()
+    })
+}
+
+pub fn current_caller_operation() -> Option<CallerOperationContext> {
+    CALLER_OPERATION.try_with(Clone::clone).ok().flatten()
+}
+
+/// A managed promise exists even before Lore has opened the repository.
+pub fn has_managed_caller() -> bool {
+    current_caller_operation().is_some() || MANAGED_CALLER.try_with(|_| ()).is_ok()
+}
+
+pub fn with_caller_operation<F: Future>(
+    context: CallerOperationContext,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    Box::pin(CALLER_OPERATION.scope(Some(context), future))
+}
+
+/// Capture before spawning, then enter inside the spawned task. `None` clears an outer scope.
+pub fn with_optional_caller_operation<F: Future>(
+    context: Option<CallerOperationContext>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    Box::pin(CALLER_OPERATION.scope(context, future))
+}
+
+pub(crate) async fn record(
+    context: &CallerOperationContext,
+    attempt: AttemptId,
+    rpc: GrpcRpc,
+    canonical_request: Vec<u8>,
+    endpoint: String,
+    authorization: &str,
+) -> Result<(), ProtocolError> {
+    let claims = lore_credential::insecure_decode_token(authorization)
+        .map_err(|_| ProtocolError::internal("managed dispatch cannot bind credential namespace"))?
+        .claims;
+    if endpoint.is_empty() || claims.issuer.is_empty() || claims.user_id.is_empty() {
+        return Err(ProtocolError::internal(
+            "managed dispatch namespace is incomplete",
+        ));
+    }
+    let endpoint = canonical_endpoint(&endpoint)?;
+    let binding = CallerRecoveryContext {
+        repository: context.repository,
+        endpoint: endpoint.clone(),
+        verified_issuer: claims.issuer.clone(),
+        authenticated_subject: claims.user_id.clone(),
+        caller_capabilities: context.capabilities().to_owned(),
+    };
+    {
+        let mut existing = context.binding.lock();
+        if existing
+            .as_ref()
+            .is_some_and(|existing| existing != &binding)
+        {
+            return Err(ProtocolError::internal(
+                "managed parent credential namespace changed",
+            ));
+        }
+        *existing = Some(binding);
+    }
+    let recorded_at_unix_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        });
+    context
+        .attempts
+        .record_managed(
+            &AttemptRecord {
+                attempt_id: attempt,
+                state: AttemptState::Unresolved,
+                operation: rpc.wire_name().to_owned(),
+                repository: context.repository,
+                recorded_at_unix_millis,
+                receipt: None,
+            },
+            &ManagedAttemptIntent {
+                version: 1,
+                parent_id: context.parent_id,
+                repository: context.repository,
+                rpc: rpc.wire_name().to_owned(),
+                canonical_request,
+                endpoint,
+                verified_issuer: claims.issuer,
+                authenticated_subject: claims.user_id,
+                caller_capabilities: context.capabilities().to_owned(),
+            },
+        )
+        .await?;
+    *context.latest_attempt.lock() = Some(attempt);
+    Ok(())
+}
+
+pub(crate) async fn settle<T>(
+    context: &CallerOperationContext,
+    attempt: AttemptId,
+    result: &Result<T, ProtocolError>,
+) -> Result<(), ProtocolError> {
+    let resolution = match result {
+        Ok(_) => AttemptResolution::Applied,
+        Err(error) if error.is_outcome_unknown() => return Ok(()),
+        Err(_) => AttemptResolution::NotApplied,
+    };
+    context
+        .attempts
+        .resolve(&attempt, resolution)
+        .await
+        .map_err(|_| crate::outcome::outcome_unknown("journal settlement", &attempt))
+}
+
+/// The request producer supplies canonical nonsecret intent; no interceptor manufactures it.
+pub(crate) async fn dispatch<T, F: Future<Output = Result<T, ProtocolError>>>(
+    repository: RepositoryId,
+    rpc: GrpcRpc,
+    canonical_request: Vec<u8>,
+    endpoint: String,
+    authorization: String,
+    future: F,
+) -> Result<T, ProtocolError> {
+    let Some(context) = current_caller_operation() else {
+        return future.await;
+    };
+    if repository != context.repository {
+        return Err(ProtocolError::internal(
+            "managed operation repository mismatch",
+        ));
+    }
+    let attempt = match rpc {
+        GrpcRpc::StoragePut
+        | GrpcRpc::StoragePutResolved
+        | GrpcRpc::StorageCopy
+        | GrpcRpc::StorageVerify
+        | GrpcRpc::StorageMutableStore
+        | GrpcRpc::StorageMutableCompareAndSwap => AttemptId::new(),
+        _ => crate::outcome::current_dispatch_attempt().unwrap_or_else(AttemptId::new),
+    };
+    record(
+        &context,
+        attempt,
+        rpc,
+        canonical_request,
+        endpoint,
+        &authorization,
+    )
+    .await?;
+    let result = DISPATCH_AUTHORIZATION
+        .scope(
+            authorization,
+            crate::outcome::with_dispatch_attempt(attempt, future),
+        )
+        .await;
+    let result = match result {
+        Err(error)
+            if error.is_outcome_unknown()
+                || error.is_disconnected()
+                || crate::error::answer_lost_code(&error).is_some() =>
+        {
+            Err(crate::outcome::outcome_unknown(rpc.wire_name(), &attempt))
+        }
+        result => result,
+    };
+    settle(&context, attempt, &result).await?;
+    result
+}

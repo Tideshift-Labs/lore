@@ -13,6 +13,31 @@ use thiserror::Error;
 #[error("Connection replaced; session must be rebound before this command is sent again")]
 pub(crate) struct SessionRebindRequired;
 
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("unsupported client capability")]
+pub struct UnsupportedClientCapability;
+
+pub fn is_unsupported_client(error: &ProtocolError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if source
+            .downcast_ref::<UnsupportedClientCapability>()
+            .is_some()
+        {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
+pub fn is_unsupported_client_status(status: &tonic::Status) -> bool {
+    let mut values = status.metadata().get_all("lore-client-admission-v1").iter();
+    status.code() == tonic::Code::FailedPrecondition
+        && values.next().and_then(|value| value.to_str().ok()) == Some("unsupported-client")
+        && values.next().is_none()
+}
+
 /// Typed proof that a status describes the *call* failing rather than the server refusing.
 ///
 /// The exact counterpart of [`SessionRebindRequired`], one step further along: that marker says
@@ -260,6 +285,12 @@ pub(crate) fn is_session_rebind_required(error: &ProtocolError) -> bool {
 
 impl From<tonic::Status> for ProtocolError {
     fn from(value: tonic::Status) -> Self {
+        if is_unsupported_client_status(&value) {
+            return Self::internal_with_context(
+                UnsupportedClientCapability,
+                "client admission refused before dispatch",
+            );
+        }
         // Checked once, before any branch on the code, for the reason the QUIC classifier
         // checks its own orthogonal property once: a per-arm check is a promise every future
         // arm has to remember to repeat, and arms do not.

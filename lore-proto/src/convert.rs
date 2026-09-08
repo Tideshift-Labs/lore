@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use lore_base::types::Address;
 use lore_base::types::BranchId;
@@ -388,24 +389,45 @@ impl crate::lore::model::v1::ItemStatus {
         Self {
             code: i32::from(tonic::Code::Ok) as u32,
             message: String::new(),
+            outcome_unknown_version: 0,
+            outcome_unknown_operation: String::new(),
+            outcome_unknown_attempt: String::new(),
         }
     }
 
     pub fn is_ok(&self) -> bool {
-        self.code == i32::from(tonic::Code::Ok) as u32
+        !self.has_outcome_unknown() && self.code == i32::from(tonic::Code::Ok) as u32
+    }
+
+    /// Unsupported or incomplete uncertainty markers still forbid a decisive verdict.
+    pub fn has_outcome_unknown(&self) -> bool {
+        self.outcome_unknown_version != 0
+            || !self.outcome_unknown_operation.is_empty()
+            || !self.outcome_unknown_attempt.is_empty()
     }
 }
 
 /// Streaming storage handlers build a per-item failure as a `tonic::Status` — that
 /// keeps the existing `MessageHandleError` mapping and server-error logging intact —
-/// then convert here to put it on the wire in-band. `details` and metadata are
-/// dropped deliberately: the address that used to be smuggled through `details` is
-/// now a field on the response message itself.
+/// then convert here to put it on the wire in-band. Only the semantic uncertainty
+/// marker is retained; addresses and request correlation live on the response.
 impl From<&tonic::Status> for crate::lore::model::v1::ItemStatus {
     fn from(status: &tonic::Status) -> Self {
+        let text = |key: &str| {
+            status
+                .metadata()
+                .get(key)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let marker = status.metadata().contains_key("lore-outcome-unknown");
         Self {
             code: i32::from(status.code()) as u32,
             message: status.message().to_string(),
+            outcome_unknown_version: if marker { 1 } else { 0 },
+            outcome_unknown_operation: text("lore-outcome-unknown-operation"),
+            outcome_unknown_attempt: text("lore-outcome-unknown-attempt"),
         }
     }
 }
@@ -415,6 +437,30 @@ impl From<&tonic::Status> for crate::lore::model::v1::ItemStatus {
 /// logging and metrics on the server. An unrecognised code decodes to `Code::Unknown`.
 impl From<&crate::lore::model::v1::ItemStatus> for tonic::Status {
     fn from(item: &crate::lore::model::v1::ItemStatus) -> Self {
-        tonic::Status::new(tonic::Code::from(item.code as i32), item.message.clone())
+        let mut status =
+            tonic::Status::new(tonic::Code::from(item.code as i32), item.message.clone());
+        if item.has_outcome_unknown() {
+            status.metadata_mut().insert(
+                "lore-outcome-unknown",
+                tonic::metadata::MetadataValue::from_static("v1"),
+            );
+            for (key, value) in [
+                (
+                    "lore-outcome-unknown-operation",
+                    &item.outcome_unknown_operation,
+                ),
+                (
+                    "lore-outcome-unknown-attempt",
+                    &item.outcome_unknown_attempt,
+                ),
+            ] {
+                if !value.is_empty()
+                    && let Ok(value) = value.parse()
+                {
+                    status.metadata_mut().insert(key, value);
+                }
+            }
+        }
+        status
     }
 }

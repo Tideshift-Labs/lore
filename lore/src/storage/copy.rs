@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! `lore_storage_copy` — copy content between `(partition, context)` tuples in the same store.
 //!
@@ -166,9 +167,9 @@ async fn copy_local(
                 let session =
                     reuse.session_for(&store, item.target_partition, !effective.no_remote);
                 let store = store.clone();
-                lore_spawn!(tasks, async move {
+                lore_spawn!(tasks, lore_transport::with_optional_caller_operation(lore_transport::current_caller_operation(), async move {
                     copy_item(store, item, effective, session).await
-                });
+                }));
             }
             let mut codes: Vec<LoreErrorCode> = Vec::with_capacity(total);
             let mut local_mirror_errors = 0usize;

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 
 //! Offline pins for the WP-114 CD-3 typed cell-authority client and its dispatch-runtime pool.
@@ -1779,6 +1780,63 @@ fn test_budget(dispatch_pool_max: u32) -> DispatchConnectionBudget {
 // Source-dark boundary
 // ------------------------------------------------------------------------------------------
 
+fn bounded_maintenance_cli_pool(source: &str) -> bool {
+    if source.matches("DispatchRuntimePool::new(").count() != 1 {
+        return false;
+    }
+    let Some(config) = source
+        .split("DispatchRuntimePool::new(DispatchPoolConfig {")
+        .nth(1)
+        .and_then(|tail| tail.split("})").next())
+    else {
+        return false;
+    };
+    [
+        "role: DispatchPoolRole::Maintenance,",
+        "pool_max: 1,",
+        "connect_timeout: Duration::from_secs(10),",
+        "acquire_timeout: Duration::from_secs(10),",
+        "statement_timeout: Duration::from_secs(10),",
+        "lock_timeout: Duration::from_secs(2),",
+    ]
+    .iter()
+    .all(|required| config.contains(required))
+        && source.contains("Duration::from_secs(30)")
+        && !source.contains("DispatchRuntimeClient")
+        && !source.contains("DispatchMaintenanceClient")
+}
+
+#[test]
+fn maintenance_cli_pool_exception_rejects_another_constructor_or_unbounded_configuration() {
+    let source = std::fs::read_to_string(crate_root().join("src/cell_budget_configure.rs"))
+        .expect("maintenance CLI source");
+    assert!(bounded_maintenance_cli_pool(&source));
+    assert!(!bounded_maintenance_cli_pool(&format!(
+        "{source}\nDispatchRuntimePool::new(config)"
+    )));
+    for (original, replacement) in [
+        (
+            "role: DispatchPoolRole::Maintenance,",
+            "role: DispatchPoolRole::Runtime,",
+        ),
+        ("pool_max: 1,", "pool_max: 2,"),
+        (
+            "connect_timeout: Duration::from_secs(10),",
+            "connect_timeout: unbounded,",
+        ),
+        ("Duration::from_secs(30)", "Duration::MAX"),
+    ] {
+        assert!(
+            source.contains(original),
+            "mutation must change the fixture"
+        );
+        assert!(
+            !bounded_maintenance_cli_pool(&source.replace(original, replacement)),
+            "accepted {replacement}"
+        );
+    }
+}
+
 #[test]
 fn no_other_crate_source_file_calls_the_typed_clients_or_builds_another_pool() {
     // Phase 5 composes CD-4 charging over CD-3's one shared runtime pool. WP-114 CD-8's
@@ -1807,6 +1865,15 @@ fn no_other_crate_source_file_calls_the_typed_clients_or_builds_another_pool() {
             );
         }
         if source.contains("DispatchRuntimePool") {
+            // This exact standalone operator CLI owns one bounded maintenance connection;
+            // it is not another pool in the long-lived runtime. Keep the typed-client ban above.
+            if path == crate_root().join("src/cell_budget_configure.rs") {
+                assert!(
+                    bounded_maintenance_cli_pool(&source),
+                    "maintenance CLI pool escaped its bounded configuration"
+                );
+                continue;
+            }
             pool_consumers.push(name.to_string());
             assert!(
                 !source.contains("DispatchRuntimePool::new("),

@@ -506,31 +506,35 @@ async fn unlock_batches(
         let batch_resources = batch_resources.to_vec();
         let remote = remote.clone();
         let attempts = attempts.cloned();
-        lore_spawn!(batches, async move {
-            let connection = remote
-                .lock(repository_id)
+        let caller_operation = lore_transport::current_caller_operation();
+        lore_spawn!(
+            batches,
+            lore_transport::with_optional_caller_operation(caller_operation, async move {
+                let connection = remote
+                    .lock(repository_id)
+                    .await
+                    .forward_with::<ReleaseError, _>(|| {
+                        format!("Failed to connect to remote {}", remote.remote_url())
+                    })?;
+
+                // Entered inside the spawned task, and that placement is load-bearing. `lore_spawn!`
+                // re-scopes `LORE_CONTEXT` and nothing else, so the attempt task-local does not cross
+                // the spawn: a scope opened around this loop would be invisible in here, every batch
+                // would mint its own id anyway, and the caller's store would record none of them.
+                // Each batch is a separate irreversible dispatch and takes a separate id, for the
+                // same reason a push's several dispatches do.
+                let response = under_own_attempt(
+                    attempts.as_ref(),
+                    repository_id,
+                    GrpcRpc::LockUnlock,
+                    connection.unlock(&batch_resources),
+                )
                 .await
-                .forward_with::<ReleaseError, _>(|| {
-                    format!("Failed to connect to remote {}", remote.remote_url())
-                })?;
+                .forward::<ReleaseError>("Failed to release the lock")?;
 
-            // Entered inside the spawned task, and that placement is load-bearing. `lore_spawn!`
-            // re-scopes `LORE_CONTEXT` and nothing else, so the attempt task-local does not cross
-            // the spawn: a scope opened around this loop would be invisible in here, every batch
-            // would mint its own id anyway, and the caller's store would record none of them.
-            // Each batch is a separate irreversible dispatch and takes a separate id, for the
-            // same reason a push's several dispatches do.
-            let response = under_own_attempt(
-                attempts.as_ref(),
-                repository_id,
-                GrpcRpc::LockUnlock,
-                connection.unlock(&batch_resources),
-            )
-            .await
-            .forward::<ReleaseError>("Failed to release the lock")?;
-
-            Ok(response)
-        });
+                Ok(response)
+            })
+        );
     }
 
     let mut outcomes = Vec::with_capacity(num_batches);

@@ -20,6 +20,9 @@ tokio = { workspace = true }
 toml = { workspace = true }
 
 lore = { workspace = true }
+lore-revision = { workspace = true }
+lore-transport = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(target_family = "windows")'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_Networking_WinSock", "Win32_Globalization"] }
@@ -33,6 +36,9 @@ swfs = ["lore/swfs"]
 vergen = { workspace = true }
 anyhow = { workspace = true }
 winresource = "0.1.23"
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "lore"

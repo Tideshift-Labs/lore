@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 mod tests {
     #![allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
@@ -10,6 +11,23 @@ mod tests {
     use lore_revision::repository::RepositoryFormat;
     use lore_revision::repository::SALT_LORE;
     use lore_revision::repository::SALT_URC;
+    use lore_revision::util::path::RelativePath;
+
+    fn assert_ignored(
+        filter: &lore_revision::filter::Filter,
+        path: &str,
+        directory: bool,
+        expected: bool,
+    ) {
+        assert_eq!(
+            filter.ignore.excludes(
+                &RelativePath::new_from_initial_path(path).expect("fixture path"),
+                directory
+            ),
+            expected,
+            "ignore behavior for {path}"
+        );
+    }
 
     #[test]
     fn format_salt_urc() {
@@ -157,9 +175,11 @@ mod tests {
 
         let filter = load_filter(&dir).expect("filter should load");
         // The ignore filter should contain user-defined rules from .urcignore
-        // plus auto-generated exclusions (.urc, .lore, conflict suffixes).
-        // With one user rule ("secret.txt") and 6 auto-generated rules, we expect 7 lines.
-        assert_eq!(filter.ignore.lines.len(), 7);
+        // One user rule plus seven generated exclusions, including .lore-workflow.
+        assert_eq!(filter.ignore.lines.len(), 8);
+        assert_ignored(&filter, "secret.txt", false, true);
+        assert_ignored(&filter, "a.txt", false, false);
+        assert_ignored(&filter, ".lore-workflow", true, true);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -177,8 +197,12 @@ mod tests {
         std::fs::write(dir.join(".urcignore"), "secret.txt\n").expect("write .urcignore");
 
         let filter = load_filter(&dir).expect("filter should load");
-        // 2 user rules from .loreignore + 6 auto-generated = 8
-        assert_eq!(filter.ignore.lines.len(), 8);
+        // Two primary-file rules plus seven generated exclusions.
+        assert_eq!(filter.ignore.lines.len(), 9);
+        assert_ignored(&filter, "a.txt", false, true);
+        assert_ignored(&filter, "b.txt", false, true);
+        assert_ignored(&filter, "secret.txt", false, false);
+        assert_ignored(&filter, ".lore-workflow", true, true);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -197,8 +221,11 @@ mod tests {
         std::fs::write(dir.join(DOT_URCIGNORE), "secret.txt\n").expect("write .urcignore");
 
         let filter = load_filter(&dir).expect("filter should load");
-        // One user rule ("secret.txt") + 6 auto-generated rules = 7 lines.
-        assert_eq!(filter.ignore.lines.len(), 7);
+        // Legacy repositories receive the same seven generated exclusions.
+        assert_eq!(filter.ignore.lines.len(), 8);
+        assert_ignored(&filter, "secret.txt", false, true);
+        assert_ignored(&filter, "a.txt", false, false);
+        assert_ignored(&filter, ".lore-workflow", true, true);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

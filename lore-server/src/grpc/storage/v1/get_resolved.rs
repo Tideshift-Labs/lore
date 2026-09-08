@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! `GetResolved`: resolve a mutable key under `KeyType::Resolve` and return the immutable blob it
 //! names, in one round trip.
@@ -112,10 +113,7 @@ fn parse_request(
 fn error_response(request_id: u64, status: &Status) -> storage_v1::GetResolvedResponse {
     storage_v1::GetResolvedResponse {
         request_id,
-        status: Some(lore_proto::lore::model::v1::ItemStatus {
-            code: status.code() as u32,
-            message: status.message().to_string(),
-        }),
+        status: Some(status.into()),
         resolved: bytes::Bytes::new(),
         fragment: None,
         payload: bytes::Bytes::new(),

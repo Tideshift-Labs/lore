@@ -1,3 +1,5 @@
+// Copyright 2026 Khurram Virani (modifications)
+// SPDX-License-Identifier: MIT
 syntax = "proto3";
 
 package lore.model.v1;
@@ -30,8 +32,8 @@ message Address {
 // a missing fragment is routine control flow, not a fault. A terminal `Status` is
 // reserved for stream-fatal conditions, where no per-item attribution is possible
 // (e.g. a corrupt request stream).
-// A code other than `OK` decides the item on its own: the rest of the response carries no
-// meaning in that case and a reader must not consult it. A response that omits the status
+// A code other than `OK` rejects the item payload. A semantic uncertainty marker
+// overrides any code and leaves the item's durable effect unknown. A response that omits the status
 // entirely predates the field and is read as `OK`.
 message ItemStatus {
   // gRPC status code, as the numeric `google.rpc.Code` value. `OK` on a successful item,
@@ -39,6 +41,12 @@ message ItemStatus {
   uint32 code = 1;
   // Human-readable detail, used for log lines and surfaced error text.
   string message = 2;
+  // Semantic uncertainty, independent of the gRPC code. Zero with empty identity
+  // fields means absent; version 1 is supported. Any other present representation
+  // remains unknown and must never be treated as a decisive item failure.
+  uint32 outcome_unknown_version = 3;
+  string outcome_unknown_operation = 4;
+  string outcome_unknown_attempt = 5;
 }
 
 // Result of a fragment lookup against the storage layer.

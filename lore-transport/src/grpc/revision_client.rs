@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -13,6 +14,7 @@ use lore_base::types::RepositoryId;
 use lore_proto::lore::model::v1 as model_v1;
 use lore_proto::lore::revision::v1 as revision_v1;
 use lore_proto::lore::revision::v1::revision_service_client::RevisionServiceClient;
+use prost::Message;
 use tokio_stream::StreamExt;
 
 use super::AuthorizedService;
@@ -250,6 +252,38 @@ impl RevisionService {
         fast_forward_merge: bool,
     ) -> Result<BranchPushResponse, ProtocolError> {
         lore_debug!("Pushing branch: {} at {}", branch, revision);
+        if crate::caller_operation::current_caller_operation().is_some() {
+            let message = revision_v1::BranchPushRequest {
+                id: branch.into(),
+                revision_signature: revision.into(),
+                force,
+                fast_forward_merge,
+            };
+            return crate::caller_operation::dispatch(
+                self.repository,
+                crate::outcome::GrpcRpc::RevisionBranchPush,
+                message.encode_to_vec(),
+                crate::caller_operation::current_transport_endpoint(),
+                super::authorization_snapshot(&self.auth),
+                async {
+                    let mut request = tonic::Request::new(message);
+                    inject_authn_bearer(&mut request, &self.auth)?;
+                    let mut client = self.client.clone();
+                    let response = client
+                        .branch_push(request)
+                        .await
+                        .map_err(ProtocolError::from)?
+                        .into_inner();
+                    Ok(BranchPushResponse {
+                        fast_forward_merged: response.fast_forward_merged,
+                        revision: response.revision_signature.into(),
+                        revision_number: response.revision_number,
+                        message: response.message,
+                    })
+                },
+            )
+            .await;
+        }
         let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();

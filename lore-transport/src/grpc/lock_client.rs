@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -15,6 +16,7 @@ use lore_proto::lock::QueryRequest;
 use lore_proto::lock::StatusRequest;
 use lore_proto::lock::UnlockRequest;
 use lore_proto::lock::lock_service_client::LockServiceClient;
+use prost::Message;
 use tonic::Code;
 
 use super::AuthorizedService;
@@ -57,6 +59,7 @@ fn wire_to_acquired_lock(lock: lore_proto::lock::Lock) -> Result<AcquiredLock, P
 
 #[derive(Debug, Clone)]
 pub struct LockService {
+    repository: RepositoryId,
     client: LockServiceClient<AuthorizedService>,
     /// Kept beside the client so a governed mutation can stamp the human's own
     /// authentication bearer per dispatch. The lock reads on this same client
@@ -77,6 +80,7 @@ impl LockService {
         .max_decoding_message_size(32 * 1024 * 1024); // 32MiB
 
         Self {
+            repository,
             client,
             auth,
             request_inflight: Arc::new(AtomicU64::new(0)),
@@ -89,6 +93,58 @@ impl LockService {
         owner: Option<&str>,
     ) -> Result<Vec<AcquiredLock>, ProtocolError> {
         lore_debug!("Locking resources");
+
+        if crate::caller_operation::current_caller_operation().is_some() {
+            let resources = resources.iter().map(fenced_resource_to_wire).collect();
+            let mut client = self.client.clone();
+            let locks = if let Some(owner) = owner {
+                let message = AdminLockRequest {
+                    resources,
+                    owner: owner.to_string(),
+                };
+                let canonical = message.encode_to_vec();
+                crate::caller_operation::dispatch(
+                    self.repository,
+                    crate::outcome::GrpcRpc::LockAdminLock,
+                    canonical,
+                    crate::caller_operation::current_transport_endpoint(),
+                    super::authorization_snapshot(&self.auth),
+                    async {
+                        let mut request = tonic::Request::new(message);
+                        inject_authn_bearer(&mut request, &self.auth)?;
+                        Ok(client
+                            .admin_lock(request)
+                            .await
+                            .map_err(ProtocolError::from)?
+                            .into_inner()
+                            .locks)
+                    },
+                )
+                .await?
+            } else {
+                let message = LockRequest { resources };
+                let canonical = message.encode_to_vec();
+                crate::caller_operation::dispatch(
+                    self.repository,
+                    crate::outcome::GrpcRpc::LockLock,
+                    canonical,
+                    crate::caller_operation::current_transport_endpoint(),
+                    super::authorization_snapshot(&self.auth),
+                    async {
+                        let mut request = tonic::Request::new(message);
+                        inject_authn_bearer(&mut request, &self.auth)?;
+                        Ok(client
+                            .lock(request)
+                            .await
+                            .map_err(ProtocolError::from)?
+                            .into_inner()
+                            .locks)
+                    },
+                )
+                .await?
+            };
+            return locks.into_iter().map(wire_to_acquired_lock).collect();
+        }
 
         let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
@@ -189,6 +245,31 @@ impl LockService {
     ) -> Result<Vec<LockResource>, ProtocolError> {
         lore_debug!("Releasing resources");
 
+        if crate::caller_operation::current_caller_operation().is_some() {
+            let message = UnlockRequest {
+                resources: resources.iter().map(fenced_resource_to_wire).collect(),
+            };
+            return crate::caller_operation::dispatch(
+                self.repository,
+                crate::outcome::GrpcRpc::LockUnlock,
+                message.encode_to_vec(),
+                crate::caller_operation::current_transport_endpoint(),
+                super::authorization_snapshot(&self.auth),
+                async {
+                    let mut request = tonic::Request::new(message);
+                    inject_authn_bearer(&mut request, &self.auth)?;
+                    let mut client = self.client.clone();
+                    let response = client
+                        .unlock(request)
+                        .await
+                        .map_err(ProtocolError::from)?
+                        .into_inner();
+                    Ok(response.resources.into_iter().map(Into::into).collect())
+                },
+            )
+            .await;
+        }
+
         let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
@@ -233,6 +314,32 @@ impl LockService {
         owner: &str,
     ) -> Result<Vec<LockResource>, ProtocolError> {
         lore_debug!("Force-releasing resources");
+
+        if crate::caller_operation::current_caller_operation().is_some() {
+            let message = ForceUnlockRequest {
+                resources: resources.iter().map(Into::into).collect(),
+                owner: owner.to_string(),
+            };
+            return crate::caller_operation::dispatch(
+                self.repository,
+                crate::outcome::GrpcRpc::LockForceUnlock,
+                message.encode_to_vec(),
+                crate::caller_operation::current_transport_endpoint(),
+                super::authorization_snapshot(&self.auth),
+                async {
+                    let mut request = tonic::Request::new(message);
+                    inject_authn_bearer(&mut request, &self.auth)?;
+                    let mut client = self.client.clone();
+                    let response = client
+                        .force_unlock(request)
+                        .await
+                        .map_err(ProtocolError::from)?
+                        .into_inner();
+                    Ok(response.resources.into_iter().map(Into::into).collect())
+                },
+            )
+            .await;
+        }
 
         let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 

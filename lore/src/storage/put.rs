@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! `lore_storage_put` — write content-addressed buffers to a store.
 //!
@@ -149,7 +150,13 @@ async fn put_local(
                     item.remote_write != 0 && !effective.no_remote,
                 );
                 let store = store.clone();
-                lore_spawn!(tasks, async move { put_item(store, item, session).await });
+                lore_spawn!(
+                    tasks,
+                    lore_transport::with_optional_caller_operation(
+                        lore_transport::current_caller_operation(),
+                        async move { put_item(store, item, session).await }
+                    )
+                );
             }
             let codes = crate::storage::drain_codes(tasks).await;
             crate::storage::build_call_error(&codes, total, "put")

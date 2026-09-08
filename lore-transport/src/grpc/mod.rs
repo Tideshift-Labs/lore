@@ -618,6 +618,10 @@ pub fn inject_attempt_id(request: &mut tonic::Request<()>) -> Result<(), tonic::
 #[derive(Clone)]
 pub struct CorrelationInterceptor;
 
+pub(crate) fn authorization_snapshot(auth: &GRPCAuthRef) -> String {
+    auth.read().authorization_token.clone()
+}
+
 impl Interceptor for CorrelationInterceptor {
     fn call(
         &mut self,
@@ -657,9 +661,40 @@ impl Interceptor for AuthzInterceptor {
         mut request: tonic::Request<()>,
     ) -> Result<tonic::Request<()>, tonic::Status> {
         inject_correlation_id(&mut request)?;
-        inject_authorization(&mut request, self.auth.read().authorization_token.as_str())?;
+        let authorization = crate::caller_operation::current_dispatch_authorization()
+            .unwrap_or_else(|| self.auth.read().authorization_token.clone());
+        if let Some(recovery) = crate::caller_operation::current_caller_recovery() {
+            let token = lore_credential::insecure_decode_token(&authorization).map_err(|_| {
+                tonic::Status::failed_precondition("recovery credential namespace is unavailable")
+            })?;
+            if recovery.repository != self.repository
+                || recovery.verified_issuer != token.claims.issuer
+                || recovery.authenticated_subject != token.claims.user_id
+                || recovery.caller_capabilities != crate::outcome::OUTCOME_UNKNOWN_CAPABILITY_V1
+            {
+                return Err(tonic::Status::failed_precondition(
+                    "recovery credential namespace mismatch",
+                ));
+            }
+            request.metadata_mut().insert(
+                crate::caller_operation::CALLER_CAPABILITIES_METADATA_KEY,
+                MetadataValue::from_static(crate::outcome::OUTCOME_UNKNOWN_CAPABILITY_V1),
+            );
+        }
+        inject_authorization(&mut request, &authorization)?;
         inject_repository(&mut request, self.repository)?;
         inject_attempt_id(&mut request)?;
+        if let Some(context) = crate::caller_operation::current_caller_operation() {
+            if context.repository() != self.repository {
+                return Err(tonic::Status::failed_precondition(
+                    "managed operation repository mismatch",
+                ));
+            }
+            request.metadata_mut().insert(
+                crate::caller_operation::CALLER_CAPABILITIES_METADATA_KEY,
+                MetadataValue::from_static(crate::outcome::OUTCOME_UNKNOWN_CAPABILITY_V1),
+            );
+        }
         Ok(request)
     }
 }
@@ -744,6 +779,9 @@ pub struct GRPCConnection {
 }
 
 impl GRPCConnection {
+    pub(crate) fn selected_endpoint(&self) -> &str {
+        self.remote_url.as_str()
+    }
     /// Build a connection around an already-established channel, for tests that drive a
     /// storage client against a local server without going through the connect path.
     #[cfg(test)]
@@ -1755,9 +1793,33 @@ where
     Rebuild: Fn(u32) -> RebuildFut,
     RebuildFut: Future<Output = Result<(), ProtocolError>>,
 {
+    if let Some(recovery) = crate::caller_operation::current_caller_recovery()
+        && (recovery.endpoint
+            != crate::caller_operation::canonical_endpoint(connection.remote_url.as_str())?
+            || grpc_replay_class(rpc) != ReplayClass::ReadRetryable)
+    {
+        return Err(ProtocolError::internal("recovery dispatch scope mismatch"));
+    }
     match grpc_replay_class(rpc) {
         ReplayClass::ReadRetryable => with_reconnect(connection, op, rebuild).await,
         ReplayClass::MutableNoReplay => {
+            if crate::caller_operation::current_caller_operation().is_some()
+                && !matches!(
+                    rpc,
+                    GrpcRpc::RevisionBranchPush
+                        | GrpcRpc::LockLock
+                        | GrpcRpc::LockAdminLock
+                        | GrpcRpc::LockUnlock
+                        | GrpcRpc::LockForceUnlock
+                        | GrpcRpc::StorageVerify
+                        | GrpcRpc::StorageMutableStore
+                        | GrpcRpc::StorageMutableCompareAndSwap
+                )
+            {
+                return Err(ProtocolError::internal(
+                    "this mutation is not supported by managed caller adoption",
+                ));
+            }
             // Reuse the attempt this dispatch is already running under, and mint only when there
             // is none. A caller that journaled an id before calling in — which is what a client
             // must do to be able to reconcile a lost answer at all — would otherwise have that id
@@ -1768,7 +1830,12 @@ where
             // request. The id the server persists is therefore the same one this client names in
             // the error it raises when the answer never arrives, which is the whole point: a
             // reconciler looks the receipt up under the identity it already journaled.
-            match crate::outcome::with_dispatch_attempt(attempt, op()).await {
+            match crate::caller_operation::with_transport_endpoint(
+                connection.remote_url.to_string(),
+                crate::outcome::with_dispatch_attempt(attempt, op()),
+            )
+            .await
+            {
                 Err(error) if answer_is_not_settled(&error) => {
                     Err(outcome_unknown(rpc.wire_name(), &attempt))
                 }

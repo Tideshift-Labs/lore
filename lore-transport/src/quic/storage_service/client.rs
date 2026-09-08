@@ -7,6 +7,16 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+fn reject_managed_quic() -> Result<(), crate::ProtocolError> {
+    if crate::current_caller_operation().is_some() {
+        Err(crate::ProtocolError::internal(
+            "managed mutations require the gRPC transport",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 use async_trait::async_trait;
 use bytes::BufMut;
 use bytes::Bytes;
@@ -231,6 +241,7 @@ impl StorageClient {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<MutableOutcome<()>, ProtocolError> {
+        reject_managed_quic()?;
         send_normal_with_reconnect_outcome(self, Command::Put, session_id, || {
             [
                 Bytes::default(),
@@ -253,6 +264,7 @@ impl StorageClient {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<MutableOutcome<()>, ProtocolError> {
+        reject_managed_quic()?;
         send_normal_with_reconnect_outcome(self, Command::PutResolved, session_id, || {
             [
                 Bytes::default(),
@@ -273,6 +285,7 @@ impl StorageClient {
         value: Hash,
         key_type: KeyType,
     ) -> Result<MutableOutcome<()>, ProtocolError> {
+        reject_managed_quic()?;
         send_normal_with_reconnect_outcome(self, Command::MutableStore, session_id, || {
             [
                 Bytes::default(),
@@ -293,6 +306,7 @@ impl StorageClient {
         value: Hash,
         key_type: KeyType,
     ) -> Result<MutableOutcome<Hash>, ProtocolError> {
+        reject_managed_quic()?;
         let outcome =
             send_normal_with_reconnect_outcome(self, Command::MutableCas, session_id, || {
                 [
@@ -338,6 +352,7 @@ impl StorageClient {
         source_address: Address,
         target_context: Context,
     ) -> Result<MutableOutcome<()>, ProtocolError> {
+        reject_managed_quic()?;
         send_normal_with_reconnect_outcome(self, Command::Copy, session_id, || {
             [
                 Bytes::default(),
@@ -357,6 +372,9 @@ impl StorageClient {
         heal: bool,
     ) -> Result<MutableOutcome<VerifyResult>, ProtocolError> {
         let heal_byte = if heal { 1u8 } else { 0u8 };
+        if heal {
+            reject_managed_quic()?;
+        }
         let mut request_bytes = BytesMut::with_capacity(size_of::<Address>() + 1);
         request_bytes.extend_from_slice(address.as_bytes());
         request_bytes.put_u8(heal_byte);

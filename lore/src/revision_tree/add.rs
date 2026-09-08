@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! `lore_revision_tree_add` — add a batch of nodes in one call. An entry
 //! parents onto an existing node or onto an earlier entry in the same batch,
@@ -1690,7 +1691,7 @@ mod tests {
         assert_eq!(
             status,
             InvalidArguments::FFI_CODE,
-            "an unknown handle must fail"
+            "an unknown handle must fail with InvalidArguments; events: {events:?}"
         );
         for id in [7u64, 8] {
             assert!(

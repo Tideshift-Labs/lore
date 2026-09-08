@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 #[cfg(test)]
 mod tests {
@@ -27,6 +28,94 @@ mod tests {
     use lore_revision::state;
 
     include!("helper.rs");
+
+    #[tokio::test]
+    async fn workflow_sidecar_is_excluded_from_root_and_explicit_stage_targets() {
+        workflow_sidecar_stage_exclusions(false).await;
+    }
+
+    #[tokio::test]
+    async fn force_stage_cannot_include_the_workflow_sidecar() {
+        workflow_sidecar_stage_exclusions(true).await;
+    }
+
+    async fn workflow_sidecar_stage_exclusions(force: bool) {
+        let (immutable_store, mutable_store, _execution) = test_store_create().await.unwrap();
+        let execution = Arc::new(lore_revision::interface::ExecutionContext::new_server(
+            lore_revision::interface::LoreGlobalArgs {
+                force: u8::from(force),
+                ..Default::default()
+            },
+            lore_revision::relay::EventDispatcher::no_dispatch(),
+            "workflow-stage-fixture".into(),
+        ));
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path();
+                // The workflow sidecar may exist before clone or init creates .lore.
+                std::fs::create_dir(path.join(".lore-workflow")).unwrap();
+                std::fs::write(
+                    path.join(".lore-workflow/journal"),
+                    b"private workflow intent",
+                )
+                .unwrap();
+                let id = RepositoryId::from(uuid::Uuid::now_v7());
+                let branch_id = Context::from(uuid::Uuid::now_v7());
+                let token = repository::RepositoryWriteToken::acquire(path).await;
+                let created = repository::create_local(
+                    path,
+                    &token,
+                    id,
+                    branch_id,
+                    branch::DEFAULT_DEFAULT_NAME.to_string(),
+                    repository::RepositoryConfig::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(immutable_store, mutable_store)
+                            .with_path(path)
+                            .with_id(id)
+                            .with_instance_id(created.instance_id),
+                    )
+                    .with_write_token(token.share()),
+                );
+                lore_revision::instance::store_current_anchor_branch(&repository, branch_id)
+                    .await
+                    .unwrap();
+                std::fs::write(path.join("visible.txt"), b"content").unwrap();
+                for target in [
+                    path.to_path_buf(),
+                    path.join(".lore-workflow"),
+                    path.join(".lore-workflow/journal"),
+                ] {
+                    let hash = Box::pin(file::stage::stage(
+                        repository.clone(),
+                        &token,
+                        LoreArray::from_vec(vec![LoreString::from(&target)]),
+                        StageOptions {
+                            case_change: stage::StageCaseChange::Error,
+                            node_flags: NodeFlags::NoFlags,
+                            file_id: None,
+                            no_children: false,
+                            scan: true,
+                        },
+                    ))
+                    .await
+                    .unwrap();
+                    let staged = state::State::deserialize(repository.clone(), hash)
+                        .await
+                        .unwrap();
+                    let listed = staged_file_listing(repository.clone(), staged).await;
+                    assert_eq!(listed.len(), 1, "target {target:?}: {listed:?}");
+                    assert!(listed[0].contains("visible.txt"), "{listed:?}");
+                }
+            })
+            .await;
+    }
 
     #[tokio::test]
     async fn stage_non_exist() {

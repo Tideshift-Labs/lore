@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -110,6 +111,7 @@ pub fn load(
     let mut ignore = load_filter(ignore_path)?;
     ignore.add_exclusion(DOT_URC)?;
     ignore.add_exclusion(DOT_LORE)?;
+    ignore.add_exclusion(crate::repository_fence::WORKFLOW_DIRECTORY)?;
     ignore.add_exclusion(&format!("*{MINE_SUFFIX}"))?;
     ignore.add_exclusion(&format!("*{THEIRS_SUFFIX}"))?;
     ignore.add_exclusion(&format!("*{BASE_SUFFIX}"))?;
@@ -396,6 +398,10 @@ bitflagsops!(FilterMode, u16);
 
 impl Filter {
     pub fn excludes(&self, path: &impl FilterPath, is_directory: bool, mode: FilterMode) -> bool {
+        // Workflow credentials and intent are never user content.
+        if crate::repository_fence::is_workflow_path(path.as_str()) {
+            return true;
+        }
         if path.is_empty() {
             return false;
         }
@@ -418,6 +424,9 @@ impl Filter {
     }
 
     pub fn emit_excludes(&self, path: &RelativePath, is_directory: bool, mode: FilterMode) -> bool {
+        if crate::repository_fence::is_workflow_path(path.as_str()) {
+            return true;
+        }
         if path.is_empty() {
             return false;
         }

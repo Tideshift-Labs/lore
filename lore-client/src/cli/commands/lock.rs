@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -127,7 +128,12 @@ fn handle_lock_acquire(globals: LoreGlobalArgs, args: &FileLockAcquireArgs) -> u
             .with_defaults(),
     ));
 
-    return runtime().block_on(lock::file_acquire(globals, acquire_args, callback)) as u8;
+    return runtime().block_on(crate::commands::operation::managed(
+        &globals.clone(),
+        "lock-acquire",
+        format!("{acquire_args:?}"),
+        |store| lock::file_acquire_with_attempt_store(globals, acquire_args, callback, store),
+    )) as u8;
 }
 
 struct LockEventData {
@@ -288,7 +294,12 @@ fn handle_lock_release(globals: LoreGlobalArgs, args: &FileLockReleaseArgs) -> u
             .with_defaults(),
     ));
 
-    return runtime().block_on(lock::file_release(globals, release_args, callback)) as u8;
+    return runtime().block_on(crate::commands::operation::managed(
+        &globals.clone(),
+        "lock-release",
+        format!("{release_args:?}"),
+        |store| lock::file_release_with_attempt_store(globals, release_args, callback, store),
+    )) as u8;
 }
 
 pub fn handle_lock_file_commands(globals: LoreGlobalArgs, cmd: &LockFileCommands) -> u8 {

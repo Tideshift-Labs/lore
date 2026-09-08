@@ -210,6 +210,7 @@ pub enum GrpcRpc {
     RepositoryMetadataGet,
     RepositoryMetadataSet,
     LockLock,
+    LockAdminLock,
     LockUnlock,
     LockForceUnlock,
     LockQuery,
@@ -253,6 +254,7 @@ impl GrpcRpc {
             Self::RepositoryMetadataGet => "RepositoryService.MetadataGet",
             Self::RepositoryMetadataSet => "RepositoryService.MetadataSet",
             Self::LockLock => "LockService.Lock",
+            Self::LockAdminLock => "LockService.AdminLock",
             Self::LockUnlock => "LockService.Unlock",
             Self::LockForceUnlock => "LockService.ForceUnlock",
             Self::LockQuery => "LockService.Query",
@@ -329,6 +331,7 @@ pub fn grpc_replay_class(rpc: GrpcRpc) -> ReplayClass {
         | GrpcRpc::RepositoryDelete
         | GrpcRpc::RepositoryMetadataSet
         | GrpcRpc::LockLock
+        | GrpcRpc::LockAdminLock
         | GrpcRpc::LockUnlock
         // Takes a row away from its owner and records `lock.force_released`. A replay after a
         // lost answer could release a lock the owner re-acquired in between, which is precisely

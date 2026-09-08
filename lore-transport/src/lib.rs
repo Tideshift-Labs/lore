@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 pub mod attempt_store;
 pub mod auth;
+pub mod caller_operation;
 pub mod connection;
 pub mod domain_receipt;
 pub mod error;
@@ -17,6 +18,7 @@ pub mod types;
 pub mod util;
 
 pub use attempt_store::*;
+pub use caller_operation::*;
 pub use connection::*;
 pub use domain_receipt::*;
 pub use error::*;

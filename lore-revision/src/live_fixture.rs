@@ -32,6 +32,8 @@
 //! normal build. A fixture that propagated its own setup failures would make each caller handle an
 //! error that means only "the test rig is broken".
 
+const MANAGED_FIXTURE_TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczovL2ZpeHR1cmUuaW52YWxpZC9pc3N1ZXIiLCJzdWIiOiJmaXh0dXJlLXVzZXIiLCJuYW1lIjoiZml4dHVyZS11c2VyIiwiZXhwIjo0MTAyNDQ0ODAwLCJhdWQiOiJmaXh0dXJlIn0.eA";
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -114,6 +116,8 @@ pub enum LockRpc {
 pub struct LockCall {
     pub rpc: LockRpc,
     pub attempt_id: Option<String>,
+    pub caller_capabilities: Option<String>,
+    pub authorization_matches_fixture: bool,
     /// The `description` of every resource in the request, in wire order.
     pub descriptions: Vec<String>,
     /// The owner named by an `AdminLock` or `ForceUnlock`, empty otherwise.
@@ -542,6 +546,16 @@ impl StubLockService {
         calls.push(LockCall {
             rpc,
             attempt_id,
+            caller_capabilities: request
+                .metadata()
+                .get("lore-caller-capabilities-v1")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            authorization_matches_fixture: request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.strip_prefix("Bearer ") == Some(MANAGED_FIXTURE_TOKEN)),
             descriptions: resources
                 .iter()
                 .map(|resource| resource.description.clone())
@@ -926,6 +940,19 @@ impl LiveRepository {
     /// requested releases is the only shape that can tell "clears what the server named" apart
     /// from "clears the whole request".
     pub async fn create_with_files(remote_url: &str, names: &[&str]) -> Self {
+        Self::create_with_identity(remote_url, names, None).await
+    }
+
+    /// A managed fixture selects a named principal before opening its connection.
+    pub async fn create_managed(remote_url: &str) -> Self {
+        Self::create_with_identity(remote_url, &["locked.file"], Some("fixture-user")).await
+    }
+
+    async fn create_with_identity(
+        remote_url: &str,
+        names: &[&str],
+        identity: Option<&str>,
+    ) -> Self {
         let tempdir = TempDir::new("lore-live-fixture-");
         let path = tempdir.path().to_path_buf();
         let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
@@ -940,6 +967,7 @@ impl LiveRepository {
             crate::branch::DEFAULT_DEFAULT_NAME.to_string(),
             RepositoryConfig {
                 remote_url: Some(remote_url.to_owned()),
+                identity: identity.map(str::to_owned),
                 ..RepositoryConfig::default()
             },
             false,
@@ -1064,6 +1092,22 @@ impl LiveRepository {
         crate::repository::load_and_connect(self.path.as_path(), access)
             .await
             .expect("opening the fixture repository")
+    }
+
+    /// Supply a syntactic JWT to the real selected connection for managed-client tests.
+    /// This disposable server does not verify signatures; live auth tests own that proof.
+    /// Retain the returned connection while calling the public engine entry points.
+    pub async fn managed_connection(&self) -> Arc<lore_transport::connection::Connection> {
+        let context = self.connect(RepositoryAccess::ReadOnly).await;
+        let connection = context.remote().await.expect("fixture remote connects");
+        connection
+            .credentials()
+            .update(MANAGED_FIXTURE_TOKEN, MANAGED_FIXTURE_TOKEN);
+        connection
+            .rebuild_lock_after_fixture_credentials(self.repository_id)
+            .await
+            .expect("fixture lock service selects supplied credentials");
+        connection
     }
 }
 

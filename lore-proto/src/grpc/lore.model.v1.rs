@@ -52,8 +52,8 @@ impl ::prost::Name for Address {
 /// a missing fragment is routine control flow, not a fault. A terminal `Status` is
 /// reserved for stream-fatal conditions, where no per-item attribution is possible
 /// (e.g. a corrupt request stream).
-/// A code other than `OK` decides the item on its own: the rest of the response carries no
-/// meaning in that case and a reader must not consult it. A response that omits the status
+/// A code other than `OK` rejects the item payload. A semantic uncertainty marker
+/// overrides any code and leaves the item's durable effect unknown. A response that omits the status
 /// entirely predates the field and is read as `OK`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ItemStatus {
@@ -64,6 +64,15 @@ pub struct ItemStatus {
     /// Human-readable detail, used for log lines and surfaced error text.
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
+    /// Semantic uncertainty, independent of the gRPC code. Zero with empty identity
+    /// fields means absent; version 1 is supported. Any other present representation
+    /// remains unknown and must never be treated as a decisive item failure.
+    #[prost(uint32, tag = "3")]
+    pub outcome_unknown_version: u32,
+    #[prost(string, tag = "4")]
+    pub outcome_unknown_operation: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub outcome_unknown_attempt: ::prost::alloc::string::String,
 }
 impl ::prost::Name for ItemStatus {
     const NAME: &'static str = "ItemStatus";

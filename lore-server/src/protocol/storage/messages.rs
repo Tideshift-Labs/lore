@@ -102,6 +102,7 @@ impl From<StoreError> for MessageHandleError {
             return MessageHandleError::OutcomeUnknown;
         }
         match value {
+            StoreError::OutcomeUnknown(_) => MessageHandleError::OutcomeUnknown,
             StoreError::SlowDown(_) => MessageHandleError::SlowDown,
             StoreError::Oversized(_) => MessageHandleError::Oversized,
             _ => MessageHandleError::StoreFailure,

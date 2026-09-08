@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use lore_base::error::InvalidArguments;
 use lore_base::text::TextNotUtf8;
@@ -155,6 +156,15 @@ pub(crate) async fn dispatch_call<
     handler: Handler,
 ) -> i32 {
     if service_delegation_requested() {
+        if lore_transport::has_managed_caller() {
+            return reject_undelegatable(
+                globals,
+                callback,
+                "managed operations cannot delegate their durable caller context to a service"
+                    .to_owned(),
+            )
+            .await;
+        }
         service_call(globals, args, callback).await
     } else {
         handler(globals, args, callback).await
@@ -177,78 +187,126 @@ pub(crate) mod tests {
     use lore_revision::event::LoreEvent;
     use lore_revision::interface::LoreEventCallbackConfig;
     use lore_revision::interface::LoreGlobalArgs;
-    use serial_test::serial;
 
     use super::*;
     use crate::interface::LoreString;
 
-    /// Restores `LORE_USE_SERVICE` to whatever it was before the test ran, even if the test
-    /// panics. The variable is process-global, so every test that touches it -- here and in
-    /// `branch::tests` -- carries `#[serial(lore_use_service)]` to keep them from racing each
-    /// other; this guard is the belt to that suspenders, covering the panic-mid-test case a bare
-    /// serial ordering does not.
-    pub(crate) struct RestoreLoreUseService(Option<String>);
-
-    impl RestoreLoreUseService {
-        pub(crate) fn set(value: &str) -> Self {
-            let previous = std::env::var("LORE_USE_SERVICE").ok();
-            // SAFETY: every reader and writer of this variable in the test binary is serialized
-            // by `#[serial(lore_use_service)]`.
-            unsafe {
-                std::env::set_var("LORE_USE_SERVICE", value);
+    /// Exact child processes isolate service settings from every ordinary dispatch reader.
+    /// A serial group only protects its members, not the rest of the test binary.
+    pub(crate) fn service_env_child(test_name: &str, values: &[Option<&str>]) -> bool {
+        struct ReapChild(std::process::Child);
+        impl Drop for ReapChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
             }
-            Self(previous)
         }
-
-        pub(crate) fn unset() -> Self {
-            let previous = std::env::var("LORE_USE_SERVICE").ok();
-            // SAFETY: see `set`.
-            unsafe {
-                std::env::remove_var("LORE_USE_SERVICE");
-            }
-            Self(previous)
+        const MARKER: &str = "LORE_SERVICE_TEST_CHILD";
+        if std::env::var(MARKER).as_deref() == Ok(test_name) {
+            let actual = std::env::var("LORE_USE_SERVICE").ok();
+            assert!(
+                values.contains(&actual.as_deref()),
+                "unexpected child environment: {actual:?}"
+            );
+            return true;
         }
-    }
-
-    impl Drop for RestoreLoreUseService {
-        fn drop(&mut self) {
-            // SAFETY: see `set`.
-            unsafe {
-                match &self.0 {
-                    Some(value) => std::env::set_var("LORE_USE_SERVICE", value),
-                    None => std::env::remove_var("LORE_USE_SERVICE"),
+        for value in values {
+            let directory = std::env::temp_dir().join(format!(
+                "lore-service-test-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir(&directory).expect("create child log directory");
+            let stdout = directory.join("stdout.log");
+            let stderr = directory.join("stderr.log");
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+                .env(MARKER, test_name)
+                .stdout(std::fs::File::create(&stdout).expect("child stdout"))
+                .stderr(std::fs::File::create(&stderr).expect("child stderr"));
+            match value {
+                Some(value) => {
+                    command.env("LORE_USE_SERVICE", value);
+                }
+                None => {
+                    command.env_remove("LORE_USE_SERVICE");
                 }
             }
-        }
-    }
-
-    /// Pins the three-way behaviour two callers now depend on: [`dispatch_call`] (delegates to a
-    /// service) and [`crate::branch::push_with_attempt_store`] (refuses rather than delegate).
-    /// Both read this exact function, so a drift here is a drift in both.
-    #[test]
-    #[serial(lore_use_service)]
-    fn service_delegation_is_false_when_the_variable_is_unset() {
-        let _restore = RestoreLoreUseService::unset();
-        assert!(!service_delegation_requested());
-    }
-
-    #[test]
-    #[serial(lore_use_service)]
-    fn service_delegation_is_false_when_the_variable_is_set_empty() {
-        let _restore = RestoreLoreUseService::set("");
-        assert!(!service_delegation_requested());
-    }
-
-    #[test]
-    #[serial(lore_use_service)]
-    fn service_delegation_is_true_for_any_non_empty_value() {
-        for value in ["1", "true", "0", "grpc://service.example"] {
-            let _restore = RestoreLoreUseService::set(value);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            let mut child = ReapChild(command.spawn().expect("spawn exact service test"));
+            drop(command);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().expect("poll service test") {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!(
+                        "{test_name} exceeded 30s; logs retained at {}",
+                        directory.display()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            drop(child);
+            let output = std::fs::read_to_string(&stdout).expect("read child stdout");
+            let errors = std::fs::read_to_string(&stderr).expect("read child stderr");
             assert!(
-                service_delegation_requested(),
-                "expected delegation requested for LORE_USE_SERVICE={value:?}"
+                status.success() && output.contains("1 passed; 0 failed"),
+                "{test_name} with {value:?}: {status}; logs {}\n{output}\n{errors}",
+                directory.display()
             );
+            std::fs::remove_dir_all(&directory).expect("remove successful child logs");
         }
+        false
+    }
+
+    #[test]
+    fn service_delegation_is_false_when_the_variable_is_unset() {
+        if !service_env_child(
+            "call_delegation::tests::service_delegation_is_false_when_the_variable_is_unset",
+            &[None],
+        ) {
+            return;
+        }
+        assert!(!service_delegation_requested());
+    }
+
+    #[test]
+    fn service_delegation_is_false_when_the_variable_is_set_empty() {
+        if !service_env_child(
+            "call_delegation::tests::service_delegation_is_false_when_the_variable_is_set_empty",
+            &[Some("")],
+        ) {
+            return;
+        }
+        assert!(!service_delegation_requested());
+    }
+
+    #[test]
+    fn service_delegation_is_true_for_any_non_empty_value() {
+        if !service_env_child(
+            "call_delegation::tests::service_delegation_is_true_for_any_non_empty_value",
+            &[
+                Some("1"),
+                Some("true"),
+                Some("0"),
+                Some("grpc://service.example"),
+            ],
+        ) {
+            return;
+        }
+        assert!(
+            service_delegation_requested(),
+            "expected delegation for {:?}",
+            std::env::var("LORE_USE_SERVICE")
+        );
     }
 
     // A concrete error whose `NotFound` variant carries error code 79, so the

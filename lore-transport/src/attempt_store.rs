@@ -277,6 +277,17 @@ pub enum AttemptResolution {
 /// which uses one store for both jobs because it has no second party to disagree with.
 #[async_trait]
 pub trait AttemptStore: Send + Sync {
+    /// Atomically persist the attempt and its exact managed recovery binding before dispatch.
+    /// Legacy journals do not support managed adoption by merely implementing `record`.
+    async fn record_managed(
+        &self,
+        _record: &AttemptRecord,
+        _intent: &crate::caller_operation::ManagedAttemptIntent,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::internal(
+            "attempt journal does not support managed intent",
+        ))
+    }
     /// Durably record an attempt. Returns only once the record would survive a crash.
     ///
     /// Called before dispatch, never after. Recording the same attempt id twice is the caller

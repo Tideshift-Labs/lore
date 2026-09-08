@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -1738,10 +1739,9 @@ mod tests {
     use lore_error_set::FfiError;
     use lore_revision::interface::LoreEventCallbackConfig;
     use lore_transport::VolatileAttemptStore;
-    use serial_test::serial;
 
     use super::*;
-    use crate::call_delegation::tests::RestoreLoreUseService;
+    use crate::call_delegation::tests::service_env_child;
 
     // Accepted as a source-level fact, not tested: `push` (via `push_local`) still reaches
     // `push_journalled` with `None`, exactly as it did before `push_with_attempt_store` existed.
@@ -1780,9 +1780,13 @@ mod tests {
     /// records every call it receives: either one being touched would mean the refusal ran too
     /// late, after the code had already started the operation it exists to prevent.
     #[test]
-    #[serial(lore_use_service)]
     fn push_with_attempt_store_refuses_when_delegation_is_requested() {
-        let _restore = RestoreLoreUseService::set("1");
+        if !service_env_child(
+            "branch::tests::push_with_attempt_store_refuses_when_delegation_is_requested",
+            &[Some("1")],
+        ) {
+            return;
+        }
 
         let globals = LoreGlobalArgs {
             repository_path: LoreString::from_str(

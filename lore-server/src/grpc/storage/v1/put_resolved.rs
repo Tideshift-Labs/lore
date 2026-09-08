@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! `PutResolved`: store a fragment and publish a mutable key naming it, in one round trip. The
 //! write side of [`super::get_resolved`].
@@ -152,10 +153,7 @@ fn parse_request(
 fn error_response(request_id: u64, status: &Status) -> storage_v1::PutResolvedResponse {
     storage_v1::PutResolvedResponse {
         request_id,
-        status: Some(lore_proto::lore::model::v1::ItemStatus {
-            code: status.code() as u32,
-            message: status.message().to_string(),
-        }),
+        status: Some(status.into()),
     }
 }
 

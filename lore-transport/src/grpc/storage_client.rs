@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::str::FromStr;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use lore_error_set::prelude::*;
 use lore_proto::lore::model::v1 as model_v1;
 use lore_proto::lore::storage::v1 as storage_v1;
 use lore_proto::lore::storage::v1::storage_service_client::StorageServiceClient;
+use prost::Message;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -65,17 +67,17 @@ fn item_status_error(
 ) -> Option<ProtocolError> {
     let status = status?;
     let code = tonic::Code::from_i32(status.code as i32);
-    if code == tonic::Code::Ok {
+    if code == tonic::Code::Ok && !status.has_outcome_unknown() {
         return None;
     }
-    Some(ProtocolError::from(tonic::Status::new(
-        code,
-        status.message.clone(),
-    )))
+    Some(ProtocolError::from(tonic::Status::from(status)))
 }
 
 const STREAM_WRITE_BUFFER_SIZE: usize = 32 * 1024;
 const INFLIGHT_COMMAND_LIMIT: usize = 10000;
+
+#[cfg(test)]
+mod adoption_tests;
 
 /// Bound on stream-level reissues before handing off to connection-level reconnect.
 ///
@@ -493,6 +495,46 @@ fn inject_metadata<T>(request: &mut tonic::Request<T>, ctx: &GrpcSessionContext)
     }
 }
 
+fn inject_managed_metadata<T>(request: &mut tonic::Request<T>, ctx: &GrpcSessionContext) {
+    inject_metadata(request, ctx);
+    if let Some(context) = crate::caller_operation::current_caller_operation() {
+        request.metadata_mut().insert(
+            crate::caller_operation::CALLER_CAPABILITIES_METADATA_KEY,
+            MetadataValue::from_static(context.capabilities()),
+        );
+        if let Some(attempt) = crate::outcome::current_dispatch_attempt()
+            && let Ok(value) = MetadataValue::from_str(&attempt.to_string())
+        {
+            request
+                .metadata_mut()
+                .insert(crate::outcome::ATTEMPT_ID_METADATA_KEY, value);
+        }
+    }
+}
+
+fn stream_lost(rpc: GrpcRpc) -> ProtocolError {
+    outcome_unknown(
+        rpc.wire_name(),
+        &crate::outcome::current_dispatch_attempt().unwrap_or_else(AttemptId::new),
+    )
+}
+
+fn managed_stream_status(status: tonic::Status, rpc: GrpcRpc) -> ProtocolError {
+    if crate::error::is_unsupported_client_status(&status) {
+        ProtocolError::from(status)
+    } else {
+        stream_lost(rpc)
+    }
+}
+
+fn decisive_item_error(error: ProtocolError) -> ProtocolError {
+    if crate::error::answer_lost_code(&error).is_some() || error.is_disconnected() {
+        ProtocolError::internal(error.to_string())
+    } else {
+        error
+    }
+}
+
 impl StorageService {
     pub fn new(connection: Arc<super::GRPCConnection>) -> Self {
         Self {
@@ -637,6 +679,38 @@ impl StorageService {
             payload,
         };
 
+        if crate::caller_operation::current_caller_operation().is_some() {
+            let mut canonical = request.clone();
+            canonical.payload = canonical.payload.map(|_| Bytes::new());
+            return crate::caller_operation::dispatch(
+                ctx.partition,
+                GrpcRpc::StoragePut,
+                canonical.encode_to_vec(),
+                self.connection.remote_url.to_string(),
+                ctx.auth_token.clone(),
+                async {
+                    let mut req = tonic::Request::new(tokio_stream::iter([request]));
+                    inject_managed_metadata(&mut req, ctx);
+                    let mut client = StorageServiceClient::new(self.connection.channel());
+                    let mut responses = client
+                        .put(req)
+                        .await
+                        .map_err(ProtocolError::from)?
+                        .into_inner();
+                    let response = responses
+                        .message()
+                        .await
+                        .map_err(|status| managed_stream_status(status, GrpcRpc::StoragePut))?
+                        .ok_or_else(|| stream_lost(GrpcRpc::StoragePut))?;
+                    if response.key() != Some(address) {
+                        return Err(stream_lost(GrpcRpc::StoragePut));
+                    }
+                    response.into_result().map_err(decisive_item_error)
+                },
+            )
+            .await;
+        }
+
         self.put_streams
             .request(
                 GrpcRpc::StoragePut,
@@ -689,6 +763,30 @@ impl StorageService {
             address: Some((*address).into()),
             heal,
         };
+        if heal && crate::caller_operation::current_caller_operation().is_some() {
+            return crate::caller_operation::dispatch(
+                ctx.partition,
+                GrpcRpc::StorageVerify,
+                request.encode_to_vec(),
+                self.connection.remote_url.to_string(),
+                ctx.auth_token.clone(),
+                async {
+                    let mut req = tonic::Request::new(request);
+                    inject_managed_metadata(&mut req, ctx);
+                    let mut client = StorageServiceClient::new(self.connection.channel());
+                    let res = client
+                        .verify(req)
+                        .await
+                        .map_err(ProtocolError::from)?
+                        .into_inner();
+                    Ok(VerifyResult {
+                        corrupted: res.corrupted,
+                        healed: HealResult::from(res.healed),
+                    })
+                },
+            )
+            .await;
+        }
         let mut client = StorageServiceClient::new(self.connection.channel());
         let mut req = tonic::Request::new(request);
         inject_metadata(&mut req, ctx);
@@ -735,6 +833,36 @@ impl StorageService {
             source_address: Some(source_address.into()),
             target_context: Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(&target_context)),
         };
+
+        if crate::caller_operation::current_caller_operation().is_some() {
+            return crate::caller_operation::dispatch(
+                ctx.partition,
+                GrpcRpc::StorageCopy,
+                request.encode_to_vec(),
+                self.connection.remote_url.to_string(),
+                ctx.auth_token.clone(),
+                async {
+                    let mut req = tonic::Request::new(tokio_stream::iter([request]));
+                    inject_managed_metadata(&mut req, ctx);
+                    let mut client = StorageServiceClient::new(self.connection.channel());
+                    let mut responses = client
+                        .copy(req)
+                        .await
+                        .map_err(ProtocolError::from)?
+                        .into_inner();
+                    let response = responses
+                        .message()
+                        .await
+                        .map_err(|status| managed_stream_status(status, GrpcRpc::StorageCopy))?
+                        .ok_or_else(|| stream_lost(GrpcRpc::StorageCopy))?;
+                    if response.key() != Some(source_address) {
+                        return Err(stream_lost(GrpcRpc::StorageCopy));
+                    }
+                    response.into_result().map_err(decisive_item_error)
+                },
+            )
+            .await;
+        }
 
         self.copy_streams
             .request(
@@ -790,6 +918,26 @@ impl StorageService {
             value: Bytes::copy_from_slice(value.data()),
             key_type: key_type as u32,
         };
+        if crate::caller_operation::current_caller_operation().is_some() {
+            return crate::caller_operation::dispatch(
+                ctx.partition,
+                GrpcRpc::StorageMutableStore,
+                request.encode_to_vec(),
+                self.connection.remote_url.to_string(),
+                ctx.auth_token.clone(),
+                async {
+                    let mut req = tonic::Request::new(request);
+                    inject_managed_metadata(&mut req, ctx);
+                    let mut client = StorageServiceClient::new(self.connection.channel());
+                    client
+                        .mutable_store(req)
+                        .await
+                        .map_err(ProtocolError::from)
+                        .map(|_| ())
+                },
+            )
+            .await;
+        }
         let mut client = StorageServiceClient::new(self.connection.channel());
         let mut req = tonic::Request::new(request);
         inject_metadata(&mut req, ctx);
@@ -821,6 +969,30 @@ impl StorageService {
             value: Bytes::copy_from_slice(value.data()),
             key_type: key_type as u32,
         };
+        if crate::caller_operation::current_caller_operation().is_some() {
+            return crate::caller_operation::dispatch(
+                ctx.partition,
+                GrpcRpc::StorageMutableCompareAndSwap,
+                request.encode_to_vec(),
+                self.connection.remote_url.to_string(),
+                ctx.auth_token.clone(),
+                async {
+                    let mut req = tonic::Request::new(request);
+                    inject_managed_metadata(&mut req, ctx);
+                    let mut client = StorageServiceClient::new(self.connection.channel());
+                    let response = client
+                        .mutable_compare_and_swap(req)
+                        .await
+                        .map_err(ProtocolError::from)?
+                        .into_inner();
+                    if response.current_value.len() != size_of::<Hash>() {
+                        return Err(stream_lost(GrpcRpc::StorageMutableCompareAndSwap));
+                    }
+                    Ok(Hash::from(&response.current_value[..]))
+                },
+            )
+            .await;
+        }
         let mut client = StorageServiceClient::new(self.connection.channel());
         let mut req = tonic::Request::new(request);
         inject_metadata(&mut req, ctx);
@@ -949,6 +1121,49 @@ impl StorageService {
             fragment: Some(fragment.into()),
             payload: payload.unwrap_or_default(),
         };
+
+        if crate::caller_operation::current_caller_operation().is_some() {
+            let _permit = self
+                .get_put_limiter
+                .acquire()
+                .await
+                .internal("permit acquire")?;
+            let mut canonical = request.clone();
+            canonical.payload = Bytes::new();
+            canonical.request_id = 0;
+            return crate::caller_operation::dispatch(
+                ctx.partition,
+                GrpcRpc::StoragePutResolved,
+                canonical.encode_to_vec(),
+                self.connection.remote_url.to_string(),
+                ctx.auth_token.clone(),
+                async {
+                    let mut req = tonic::Request::new(tokio_stream::iter([request]));
+                    inject_managed_metadata(&mut req, ctx);
+                    let mut client = StorageServiceClient::new(self.connection.channel());
+                    let mut responses = client
+                        .put_resolved(req)
+                        .await
+                        .map_err(ProtocolError::from)?
+                        .into_inner();
+                    let response = responses
+                        .message()
+                        .await
+                        .map_err(|status| {
+                            managed_stream_status(status, GrpcRpc::StoragePutResolved)
+                        })?
+                        .ok_or_else(|| stream_lost(GrpcRpc::StoragePutResolved))?;
+                    if response.request_id != request_id {
+                        return Err(stream_lost(GrpcRpc::StoragePutResolved));
+                    }
+                    match item_status_error(response.status.as_ref()) {
+                        Some(error) => Err(decisive_item_error(error)),
+                        None => Ok(()),
+                    }
+                },
+            )
+            .await;
+        }
 
         let _permit = self
             .get_put_limiter
@@ -1402,11 +1617,13 @@ mod tests {
                         lore_proto::lore::model::v1::ItemStatus {
                             code: i32::from(tonic::Code::NotFound) as u32,
                             message: "gone".to_string(),
+                            ..Default::default()
                         }
                     } else if matches!(kill_mode, KillMode::ErrorBesidePayloadCancelled) {
                         lore_proto::lore::model::v1::ItemStatus {
                             code: i32::from(tonic::Code::Cancelled) as u32,
                             message: "mid-flight stream reset".to_string(),
+                            ..Default::default()
                         }
                     } else {
                         lore_proto::lore::model::v1::ItemStatus::ok()

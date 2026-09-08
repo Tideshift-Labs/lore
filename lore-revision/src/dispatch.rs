@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! Attempt identity for the client's irreversible dispatches (WP-120).
 //!
@@ -71,6 +72,9 @@ pub(crate) async fn under_own_attempt<T, Fut>(
 where
     Fut: Future<Output = Result<T, ProtocolError>>,
 {
+    if lore_transport::current_caller_operation().is_some() {
+        return under_named_attempt(attempts, AttemptId::new(), repository, rpc, dispatch).await;
+    }
     let Some(store) = attempts else {
         return dispatch.await;
     };
@@ -107,6 +111,15 @@ pub(crate) async fn under_named_attempt<T, Fut>(
 where
     Fut: Future<Output = Result<T, ProtocolError>>,
 {
+    if let Some(context) = lore_transport::current_caller_operation() {
+        if context.repository() != repository {
+            return Err(ProtocolError::internal(
+                "managed operation repository mismatch",
+            ));
+        }
+        // The transport request producer owns canonical intent, journaling and settlement.
+        return with_dispatch_attempt(attempt, dispatch).await;
+    }
     // Recorded before the dispatch, never after. A record written afterwards cannot describe an
     // attempt whose response was lost, which is the only case that needs one.
     if let Some(store) = attempts {

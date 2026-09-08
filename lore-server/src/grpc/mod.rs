@@ -185,7 +185,16 @@ pub fn map_message_handle_error_to_status(
         ),
     };
 
-    Status::with_details(code, message, details.unwrap_or_default())
+    let mut status = Status::with_details(code, message, details.unwrap_or_default());
+    if matches!(error, MessageHandleError::OutcomeUnknown) {
+        status.metadata_mut().insert(
+            lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static(
+                lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_VALUE,
+            ),
+        );
+    }
+    status
 }
 
 /// Stable client-facing meaning of an indeterminate domain commit.

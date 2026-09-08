@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! Dispatch helper for the content-addressed storage API.
 //!
@@ -11,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use lore_base::error::InvalidArguments;
+use lore_base::error::OutcomeUnknown;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::FfiError;
 use lore_error_set::HasTrace;
@@ -32,6 +34,7 @@ use crate::util::log_command_info;
 /// Errors emitted by the dispatch helper itself (not by the op impl).
 #[error_set]
 enum DispatchError {
+    OutcomeUnknown,
     InvalidArguments,
 }
 
@@ -40,6 +43,7 @@ impl EventError for DispatchError {
         match self {
             DispatchError::InvalidArguments(_) => LoreError::InvalidArguments,
             DispatchError::Internal(_) => LoreError::Internal,
+            DispatchError::OutcomeUnknown(_) => LoreError::OutcomeUnknown,
         }
     }
 
@@ -99,7 +103,28 @@ where
             let time_start = Instant::now();
 
             let store = guard.store_clone();
-            let detail = LoreErrorDetail::from_result(command(store, args).await);
+            let mut detail = LoreErrorDetail::from_result(command(store, args).await);
+            // A managed child without a durable verdict dominates the per-item code summary.
+            // Keep the actual journal identity when that summary has only numeric status codes.
+            if let Some(context) = lore_transport::current_caller_operation() {
+                let uncertain = match context.attempts().unresolved().await {
+                    Ok(records) => records
+                        .into_iter()
+                        .find(|record| record.repository == context.repository())
+                        .map(|record| (record.operation, record.attempt_id)),
+                    Err(_) => context
+                        .latest_attempt()
+                        .map(|attempt| ("storage journal read".to_owned(), attempt)),
+                };
+                if let Some((operation, attempt)) = uncertain {
+                    detail = LoreErrorDetail::from_error(&DispatchError::from(
+                        lore_base::error::OutcomeUnknown {
+                            operation,
+                            attempt_id: attempt.to_string(),
+                        },
+                    ));
+                }
+            }
 
             log_command_done(&caller, time_start);
             let status = execution_context().dispatcher.complete(detail).await;

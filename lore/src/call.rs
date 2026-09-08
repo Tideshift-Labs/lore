@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::path::Path;
 use std::path::PathBuf;
@@ -113,6 +114,45 @@ pub fn setup_execution(
     ))
 }
 
+/// Remote mutations such as lock operations need worktree admission but no local write token.
+pub async fn repository_call_mutation_read<Arg, T, F, Fut, ResT, ErrT>(
+    globals: LoreGlobalArgs,
+    callback: LoreEventCallback,
+    args: Arg,
+    caller: T,
+    command: F,
+) -> i32
+where
+    ErrT: EventError + FfiError + HasTrace,
+    Arg: std::fmt::Debug,
+    F: FnOnce(Arc<RepositoryContext>, Arg) -> Fut,
+    Fut: Future<Output = Result<ResT, ErrT>> + 'static,
+{
+    let root = util::path::make_absolute_from(
+        globals.repository_path.as_str(),
+        globals.working_directory().map(Path::new),
+    )
+    .unwrap_or_else(|_| PathBuf::from(globals.repository_path.as_str()));
+    let fence = match lore_revision::repository_fence::RepositoryMutationGuard::acquire(&root).await
+    {
+        Ok(fence) => fence,
+        Err(error) => {
+            let execution = setup_execution(globals, callback);
+            let detail = LoreErrorDetail::from_error(&error);
+            return LORE_CONTEXT
+                .scope(execution, async move {
+                    execution_context().dispatcher.complete(detail).await
+                })
+                .await;
+        }
+    };
+    fence
+        .run(repository_call_read(
+            globals, callback, args, caller, command,
+        ))
+        .await
+}
+
 /// Read-only repository call. No `RepositoryWriteToken` is minted, so
 /// closures cannot name one — write-gated leaf operations fail at compile
 /// time.
@@ -166,8 +206,13 @@ where
                 .await
                 {
                     Ok(repository) => {
-                        detail =
-                            LoreErrorDetail::from_result(command(repository.clone(), args).await);
+                        detail = LoreErrorDetail::from_result(
+                            lore_transport::with_optional_caller_operation(
+                                lore_transport::caller_operation_for_repository(repository.id),
+                                command(repository.clone(), args),
+                            )
+                            .await,
+                        );
                         weak_repository = Some(post_command_cleanup(repository).await);
                     }
                     Err(err) => {
@@ -210,11 +255,26 @@ where
             Err(status) => return status,
         };
 
+    let fence =
+        match lore_revision::repository_fence::RepositoryMutationGuard::acquire(&repository_path)
+            .await
+        {
+            Ok(fence) => fence,
+            Err(error) => {
+                let detail = LoreErrorDetail::from_error(&error);
+                return LORE_CONTEXT
+                    .scope(execution, async move {
+                        execution_context().dispatcher.complete(detail).await
+                    })
+                    .await;
+            }
+        };
+
     let token = RepositoryWriteToken::acquire(&repository_path).await;
     let context_token = token.share();
 
-    LORE_CONTEXT
-        .scope(
+    fence
+        .run(LORE_CONTEXT.scope(
             execution,
             in_dispatch_attempt(attempt, async move {
                 log_command_info(&caller, &args);
@@ -231,7 +291,11 @@ where
                 {
                     Ok(repository) => {
                         detail = LoreErrorDetail::from_result(
-                            command(repository.clone(), token, args).await,
+                            lore_transport::with_optional_caller_operation(
+                                lore_transport::caller_operation_for_repository(repository.id),
+                                command(repository.clone(), token, args),
+                            )
+                            .await,
                         );
                         weak_repository = Some(post_command_cleanup(repository).await);
                     }
@@ -245,7 +309,7 @@ where
                 log_command_done(&caller, time_start);
                 execution_context().dispatcher.complete(detail).await
             }),
-        )
+        ))
         .await
 }
 
@@ -274,11 +338,30 @@ where
             Err(err) => return Err(err),
         };
 
+    let fence =
+        match lore_revision::repository_fence::RepositoryMutationGuard::acquire(&repository_path)
+            .await
+        {
+            Ok(fence) => fence,
+            Err(error) => {
+                let err = ErrT::from(RepositoryError::from(InvalidArguments {
+                    reason: error.to_string(),
+                }));
+                let detail = LoreErrorDetail::from_error(&err);
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let _ = execution_context().dispatcher.complete(detail).await;
+                    })
+                    .await;
+                return Err(err);
+            }
+        };
+
     let token = RepositoryWriteToken::acquire(&repository_path).await;
     let context_token = token.share();
 
-    LORE_CONTEXT
-        .scope(
+    fence
+        .run(LORE_CONTEXT.scope(
             execution,
             in_dispatch_attempt(attempt, async move {
                 log_command_info(&caller, &args);
@@ -293,7 +376,11 @@ where
                 .await
                 {
                     Ok(repository) => {
-                        let result = command(repository.clone(), token, args).await;
+                        let result = lore_transport::with_optional_caller_operation(
+                            lore_transport::caller_operation_for_repository(repository.id),
+                            command(repository.clone(), token, args),
+                        )
+                        .await;
                         weak_repository = Some(post_command_cleanup(repository).await);
                         result
                     }
@@ -310,7 +397,7 @@ where
                 let _ = execution_context().dispatcher.complete(detail).await;
                 result
             }),
-        )
+        ))
         .await
 }
 
@@ -353,8 +440,13 @@ where
                 .await
                 {
                     Ok(repository) => {
-                        detail =
-                            LoreErrorDetail::from_result(command(repository.clone(), args).await);
+                        detail = LoreErrorDetail::from_result(
+                            lore_transport::with_optional_caller_operation(
+                                lore_transport::caller_operation_for_repository(repository.id),
+                                command(repository.clone(), args),
+                            )
+                            .await,
+                        );
                         weak_repository = Some(post_command_cleanup(repository).await);
                     }
                     Err(err) => {
