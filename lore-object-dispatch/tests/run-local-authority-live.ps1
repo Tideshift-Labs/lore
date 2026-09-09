@@ -332,7 +332,7 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
         [array]$Tests
     )
 
-    # The retention-client and cell-schema-install live tiers are the crate's other ignored tiers,
+    # These exact cases belong to the crate's other tracked live runners,
     # each with its own runner. Named here so a brand-new ignored test outside every known family is
     # caught, not silently accepted.
     $knownOtherIgnoredTests = @(
@@ -355,7 +355,21 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
         'live_postgres_successor_fence_and_stage3_publication_matrix',
         'live_postgres_expired_exact_publication_replays_but_charge_fails_closed',
         'live_postgres_missing_malformed_and_stage3_inconsistent_configs_fail_closed',
-        'live_postgres_cd5_charge_before_send_conformance_and_authority_unavailable'
+        'live_postgres_cd5_charge_before_send_conformance_and_authority_unavailable',
+        'live_postgres_two_replica_charge_waits_before_snapshot_and_accounts_once',
+        'live_postgres_charge_lock_timeout_and_cancellation_retire_sessions_without_send',
+        # Budget configuration -- run-budget-configure-live.ps1
+        'live_budget_publish_verify_replay_preserves_depletion',
+        'live_budget_exact_binding_drift_and_absence_refuse',
+        'live_budget_wrong_role_tls_and_database_identity_refuse',
+        'live_budget_renewal_carries_depletion_without_reset',
+        'live_budget_expired_reconcile_is_read_only_and_allows_successor',
+        # Cell retention -- run-cell-retention-live.ps1
+        'live_cell_retention_removes_children_atomically_and_preserves_both_horizons',
+        'live_cell_retention_blockers_fail_readiness_and_recover_after_drain',
+        'live_cell_retention_bounds_batch_probe_and_recovers_from_saturation',
+        'live_cell_retention_real_grants_use_budget_expiry_and_bounded_drain',
+        'live_cell_retention_backlog_keeps_clock_and_horizon_coherent'
     )
 
     Write-Host 'Cross-checking the ignored-test catalog against this harness''s known live tests...'
@@ -396,7 +410,7 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
     if ($unexpectedOther.Count -gt 0) {
         $descriptions = ($unexpectedOther | ForEach-Object { "$($_.Name) ($($_.Target))" }) -join '; '
         $message = "found unexpected ignored test(s) outside the local_authority_* family and the known " +
-        "retention-client and cell-schema-install live tiers: $descriptions"
+        "explicitly enumerated dedicated live tiers: $descriptions"
         throw $message
     }
     if ($otherCatalog.Count -ne $knownOtherIgnoredTests.Count) {

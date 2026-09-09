@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! Integration tests for the Postgres-backed immutable store (CR-007).
 //!
@@ -663,8 +664,8 @@ async fn payload_put_overwrites_untrusted_rowless_orphan_objects() {
 ///
 /// After a full put:
 /// - `query` on the exact address reports `MatchFull`.
-/// - `query` for the same hash under a DIFFERENT partition reports `MatchHash`
-///   (global dedup: hash is visible across partitions via the index on `hash` alone).
+/// - `query` for the same hash in another context of this partition reports `MatchPartition`.
+/// - `query` under a different partition reports `MatchNone`, without exposing global dedup.
 /// - `query` for a random never-put hash reports `MatchNone`.
 #[tokio::test]
 #[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
@@ -693,16 +694,28 @@ async fn existence_levels() {
         "exact address must be MatchFull"
     );
 
-    // The hash is globally visible — a different partition with MatchHash finds it.
+    let other_context = Address {
+        hash: address.hash,
+        context: rand::random(),
+    };
+    let m_partition = query_one(s.clone(), partition, other_context)
+        .await
+        .expect("query same-partition hash in another context");
+    assert_eq!(m_partition.match_made, StoreMatch::MatchPartition);
+    assert!(m_partition.stored_durable);
+
+    // Global payload dedup does not expose another partition's associations.
     let other_partition: Partition = rand::random();
     let m_hash = query_one(s.clone(), other_partition, address)
         .await
         .expect("query cross-partition hash");
     assert_eq!(
         m_hash.match_made,
-        StoreMatch::MatchHash,
-        "same hash under different partition must be MatchHash (global dedup)"
+        StoreMatch::MatchNone,
+        "same hash under a different partition must not disclose stored content"
     );
+    assert!(!m_hash.stored_durable);
+    assert!(!m_hash.stored_local);
 
     // A never-put hash is absent at every level.
     let absent = Address {
@@ -752,7 +765,7 @@ async fn dedup_same_partition_requires_payload() {
     let no_payload_result = s.clone().put(partition, addr2, frag, None, false).await;
     assert!(
         no_payload_result.is_err(),
-        "same-partition same-hash no-payload put must error (MatchPartition path unreachable)"
+        "a partition-level hash match does not authorize a new association without payload proof"
     );
     let err_str = format!("{:?}", no_payload_result.unwrap_err());
     assert!(
@@ -1769,7 +1782,7 @@ async fn query_batch_order_preservation() {
 
     // --- MatchFull batch: same hash, different context ---
     // put at (hash, ctxA); query over [(hash,ctxA), (hash,ctxB)].
-    // Only the exact (hash, context) pair matches; the other context returns MatchNone.
+    // The exact pair is Full; another context retains the weaker partition-level match.
     let hash: Hash = rand::random();
     let ctx_a: Context = rand::random();
     let ctx_b: Context = rand::random();
@@ -1795,9 +1808,13 @@ async fn query_batch_order_preservation() {
     );
     assert_eq!(
         full_results[1].match_made,
-        StoreMatch::MatchNone,
-        "addr_b (same hash, different context) → MatchNone"
+        StoreMatch::MatchPartition,
+        "addr_b (same hash, different context) → MatchPartition"
     );
+    assert_eq!(full_results[0].context, ctx_a);
+    assert_eq!(full_results[1].context, Context::default());
+    assert_eq!(full_results[1].partition, partition);
+    assert!(full_results[1].stored_durable);
 }
 
 /// 9. `repository_stats` on a repository with no fragment associations

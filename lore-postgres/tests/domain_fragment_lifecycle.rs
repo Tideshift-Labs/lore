@@ -7225,10 +7225,11 @@ async fn acquire_staged_leases_refuses_a_staged_member_awaiting_exact_payload_pu
     let coordinator = store.fragment_coordinator();
     let direct = client(&url).await;
     let deadline = microsecond_deadline(Duration::from_secs(60));
-    enable_write_claims(&url, &coordinator).await;
 
     let hash = random_hash();
     let repository_id = create_repository(&store).await;
+    // Legacy repository setup precedes enforcement; the staged lease probe does not.
+    enable_write_claims(&url, &coordinator).await;
     let context = random_context();
     let BeginOutcome::Admitted(stage_intent) =
         coordinator.begin_stage(&hash).await.expect("begin stage")
@@ -7433,10 +7434,11 @@ async fn acquire_staged_leases_refuses_a_member_whose_fragment_was_obliterated_a
     let coordinator = store.fragment_coordinator();
     let direct = client(&url).await;
     let deadline = microsecond_deadline(Duration::from_secs(60));
-    enable_write_claims(&url, &coordinator).await;
 
     let hash = random_hash();
     let repository_id = create_repository(&store).await;
+    // Legacy repository setup precedes enforcement; the staged lease probe does not.
+    enable_write_claims(&url, &coordinator).await;
     let context = random_context();
     let BeginOutcome::Admitted(stage_intent) =
         coordinator.begin_stage(&hash).await.expect("begin stage")
@@ -7584,10 +7586,11 @@ async fn acquire_staged_leases_refuses_a_member_whose_head_is_mid_deletion() {
     let coordinator = store.fragment_coordinator();
     let direct = client(&url).await;
     let deadline = microsecond_deadline(Duration::from_secs(60));
-    enable_write_claims(&url, &coordinator).await;
 
     let hash = random_hash();
     let repository_id = create_repository(&store).await;
+    // Legacy repository setup precedes enforcement; the staged lease probe does not.
+    enable_write_claims(&url, &coordinator).await;
     let context = random_context();
     let BeginOutcome::Admitted(stage_intent) =
         coordinator.begin_stage(&hash).await.expect("begin stage")
@@ -10174,8 +10177,8 @@ async fn backfill_cursor_advance_cannot_reach_cutover_readiness_or_the_enable_ga
                 "refusal must name the observed backfill state: {message}"
             );
             assert!(
-                message.contains("requires a completed backfill"),
-                "refusal must be the completed-backfill gate: {message}"
+                message.contains("requires clean initialization or a completed backfill"),
+                "refusal must be the clean-initialization/completed-backfill gate: {message}"
             );
         }
         other => panic!("enable_lifecycle must refuse with NotReady, got {other:?}"),

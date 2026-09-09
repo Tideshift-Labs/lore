@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 mod client;
 mod peer_discovery;
@@ -13,7 +14,8 @@ mod helpers {
 
     pub fn docker_compose_config() -> Config {
         Config {
-            address: "http://127.0.0.1:8500".to_string(),
+            address: std::env::var("LORE_INTEGRATION_CONSUL_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:8500".to_string()),
             token: None,
             ..Default::default()
         }

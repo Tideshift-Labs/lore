@@ -1,5 +1,6 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 // Copyright 2026 Tideshift Labs Ltd.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 
 fn coordinator_source() -> String {
@@ -62,6 +63,19 @@ fn assert_order(source: &str, markers: &[&str]) {
 fn claim_creation_locks_head_before_claim_and_uses_one_database_clock_snapshot() {
     let source = coordinator_source();
     let begin = function(&source, "async fn begin_publication(");
+    // First-head insert contention now restarts through one bounded fresh pass.
+    // Pin the delegation as well as the transaction's unchanged lock ordering.
+    assert_order(
+        begin,
+        &[
+            "for _ in 0..2",
+            ".begin_publication_once(",
+            ".await?",
+            "return Ok(outcome)",
+        ],
+    );
+    assert!(!begin.contains(".transaction()"));
+    let begin = function(&source, "async fn begin_publication_once(");
     assert_order(
         begin,
         &[

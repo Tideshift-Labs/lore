@@ -1,4 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# Copyright 2026 Khurram Virani
 # SPDX-License-Identifier: MIT
 import json
 import logging
@@ -115,7 +116,7 @@ def pytest_addoption(parser):
 
 @pytest.fixture(scope="function")
 def new_lore_repo(
-    lore_executable_path, lore_remote_url, tmp_path_factory, global_dir_name
+    request, lore_executable_path, lore_remote_url, tmp_path_factory, global_dir_name
 ):
     """
     Returns a function that can be used to create a new lore repo
@@ -133,6 +134,24 @@ def new_lore_repo(
             name = ""
         name = Lore.generate_random_name(name)
         path = str(tmp_path_factory.getbasetemp() / name)
+        # Explicit endpoints retain their protocol/auth contract. Auth-negative
+        # tests use new_authless_lore_repo rather than an implicit signed login.
+        managed = None
+        if (
+            request.config.getoption("--use-grpc")
+            and remote_url is None
+            and remote_path is None
+            and not request.config.getoption("--lore-remote-url")
+            and not request.config.getoption("--disable-local-server")
+            and not request.config.getoption("--disable-auto-server")
+        ):
+            managed, remote_url, token = request.getfixturevalue("managed_cli_identity")
+            repo_id = repo_id or Lore.generate_id()
+            managed.grant(token, repo_id)
+            environment_vars = {
+                **(environment_vars or {}),
+                **managed.environment(global_dir_name),
+            }
         return Lore(
             lore_executable_path=lore_executable_path,
             path=path,
@@ -146,6 +165,82 @@ def new_lore_repo(
         )
 
     return _new_lore_repo
+
+
+@pytest.fixture
+def new_authless_lore_repo(new_lore_repo, lore_remote_url):
+    def create(**kwargs):
+        kwargs.setdefault("remote_url", lore_remote_url)
+        return new_lore_repo(**kwargs)
+
+    return create
+
+
+@pytest.fixture(scope="session")
+def managed_cli_server(request, tmp_path_factory, lore_server_executable_path):
+    from managed_auth import ManagedAuth
+
+    directory = tmp_path_factory.mktemp("managed-auth")
+    auth = ManagedAuth(directory)
+    ports = {
+        name: allocate_free_port() for name in ("quic", "grpc", "http", "internal")
+    }
+    try:
+        server_root, env = generate_server_config(request, tmp_path_factory, ports)
+        env["SSL_CERT_FILE"] = str(auth.ca_path)
+        env.pop("SSL_CERT_DIR", None)
+        # Use configuration, not authentication-policy overrides in the client.
+        (server_root / "lore-server" / "config" / "local.toml").write_text(
+            "[server.auth]\n"
+            f"jwt_issuer={json.dumps(auth.issuer)}\n"
+            'jwt_audience=["lore-storage","commit0-cli","localhost","127.0.0.1"]\n'
+            "enforce_write_permission=true\n[server.auth.jwk]\n"
+            f"endpoint={json.dumps(auth.jwks_url)}\n"
+            "[environment.endpoint]\n"
+            f"auth_url={json.dumps(auth.url)}\n",
+            encoding="utf-8",
+        )
+        yield from _managed_server_lifetime(
+            auth, server_root, env, lore_server_executable_path, ports
+        )
+    finally:
+        auth.close()
+
+
+def _managed_server_lifetime(auth, server_root, env, executable, ports):
+    process, log, log_fd = launch_lore_server(server_root, env, executable)
+    try:
+        yield auth, f"grpc://127.0.0.1:{ports['grpc']}/"
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+        log_fd.close()
+
+
+@pytest.fixture
+def managed_cli_identity(managed_cli_server, global_dir_name, lore_executable_path):
+    auth, remote = managed_cli_server
+    token = auth.identity()
+    try:
+        auth.login(lore_executable_path, global_dir_name, remote, token)
+        yield auth, remote, token
+    finally:
+        with auth.lock:
+            auth.identities.pop(token, None)
+        for name in (
+            "auth.json",
+            "tokenstore.toml",
+            "tokens.toml",
+            "sec-tokenstore_encryption_key",
+        ):
+            path = Path(global_dir_name) / name
+            if path.is_symlink():
+                raise RuntimeError("Refusing redirected fixture credential cleanup")
+            path.unlink(missing_ok=True)
 
 
 @pytest.fixture(scope="function")

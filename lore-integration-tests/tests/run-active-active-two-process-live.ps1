@@ -249,10 +249,14 @@ try {
             'build', '-p', 'lore-server', '--release', '--bin', 'loreserver',
             '--features', 'failure_generator'
         ) | Out-Null
+        $metadataJson = (& cargo metadata --no-deps --format-version 1 | Out-String)
+        if ($LASTEXITCODE -ne 0) { throw "cargo metadata exited $LASTEXITCODE" }
+        $targetDirectory = ($metadataJson | ConvertFrom-Json).target_directory
+        if ([string]::IsNullOrWhiteSpace($targetDirectory) -or -not [IO.Path]::IsPathFullyQualified($targetDirectory)) { throw 'Cargo target directory must be absolute' }
     }
     finally { Pop-Location }
-    $serverBin = Join-Path $loreRoot 'target/release/loreserver.exe'
-    if (-not (Test-Path $serverBin)) { $serverBin = Join-Path $loreRoot 'target/release/loreserver' }
+    $serverBin = Join-Path $targetDirectory 'release/loreserver.exe'
+    if (-not (Test-Path $serverBin)) { $serverBin = Join-Path $targetDirectory 'release/loreserver' }
     if (-not (Test-Path $serverBin)) { throw 'the release loreserver binary was not produced' }
 
     # -- gateway trust material and streams --------------------------------

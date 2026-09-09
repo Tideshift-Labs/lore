@@ -1,4 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# Copyright 2026 Khurram Virani
 # SPDX-License-Identifier: MIT
 import logging
 
@@ -18,24 +19,24 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.mark.smoke
-def test_auth_login_not_supported_without_auth_endpoint(new_lore_repo):
+def test_auth_login_not_supported_without_auth_endpoint(new_authless_lore_repo):
     """The local test server is authless (no auth endpoint configured), so an
     interactive `auth login` against it must fail with `NotSupported` rather
     than an opaque internal error."""
 
-    repo: Lore = new_lore_repo()
+    repo: Lore = new_authless_lore_repo()
 
     with pytest.raises(NotSupportedError):
         repo.run(urc_args=["auth", "login", repo.remote_path, "--no-browser"])
 
 
 @pytest.mark.smoke
-def test_auth_info_not_supported_without_auth_endpoint(new_lore_repo):
+def test_auth_info_not_supported_without_auth_endpoint(new_authless_lore_repo):
     """`auth info` resolves its auth endpoint from the repository's remote. The
     authless test server advertises no auth endpoint, so there is no URL to key
     a token lookup on and the command must fail with `NotSupported`."""
 
-    repo: Lore = new_lore_repo()
+    repo: Lore = new_authless_lore_repo()
 
     with pytest.raises(NotSupportedError):
         repo.run(urc_args=["auth", "info"])
@@ -43,7 +44,7 @@ def test_auth_info_not_supported_without_auth_endpoint(new_lore_repo):
 
 @pytest.mark.smoke
 def test_auth_user_info_not_supported_without_auth_endpoint(
-    new_lore_repo, lore_library_path
+    new_authless_lore_repo, lore_library_path
 ):
     """`authUserInfo` (remote user-info resolution) must fail with
     `NotSupported` against the authless test server, not `NotAuthenticated`:
@@ -56,7 +57,7 @@ def test_auth_user_info_not_supported_without_auth_endpoint(
     the test calls the public C API — the surface the SDK's `authUserInfo`
     binding is built on — and asserts on the returned FFI code."""
 
-    repo: Lore = new_lore_repo()
+    repo: Lore = new_authless_lore_repo()
 
     result = repo.auth_user_info_capi(lore_library_path, "some-other-user")
 

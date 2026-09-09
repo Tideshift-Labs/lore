@@ -43,7 +43,12 @@ function Invoke-CargoCaptured([string[]]$ArgumentList) {
 Push-Location $loreRoot
 try {
     if (-not $SkipBuild) { $null = Invoke-CargoCaptured @('build', '-p', 'lore-server', '--release', '--bin', 'loreserver', '-j', '4') }
-    $env:LORE_TEST_SINGLE_RPC_SERVER = Join-Path $loreRoot 'target/release/loreserver.exe'
+    # Ask Cargo rather than assuming its target directory; test:all uses a shared warm target.
+    $metadataJson = (& cargo metadata --no-deps --format-version 1 | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "cargo metadata exited $LASTEXITCODE" }
+    $targetDirectory = ($metadataJson | ConvertFrom-Json).target_directory
+    if ([string]::IsNullOrWhiteSpace($targetDirectory) -or -not [IO.Path]::IsPathFullyQualified($targetDirectory)) { throw 'Cargo target directory must be absolute' }
+    $env:LORE_TEST_SINGLE_RPC_SERVER = Join-Path $targetDirectory 'release/loreserver.exe'
     if (-not (Test-Path -LiteralPath $env:LORE_TEST_SINGLE_RPC_SERVER)) { throw 'release loreserver missing' }
     Write-Host ('Server release SHA256: ' + (Get-FileHash -Algorithm SHA256 -LiteralPath $env:LORE_TEST_SINGLE_RPC_SERVER).Hash)
     $env:LORE_TEST_SINGLE_RPC_LOG = Join-Path (Split-Path -Parent $loreRoot) '.codex/tmp/single-rpc-server.log'

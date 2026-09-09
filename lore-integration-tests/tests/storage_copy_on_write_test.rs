@@ -237,18 +237,21 @@ mod storage_copy_on_write_tests {
                     ),
                 )
                 .await;
+                let event_snapshot = events.lock().unwrap().clone();
+                let completion_snapshot = completions.lock().unwrap().clone();
+                let unresolved_snapshot = journal.unresolved().await.unwrap();
                 assert_eq!(server.counted.traffic().copies, 1,
                     "fixture must reach Copy before testing response-loss propagation; status={status}, events={:?}, unresolved={:?}, completions={:?}",
-                    events.lock().unwrap(), journal.unresolved().await.unwrap(), completions.lock().unwrap());
+                    event_snapshot, unresolved_snapshot, completion_snapshot);
                 assert_eq!(
                     status,
                     lore_revision::interface::LoreError::OutcomeUnknown as i32,
                     "traffic={:?}, events={:?}, unresolved={:?}, intents={:?}, completions={:?}",
                     server.counted.traffic(),
-                    events.lock().unwrap(),
-                    journal.unresolved().await.unwrap(),
+                    event_snapshot,
+                    unresolved_snapshot,
                     journal.intents.lock().unwrap(),
-                    completions.lock().unwrap()
+                    completion_snapshot
                 );
                 let mut observed = events.lock().unwrap().clone();
                 observed.sort_by_key(|(id, _)| *id);
@@ -270,14 +273,15 @@ mod storage_copy_on_write_tests {
                 );
                 let unresolved = journal.unresolved().await?;
                 assert_eq!(unresolved.len(), 1);
-                let completed = completions.lock().unwrap();
-                assert_eq!(completed.len(), 1);
-                let detail: serde_json::Value = serde_json::from_str(&completed[0]).unwrap();
+                let detail: serde_json::Value = {
+                    let completed = completions.lock().unwrap();
+                    assert_eq!(completed.len(), 1);
+                    serde_json::from_str(&completed[0]).unwrap()
+                };
                 assert_eq!(detail["status"], 193);
                 assert_eq!(detail["error"]["errorCode"], 193);
                 assert_eq!(detail["error"]["attemptId"], unresolved[0].attempt_id.to_string());
                 assert_eq!(detail["error"]["operation"], "StorageService.Copy");
-                drop(completed);
                 close_handle(handle_id).await;
                 Ok(())
             })

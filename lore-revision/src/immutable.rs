@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::ops::Range;
 use std::path::Path;
@@ -222,7 +223,6 @@ pub async fn store_raw_remote_retry(
                 return Err(Disconnected.into());
             }
             Err(err) => {
-                debug_assert!(false, "Remote server responded with error on put: {err}");
                 return Err(ImmutableError::internal_with_context(
                     err,
                     "Failed to store fragments, remote error",
@@ -831,6 +831,8 @@ impl<T> WriteToImmutable for T where T: zerocopy::IntoBytes + zerocopy::Immutabl
 #[cfg(test)]
 mod session_tests {
     use std::future::Future;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use lore_base::runtime::LORE_CONTEXT;
 
@@ -891,6 +893,59 @@ mod session_tests {
             Arc::new(lore_transport::SessionPool::new(vec![session.clone()])),
             session,
         )
+    }
+
+    #[tokio::test]
+    async fn remote_put_predispatch_refusal_returns_typed_error_without_panicking_or_retrying() {
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let calls = resolutions.clone();
+        let session = Arc::new(StorageSession::pending(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(ProtocolError::internal(
+                    "managed dispatch cannot bind credential namespace",
+                ))
+            }
+        }));
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store_raw_remote_retry(session, absent_address(), Fragment::new_zeroed(), None),
+        )
+        .await
+        .expect("a decisive refusal must return without the SlowDown retry schedule")
+        .expect_err("the refused session must never report a successful put");
+        assert!(matches!(&error, ImmutableError::Internal(_)));
+        assert!(format!("{error:?}").contains("managed dispatch cannot bind credential namespace"));
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_put_preserves_the_exact_unknown_attempt_without_retrying() {
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let calls = resolutions.clone();
+        let attempt = uuid::Uuid::now_v7().to_string();
+        let returned_attempt = attempt.clone();
+        let session = Arc::new(StorageSession::pending(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let attempt_id = returned_attempt.clone();
+            async move {
+                Err(OutcomeUnknown {
+                    operation: "StorageService.Put".to_owned(),
+                    attempt_id,
+                }
+                .into())
+            }
+        }));
+        let error = store_raw_remote_retry(session, absent_address(), Fragment::new_zeroed(), None)
+            .await
+            .expect_err("an unknown attempt is never a successful put");
+        assert_eq!(error.ffi_code(), 193);
+        let ImmutableError::OutcomeUnknown(unknown) = error else {
+            panic!("the typed unknown result must survive the immutable layer");
+        };
+        assert_eq!(unknown.operation, "StorageService.Put");
+        assert_eq!(unknown.attempt_id, attempt);
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
     }
 
     /// What a read or write ends up using comes from the pool the context holds.

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 #[cfg(all(test, feature = "integration_tests"))]
 mod dynamo_tests {
@@ -33,6 +34,7 @@ mod dynamo_tests {
     use crate::common::aws_common::FRAGMENTS_TABLE_NAME;
     use crate::common::aws_common::LOCKS_TABLE_NAME;
     use crate::common::aws_common::dynamodb_client;
+    use crate::common::aws_common::dynamodb_endpoint;
     use crate::setup_execution;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -42,11 +44,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async move {
-                dynamodb_client(
-                    "http://127.0.0.1:9090".to_string(),
-                    vec![FRAGMENTS_TABLE_NAME],
-                )
-                .await
+                dynamodb_client(dynamodb_endpoint(), vec![FRAGMENTS_TABLE_NAME]).await
             })
             .await?;
 
@@ -130,11 +128,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async move {
-                dynamodb_client(
-                    "http://127.0.0.1:9090".to_string(),
-                    vec![FRAGMENTS_TABLE_NAME],
-                )
-                .await
+                dynamodb_client(dynamodb_endpoint(), vec![FRAGMENTS_TABLE_NAME]).await
             })
             .await?;
 
@@ -213,11 +207,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async move {
-                dynamodb_client(
-                    "http://127.0.0.1:9090".to_string(),
-                    vec![FRAGMENTS_TABLE_NAME],
-                )
-                .await
+                dynamodb_client(dynamodb_endpoint(), vec![FRAGMENTS_TABLE_NAME]).await
             })
             .await?;
 
@@ -292,11 +282,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async move {
-                dynamodb_client(
-                    "http://127.0.0.1:9090".to_string(),
-                    vec![FRAGMENTS_TABLE_NAME],
-                )
-                .await
+                dynamodb_client(dynamodb_endpoint(), vec![FRAGMENTS_TABLE_NAME]).await
             })
             .await?;
 
@@ -347,7 +333,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async move {
-                dynamodb_client("http://127.0.0.1:9090".to_string(), vec![LOCKS_TABLE_NAME]).await
+                dynamodb_client(dynamodb_endpoint(), vec![LOCKS_TABLE_NAME]).await
             })
             .await?;
 
@@ -455,11 +441,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async {
-                dynamodb_client(
-                    "http://127.0.0.1:9090".to_string(),
-                    vec![FRAGMENTS_TABLE_NAME],
-                )
-                .await
+                dynamodb_client(dynamodb_endpoint(), vec![FRAGMENTS_TABLE_NAME]).await
             })
             .await?;
 
@@ -519,11 +501,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async {
-                dynamodb_client(
-                    "http://127.0.0.1:9090".to_string(),
-                    vec![FRAGMENTS_TABLE_NAME],
-                )
-                .await
+                dynamodb_client(dynamodb_endpoint(), vec![FRAGMENTS_TABLE_NAME]).await
             })
             .await?;
 

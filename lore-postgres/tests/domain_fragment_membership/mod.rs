@@ -1,4 +1,5 @@
 // Copyright 2026 Tideshift Labs
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 
 use super::*;
@@ -139,8 +140,10 @@ async fn both_obliterate_retirement_paths_advance_invalidation_with_retained_pay
     let url = pg_url().expect("LORE_TEST_PG_URL");
     let store = store(&url).await;
     let coordinator = store.fragment_coordinator();
-    enable_write_claims(&url, &coordinator).await;
     let repository = create_repository(&store).await;
+    // Arrange the legacy repository before enabling governed metadata admission.
+    // Both fragment publication and retirement still run with write claims active.
+    enable_write_claims(&url, &coordinator).await;
     let hash = publish_remote_fragment(&coordinator, 13).await;
     let first = random_context();
     let second = random_context();

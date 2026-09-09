@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 // Sanity checks API calls and responses.
 // Run `docker compose up` or set env variable to point to consul running in our cluster.
@@ -25,7 +26,10 @@ mod rs_consul_client_interactions {
         {
             (false, raw_address)
         } else {
-            (true, "http://127.0.0.1:8500".to_string())
+            (
+                true,
+                crate::hashicorp::consul::helpers::docker_compose_config().address,
+            )
         };
 
         let consul_config = Config {
