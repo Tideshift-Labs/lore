@@ -32,27 +32,30 @@ fn points() -> [PublicationPoint; 4] {
     ]
 }
 
-/// Descriptive phase timings, never a latency gate. The hook intervals include instrumentation
-/// overhead; on Windows publication measures the checked WRITE_THROUGH API, not power loss.
+/// Descriptive timings, never a latency gate or power-loss proof.
 #[tokio::test]
 async fn managed_child_publication_phase_counts_and_recovery() {
-    use std::time::Duration;
+    publication_phase_diagnostic(1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn managed_child_publication_phase_counts_and_recovery_with_16_workers() {
+    publication_phase_diagnostic(16).await;
+}
+
+async fn publication_phase_diagnostic(workers: usize) {
     use std::time::Instant;
 
     #[derive(Default)]
-    struct Timings {
-        flushing: Option<(PathBuf, Instant)>,
-        publishing: Option<(PathBuf, Instant)>,
+    struct Counts {
         flushes: usize,
         pending_publications: usize,
         settled_publications: usize,
-        flush_time: Duration,
-        publish_time: Duration,
     }
 
     const COUNT: usize = 128;
     let dir = tempfile::tempdir().unwrap();
-    let store = RepositoryAttemptStore::in_directory(dir.path());
+    let store = Arc::new(RepositoryAttemptStore::in_directory(dir.path()));
     let parent = Uuid::now_v7();
     let context = CallerRecoveryContext {
         repository: RepositoryId::from([0x41; 16]),
@@ -76,8 +79,10 @@ async fn managed_child_publication_phase_counts_and_recovery() {
         .await
         .unwrap();
     store.bind_parent_namespace(parent, &context).await.unwrap();
-    let timings = Arc::new(std::sync::Mutex::new(Timings::default()));
-    let measured = timings.clone();
+    let counts = Arc::new(std::sync::Mutex::new(Counts::default()));
+    let measured = counts.clone();
+    // Setup and verification are outside the timing scope. All child state starts fresh.
+    let phases = phase_diagnostics::Probe::install(dir.path().to_path_buf());
     let probe =
         install_publication_probe(dir.path().to_path_buf(), move |point, _, destination| {
             if !destination
@@ -91,32 +96,10 @@ async fn managed_child_publication_phase_counts_and_recovery() {
             }
             let mut measured = measured.lock().unwrap();
             match point {
-                PublicationPoint::AfterWrite => {
-                    assert!(
-                        measured
-                            .flushing
-                            .replace((destination.to_path_buf(), Instant::now()))
-                            .is_none()
-                    );
-                }
                 PublicationPoint::AfterSync => {
-                    let (path, started) = measured.flushing.take().unwrap();
-                    assert_eq!(path, destination);
                     measured.flushes += 1;
-                    measured.flush_time += started.elapsed();
-                }
-                PublicationPoint::BeforeRename => {
-                    assert!(
-                        measured
-                            .publishing
-                            .replace((destination.to_path_buf(), Instant::now()))
-                            .is_none()
-                    );
                 }
                 PublicationPoint::AfterRename => {
-                    let (path, started) = measured.publishing.take().unwrap();
-                    assert_eq!(path, destination);
-                    measured.publish_time += started.elapsed();
                     if destination.parent().unwrap().ends_with("pending") {
                         measured.pending_publications += 1;
                     } else {
@@ -128,47 +111,59 @@ async fn managed_child_publication_phase_counts_and_recovery() {
             Ok(())
         });
     let started = Instant::now();
-    for index in 1..=COUNT {
-        let child = record(index as u128, AttemptState::Unresolved);
-        store
-            .record_managed(
-                &child,
-                &ManagedAttemptIntent {
-                    version: 1,
-                    parent_id: parent,
-                    repository: context.repository,
-                    rpc: child.operation.clone(),
-                    canonical_request: vec![0x42; 64],
-                    endpoint: context.endpoint.clone(),
-                    verified_issuer: context.verified_issuer.clone(),
-                    authenticated_subject: context.authenticated_subject.clone(),
-                    caller_capabilities: context.caller_capabilities.clone(),
-                },
-            )
-            .await
-            .unwrap();
-        store
-            .resolve(&child.attempt_id, AttemptResolution::Applied)
-            .await
-            .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(workers));
+    let mut tasks = Vec::new();
+    for worker in 0..workers {
+        let store = store.clone();
+        let context = context.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio_util::task::AbortOnDropHandle::new(
+            lore_base::lore_spawn!(async move {
+                barrier.wait().await;
+                for index in ((worker + 1)..=COUNT).step_by(workers) {
+                    let child = record(index as u128, AttemptState::Unresolved);
+                    store
+                        .record_managed(
+                            &child,
+                            &ManagedAttemptIntent {
+                                version: 1,
+                                parent_id: parent,
+                                repository: context.repository,
+                                rpc: child.operation.clone(),
+                                canonical_request: vec![0x42; 64],
+                                endpoint: context.endpoint.clone(),
+                                verified_issuer: context.verified_issuer.clone(),
+                                authenticated_subject: context.authenticated_subject.clone(),
+                                caller_capabilities: context.caller_capabilities.clone(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    store
+                        .resolve(&child.attempt_id, AttemptResolution::Applied)
+                        .await
+                        .unwrap();
+                }
+            }),
+        ));
+    }
+    let mut results = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        results.push(task.await);
+    }
+    for result in results {
+        result.unwrap();
     }
     let total = started.elapsed();
     drop(probe);
     {
-        let measured = timings.lock().unwrap();
-        assert!(measured.flushing.is_none() && measured.publishing.is_none());
+        let measured = counts.lock().unwrap();
         assert_eq!(measured.flushes, COUNT * 2);
         assert_eq!(measured.pending_publications, COUNT * 2);
         assert_eq!(measured.settled_publications, COUNT);
         eprintln!(
-            "managed_child_phases children={COUNT} total_ms={:.3} flush_interval_ms={:.3} publish_interval_ms={:.3} residual_ms={:.3} flushes={} publications={} profile={}",
+            "managed_child_phases workers={workers} children={COUNT} wall_ms={:.3} flushes={} publications={} profile={} nested_totals_are_inclusive=true concurrent_totals_may_exceed_wall=true",
             total.as_secs_f64() * 1000.0,
-            measured.flush_time.as_secs_f64() * 1000.0,
-            measured.publish_time.as_secs_f64() * 1000.0,
-            total
-                .saturating_sub(measured.flush_time + measured.publish_time)
-                .as_secs_f64()
-                * 1000.0,
             measured.flushes,
             measured.pending_publications + measured.settled_publications,
             if cfg!(debug_assertions) {
@@ -176,6 +171,51 @@ async fn managed_child_publication_phase_counts_and_recovery() {
             } else {
                 "release"
             }
+        );
+    }
+    let snapshot = phases.snapshot();
+    drop(phases);
+    for (name, expected) in [
+        ("record_mutex_wait", COUNT),
+        ("resolve_mutex_wait", COUNT),
+        ("ensure_directory_inclusive", COUNT * 2),
+        ("journal_fslock_wait", COUNT * 2),
+        ("bootstrap_fslock_wait", COUNT * 2),
+        ("root_read", COUNT * 2),
+        ("root_parse", COUNT * 2),
+        ("root_validate_repair_inclusive", COUNT * 2),
+        ("child_read", COUNT * 4),
+        ("child_parse", COUNT),
+        ("child_validate", COUNT * 3),
+        ("child_serialize", COUNT * 2),
+        ("temporary_prepare_remove", COUNT * 2),
+        ("temporary_create", COUNT * 2),
+        ("temporary_write", COUNT * 2),
+        ("temporary_sync", COUNT * 2),
+        ("temporary_close", COUNT * 2),
+        ("publication_inclusive", COUNT * 3),
+        (
+            if cfg!(windows) {
+                "ancestor_repair_windows_test_only"
+            } else {
+                "ancestor_repair_unix"
+            },
+            COUNT * 2,
+        ),
+    ] {
+        assert_eq!(
+            snapshot.get(name).unwrap().count,
+            expected,
+            "{name}, workers={workers}"
+        );
+    }
+    for (phase, metric) in snapshot {
+        assert!(metric.max <= metric.total);
+        eprintln!(
+            "managed_child_phase workers={workers} phase={phase} count={} total_ms={:.3} max_ms={:.3}",
+            metric.count,
+            metric.total.as_secs_f64() * 1000.0,
+            metric.max.as_secs_f64() * 1000.0
         );
     }
     drop(store);
@@ -208,7 +248,7 @@ async fn managed_child_publication_phase_counts_and_recovery() {
     assert_eq!(parents.len(), 1);
     assert_eq!(parents[0].id, parent.to_string());
     assert!(parents[0].complete && parents[0].body_completed);
-    eprintln!("managed_child_phases verified_applied={COUNT}");
+    eprintln!("managed_child_phases workers={workers} verified_applied={COUNT}");
 }
 
 fn legacy(path: &Path) -> Vec<u8> {

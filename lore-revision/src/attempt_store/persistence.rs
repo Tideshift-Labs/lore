@@ -139,6 +139,15 @@ pub(crate) async fn ensure_directory(path: &Path) -> Result<(), ProtocolError> {
     // A prior publisher can leave a visible ancestor and then fail its directory sync.
     // Repair journal-created ancestors before using that visibility as authority. Existing
     // bootstrap sidecars identify their parents without creating files in system ancestors.
+    #[cfg(test)]
+    let repair = phase_diagnostics::start(
+        Some(&absolute),
+        if cfg!(windows) {
+            "ancestor_repair_windows_test_only"
+        } else {
+            "ancestor_repair_unix"
+        },
+    );
     #[cfg(any(not(windows), test))]
     for ancestor in parent.parent().into_iter().flat_map(Path::ancestors) {
         let bootstrap = ancestor.join(BOOTSTRAP_LOCK_FILE);
@@ -153,9 +162,15 @@ pub(crate) async fn ensure_directory(path: &Path) -> Result<(), ProtocolError> {
             Err(error) => return Err(io_error("inspect ancestor bootstrap", &bootstrap, error)),
         }
     }
+    #[cfg(test)]
+    drop(repair);
+    #[cfg(test)]
+    let wait = phase_diagnostics::start(Some(&absolute), "bootstrap_fslock_wait");
     let _bootstrap = FSLock::acquire_file_lock(parent.join(BOOTSTRAP_FILE))
         .await
         .map_err(|error| io_error("lock bootstrap for", &absolute, error))?;
+    #[cfg(test)]
+    drop(wait);
     match std::fs::metadata(&absolute) {
         Ok(metadata) if metadata.is_dir() => sync_directory(Some(parent)),
         Ok(_) => Err(ProtocolError::internal(
@@ -194,6 +209,8 @@ fn publish_directory(path: &Path) -> Result<(), ProtocolError> {
 /// locked operation reload disk state; callers must not dispatch after this error.
 #[allow(clippy::disallowed_methods)]
 fn publish(source: &Path, destination: &Path, replace: bool) -> Result<(), ProtocolError> {
+    #[cfg(test)]
+    let _publication = phase_diagnostics::start(Some(destination), "publication_inclusive");
     #[cfg(test)]
     publication_point(PublicationPoint::BeforeRename, source, destination)?;
     #[cfg(windows)]
@@ -267,6 +284,8 @@ fn sync_directory(directory: Option<&Path>) -> Result<(), ProtocolError> {
 
 #[allow(clippy::disallowed_methods)]
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ProtocolError> {
+    #[cfg(test)]
+    let preparation = phase_diagnostics::start(Some(path), "temporary_prepare_remove");
     let mut name = path.as_os_str().to_owned();
     name.push(TEMP_SUFFIX);
     let temporary = PathBuf::from(name);
@@ -277,30 +296,50 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ProtocolError> {
         Err(error) => return Err(io_error("remove temporary", &temporary, error)),
     }
     let mut options = std::fs::OpenOptions::new();
+    #[cfg(test)]
+    drop(preparation);
     options.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    #[cfg(test)]
+    let create = phase_diagnostics::start(Some(path), "temporary_create");
     let mut file = options
         .open(&temporary)
         .map_err(|error| io_error("create temporary", &temporary, error))?;
+    #[cfg(test)]
+    drop(create);
+    #[cfg(test)]
+    let write = phase_diagnostics::start(Some(path), "temporary_write");
     file.write_all(bytes)
         .map_err(|error| io_error("write temporary", &temporary, error))?;
     #[cfg(test)]
+    drop(write);
+    #[cfg(test)]
     publication_point(PublicationPoint::AfterWrite, &temporary, path)?;
+    #[cfg(test)]
+    let sync = phase_diagnostics::start(Some(path), "temporary_sync");
     file.sync_all()
         .map_err(|error| io_error("flush temporary", &temporary, error))?;
     #[cfg(test)]
+    drop(sync);
+    #[cfg(test)]
     publication_point(PublicationPoint::AfterSync, &temporary, path)?;
+    #[cfg(test)]
+    let close = phase_diagnostics::start(Some(path), "temporary_close");
     drop(file);
+    #[cfg(test)]
+    drop(close);
     publish(&temporary, path, true)
 }
 
 impl RepositoryAttemptStore {
     pub(super) fn load(&self, guard: &FSLock) -> Result<StoredDocument, ProtocolError> {
         let path = self.require_path()?;
+        #[cfg(test)]
+        let read = phase_diagnostics::start(Some(path), "root_read");
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -327,6 +366,10 @@ impl RepositoryAttemptStore {
             }
             Err(error) => return Err(io_error("read", path, error)),
         };
+        #[cfg(test)]
+        drop(read);
+        #[cfg(test)]
+        let parse = phase_diagnostics::start(Some(path), "root_parse");
         let (version, body) = bytes
             .split_first()
             .ok_or_else(|| ProtocolError::internal("empty attempt journal is corrupt"))?;
@@ -337,6 +380,10 @@ impl RepositoryAttemptStore {
         }
         let document: StoredDocument =
             serde_json::from_slice(body).map_err(|error| io_error("parse", path, error))?;
+        #[cfg(test)]
+        drop(parse);
+        #[cfg(test)]
+        let _validation = phase_diagnostics::start(Some(path), "root_validate_repair_inclusive");
         if *version == 1 {
             return self.migrate(guard, document);
         }
@@ -480,6 +527,8 @@ impl RepositoryAttemptStore {
         child: &StoredChild,
         id: &str,
     ) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        let _validation = phase_diagnostics::start(self.path.as_deref(), "child_validate");
         if child.version != ATTEMPT_STORE_VERSION || child.attempt.attempt_id != id {
             return Err(ProtocolError::internal(
                 "invalid journal child version or identity",
@@ -509,13 +558,21 @@ impl RepositoryAttemptStore {
         path: &Path,
         id: &str,
     ) -> Result<Option<StoredChild>, ProtocolError> {
+        #[cfg(test)]
+        let read = phase_diagnostics::start(Some(path), "child_read");
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(io_error("read child", path, error)),
         };
+        #[cfg(test)]
+        drop(read);
+        #[cfg(test)]
+        let parse = phase_diagnostics::start(Some(path), "child_parse");
         let child: StoredChild =
             serde_json::from_slice(&bytes).map_err(|error| io_error("parse child", path, error))?;
+        #[cfg(test)]
+        drop(parse);
         self.validate_child(document, &child, id)?;
         Ok(Some(child))
     }
@@ -604,8 +661,12 @@ impl RepositoryAttemptStore {
     }
 
     fn write_child_at(&self, path: &Path, child: &StoredChild) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        let serialize = phase_diagnostics::start(Some(path), "child_serialize");
         let bytes =
             serde_json::to_vec(child).map_err(|error| io_error("serialize child", path, error))?;
+        #[cfg(test)]
+        drop(serialize);
         write_atomic(path, &bytes)
     }
 

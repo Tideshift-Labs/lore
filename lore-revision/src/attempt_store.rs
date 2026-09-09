@@ -78,6 +78,8 @@ use crate::repository::RepositoryContext;
 mod operations;
 mod persistence;
 #[cfg(test)]
+mod phase_diagnostics;
+#[cfg(test)]
 mod publication_tests;
 
 pub(crate) use persistence::BOOTSTRAP_LOCK_FILE;
@@ -171,8 +173,12 @@ impl RepositoryAttemptStore {
     async fn guard(&self) -> Result<FSLock, ProtocolError> {
         let path = self.require_path()?;
         if let Some(parent) = path.parent() {
+            #[cfg(test)]
+            let _ensure = phase_diagnostics::start(Some(path), "ensure_directory_inclusive");
             ensure_directory(parent).await?;
         }
+        #[cfg(test)]
+        let _lock = phase_diagnostics::start(Some(path), "journal_fslock_wait");
         FSLock::acquire_file_lock(path).await.map_err(|error| {
             ProtocolError::internal(format!(
                 "Failed to lock the attempt store {}: {error}",
