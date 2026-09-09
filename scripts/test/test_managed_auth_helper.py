@@ -132,6 +132,26 @@ class ManagedAuthTests(unittest.TestCase):
             ],
         )
 
+    def test_denied_exchange_evidence_binds_subject_and_resource_without_token(self):
+        resource = "urc-" + uuid.uuid4().hex
+        with self.auth.lock:
+            subject = self.auth.identities[self.token][0]
+        with self.assertRaises(grpc.RpcError) as error:
+            self.call(
+                "ExchangeUserTokenForMultiresourceToken", field(1, resource.encode())
+            )
+        self.assertEqual(error.exception.code(), grpc.StatusCode.PERMISSION_DENIED)
+        with self.auth.lock:
+            evidence = list(self.auth.denied_exchanges)
+        self.assertEqual(evidence, [(subject, (resource,))])
+        self.assertNotIn(self.token, repr(evidence))
+        self.call(
+            "ExchangeUserTokenForMultiresourceToken",
+            field(1, ("urc-" + self.repository).encode()),
+        )
+        with self.auth.lock:
+            self.assertEqual(list(self.auth.denied_exchanges), evidence)
+
     def test_admin_grant_does_not_elevate_other_identity_or_ungranted_resource(self):
         self.auth.grant(self.token, self.repository, admin=True)
         other_token = self.auth.identity()

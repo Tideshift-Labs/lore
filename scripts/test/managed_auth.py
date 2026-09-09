@@ -7,6 +7,7 @@ The governed PostgreSQL proof remains clean_init_actual_cli.rs.
 """
 
 import base64
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +38,7 @@ class ManagedAuth:
         self.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         self.identities = {}
         self.lock = threading.Lock()
+        self.denied_exchanges = deque(maxlen=128)
         self.issuer = "https://python-fixture.invalid/" + uuid.uuid4().hex
         self.executor = ThreadPoolExecutor(max_workers=4)
         public = self.key.public_key().public_numbers()
@@ -237,6 +239,8 @@ class ManagedAuth:
             or len(set(resources)) != len(resources)
             or not set(resources) <= allowed.keys()
         ):
+            with self.lock:
+                self.denied_exchanges.append((subject, tuple(resources)))
             context.abort(
                 grpc.StatusCode.PERMISSION_DENIED,
                 "Repository is not granted to this fixture",

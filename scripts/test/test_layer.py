@@ -2297,14 +2297,25 @@ def test_layer_push_with_primary_only_caller_refuses_ungranted_layer(
     caller_dir.mkdir()
     token = auth.identity()
     auth.grant(token, repo.get_id())
+    with auth.lock:
+        caller_identity = auth.identities[token][0]
     try:
         auth.login(repo.lore_executable_path, caller_dir, remote, token)
         env = os.environ.copy()
         env.update(auth.environment(caller_dir))
+        # Preserve local object storage while isolating the caller's credentials.
+        env["LORE_GLOBAL_PATH"] = str(global_dir_name)
         env["LORE_REMOTE_URL"] = remote
         env.pop("SSL_CERT_DIR", None)
         result = subprocess.run(
-            [repo.lore_executable_path, "--repository", repo.path, "push"],
+            [
+                repo.lore_executable_path,
+                "--repository",
+                repo.path,
+                "--identity",
+                caller_identity,
+                "push",
+            ],
             cwd=repo.path,
             env=env,
             text=True,
@@ -2313,11 +2324,13 @@ def test_layer_push_with_primary_only_caller_refuses_ungranted_layer(
         )
         output = result.stdout + result.stderr
         assert result.returncode != 0, "primary-only identity must not push its layer"
-        assert re.search(
-            r"not.?authorized|permission.?denied|unauthorized|access.?denied",
-            output,
-            re.IGNORECASE,
-        ), output
+        denied_resource = "urc-" + layer.get_id().replace("-", "")
+        with auth.lock:
+            denied = list(auth.denied_exchanges)
+        assert any(
+            subject == caller_identity and denied_resource in resources
+            for subject, resources in denied
+        ), "the fresh caller must receive an actual layer authorization denial"
         assert "managed operation repository mismatch" not in output
         after = parse_jsonl(
             layer.branch_info("main", json=True, remote=True), "branchInfo"
