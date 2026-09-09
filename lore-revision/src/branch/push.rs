@@ -43,6 +43,7 @@ use crate::lore::Hash;
 use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_debug;
+use crate::managed_push::ManagedPushRunner;
 use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
@@ -317,6 +318,16 @@ pub async fn push(
     options: PushOptions,
     attempts: Option<Arc<dyn AttemptStore>>,
 ) -> Result<(), PushError> {
+    push_with_runner(repository, token, options, attempts, None).await
+}
+
+pub async fn push_with_runner(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: PushOptions,
+    attempts: Option<Arc<dyn AttemptStore>>,
+    runner: Option<Arc<ManagedPushRunner>>,
+) -> Result<(), PushError> {
     let branch;
     let local_latest;
     if let Some(branch_identifier) = &options.branch {
@@ -348,6 +359,7 @@ pub async fn push(
         branch,
         local_latest,
         attempts.clone(),
+        runner.clone(),
     )
     .await?;
 
@@ -367,6 +379,7 @@ pub async fn push(
             branch,
             layer.current,
             attempts.clone(),
+            runner.clone(),
         )
         .await?;
     }
@@ -397,6 +410,7 @@ pub async fn push(
                 link_branch_id,
                 link_local_latest,
                 attempts.clone(),
+                runner.clone(),
             )
             .await?;
         }
@@ -405,6 +419,8 @@ pub async fn push(
     Ok(())
 }
 
+// Keep the explicit stage runner separate from the existing push execution inputs.
+#[allow(clippy::too_many_arguments)]
 async fn collect_fragments_and_push(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -413,6 +429,7 @@ async fn collect_fragments_and_push(
     branch: BranchId,
     local_latest: Hash,
     attempts: Option<Arc<dyn AttemptStore>>,
+    runner: Option<Arc<ManagedPushRunner>>,
 ) -> Result<(), PushError> {
     let remote = repository
         .remote()
@@ -606,7 +623,8 @@ async fn collect_fragments_and_push(
     if already_pushed {
         if remote_deleted && !dry_run {
             lore_debug!("Branch deleted on server with same latest, restoring via branch_create");
-            under_own_attempt(
+            push_revision_stage(
+                runner.as_ref(),
                 attempts.as_ref(),
                 repository.id,
                 GrpcRpc::RevisionBranchCreate,
@@ -653,7 +671,8 @@ async fn collect_fragments_and_push(
     // If the branch was deleted on the server, restore it via branch_create
     if remote_deleted && !dry_run {
         lore_debug!("Branch deleted on server, restoring via branch_create before push");
-        under_own_attempt(
+        push_revision_stage(
+            runner.as_ref(),
             attempts.as_ref(),
             repository.id,
             GrpcRpc::RevisionBranchCreate,
@@ -685,7 +704,8 @@ async fn collect_fragments_and_push(
         .send();
 
         if !dry_run {
-            remote_latest = under_own_attempt(
+            remote_latest = push_revision_stage(
+                runner.as_ref(),
                 attempts.as_ref(),
                 repository.id,
                 GrpcRpc::RevisionBranchCreate,
@@ -746,7 +766,7 @@ async fn collect_fragments_and_push(
                     "Pushing link changes for link ID {link_id} on branch {link_branch_id} at revision {link_signature}"
                 );
 
-                if collect_fragments_and_push_recurse(
+                collect_fragments_and_push_recurse(
                     link_repository,
                     token.share(),
                     options.clone(),
@@ -754,14 +774,10 @@ async fn collect_fragments_and_push(
                     link_branch_id,
                     link_reference.signature,
                     attempts.clone(),
+                    runner.clone(),
                 )
                 .await
-                .is_err()
-                {
-                    return Err(PushError::internal(format!(
-                        "Failed to push link with ID {link_id}"
-                    )));
-                }
+                .forward::<PushError>("pushing linked repository")?;
             }
         }
 
@@ -850,11 +866,16 @@ async fn collect_fragments_and_push(
         }));
 
         if !dry_run {
-            push_fragments(
-                repository.clone(),
-                storage_protocol.clone(),
-                fragments,
-                stats.clone(),
+            push_stage(
+                runner.as_ref(),
+                repository.id,
+                "upload-fragments",
+                push_fragments(
+                    repository.clone(),
+                    storage_protocol.clone(),
+                    fragments,
+                    stats.clone(),
+                ),
             )
             .await?;
         }
@@ -896,7 +917,8 @@ async fn collect_fragments_and_push(
         let mut response_message = None;
 
         if !dry_run && remote_latest != current_revision {
-            let push_result = under_own_attempt(
+            let push_result = push_revision_stage(
+                runner.as_ref(),
                 attempts.as_ref(),
                 repository.id,
                 GrpcRpc::RevisionBranchPush,
@@ -924,7 +946,8 @@ async fn collect_fragments_and_push(
                     )
                     .send();
 
-                    under_own_attempt(
+                    push_revision_stage(
+                        runner.as_ref(),
                         attempts.as_ref(),
                         repository.id,
                         GrpcRpc::RevisionBranchCreate,
@@ -946,7 +969,8 @@ async fn collect_fragments_and_push(
                     )
                     .send();
 
-                    under_own_attempt(
+                    push_revision_stage(
+                        runner.as_ref(),
                         attempts.as_ref(),
                         repository.id,
                         GrpcRpc::RevisionBranchPush,
@@ -1080,6 +1104,42 @@ async fn collect_fragments_and_push(
     Ok(())
 }
 
+async fn push_stage<T, E, F>(
+    runner: Option<&Arc<ManagedPushRunner>>,
+    repository: RepositoryId,
+    label: &str,
+    future: F,
+) -> Result<T, E>
+where
+    E: ErrorSet + lore_error_set::HasAll<<ProtocolError as ErrorSet>::Variants> + FfiError,
+    F: Future<Output = Result<T, E>>,
+{
+    match runner {
+        Some(runner) => runner.run_stage(repository, label, future).await,
+        None => future.await,
+    }
+}
+
+async fn push_revision_stage<T, F>(
+    runner: Option<&Arc<ManagedPushRunner>>,
+    attempts: Option<&Arc<dyn AttemptStore>>,
+    repository: RepositoryId,
+    rpc: GrpcRpc,
+    dispatch: F,
+) -> Result<T, ProtocolError>
+where
+    F: Future<Output = Result<T, ProtocolError>>,
+{
+    push_stage(
+        runner,
+        repository,
+        &format!("{rpc:?}"),
+        under_own_attempt(attempts, repository, rpc, dispatch),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_fragments_and_push_recurse(
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
@@ -1088,6 +1148,7 @@ fn collect_fragments_and_push_recurse(
     branch: BranchId,
     local_latest: Hash,
     attempts: Option<Arc<dyn AttemptStore>>,
+    runner: Option<Arc<ManagedPushRunner>>,
 ) -> Pin<Box<dyn Future<Output = Result<(), PushError>> + Send>> {
     Box::pin(async move {
         collect_fragments_and_push(
@@ -1098,6 +1159,7 @@ fn collect_fragments_and_push_recurse(
             branch,
             local_latest,
             attempts,
+            runner,
         )
         .await
     })

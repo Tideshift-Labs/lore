@@ -7,7 +7,6 @@ import re
 import tomllib
 from lore import Lore
 from lore_parsers import (
-    parse_branch_info,
     parse_complete_json,
     parse_jsonl,
     parse_layer_list_json,
@@ -474,7 +473,9 @@ def test_layer_branch_archive_reports_once(new_lore_repo):
 @pytest.mark.smoke
 def test_layer_branch_archive_continues_past_refusing_layer(new_lore_repo):
     """One layer refusing the archive does not stop the remaining layers."""
-    repo, second_repo, third_repo = _setup_repo_with_two_layers(new_lore_repo)
+    repo, second_repo, third_repo = _setup_repo_with_two_layers(
+        new_lore_repo, second_repo_admin=True
+    )
 
     repo.branch_create("feature")
     repo.push()
@@ -787,12 +788,14 @@ def test_layer_branch_switch_name_collision(new_lore_repo):
     )
 
 
-def _setup_repo_with_two_layers(new_lore_repo):
+def _setup_repo_with_two_layers(new_lore_repo, *, second_repo_admin=False):
     """Set up a parent repo with two non-overlapping layers (sec, thr) and
     initial content in each. Returns (parent_repo, second_repo, third_repo).
     """
     repo: Lore = new_lore_repo()
-    second_repo: Lore = new_lore_repo(repo.name + "_second")
+    second_repo: Lore = new_lore_repo(
+        repo.name + "_second", repository_admin=second_repo_admin
+    )
     third_repo: Lore = new_lore_repo(repo.name + "_third")
 
     with repo.open_file("root_repo.txt", mode="w+b") as out:
@@ -2245,3 +2248,95 @@ def test_layer_source_path_inside_link_is_rejected(new_lore_repo):
     assert middle.get_id() not in target.layer_list(), (
         "No layer should be added when the source path belongs to a linked repository"
     )
+
+
+@pytest.mark.smoke
+def test_layer_push_with_primary_only_caller_refuses_ungranted_layer(
+    new_lore_repo, managed_cli_identity, global_dir_name, tmp_path
+):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    auth, remote, setup_token = managed_cli_identity
+
+    def signed_repo(*args, **kwargs):
+        repository = Lore.generate_id()
+        auth.grant(setup_token, repository)
+        return new_lore_repo(
+            *args,
+            repo_id=repository,
+            remote_url=remote,
+            environment_vars=auth.environment(global_dir_name),
+            **kwargs,
+        )
+
+    repo, layer = _setup_repo_with_layer(signed_repo)
+    with repo.open_file(LAYER_FILE, "wb") as changed_file:
+        changed_file.write(b"layer change requiring authorization")
+    repo.stage(scan=True)
+    repo.commit()
+    before = parse_jsonl(
+        layer.branch_info("main", json=True, remote=True), "branchInfo"
+    )[0]["latestRemote"]
+
+    def attempts():
+        root = Path(repo.path) / ".lore-workflow"
+        paths = list(root.glob("attempts-v2-*/*/*.json"))
+        assert paths, "setup pushes must have durable journal children"
+        assert len(paths) < 1000, "this is a bounded two-file fixture"
+        rows = {str(path): json.loads(path.read_text()) for path in paths}
+        for row in rows.values():
+            assert row["version"] == 2
+            assert row["attempt"]["attempt_id"]
+            assert row["attempt"]["repository"]
+        return rows
+
+    existing = attempts()
+    caller_dir = tmp_path / "primary-only-caller"
+    caller_dir.mkdir()
+    token = auth.identity()
+    auth.grant(token, repo.get_id())
+    try:
+        auth.login(repo.lore_executable_path, caller_dir, remote, token)
+        env = os.environ.copy()
+        env.update(auth.environment(caller_dir))
+        env["LORE_REMOTE_URL"] = remote
+        env.pop("SSL_CERT_DIR", None)
+        result = subprocess.run(
+            [repo.lore_executable_path, "--repository", repo.path, "push"],
+            cwd=repo.path,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+        output = result.stdout + result.stderr
+        assert result.returncode != 0, "primary-only identity must not push its layer"
+        assert re.search(
+            r"not.?authorized|permission.?denied|unauthorized|access.?denied",
+            output,
+            re.IGNORECASE,
+        ), output
+        assert "managed operation repository mismatch" not in output
+        after = parse_jsonl(
+            layer.branch_info("main", json=True, remote=True), "branchInfo"
+        )[0]["latestRemote"]
+        assert after == before, "denied target branch must remain unchanged"
+        new = {path: row for path, row in attempts().items() if path not in existing}
+        assert not any(
+            row["attempt"]["repository"] == layer.get_id() for row in new.values()
+        ), "ungranted layer must not admit a managed write"
+    finally:
+        with auth.lock:
+            auth.identities.pop(token, None)
+        for name in (
+            "auth.json",
+            "tokenstore.toml",
+            "tokens.toml",
+            "sec-tokenstore_encryption_key",
+        ):
+            path = caller_dir / name
+            if path.is_symlink():
+                raise RuntimeError("Refusing redirected fixture credential cleanup")
+            path.unlink(missing_ok=True)

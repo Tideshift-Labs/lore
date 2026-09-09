@@ -917,6 +917,47 @@ pub async fn push_with_attempt_store(
     push_journalled(globals, args, callback, Some(attempts)).await
 }
 
+/// Managed push adoption for CLI and embedders: one fence, sequential repository stages.
+pub async fn push_managed(
+    globals: LoreGlobalArgs,
+    args: LoreBranchPushArgs,
+    callback: LoreEventCallback,
+    observer: Option<Arc<dyn lore_revision::managed_push::ManagedPushObserver>>,
+) -> i32 {
+    if service_delegation_requested() || lore_transport::has_managed_caller() {
+        return reject_undelegatable(
+            globals,
+            callback,
+            "Managed push requires a fresh in-process workflow, without an existing caller context"
+                .to_owned(),
+        )
+        .await;
+    }
+    let guard = match lore_revision::repository_fence::RepositoryMutationGuard::acquire(
+        std::path::Path::new(globals.repository_path.as_str()),
+    )
+    .await
+    {
+        Ok(guard) => Arc::new(guard),
+        Err(error) => return reject_undelegatable(globals, callback, error.to_string()).await,
+    };
+    let runner = Arc::new(lore_revision::managed_push::ManagedPushRunner::new(
+        guard.clone(),
+        observer,
+    ));
+    guard
+        .run(repository_call_write(
+            globals,
+            callback,
+            args,
+            push,
+            move |repository, token, args| async move {
+                push_impl_with_runner(repository, &token, args, None, Some(runner)).await
+            },
+        ))
+        .await
+}
+
 async fn push_local(
     globals: LoreGlobalArgs,
     args: LoreBranchPushArgs,
@@ -949,6 +990,16 @@ async fn push_impl(
     args: LoreBranchPushArgs,
     attempts: Option<Arc<dyn AttemptStore>>,
 ) -> Result<(), branch::push::PushError> {
+    push_impl_with_runner(repository, token, args, attempts, None).await
+}
+
+async fn push_impl_with_runner(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    args: LoreBranchPushArgs,
+    attempts: Option<Arc<dyn AttemptStore>>,
+    runner: Option<Arc<lore_revision::managed_push::ManagedPushRunner>>,
+) -> Result<(), branch::push::PushError> {
     repository
         .remote()
         .await
@@ -966,7 +1017,8 @@ async fn push_impl(
     // dispatch exactly as it did before. An embedder that keeps one reaches here through
     // `push_with_attempt_store`, which is what makes the id it recorded the id the server files a
     // receipt under.
-    lore_revision::branch::push::push(repository, token, options, attempts).await
+    lore_revision::branch::push::push_with_runner(repository, token, options, attempts, runner)
+        .await
 }
 
 #[repr(C)]

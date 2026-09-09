@@ -34,7 +34,7 @@ def find_status_entry(entries: list[dict], path: str) -> dict | None:
 
 @pytest.mark.smoke
 def test_sync(new_lore_repo):
-    repo: Lore = new_lore_repo()
+    repo: Lore = new_lore_repo(repository_admin=True)
     # Generate some files
     text_file = "text-File.txt"
     unicode_file = os.path.join("奇怪的路徑", "کاراکترهای یونیکد")

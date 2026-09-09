@@ -187,6 +187,56 @@ mod tests {
             RepositoryId::from([7u8; 16])
         }
 
+        #[tokio::test]
+        async fn arbitrary_foreign_context_refuses_before_dispatch_or_journal_write() {
+            use std::sync::atomic::AtomicBool;
+            use std::sync::atomic::Ordering;
+
+            for named in [false, true] {
+                let store = store();
+                let dispatched = AtomicBool::new(false);
+                let context = lore_transport::caller_operation::CallerOperationContext::new(
+                    uuid::Uuid::now_v7(),
+                    repository(),
+                    store.clone(),
+                );
+                let foreign = RepositoryId::from([8u8; 16]);
+                let result = lore_transport::with_caller_operation(context, async {
+                    let dispatch = async {
+                        dispatched.store(true, Ordering::SeqCst);
+                        Ok::<_, ProtocolError>(())
+                    };
+                    if named {
+                        under_named_attempt(
+                            Some(&store),
+                            AttemptId::new(),
+                            foreign,
+                            GrpcRpc::RevisionBranchPush,
+                            dispatch,
+                        )
+                        .await
+                    } else {
+                        under_own_attempt(
+                            Some(&store),
+                            foreign,
+                            GrpcRpc::RevisionBranchPush,
+                            dispatch,
+                        )
+                        .await
+                    }
+                })
+                .await;
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("repository mismatch")
+                );
+                assert!(!dispatched.load(Ordering::SeqCst));
+                assert!(store.unresolved().await.unwrap().is_empty());
+            }
+        }
+
         /// The id recorded before the dispatch is the id the dispatch runs under. If these ever
         /// differ the caller journals one identity and the server files another.
         #[tokio::test]

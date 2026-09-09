@@ -34,6 +34,8 @@
 
 const MANAGED_FIXTURE_TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczovL2ZpeHR1cmUuaW52YWxpZC9pc3N1ZXIiLCJzdWIiOiJmaXh0dXJlLXVzZXIiLCJuYW1lIjoiZml4dHVyZS11c2VyIiwiZXhwIjo0MTAyNDQ0ODAwLCJhdWQiOiJmaXh0dXJlIn0.eA";
 
+pub mod receipt;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -351,6 +353,7 @@ struct ServerState {
 /// Aborting the accept loop on drop is deliberate but not load-bearing: the ephemeral port is
 /// released when the process ends either way, and no test here severs a connection.
 pub struct LockServer {
+    pub receipts: Arc<receipt::ReceiptProbe>,
     addr: SocketAddr,
     state: Arc<ServerState>,
     handle: tokio::task::JoinHandle<()>,
@@ -384,6 +387,8 @@ impl LockServer {
     /// One server rather than two, because a repository names exactly one remote and a push
     /// reaches both services through it.
     pub async fn start_with_policies(policy: LockPolicy, revision: RevisionPolicy) -> Self {
+        let receipts = Arc::new(receipt::ReceiptProbe::default());
+        let receipt_service = receipt::service(receipts.clone());
         let state = Arc::new(ServerState {
             calls: Mutex::new(Vec::new()),
             policy: Mutex::new(policy),
@@ -419,6 +424,7 @@ impl LockServer {
         // one command's context on every request the server ever handles.
         let handle = lore_base::lore_spawn_net_nocontext!(async move {
             let _ = tonic::transport::Server::builder()
+                .add_service(receipt_service)
                 .add_service(LockServiceServer::new(lock_service))
                 .add_service(RevisionServiceServer::new(revision_service))
                 .add_service(EnvironmentServiceServer::new(StubEnvironmentService))
@@ -427,6 +433,7 @@ impl LockServer {
         });
 
         Self {
+            receipts,
             addr,
             state,
             handle,

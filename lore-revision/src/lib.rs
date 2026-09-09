@@ -55,6 +55,7 @@ pub mod protocol;
 pub mod relay;
 pub mod repository;
 pub mod repository_fence;
+pub mod managed_push;
 pub mod revision;
 pub mod runtime;
 pub mod stage;

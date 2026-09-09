@@ -948,12 +948,7 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
             .with_defaults(),
     ));
 
-    return runtime().block_on(crate::commands::operation::managed(
-        &globals.clone(),
-        "push",
-        format!("{push_args:?}"),
-        |store| branch::push_with_attempt_store(globals, push_args, callback, store),
-    )) as u8;
+    return runtime().block_on(branch::push_managed(globals, push_args, callback, None)) as u8;
 }
 
 fn handle_branch_merge_unresolve(globals: LoreGlobalArgs, args: &BranchMergeUnresolveArgs) -> u8 {
