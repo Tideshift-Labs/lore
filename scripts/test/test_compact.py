@@ -16,10 +16,12 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.mark.slow
+@pytest.mark.timeout(3600)
 def test_store_compaction(new_lore_repo, lore_executable_path):
     repo: Lore = new_lore_repo()
 
-    # Generate 10k files
+    # Generate 100k files. The initial managed push alone measured about 15 minutes
+    # on the local release fixture; this whole-case guard also bounds the GC stress.
     for i in range(10):
         subpath = str(i)
         for j in range(10):
@@ -114,9 +116,15 @@ def test_store_compaction(new_lore_repo, lore_executable_path):
                 ]
             )
 
-            time.sleep(random.uniform(1.0, 5.0))
-
-            p.terminate()
+            try:
+                time.sleep(random.uniform(1.0, 5.0))
+            finally:
+                p.terminate()
+                try:
+                    p.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait(timeout=10)
         else:
             repo.repository_gc(debug=True)
 
