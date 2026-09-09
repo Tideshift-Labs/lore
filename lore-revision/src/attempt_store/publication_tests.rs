@@ -32,6 +32,185 @@ fn points() -> [PublicationPoint; 4] {
     ]
 }
 
+/// Descriptive phase timings, never a latency gate. The hook intervals include instrumentation
+/// overhead; on Windows publication measures the checked WRITE_THROUGH API, not power loss.
+#[tokio::test]
+async fn managed_child_publication_phase_counts_and_recovery() {
+    use std::time::Duration;
+    use std::time::Instant;
+
+    #[derive(Default)]
+    struct Timings {
+        flushing: Option<(PathBuf, Instant)>,
+        publishing: Option<(PathBuf, Instant)>,
+        flushes: usize,
+        pending_publications: usize,
+        settled_publications: usize,
+        flush_time: Duration,
+        publish_time: Duration,
+    }
+
+    const COUNT: usize = 128;
+    let dir = tempfile::tempdir().unwrap();
+    let store = RepositoryAttemptStore::in_directory(dir.path());
+    let parent = Uuid::now_v7();
+    let context = CallerRecoveryContext {
+        repository: RepositoryId::from([0x41; 16]),
+        endpoint: "https://publication-timing.invalid:443".into(),
+        verified_issuer: "timing-issuer".into(),
+        authenticated_subject: "timing-subject".into(),
+        caller_capabilities: "read,write".into(),
+    };
+    store
+        .begin_parent(ManagedParent {
+            version: 1,
+            id: parent.to_string(),
+            root: "publication-timing".into(),
+            operation: "push".into(),
+            normalized_intent: "publication-timing".into(),
+            namespace: None,
+            complete: false,
+            parent_uncertainty_code: None,
+            body_completed: false,
+        })
+        .await
+        .unwrap();
+    store.bind_parent_namespace(parent, &context).await.unwrap();
+    let timings = Arc::new(std::sync::Mutex::new(Timings::default()));
+    let measured = timings.clone();
+    let probe =
+        install_publication_probe(dir.path().to_path_buf(), move |point, _, destination| {
+            if !destination
+                .parent()
+                .is_some_and(|p| p.ends_with("pending") || p.ends_with("settled"))
+                || destination
+                    .extension()
+                    .is_none_or(|extension| extension != "json")
+            {
+                return Ok(());
+            }
+            let mut measured = measured.lock().unwrap();
+            match point {
+                PublicationPoint::AfterWrite => {
+                    assert!(
+                        measured
+                            .flushing
+                            .replace((destination.to_path_buf(), Instant::now()))
+                            .is_none()
+                    );
+                }
+                PublicationPoint::AfterSync => {
+                    let (path, started) = measured.flushing.take().unwrap();
+                    assert_eq!(path, destination);
+                    measured.flushes += 1;
+                    measured.flush_time += started.elapsed();
+                }
+                PublicationPoint::BeforeRename => {
+                    assert!(
+                        measured
+                            .publishing
+                            .replace((destination.to_path_buf(), Instant::now()))
+                            .is_none()
+                    );
+                }
+                PublicationPoint::AfterRename => {
+                    let (path, started) = measured.publishing.take().unwrap();
+                    assert_eq!(path, destination);
+                    measured.publish_time += started.elapsed();
+                    if destination.parent().unwrap().ends_with("pending") {
+                        measured.pending_publications += 1;
+                    } else {
+                        measured.settled_publications += 1;
+                    }
+                }
+                _ => (),
+            }
+            Ok(())
+        });
+    let started = Instant::now();
+    for index in 1..=COUNT {
+        let child = record(index as u128, AttemptState::Unresolved);
+        store
+            .record_managed(
+                &child,
+                &ManagedAttemptIntent {
+                    version: 1,
+                    parent_id: parent,
+                    repository: context.repository,
+                    rpc: child.operation.clone(),
+                    canonical_request: vec![0x42; 64],
+                    endpoint: context.endpoint.clone(),
+                    verified_issuer: context.verified_issuer.clone(),
+                    authenticated_subject: context.authenticated_subject.clone(),
+                    caller_capabilities: context.caller_capabilities.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .resolve(&child.attempt_id, AttemptResolution::Applied)
+            .await
+            .unwrap();
+    }
+    let total = started.elapsed();
+    drop(probe);
+    {
+        let measured = timings.lock().unwrap();
+        assert!(measured.flushing.is_none() && measured.publishing.is_none());
+        assert_eq!(measured.flushes, COUNT * 2);
+        assert_eq!(measured.pending_publications, COUNT * 2);
+        assert_eq!(measured.settled_publications, COUNT);
+        eprintln!(
+            "managed_child_phases children={COUNT} total_ms={:.3} flush_interval_ms={:.3} publish_interval_ms={:.3} residual_ms={:.3} flushes={} publications={} profile={}",
+            total.as_secs_f64() * 1000.0,
+            measured.flush_time.as_secs_f64() * 1000.0,
+            measured.publish_time.as_secs_f64() * 1000.0,
+            total
+                .saturating_sub(measured.flush_time + measured.publish_time)
+                .as_secs_f64()
+                * 1000.0,
+            measured.flushes,
+            measured.pending_publications + measured.settled_publications,
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+        );
+    }
+    drop(store);
+    let reopened = RepositoryAttemptStore::in_directory(dir.path());
+    assert!(reopened.unresolved().await.unwrap().is_empty());
+    for index in 1..=COUNT {
+        let expected = record(
+            index as u128,
+            AttemptState::Resolved(AttemptResolution::Applied),
+        );
+        assert_eq!(
+            reopened.lookup(&expected.attempt_id).await.unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            reopened
+                .recovery_context(&expected.attempt_id)
+                .await
+                .unwrap(),
+            context
+        );
+    }
+    reopened.complete_parent_body(parent).await.unwrap();
+    reopened.finish_parent(parent).await.unwrap();
+    drop(reopened);
+    let parents = RepositoryAttemptStore::in_directory(dir.path())
+        .managed_parents()
+        .await
+        .unwrap();
+    assert_eq!(parents.len(), 1);
+    assert_eq!(parents[0].id, parent.to_string());
+    assert!(parents[0].complete && parents[0].body_completed);
+    eprintln!("managed_child_phases verified_applied={COUNT}");
+}
+
 fn legacy(path: &Path) -> Vec<u8> {
     let document = serde_json::json!({"attempts":[{
         "attempt_id":record(1, AttemptState::Unresolved).attempt_id.to_string(),

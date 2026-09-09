@@ -94,6 +94,15 @@ pub(super) struct StoredChild {
     pub(super) managed: Option<StoredManagedIntent>,
 }
 
+/// Single-use lookup retained while its journal lock is held. Callers must not write
+/// another child between loading this value and passing it to `write_child`.
+pub(super) struct LoadedChild<'guard> {
+    _guard: &'guard FSLock,
+    id: String,
+    pub(super) child: Option<StoredChild>,
+    path: Option<PathBuf>,
+}
+
 impl StoredChild {
     pub(super) fn new(attempt: StoredAttempt, managed: Option<StoredManagedIntent>) -> Self {
         Self {
@@ -541,19 +550,42 @@ impl RepositoryAttemptStore {
         }
     }
 
+    pub(super) fn load_child<'guard>(
+        &self,
+        guard: &'guard FSLock,
+        document: &StoredDocument,
+        id: &str,
+    ) -> Result<LoadedChild<'guard>, ProtocolError> {
+        let (child, path) = match self.child(document, id)? {
+            Some((child, path)) => (Some(child), Some(path)),
+            None => (None, None),
+        };
+        Ok(LoadedChild {
+            _guard: guard,
+            id: id.to_owned(),
+            child,
+            path,
+        })
+    }
+
     pub(super) fn write_child(
         &self,
         document: &StoredDocument,
         child: &StoredChild,
+        existing: LoadedChild<'_>,
     ) -> Result<(), ProtocolError> {
         let id = &child.attempt.attempt_id;
+        if *id != existing.id {
+            return Err(ProtocolError::internal(
+                "loaded journal child identity mismatch",
+            ));
+        }
         self.validate_child(document, child, id)?;
         let generation = self.generation(document)?;
         let pending = generation.join("pending").join(format!("{id}.json"));
         let settled = generation.join("settled").join(format!("{id}.json"));
-        let existing = self.child(document, id)?;
         if child.attempt.state.is_unresolved() {
-            if let Some((_, path)) = existing
+            if let Some(path) = existing.path
                 && path == settled
             {
                 // Never publish unresolved bytes in settled. A crash before the replacement
@@ -561,7 +593,7 @@ impl RepositoryAttemptStore {
                 publish(&settled, &pending, false)?;
             }
             self.write_child_at(&pending, child)
-        } else if let Some((_, path)) = existing
+        } else if let Some(path) = existing.path
             && path == pending
         {
             self.write_child_at(&pending, child)?;

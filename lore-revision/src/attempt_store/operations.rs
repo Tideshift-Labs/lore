@@ -22,9 +22,8 @@ impl AttemptStore for RepositoryAttemptStore {
         let guard = self.guard().await?;
         let mut document = self.load_for_write(&guard)?;
         let id = record.attempt_id.to_string();
-        if self.child(&document, &id)?.is_some()
-            || document.managed.iter().any(|child| child.attempt == id)
-        {
+        let existing = self.load_child(&guard, &document, &id)?;
+        if existing.child.is_some() || document.managed.iter().any(|child| child.attempt == id) {
             return Err(ProtocolError::internal(
                 "managed child identity already dispatched",
             ));
@@ -68,6 +67,7 @@ impl AttemptStore for RepositoryAttemptStore {
                     canonical_request: intent.canonical_request.clone(),
                 }),
             ),
+            existing,
         )
     }
 
@@ -80,12 +80,13 @@ impl AttemptStore for RepositoryAttemptStore {
             .managed
             .iter()
             .position(|child| child.attempt == id);
-        let existing = self.child(&document, &id)?;
+        let existing = self.load_child(&guard, &document, &id)?;
         let managed = if let Some(index) = orphan {
             let intent = &document.managed[index];
             if existing
+                .child
                 .as_ref()
-                .is_some_and(|(child, _)| child.managed.as_ref() != Some(intent))
+                .is_some_and(|child| child.managed.as_ref() != Some(intent))
             {
                 return Err(ProtocolError::internal(
                     "legacy intent transition does not match stored child",
@@ -93,11 +94,15 @@ impl AttemptStore for RepositoryAttemptStore {
             }
             Some(intent.clone())
         } else {
-            existing.and_then(|(child, _)| child.managed)
+            existing
+                .child
+                .as_ref()
+                .and_then(|child| child.managed.clone())
         };
         self.write_child(
             &document,
             &StoredChild::new(StoredAttempt::try_from(record)?, managed),
+            existing,
         )?;
         if let Some(index) = orphan {
             // Preserve ordinary record's v1 meaning: the old intent remains attached. Publish
@@ -229,9 +234,10 @@ impl AttemptStore for RepositoryAttemptStore {
         let _local = self.write_guard.lock().await;
         let guard = self.guard().await?;
         let document = self.load(&guard)?;
-        if let Some((mut child, _)) = self.child(&document, &attempt.to_string())? {
+        let mut existing = self.load_child(&guard, &document, &attempt.to_string())?;
+        if let Some(mut child) = existing.child.take() {
             child.attempt.state = StoredState::from(&AttemptState::Resolved(resolution));
-            self.write_child(&document, &child)?;
+            self.write_child(&document, &child, existing)?;
         }
         // Ownership outlives an attempt. Only confirmed release clears its token.
         Ok(())
@@ -273,7 +279,13 @@ impl RepositoryAttemptStore {
             .parents
             .iter()
             .any(|held| held.id == parent.to_string() && held.version == 1 && !held.complete)
-            || self.child(&document, &attempt.to_string())?.is_some()
+        {
+            return Err(ProtocolError::internal(
+                "workflow parent missing or child already exists",
+            ));
+        }
+        let existing = self.load_child(&guard, &document, &attempt.to_string())?;
+        if existing.child.is_some()
             || document
                 .managed
                 .iter()
@@ -301,6 +313,7 @@ impl RepositoryAttemptStore {
                     canonical_request: canonical_intent,
                 }),
             ),
+            existing,
         )
     }
 
