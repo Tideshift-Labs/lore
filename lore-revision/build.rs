@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::env;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
     if env::var("CARGO_FEATURE_SWFS").is_ok() {
         let swfs_lib_dir =
             PathBuf::from_str(&env::var("SWFS_LIB_DIR").expect("SWFS_LIB_DIR not set"))

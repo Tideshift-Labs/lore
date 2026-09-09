@@ -112,6 +112,7 @@ pub fn load(
     ignore.add_exclusion(DOT_URC)?;
     ignore.add_exclusion(DOT_LORE)?;
     ignore.add_exclusion(crate::repository_fence::WORKFLOW_DIRECTORY)?;
+    ignore.add_exclusion(crate::attempt_store::BOOTSTRAP_LOCK_FILE)?;
     ignore.add_exclusion(&format!("*{MINE_SUFFIX}"))?;
     ignore.add_exclusion(&format!("*{THEIRS_SUFFIX}"))?;
     ignore.add_exclusion(&format!("*{BASE_SUFFIX}"))?;

@@ -7,8 +7,9 @@
 //! [`lore_transport::attempt_store`] defines the shape and ships only a volatile, test-only
 //! implementation, on the argument that a store which acknowledges a write before it is durable
 //! gives a caller permission to dispatch a mutation it can never ask about. This is the durable
-//! one: a single file under the repository's `.lore/` directory, written whole, replaced
-//! atomically, and guarded across processes by the same `FSLock` sidecar the token cache uses.
+//! one: a small versioned root and separate attempt files, atomically published and guarded
+//! across processes by the same `FSLock` sidecar the token cache uses. Settled history is not
+//! rewritten for each child dispatch. Version-one roots migrate before their first use.
 //!
 //! # Why it lives beside the repository rather than in the user's config directory
 //!
@@ -74,6 +75,15 @@ use uuid::Uuid;
 
 use crate::repository::RepositoryContext;
 
+mod operations;
+mod persistence;
+#[cfg(test)]
+mod publication_tests;
+
+pub(crate) use persistence::BOOTSTRAP_LOCK_FILE;
+pub(crate) use persistence::ensure_directory;
+pub(crate) use persistence::is_directory_temporary;
+
 /// File name of the store inside the repository's dot directory.
 pub const ATTEMPT_STORE_FILE: &str = "attempts";
 
@@ -83,7 +93,7 @@ pub const ATTEMPT_STORE_FILE: &str = "attempts";
 /// read the format before it tries to parse it. A future version that changed the body's shape
 /// would otherwise be met by a parser that fails with a message about the body, and the honest
 /// answer is that the file is newer than this client.
-pub const ATTEMPT_STORE_VERSION: u8 = 1;
+pub const ATTEMPT_STORE_VERSION: u8 = 2;
 
 /// Suffix of the sibling file a write lands in before it replaces the store.
 ///
@@ -91,7 +101,7 @@ pub const ATTEMPT_STORE_VERSION: u8 = 1;
 /// conventions that already ignore it keep working.
 const TEMP_SUFFIX: &str = ".~loretemp";
 
-/// A durable [`AttemptStore`] backed by one file in a repository's dot directory.
+/// A durable [`AttemptStore`] backed by a root and child files in a repository's dot directory.
 ///
 /// Cheap to construct and does no I/O until a method is called, so a caller can build one on a
 /// path-less context path and only discover the problem where it matters.
@@ -161,12 +171,7 @@ impl RepositoryAttemptStore {
     async fn guard(&self) -> Result<FSLock, ProtocolError> {
         let path = self.require_path()?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                ProtocolError::internal(format!(
-                    "Failed to create the attempt store directory {}: {error}",
-                    parent.display()
-                ))
-            })?;
+            ensure_directory(parent).await?;
         }
         FSLock::acquire_file_lock(path).await.map_err(|error| {
             ProtocolError::internal(format!(
@@ -176,88 +181,6 @@ impl RepositoryAttemptStore {
         })
     }
 
-    /// Read the whole store. A missing file is an empty store; an unreadable one is an error.
-    fn load(&self, _guard: &FSLock) -> Result<StoredDocument, ProtocolError> {
-        let path = self.require_path()?;
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(StoredDocument::default());
-            }
-            Err(error) => {
-                return Err(ProtocolError::internal(format!(
-                    "Failed to read the attempt store {}: {error}",
-                    path.display()
-                )));
-            }
-        };
-
-        // An empty file is the one damaged shape that is safely read as empty: it is what a
-        // crash between create and write leaves behind, and it holds nothing that could be lost.
-        if bytes.is_empty() {
-            return Err(ProtocolError::internal("empty attempt journal is corrupt"));
-        }
-
-        let Some((version, body)) = bytes.split_first() else {
-            return Ok(StoredDocument::default());
-        };
-        if *version != ATTEMPT_STORE_VERSION {
-            return Err(ProtocolError::internal(format!(
-                "The attempt store {} is version {version}, and this client reads version {}",
-                path.display(),
-                ATTEMPT_STORE_VERSION
-            )));
-        }
-
-        serde_json::from_slice(body).map_err(|error| {
-            ProtocolError::internal(format!(
-                "Failed to parse the attempt store {}: {error}",
-                path.display()
-            ))
-        })
-    }
-
-    /// Replace the whole store atomically.
-    ///
-    /// The disallowed-methods lint asks repository-level filesystem writes to go through a
-    /// `RepositoryWriteToken`-gated helper, and this is a deliberate, narrow exception rather
-    /// than an oversight. That token gates mutations of the *working tree*, and is minted by
-    /// `repository_call_write`; the lock verbs are read calls and correctly hold none, because
-    /// acquiring a lock changes no tracked content. What this writes is client-side metadata
-    /// inside `.lore/`, under its own `FSLock` sidecar — the same arrangement, and the same
-    /// exception, that the authentication token cache makes for its own guarded store. The allow
-    /// is on this one function so a filesystem write added anywhere else in this module is still
-    /// caught.
-    #[allow(clippy::disallowed_methods)]
-    fn store(&self, _guard: &FSLock, document: &StoredDocument) -> Result<(), ProtocolError> {
-        let mut bytes = Vec::with_capacity(1024);
-        bytes.push(ATTEMPT_STORE_VERSION);
-        serde_json::to_writer(&mut bytes, document).map_err(|error| {
-            ProtocolError::internal(format!("Failed to serialize the attempt store: {error}"))
-        })?;
-
-        let path = self.require_path()?;
-        let mut temporary = path.to_path_buf().into_os_string();
-        temporary.push(TEMP_SUFFIX);
-        let temporary = PathBuf::from(temporary);
-
-        write_private_file(&temporary, &bytes)?;
-
-        // `rename` replaces on both platforms, so a reader either sees the whole previous file or
-        // the whole new one. It never sees a truncated store, which for this file would read as
-        // "no token for that lock".
-        std::fs::rename(&temporary, path).map_err(|error| {
-            let _ = std::fs::remove_file(&temporary);
-            ProtocolError::internal(format!(
-                "Failed to replace the attempt store {}: {error}",
-                path.display()
-            ))
-        })?;
-
-        sync_parent_directory(path);
-        Ok(())
-    }
-
     /// One guarded load-modify-store span.
     async fn update<F>(&self, change: F) -> Result<(), ProtocolError>
     where
@@ -265,7 +188,7 @@ impl RepositoryAttemptStore {
     {
         let _in_process = self.write_guard.lock().await;
         let guard = self.guard().await?;
-        let mut document = self.load(&guard)?;
+        let mut document = self.load_for_write(&guard)?;
         change(&mut document);
         self.store(&guard, &document)
     }
@@ -275,317 +198,6 @@ impl RepositoryAttemptStore {
         let _in_process = self.write_guard.lock().await;
         let guard = self.guard().await?;
         self.load(&guard)
-    }
-}
-
-/// Create a file only this user can read, then write the whole body into it.
-///
-/// Two things here are load-bearing for a file that holds bearer tokens.
-///
-/// **`create_new`, after removing whatever was there.** The unix `mode` applies only when the
-/// open actually creates the file, so opening an existing path with `create(true)` would write
-/// tokens into a file that kept *its* mode — a stale temporary from an aborted write on an older
-/// build, an extracted archive, or a symlink someone left pointing elsewhere. Removing first and
-/// refusing to open anything that survives that makes the mode unconditional and takes the
-/// symlink-follow with it.
-///
-/// **The mode is set at creation rather than afterwards.** A `set_permissions` following the
-/// write leaves a window in which the token is readable by anyone who can reach the directory.
-///
-/// Neither applies on Windows, which has no mode; see this module's own note on what does and
-/// does not hold there.
-#[allow(clippy::disallowed_methods)]
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ProtocolError> {
-    use std::io::Write;
-
-    // Not `?`: absence is the ordinary case and is not a failure. A path that cannot be removed
-    // fails the `create_new` below, with a message naming the real problem.
-    let _ = std::fs::remove_file(path);
-
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let mut file = options.open(path).map_err(|error| {
-        ProtocolError::internal(format!(
-            "Failed to open the attempt store temporary {}: {error}",
-            path.display()
-        ))
-    })?;
-
-    // The temporary is removed on any failure. Leaving one behind is not merely untidy: it is a
-    // file holding whatever bytes did land, at whatever point the write stopped, sitting beside
-    // the store until something else happens to overwrite it.
-    let written = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| {
-            ProtocolError::internal(format!(
-                "Failed to write the attempt store temporary {}: {error}",
-                path.display()
-            ))
-        });
-    if written.is_err() {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-    }
-    written
-}
-
-/// Flush the directory entry a rename just created.
-///
-/// `sync_all` on the temporary persists its *contents*; on several filesystems the rename that
-/// gives those contents their name is a separate metadata operation that a crash can still lose.
-/// The trait this implements promises a record survives a crash once the write returns, and
-/// without this that promise covers the bytes but not the name they are reachable under — which
-/// for this file reads back as an empty store, which reads as "no token for that lock".
-///
-/// A directory that cannot be opened or synced is not fatal. Some platforms do not permit either
-/// on a directory handle, and on those the rename is already durable or the guarantee was never
-/// available to ask for; failing the whole write there would refuse to store a token this client
-/// has already been issued, which is worse than the weaker guarantee.
-fn sync_parent_directory(path: &Path) {
-    if let Some(parent) = path.parent()
-        && let Ok(directory) = std::fs::File::open(parent)
-    {
-        let _ = directory.sync_all();
-    }
-}
-
-#[async_trait]
-impl AttemptStore for RepositoryAttemptStore {
-    async fn record_managed(
-        &self,
-        record: &AttemptRecord,
-        intent: &ManagedAttemptIntent,
-    ) -> Result<(), ProtocolError> {
-        if intent.version != 1
-            || intent.repository != record.repository
-            || intent.rpc != record.operation
-        {
-            return Err(ProtocolError::internal("managed child identity mismatch"));
-        }
-        let _local = self.write_guard.lock().await;
-        let guard = self.guard().await?;
-        let mut document = self.load(&guard)?;
-        let namespace = ManagedNamespace {
-            repository: intent.repository.to_string(),
-            endpoint: intent.endpoint.clone(),
-            issuer: intent.verified_issuer.clone(),
-            subject: intent.authenticated_subject.clone(),
-            capabilities: intent.caller_capabilities.clone(),
-        };
-        let parent = document
-            .parents
-            .iter_mut()
-            .find(|parent| parent.id == intent.parent_id.to_string())
-            .ok_or_else(|| ProtocolError::internal("managed child has no durable parent"))?;
-        if parent.version != 1
-            || parent.complete
-            || parent
-                .namespace
-                .as_ref()
-                .is_some_and(|old| old != &namespace)
-        {
-            return Err(ProtocolError::internal(
-                "managed parent namespace changed or closed",
-            ));
-        }
-        parent.namespace = Some(namespace);
-        if document
-            .managed
-            .iter()
-            .any(|child| child.attempt == record.attempt_id.to_string())
-        {
-            return Err(ProtocolError::internal(
-                "managed child identity already dispatched",
-            ));
-        }
-        // Older intent-only rows are not upgraded into replayable managed children.
-        if document
-            .attempts
-            .iter()
-            .any(|child| child.attempt_id == record.attempt_id.to_string())
-        {
-            return Err(ProtocolError::internal("attempt identity already exists"));
-        }
-        document.managed.push(StoredManagedIntent {
-            attempt: record.attempt_id.to_string(),
-            parent: intent.parent_id.to_string(),
-            rpc: intent.rpc.clone(),
-            canonical_request: intent.canonical_request.clone(),
-        });
-        document.attempts.push(StoredAttempt::try_from(record)?);
-        self.store(&guard, &document)
-    }
-
-    async fn record(&self, record: &AttemptRecord) -> Result<(), ProtocolError> {
-        let stored = StoredAttempt::try_from(record)?;
-        self.update(|document| {
-            match document
-                .attempts
-                .iter_mut()
-                .find(|held| held.attempt_id == stored.attempt_id)
-            {
-                // Re-recording one id is a caller retrying its own write, and the contract says
-                // to overwrite rather than duplicate or refuse.
-                Some(existing) => *existing = stored,
-                None => document.attempts.push(stored),
-            }
-        })
-        .await
-    }
-
-    async fn lookup(&self, attempt: &AttemptId) -> Result<Option<AttemptRecord>, ProtocolError> {
-        let document = self.read().await?;
-        document
-            .attempts
-            .iter()
-            .find(|held| held.attempt_id == attempt.to_string())
-            .map(AttemptRecord::try_from)
-            .transpose()
-    }
-
-    async fn unresolved(&self) -> Result<Vec<AttemptRecord>, ProtocolError> {
-        let document = self.read().await?;
-        let mut records = document
-            .attempts
-            .iter()
-            .filter(|held| held.state.is_unresolved())
-            .map(AttemptRecord::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
-        // Tie-broken by the attempt id, which is a v7 and so itself mint-ordered: a client clock
-        // can repeat a millisecond or step backwards, and an order that changed between two reads
-        // of an unchanged store would be a poor thing to show an operator.
-        records.sort_by(|left, right| {
-            left.recorded_at_unix_millis
-                .cmp(&right.recorded_at_unix_millis)
-                .then_with(|| left.attempt_id.as_uuid().cmp(&right.attempt_id.as_uuid()))
-        });
-        Ok(records)
-    }
-
-    async fn record_ownership(&self, ownership: &LockOwnership) -> Result<(), ProtocolError> {
-        let stored = StoredOwnership::from(ownership);
-        self.update(|document| {
-            match document
-                .ownership
-                .iter_mut()
-                .find(|held| held.branch == stored.branch && held.resource == stored.resource)
-            {
-                // One resource holds one token. A renewal mints a new one and the old one is
-                // dead, so keeping both would leave a caller choosing between them.
-                Some(existing) => *existing = stored,
-                None => document.ownership.push(stored),
-            }
-        })
-        .await
-    }
-
-    async fn ownership_for(
-        &self,
-        branch: &Context,
-        resource_hash: &Hash,
-    ) -> Result<Option<LockOwnership>, ProtocolError> {
-        let document = self.read().await?;
-        document
-            .ownership
-            .iter()
-            .find(|held| {
-                held.branch == branch.to_string() && held.resource == resource_hash.to_string()
-            })
-            .map(LockOwnership::try_from)
-            .transpose()
-    }
-
-    /// One read for the whole batch, which is the reason the trait defaults this rather than
-    /// leaving every caller to loop: a release rebuilt from a branch-wide `Query` asks about every
-    /// lock on the branch, and the default would take the file lock once per resource.
-    async fn ownership_for_batch(
-        &self,
-        resources: &[(Context, Hash)],
-    ) -> Result<Vec<Option<LockOwnership>>, ProtocolError> {
-        let document = self.read().await?;
-        let mut held = Vec::with_capacity(resources.len());
-        for (branch, resource_hash) in resources {
-            let branch = branch.to_string();
-            let resource = resource_hash.to_string();
-            held.push(
-                document
-                    .ownership
-                    .iter()
-                    .find(|stored| stored.branch == branch && stored.resource == resource)
-                    .map(LockOwnership::try_from)
-                    .transpose()?,
-            );
-        }
-        Ok(held)
-    }
-
-    async fn clear_ownership(
-        &self,
-        branch: &Context,
-        resource_hash: &Hash,
-    ) -> Result<(), ProtocolError> {
-        let branch = branch.to_string();
-        let resource = resource_hash.to_string();
-        self.update(|document| {
-            document
-                .ownership
-                .retain(|held| !(held.branch == branch && held.resource == resource));
-        })
-        .await
-    }
-
-    /// One rewrite for the whole batch. The default's loop would take the file lock, rewrite the
-    /// document and fsync once per released resource, which on a branch-wide release is quadratic
-    /// in the number of locks held.
-    async fn clear_ownership_batch(
-        &self,
-        resources: &[(Context, Hash)],
-    ) -> Result<(), ProtocolError> {
-        if resources.is_empty() {
-            return Ok(());
-        }
-        let cleared = resources
-            .iter()
-            .map(|(branch, resource_hash)| (branch.to_string(), resource_hash.to_string()))
-            .collect::<Vec<_>>();
-        self.update(|document| {
-            document.ownership.retain(|held| {
-                !cleared
-                    .iter()
-                    .any(|(branch, resource)| held.branch == *branch && held.resource == *resource)
-            });
-        })
-        .await
-    }
-
-    async fn resolve(
-        &self,
-        attempt: &AttemptId,
-        resolution: AttemptResolution,
-    ) -> Result<(), ProtocolError> {
-        let attempt = attempt.to_string();
-        let state = StoredState::from(&AttemptState::Resolved(resolution));
-        self.update(|document| {
-            if let Some(existing) = document
-                .attempts
-                .iter_mut()
-                .find(|held| held.attempt_id == attempt)
-            {
-                existing.state = state;
-            }
-            // Ownership is deliberately untouched. Settling an attempt says its outcome is known;
-            // it says nothing about whether a lock that attempt took is still held, and dropping
-            // the token here would strand a live lock behind an administrator. Only
-            // `clear_ownership`, on a confirmed release, removes a row. See the trait docs.
-        })
-        .await
     }
 }
 
@@ -609,6 +221,8 @@ pub fn repository_attempt_store(repository: &RepositoryContext) -> Arc<dyn Attem
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct StoredDocument {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation: Option<String>,
     #[serde(default)]
     parents: Vec<ManagedParent>,
     #[serde(default)]
@@ -646,228 +260,12 @@ pub struct ManagedNamespace {
     pub capabilities: String,
 }
 
-#[derive(Clone, Deserialize, Serialize, Debug)]
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
 struct StoredManagedIntent {
     attempt: String,
     parent: String,
     rpc: String,
     canonical_request: Vec<u8>,
-}
-
-impl RepositoryAttemptStore {
-    pub async fn reconcile_parent(&self, parent: Uuid) -> Result<(), ProtocolError> {
-        let document = self.read().await?;
-        if !document
-            .managed
-            .iter()
-            .any(|child| child.parent == parent.to_string())
-        {
-            return Err(ProtocolError::internal(
-                "parent has no positive child settlement evidence",
-            ));
-        }
-        self.finish_parent(parent).await
-    }
-
-    /// Non-RPC steps share the same parent fence. Their stored intent never authorizes replay.
-    pub async fn record_workflow_child(
-        &self,
-        parent: Uuid,
-        attempt: AttemptId,
-        operation: String,
-        canonical_intent: Vec<u8>,
-    ) -> Result<(), ProtocolError> {
-        let _local = self.write_guard.lock().await;
-        let guard = self.guard().await?;
-        let mut document = self.load(&guard)?;
-        if !document
-            .parents
-            .iter()
-            .any(|held| held.id == parent.to_string() && !held.complete)
-            || document
-                .attempts
-                .iter()
-                .any(|held| held.attempt_id == attempt.to_string())
-        {
-            return Err(ProtocolError::internal(
-                "workflow parent missing or child already exists",
-            ));
-        }
-        document.managed.push(StoredManagedIntent {
-            attempt: attempt.to_string(),
-            parent: parent.to_string(),
-            rpc: operation.clone(),
-            canonical_request: canonical_intent,
-        });
-        document
-            .attempts
-            .push(StoredAttempt::try_from(&AttemptRecord {
-                attempt_id: attempt,
-                state: AttemptState::Unresolved,
-                operation,
-                repository: RepositoryId::from([0u8; 16]),
-                recorded_at_unix_millis: now_unix_millis(),
-                receipt: None,
-            })?);
-        self.store(&guard, &document)
-    }
-
-    pub async fn managed_parents(&self) -> Result<Vec<ManagedParent>, ProtocolError> {
-        let document = self.read().await?;
-        if document.parents.iter().any(|parent| parent.version != 1) {
-            return Err(ProtocolError::internal(
-                "unsupported managed parent version",
-            ));
-        }
-        Ok(document.parents)
-    }
-
-    pub async fn mark_parent_uncertain(&self, id: Uuid, code: i32) -> Result<(), ProtocolError> {
-        let _local = self.write_guard.lock().await;
-        let guard = self.guard().await?;
-        let mut document = self.load(&guard)?;
-        let parent = document
-            .parents
-            .iter_mut()
-            .find(|parent| parent.id == id.to_string())
-            .ok_or_else(|| ProtocolError::internal("managed parent is missing"))?;
-        parent.parent_uncertainty_code = Some(code);
-        parent.complete = false;
-        self.store(&guard, &document)
-    }
-
-    pub async fn complete_parent_body(&self, id: Uuid) -> Result<(), ProtocolError> {
-        let _local = self.write_guard.lock().await;
-        let guard = self.guard().await?;
-        let mut document = self.load(&guard)?;
-        let parent = document
-            .parents
-            .iter_mut()
-            .find(|parent| parent.id == id.to_string())
-            .ok_or_else(|| ProtocolError::internal("managed parent is missing"))?;
-        if parent.parent_uncertainty_code.is_some() {
-            return Err(ProtocolError::internal(
-                "parent uncertainty requires independent evidence",
-            ));
-        }
-        parent.body_completed = true;
-        self.store(&guard, &document)
-    }
-
-    pub async fn begin_parent(&self, parent: ManagedParent) -> Result<(), ProtocolError> {
-        let _local = self.write_guard.lock().await;
-        let guard = self.guard().await?;
-        let mut document = self.load(&guard)?;
-        if document
-            .parents
-            .iter()
-            .any(|old| !old.complete || old.id == parent.id)
-            || document
-                .attempts
-                .iter()
-                .any(|child| child.state.is_unresolved())
-        {
-            return Err(ProtocolError::internal(
-                "repository has an unresolved managed workflow",
-            ));
-        }
-        document.parents.push(parent);
-        self.store(&guard, &document)
-    }
-
-    /// Freeze the selected transport namespace before a workflow's local effects.
-    pub async fn bind_parent_namespace(
-        &self,
-        id: Uuid,
-        binding: &CallerRecoveryContext,
-    ) -> Result<(), ProtocolError> {
-        let _local = self.write_guard.lock().await;
-        let guard = self.guard().await?;
-        let mut document = self.load(&guard)?;
-        let namespace = ManagedNamespace {
-            repository: binding.repository.to_string(),
-            endpoint: binding.endpoint.clone(),
-            issuer: binding.verified_issuer.clone(),
-            subject: binding.authenticated_subject.clone(),
-            capabilities: binding.caller_capabilities.clone(),
-        };
-        let parent = document
-            .parents
-            .iter_mut()
-            .find(|parent| parent.id == id.to_string())
-            .ok_or_else(|| ProtocolError::internal("managed parent is missing"))?;
-        if parent.version != 1
-            || parent.complete
-            || parent
-                .namespace
-                .as_ref()
-                .is_some_and(|old| old != &namespace)
-        {
-            return Err(ProtocolError::internal(
-                "managed parent namespace changed or closed",
-            ));
-        }
-        parent.namespace = Some(namespace);
-        self.store(&guard, &document)
-    }
-
-    /// Called only by a live workflow after its future returned. Recovery cannot use zero children
-    /// as proof that an interrupted local operation did not run.
-    pub async fn finish_parent(&self, parent: Uuid) -> Result<(), ProtocolError> {
-        let _local = self.write_guard.lock().await;
-        let guard = self.guard().await?;
-        let mut document = self.load(&guard)?;
-        let id = parent.to_string();
-        if document
-            .attempts
-            .iter()
-            .any(|child| child.state.is_unresolved())
-        {
-            return Err(ProtocolError::internal(
-                "workflow outcome remains unknown; use operation status",
-            ));
-        }
-        let parent = document
-            .parents
-            .iter_mut()
-            .find(|parent| parent.id == id)
-            .ok_or_else(|| ProtocolError::internal("managed parent is missing"))?;
-        if parent.parent_uncertainty_code.is_some() || !parent.body_completed {
-            return Err(ProtocolError::internal(
-                "parent uncertainty requires independent body completion evidence",
-            ));
-        }
-        parent.complete = true;
-        self.store(&guard, &document)
-    }
-
-    pub async fn recovery_context(
-        &self,
-        attempt: &AttemptId,
-    ) -> Result<CallerRecoveryContext, ProtocolError> {
-        let document = self.read().await?;
-        let child = document
-            .managed
-            .iter()
-            .find(|child| child.attempt == attempt.to_string())
-            .ok_or_else(|| ProtocolError::internal("attempt has no managed namespace"))?;
-        let namespace = document
-            .parents
-            .iter()
-            .find(|parent| parent.id == child.parent)
-            .and_then(|parent| parent.namespace.as_ref())
-            .ok_or_else(|| ProtocolError::internal("parent namespace is missing"))?;
-        Ok(CallerRecoveryContext {
-            repository: namespace
-                .repository
-                .parse()
-                .map_err(|_| ProtocolError::internal("invalid repository identity"))?,
-            endpoint: namespace.endpoint.clone(),
-            verified_issuer: namespace.issuer.clone(),
-            authenticated_subject: namespace.subject.clone(),
-            caller_capabilities: namespace.capabilities.clone(),
-        })
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

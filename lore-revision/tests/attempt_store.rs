@@ -103,6 +103,36 @@ mod tests {
         serde_json::from_slice(body).expect("the body must be valid JSON")
     }
 
+    /// Count physical records independently of lookup, across both v2 state directories.
+    fn physical_attempt_count(store: &RepositoryAttemptStore) -> usize {
+        let document = raw_document(store);
+        if let Some(generation) = document["generation"].as_str() {
+            let directory = store
+                .path()
+                .unwrap()
+                .with_file_name(format!("attempts-v2-{generation}"));
+            ["pending", "settled"]
+                .into_iter()
+                .map(|state| {
+                    std::fs::read_dir(directory.join(state))
+                        .unwrap()
+                        .map(|entry| {
+                            let entry = entry.unwrap();
+                            assert_eq!(entry.path().extension().unwrap(), "json");
+                            let child: serde_json::Value =
+                                serde_json::from_slice(&std::fs::read(entry.path()).unwrap())
+                                    .unwrap();
+                            assert!(child["attempt"]["attempt_id"].is_string());
+                            1usize
+                        })
+                        .sum::<usize>()
+                })
+                .sum()
+        } else {
+            document["attempts"].as_array().unwrap().len()
+        }
+    }
+
     /// A missing file is an empty store, not an error -- the very first repository operation that
     /// ever touches locks or receipts must not require the file to already exist.
     #[tokio::test]
@@ -178,14 +208,10 @@ mod tests {
 
         let looked_up = store.lookup(&attempt).await.unwrap().unwrap();
         assert_eq!(looked_up.recorded_at_unix_millis, 2_000);
-        let document = raw_document(&store);
         assert_eq!(
-            document["attempts"]
-                .as_array()
-                .expect("attempts array")
-                .len(),
+            physical_attempt_count(&store),
             1,
-            "one attempt id retried into a second write must replace the row, not duplicate it: {document}"
+            "one attempt id retried into a second write must replace the row, not duplicate it"
         );
     }
 

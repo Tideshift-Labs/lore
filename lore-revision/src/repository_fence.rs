@@ -18,8 +18,13 @@ use crate::attempt_store::RepositoryAttemptStore;
 pub const WORKFLOW_DIRECTORY: &str = ".lore-workflow";
 
 pub fn is_workflow_path(path: &str) -> bool {
-    path.split(['/', '\\'])
-        .any(|part| part.eq_ignore_ascii_case(WORKFLOW_DIRECTORY))
+    path.split(['/', '\\']).any(|part| {
+        part.eq_ignore_ascii_case(WORKFLOW_DIRECTORY)
+            || part.eq_ignore_ascii_case(crate::attempt_store::BOOTSTRAP_LOCK_FILE)
+            // Windows names are case-insensitive; aliases of our lowercase UUID must stay
+            // excluded too. Parsing still rejects malformed and non-UUID lookalikes.
+            || crate::attempt_store::is_directory_temporary(&part.to_ascii_lowercase())
+    })
 }
 
 tokio::task_local! { static ACTIVE_WORKTREE: PathBuf; }
@@ -46,8 +51,7 @@ impl RepositoryMutationGuard {
         let root = std::fs::canonicalize(root)
             .map_err(|error| ProtocolError::internal(error.to_string()))?;
         let dot = root.join(WORKFLOW_DIRECTORY);
-        std::fs::create_dir_all(&dot)
-            .map_err(|error| ProtocolError::internal(error.to_string()))?;
+        crate::attempt_store::ensure_directory(&dot).await?;
         let nested = ACTIVE_WORKTREE
             .try_with(|active| active == &root)
             .unwrap_or(false);
