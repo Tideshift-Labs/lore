@@ -77,32 +77,147 @@ async fn exact_replay_precedes_request_validation_and_every_repository_read() {
         creator: Some("foreign".into()),
         ..Default::default()
     };
-    let actual = super::governed_branch_create(&governed, &invalid_request, repository, "verified")
-        .await
-        .unwrap();
+    let actual =
+        super::governed_branch_create(&governed, &invalid_request, repository, "verified", false)
+            .await
+            .unwrap();
     assert_eq!(actual.response, expected);
     assert!(!actual.newly_applied);
     assert!(script.branch_create_calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn foreign_attribution_is_refused_before_reads_or_publication() {
-    let (governed, script, repository) = governed_fixture(None).await;
+async fn frozen_foreign_creator_survives_role_downgrade_without_new_publication() {
+    let mut expected = response();
+    expected.branch.as_mut().unwrap().creator = "previously-authorized-foreign".into();
+    let (governed, script, repository) = governed_fixture(Some(stored(&expected))).await;
     let request = lore_proto::lore::revision::v1::BranchCreateRequest {
-        id: vec![1; 16].into(),
-        name: "feature".into(),
-        creator: Some("foreign".into()),
+        creator: Some("previously-authorized-foreign".into()),
         ..Default::default()
     };
-    assert_eq!(
-        super::governed_branch_create(&governed, &request, repository, "verified")
-            .await
-            .err()
-            .unwrap()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
+    let replay = super::governed_branch_create(&governed, &request, repository, "verified", false)
+        .await
+        .unwrap();
+    assert_eq!(replay.response, expected);
+    assert!(!replay.newly_applied);
     assert!(script.branch_create_calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn creator_policy_preserves_foreign_identity_only_with_verified_permission() {
+    for (requested, allowed, expected) in [
+        (None, false, "verified"),
+        (None, true, "verified"),
+        (Some("verified"), false, "verified"),
+        (Some("foreign"), false, "verified"),
+        (Some("foreign"), true, "foreign"),
+        (Some(""), false, "verified"),
+        (Some(""), true, ""),
+    ] {
+        assert_eq!(
+            super::effective_creator(requested, "verified", allowed),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn authenticated_handler_persists_creator_from_exact_repository_permissions() {
+    use std::sync::Arc;
+
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_revision::branch;
+    use lore_revision::repository;
+
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::auth::jwt::ResourcePermission;
+
+    struct Instruments;
+    impl lore_telemetry::InstrumentProvider for Instruments {
+        fn namespace(&self) -> &'static str {
+            "creator-policy"
+        }
+        fn labels(&self) -> &[opentelemetry::KeyValue] {
+            &[]
+        }
+    }
+    // These extensions stand in for already-verified auth middleware. This test does not verify JWTs.
+    for (permission, resource_scope, requested, expected) in [
+        ("write", "exact", Some("foreign"), "verified"),
+        ("write", "exact", None, "verified"),
+        ("write", "exact", Some("verified"), "verified"),
+        ("owner", "exact", Some("foreign"), "foreign"),
+        ("admin", "exact", Some("foreign"), "foreign"),
+        ("admin", "other", Some("foreign"), "verified"),
+        ("owner", "wildcard", Some("foreign"), "verified"),
+        ("read", "exact", Some("foreign"), "verified"),
+    ] {
+        let repo = rand::random::<lore_revision::lore::RepositoryId>();
+        let other = rand::random::<lore_revision::lore::RepositoryId>();
+        let (immutable, mutable, execution) = crate::store::test_store_create().await.unwrap();
+        let context = Arc::new(repository::RepositoryContext::new_server_context(
+            immutable.clone(),
+            mutable.clone(),
+            repo,
+        ));
+        let mut notifications = crate::notification::testing::MockNotificationSender::new();
+        notifications
+            .expect_branch_created()
+            .times(1)
+            .returning(|_, _| ());
+        LORE_CONTEXT
+            .scope(execution, async {
+                let mut request =
+                    tonic::Request::new(lore_proto::lore::revision::v1::BranchCreateRequest {
+                        id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+                        name: "main".into(),
+                        creator: requested.map(str::to_owned),
+                        ..Default::default()
+                    });
+                request.metadata_mut().insert_bin(
+                    lore_transport::grpc::REPOSITORY_ID_KEY,
+                    tonic::metadata::BinaryMetadataValue::from_bytes(repo.data()),
+                );
+                let resource_id = match resource_scope {
+                    "exact" => format!("urc-{repo}"),
+                    "other" => format!("urc-{other}"),
+                    "wildcard" => "urc-*".into(),
+                    _ => unreachable!(),
+                };
+                request.extensions_mut().insert(AuthorizationToken {
+                    user_id: "verified".into(),
+                    resources: Some(vec![ResourcePermission {
+                        resource_id,
+                        permission: vec![permission.into()],
+                    }]),
+                    ..Default::default()
+                });
+                let response = super::handler(
+                    request,
+                    immutable,
+                    mutable,
+                    Arc::new(notifications),
+                    &None,
+                    &crate::hooks::HookDispatcher::empty(),
+                    &Instruments,
+                )
+                .await
+                .unwrap()
+                .into_inner()
+                .branch
+                .unwrap();
+                assert_eq!(response.creator, expected, "{permission}/{resource_scope}");
+                let metadata = branch::load_metadata(context, response.metadata.as_ref().into())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    branch::creator(&metadata).unwrap(),
+                    expected,
+                    "persisted {permission}/{resource_scope}"
+                );
+            })
+            .await;
+    }
 }
 
 #[tokio::test]

@@ -81,6 +81,7 @@ pub fn recovery_receipt_method_matches(recorded_rpc: &str, receipt_method: &str)
     matches!(
         (recorded_rpc, receipt_method),
         ("RevisionService.BranchPush", "branch.push")
+            | ("RevisionService.BranchCreate", "branch.create")
             | ("LockService.Lock", "lock.acquire" | "lock.renew")
             | ("LockService.Unlock", "lock.release")
             | ("LockService.ForceUnlock", "lock.force_release")
@@ -425,6 +426,7 @@ mod recovery_dial_tests {
     #[test]
     fn recovery_dial_receipt_method_matrix_accepts_only_exact_supported_server_pairs() {
         let pairs = [
+            ("RevisionService.BranchCreate", "branch.create"),
             ("RevisionService.BranchPush", "branch.push"),
             ("LockService.Lock", "lock.acquire"),
             ("LockService.Lock", "lock.renew"),

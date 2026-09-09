@@ -1807,6 +1807,7 @@ where
                 && !matches!(
                     rpc,
                     GrpcRpc::RevisionBranchPush
+                        | GrpcRpc::RevisionBranchCreate
                         | GrpcRpc::LockLock
                         | GrpcRpc::LockAdminLock
                         | GrpcRpc::LockUnlock

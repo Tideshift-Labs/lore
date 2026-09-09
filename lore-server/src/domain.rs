@@ -1786,7 +1786,7 @@ pub struct GovernedRepositoryCreate {
     create_witness: Option<GovernedCreateWitness>,
 }
 
-/// Server preparation seam for fresh branch creation. Public admission remains gated.
+/// Server preparation seam for governed v1 branch creation.
 pub struct GovernedBranchCreate {
     domain: Arc<DomainContext>,
     operation: GovernedOperation,
@@ -1804,7 +1804,7 @@ impl GovernedBranchCreate {
             ));
         }
         let operation = domain
-            .complete_governed(admitted, "branch_create", digest)
+            .complete_governed(admitted, "branch.create", digest)
             .await?;
         Ok(Self {
             domain: domain.clone(),

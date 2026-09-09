@@ -35,6 +35,10 @@ use crate::types::RevisionItem;
 use crate::types::RevisionListResponse;
 use crate::types::RevisionListStart;
 
+#[cfg(test)]
+#[path = "revision_client/adoption_tests.rs"]
+mod adoption_tests;
+
 #[derive(Clone)]
 pub struct RevisionService {
     client: RevisionServiceClient<AuthorizedService>,
@@ -73,17 +77,52 @@ impl RevisionService {
         stack: &[BranchPoint],
     ) -> Result<Hash, ProtocolError> {
         lore_debug!("Creating remote branch {name} ({branch}) with stack {stack:?}");
+        if crate::caller_operation::current_caller_operation().is_some() {
+            let message = revision_v1::BranchCreateRequest {
+                id: branch.into(),
+                name: name.to_owned(),
+                creator: Some(creator.to_owned()),
+                category: category.to_owned(),
+                stack: stack.iter().map(model_v1::BranchPoint::from).collect(),
+            };
+            return crate::caller_operation::dispatch(
+                self.repository,
+                crate::outcome::GrpcRpc::RevisionBranchCreate,
+                message.encode_to_vec(),
+                crate::caller_operation::current_transport_endpoint(),
+                super::authorization_snapshot(&self.auth),
+                async {
+                    let mut request = tonic::Request::new(message);
+                    inject_authn_bearer(&mut request, &self.auth)?;
+                    let attempt = crate::outcome::current_dispatch_attempt().ok_or_else(|| {
+                        ProtocolError::internal("BranchCreate managed attempt missing")
+                    })?;
+                    let _counter = RequestScopedCounter::new(self.request_inflight.clone());
+                    let mut client = self.client.clone();
+                    let response = client
+                        .branch_create(request)
+                        .await
+                        .map_err(ProtocolError::from)?
+                        .into_inner();
+                    decode_created_branch(response, branch).map_err(|_| {
+                        crate::outcome::outcome_unknown("BranchCreate malformed response", &attempt)
+                    })
+                },
+            )
+            .await;
+        }
         let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let response = loop {
-            let request = revision_v1::BranchCreateRequest {
+            let mut request = tonic::Request::new(revision_v1::BranchCreateRequest {
                 id: branch.into(),
                 name: name.to_string(),
                 creator: Some(creator.to_string()),
                 category: category.to_string(),
                 stack: stack.iter().map(model_v1::BranchPoint::from).collect(),
-            };
+            });
+            inject_authn_bearer(&mut request, &self.auth)?;
 
             let mut client = self.client.clone();
 
@@ -97,10 +136,7 @@ impl RevisionService {
             }
         };
 
-        let branch_record = response
-            .branch
-            .ok_or_else(|| ProtocolError::internal("BranchCreate response missing branch"))?;
-        Ok(Hash::from(branch_record.latest))
+        decode_created_branch(response, branch)
     }
 
     pub async fn branch_delete(&self, branch: BranchId) -> Result<(), ProtocolError> {
@@ -440,6 +476,24 @@ impl RevisionService {
             current_hash,
         })
     }
+}
+
+fn decode_created_branch(
+    response: revision_v1::BranchCreateResponse,
+    expected: BranchId,
+) -> Result<Hash, ProtocolError> {
+    let branch = response
+        .branch
+        .ok_or_else(|| ProtocolError::internal("BranchCreate response missing branch"))?;
+    if branch.id.as_ref() != expected.data().as_slice()
+        || branch.latest.len() != 32
+        || branch.metadata.len() != 32
+    {
+        return Err(ProtocolError::internal(
+            "BranchCreate response has invalid identifiers",
+        ));
+    }
+    Ok(Hash::from(branch.latest))
 }
 
 fn branch_metadata_from_v1(branch: model_v1::Branch) -> BranchMetadata {

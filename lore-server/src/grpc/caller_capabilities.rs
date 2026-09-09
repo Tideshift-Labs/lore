@@ -319,14 +319,13 @@ pub fn admit(
     }
     match classify_rpc(path) {
         Some(RpcClass::Read) => Ok(()),
-        // Neither branch-create version has a governed receipt path; branch
-        // deletion still refuses its unfrozen canonical intent/tombstone proof.
+        // Only v1 branch creation has a governed receipt path; branch deletion
+        // still refuses its unfrozen canonical intent/tombstone proof.
         Some(RpcClass::Mutation)
             if matches!(
                 path,
                 "/urc.rpc.RevisionService/BranchCreate"
                     | "/urc.rpc.RevisionService/BranchDelete"
-                    | "/lore.revision.v1.RevisionService/BranchCreate"
                     | "/lore.revision.v1.RevisionService/BranchDelete"
             ) =>
         {

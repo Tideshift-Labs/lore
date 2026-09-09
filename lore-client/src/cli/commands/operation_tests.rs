@@ -67,6 +67,55 @@ async fn managed_child(store: &RepositoryAttemptStore, method: &str) -> (Uuid, A
 }
 
 #[tokio::test]
+async fn branch_create_reconciliation_requires_exact_receipt_method_and_original_namespace() {
+    for method in ["branch.create", "branch_create", "branch.push"] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".lore")).unwrap();
+        let store = RepositoryAttemptStore::in_directory(directory.path().join(".lore"));
+        let (parent, record) = managed_child(&store, "RevisionService.BranchCreate").await;
+        let expected_namespace = store.recovery_context(&record.attempt_id).await.unwrap();
+        let guard = RepositoryMutationGuard::recover(directory.path())
+            .await
+            .unwrap();
+        let calls = AtomicUsize::new(0);
+        let result = reconcile_stores(&guard, |opened, attempt| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let expected_namespace = expected_namespace.clone();
+            let expected_attempt = record.attempt_id;
+            async move {
+                assert_eq!(attempt, expected_attempt);
+                assert_eq!(
+                    opened.recovery_context(&attempt).await.unwrap(),
+                    expected_namespace
+                );
+                Ok(DomainAttemptReceipt {
+                    method: method.into(),
+                    state: DomainReceiptState::Committed {
+                        outcome: DomainReceiptOutcome::Applied,
+                        from_future_marker: false,
+                    },
+                })
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(guard);
+        let reopened = RepositoryAttemptStore::in_directory(directory.path().join(".lore"));
+        let parents = reopened.managed_parents().await.unwrap();
+        assert_eq!(parents[0].id, parent.to_string());
+        if method == "branch.create" {
+            result.unwrap();
+            assert!(reopened.unresolved().await.unwrap().is_empty());
+            assert!(parents[0].complete);
+        } else {
+            assert!(result.is_err());
+            assert_eq!(reopened.unresolved().await.unwrap(), vec![record]);
+            assert!(!parents[0].complete);
+        }
+    }
+}
+
+#[tokio::test]
 async fn status_exposes_legacy_only_blockers_and_reconcile_never_guesses_namespace() {
     for source in [".lore", ".urc"] {
         let directory = tempfile::tempdir().unwrap();

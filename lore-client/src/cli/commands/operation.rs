@@ -110,6 +110,7 @@ where
             if !matches!(
                 child.operation.as_str(),
                 "RevisionService.BranchPush"
+                    | "RevisionService.BranchCreate"
                     | "LockService.Lock"
                     | "LockService.Unlock"
                     | "LockService.ForceUnlock"

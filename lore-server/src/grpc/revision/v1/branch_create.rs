@@ -112,13 +112,14 @@ pub(crate) async fn emit_governed_branch_created(
     instruments.counter("num_branches_created").add(1, &[]);
 }
 
-/// Preparation for the disabled governed entry point. Receipted replay is first,
+/// Preparation for the governed entry point. Receipted replay is first,
 /// followed by read-only validation and immutable upload, then one publication.
 pub(crate) async fn governed_branch_create(
     governed: &crate::domain::GovernedBranchCreate,
     request: &BranchCreateRequest,
     repository: Arc<RepositoryContext>,
     verified_identity: &str,
+    can_set_creator: bool,
 ) -> Result<GovernedBranchCreateResponse, Status> {
     use lore_base::types::Context;
     use lore_base::types::Hash;
@@ -134,13 +135,11 @@ pub(crate) async fn governed_branch_create(
             newly_applied: false,
         });
     }
-    let creator = request.creator.as_deref().unwrap_or(verified_identity);
-    // Foreign attribution awaits its explicit policy and public gate review.
-    if creator != verified_identity {
-        return Err(Status::failed_precondition(
-            "Governed foreign branch attribution is not enabled",
-        ));
-    }
+    let creator = effective_creator(
+        request.creator.as_deref(),
+        verified_identity,
+        can_set_creator,
+    );
     validate_create_input(&request.name, &request.category, creator)?;
     if !branch::is_valid_name(&request.name) || request.id.len() != 16 || request.stack.len() > 1024
     {
@@ -335,6 +334,19 @@ pub(crate) async fn governed_branch_create(
     completed_creation(governed.commit(&input).await?)
 }
 
+/// Foreign attribution requires verified repository owner/admin permission.
+pub(crate) fn effective_creator<'a>(
+    requested: Option<&'a str>,
+    verified_identity: &'a str,
+    can_set_creator: bool,
+) -> &'a str {
+    if can_set_creator {
+        requested.unwrap_or(verified_identity)
+    } else {
+        verified_identity
+    }
+}
+
 /// Reject oversized string fields early to prevent resource exhaustion.
 fn validate_create_input(name: &str, category: &str, creator: &str) -> Result<(), Status> {
     if name.len() > branch::MAX_NAME_LEN {
@@ -411,6 +423,8 @@ pub async fn handler_with_domain(
     }
     let caller_context = CallerContext::from_original_request(&request)?;
     let authorization = crate::grpc::get_authorization_optional(request.extensions());
+    let can_set_creator =
+        crate::grpc::is_owner_or_admin(request.extensions(), caller_context.repository_id);
     let admitted = crate::domain::admit_at_entry(
         domain_context,
         request.metadata(),
@@ -419,7 +433,7 @@ pub async fn handler_with_domain(
             repository_id: caller_context.repository_id.data(),
         },
     )?;
-    let req = request.into_inner();
+    let mut req = request.into_inner();
     if let Some(admitted) = admitted {
         if forwarded_requests
             .as_ref()
@@ -476,9 +490,14 @@ pub async fn handler_with_domain(
                 hook_dispatcher
                     .dispatch_pre(HookPoint::BranchCreate, &hook)
                     .map_err(hook_error_to_status)?;
-                let response =
-                    governed_branch_create(&governed, &req, repository, &caller_context.user_id)
-                        .await?;
+                let response = governed_branch_create(
+                    &governed,
+                    &req,
+                    repository,
+                    &caller_context.user_id,
+                    can_set_creator,
+                )
+                .await?;
                 emit_governed_branch_created(
                     &response,
                     notification_sender.as_ref(),
@@ -492,6 +511,18 @@ pub async fn handler_with_domain(
                 Ok(Response::new(response.response))
             })
             .await;
+    }
+    // Auth-off legacy fixtures have no verified token. Authenticated legacy calls
+    // use the same attribution rule before either local execution or forwarding.
+    if authorization.is_some() {
+        req.creator = Some(
+            effective_creator(
+                req.creator.as_deref(),
+                &caller_context.user_id,
+                can_set_creator,
+            )
+            .to_owned(),
+        );
     }
     if let Some(forwarded_requests) = forwarded_requests
         && forwarded_requests.rpc_flags().revision_branch_create

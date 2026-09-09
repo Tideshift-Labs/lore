@@ -117,7 +117,6 @@ fn required_mode_checks_mutations_and_unknown_paths_without_jwt_exemption() {
                 if [
                     "/urc.rpc.RevisionService/BranchCreate",
                     "/urc.rpc.RevisionService/BranchDelete",
-                    "/lore.revision.v1.RevisionService/BranchCreate",
                     "/lore.revision.v1.RevisionService/BranchDelete",
                 ]
                 .contains(path)
@@ -152,12 +151,13 @@ fn required_mode_checks_mutations_and_unknown_paths_without_jwt_exemption() {
 }
 
 #[test]
-fn governed_repository_lifecycle_requires_attempt_identity_after_capability() {
+fn governed_lifecycle_requires_attempt_identity_after_capability() {
     for path in [
         "/urc.rpc.RepositoryService/RepositoryCreate",
         "/urc.rpc.RepositoryService/RepositoryDelete",
         "/lore.repository.v1.RepositoryService/RepositoryCreate",
         "/lore.repository.v1.RepositoryService/RepositoryDelete",
+        "/lore.revision.v1.RevisionService/BranchCreate",
     ] {
         for attempt in [
             None,
