@@ -52,20 +52,20 @@ pub(crate) fn decode_governed_result(
             _ => Status::failed_precondition(reason),
         });
     }
-    let bytes = result
-        .public_result
-        .ok_or_else(|| Status::data_loss("Branch create receipt has no response"))?;
+    let bytes = result.public_result.ok_or_else(|| {
+        crate::domain::branch_create_outcome_unknown("Branch create receipt has no response")
+    })?;
     if bytes.len() > 4096 || bytes.first() != Some(&1) {
-        return Err(Status::data_loss(
+        return Err(crate::domain::branch_create_outcome_unknown(
             "Unsupported branch create receipt response",
         ));
     }
-    let response = BranchCreateResponse::decode(&bytes[1..])
-        .map_err(|_| Status::data_loss("Malformed branch create receipt response"))?;
-    let branch = response
-        .branch
-        .as_ref()
-        .ok_or_else(|| Status::data_loss("Branch create receipt has no branch"))?;
+    let response = BranchCreateResponse::decode(&bytes[1..]).map_err(|_| {
+        crate::domain::branch_create_outcome_unknown("Malformed branch create receipt response")
+    })?;
+    let branch = response.branch.as_ref().ok_or_else(|| {
+        crate::domain::branch_create_outcome_unknown("Branch create receipt has no branch")
+    })?;
     if branch.id.len() != 16
         || branch.metadata.len() != 32
         || branch.latest.len() != 32
@@ -74,7 +74,9 @@ pub(crate) fn decode_governed_result(
             .iter()
             .any(|p| p.branch_id.len() != 16 || p.revision_signature.len() != 32)
     {
-        return Err(Status::data_loss("Malformed branch create receipt branch"));
+        return Err(crate::domain::branch_create_outcome_unknown(
+            "Malformed branch create receipt branch",
+        ));
     }
     Ok(response)
 }

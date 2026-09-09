@@ -123,6 +123,13 @@ impl DomainTransactionStore for PausedStore {
     ) -> Result<MutationResult, DomainError> {
         self.inner.repository_delete(operation, input).await
     }
+    async fn branch_create_terminal_replay(
+        &self,
+        key: &ReceiptKey,
+        binding: &OperationBinding,
+    ) -> Result<Option<BranchCreateResult>, DomainError> {
+        self.inner.branch_create_terminal_replay(key, binding).await
+    }
     async fn branch_create_replay(
         &self,
         operation: &GovernedOperation,

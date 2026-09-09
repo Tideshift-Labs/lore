@@ -322,7 +322,7 @@ async fn lock_receipt_row(
                     prepared_at, hard_expires_at, committed_at, full_result_expires_at, \
                     compact_expires_at, compacted, direct_authorization_id, \
                     direct_authorization_revision::text AS direct_authorization_revision, \
-                    direct_verification_nonce, direct_bound_fields_digest \
+                    direct_verification_nonce, direct_bound_fields_digest, client_attempt_id \
              FROM lore_domain_operation_receipts \
              WHERE verified_issuer = $1 AND authenticated_subject = $2 \
                AND tenant_scope_key = $3 AND operation_id = $4 \
@@ -354,6 +354,7 @@ async fn lock_receipt_row(
         committed_at: r.get("committed_at"),
         full_result_expires_at: r.get("full_result_expires_at"),
         direct_authorization_id: r.get("direct_authorization_id"),
+        client_attempt_id: r.get("client_attempt_id"),
         direct_authorization_revision: r.get("direct_authorization_revision"),
         direct_verification_nonce: r.get("direct_verification_nonce"),
         direct_bound_fields_digest: r.get("direct_bound_fields_digest"),
@@ -377,6 +378,7 @@ struct ReceiptRow {
     committed_at: Option<SystemTime>,
     full_result_expires_at: Option<SystemTime>,
     direct_authorization_id: Option<Vec<u8>>,
+    client_attempt_id: Option<Vec<u8>>,
     direct_authorization_revision: Option<String>,
     direct_verification_nonce: Option<Vec<u8>>,
     direct_bound_fields_digest: Option<Vec<u8>>,
@@ -1262,6 +1264,94 @@ pub async fn attempt_receipt_get(
         _ => Some(binding.method),
     };
     Ok(AttemptReceipt { method, lookup })
+}
+
+/// Internal BranchCreate retry: read terminal evidence without a consume token
+/// or a second platform witness. Never authorizes a fresh mutation.
+pub async fn branch_create_terminal_replay(
+    tx: &Transaction<'_>,
+    key: &ReceiptKey,
+    binding: &OperationBinding,
+) -> Result<Option<super::coordinator::BranchCreateResult>, DomainError> {
+    use super::coordinator::BranchCreateResult;
+    if binding.method != "branch.create" {
+        return Err(DomainError::InvalidInput(
+            "branch create replay method mismatch".into(),
+        ));
+    }
+    let clock = admission_clock(tx).await?;
+    if let Some(row) = lock_receipt_row(tx, key).await? {
+        if !row.matches(binding)
+            || row.client_attempt_id.as_deref() != Some(key.operation_id.as_bytes().as_slice())
+            || row.direct_authorization_id.as_deref()
+                != Some(key.operation_id.as_bytes().as_slice())
+            || row
+                .direct_authorization_revision
+                .as_deref()
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_none_or(|v| v == 0)
+            || row
+                .direct_verification_nonce
+                .as_ref()
+                .is_none_or(|v| v.len() != 32)
+            || row
+                .direct_bound_fields_digest
+                .as_ref()
+                .is_none_or(|v| v.len() != 32)
+        {
+            return Err(DomainError::InvalidInput(
+                "branch create replay binding mismatch".into(),
+            ));
+        }
+        if row.state == schema::RECEIPT_STATE_PREPARED {
+            return Ok(None);
+        }
+        if row
+            .full_result_expires_at
+            .is_none_or(|expiry| clock >= expiry)
+        {
+            return Err(DomainError::OutcomeUnknown(
+                "branch create terminal result expired".into(),
+            ));
+        }
+        let outcome = row.committed_outcome()?;
+        if matches!(outcome, DomainOutcome::Applied)
+            && row
+                .public_result
+                .as_ref()
+                .is_none_or(|bytes| bytes.is_empty() || bytes.len() > PUBLIC_RESULT_MAX_BYTES)
+        {
+            return Err(DomainError::OutcomeUnknown(
+                "branch create terminal result unavailable".into(),
+            ));
+        }
+        return Ok(Some(BranchCreateResult {
+            replayed: true,
+            outcome,
+            public_result: row.public_result,
+        }));
+    }
+    if let Some(marker) = load_future_marker(tx, key, binding).await? {
+        return match marker {
+            FutureMarker::Exact(outcome) => Ok(Some(BranchCreateResult {
+                replayed: true,
+                outcome,
+                public_result: None,
+            })),
+            FutureMarker::Mismatch => Err(DomainError::InvalidInput(
+                "branch create replay binding mismatch".into(),
+            )),
+        };
+    }
+    if matches!(
+        classify(uuid_v7_timestamp(&key.operation_id)?, clock),
+        TemporalClass::Stale
+    ) {
+        return Err(DomainError::OutcomeUnknown(
+            "branch create attempt expired or unknown".into(),
+        ));
+    }
+    Ok(None)
 }
 
 pub async fn receipt_get(

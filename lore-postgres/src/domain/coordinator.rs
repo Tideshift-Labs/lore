@@ -674,6 +674,13 @@ pub trait DomainTransactionStore: Send + Sync {
     ) -> Result<MutationResult, DomainError>;
 
     /// Read a terminal branch-create response, leaving a prepared receipt unconsumed.
+    async fn branch_create_terminal_replay(
+        &self,
+        key: &ReceiptKey,
+        binding: &OperationBinding,
+    ) -> Result<Option<BranchCreateResult>, DomainError>;
+
+    /// Replay through an already prepared operation, including carried callers.
     async fn branch_create_replay(
         &self,
         operation: &GovernedOperation,

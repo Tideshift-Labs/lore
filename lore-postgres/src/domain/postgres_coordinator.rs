@@ -733,6 +733,23 @@ impl DomainTransactionStore for PostgresDomainStore {
         })
     }
 
+    async fn branch_create_terminal_replay(
+        &self,
+        key: &receipts::ReceiptKey,
+        binding: &receipts::OperationBinding,
+    ) -> Result<Option<BranchCreateResult>, DomainError> {
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("branch create terminal replay transaction", e))?;
+        let result = receipts::branch_create_terminal_replay(&tx, key, binding).await?;
+        tx.rollback()
+            .await
+            .map_err(|e| DomainError::from_pg("branch create terminal replay rollback", e))?;
+        Ok(result)
+    }
+
     async fn branch_create_replay(
         &self,
         operation: &GovernedOperation,

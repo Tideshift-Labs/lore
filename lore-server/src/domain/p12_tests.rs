@@ -302,6 +302,13 @@ impl DomainTransactionStore for MetadataCasScriptedStore {
     ) -> Result<Option<BranchSnapshot>, DomainError> {
         unreachable!("MetadataCasScriptedStore only scripts metadata_compare_and_swap")
     }
+    async fn branch_create_terminal_replay(
+        &self,
+        _key: &ReceiptKey,
+        _binding: &OperationBinding,
+    ) -> Result<Option<lore_postgres::domain::coordinator::BranchCreateResult>, DomainError> {
+        unreachable!("This test store does not prepare branch creation")
+    }
     async fn branch_create_replay(
         &self,
         _operation: &GovernedOperation,
@@ -635,6 +642,13 @@ impl DomainTransactionStore for RepositoryCreateScriptedStore {
         unreachable!(
             "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
         )
+    }
+    async fn branch_create_terminal_replay(
+        &self,
+        _key: &ReceiptKey,
+        _binding: &OperationBinding,
+    ) -> Result<Option<lore_postgres::domain::coordinator::BranchCreateResult>, DomainError> {
+        unreachable!("This test store does not prepare branch creation")
     }
     async fn branch_create_replay(
         &self,

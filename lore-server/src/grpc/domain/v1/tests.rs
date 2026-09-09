@@ -357,6 +357,13 @@ impl DomainTransactionStore for RecordingStore {
         unreachable!("receipt-rail tests do not call repository_delete")
     }
 
+    async fn branch_create_terminal_replay(
+        &self,
+        _key: &ReceiptKey,
+        _binding: &OperationBinding,
+    ) -> Result<Option<lore_postgres::domain::coordinator::BranchCreateResult>, DomainError> {
+        unreachable!("This test store does not prepare branch creation")
+    }
     async fn branch_create_replay(
         &self,
         _operation: &GovernedOperation,

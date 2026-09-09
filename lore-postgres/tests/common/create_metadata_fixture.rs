@@ -15,7 +15,7 @@ use lore_postgres::pool::TlsConfig;
 use lore_postgres::pool::build_pool;
 use tokio_postgres::Client;
 
-async fn client(url: &str) -> Client {
+pub(crate) async fn client(url: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
         .await
         .unwrap();

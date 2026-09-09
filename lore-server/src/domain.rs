@@ -1789,13 +1789,40 @@ pub struct GovernedRepositoryCreate {
 /// Server preparation seam for governed v1 branch creation.
 pub struct GovernedBranchCreate {
     domain: Arc<DomainContext>,
-    operation: GovernedOperation,
+    admission: BranchCreateAdmission,
+}
+
+enum BranchCreateAdmission {
+    Prepared(GovernedOperation),
+    Terminal(lore_postgres::domain::coordinator::BranchCreateResult),
+}
+
+pub(crate) fn branch_create_outcome_unknown(message: impl Into<String>) -> Status {
+    let mut status = Status::aborted(message);
+    status.metadata_mut().insert(
+        lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(
+            lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_VALUE,
+        ),
+    );
+    status
+}
+
+fn branch_create_domain_error(error: &lore_postgres::domain::errors::DomainError) -> Status {
+    if matches!(
+        error,
+        lore_postgres::domain::errors::DomainError::OutcomeUnknown(_)
+    ) {
+        branch_create_outcome_unknown(error.to_string())
+    } else {
+        crate::grpc::map_domain_error_to_status(error)
+    }
 }
 
 impl GovernedBranchCreate {
     pub async fn prepare(
         domain: &Arc<DomainContext>,
-        admitted: AdmittedOperation,
+        mut admitted: AdmittedOperation,
         digest: Vec<u8>,
     ) -> Result<Self, Status> {
         if !domain.enforcement_enabled() {
@@ -1803,12 +1830,72 @@ impl GovernedBranchCreate {
                 "Governed branch create requires domain enforcement",
             ));
         }
-        let operation = domain
+        // Only this managed lifecycle RPC promises exact retry by client attempt.
+        // Other internal mutations and carried operation identities are unchanged.
+        let retry_binding = if let AdmissionSource::Internal(internal) = &admitted.source {
+            let attempt = internal.client_attempt_id.ok_or_else(|| {
+                Status::invalid_argument("BranchCreate requires a client attempt identity")
+            })?;
+            admitted.key.operation_id = attempt;
+            if digest.len() != 32 {
+                return Err(Status::invalid_argument(
+                    "BranchCreate intent digest must be 32 bytes",
+                ));
+            }
+            Some(OperationBinding {
+                method: "branch.create".into(),
+                scope: admitted.key.tenant_scope_key.clone(),
+                fingerprint_version: 1,
+                fingerprint: internal_prepare_fingerprint(
+                    "branch.create",
+                    &admitted.key.tenant_scope_key,
+                    &digest,
+                )?,
+                canonical_intent_digest: digest.clone(),
+            })
+        } else {
+            None
+        };
+        let key = admitted.key.clone();
+        if let Some(binding) = &retry_binding
+            && let Some(result) = domain
+                .store()
+                .branch_create_terminal_replay(&key, binding)
+                .await
+                .map_err(|e| branch_create_domain_error(&e))?
+        {
+            return Ok(Self {
+                domain: domain.clone(),
+                admission: BranchCreateAdmission::Terminal(result),
+            });
+        }
+        let operation = match domain
             .complete_governed(admitted, "branch.create", digest)
-            .await?;
+            .await
+        {
+            Ok(operation) => operation,
+            Err(error) => {
+                // A concurrent dispatch may commit after the first lookup, before
+                // normal prepare returns its already-decided classification.
+                if error.code() == tonic::Code::Aborted
+                    && let Some(binding) = &retry_binding
+                    && let Some(result) = domain
+                        .store()
+                        .branch_create_terminal_replay(&key, binding)
+                        .await
+                        .map_err(|e| branch_create_domain_error(&e))?
+                {
+                    return Ok(Self {
+                        domain: domain.clone(),
+                        admission: BranchCreateAdmission::Terminal(result),
+                    });
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
             domain: domain.clone(),
-            operation,
+            admission: BranchCreateAdmission::Prepared(operation),
         })
     }
 
@@ -1819,22 +1906,31 @@ impl GovernedBranchCreate {
     pub(crate) async fn replay(
         &self,
     ) -> Result<Option<lore_postgres::domain::coordinator::BranchCreateResult>, Status> {
+        let operation = match &self.admission {
+            BranchCreateAdmission::Terminal(result) => return Ok(Some(result.clone())),
+            BranchCreateAdmission::Prepared(operation) => operation,
+        };
         self.domain
             .store()
-            .branch_create_replay(&self.operation)
+            .branch_create_replay(operation)
             .await
-            .map_err(|e| crate::grpc::map_domain_error_to_status(&e))
+            .map_err(|e| branch_create_domain_error(&e))
     }
 
     pub(crate) async fn commit(
         &self,
         input: &lore_postgres::domain::coordinator::BranchCreateInput,
     ) -> Result<lore_postgres::domain::coordinator::BranchCreateResult, Status> {
+        let BranchCreateAdmission::Prepared(operation) = &self.admission else {
+            return Err(Status::failed_precondition(
+                "Terminal BranchCreate has no mutation authority",
+            ));
+        };
         self.domain
             .store()
-            .branch_create(&self.operation, input)
+            .branch_create(operation, input)
             .await
-            .map_err(|e| crate::grpc::map_domain_error_to_status(&e))
+            .map_err(|e| branch_create_domain_error(&e))
     }
 
     pub(crate) fn metadata_upload_context(
@@ -3503,6 +3599,14 @@ pub(crate) mod test_support {
         ) -> Result<Option<BranchSnapshot>, DomainError> {
             unreachable!("DomainContext::admit tests never call the coordinator")
         }
+        async fn branch_create_terminal_replay(
+            &self,
+            _key: &ReceiptKey,
+            _binding: &OperationBinding,
+        ) -> Result<Option<lore_postgres::domain::coordinator::BranchCreateResult>, DomainError>
+        {
+            unreachable!("This test store does not prepare branch creation")
+        }
         async fn branch_create_replay(
             &self,
             _operation: &GovernedOperation,
@@ -3589,6 +3693,15 @@ pub(crate) mod test_support {
     pub(crate) struct PreparingDomainStore {
         pub(crate) direct_evidence:
             std::sync::Mutex<Option<lore_postgres::domain::receipts::DirectAuthorizationEvidence>>,
+        pub(crate) direct_result: std::sync::Mutex<Option<PrepareResult>>,
+        pub(crate) direct_calls:
+            std::sync::Mutex<Vec<(ReceiptKey, OperationBinding, Option<uuid::Uuid>)>>,
+        pub(crate) branch_terminal_calls: std::sync::Mutex<Vec<(ReceiptKey, OperationBinding)>>,
+        pub(crate) branch_terminal_replies: std::sync::Mutex<
+            std::collections::VecDeque<
+                Result<Option<lore_postgres::domain::coordinator::BranchCreateResult>, DomainError>,
+            >,
+        >,
     }
 
     /// The token this double hands back, so a test can assert the governed
@@ -3601,15 +3714,23 @@ pub(crate) mod test_support {
         async fn domain_operation_prepare_direct(
             &self,
             key: &ReceiptKey,
-            _binding: &OperationBinding,
+            binding: &OperationBinding,
             evidence: &lore_postgres::domain::receipts::DirectAuthorizationEvidence,
-            _client_attempt_id: Option<uuid::Uuid>,
+            client_attempt_id: Option<uuid::Uuid>,
         ) -> Result<PrepareResult, DomainError> {
             assert_eq!(evidence.authorization_id, key.operation_id.as_bytes());
             assert_eq!(evidence.authorization_revision, 1);
             assert_eq!(evidence.verification_nonce, vec![0x11; 32]);
             assert_eq!(evidence.bound_fields_digest.len(), 32);
             *self.direct_evidence.lock().unwrap() = Some(evidence.clone());
+            self.direct_calls.lock().unwrap().push((
+                key.clone(),
+                binding.clone(),
+                client_attempt_id,
+            ));
+            if let Some(result) = self.direct_result.lock().unwrap().take() {
+                return Ok(result);
+            }
             Ok(PrepareResult::Prepared {
                 token: PREPARED_TEST_TOKEN,
                 hard_expires_at: std::time::SystemTime::UNIX_EPOCH
@@ -3697,6 +3818,22 @@ pub(crate) mod test_support {
             _branch_id: &[u8],
         ) -> Result<Option<BranchSnapshot>, DomainError> {
             unreachable!("PreparingDomainStore only serves domain_operation_prepare")
+        }
+        async fn branch_create_terminal_replay(
+            &self,
+            key: &ReceiptKey,
+            binding: &OperationBinding,
+        ) -> Result<Option<lore_postgres::domain::coordinator::BranchCreateResult>, DomainError>
+        {
+            self.branch_terminal_calls
+                .lock()
+                .unwrap()
+                .push((key.clone(), binding.clone()));
+            self.branch_terminal_replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(None))
         }
         async fn branch_create_replay(
             &self,
@@ -3910,6 +4047,14 @@ pub(crate) mod test_support {
                 .take()
                 .expect("scripted parent snapshot")
         }
+        async fn branch_create_terminal_replay(
+            &self,
+            _key: &ReceiptKey,
+            _binding: &OperationBinding,
+        ) -> Result<Option<lore_postgres::domain::coordinator::BranchCreateResult>, DomainError>
+        {
+            unreachable!("This scripted store expects carried branch operations")
+        }
         async fn branch_create_replay(
             &self,
             _operation: &GovernedOperation,
@@ -3996,6 +4141,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    include!("domain/branch_create_replay_tests.rs");
     use std::time::SystemTime;
 
     use lore_postgres::domain::schema::BACKFILL_CUTOVER;

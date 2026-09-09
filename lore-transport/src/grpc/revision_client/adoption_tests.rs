@@ -89,6 +89,7 @@ enum Reply {
     Loss,
     Refusal,
     Malformed,
+    ExpiredReceipt,
 }
 
 struct FixtureServer {
@@ -155,6 +156,16 @@ impl Server for FixtureServer {
             })),
             Reply::Loss => Err(Status::unavailable("response unavailable after dispatch")),
             Reply::Refusal => Err(Status::permission_denied("write refused")),
+            Reply::ExpiredReceipt => {
+                let mut status = Status::aborted("terminal payload expired");
+                status.metadata_mut().insert(
+                    crate::outcome::OUTCOME_UNKNOWN_METADATA_KEY,
+                    crate::outcome::OUTCOME_UNKNOWN_METADATA_VALUE
+                        .parse()
+                        .unwrap(),
+                );
+                Err(status)
+            }
         }
     }
     async fn branch_delete(
@@ -311,16 +322,28 @@ async fn managed_create_records_exact_intent_before_one_dispatch() {
 
 #[tokio::test]
 async fn dispatched_failure_never_enters_the_legacy_retry_loop() {
-    for reply in [Reply::Loss, Reply::Refusal, Reply::Malformed] {
+    for reply in [
+        Reply::Loss,
+        Reply::Refusal,
+        Reply::Malformed,
+        Reply::ExpiredReceipt,
+    ] {
         let fixture = Fixture::new(reply).await;
         let error = fixture
             .create(RepositoryId::from([0x11; 16]))
             .await
             .unwrap_err();
         assert_eq!(fixture.seen.lock().len(), 1);
-        if matches!(reply, Reply::Loss | Reply::Malformed) {
+        if matches!(
+            reply,
+            Reply::Loss | Reply::Malformed | Reply::ExpiredReceipt
+        ) {
             assert!(error.is_outcome_unknown(), "{error:?}");
-            assert_eq!(fixture.journal.unresolved().await.unwrap().len(), 1);
+            let unresolved = fixture.journal.unresolved().await.unwrap();
+            assert_eq!(unresolved.len(), 1);
+            let recorded = fixture.journal.intents.lock()[0].0.attempt_id;
+            assert_eq!(unresolved[0].attempt_id, recorded);
+            assert!(format!("{error:?}").contains(&recorded.to_string()));
         }
     }
 }

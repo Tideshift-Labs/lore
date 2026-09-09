@@ -122,6 +122,191 @@ fn rejected(outcome: DomainOutcome, reason: &str) {
     );
 }
 
+async fn direct_branch_operation(store: &PostgresDomainStore, repo: &[u8]) -> GovernedOperation {
+    let elapsed = store
+        .domain_operation_clock_get()
+        .await
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let attempt = Uuid::new_v7(uuid::Timestamp::from_unix(
+        uuid::NoContext,
+        elapsed.as_secs(),
+        elapsed.subsec_nanos(),
+    ));
+    let key = ReceiptKey {
+        verified_issuer: "https://direct-branch.invalid".into(),
+        authenticated_subject: "creator".into(),
+        tenant_scope_key: repo.to_vec(),
+        operation_id: attempt,
+    };
+    let binding = OperationBinding {
+        method: "branch.create".into(),
+        scope: repo.to_vec(),
+        fingerprint_version: 1,
+        fingerprint: vec![4; 32],
+        canonical_intent_digest: vec![5; 32],
+    };
+    let evidence = lore_postgres::domain::receipts::DirectAuthorizationEvidence {
+        authorization_id: attempt.as_bytes().to_vec(),
+        authorization_revision: 1,
+        verification_nonce: vec![6; 32],
+        bound_fields_digest: vec![7; 32],
+    };
+    let PrepareResult::Prepared { token, .. } = store
+        .domain_operation_prepare_direct(&key, &binding, &evidence, Some(attempt))
+        .await
+        .unwrap()
+    else {
+        panic!("fresh direct operation")
+    };
+    GovernedOperation {
+        key,
+        binding,
+        prepare_token: token,
+    }
+}
+
+#[tokio::test]
+#[ignore = "owned PostgreSQL; explicitly registered live target"]
+async fn direct_terminal_replay_checks_full_binding_namespace_and_retained_payload() {
+    use lore_postgres::domain::errors::DomainError;
+    let (_, store, client) = setup::fixture(false).await;
+    let repo = repository(&store).await;
+    let input = input(&repo);
+    let op = direct_branch_operation(&store, &repo.repository_id).await;
+    assert!(
+        store
+            .branch_create_terminal_replay(&op.key, &op.binding)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let applied = store.branch_create(&op, &input).await.unwrap();
+    let replay = store
+        .branch_create_terminal_replay(&op.key, &op.binding)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.outcome, applied.outcome);
+    assert_eq!(replay.public_result, applied.public_result);
+    for dimension in 0..5 {
+        let mut changed = op.binding.clone();
+        match dimension {
+            0 => changed.canonical_intent_digest[0] ^= 1,
+            1 => changed.fingerprint[0] ^= 1,
+            2 => changed.scope[0] ^= 1,
+            3 => changed.fingerprint_version += 1,
+            _ => changed.method = "branch.push".into(),
+        }
+        assert!(matches!(
+            store.branch_create_terminal_replay(&op.key, &changed).await,
+            Err(DomainError::InvalidInput(_))
+        ));
+    }
+    for dimension in 0..3 {
+        let mut other = op.key.clone();
+        match dimension {
+            0 => other.authenticated_subject = "another-user".into(),
+            1 => other.verified_issuer = "https://another-issuer.invalid".into(),
+            _ => other.tenant_scope_key = id(),
+        }
+        assert!(
+            store
+                .branch_create_terminal_replay(&other, &op.binding)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(artifacts(&client, &input).await, vec![1, 1, 1]);
+    client
+        .execute(
+            "UPDATE lore_domain_operation_receipts SET public_result=NULL WHERE operation_id=$1",
+            &[&op.key.operation_id.as_bytes().as_slice()],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .branch_create_terminal_replay(&op.key, &op.binding)
+            .await,
+        Err(DomainError::OutcomeUnknown(_))
+    ));
+    client.execute("UPDATE lore_domain_operation_receipts SET public_result=$2, full_result_expires_at=clock_timestamp()-interval '1 second' WHERE operation_id=$1",
+        &[&op.key.operation_id.as_bytes().as_slice(), &input.public_result]).await.unwrap();
+    assert!(matches!(
+        store
+            .branch_create_terminal_replay(&op.key, &op.binding)
+            .await,
+        Err(DomainError::OutcomeUnknown(_))
+    ));
+    assert_eq!(artifacts(&client, &input).await, vec![1, 1, 1]);
+}
+
+#[tokio::test]
+#[ignore = "owned PostgreSQL; explicitly registered live target"]
+async fn concurrent_direct_attempt_commits_once_and_has_one_lookup_receipt() {
+    let (url, store, client) = setup::fixture(false).await;
+    let repo = repository(&store).await;
+    let input = input(&repo);
+    let op = direct_branch_operation(&store, &repo.repository_id).await;
+    let mut blocker = setup::client(&url).await;
+    let blocked = blocker.transaction().await.unwrap();
+    blocked.query_one("SELECT operation_id FROM lore_domain_operation_receipts WHERE operation_id=$1 FOR UPDATE",
+        &[&op.key.operation_id.as_bytes().as_slice()]).await.unwrap();
+    let release = async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: i64 = client.query_one("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%lore_domain_operation_receipts%'", &[]).await.unwrap().get(0);
+                if waiting >= 2 { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("both creates must be blocked on the held receipt before release");
+        blocked.commit().await.unwrap();
+    };
+    let (a, b, ()) = tokio::join!(
+        store.branch_create(&op, &input),
+        store.branch_create(&op, &input),
+        release
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_ne!(a.replayed, b.replayed);
+    assert_eq!(a.outcome, DomainOutcome::Applied);
+    assert_eq!(a.outcome, b.outcome);
+    assert_eq!(a.public_result, b.public_result);
+    assert_eq!(artifacts(&client, &input).await, vec![1, 1, 1]);
+    let rows: i64 = client
+        .query_one(
+            "SELECT count(*) FROM lore_domain_operation_receipts WHERE client_attempt_id=$1",
+            &[&op.key.operation_id.as_bytes().as_slice()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 1);
+    let receipt = store
+        .domain_operation_attempt_receipt_get(
+            &op.key.verified_issuer,
+            &op.key.authenticated_subject,
+            &op.key.operation_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.method.as_deref(), Some("branch.create"));
+    assert!(matches!(
+        receipt.lookup,
+        lore_postgres::domain::receipts::ReceiptLookup::Committed { .. }
+    ));
+    let replay = store
+        .branch_create_terminal_replay(&op.key, &op.binding)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.public_result, Some(input.public_result));
+}
+
 async fn artifacts(client: &Client, input: &BranchCreateInput) -> Vec<i64> {
     let row = client
         .query_one(

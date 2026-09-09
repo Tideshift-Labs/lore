@@ -10,6 +10,18 @@ use prost::Message;
 
 use super::decode_governed_result;
 
+fn assert_unknown(status: tonic::Status) {
+    assert_eq!(status.code(), tonic::Code::Aborted);
+    assert_eq!(
+        status
+            .metadata()
+            .get(lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_KEY)
+            .unwrap(),
+        lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_VALUE
+    );
+    assert!(lore_transport::error::ProtocolError::from(status).is_outcome_unknown());
+}
+
 async fn governed_fixture(
     replay: Option<BranchCreateResult>,
 ) -> (
@@ -327,10 +339,7 @@ fn full_durable_response_bound_includes_the_version_byte() {
     response.branch.as_mut().unwrap().name.push('x');
     let over_limit = stored(&response);
     assert_eq!(over_limit.public_result.as_ref().unwrap().len(), 4097);
-    assert_eq!(
-        decode_governed_result(over_limit).unwrap_err().code(),
-        tonic::Code::DataLoss
-    );
+    assert_unknown(decode_governed_result(over_limit).unwrap_err());
 }
 
 #[test]
@@ -348,10 +357,7 @@ fn missing_unknown_truncated_or_overlong_receipts_fail_closed() {
             outcome: DomainOutcome::Applied,
             public_result: bytes,
         };
-        assert_eq!(
-            decode_governed_result(result).unwrap_err().code(),
-            tonic::Code::DataLoss
-        );
+        assert_unknown(decode_governed_result(result).unwrap_err());
     }
 }
 
@@ -369,12 +375,7 @@ fn every_durable_branch_identity_and_pointer_width_is_checked() {
                 _ => &mut branch.stack[0].revision_signature,
             };
             *bytes = vec![0; bytes.len().checked_add_signed(width_delta).unwrap()].into();
-            assert_eq!(
-                decode_governed_result(stored(&response))
-                    .unwrap_err()
-                    .code(),
-                tonic::Code::DataLoss
-            );
+            assert_unknown(decode_governed_result(stored(&response)).unwrap_err());
         }
     }
 }
@@ -406,6 +407,14 @@ fn terminal_rejections_keep_their_public_status_without_response_bytes() {
             },
             public_result: None,
         };
-        assert_eq!(decode_governed_result(result).unwrap_err().code(), code);
+        let error = decode_governed_result(result).unwrap_err();
+        assert_eq!(error.code(), code);
+        assert!(
+            error
+                .metadata()
+                .get(lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_KEY)
+                .is_none()
+        );
+        assert!(!lore_transport::error::ProtocolError::from(error).is_outcome_unknown());
     }
 }
