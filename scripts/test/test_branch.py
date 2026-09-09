@@ -27,7 +27,7 @@ def generate_branch_id() -> str:
 
 @pytest.mark.smoke
 def test_branch(new_lore_repo):
-    repo: Lore = new_lore_repo()
+    repo: Lore = new_lore_repo(repository_admin=True)
 
     with pytest.raises(ZeroRevisionError):
         repo.branch_create("zero-branch")

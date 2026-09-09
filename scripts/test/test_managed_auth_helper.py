@@ -86,6 +86,13 @@ class ManagedAuthTests(unittest.TestCase):
             claims["resources"],
             [{"resource_id": resource, "permission": ["read", "write"]}],
         )
+        permissions = parse_fields(
+            self.call("CheckUserPermission", field(1, resource.encode()))
+        )
+        self.assertEqual(
+            parse_fields(permissions[1][0]),
+            {1: [resource.encode()], 2: [b"read", b"write"]},
+        )
         with self.assertRaises(grpc.RpcError) as error:
             self.call(
                 "ExchangeUserTokenForMultiresourceToken",
@@ -93,6 +100,56 @@ class ManagedAuthTests(unittest.TestCase):
                 token,
             )
         self.assertEqual(error.exception.code(), grpc.StatusCode.UNAUTHENTICATED)
+
+    def test_admin_grant_matches_jwt_and_rpc_for_only_selected_repository(self):
+        admin_repository = uuid.uuid4().hex
+        self.auth.grant(self.token, admin_repository, admin=True)
+        writer_resource = "urc-" + self.repository
+        admin_resource = "urc-" + admin_repository
+        request = field(1, writer_resource.encode()) + field(1, admin_resource.encode())
+        response = self.call("ExchangeUserTokenForMultiresourceToken", request)
+        token = parse_fields(parse_fields(response)[1][0])[1][0].decode()
+        payload = token.split(".")[1]
+        claims = json.loads(
+            base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        )
+        self.assertEqual(
+            claims["resources"],
+            [
+                {"resource_id": writer_resource, "permission": ["read", "write"]},
+                {
+                    "resource_id": admin_resource,
+                    "permission": ["read", "write", "admin"],
+                },
+            ],
+        )
+        permissions = parse_fields(self.call("CheckUserPermission", request))
+        self.assertEqual(
+            [parse_fields(value) for value in permissions[1]],
+            [
+                {1: [writer_resource.encode()], 2: [b"read", b"write"]},
+                {1: [admin_resource.encode()], 2: [b"read", b"write", b"admin"]},
+            ],
+        )
+
+    def test_admin_grant_does_not_elevate_other_identity_or_ungranted_resource(self):
+        self.auth.grant(self.token, self.repository, admin=True)
+        other_token = self.auth.identity()
+        self.auth.grant(other_token, self.repository)
+        resource = "urc-" + self.repository
+        request = field(1, resource.encode())
+        permissions = parse_fields(
+            self.call("CheckUserPermission", request, other_token)
+        )
+        self.assertEqual(
+            parse_fields(permissions[1][0]),
+            {1: [resource.encode()], 2: [b"read", b"write"]},
+        )
+        foreign = field(1, ("urc-" + uuid.uuid4().hex).encode())
+        for token in (self.token, other_token):
+            with self.assertRaises(grpc.RpcError) as error:
+                self.call("ExchangeUserTokenForMultiresourceToken", foreign, token)
+            self.assertEqual(error.exception.code(), grpc.StatusCode.PERMISSION_DENIED)
 
     def test_foreign_identity_resource_and_impersonation_refused(self):
         resource = field(1, ("urc-" + self.repository).encode())

@@ -33,6 +33,7 @@ re-handshakes against the restarted server, and every in-flight read
 must recover.
 """
 
+import json
 import logging
 import os
 import signal
@@ -40,9 +41,11 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pytest
+from managed_auth import ManagedAuth
 
 from lore_server import (
     allocate_free_port,
@@ -140,6 +143,27 @@ def _wait_for_port_free(host: str, port: int, deadline_s: float = 10.0) -> None:
     raise RuntimeError(f"Port {port} still in use after {deadline_s}s")
 
 
+@pytest.fixture
+def reconnect_auth(tmp_path_factory, global_dir_name):
+    auth = ManagedAuth(tmp_path_factory.mktemp("quic-reconnect-auth"))
+    try:
+        yield auth
+    finally:
+        try:
+            auth.close()
+        finally:
+            for name in (
+                "auth.json",
+                "tokenstore.toml",
+                "tokens.toml",
+                "sec-tokenstore_encryption_key",
+            ):
+                path = Path(global_dir_name) / name
+                if path.is_symlink():
+                    raise RuntimeError("Refusing redirected fixture credential cleanup")
+                path.unlink(missing_ok=True)
+
+
 @pytest.mark.smoke
 def test_sync_survives_mid_flight_disconnect(
     request,
@@ -148,6 +172,7 @@ def test_sync_survives_mid_flight_disconnect(
     lore_executable_path,
     lore_server_executable_path,
     new_lore_repo,
+    reconnect_auth,
 ):
     # Dedicated server for this test so we can kill+relaunch freely
     # without disrupting other tests that share the session-scoped
@@ -162,6 +187,18 @@ def test_sync_survives_mid_flight_disconnect(
     }
     server_root, server_env = generate_server_config(
         request, tmp_path_factory, server_ports
+    )
+    server_env["SSL_CERT_FILE"] = str(reconnect_auth.ca_path)
+    server_env.pop("SSL_CERT_DIR", None)
+    (server_root / "lore-server" / "config" / "local.toml").write_text(
+        "[server.auth]\n"
+        f"jwt_issuer={json.dumps(reconnect_auth.issuer)}\n"
+        'jwt_audience=["lore-storage","commit0-cli","localhost","127.0.0.1"]\n'
+        "enforce_write_permission=true\n[server.auth.jwk]\n"
+        f"endpoint={json.dumps(reconnect_auth.jwks_url)}\n"
+        "[environment.endpoint]\n"
+        f"auth_url={json.dumps(reconnect_auth.url)}\n",
+        encoding="utf-8",
     )
     # Slow the server's outbound throughput so the clone's transfer phase
     # spans multiple seconds — without this, even 128 MiB on loopback
@@ -180,10 +217,22 @@ def test_sync_survives_mid_flight_disconnect(
     )
     try:
         test_remote_url = f"lore://127.0.0.1:{server_ports['quic']}/"
+        setup_remote_url = f"grpc://127.0.0.1:{server_ports['grpc']}/"
 
         # Populate the test server: create a repo, write NUM_FILES random
-        # binary blobs, push.
-        source = new_lore_repo(remote_url=test_remote_url)
+        # binary blobs, push through the supported managed write transport.
+        # Both listeners serve the same stores; the interrupted read stays QUIC.
+        identity = reconnect_auth.identity()
+        repository_id = uuid.uuid4().hex
+        reconnect_auth.grant(identity, repository_id)
+        reconnect_auth.login(
+            lore_executable_path, global_dir_name, setup_remote_url, identity
+        )
+        source = new_lore_repo(
+            remote_url=setup_remote_url,
+            repo_id=repository_id,
+            environment_vars=reconnect_auth.environment(global_dir_name),
+        )
         files = {
             f"data/file_{i:03d}.bin": os.urandom(FILE_SIZE) for i in range(NUM_FILES)
         }
@@ -208,15 +257,20 @@ def test_sync_survives_mid_flight_disconnect(
         target_path.mkdir(exist_ok=True)
 
         client_env = os.environ.copy()
+        client_env.update(reconnect_auth.environment(global_dir_name))
+        client_env.pop("SSL_CERT_DIR", None)
         client_env["LORE_REMOTE_URL"] = test_remote_url
         client_env["LORE_GLOBAL_PATH"] = global_dir_name
         client_env.setdefault("RUST_LOG", "info")
+        quic_repository_url = test_remote_url + source.name
+        assert source.remote_path == setup_remote_url + source.name
+        assert quic_repository_url.startswith("lore://")
 
         clone_cmd = [
             lore_executable_path,
             "repository",
             "clone",
-            source.remote_path,
+            quic_repository_url,
             str(target_path),
         ]
         logger.info("Spawning clone subprocess: %s", " ".join(clone_cmd))

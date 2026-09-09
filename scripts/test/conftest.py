@@ -129,6 +129,7 @@ def new_lore_repo(
         create_repo=True,
         remote_url=None,
         environment_vars: dict[str, str] | None = None,
+        repository_admin=False,
     ):
         if name is None:
             name = ""
@@ -147,7 +148,7 @@ def new_lore_repo(
         ):
             managed, remote_url, token = request.getfixturevalue("managed_cli_identity")
             repo_id = repo_id or Lore.generate_id()
-            managed.grant(token, repo_id)
+            managed.grant(token, repo_id, admin=repository_admin)
             environment_vars = {
                 **(environment_vars or {}),
                 **managed.environment(global_dir_name),

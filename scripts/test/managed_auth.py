@@ -190,7 +190,8 @@ class ManagedAuth:
         }
         if resources is not None:
             claims["resources"] = [
-                {"resource_id": r, "permission": ["read", "write"]} for r in resources
+                {"resource_id": r, "permission": list(permissions)}
+                for r, permissions in resources.items()
             ]
         payload = ".".join(
             b64(json.dumps(v, separators=(",", ":")).encode())
@@ -206,13 +207,15 @@ class ManagedAuth:
         subject = str(uuid.uuid4())
         token = self.sign(subject)
         with self.lock:
-            self.identities[token] = (subject, set())
+            self.identities[token] = (subject, {})
         return token
 
-    def grant(self, token, repository):
+    def grant(self, token, repository, *, admin=False):
         resource = "urc-" + uuid.UUID(repository).hex
         with self.lock:
-            self.identities[token][1].add(resource)
+            self.identities[token][1][resource] = (
+                ("read", "write", "admin") if admin else ("read", "write")
+            )
 
     def authorized(self, context):
         bearer = dict(context.invocation_metadata()).get("authorization", "")
@@ -223,7 +226,7 @@ class ManagedAuth:
                 else None
             )
             if identity:
-                return identity[0], set(identity[1])
+                return identity[0], dict(identity[1])
         context.abort(grpc.StatusCode.UNAUTHENTICATED, "Unknown fixture identity")
 
     def exchange(self, request, context):
@@ -232,13 +235,15 @@ class ManagedAuth:
         if (
             not resources
             or len(set(resources)) != len(resources)
-            or not set(resources) <= allowed
+            or not set(resources) <= allowed.keys()
         ):
             context.abort(
                 grpc.StatusCode.PERMISSION_DENIED,
                 "Repository is not granted to this fixture",
             )
-        token = self.sign(subject, resources)
+        token = self.sign(
+            subject, {resource: allowed[resource] for resource in resources}
+        )
         user = (
             field(1, token.encode())
             + _encode_varint(2 << 3)
@@ -280,7 +285,9 @@ class ManagedAuth:
             granted = resource.decode() in allowed
             permission = field(1, resource)
             if granted:
-                permission += field(2, b"read") + field(2, b"write")
+                permission += b"".join(
+                    field(2, value.encode()) for value in allowed[resource.decode()]
+                )
             result += field(1 if granted else 2, permission)
         return result
 
