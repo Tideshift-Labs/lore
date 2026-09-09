@@ -23,7 +23,7 @@ import grpc
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from protobuf_wire import encode_bytes_field as field, parse_fields, _encode_varint
 
@@ -72,17 +72,41 @@ class ManagedAuth:
         self.http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.http.serve_forever, daemon=True)
         now = datetime.now(timezone.utc)
+        ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        ca_name = x509.Name(
+            [x509.NameAttribute(NameOID.COMMON_NAME, "Python fixture CA")]
+        )
+        ca = (
+            x509.CertificateBuilder()
+            .subject_name(ca_name)
+            .issuer_name(ca_name)
+            .public_key(ca_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=1))
+            .not_valid_after(now + timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    False, False, False, False, False, True, True, None, None
+                ),
+                critical=True,
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
         cert = (
             x509.CertificateBuilder()
             .subject_name(name)
-            .issuer_name(name)
+            .issuer_name(ca_name)
             .public_key(self.key.public_key())
             .serial_number(x509.random_serial_number())
             .not_valid_before(now - timedelta(minutes=1))
             .not_valid_after(now + timedelta(days=1))
             .add_extension(
-                x509.BasicConstraints(ca=True, path_length=None), critical=True
+                x509.BasicConstraints(ca=False, path_length=None), critical=True
+            )
+            .add_extension(
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
             )
             .add_extension(
                 x509.SubjectAlternativeName(
@@ -93,11 +117,12 @@ class ManagedAuth:
                 ),
                 critical=False,
             )
-            .sign(self.key, hashes.SHA256())
+            .sign(ca_key, hashes.SHA256())
         )
         pem = cert.public_bytes(serialization.Encoding.PEM)
+        self.server_certificate = cert
         self.ca_path = Path(directory) / "fixture-ca.pem"
-        self.ca_path.write_bytes(pem)
+        self.ca_path.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
         private = self.key.private_bytes(
             serialization.Encoding.PEM,
             serialization.PrivateFormat.PKCS8,
@@ -115,6 +140,14 @@ class ManagedAuth:
                         "CheckUserPermission": grpc.unary_unary_rpc_method_handler(
                             self.permissions
                         ),
+                    },
+                ),
+                grpc.method_handlers_generic_handler(
+                    "ucs.auth.RebacApi",
+                    {
+                        "CreateResource": grpc.unary_unary_rpc_method_handler(
+                            self.create_resource
+                        )
                     },
                 ),
             )
@@ -214,6 +247,26 @@ class ManagedAuth:
             + field(4, b"Python fixture")
         )
         return field(1, user)
+
+    def create_resource(self, request, context):
+        # Legacy create only: never acknowledge an attached governed claim.
+        # The exact bearer lookup identifies a fixture-minted signed subject;
+        # only that subject's preallocated repository may be registered.
+        _, allowed = self.authorized(context)
+        values = parse_fields(request)
+        if (
+            set(values) != {1, 2}
+            or len(values[1]) != 1
+            or len(values[2]) != 1
+            or not isinstance(values[1][0], bytes)
+            or not isinstance(values[2][0], bytes)
+            or not values[2][0]
+            or values[1][0].decode() not in allowed
+        ):
+            context.abort(
+                grpc.StatusCode.PERMISSION_DENIED, "Create is outside the fixture grant"
+            )
+        return b""
 
     def permissions(self, request, context):
         _, allowed = self.authorized(context)

@@ -11,6 +11,8 @@ import uuid
 from unittest.mock import patch
 
 import grpc
+from cryptography import x509
+from cryptography.x509.oid import ExtendedKeyUsageOID
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -19,6 +21,21 @@ from protobuf_wire import encode_bytes_field as field, parse_fields
 
 
 class ManagedAuthTests(unittest.TestCase):
+    def test_tls_leaf_is_not_a_ca_and_chains_to_owned_root(self):
+        leaf = self.auth.server_certificate
+        root = x509.load_pem_x509_certificate(self.auth.ca_path.read_bytes())
+        self.assertFalse(
+            leaf.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+        )
+        self.assertTrue(
+            root.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+        )
+        self.assertIn(
+            ExtendedKeyUsageOID.SERVER_AUTH,
+            leaf.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value,
+        )
+        leaf.verify_directly_issued_by(root)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.auth = ManagedAuth(self.directory.name)
@@ -107,6 +124,7 @@ class ManagedAuthTests(unittest.TestCase):
                     self.token,
                 )
             self.assertNotIn(self.token, str(error.exception))
+
             self.assertEqual(
                 run.call_args.kwargs["env"]["LORE_AUTH_PATH"], self.directory.name
             )
@@ -120,6 +138,34 @@ class ManagedAuthTests(unittest.TestCase):
                     self.token,
                 )
             self.assertNotIn(self.token, str(error.exception))
+
+    def test_rebac_create_requires_exact_pregrant_and_rejects_governed_claim(self):
+        rpc = self.channel.unary_unary("/ucs.auth.RebacApi/CreateResource")
+        request = field(1, ("urc-" + self.repository).encode()) + field(
+            2, b"owned-repository"
+        )
+        self.assertEqual(
+            rpc(
+                request,
+                metadata=(("authorization", "Bearer " + self.token),),
+                timeout=5,
+            ),
+            b"",
+        )
+        for payload, token in (
+            (request, self.auth.identity()),
+            (
+                field(1, b"urc-00000000000000000000000000000000")
+                + field(2, b"foreign"),
+                self.token,
+            ),
+            (request + field(3, b"governed-issuer"), self.token),
+        ):
+            with self.assertRaises(grpc.RpcError) as error:
+                rpc(
+                    payload, metadata=(("authorization", "Bearer " + token),), timeout=5
+                )
+            self.assertEqual(error.exception.code(), grpc.StatusCode.PERMISSION_DENIED)
 
 
 if __name__ == "__main__":
