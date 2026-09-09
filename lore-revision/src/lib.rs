@@ -42,6 +42,7 @@ pub mod shared_store;
 #[doc(hidden)]
 pub use lore_base;
 pub mod lore;
+pub mod managed_push;
 pub mod merge;
 pub mod merge_carry;
 pub mod metadata;
@@ -55,7 +56,6 @@ pub mod protocol;
 pub mod relay;
 pub mod repository;
 pub mod repository_fence;
-pub mod managed_push;
 pub mod revision;
 pub mod runtime;
 pub mod stage;
