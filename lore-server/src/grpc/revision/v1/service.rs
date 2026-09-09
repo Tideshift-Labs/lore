@@ -178,7 +178,7 @@ impl RevisionService for LoreRevisionV1Service {
         )?;
         timeout_grpc(
             self.rpc_timeout,
-            branch_create::handler(
+            branch_create::handler_with_domain(
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
@@ -186,6 +186,7 @@ impl RevisionService for LoreRevisionV1Service {
                 &self.forwarded_requests,
                 &self.hook_dispatcher,
                 &self.instrument_provider,
+                self.domain_context.as_ref(),
             ),
         )
         .await

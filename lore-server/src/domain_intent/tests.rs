@@ -739,6 +739,14 @@ fn maximum_create_preimage_is_exactly_68635_bytes_and_over_limit_refuses() {
 fn intent_surface_excludes_authority_and_server_derived_seams() {
     fn exhaustively_destructure(intent: CanonicalIntent<'_>) {
         match intent {
+            CanonicalIntent::BranchCreate {
+                repository_id: _,
+                branch_id: _,
+                name: _,
+                category: _,
+                creator: _,
+                stack: _,
+            } => {}
             CanonicalIntent::RepositoryCreate {
                 repository_id: _,
                 name: _,
@@ -776,5 +784,13 @@ fn intent_surface_excludes_authority_and_server_derived_seams() {
     }
     exhaustively_destructure(CanonicalIntent::RepositoryDelete {
         repository_id: &REPOSITORY_ID,
+    });
+    exhaustively_destructure(CanonicalIntent::BranchCreate {
+        repository_id: &REPOSITORY_ID,
+        branch_id: &BRANCH_ID,
+        name: "feature",
+        category: "",
+        creator: None,
+        stack: &[],
     });
 }

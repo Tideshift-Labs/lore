@@ -64,6 +64,7 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
+pub(crate) use creation::bind_branch_creation_metadata;
 pub(crate) use creation::bind_creation_metadata;
 use deadpool_postgres::Pool;
 use deadpool_postgres::Transaction;

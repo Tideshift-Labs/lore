@@ -168,6 +168,41 @@ pub struct RepositoryCreateInput {
     pub events: Vec<PendingEvent>,
 }
 
+/// An authoritative first-parent metadata pointer, or confirmed absence.
+#[derive(Debug, Clone)]
+pub struct BranchCreateParentMetadata {
+    pub branch_id: Vec<u8>,
+    pub metadata_hash: Option<Vec<u8>>,
+}
+
+/// Prepared fresh-identity branch publication. No store or network handle crosses this seam.
+#[derive(Debug, Clone)]
+pub struct BranchCreateInput {
+    pub repository_id: Vec<u8>,
+    pub branch_id: Vec<u8>,
+    pub expected_repository_generation: i64,
+    pub expected_repository_metadata_hash: Vec<u8>,
+    pub expected_default_branch_id: Vec<u8>,
+    pub parent_metadata: Option<BranchCreateParentMetadata>,
+    pub name: String,
+    pub metadata_hash: Vec<u8>,
+    pub latest_hash: Vec<u8>,
+    pub metadata_witness: Option<super::fragments::EpochWitness>,
+    pub projection: Vec<ProjectionWrite>,
+    pub events: Vec<PendingEvent>,
+    /// Version byte plus the complete prepared wire response, at most 4096 bytes.
+    pub public_result: Vec<u8>,
+}
+
+/// Both a fresh acknowledgement and an exact retry carry only durable response bytes.
+#[derive(Debug, Clone)]
+pub struct BranchCreateResult {
+    pub outcome: DomainOutcome,
+    pub public_result: Option<Vec<u8>>,
+    /// True only when this call read an already terminal receipt.
+    pub replayed: bool,
+}
+
 /// The most classified events one governed mutation may append.
 ///
 /// Repository create is the only method that needs more than one today, and it
@@ -637,6 +672,19 @@ pub trait DomainTransactionStore: Send + Sync {
         operation: &GovernedOperation,
         input: &RepositoryCreateInput,
     ) -> Result<MutationResult, DomainError>;
+
+    /// Read a terminal branch-create response, leaving a prepared receipt unconsumed.
+    async fn branch_create_replay(
+        &self,
+        operation: &GovernedOperation,
+    ) -> Result<Option<BranchCreateResult>, DomainError>;
+
+    /// Publish a fresh branch and its exact response atomically with its receipt.
+    async fn branch_create(
+        &self,
+        operation: &GovernedOperation,
+        input: &BranchCreateInput,
+    ) -> Result<BranchCreateResult, DomainError>;
 
     /// Tombstone a repository, release its live name, tombstone its branches,
     /// and remove the projection rows, in one transaction.

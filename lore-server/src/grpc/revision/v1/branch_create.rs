@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::util;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::BRANCH_ID;
+use prost::Message;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -29,6 +31,309 @@ use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
 use crate::util::setup_execution;
+
+#[cfg(test)]
+#[path = "branch_create/governed_tests.rs"]
+mod governed_tests;
+
+/// Decode only the durable response; no later branch state may replace receipt evidence.
+pub(crate) fn decode_governed_result(
+    result: lore_postgres::domain::coordinator::BranchCreateResult,
+) -> Result<BranchCreateResponse, Status> {
+    use lore_postgres::domain::coordinator::*;
+    use lore_postgres::domain::errors::DomainOutcome;
+    if let DomainOutcome::NotApplied { reason, .. } = result.outcome {
+        return Err(match reason.as_str() {
+            "branch_create_response_too_large_v1" => Status::invalid_argument(reason),
+            NAME_TAKEN_V1 | TOMBSTONED_V1 | "branch_create_id_exists_v1" => {
+                Status::already_exists(reason)
+            }
+            NOT_FOUND_V1 => Status::not_found(reason),
+            _ => Status::failed_precondition(reason),
+        });
+    }
+    let bytes = result
+        .public_result
+        .ok_or_else(|| Status::data_loss("Branch create receipt has no response"))?;
+    if bytes.len() > 4096 || bytes.first() != Some(&1) {
+        return Err(Status::data_loss(
+            "Unsupported branch create receipt response",
+        ));
+    }
+    let response = BranchCreateResponse::decode(&bytes[1..])
+        .map_err(|_| Status::data_loss("Malformed branch create receipt response"))?;
+    let branch = response
+        .branch
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("Branch create receipt has no branch"))?;
+    if branch.id.len() != 16
+        || branch.metadata.len() != 32
+        || branch.latest.len() != 32
+        || branch
+            .stack
+            .iter()
+            .any(|p| p.branch_id.len() != 16 || p.revision_signature.len() != 32)
+    {
+        return Err(Status::data_loss("Malformed branch create receipt branch"));
+    }
+    Ok(response)
+}
+
+#[derive(Debug)]
+pub(crate) struct GovernedBranchCreateResponse {
+    pub response: BranchCreateResponse,
+    pub newly_applied: bool,
+}
+
+fn completed_creation(
+    result: lore_postgres::domain::coordinator::BranchCreateResult,
+) -> Result<GovernedBranchCreateResponse, Status> {
+    let newly_applied = !result.replayed;
+    Ok(GovernedBranchCreateResponse {
+        response: decode_governed_result(result)?,
+        newly_applied,
+    })
+}
+
+pub(crate) async fn emit_governed_branch_created(
+    result: &GovernedBranchCreateResponse,
+    notification: &dyn NotificationSender,
+    hooks: &HookDispatcher,
+    instruments: &impl InstrumentProvider,
+    hook: HookContext,
+    repository_id: lore_revision::lore::RepositoryId,
+    branch_id: BranchId,
+) {
+    if !result.newly_applied {
+        return;
+    }
+    notification.branch_created(repository_id, branch_id).await;
+    hooks.spawn_post(HookPoint::BranchCreate, hook);
+    instruments.counter("num_branches_created").add(1, &[]);
+}
+
+/// Preparation for the disabled governed entry point. Receipted replay is first,
+/// followed by read-only validation and immutable upload, then one publication.
+pub(crate) async fn governed_branch_create(
+    governed: &crate::domain::GovernedBranchCreate,
+    request: &BranchCreateRequest,
+    repository: Arc<RepositoryContext>,
+    verified_identity: &str,
+) -> Result<GovernedBranchCreateResponse, Status> {
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_base::types::KeyType;
+    use lore_postgres::domain::coordinator::BranchCreateInput;
+    use lore_postgres::domain::coordinator::BranchCreateParentMetadata;
+    use lore_postgres::domain::coordinator::ProjectionWrite;
+    use lore_revision::metadata::Metadata;
+    use lore_storage::hash;
+    if let Some(result) = governed.replay().await? {
+        return Ok(GovernedBranchCreateResponse {
+            response: decode_governed_result(result)?,
+            newly_applied: false,
+        });
+    }
+    let creator = request.creator.as_deref().unwrap_or(verified_identity);
+    // Foreign attribution awaits its explicit policy and public gate review.
+    if creator != verified_identity {
+        return Err(Status::failed_precondition(
+            "Governed foreign branch attribution is not enabled",
+        ));
+    }
+    validate_create_input(&request.name, &request.category, creator)?;
+    if !branch::is_valid_name(&request.name) || request.id.len() != 16 || request.stack.len() > 1024
+    {
+        return Err(Status::invalid_argument("Invalid branch creation input"));
+    }
+    if request
+        .stack
+        .iter()
+        .any(|p| p.branch_id.len() != 16 || p.revision_signature.len() != 32)
+    {
+        return Err(Status::invalid_argument("Invalid branch point width"));
+    }
+    let snapshot = governed
+        .domain()
+        .store()
+        .repository_snapshot(repository.id.data())
+        .await
+        .map_err(|e| crate::grpc::map_domain_error_to_status(&e))?
+        .filter(|s| s.live)
+        .ok_or_else(|| Status::not_found("Repository is not live"))?;
+    // Load the exact captured repository pointer, never a second mutable lookup.
+    let repo_metadata = repository::metadata(
+        repository.clone(),
+        Hash::from(snapshot.metadata_hash.as_slice()),
+    )
+    .await
+    .map_err(|e| Status::internal(format!("Cannot read repository metadata: {e}")))?;
+    if repo_metadata.default_branch.data().as_slice() != snapshot.default_branch_id {
+        return Err(Status::failed_precondition(
+            "Repository default branch metadata disagrees",
+        ));
+    }
+    let parent_metadata = if let Some(parent) = request.stack.first() {
+        if parent.branch_id.iter().all(|b| *b == 0) || parent.branch_id == request.id {
+            return Err(Status::invalid_argument("Invalid parent branch"));
+        }
+        if parent.revision_signature.iter().all(|b| *b == 0)
+            && parent.branch_id != snapshot.default_branch_id
+        {
+            return Err(Status::invalid_argument(
+                "Zero parent revision requires the default branch",
+            ));
+        }
+        let parent_snapshot = governed
+            .domain()
+            .store()
+            .branch_snapshot(repository.id.data(), &parent.branch_id)
+            .await
+            .map_err(|e| crate::grpc::map_domain_error_to_status(&e))?
+            .filter(|s| s.live);
+        let metadata_hash = parent_snapshot.map(|s| s.metadata_hash);
+        if let Some(pointer) = &metadata_hash {
+            let metadata =
+                branch::load_metadata(repository.clone(), Hash::from(pointer.as_slice()))
+                    .await
+                    .map_err(|e| Status::internal(format!("Cannot read parent metadata: {e}")))?;
+            if branch::category(&metadata).unwrap_or(branch::default_category())
+                == branch::personal_category()
+            {
+                return Err(Status::invalid_argument(
+                    "A personal branch cannot be a parent",
+                ));
+            }
+        }
+        Some(BranchCreateParentMetadata {
+            branch_id: parent.branch_id.to_vec(),
+            metadata_hash,
+        })
+    } else {
+        None
+    };
+    let branch_id = BranchId::from(request.id.as_ref());
+    let stack: Vec<BranchPoint> = request
+        .stack
+        .iter()
+        .cloned()
+        .map(BranchPoint::from)
+        .collect();
+    let latest = stack.first().map(|p| p.revision).unwrap_or_default();
+    let created = util::time::timestamp();
+    let mut metadata = Metadata::new();
+    branch::metadata_populate(
+        &mut metadata,
+        branch_id,
+        &request.name,
+        &request.category,
+        creator,
+        created,
+        stack.clone(),
+    )
+    .map_err(|e| Status::invalid_argument(format!("Invalid branch metadata: {e}")))?;
+    let mut response = BranchCreateResponse {
+        branch: Some(lore_proto::lore::model::v1::Branch {
+            id: request.id.clone(),
+            name: request.name.clone(),
+            creator: creator.to_owned(),
+            category: request.category.clone(),
+            created,
+            latest: latest.into(),
+            deleted: false,
+            metadata: vec![0; 32].into(),
+            stack: request.stack.clone(),
+            protected: branch::protected(&metadata),
+        }),
+    };
+    let encode = |response: &BranchCreateResponse| {
+        let mut bytes = vec![1];
+        response.encode(&mut bytes).map(|()| bytes)
+    };
+    let mut input = BranchCreateInput {
+        repository_id: repository.id.data().to_vec(),
+        branch_id: request.id.to_vec(),
+        expected_repository_generation: snapshot.generation,
+        expected_repository_metadata_hash: snapshot.metadata_hash,
+        expected_default_branch_id: snapshot.default_branch_id,
+        parent_metadata,
+        name: request.name.clone(),
+        metadata_hash: vec![0; 32],
+        latest_hash: latest.data().to_vec(),
+        metadata_witness: None,
+        projection: Vec::new(),
+        events: Vec::new(),
+        public_result: encode(&response).map_err(|e| Status::internal(e.to_string()))?,
+    };
+    if input.public_result.len() > 4096 {
+        return completed_creation(governed.commit(&input).await?);
+    }
+    let upload = governed.metadata_upload_context(&repository)?;
+    let target = upload
+        .as_ref()
+        .map_or_else(|| repository.clone(), |u| u.repository.clone());
+    let metadata_hash = metadata.serialize(target).await.map_err(|e| {
+        if e.is_slow_down() {
+            Status::resource_exhausted("Branch metadata upload requires retry")
+        } else {
+            Status::internal(format!("Branch metadata upload failed: {e}"))
+        }
+    })?;
+    input.metadata_hash = metadata_hash.data().to_vec();
+    if let Some(upload) = upload {
+        let witnesses = upload.uploads.witnesses().await;
+        if witnesses.len() != 1 || witnesses[0].hash != input.metadata_hash {
+            return Err(Status::failed_precondition(
+                "Branch metadata upload has no exact epoch witness",
+            ));
+        }
+        input.metadata_witness = witnesses.into_iter().next();
+    }
+    if let Some(branch) = response.branch.as_mut() {
+        branch.metadata = input.metadata_hash.clone().into();
+    }
+    input.public_result = encode(&response).map_err(|e| Status::internal(e.to_string()))?;
+    let repo_hex = hex::encode(repository.id.data());
+    let branch_hex = hex::encode(&request.id);
+    let projection = |key: Hash, key_type: KeyType, value: Vec<u8>| ProjectionWrite {
+        partition: repository.id.data().to_vec(),
+        key_type: key_type as i16,
+        key: key.data().to_vec(),
+        value: Some(value),
+    };
+    input.projection = vec![
+        projection(
+            hash::hash_function_args(repository.salt(), branch::METADATA, &repo_hex, &branch_hex),
+            KeyType::BranchMetadata,
+            input.metadata_hash.clone(),
+        ),
+        projection(
+            hash::hash_function_arg(repository.salt(), branch::ID, &request.name.to_lowercase()),
+            KeyType::BranchId,
+            Hash::from_context(Context::from(request.id.as_ref()))
+                .data()
+                .to_vec(),
+        ),
+        projection(
+            hash::hash_function_args(repository.salt(), branch::LATEST, &repo_hex, &branch_hex),
+            KeyType::BranchLatestPointer,
+            input.latest_hash.clone(),
+        ),
+    ];
+    if let Some(cell) = governed.domain().cell_id() {
+        input.events.push(
+            lore_postgres::domain::outbox::builders::branch_created(
+                cell,
+                &input.repository_id,
+                &input.branch_id,
+                &input.name,
+                &input.latest_hash,
+            )
+            .map_err(|e| crate::grpc::map_domain_error_to_status(&e))?,
+        );
+    }
+    completed_creation(governed.commit(&input).await?)
+}
 
 /// Reject oversized string fields early to prevent resource exhaustion.
 fn validate_create_input(name: &str, category: &str, creator: &str) -> Result<(), Status> {
@@ -72,8 +377,122 @@ pub async fn handler(
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<BranchCreateResponse>, Status> {
+    handler_with_domain(
+        request,
+        immutable_store,
+        mutable_store,
+        notification_sender,
+        forwarded_requests,
+        hook_dispatcher,
+        instrument_provider,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn handler_with_domain(
+    request: Request<BranchCreateRequest>,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    notification_sender: Arc<dyn NotificationSender>,
+    forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
+    hook_dispatcher: &HookDispatcher,
+    instrument_provider: &impl InstrumentProvider,
+    domain_context: Option<&Arc<crate::domain::DomainContext>>,
+) -> Result<Response<BranchCreateResponse>, Status> {
+    // Reuse the public gate before admission even when the service is invoked directly.
+    if domain_context.is_some_and(|domain| domain.enforcement_enabled()) {
+        crate::grpc::caller_capabilities::admit(
+            crate::grpc::caller_capabilities::CallerCapabilityPolicy::RequireOutcomeUnknownV1,
+            "/lore.revision.v1.RevisionService/BranchCreate",
+            &request.metadata().clone().into_headers(),
+        )?;
+    }
     let caller_context = CallerContext::from_original_request(&request)?;
+    let authorization = crate::grpc::get_authorization_optional(request.extensions());
+    let admitted = crate::domain::admit_at_entry(
+        domain_context,
+        request.metadata(),
+        authorization.as_ref(),
+        crate::domain::GovernedScope::TargetRepository {
+            repository_id: caller_context.repository_id.data(),
+        },
+    )?;
     let req = request.into_inner();
+    if let Some(admitted) = admitted {
+        if forwarded_requests
+            .as_ref()
+            .is_some_and(|f| f.rpc_flags().revision_branch_create)
+        {
+            return Err(crate::domain::reject_unwired_governed_operation(
+                &admitted,
+                "branch_create (forwarded)",
+            ));
+        }
+        let domain = domain_context
+            .ok_or_else(|| Status::failed_precondition("Domain coordinator unavailable"))?;
+        let stack: Vec<(&[u8], &[u8])> = req
+            .stack
+            .iter()
+            .map(|p| (p.branch_id.as_ref(), p.revision_signature.as_ref()))
+            .collect();
+        let digest = crate::domain_intent::canonical_intent_digest(
+            &crate::domain_intent::CanonicalIntent::BranchCreate {
+                repository_id: caller_context.repository_id.data(),
+                branch_id: &req.id,
+                name: &req.name,
+                category: &req.category,
+                creator: req.creator.as_deref(),
+                stack: &stack,
+            },
+        )
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let governed =
+            crate::domain::GovernedBranchCreate::prepare(domain, admitted, digest).await?;
+        let repository = Arc::new(RepositoryContext::new_server_context(
+            immutable_store,
+            mutable_store,
+            caller_context.repository_id,
+        ));
+        let execution = setup_execution(
+            module_path!(),
+            caller_context.correlation_id.clone(),
+            caller_context.user_id.clone(),
+        );
+        return LORE_CONTEXT
+            .scope(execution, async {
+                if let Some(result) = governed.replay().await? {
+                    return decode_governed_result(result).map(Response::new);
+                }
+                let branch_id = BranchId::from(req.id.as_ref());
+                let hook = HookContext::builder()
+                    .correlation_id(&caller_context.correlation_id)
+                    .hook_point(HookPoint::BranchCreate)
+                    .repository(caller_context.repository_id)
+                    .user(&caller_context.user_id)
+                    .branch(branch_id)
+                    .build();
+                hook_dispatcher
+                    .dispatch_pre(HookPoint::BranchCreate, &hook)
+                    .map_err(hook_error_to_status)?;
+                let response =
+                    governed_branch_create(&governed, &req, repository, &caller_context.user_id)
+                        .await?;
+                emit_governed_branch_created(
+                    &response,
+                    notification_sender.as_ref(),
+                    hook_dispatcher,
+                    instrument_provider,
+                    hook,
+                    caller_context.repository_id,
+                    branch_id,
+                )
+                .await;
+                Ok(Response::new(response.response))
+            })
+            .await;
+    }
     if let Some(forwarded_requests) = forwarded_requests
         && forwarded_requests.rpc_flags().revision_branch_create
     {

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //! CR-029's frozen canonical intent preimages for governed mutations.
 //!
-//! This is the only Lore-side definition of the six intent families. Handlers
+//! This is the only Lore-side definition of the governed intent families. Handlers
 //! construct a normalized [`CanonicalIntent`] only after their ordinary wire
 //! validation; the coordinator receives only the resulting digest.
 
@@ -13,6 +13,7 @@ const REPOSITORY_DELETE_DOMAIN: &[u8] = b"lore-repository-delete-intent-v1\0";
 const REPOSITORY_METADATA_CAS_DOMAIN: &[u8] = b"lore-repository-metadata-cas-intent-v1\0";
 const BRANCH_METADATA_CAS_DOMAIN: &[u8] = b"lore-branch-metadata-cas-intent-v1\0";
 const BRANCH_PUSH_DOMAIN: &[u8] = b"lore-branch-push-intent-v1\0";
+const BRANCH_CREATE_DOMAIN: &[u8] = b"lore-branch-create-intent-v1\0";
 const OBLITERATE_DOMAIN: &[u8] = b"lore-obliterate-intent-v1\0";
 
 /// Maximum repository/default-branch/creator text size in UTF-8 bytes.
@@ -25,6 +26,15 @@ pub const REPOSITORY_CREATE_MAX_PREIMAGE: usize = 68_635;
 /// One normalized caller-known governed mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CanonicalIntent<'a> {
+    /// Fresh branch creation; stack order and explicit empty attribution are intent.
+    BranchCreate {
+        repository_id: &'a [u8],
+        branch_id: &'a [u8],
+        name: &'a str,
+        category: &'a str,
+        creator: Option<&'a str>,
+        stack: &'a [(&'a [u8], &'a [u8])],
+    },
     /// Repository create across v0, v1, and forwarded-v1 entry shapes.
     RepositoryCreate {
         repository_id: &'a [u8],
@@ -137,6 +147,50 @@ pub fn canonical_intent_preimage(
 ) -> Result<Vec<u8>, CanonicalIntentError> {
     let mut out = Vec::new();
     match intent {
+        CanonicalIntent::BranchCreate {
+            repository_id,
+            branch_id,
+            name,
+            category,
+            creator,
+            stack,
+        } => {
+            out.extend_from_slice(BRANCH_CREATE_DOMAIN);
+            framed(
+                &mut out,
+                "repository_id",
+                fixed("repository_id", repository_id, 16)?,
+            )?;
+            framed(&mut out, "branch_id", fixed("branch_id", branch_id, 16)?)?;
+            framed(
+                &mut out,
+                "name",
+                text("name", name, 1, CREATE_SHORT_TEXT_MAX)?,
+            )?;
+            framed(
+                &mut out,
+                "category",
+                text("category", category, 0, CREATE_SHORT_TEXT_MAX)?,
+            )?;
+            out.push(u8::from(creator.is_some()));
+            framed(
+                &mut out,
+                "creator",
+                text("creator", creator.unwrap_or(""), 0, CREATE_SHORT_TEXT_MAX)?,
+            )?;
+            if stack.len() > 1024 {
+                return Err(CanonicalIntentError::FramingOverflow { field: "stack" });
+            }
+            out.extend_from_slice(&(stack.len() as u32).to_be_bytes());
+            for (parent, revision) in *stack {
+                framed(&mut out, "stack.branch", fixed("stack.branch", parent, 16)?)?;
+                framed(
+                    &mut out,
+                    "stack.revision",
+                    fixed("stack.revision", revision, 32)?,
+                )?;
+            }
+        }
         CanonicalIntent::RepositoryCreate {
             repository_id,
             name,

@@ -1,6 +1,6 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! Representation evidence and atomic association publication for repository creation.
+//! Representation evidence and atomic associations for repository and branch creation.
 use tokio_postgres::Transaction;
 
 use super::*;
@@ -85,6 +85,82 @@ async fn remote_epoch_exists(
 
 pub(crate) struct CreationMetadataEvents {
     advances: Vec<(Option<AssociationAdvance>, i64)>,
+}
+
+/// Bind one branch metadata epoch in an existing repository. Repository-create's
+/// residue rule deliberately does not apply to an already shared live association.
+pub(crate) async fn bind_branch_creation_metadata(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    input: &crate::domain::coordinator::BranchCreateInput,
+) -> Result<CreationMetadataEvents, DomainError> {
+    let reject = |reason: &str| DomainError::PreconditionRejected {
+        reason: format!("branch_create_metadata_{reason}_v1"),
+        reason_version: 1,
+    };
+    let exists: bool = tx
+        .query_one(
+            "SELECT to_regclass('lore_fragment_schema_state') IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("branch metadata schema", e))?
+        .get(0);
+    let lifecycle = if exists {
+        tx.query_one("SELECT lifecycle_enabled OR write_capability=1 FROM lore_fragment_schema_state WHERE id=1", &[])
+            .await.map_err(|e| DomainError::from_pg("branch metadata routing", e))?.get::<_,bool>(0)
+    } else {
+        false
+    };
+    if !lifecycle && !super::super::membership::enabled(tx).await? {
+        if input.metadata_witness.is_some() {
+            return Err(reject("inactive"));
+        }
+        return Ok(CreationMetadataEvents {
+            advances: Vec::new(),
+        });
+    }
+    let witness = input
+        .metadata_witness
+        .as_ref()
+        .ok_or_else(|| reject("witness_required"))?;
+    if input.events.len() + 1 > crate::domain::coordinator::MAX_PENDING_EVENTS {
+        return Err(reject("event_limit"));
+    }
+    if witness.hash != input.metadata_hash || witness.hash.iter().all(|b| *b == 0) {
+        return Err(reject("hash_mismatch"));
+    }
+    let head = lock_fragment_head(tx, sequence, &witness.hash)
+        .await?
+        .ok_or_else(|| reject("absent"))?;
+    if !head.matches(witness) {
+        return Err(reject("stale"));
+    }
+    if witness.state != FragmentLifecycleState::Remote || !remote_epoch_exists(tx, witness).await? {
+        return Err(reject("unreadable"));
+    }
+    sequence.enter(LockClass::Associations)?;
+    let context = [0_u8; 16];
+    let existing = tx.query_opt("SELECT state, repository_generation FROM lore_fragment_associations WHERE hash=$1 AND repository_id=$2 AND context=$3 FOR UPDATE",
+        &[&witness.hash,&input.repository_id,&&context[..]]).await
+        .map_err(|e| DomainError::from_pg("branch metadata association lock", e))?;
+    if existing.as_ref().is_some_and(|r| {
+        r.get::<_, i16>("state") == schema::ASSOCIATION_LIVE
+            && r.get::<_, i64>("repository_generation") == input.expected_repository_generation
+    }) {
+        return Ok(CreationMetadataEvents {
+            advances: Vec::new(),
+        });
+    }
+    super::super::membership::allow_association(tx).await?;
+    let epoch = next_fence(tx).await?;
+    tx.execute("INSERT INTO lore_fragment_associations(hash,repository_id,context,association_epoch,state,repository_generation) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(hash,repository_id,context) DO UPDATE SET association_epoch=EXCLUDED.association_epoch,state=EXCLUDED.state,repository_generation=EXCLUDED.repository_generation,updated_at=clock_timestamp()",
+        &[&witness.hash,&input.repository_id,&&context[..],&epoch,&schema::ASSOCIATION_LIVE,&input.expected_repository_generation]).await
+        .map_err(|e| DomainError::from_pg("branch metadata association publication", e))?;
+    let advance = bump_association_generation(tx, &input.repository_id, existing.is_some()).await?;
+    Ok(CreationMetadataEvents {
+        advances: vec![(advance, epoch)],
+    })
 }
 
 impl CreationMetadataEvents {

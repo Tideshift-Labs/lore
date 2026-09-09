@@ -733,6 +733,233 @@ impl DomainTransactionStore for PostgresDomainStore {
         })
     }
 
+    async fn branch_create_replay(
+        &self,
+        operation: &GovernedOperation,
+    ) -> Result<Option<BranchCreateResult>, DomainError> {
+        let mut client = self.checkout().await?;
+        let mut sequence = LockSequence::new();
+        match self
+            .begin_admitted(&mut client, operation, &mut sequence)
+            .await?
+        {
+            BeginAdmitted::Admitted(tx, _) => {
+                tx.rollback()
+                    .await
+                    .map_err(|e| DomainError::from_pg("branch create replay rollback", e))?;
+                Ok(None)
+            }
+            BeginAdmitted::Committed(outcome, public_result) => Ok(Some(BranchCreateResult {
+                replayed: true,
+                outcome,
+                public_result,
+            })),
+            BeginAdmitted::Rejected => Ok(Some(BranchCreateResult {
+                replayed: false,
+                outcome: MutationResult::rejected(ADMISSION_REJECTED_V1).outcome,
+                public_result: None,
+            })),
+        }
+    }
+
+    async fn branch_create(
+        &self,
+        operation: &GovernedOperation,
+        input: &BranchCreateInput,
+    ) -> Result<BranchCreateResult, DomainError> {
+        let mut client = self.checkout().await?;
+        let mut sequence = LockSequence::new();
+        let (tx, clock) = match self
+            .begin_admitted(&mut client, operation, &mut sequence)
+            .await?
+        {
+            BeginAdmitted::Admitted(tx, clock) => (tx, clock),
+            BeginAdmitted::Committed(outcome, public_result) => {
+                return Ok(BranchCreateResult {
+                    replayed: true,
+                    outcome,
+                    public_result,
+                });
+            }
+            BeginAdmitted::Rejected => {
+                return Ok(BranchCreateResult {
+                    replayed: false,
+                    outcome: MutationResult::rejected(ADMISSION_REJECTED_V1).outcome,
+                    public_result: None,
+                });
+            }
+        };
+        // Replay precedes validation of speculative preparation, including its response bound.
+        if input.public_result.len() > 4096 {
+            let outcome = MutationResult::rejected("branch_create_response_too_large_v1").outcome;
+            receipts::commit_terminal(&tx, &operation.key, &outcome, None, clock).await?;
+            classify_commit(tx.commit().await, "branch create response bound commit")?;
+            return Ok(BranchCreateResult {
+                replayed: false,
+                outcome,
+                public_result: None,
+            });
+        }
+        validate_pending_events(&input.events, "branch_create")?;
+        if input.repository_id.len() != 16
+            || input.branch_id.len() != 16
+            || input.metadata_hash.len() != 32
+            || input.latest_hash.len() != 32
+            || input.expected_repository_metadata_hash.len() != 32
+            || input.expected_default_branch_id.len() != 16
+            || input.name.is_empty()
+            || input.name.len() > 1000
+            || input.public_result.first() != Some(&1)
+            || input.parent_metadata.as_ref().is_some_and(|p| {
+                p.branch_id.len() != 16
+                    || p.branch_id == input.branch_id
+                    || p.branch_id.iter().all(|b| *b == 0)
+                    || p.metadata_hash.as_ref().is_some_and(|h| h.len() != 32)
+            })
+        {
+            return Err(DomainError::InvalidInput(
+                "Invalid prepared branch creation".into(),
+            ));
+        }
+        let repository = lock_repository(&tx, &mut sequence, &input.repository_id).await?;
+        let mut reason = match repository.as_ref() {
+            None => Some(NOT_FOUND_V1),
+            Some(r) if r.state != schema::STATE_LIVE => Some(TOMBSTONED_V1),
+            Some(r) if r.generation != input.expected_repository_generation => {
+                Some(GENERATION_MISMATCH_V1)
+            }
+            Some(r)
+                if r.metadata_hash != input.expected_repository_metadata_hash
+                    || r.default_branch_id != input.expected_default_branch_id =>
+            {
+                Some("branch_create_read_set_changed_v1")
+            }
+            _ => None,
+        };
+        if reason.is_none() {
+            let mut ids = vec![input.branch_id.as_slice()];
+            if let Some(parent) = &input.parent_metadata {
+                ids.push(&parent.branch_id);
+            }
+            ids.sort();
+            ids.dedup();
+            for id in ids {
+                let branch = lock_branch(&tx, &mut sequence, &input.repository_id, id).await?;
+                if id == input.branch_id {
+                    if let Some(existing) = branch {
+                        reason = Some(if existing.state == schema::STATE_TOMBSTONED {
+                            TOMBSTONED_V1
+                        } else {
+                            "branch_create_id_exists_v1"
+                        });
+                    }
+                } else if let Some(parent) = &input.parent_metadata {
+                    let actual = branch
+                        .as_ref()
+                        .filter(|b| b.state == schema::STATE_LIVE)
+                        .map(|b| &b.metadata_hash);
+                    if actual != parent.metadata_hash.as_ref() {
+                        reason = Some("branch_create_read_set_changed_v1");
+                    }
+                }
+            }
+        }
+        if let Some(reason) = reason {
+            let outcome = MutationResult::rejected(reason).outcome;
+            receipts::commit_terminal(&tx, &operation.key, &outcome, None, clock).await?;
+            classify_commit(tx.commit().await, "branch create precondition commit")?;
+            return Ok(BranchCreateResult {
+                replayed: false,
+                outcome,
+                public_result: None,
+            });
+        }
+        tx.batch_execute("SAVEPOINT branch_create_fresh")
+            .await
+            .map_err(|e| DomainError::from_pg("branch create savepoint", e))?;
+        tx.execute(
+            "INSERT INTO lore_domain_branches (repository_id, branch_id, repository_generation, state, generation, name, metadata_hash, latest_hash, creation_fingerprint_version, creation_fingerprint, created_at) VALUES ($1,$2,$3,$4,1,$5,$6,$7,1,$8,$9)",
+            &[&input.repository_id, &input.branch_id, &input.expected_repository_generation,
+              &schema::STATE_LIVE, &input.name, &input.metadata_hash, &input.latest_hash,
+              &operation.binding.canonical_intent_digest, &clock],
+        ).await.map_err(|e| DomainError::from_pg("branch create insert", e))?;
+        let claimed = tx.execute(
+            "INSERT INTO lore_domain_branch_names (repository_id,name_key,display_name,branch_id,repository_generation,branch_generation,created_at) VALUES ($1,lower($2),$2,$3,$4,1,$5) ON CONFLICT (repository_id,name_key) DO NOTHING",
+            &[&input.repository_id,&input.name,&input.branch_id,&input.expected_repository_generation,&clock],
+        ).await.map_err(|e| DomainError::from_pg("branch create name claim", e))?;
+        let metadata = if claimed == 0 {
+            Err(DomainError::PreconditionRejected {
+                reason: NAME_TAKEN_V1.into(),
+                reason_version: 1,
+            })
+        } else {
+            crate::domain::fragments::coordinator::bind_branch_creation_metadata(
+                &tx,
+                &mut sequence,
+                input,
+            )
+            .await
+        };
+        let metadata_events = match metadata {
+            Ok(events) => events,
+            Err(DomainError::PreconditionRejected {
+                reason,
+                reason_version,
+            }) => {
+                tx.batch_execute("ROLLBACK TO SAVEPOINT branch_create_fresh")
+                    .await
+                    .map_err(|e| DomainError::from_pg("branch create rollback", e))?;
+                let outcome = DomainOutcome::NotApplied {
+                    reason,
+                    reason_version,
+                };
+                receipts::commit_terminal(&tx, &operation.key, &outcome, None, clock).await?;
+                classify_commit(tx.commit().await, "branch create rejection commit")?;
+                return Ok(BranchCreateResult {
+                    replayed: false,
+                    outcome,
+                    public_result: None,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        apply_projection(&tx, &input.projection).await?;
+        metadata_events
+            .append(
+                &tx,
+                &mut sequence,
+                input.events.first().map(|e| e.cell_id.as_str()),
+                &input.repository_id,
+            )
+            .await?;
+        append_events(
+            &tx,
+            &mut sequence,
+            &input.repository_id,
+            CommittedVersions {
+                repository_generation: input.expected_repository_generation,
+                branch_generation: Some(1),
+            },
+            &input.events,
+        )
+        .await?;
+        let outcome = DomainOutcome::Applied;
+        receipts::commit_terminal(
+            &tx,
+            &operation.key,
+            &outcome,
+            Some(&input.public_result),
+            clock,
+        )
+        .await?;
+        classify_commit(tx.commit().await, "branch create commit")?;
+        Ok(BranchCreateResult {
+            replayed: false,
+            outcome,
+            public_result: Some(input.public_result.clone()),
+        })
+    }
+
     async fn repository_delete(
         &self,
         operation: &GovernedOperation,

@@ -61,6 +61,7 @@ use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptKey;
 use lore_revision::branch;
 use lore_revision::repository;
+use lore_revision::repository::RepositoryContext;
 use lore_storage::hash;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
@@ -1785,6 +1786,89 @@ pub struct GovernedRepositoryCreate {
     create_witness: Option<GovernedCreateWitness>,
 }
 
+/// Server preparation seam for fresh branch creation. Public admission remains gated.
+pub struct GovernedBranchCreate {
+    domain: Arc<DomainContext>,
+    operation: GovernedOperation,
+}
+
+impl GovernedBranchCreate {
+    pub async fn prepare(
+        domain: &Arc<DomainContext>,
+        admitted: AdmittedOperation,
+        digest: Vec<u8>,
+    ) -> Result<Self, Status> {
+        if !domain.enforcement_enabled() {
+            return Err(Status::failed_precondition(
+                "Governed branch create requires domain enforcement",
+            ));
+        }
+        let operation = domain
+            .complete_governed(admitted, "branch_create", digest)
+            .await?;
+        Ok(Self {
+            domain: domain.clone(),
+            operation,
+        })
+    }
+
+    pub(crate) fn domain(&self) -> &DomainContext {
+        &self.domain
+    }
+
+    pub(crate) async fn replay(
+        &self,
+    ) -> Result<Option<lore_postgres::domain::coordinator::BranchCreateResult>, Status> {
+        self.domain
+            .store()
+            .branch_create_replay(&self.operation)
+            .await
+            .map_err(|e| crate::grpc::map_domain_error_to_status(&e))
+    }
+
+    pub(crate) async fn commit(
+        &self,
+        input: &lore_postgres::domain::coordinator::BranchCreateInput,
+    ) -> Result<lore_postgres::domain::coordinator::BranchCreateResult, Status> {
+        self.domain
+            .store()
+            .branch_create(&self.operation, input)
+            .await
+            .map_err(|e| crate::grpc::map_domain_error_to_status(&e))
+    }
+
+    pub(crate) fn metadata_upload_context(
+        &self,
+        repository: &Arc<RepositoryContext>,
+    ) -> Result<Option<creation_metadata::CreationMetadataContext>, Status> {
+        let Some(coordinator) = self.domain.fragment_coordinator() else {
+            return Ok(None);
+        };
+        let raw: Arc<dyn std::any::Any + Send + Sync> = repository.immutable_store();
+        let store =
+            Arc::downcast::<lore_postgres::store::immutable_store::PostgresImmutableStore>(raw)
+                .map_err(|_| {
+                    Status::failed_precondition(
+                        "Branch creation requires the configured Postgres immutable store",
+                    )
+                })?;
+        let uploads = store
+            .creation_metadata_store(*repository.id.data(), coordinator)
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let mutable = repository.try_mutable_store_arc().ok_or_else(|| {
+            Status::failed_precondition("Branch creation context is not writable")
+        })?;
+        Ok(Some(creation_metadata::CreationMetadataContext {
+            repository: Arc::new(RepositoryContext::new_server_context(
+                uploads.clone(),
+                mutable,
+                repository.id,
+            )),
+            uploads,
+        }))
+    }
+}
+
 impl GovernedRepositoryCreate {
     /// Prepare the governed call, or `Ok(None)` for the ungoverned path.
     ///
@@ -3419,6 +3503,20 @@ pub(crate) mod test_support {
         ) -> Result<Option<BranchSnapshot>, DomainError> {
             unreachable!("DomainContext::admit tests never call the coordinator")
         }
+        async fn branch_create_replay(
+            &self,
+            _operation: &GovernedOperation,
+        ) -> Result<Option<lore_postgres::domain::coordinator::BranchCreateResult>, DomainError>
+        {
+            unreachable!("This test store does not execute branch creation")
+        }
+        async fn branch_create(
+            &self,
+            _operation: &GovernedOperation,
+            _input: &lore_postgres::domain::coordinator::BranchCreateInput,
+        ) -> Result<lore_postgres::domain::coordinator::BranchCreateResult, DomainError> {
+            unreachable!("This test store does not execute branch creation")
+        }
 
         async fn repository_create(
             &self,
@@ -3600,6 +3698,20 @@ pub(crate) mod test_support {
         ) -> Result<Option<BranchSnapshot>, DomainError> {
             unreachable!("PreparingDomainStore only serves domain_operation_prepare")
         }
+        async fn branch_create_replay(
+            &self,
+            _operation: &GovernedOperation,
+        ) -> Result<Option<lore_postgres::domain::coordinator::BranchCreateResult>, DomainError>
+        {
+            unreachable!("This test store does not execute branch creation")
+        }
+        async fn branch_create(
+            &self,
+            _operation: &GovernedOperation,
+            _input: &lore_postgres::domain::coordinator::BranchCreateInput,
+        ) -> Result<lore_postgres::domain::coordinator::BranchCreateResult, DomainError> {
+            unreachable!("This test store does not execute branch creation")
+        }
 
         async fn repository_create(
             &self,
@@ -3666,7 +3778,15 @@ pub(crate) mod test_support {
         result: MutationResult,
         pub(crate) create_snapshot:
             std::sync::Mutex<Option<Result<Option<RepositorySnapshot>, DomainError>>>,
+        pub(crate) parent_snapshot:
+            std::sync::Mutex<Option<Result<Option<BranchSnapshot>, DomainError>>>,
         pub(crate) create_calls: std::sync::Mutex<Vec<RepositoryCreateInput>>,
+        pub(crate) branch_create_replay_result:
+            std::sync::Mutex<Option<lore_postgres::domain::coordinator::BranchCreateResult>>,
+        pub(crate) branch_create_result:
+            std::sync::Mutex<Option<lore_postgres::domain::coordinator::BranchCreateResult>>,
+        pub(crate) branch_create_calls:
+            std::sync::Mutex<Vec<lore_postgres::domain::coordinator::BranchCreateInput>>,
         calls: std::sync::Mutex<Vec<BranchPushCommitInput>>,
     }
 
@@ -3676,7 +3796,11 @@ pub(crate) mod test_support {
             Self {
                 result,
                 create_snapshot: std::sync::Mutex::new(None),
+                parent_snapshot: std::sync::Mutex::new(None),
                 create_calls: std::sync::Mutex::new(Vec::new()),
+                branch_create_replay_result: std::sync::Mutex::new(None),
+                branch_create_result: std::sync::Mutex::new(None),
+                branch_create_calls: std::sync::Mutex::new(Vec::new()),
                 calls: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -3780,7 +3904,34 @@ pub(crate) mod test_support {
             _repository_id: &[u8],
             _branch_id: &[u8],
         ) -> Result<Option<BranchSnapshot>, DomainError> {
-            unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+            self.parent_snapshot
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted parent snapshot")
+        }
+        async fn branch_create_replay(
+            &self,
+            _operation: &GovernedOperation,
+        ) -> Result<Option<lore_postgres::domain::coordinator::BranchCreateResult>, DomainError>
+        {
+            Ok(self.branch_create_replay_result.lock().unwrap().clone())
+        }
+        async fn branch_create(
+            &self,
+            _operation: &GovernedOperation,
+            _input: &lore_postgres::domain::coordinator::BranchCreateInput,
+        ) -> Result<lore_postgres::domain::coordinator::BranchCreateResult, DomainError> {
+            self.branch_create_calls
+                .lock()
+                .unwrap()
+                .push(_input.clone());
+            Ok(self
+                .branch_create_result
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("scripted branch creation result"))
         }
 
         async fn repository_create(
