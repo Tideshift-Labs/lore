@@ -3196,9 +3196,15 @@ impl State {
                     );
                     return Ok(());
                 }
-                // Clear existing dirty+action bits, then set new ones.
-                // This replaces the previous action (latest wins). Staged and merge bits are preserved.
-                node.flags &= !NodeFlags::DirtyBits;
+                // Explicit dirty actions replace the previous action. Ancestor
+                // propagation must preserve an existing staged action: DirtyBits
+                // and StagedBits share their action bits.
+                let clear_flags = if !mark_dirty && flags == NodeFlags::Dirty && node.is_staged() {
+                    NodeFlags::Dirty
+                } else {
+                    NodeFlags::DirtyBits
+                };
+                node.flags &= !clear_flags;
                 node.flags |= flags & NodeFlags::DirtyBits;
                 lore_trace!(
                     "Node {} with parent {} now marked with dirty flags {:x}",
@@ -9924,6 +9930,102 @@ mod tests {
             .expect("adding a node to the walked tree")
     }
 
+    #[tokio::test]
+    async fn dirty_children_preserve_staged_move_ancestors() {
+        for action in [
+            NodeFlags::DirtyAdd,
+            NodeFlags::DirtyDelete,
+            NodeFlags::DirtyModify,
+        ] {
+            let repository = null_repository().await;
+            let state = State::new();
+            let parent = add_dirty_node(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                "moved",
+                NodeFlags::StagedMove,
+            )
+            .await;
+            let nested = add_dirty_node(
+                &state,
+                repository.clone(),
+                parent,
+                "nested",
+                NodeFlags::StagedMove,
+            )
+            .await;
+            let child =
+                add_dirty_node(&state, repository.clone(), nested, "file", NodeFlags::File).await;
+            state
+                .node_mark_dirty(repository.clone(), child, action, true)
+                .await
+                .unwrap();
+            for ancestor in [parent, nested] {
+                let node = state.node(repository.clone(), ancestor).await.unwrap();
+                assert_eq!(
+                    node.flags & NodeFlags::StagedBits.bits(),
+                    NodeFlags::StagedMove.bits()
+                );
+                assert!(node.is_dirty());
+            }
+            let node = state.node(repository.clone(), child).await.unwrap();
+            assert_eq!(node.flags & NodeFlags::DirtyBits.bits(), action.bits());
+        }
+    }
+
+    #[tokio::test]
+    async fn dirty_propagation_clears_unstaged_ancestor_action() {
+        let repository = null_repository().await;
+        let state = State::new();
+        let stale_action = NodeFlags::StagedMove & NodeFlags::ActionBits;
+        let parent = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "parent",
+            stale_action,
+        )
+        .await;
+        let child =
+            add_dirty_node(&state, repository.clone(), parent, "file", NodeFlags::File).await;
+        state
+            .node_mark_dirty(repository.clone(), child, NodeFlags::DirtyAdd, true)
+            .await
+            .unwrap();
+        let node = state.node(repository, parent).await.unwrap();
+        assert_eq!(
+            node.flags & NodeFlags::DirtyBits.bits(),
+            NodeFlags::Dirty.bits()
+        );
+        assert!(!node.is_staged());
+    }
+
+    #[tokio::test]
+    async fn dirty_action_replaces_staged_action_even_without_force() {
+        for force in [false, true] {
+            let repository = null_repository().await;
+            let state = State::new();
+            let node = add_dirty_node(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                "file",
+                NodeFlags::File | NodeFlags::StagedMove,
+            )
+            .await;
+            state
+                .node_mark_dirty(repository.clone(), node, NodeFlags::DirtyDelete, force)
+                .await
+                .unwrap();
+            let node = state.node(repository, node).await.unwrap();
+            assert_eq!(
+                node.flags & NodeFlags::DirtyBits.bits(),
+                NodeFlags::DirtyDelete.bits()
+            );
+            assert!(node.is_file());
+        }
+    }
     /// The dirty paths of the whole tree, sorted, so the assertions do not depend
     /// on the order the sibling chain happens to hold.
     async fn walk_dirty_paths(
