@@ -6,8 +6,11 @@ import logging
 import os
 import time
 import uuid
+from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
+from managed_auth import ManagedAuth
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -16,6 +19,78 @@ from lore_server import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@pytest.fixture(scope="module")
+def topology_auth(tmp_path_factory):
+    auth = ManagedAuth(tmp_path_factory.mktemp("topology-auth"))
+    try:
+        yield auth
+    finally:
+        auth.close()
+
+
+@pytest.fixture(scope="module")
+def topology_primary_config(request, tmp_path_factory, topology_auth):
+    ports = {
+        name: allocate_free_port() for name in ("quic", "grpc", "http", "internal")
+    }
+    root, env = generate_server_config(request, tmp_path_factory, ports)
+    topology_auth.configure_server(root, env)
+    return root, env
+
+
+@pytest.fixture(scope="module")
+def topology_primary(topology_primary_config, lore_server_executable_path):
+    root, env = topology_primary_config
+    process, log, log_fd = launch_lore_server(root, env, lore_server_executable_path)
+    try:
+        yield process
+    finally:
+        try:
+            _kill_server_by_pid(process.pid, log, label="topology primary")
+        finally:
+            log_fd.close()
+
+
+@pytest.fixture
+def topology_repositories(
+    topology_auth, global_dir_name, lore_executable_path, new_lore_repo
+):
+    token = topology_auth.identity()
+
+    def create(repository_id, remotes):
+        topology_auth.grant(token, repository_id)
+        repos = []
+        for remote_path in remotes:
+            parsed = urlsplit(remote_path)
+            remote = f"{parsed.scheme}://{parsed.netloc}"
+            topology_auth.login(lore_executable_path, global_dir_name, remote, token)
+            repo = new_lore_repo(
+                remote_url=remote,
+                remote_path=remote_path,
+                repo_id=repository_id,
+                environment_vars=topology_auth.environment(global_dir_name).copy(),
+            )
+            assert repo.environment_vars["LORE_REMOTE_URL"] == remote
+            repos.append(repo)
+        return tuple(repos)
+
+    try:
+        yield create
+    finally:
+        with topology_auth.lock:
+            topology_auth.identities.pop(token, None)
+        for name in (
+            "auth.json",
+            "tokenstore.toml",
+            "tokens.toml",
+            "sec-tokenstore_encryption_key",
+        ):
+            path = Path(global_dir_name) / name
+            if path.is_symlink():
+                raise RuntimeError("Refusing redirected fixture credential cleanup")
+            path.unlink(missing_ok=True)
 
 
 def ensure_fragment_exists_output(
@@ -60,8 +135,7 @@ def ensure_fragment_exists_remotely(wants_exists: bool, json_output: str):
 @pytest.mark.xdist_group("topology")
 class TestTopology:
     """
-    Topology backed store related tests. Server 1 is the main server fixture that is run for all tests
-    including those outside this - its config remains unchanged.
+    Topology backed store tests with an isolated signed primary and peers.
 
     Server 2 is a new server with topology configured, fixed to point to Server 1. It explicitly has read
     replicas disabled, to prove out write replication related tests.
@@ -72,7 +146,7 @@ class TestTopology:
 
     @pytest.fixture(scope="class")
     def lore_local_server_2_config(
-        self, request, tmp_path_factory, lore_main_server_ports
+        self, request, tmp_path_factory, topology_primary_config, topology_auth
     ):
         # QUIC and GRPC share one port by convention (UDP vs TCP; no collision)
         shared_port = allocate_free_port()
@@ -85,7 +159,10 @@ class TestTopology:
         (new_server_root, server_2_env) = generate_server_config(
             request, tmp_path_factory, server_2_ports
         )
-        main_server_internal_port = lore_main_server_ports["internal"]
+        topology_auth.configure_server(new_server_root, server_2_env)
+        main_server_internal_port = topology_primary_config[1][
+            "LORE__SERVER__QUIC_INTERNAL__PORT"
+        ]
         # set up a composite store for replication
         server_2_env["LORE__IMMUTABLE_STORE__MODE"] = "composite"
         server_2_env["LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__MODE"] = "local"
@@ -128,7 +205,7 @@ class TestTopology:
 
     @pytest.fixture(scope="class")
     def lore_local_server_3_config(
-        self, request, tmp_path_factory, lore_main_server_ports
+        self, request, tmp_path_factory, topology_primary_config, topology_auth
     ):
         # QUIC and GRPC share one port by convention (UDP vs TCP; no collision)
         shared_port = allocate_free_port()
@@ -141,7 +218,10 @@ class TestTopology:
         (new_server_root, server_3_env) = generate_server_config(
             request, tmp_path_factory, server_3_ports
         )
-        main_server_internal_port = lore_main_server_ports["internal"]
+        topology_auth.configure_server(new_server_root, server_3_env)
+        main_server_internal_port = topology_primary_config[1][
+            "LORE__SERVER__QUIC_INTERNAL__PORT"
+        ]
         # set up a composite store for replication
         server_3_env["LORE__IMMUTABLE_STORE__MODE"] = "composite"
         server_3_env["LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__MODE"] = "local"
@@ -183,7 +263,7 @@ class TestTopology:
 
     @pytest.fixture(scope="class")
     def lore_server_with_no_read_replicas(
-        self, lore_local_server_2_config, lore_server_executable_path
+        self, lore_local_server_2_config, lore_server_executable_path, topology_primary
     ):
         """
         Runs a loreserver locally that write replicates to the main server
@@ -202,7 +282,7 @@ class TestTopology:
 
     @pytest.fixture(scope="class")
     def lore_server_with_read_replicas(
-        self, lore_local_server_3_config, lore_server_executable_path
+        self, lore_local_server_3_config, lore_server_executable_path, topology_primary
     ):
         """
         Runs a loreserver locally that read and write replicates to the main server
@@ -222,35 +302,28 @@ class TestTopology:
     def same_repo_id_different_remotes(
         self,
         request,
-        lore_local_server_config,
+        topology_primary_config,
         lore_local_server_2_config,
         lore_server_with_no_read_replicas,
         lore_local_server_3_config,
         lore_server_with_read_replicas,
-        auto_lore_local_server,
-        new_lore_repo,
+        topology_primary,
+        topology_repositories,
     ):
         server_host_name = request.config.getoption("--lore-server-hostname")
-        (server_1_root, server_1_env) = lore_local_server_config
+        (server_1_root, server_1_env) = topology_primary_config
         (server_2_root, server_2_env) = lore_local_server_2_config
         (server_3_root, server_3_env) = lore_local_server_3_config
 
         common_repo_id = uuid.uuid4().hex
         # specify a repository URL so the specific Lore Server is used to create it
-        remote_url_server_1 = f"lore://{server_host_name}:{server_1_env['LORE__SERVER__GRPC__PORT']}/repo-{common_repo_id}"
-        remote_url_server_2 = f"lore://{server_host_name}:{server_2_env['LORE__SERVER__GRPC__PORT']}/repo-{common_repo_id}"
-        remote_url_server_3 = f"lore://{server_host_name}:{server_3_env['LORE__SERVER__GRPC__PORT']}/repo-{common_repo_id}"
-        server_1_repo = new_lore_repo(
-            remote_path=remote_url_server_1, repo_id=common_repo_id
+        remote_url_server_1 = f"grpc://{server_host_name}:{server_1_env['LORE__SERVER__GRPC__PORT']}/repo-{common_repo_id}"
+        remote_url_server_2 = f"grpc://{server_host_name}:{server_2_env['LORE__SERVER__GRPC__PORT']}/repo-{common_repo_id}"
+        remote_url_server_3 = f"grpc://{server_host_name}:{server_3_env['LORE__SERVER__GRPC__PORT']}/repo-{common_repo_id}"
+        return topology_repositories(
+            common_repo_id,
+            (remote_url_server_1, remote_url_server_2, remote_url_server_3),
         )
-        server_2_repo = new_lore_repo(
-            remote_path=remote_url_server_2, repo_id=common_repo_id
-        )
-        server_3_repo = new_lore_repo(
-            remote_path=remote_url_server_3, repo_id=common_repo_id
-        )
-
-        return server_1_repo, server_2_repo, server_3_repo
 
     def test_server_1_doesnt_replicate_to_server_2(
         self, same_repo_id_different_remotes
@@ -444,7 +517,7 @@ class TestCompositeTopology:
     in different localities.
 
     Server layout:
-    - Server 1: the main server fixture (SameRegion peer for the composite server)
+    - Server 1: the isolated signed primary (SameRegion peer for the composite server)
     - Other-region server: a standalone server acting as the OtherRegion peer
     - Composite server: uses composite topology with two fixed sources —
       one SameRegion pointing at server 1, one OtherRegion pointing at the
@@ -452,7 +525,7 @@ class TestCompositeTopology:
     """
 
     @pytest.fixture(scope="class")
-    def other_region_server_config(self, request, tmp_path_factory):
+    def other_region_server_config(self, request, tmp_path_factory, topology_auth):
         """Config for a standalone server that acts as the OtherRegion peer."""
         shared_port = allocate_free_port()
         ports = {
@@ -461,7 +534,9 @@ class TestCompositeTopology:
             "http": allocate_free_port(),
             "internal": allocate_free_port(),
         }
-        return generate_server_config(request, tmp_path_factory, ports), ports
+        root, env = generate_server_config(request, tmp_path_factory, ports)
+        topology_auth.configure_server(root, env)
+        return (root, env), ports
 
     @pytest.fixture(scope="class")
     def other_region_server(
@@ -485,8 +560,9 @@ class TestCompositeTopology:
         self,
         request,
         tmp_path_factory,
-        lore_main_server_ports,
+        topology_primary_config,
         other_region_server_config,
+        topology_auth,
     ):
         """Config for a server with composite topology: SameRegion → server 1,
         OtherRegion → other-region server."""
@@ -500,6 +576,8 @@ class TestCompositeTopology:
         (new_server_root, server_env) = generate_server_config(
             request, tmp_path_factory, composite_ports
         )
+
+        topology_auth.configure_server(new_server_root, server_env)
 
         # composite immutable store
         server_env["LORE__IMMUTABLE_STORE__MODE"] = "composite"
@@ -524,7 +602,9 @@ class TestCompositeTopology:
 
         # composite topology with two fixed sources
         server_hostname = request.config.getoption("--lore-server-hostname")
-        same_region_port = lore_main_server_ports["internal"]
+        same_region_port = topology_primary_config[1][
+            "LORE__SERVER__QUIC_INTERNAL__PORT"
+        ]
         (_other_root, _other_env), other_ports = other_region_server_config
         other_region_port = other_ports["internal"]
 
@@ -555,7 +635,13 @@ class TestCompositeTopology:
         return new_server_root, server_env
 
     @pytest.fixture(scope="class")
-    def composite_server(self, composite_server_config, lore_server_executable_path):
+    def composite_server(
+        self,
+        composite_server_config,
+        lore_server_executable_path,
+        topology_primary,
+        other_region_server,
+    ):
         """Launches the composite topology server."""
         (server_root, server_env) = composite_server_config
         server_proc, server_log_path, server_log_fd = launch_lore_server(
@@ -573,37 +659,29 @@ class TestCompositeTopology:
     def composite_repos(
         self,
         request,
-        lore_local_server_config,
+        topology_primary_config,
         other_region_server_config,
         other_region_server,
         composite_server_config,
         composite_server,
-        auto_lore_local_server,
-        new_lore_repo,
+        topology_primary,
+        topology_repositories,
     ):
         """Creates repos on server 1, the other-region server, and the composite
         server, all sharing the same repo ID."""
         server_hostname = request.config.getoption("--lore-server-hostname")
-        (_server_1_root, server_1_env) = lore_local_server_config
+        (_server_1_root, server_1_env) = topology_primary_config
         (_other_root, other_env), _other_ports = other_region_server_config
         (_comp_root, comp_env) = composite_server_config
 
         common_repo_id = uuid.uuid4().hex
-        remote_server_1 = f"lore://{server_hostname}:{server_1_env['LORE__SERVER__GRPC__PORT']}/repo-{common_repo_id}"
-        remote_other = f"lore://{server_hostname}:{other_env['LORE__SERVER__GRPC__PORT']}/repo-{common_repo_id}"
-        remote_composite = f"lore://{server_hostname}:{comp_env['LORE__SERVER__GRPC__PORT']}/repo-{common_repo_id}"
+        remote_server_1 = f"grpc://{server_hostname}:{server_1_env['LORE__SERVER__GRPC__PORT']}/repo-{common_repo_id}"
+        remote_other = f"grpc://{server_hostname}:{other_env['LORE__SERVER__GRPC__PORT']}/repo-{common_repo_id}"
+        remote_composite = f"grpc://{server_hostname}:{comp_env['LORE__SERVER__GRPC__PORT']}/repo-{common_repo_id}"
 
-        server_1_repo = new_lore_repo(
-            remote_path=remote_server_1, repo_id=common_repo_id
+        return topology_repositories(
+            common_repo_id, (remote_server_1, remote_other, remote_composite)
         )
-        other_region_repo = new_lore_repo(
-            remote_path=remote_other, repo_id=common_repo_id
-        )
-        composite_repo = new_lore_repo(
-            remote_path=remote_composite, repo_id=common_repo_id
-        )
-
-        return server_1_repo, other_region_repo, composite_repo
 
     def test_composite_server_write_replicates_to_same_and_other_region(
         self, composite_repos

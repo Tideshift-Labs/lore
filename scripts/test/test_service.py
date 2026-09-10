@@ -38,7 +38,7 @@ def _assert_managed_push_settled(repo):
     for path in paths:
         child = json.loads(path.read_text(encoding="utf-8"))
         assert child["version"] == 2
-        if child.get("managed", {}).get("parent_id") not in stage_ids:
+        if child.get("managed", {}).get("parent") not in stage_ids:
             continue
         assert UUID(child["attempt"]["repository"]).hex == UUID(repo.get_id()).hex
         assert child["attempt"]["state"]["state"] == "resolved"
