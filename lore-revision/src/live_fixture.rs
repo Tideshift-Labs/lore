@@ -762,8 +762,8 @@ impl RevisionService for StubRevisionService {
         request: Request<BranchCreateRequest>,
     ) -> Result<Response<BranchCreateResponse>, Status> {
         self.record(RevisionRpc::BranchCreate, &request);
-        let outcome = self.state.revision_policy.lock().branch_create;
-        match outcome {
+        let policy = self.state.revision_policy.lock().clone();
+        match policy.branch_create {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
@@ -777,7 +777,13 @@ impl RevisionService for StubRevisionService {
                     .stack
                     .first()
                     .map(|point| point.revision_signature.clone())
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| vec![0; 32].into());
+                // Restoration keeps the configured metadata. An absent branch gets a
+                // deterministic synthetic hash; this transport fixture has no metadata store.
+                let metadata = match policy.branch_get {
+                    BranchAnswer::Present { metadata, .. } => metadata,
+                    BranchAnswer::NotFound => blake3::hash(&body.id).as_bytes().to_vec(),
+                };
                 Ok(Response::new(BranchCreateResponse {
                     branch: Some(model_v1::Branch {
                         id: body.id,
@@ -785,6 +791,7 @@ impl RevisionService for StubRevisionService {
                         creator: body.creator.unwrap_or_default(),
                         category: body.category,
                         latest,
+                        metadata: metadata.into(),
                         stack: body.stack,
                         ..model_v1::Branch::default()
                     }),

@@ -337,6 +337,55 @@ impl QuicQuinnConnection {
     }
 }
 
+#[cfg(feature = "test_seams")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorizeRetryPhase {
+    First,
+    BudgetSpent,
+}
+
+#[cfg(feature = "test_seams")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorizeRetryError {
+    NotAuthorized,
+    Terminated,
+    StreamOpen,
+    Read,
+    WriteChunks,
+    Crypto,
+    SessionRebindRequired,
+    Other,
+}
+
+#[cfg(feature = "test_seams")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorizeRetryDecision {
+    Failed,
+    Unknown,
+    Retry,
+    BudgetExhausted,
+}
+
+#[cfg(feature = "test_seams")]
+#[derive(Clone, Debug)]
+pub struct AuthorizeRetryObservation {
+    pub phase: AuthorizeRetryPhase,
+    pub dispatch: DispatchState,
+    pub error: AuthorizeRetryError,
+    pub decision: AuthorizeRetryDecision,
+    pub sent_epoch: u32,
+    pub current_epoch: u32,
+    pub current_generation: u32,
+    pub current_connection_id: Option<usize>,
+}
+
+#[cfg(feature = "test_seams")]
+#[derive(Default, Debug)]
+pub struct AuthorizeRetryObservations {
+    pub entries: Vec<AuthorizeRetryObservation>,
+    pub overflowed: bool,
+}
+
 pub struct QuicConnection {
     connection: RwLock<QuicQuinnConnection>,
     created: Instant,
@@ -365,6 +414,8 @@ pub struct QuicConnection {
     /// act on it — inside the read lock, immediately before the writer is taken.
     sessions: dashmap::DashMap<u32, u32>,
     #[cfg(feature = "test_seams")]
+    authorize_retry_observations: parking_lot::Mutex<AuthorizeRetryObservations>,
+    #[cfg(feature = "test_seams")]
     pause_next_session_send: AtomicBool,
     #[cfg(feature = "test_seams")]
     session_send_paused: Semaphore,
@@ -381,6 +432,11 @@ pub struct QuicConnection {
 }
 
 impl QuicConnection {
+    #[cfg(feature = "test_seams")]
+    pub fn take_authorize_retry_observations_for_test(&self) -> AuthorizeRetryObservations {
+        std::mem::take(&mut *self.authorize_retry_observations.lock())
+    }
+
     pub fn new(connection: quinn::Connection, max_chunk_size: usize) -> Self {
         Self::with_v4(connection, max_chunk_size, false)
     }
@@ -398,6 +454,10 @@ impl QuicConnection {
             epoch: AtomicU32::new(1),
             generation: AtomicU32::new(1),
             sessions: dashmap::DashMap::new(),
+            #[cfg(feature = "test_seams")]
+            authorize_retry_observations: parking_lot::Mutex::new(
+                AuthorizeRetryObservations::default(),
+            ),
             #[cfg(feature = "test_seams")]
             pause_next_session_send: AtomicBool::new(false),
             #[cfg(feature = "test_seams")]
@@ -749,10 +809,22 @@ where
     // Resolved before the await below, not across it. A `Verdict` carries a mapped error, and
     // holding one over a reconnect would put that error in this function's future for the
     // length of the reconnect.
-    match classify(service_client, request_type, epoch, &failure) {
-        Verdict::Failed(error) => return Err(error),
-        Verdict::Unknown => return Err(report_unknown(service_client, request_type, unknown)),
-        Verdict::Reconnect => {}
+    {
+        let verdict = classify(service_client, request_type, epoch, &failure);
+        #[cfg(feature = "test_seams")]
+        trace_authorize_verdict(
+            service_client,
+            request_type,
+            epoch,
+            &failure,
+            &verdict,
+            AuthorizeRetryPhase::First,
+        );
+        match verdict {
+            Verdict::Failed(error) => return Err(error),
+            Verdict::Unknown => return Err(report_unknown(service_client, request_type, unknown)),
+            Verdict::Reconnect => {}
+        }
     }
 
     // Everything past this point reconnects, and none of it belongs in this function's future:
@@ -784,6 +856,60 @@ enum Verdict<ErrorType> {
     Unknown,
     /// Worth another attempt once the connection has been replaced.
     Reconnect,
+}
+
+// Test diagnostics contain only transport identifiers and fixed classifications, never payloads.
+#[cfg(feature = "test_seams")]
+fn trace_authorize_verdict<S: ServiceClient>(
+    service: &S,
+    request: S::RequestType,
+    sent_epoch: u32,
+    failure: &SendFailure,
+    verdict: &Verdict<S::ErrorType>,
+    phase: AuthorizeRetryPhase,
+) {
+    if service.request_name(request) != "authorize" {
+        return;
+    }
+    let error = match &failure.error {
+        QuicClientError::NotAuthorized => AuthorizeRetryError::NotAuthorized,
+        QuicClientError::Terminated => AuthorizeRetryError::Terminated,
+        QuicClientError::StreamOpen => AuthorizeRetryError::StreamOpen,
+        QuicClientError::Read => AuthorizeRetryError::Read,
+        QuicClientError::WriteChunks => AuthorizeRetryError::WriteChunks,
+        QuicClientError::CrytpoError => AuthorizeRetryError::Crypto,
+        QuicClientError::SessionRebindRequired => AuthorizeRetryError::SessionRebindRequired,
+        _ => AuthorizeRetryError::Other,
+    };
+    let decision = match verdict {
+        Verdict::Failed(_) => AuthorizeRetryDecision::Failed,
+        Verdict::Unknown => AuthorizeRetryDecision::Unknown,
+        Verdict::Reconnect if phase == AuthorizeRetryPhase::First => AuthorizeRetryDecision::Retry,
+        Verdict::Reconnect => AuthorizeRetryDecision::BudgetExhausted,
+    };
+    let quic = service.quic();
+    // This is current observed state, not the original request's wire connection.
+    let current_connection_id = quic
+        .connection
+        .try_read()
+        .ok()
+        .map(|c| c.connection.stable_id());
+    let observation = AuthorizeRetryObservation {
+        phase,
+        dispatch: failure.dispatched,
+        error,
+        decision,
+        sent_epoch,
+        current_epoch: quic.epoch.load(Ordering::Relaxed),
+        current_generation: quic.connection_generation(),
+        current_connection_id,
+    };
+    let mut observations = quic.authorize_retry_observations.lock();
+    if observations.entries.len() < 64 {
+        observations.entries.push(observation);
+    } else {
+        observations.overflowed = true;
+    }
 }
 
 /// Decide a failed send's fate.
@@ -967,15 +1093,27 @@ where
         }
     };
 
-    match classify(service_client, request_type, epoch, &failure) {
-        Verdict::Failed(error) => Err(error),
-        Verdict::Unknown => Err(report_unknown(service_client, request_type, unknown)),
-        // The budget is spent. Reconnecting again here is the nested retry the contract
-        // forbids, so the first attempt's error is what the caller is told.
-        Verdict::Reconnect => Err(service_client.map_send_error(
+    {
+        let verdict = classify(service_client, request_type, epoch, &failure);
+        #[cfg(feature = "test_seams")]
+        trace_authorize_verdict(
+            service_client,
             request_type,
-            SendWithReconnectError::ClientError(first_error),
-        )),
+            epoch,
+            &failure,
+            &verdict,
+            AuthorizeRetryPhase::BudgetSpent,
+        );
+        match verdict {
+            Verdict::Failed(error) => Err(error),
+            Verdict::Unknown => Err(report_unknown(service_client, request_type, unknown)),
+            // The budget is spent. Reconnecting again here is the nested retry the contract
+            // forbids, so the first attempt's error is what the caller is told.
+            Verdict::Reconnect => Err(service_client.map_send_error(
+                request_type,
+                SendWithReconnectError::ClientError(first_error),
+            )),
+        }
     }
 }
 

@@ -175,11 +175,12 @@ mod tests {
 
         let filter = load_filter(&dir).expect("filter should load");
         // The ignore filter should contain user-defined rules from .urcignore
-        // One user rule plus seven generated exclusions, including .lore-workflow.
-        assert_eq!(filter.ignore.lines.len(), 8);
+        // One user rule plus eight generated exclusions, including the bootstrap lock.
+        assert_eq!(filter.ignore.lines.len(), 9);
         assert_ignored(&filter, "secret.txt", false, true);
         assert_ignored(&filter, "a.txt", false, false);
         assert_ignored(&filter, ".lore-workflow", true, true);
+        assert_ignored(&filter, ".lore-workflow.bootstrap.lock", false, true);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -197,12 +198,13 @@ mod tests {
         std::fs::write(dir.join(".urcignore"), "secret.txt\n").expect("write .urcignore");
 
         let filter = load_filter(&dir).expect("filter should load");
-        // Two primary-file rules plus seven generated exclusions.
-        assert_eq!(filter.ignore.lines.len(), 9);
+        // Two primary-file rules plus eight generated exclusions.
+        assert_eq!(filter.ignore.lines.len(), 10);
         assert_ignored(&filter, "a.txt", false, true);
         assert_ignored(&filter, "b.txt", false, true);
         assert_ignored(&filter, "secret.txt", false, false);
         assert_ignored(&filter, ".lore-workflow", true, true);
+        assert_ignored(&filter, ".lore-workflow.bootstrap.lock", false, true);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -221,11 +223,12 @@ mod tests {
         std::fs::write(dir.join(DOT_URCIGNORE), "secret.txt\n").expect("write .urcignore");
 
         let filter = load_filter(&dir).expect("filter should load");
-        // Legacy repositories receive the same seven generated exclusions.
-        assert_eq!(filter.ignore.lines.len(), 8);
+        // Legacy repositories receive the same eight generated exclusions.
+        assert_eq!(filter.ignore.lines.len(), 9);
         assert_ignored(&filter, "secret.txt", false, true);
         assert_ignored(&filter, "a.txt", false, false);
         assert_ignored(&filter, ".lore-workflow", true, true);
+        assert_ignored(&filter, ".lore-workflow.bootstrap.lock", false, true);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -165,6 +165,9 @@ class Lore:
         self.name = name
         self.global_dir = global_dir
         self.environment_vars = environment_vars or {}
+        # A deferred fixture create must use the same preallocated, granted UUID.
+        # Consume it once; later creates require an explicit independently granted ID.
+        self._pending_create_repo_id = repo_id
         # If the caller picked a specific remote_url, mirror it into the env
         # subprocess overrides — otherwise repository_create inherits the
         # session-level LORE_REMOTE_URL pointing at the autouse server and
@@ -288,6 +291,7 @@ class Lore:
                 run_cwd = target_dir
         attempt = 0
         max_attempts = 3
+        self._last_command_returncode = None
         while True:
             try:
                 env = self._subprocess_env()
@@ -299,6 +303,7 @@ class Lore:
                     env=env,
                     cwd=run_cwd,
                 )
+                self._last_command_returncode = output.returncode
                 logger.info(output.stdout + output.stderr)
                 return output.stdout + output.stderr
             except subprocess.CalledProcessError as e:
@@ -362,6 +367,7 @@ class Lore:
         shared_store_path: str | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
+        repo_id = repo_id or self._pending_create_repo_id
         output = self.run(
             ["repository", "create", remote_path if remote_path else self.name]
             + (["--description", description] if description else [])
@@ -370,7 +376,9 @@ class Lore:
             + (["--shared-store-path", shared_store_path] if shared_store_path else []),
             **kwargs,
         )
-        self._ensure_test_identity_in_config()
+        if self._last_command_returncode == 0:
+            self._pending_create_repo_id = None
+            self._ensure_test_identity_in_config()
         return output
 
     def _ensure_test_identity_in_config(self) -> None:
@@ -1956,13 +1964,25 @@ class Lore:
 
     def dirty_move(self, from_path: str, to_path: str, **kwargs: Unpack[GlobalOptions]):
         return self.run(
-            ["file", "dirty", "move", self._fix_path(from_path), self._fix_path(to_path)],
+            [
+                "file",
+                "dirty",
+                "move",
+                self._fix_path(from_path),
+                self._fix_path(to_path),
+            ],
             **kwargs,
         )
 
     def dirty_copy(self, from_path: str, to_path: str, **kwargs: Unpack[GlobalOptions]):
         return self.run(
-            ["file", "dirty", "copy", self._fix_path(from_path), self._fix_path(to_path)],
+            [
+                "file",
+                "dirty",
+                "copy",
+                self._fix_path(from_path),
+                self._fix_path(to_path),
+            ],
             **kwargs,
         )
 

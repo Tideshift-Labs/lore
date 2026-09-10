@@ -249,7 +249,7 @@ impl LockService {
             let message = UnlockRequest {
                 resources: resources.iter().map(fenced_resource_to_wire).collect(),
             };
-            return crate::caller_operation::dispatch(
+            let result = crate::caller_operation::dispatch_recorded_result(
                 self.repository,
                 crate::outcome::GrpcRpc::LockUnlock,
                 message.encode_to_vec(),
@@ -267,7 +267,13 @@ impl LockService {
                     Ok(response.resources.into_iter().map(Into::into).collect())
                 },
             )
-            .await;
+            .await?;
+            // Dispatch settles the original attempt before applying this ordinary-unlock
+            // compatibility rule. Unknown outcomes and administrative releases stay errors.
+            return match result {
+                Err(error) if error.is_not_found() => Ok(vec![]),
+                other => other,
+            };
         }
 
         let _counter = RequestScopedCounter::new(self.request_inflight.clone());
@@ -365,3 +371,7 @@ impl LockService {
         Ok(resources.into_iter().map(Into::into).collect())
     }
 }
+
+#[cfg(test)]
+#[path = "lock_client_tests.rs"]
+mod tests;

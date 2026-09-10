@@ -142,6 +142,9 @@ class ManagedAuth:
                         "CheckUserPermission": grpc.unary_unary_rpc_method_handler(
                             self.permissions
                         ),
+                        "LookupUserPermissions": grpc.unary_unary_rpc_method_handler(
+                            self.lookup_permissions
+                        ),
                     },
                 ),
                 grpc.method_handlers_generic_handler(
@@ -149,7 +152,10 @@ class ManagedAuth:
                     {
                         "CreateResource": grpc.unary_unary_rpc_method_handler(
                             self.create_resource
-                        )
+                        ),
+                        "DeleteResource": grpc.unary_unary_rpc_method_handler(
+                            self.delete_resource
+                        ),
                     },
                 ),
             )
@@ -219,6 +225,52 @@ class ManagedAuth:
                 ("read", "write", "admin") if admin else ("read", "write")
             )
 
+    def subject(self, token):
+        with self.lock:
+            return self.identities[token][0]
+
+    def configure_server(self, server_root, env):
+        env["SSL_CERT_FILE"] = str(self.ca_path)
+        env.pop("SSL_CERT_DIR", None)
+        config = Path(server_root) / "lore-server" / "config" / "local.toml"
+        existing = config.read_text(encoding="utf-8") if config.exists() else ""
+        if "[server.auth]" in existing or "[environment.endpoint]" in existing:
+            raise RuntimeError("Fixture auth configuration already exists")
+        config.write_text(
+            existing + "\n[server.auth]\n"
+            f"jwt_issuer={json.dumps(self.issuer)}\n"
+            'jwt_audience=["lore-storage","commit0-cli","localhost","127.0.0.1"]\n'
+            "enforce_write_permission=true\n[server.auth.jwk]\n"
+            f"endpoint={json.dumps(self.jwks_url)}\n"
+            "[environment.endpoint]\n"
+            f"auth_url={json.dumps(self.url)}\n",
+            encoding="utf-8",
+        )
+
+    def exchange_token(self, token, resources):
+        # Use the actual TLS exchange; never expose credential-bearing RPC exceptions.
+        endpoint = self.url.removeprefix("https://")
+        credentials = grpc.ssl_channel_credentials(self.ca_path.read_bytes())
+        try:
+            with grpc.secure_channel(endpoint, credentials) as channel:
+                call = channel.unary_unary(
+                    "/epic_urc.UrcAuthApi/ExchangeUserTokenForMultiresourceToken"
+                )
+                response = call(
+                    b"".join(field(1, resource.encode()) for resource in resources),
+                    metadata=(("authorization", "Bearer " + token),),
+                    timeout=10,
+                )
+            user = parse_fields(response).get(1, [])
+            encoded = parse_fields(user[0]).get(1, []) if len(user) == 1 else []
+            if len(encoded) != 1 or not isinstance(encoded[0], bytes):
+                raise RuntimeError("Invalid fixture exchange response")
+            return encoded[0].decode()
+        except grpc.RpcError as error:
+            raise RuntimeError(
+                f"Fixture token exchange refused ({error.code().name}); credentials withheld"
+            ) from None
+
     def authorized(self, context):
         bearer = dict(context.invocation_metadata()).get("authorization", "")
         with self.lock:
@@ -276,6 +328,49 @@ class ManagedAuth:
                 grpc.StatusCode.PERMISSION_DENIED, "Create is outside the fixture grant"
             )
         return b""
+
+    def delete_resource(self, request, context):
+        subject, allowed = self.authorized(context)
+        values = parse_fields(request)
+        resources = values.get(1, [])
+        if (
+            set(values) != {1}
+            or len(resources) != 1
+            or not isinstance(resources[0], bytes)
+            or resources[0].decode() not in allowed
+        ):
+            context.abort(
+                grpc.StatusCode.PERMISSION_DENIED, "Delete is outside the fixture grant"
+            )
+        resource = resources[0].decode()
+        bearer = dict(context.invocation_metadata())["authorization"].removeprefix(
+            "Bearer "
+        )
+        with self.lock:
+            identity = self.identities.get(bearer)
+            if not identity or identity[0] != subject or resource not in identity[1]:
+                context.abort(
+                    grpc.StatusCode.PERMISSION_DENIED, "Fixture grant no longer exists"
+                )
+            del identity[1][resource]
+        return b""
+
+    def lookup_permissions(self, request, context):
+        _, allowed = self.authorized(context)
+        values = parse_fields(request)
+        if values != {1: [b"urc"]}:
+            context.abort(
+                grpc.StatusCode.PERMISSION_DENIED,
+                "Unsupported fixture permission lookup",
+            )
+        return b"".join(
+            field(
+                1,
+                field(1, resource.encode())
+                + b"".join(field(2, permission.encode()) for permission in permissions),
+            )
+            for resource, permissions in sorted(allowed.items())
+        )
 
     def permissions(self, request, context):
         _, allowed = self.authorized(context)

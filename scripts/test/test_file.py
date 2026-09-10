@@ -258,8 +258,14 @@ def test_file_reset_view(new_lore_repo, tmp_path_factory):
     def snapshot_tree(root: str) -> set[str]:
         entries: set[str] = set()
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in (".lore", ".urc")]
             rel_dir = os.path.relpath(dirpath, root)
+            if rel_dir == ".":
+                dirnames[:] = [
+                    d for d in dirnames if d not in (".lore", ".urc", ".lore-workflow")
+                ]
+                filenames[:] = [
+                    f for f in filenames if f != ".lore-workflow.bootstrap.lock"
+                ]
             for d in dirnames:
                 entries.add(os.path.join(rel_dir, d) if rel_dir != "." else d)
             for f in filenames:

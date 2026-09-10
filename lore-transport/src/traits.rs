@@ -121,6 +121,15 @@ pub trait Protocol: Send + Sync {
 /// Storage protocol
 #[async_trait]
 pub trait Storage: Send + Sync {
+    #[cfg(feature = "test_seams")]
+    fn take_authorize_retry_observations_for_test(
+        &self,
+    ) -> Result<crate::quic::client::AuthorizeRetryObservations, ProtocolError> {
+        Err(ProtocolError::internal(
+            "authorization retry observations unsupported",
+        ))
+    }
+
     /// Start a session for the given partition and correlation ID.
     /// Returns a raw session ID. The caller is responsible for calling
     /// `session_stop` when done. Prefer `StorageConnector::session()` for

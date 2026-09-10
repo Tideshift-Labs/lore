@@ -169,9 +169,25 @@ function Assert-ContainerRunning {
 }
 
 function Assert-Listening {
-    param([Parameter(Mandatory)][string]$Label, [Parameter(Mandatory)][int]$Port)
-    $probe = Test-NetConnection -ComputerName '127.0.0.1' -Port $Port -InformationLevel Quiet -WarningAction SilentlyContinue
-    if (-not $probe) { throw "$Label is not listening on 127.0.0.1:$Port" }
+    param([Parameter(Mandatory)][string]$Label, [Parameter(Mandatory)][string]$Endpoint)
+    $endpointUri = $null
+    if (-not [Uri]::TryCreate($Endpoint, [UriKind]::Absolute, [ref]$endpointUri) -or
+        $endpointUri.Scheme -notin @('http', 'https', 'nats', 'tls') -or
+        [string]::IsNullOrWhiteSpace($endpointUri.Host) -or
+        $endpointUri.UserInfo -or $endpointUri.Query -or $endpointUri.Fragment -or
+        $endpointUri.AbsolutePath -notin @('', '/')) {
+        throw "$Label endpoint must be an absolute service URL without credentials, path, query or fragment"
+    }
+    $endpointPort = $endpointUri.Port
+    if ($endpointPort -eq -1 -and $endpointUri.Scheme -in @('nats', 'tls')) {
+        $endpointPort = 4222
+    }
+    if ($endpointPort -lt 1 -or $endpointPort -gt 65535) {
+        throw "$Label endpoint must have a valid service port"
+    }
+    $endpointHost = $endpointUri.DnsSafeHost
+    $probe = Test-NetConnection -ComputerName $endpointHost -Port $endpointPort -InformationLevel Quiet -WarningAction SilentlyContinue
+    if (-not $probe) { throw "$Label is not listening on ${endpointHost}:$endpointPort" }
 }
 
 function New-CaseDatabase {
@@ -216,8 +232,8 @@ try {
     Write-Host '== preflight =='
     Assert-ContainerRunning -Name $PostgresContainer
     Assert-ContainerRunning -Name $MinioContainer
-    Assert-Listening -Label 'MinIO' -Port 9000
-    Assert-Listening -Label 'NATS (compose profile "notifications")' -Port 4222
+    Assert-Listening -Label 'MinIO' -Endpoint $MinioEndpoint
+    Assert-Listening -Label 'NATS (compose profile "notifications")' -Endpoint $NatsUrl
     foreach ($required in @('jwks.json', 'jwt-private-key.pem')) {
         $path = Join-Path $fixtures $required
         if (-not (Test-Path $path)) { throw "missing TEST key material: $path" }

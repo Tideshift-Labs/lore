@@ -244,6 +244,94 @@ class ManagedAuthTests(unittest.TestCase):
                 )
             self.assertEqual(error.exception.code(), grpc.StatusCode.PERMISSION_DENIED)
 
+    def test_delete_is_scoped_and_revokes_only_callers_exact_resource(self):
+        resource = ("urc-" + self.repository).encode()
+        other = self.auth.identity()
+        self.auth.grant(other, self.repository)
+        foreign = uuid.uuid4().hex
+        self.auth.grant(self.token, foreign)
+        rpc = self.channel.unary_unary("/ucs.auth.RebacApi/DeleteResource")
+        for payload, token in (
+            (field(1, resource), self.auth.identity()),
+            (field(1, b"urc-" + uuid.uuid4().hex.encode()), self.token),
+            (field(1, resource) + field(2, b"other-subject"), self.token),
+        ):
+            with self.assertRaises(grpc.RpcError) as error:
+                rpc(
+                    payload, metadata=(("authorization", "Bearer " + token),), timeout=5
+                )
+            self.assertEqual(error.exception.code(), grpc.StatusCode.PERMISSION_DENIED)
+        self.assertEqual(
+            rpc(
+                field(1, resource),
+                metadata=(("authorization", "Bearer " + self.token),),
+                timeout=5,
+            ),
+            b"",
+        )
+        with self.assertRaises(grpc.RpcError) as error:
+            self.call("ExchangeUserTokenForMultiresourceToken", field(1, resource))
+        self.assertEqual(error.exception.code(), grpc.StatusCode.PERMISSION_DENIED)
+        self.call("ExchangeUserTokenForMultiresourceToken", field(1, resource), other)
+        self.call(
+            "ExchangeUserTokenForMultiresourceToken",
+            field(1, ("urc-" + foreign).encode()),
+        )
+
+    def test_permission_listing_exposes_only_current_subject_grants(self):
+        other = self.auth.identity()
+        foreign = uuid.uuid4().hex
+        self.auth.grant(other, foreign)
+        result = parse_fields(self.call("LookupUserPermissions", field(1, b"urc")))
+        self.assertEqual(
+            result,
+            {
+                1: [
+                    field(1, ("urc-" + self.repository).encode())
+                    + field(2, b"read")
+                    + field(2, b"write")
+                ]
+            },
+        )
+        for request in (
+            b"",
+            field(1, b"*"),
+            field(1, b"urc") + field(2, self.auth.subject(other).encode()),
+        ):
+            with self.assertRaises(grpc.RpcError) as error:
+                self.call("LookupUserPermissions", request)
+            self.assertEqual(error.exception.code(), grpc.StatusCode.PERMISSION_DENIED)
+
+    def test_thin_client_credentials_bind_actual_endpoint_and_current_grants(self):
+        from types import SimpleNamespace
+        from conftest import thin_client_credentials
+
+        remote = "grpc://127.0.0.1:45678/"
+        credentials = thin_client_credentials.__wrapped__(
+            (self.auth, remote, self.token)
+        )
+        repo = SimpleNamespace(remote=remote, get_id=lambda: self.repository)
+        target, token = credentials(repo)
+        self.assertEqual(target, "127.0.0.1:45678")
+        payload = token.split(".")[1]
+        claims = json.loads(
+            base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        )
+        self.assertEqual(claims["sub"], self.auth.subject(self.token))
+        self.assertEqual(
+            [r["resource_id"] for r in claims["resources"]], ["urc-" + self.repository]
+        )
+        with patch.object(self.auth, "exchange_token") as exchange:
+            for bad in (
+                SimpleNamespace(
+                    remote="grpc://127.0.0.1:45679/", get_id=lambda: self.repository
+                ),
+                SimpleNamespace(remote=remote, get_id=lambda: uuid.uuid4().hex),
+            ):
+                with self.assertRaises(RuntimeError):
+                    credentials(bad)
+            exchange.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

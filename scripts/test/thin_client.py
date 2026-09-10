@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: MIT
 """Minimal gRPC client for `lore.thin_client.v1.ThinClientService`.
 
-The CLI never calls this service, so a test asserting what reaches its wire has
-to talk to it directly. The test server runs gRPC in plaintext and registers the
-service without an auth interceptor, so an insecure channel carrying only the
-repository-id metadata works. Only the fields the tests assert on are decoded.
+The CLI never calls this service, so tests call it directly. Use the repository's
+actual server and a scoped repository token for authenticated fixtures. Only the
+fields the tests assert on are decoded.
 """
 
 import logging
@@ -148,6 +147,7 @@ def _collect_stream(
     repository_id: bytes,
     deserializer,
     timeout: float,
+    authorization: str | None = None,
 ) -> list:
     with grpc.insecure_channel(grpc_target) as channel:
         call = channel.unary_stream(
@@ -155,10 +155,13 @@ def _collect_stream(
             request_serializer=_already_encoded,
             response_deserializer=deserializer,
         )
+        metadata = ((_REPOSITORY_ID_METADATA_KEY, repository_id),)
+        if authorization is not None:
+            metadata += (("authorization", "Bearer " + authorization),)
         responses = call(
             request,
             timeout=timeout,
-            metadata=((_REPOSITORY_ID_METADATA_KEY, repository_id),),
+            metadata=metadata,
         )
         return [item for message in responses for item in message]
 
@@ -168,6 +171,8 @@ def revision_tree(
     repository_id: bytes,
     signature: bytes,
     timeout: float = 30.0,
+    *,
+    authorization: str | None = None,
 ) -> list[TreeNode]:
     """Every `TreeNode` the server streams for `signature`, in stream order."""
     nodes = _collect_stream(
@@ -177,6 +182,7 @@ def revision_tree(
         repository_id,
         _tree_nodes,
         timeout,
+        authorization,
     )
     logger.info("RevisionTree(%s) returned %d nodes", signature.hex(), len(nodes))
     return nodes
@@ -188,6 +194,8 @@ def revision_diff(
     signature_from: bytes,
     signature_to: bytes,
     timeout: float = 30.0,
+    *,
+    authorization: str | None = None,
 ) -> list[DiffChange]:
     """Every `DiffChange` the server streams between the two revisions, in
     stream order."""
@@ -202,6 +210,7 @@ def revision_diff(
         repository_id,
         lambda response: _diff_changes(response, partitions),
         timeout,
+        authorization,
     )
     logger.info(
         "RevisionDiff(%s -> %s) returned %d changes",

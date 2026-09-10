@@ -51,6 +51,7 @@ mod quic_session_rebind_tests {
     use lore_server::grpc::server::GrpcServerBuilder;
     use lore_server::hooks::HookDispatcher;
     use lore_server::protocol::attribute_map::AttributeMap;
+    use lore_server::protocol::attribute_map::ConnectionId;
     use lore_server::protocol::storage::messages::MessageHandleError;
     use lore_server::protocol::storage::messages::MessageParseError;
     use lore_server::quic::ProtocolErrorInfo;
@@ -128,7 +129,16 @@ mod quic_session_rebind_tests {
         opcode: u8,
         notify_answered: Arc<tokio::sync::Notify>,
         release_answer: Arc<tokio::sync::Notify>,
+        hold_exited: Arc<tokio::sync::Notify>,
         armed: Arc<AtomicBool>,
+    }
+
+    /// Releasing on drop also covers timeout/panic while the endpoint is being retired.
+    struct ReleaseHeldAnswer(Arc<tokio::sync::Notify>);
+    impl Drop for ReleaseHeldAnswer {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
     }
 
     /// Delegates every `QuicService` call to a real `StorageServiceV4`, recording
@@ -136,6 +146,7 @@ mod quic_session_rebind_tests {
     /// severing one command's response deterministically (see [`SeverResponse`]).
     struct RecordingStorageServiceV4 {
         inner: StorageServiceV4,
+        connection_id: usize,
         log: Log,
         sever: Option<SeverResponse>,
         hold_answered_error: Option<HoldAnsweredError>,
@@ -156,6 +167,14 @@ mod quic_session_rebind_tests {
             header: &CommandHeader,
             bytes: Bytes,
         ) -> Result<Self::ParsedRequestType, Self::RequestParseErrorType> {
+            if header.cmd == Command::Authorize as u8 {
+                eprintln!(
+                    "[auth-wire] connection={} action={:?} session={}",
+                    self.connection_id,
+                    bytes.first(),
+                    header.session_id
+                );
+            }
             self.log.lock().expect("log mutex poisoned").push(Observed {
                 opcode: header.cmd,
                 session_id: header.session_id,
@@ -170,9 +189,17 @@ mod quic_session_rebind_tests {
         ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
             let opcode = match &request {
                 ParsedStorageRequestV4::StorageCommand { opcode, .. } => Some(*opcode),
-                _ => None,
+                ParsedStorageRequestV4::AuthorizeStart { .. }
+                | ParsedStorageRequestV4::AuthorizeStop { .. } => Some(Command::Authorize as u8),
             };
             let result = self.inner.run_request_handler(context, request).await;
+            if opcode == Some(Command::Authorize as u8) {
+                eprintln!(
+                    "[auth-handler] connection={} successful={} (response delivery not observed)",
+                    self.connection_id,
+                    result.is_ok()
+                );
+            }
             if result.is_err()
                 && let Some(hold) = &self.hold_answered_error
                 && opcode == Some(hold.opcode)
@@ -180,6 +207,7 @@ mod quic_session_rebind_tests {
             {
                 hold.notify_answered.notify_one();
                 hold.release_answer.notified().await;
+                hold.hold_exited.notify_one();
             }
             if result.is_ok()
                 && let Some(sever) = &self.sever
@@ -284,13 +312,14 @@ mod quic_session_rebind_tests {
             mutable_store: Arc<dyn MutableStore>,
             log: Log,
             jwt_verifier: Arc<Option<JwtVerifier>>,
+            hold: Option<HoldAnsweredError>,
         ) -> Self {
             Self::with_controls(
                 immutable_store,
                 mutable_store,
                 log,
                 None,
-                None,
+                hold,
                 jwt_verifier,
             )
         }
@@ -316,6 +345,7 @@ mod quic_session_rebind_tests {
                     );
                     let service = RecordingStorageServiceV4 {
                         inner,
+                        connection_id: context.get::<ConnectionId>().map(|id| id.0).unwrap_or(0),
                         log: log.clone(),
                         sever: sever.clone(),
                         hold_answered_error: hold_answered_error.clone(),
@@ -488,6 +518,16 @@ mod quic_session_rebind_tests {
         mutable: Arc<dyn MutableStore>,
         log: Log,
     ) -> QuinnServer {
+        start_auth_quic_server_with_hold(udp, immutable, mutable, log, None)
+    }
+
+    fn start_auth_quic_server_with_hold(
+        udp: std::net::UdpSocket,
+        immutable: Arc<dyn ImmutableStore>,
+        mutable: Arc<dyn MutableStore>,
+        log: Log,
+        hold: Option<HoldAnsweredError>,
+    ) -> QuinnServer {
         let (cert_file, pkey_file, _ca) = server_certs().expect("test certificate paths");
         QuinnServer::start(
             QuinnConfigBuilder::new()
@@ -499,6 +539,7 @@ mod quic_session_rebind_tests {
                     mutable,
                     log,
                     test_jwt_verifier(),
+                    hold,
                 )))
                 .build()
                 .expect("quinn config"),
@@ -708,6 +749,7 @@ mod quic_session_rebind_tests {
             opcode: opcode as u8,
             notify_answered: notify_answered.clone(),
             release_answer: release_answer.clone(),
+            hold_exited: Arc::new(tokio::sync::Notify::new()),
             armed: Arc::new(AtomicBool::new(true)),
         };
         let (cert_file, pkey_file, _ca) = server_certs().expect("test certificate paths");
@@ -1138,6 +1180,7 @@ mod quic_session_rebind_tests {
         port: u16,
         server_a: QuinnServer,
         identity: String,
+        log: Log,
         /// Held for the lifetime of the scenario: dropping the sender shuts the gRPC backend
         /// down, and a later reconnect still needs it to resolve the environment.
         _grpc_shutdown: tokio::sync::oneshot::Sender<()>,
@@ -1159,6 +1202,15 @@ mod quic_session_rebind_tests {
         partition: RepositoryId,
         initial_token: &str,
     ) -> AuthScenario {
+        auth_scenario_with_hold(arm, partition, initial_token, None).await
+    }
+
+    async fn auth_scenario_with_hold(
+        arm: &str,
+        partition: RepositoryId,
+        initial_token: &str,
+        hold: Option<HoldAnsweredError>,
+    ) -> AuthScenario {
         let (tcp, udp) = bind_matched_pair();
         let addr: SocketAddr = tcp.local_addr().unwrap();
         let port = addr.port();
@@ -1167,8 +1219,13 @@ mod quic_session_rebind_tests {
 
         let (immutable, mutable) = fresh_stores().await;
         let log_a: Log = Arc::new(StdMutex::new(Vec::new()));
-        let server_a =
-            start_auth_quic_server(udp, immutable.clone(), mutable.clone(), log_a.clone());
+        let server_a = start_auth_quic_server_with_hold(
+            udp,
+            immutable.clone(),
+            mutable.clone(),
+            log_a.clone(),
+            hold,
+        );
 
         let identity = format!("wp108-b4-{arm}-{}", random::<u32>());
         let connection = lore_transport::connect(
@@ -1212,6 +1269,7 @@ mod quic_session_rebind_tests {
             port,
             server_a,
             identity,
+            log: log_a,
             _grpc_shutdown: grpc_shutdown,
         }
     }
@@ -1237,35 +1295,59 @@ mod quic_session_rebind_tests {
         );
     }
 
-    /// The wire evidence a failing B4 arm must show on the replacement connection.
-    ///
-    /// The `Authorize` count is pinned at exactly one, which is what both failing arms were
-    /// measured to cost rather than what `ATTEMPT_BUDGET` would permit. A refused authorization
-    /// is an ANSWERED error, so it is neither rebound nor retried: the budget is the ceiling,
-    /// and the honest observed cost sits well under it. Asserting only the ceiling would keep
-    /// passing if a future change started re-presenting a rejected credential, which is exactly
-    /// the authorization storm the single-flight rule exists to prevent.
-    const EXPECTED_REFUSED_AUTHORIZE_COMMANDS: usize = 1;
-
-    fn assert_replacement_failed_closed(log: &[Observed], arm: &str) {
-        let authorize_count = log
-            .iter()
-            .filter(|o| o.opcode == Command::Authorize as u8)
-            .count();
+    /// Only causal loss or non-dispatch permits a retry before the terminal answered refusal.
+    fn assert_replacement_failed_closed(
+        log: &[Observed],
+        observations: &lore_transport::quic::client::AuthorizeRetryObservations,
+        arm: &str,
+    ) -> usize {
+        use lore_transport::quic::client::AuthorizeRetryDecision as Decision;
+        use lore_transport::quic::client::AuthorizeRetryError as Error;
+        use lore_transport::quic::client::AuthorizeRetryPhase as Phase;
+        use lore_transport::replay::DispatchState;
+        assert!(!observations.overflowed, "{arm}: incomplete retry evidence");
+        let events = &observations.entries;
+        assert!((1..=2).contains(&events.len()), "{arm}: {events:?}");
+        let terminal = events.last().unwrap();
         assert_eq!(
-            authorize_count,
-            EXPECTED_REFUSED_AUTHORIZE_COMMANDS,
-            "{arm}: the replacement session_start must be attempted exactly once and never \
-             re-presented after a refusal (ATTEMPT_BUDGET is {}, the ceiling, not the expected \
-             cost); observed {authorize_count} Authorize commands in {log:?}",
-            lore_transport::ATTEMPT_BUDGET
+            terminal.dispatch,
+            DispatchState::DispatchedAndAnswered,
+            "{arm}: {events:?}"
+        );
+        assert_eq!(terminal.error, Error::NotAuthorized, "{arm}: {events:?}");
+        assert_eq!(terminal.decision, Decision::Failed, "{arm}: {events:?}");
+        assert_eq!(
+            terminal.phase,
+            if events.len() == 1 {
+                Phase::First
+            } else {
+                Phase::BudgetSpent
+            }
+        );
+        let mut lost_retries = 0;
+        if events.len() == 2 {
+            let retry = &events[0];
+            assert_eq!(retry.phase, Phase::First);
+            assert_eq!(retry.decision, Decision::Retry, "{arm}: {events:?}");
+            assert_ne!(retry.error, Error::NotAuthorized, "{arm}: {events:?}");
+            match retry.dispatch {
+                DispatchState::NotDispatched => {}
+                DispatchState::DispatchedResponseLost => lost_retries += 1,
+                DispatchState::DispatchedAndAnswered => {
+                    panic!("{arm}: retried an answered refusal: {events:?}")
+                }
+            }
+        }
+        assert!(
+            (1..=1 + lost_retries).contains(&log.len()),
+            "{arm}: {log:?}, {events:?}"
         );
         assert!(
-            log.iter().all(|o| o.opcode == Command::Authorize as u8),
-            "{arm}: nothing but the refused session_start attempt may reach the replacement \
-             server -- a rejected authorization must never be followed by the operation itself; \
-             observed: {log:?}"
+            log.iter()
+                .all(|o| o.opcode == Command::Authorize as u8 && o.session_id == 0),
+            "{arm}: only Authorize Start may reach the server: {log:?}"
         );
+        lost_retries
     }
 
     /// Run one B4 arm to its end: rotate the credential, replace the connection, and return the
@@ -1277,8 +1359,16 @@ mod quic_session_rebind_tests {
     async fn run_after_credential_change(
         scenario: AuthScenario,
         replacement_token: &str,
-    ) -> (Result<(), lore_transport::ProtocolError>, Vec<Observed>) {
+    ) -> (
+        Result<(), lore_transport::ProtocolError>,
+        Vec<Observed>,
+        lore_transport::quic::client::AuthorizeRetryObservations,
+    ) {
         rotate_supplied_credential(&scenario, replacement_token).await;
+        let storage = scenario.connection.storage().await.unwrap();
+        storage
+            .take_authorize_retry_observations_for_test()
+            .unwrap();
 
         let AuthScenario {
             session,
@@ -1297,7 +1387,10 @@ mod quic_session_rebind_tests {
         let (fragment, address, payload) = random_fragment();
         let result = session.put(address, fragment, Some(payload)).await;
         let log = log_b.lock().unwrap().clone();
-        (result, log)
+        let observations = storage
+            .take_authorize_retry_observations_for_test()
+            .unwrap();
+        (result, log, observations)
     }
 
     // B4: replacement authorization uses the CURRENT credential and fails closed when that
@@ -1328,7 +1421,8 @@ mod quic_session_rebind_tests {
 
                 // Expiry as an absolute past instant, not as elapsed time.
                 let expired = mint_token(&[partition], now - 3600);
-                let (result, log) = run_after_credential_change(scenario, &expired).await;
+                let (result, log, observations) =
+                    run_after_credential_change(scenario, &expired).await;
 
                 let error = result.expect_err(
                     "an expired credential must fail the replacement session_start, not be \
@@ -1339,7 +1433,7 @@ mod quic_session_rebind_tests {
                     "the failure must be an authorization failure and not an incidental transport \
                      error, or this arm passes for the wrong reason; got {error:?}"
                 );
-                assert_replacement_failed_closed(&log, "expired");
+                assert_replacement_failed_closed(&log, &observations, "expired");
 
                 Ok(())
             })
@@ -1363,7 +1457,8 @@ mod quic_session_rebind_tests {
                 // Unexpired, correctly signed, and authorized for some OTHER repository. Only
                 // `verify_authorization` can refuse this one.
                 let revoked = mint_token(&[random::<RepositoryId>()], now + 3600);
-                let (result, log) = run_after_credential_change(scenario, &revoked).await;
+                let (result, log, observations) =
+                    run_after_credential_change(scenario, &revoked).await;
 
                 let error = result.expect_err(
                     "a credential that no longer grants this repository must fail the replacement \
@@ -1374,8 +1469,161 @@ mod quic_session_rebind_tests {
                     "the failure must be an authorization failure and not an incidental transport \
                      error; got {error:?}"
                 );
-                assert_replacement_failed_closed(&log, "revoked");
+                assert_replacement_failed_closed(&log, &observations, "revoked");
 
+                Ok(())
+            })
+            .await
+    }
+
+    /// An answered authorization refusal is terminal even when its connection generation
+    /// changes while the real server answer is held in flight. No socket is severed here.
+    #[tokio::test]
+    async fn answered_authorize_refusal_is_not_replayed_when_generation_moves() -> TestResult {
+        LORE_CONTEXT
+            .scope(setup_execution("test".to_string()), async move {
+                let partition = random::<RepositoryId>();
+                let now = unix_now_secs();
+                let hold = HoldAnsweredError {
+                    opcode: Command::Authorize as u8,
+                    notify_answered: Arc::new(tokio::sync::Notify::new()),
+                    release_answer: Arc::new(tokio::sync::Notify::new()),
+                    hold_exited: Arc::new(tokio::sync::Notify::new()),
+                    armed: Arc::new(AtomicBool::new(false)),
+                };
+                let _release_on_drop = ReleaseHeldAnswer(hold.release_answer.clone());
+                let scenario = auth_scenario_with_hold(
+                    "answered-revoked",
+                    partition,
+                    &mint_token(&[partition], now + 3600),
+                    Some(hold.clone()),
+                )
+                .await;
+                rotate_supplied_credential(
+                    &scenario,
+                    &mint_token(&[random::<RepositoryId>()], now + 3600),
+                )
+                .await;
+                // Retire the cached session generation on an otherwise live stream, forcing
+                // fresh authorization without a physical replacement/lost-response race.
+                scenario
+                    .connection
+                    .advance_storage_generation_before_epoch_for_test()
+                    .await?;
+                let storage = scenario.connection.storage().await?;
+                storage.take_authorize_retry_observations_for_test()?;
+                scenario.log.lock().unwrap().clear();
+                hold.armed.store(true, Ordering::Relaxed);
+                let (fragment, address, payload) = random_fragment();
+                let (result, ()) = tokio::time::timeout(SEVER_SIGNAL_TIMEOUT, async {
+                    tokio::join!(
+                        scenario.session.put(address, fragment, Some(payload)),
+                        async {
+                            hold.notify_answered.notified().await;
+                            scenario
+                                .connection
+                                .advance_storage_generation_before_epoch_for_test()
+                                .await
+                                .expect("generation seam");
+                            hold.release_answer.notify_one();
+                        }
+                    )
+                })
+                .await
+                .expect("answered authorization exchange must complete within its bound");
+                let error = result.expect_err("the revoked credential must be refused");
+                assert!(
+                    error.is_not_authorized(),
+                    "expected actual authorization refusal: {error:?}"
+                );
+                let log = scenario.log.lock().unwrap().clone();
+                let observations = storage.take_authorize_retry_observations_for_test()?;
+                assert_replacement_failed_closed(&log, &observations, "answered generation change");
+                assert_eq!(observations.entries.len(), 1);
+                assert_eq!(log.len(), 1);
+                assert_eq!(
+                    log[0].session_id, 0,
+                    "the sole command must start a new session"
+                );
+                Ok(())
+            })
+            .await
+    }
+
+    /// The first real refusal is computed, then its connection is closed before delivery.
+    /// One read-retry is legal; the replacement's answered refusal must terminate it.
+    #[tokio::test]
+    async fn lost_authorize_refusal_response_retries_once_then_stops() -> TestResult {
+        LORE_CONTEXT
+            .scope(setup_execution("test".to_string()), async move {
+                let partition = random::<RepositoryId>();
+                let now = unix_now_secs();
+                let hold = HoldAnsweredError {
+                    opcode: Command::Authorize as u8,
+                    notify_answered: Arc::new(tokio::sync::Notify::new()),
+                    release_answer: Arc::new(tokio::sync::Notify::new()),
+                    hold_exited: Arc::new(tokio::sync::Notify::new()),
+                    armed: Arc::new(AtomicBool::new(false)),
+                };
+                let _release_on_drop = ReleaseHeldAnswer(hold.release_answer.clone());
+                let scenario = auth_scenario_with_hold(
+                    "lost-refusal",
+                    partition,
+                    &mint_token(&[partition], now + 3600),
+                    Some(hold.clone()),
+                )
+                .await;
+                rotate_supplied_credential(
+                    &scenario,
+                    &mint_token(&[random::<RepositoryId>()], now + 3600),
+                )
+                .await;
+                scenario
+                    .connection
+                    .advance_storage_generation_before_epoch_for_test()
+                    .await?;
+                let storage = scenario.connection.storage().await?;
+                storage.take_authorize_retry_observations_for_test()?;
+                scenario.log.lock().unwrap().clear();
+                hold.armed.store(true, Ordering::Relaxed);
+                let AuthScenario {
+                    session,
+                    immutable,
+                    mutable,
+                    port,
+                    server_a,
+                    log,
+                    _grpc_shutdown,
+                    ..
+                } = scenario;
+                let (fragment, address, payload) = random_fragment();
+                let (result, _server_b) = tokio::time::timeout(SEVER_SIGNAL_TIMEOUT, async {
+                    tokio::join!(session.put(address, fragment, Some(payload)), async {
+                        hold.notify_answered.notified().await;
+                        // The handler remains held. Closing the server loses this real refusal.
+                        server_a.close().await;
+                        // Endpoint closure makes loss certain before the real handler is released.
+                        hold.release_answer.notify_one();
+                        hold.hold_exited.notified().await;
+                        drop(server_a);
+                        let udp = rebind_udp(port).await;
+                        start_auth_quic_server(udp, immutable, mutable, log.clone())
+                    })
+                })
+                .await
+                .expect("controlled response-loss exchange must finish within its bound");
+                let error = result.expect_err("replacement must refuse the revoked credential");
+                assert!(
+                    error.is_not_authorized(),
+                    "actual refusal required: {error:?}"
+                );
+                let observations = storage.take_authorize_retry_observations_for_test()?;
+                let log = log.lock().unwrap().clone();
+                assert_eq!(
+                    assert_replacement_failed_closed(&log, &observations, "forced lost refusal"),
+                    1
+                );
+                assert_eq!(log.len(), 2, "both server receipts are controlled: {log:?}");
                 Ok(())
             })
             .await
@@ -1399,7 +1647,8 @@ mod quic_session_rebind_tests {
 
                 // A different token object, still valid and still granting this repository.
                 let still_valid = mint_token(&[partition], now + 7200);
-                let (result, log) = run_after_credential_change(scenario, &still_valid).await;
+                let (result, log, _observations) =
+                    run_after_credential_change(scenario, &still_valid).await;
 
                 result.expect(
                     "a still-valid credential must reauthorize on the replacement connection and \

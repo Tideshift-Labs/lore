@@ -9231,7 +9231,7 @@ def _mount_changes(changes: list, link_path: str) -> list:
 
 @pytest.mark.smoke
 def test_thin_client_tree_discriminates_tracking_from_pinned(
-    new_lore_repo, lore_grpc_target
+    new_lore_repo, thin_client_credentials
 ):
     """One tree holding both link kinds and a plain file: only the link left on
     its parent's branch reports tracking. Asserting all three off a single
@@ -9246,10 +9246,13 @@ def test_thin_client_tree_discriminates_tracking_from_pinned(
     repo.commit()
     repo.push()
 
+    target, authorization = thin_client_credentials(repo)
     repository_id, signature = _wire_identity(repo)
     nodes = {
         node.path: node
-        for node in revision_tree(lore_grpc_target, repository_id, signature)
+        for node in revision_tree(
+            target, repository_id, signature, authorization=authorization
+        )
     }
     for path in ("tracked", "pinned", "own.txt"):
         assert path in nodes, f"{path} missing from tree: {sorted(nodes)}"
@@ -9281,7 +9284,7 @@ def test_thin_client_tree_discriminates_tracking_from_pinned(
 
 @pytest.mark.smoke
 def test_thin_client_diff_reports_tracking_on_added_link(
-    new_lore_repo, lore_grpc_target
+    new_lore_repo, thin_client_credentials
 ):
     """Adding a tracking link is reported as a tracking link entry on the
     thin-client revision diff."""
@@ -9296,7 +9299,10 @@ def test_thin_client_diff_reports_tracking_on_added_link(
     repo.push()
 
     _, after = _wire_identity(repo)
-    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+    target, authorization = thin_client_credentials(repo)
+    changes = revision_diff(
+        target, repository_id, before, after, authorization=authorization
+    )
 
     mount_changes = _mount_changes(changes, link_path)
     assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
@@ -9311,7 +9317,7 @@ def test_thin_client_diff_reports_tracking_on_added_link(
 
 @pytest.mark.smoke
 def test_thin_client_diff_reports_tracking_on_removed_link(
-    new_lore_repo, lore_grpc_target
+    new_lore_repo, thin_client_credentials
 ):
     """Removing a tracking link reports tracking on the delete entry. A delete
     resolves against the "from" side, the only action that does."""
@@ -9330,7 +9336,10 @@ def test_thin_client_diff_reports_tracking_on_removed_link(
     repo.push()
 
     _, after = _wire_identity(repo)
-    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+    target, authorization = thin_client_credentials(repo)
+    changes = revision_diff(
+        target, repository_id, before, after, authorization=authorization
+    )
 
     mount_changes = _mount_changes(changes, link_path)
     assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
@@ -9345,7 +9354,7 @@ def test_thin_client_diff_reports_tracking_on_removed_link(
 
 @pytest.mark.smoke
 def test_thin_client_diff_reports_tracking_on_moved_pin(
-    new_lore_repo, lore_grpc_target
+    new_lore_repo, thin_client_credentials
 ):
     """Committing content through a tracking link moves its pin, and the pin
     move is reported as a tracking link entry on the thin-client revision
@@ -9369,7 +9378,10 @@ def test_thin_client_diff_reports_tracking_on_moved_pin(
     repo.push()
 
     _, after = _wire_identity(repo)
-    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+    target, authorization = thin_client_credentials(repo)
+    changes = revision_diff(
+        target, repository_id, before, after, authorization=authorization
+    )
 
     mount_changes = _mount_changes(changes, link_path)
     assert mount_changes, (
@@ -9395,7 +9407,7 @@ def test_thin_client_diff_reports_tracking_on_moved_pin(
 
 @pytest.mark.smoke
 def test_thin_client_diff_partitions_added_link_under_linked_repository(
-    new_lore_repo, lore_grpc_target
+    new_lore_repo, thin_client_credentials
 ):
     """A newly mounted link is the only diff entry for its mount path, and the
     content it names is a revision of the linked repository, so the entry must
@@ -9411,7 +9423,10 @@ def test_thin_client_diff_partitions_added_link_under_linked_repository(
     repo.push()
 
     _, after = _wire_identity(repo)
-    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+    target, authorization = thin_client_credentials(repo)
+    changes = revision_diff(
+        target, repository_id, before, after, authorization=authorization
+    )
 
     mount_changes = _mount_changes(changes, link_path)
     assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
@@ -9426,7 +9441,7 @@ def test_thin_client_diff_partitions_added_link_under_linked_repository(
 
 @pytest.mark.smoke
 def test_thin_client_diff_partitions_removed_link_under_linked_repository(
-    new_lore_repo, lore_grpc_target
+    new_lore_repo, thin_client_credentials
 ):
     """A removed link names the revision it was pinned to, which still lives in
     the linked repository, so the delete entry must be partitioned there. A
@@ -9446,7 +9461,10 @@ def test_thin_client_diff_partitions_removed_link_under_linked_repository(
     repo.push()
 
     _, after = _wire_identity(repo)
-    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+    target, authorization = thin_client_credentials(repo)
+    changes = revision_diff(
+        target, repository_id, before, after, authorization=authorization
+    )
 
     mount_changes = _mount_changes(changes, link_path)
     assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
@@ -9462,7 +9480,7 @@ def test_thin_client_diff_partitions_removed_link_under_linked_repository(
 
 @pytest.mark.smoke
 def test_thin_client_diff_partitions_moved_pin_under_linked_repository(
-    new_lore_repo, lore_grpc_target
+    new_lore_repo, thin_client_credentials
 ):
     """Committing through a link moves its pin, and every entry the diff reports
     for the mount path must agree on the linked repository as its partition,
@@ -9486,7 +9504,10 @@ def test_thin_client_diff_partitions_moved_pin_under_linked_repository(
     repo.push()
 
     _, after = _wire_identity(repo)
-    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+    target, authorization = thin_client_credentials(repo)
+    changes = revision_diff(
+        target, repository_id, before, after, authorization=authorization
+    )
 
     mount_changes = _mount_changes(changes, link_path)
     assert mount_changes, (
@@ -9508,7 +9529,7 @@ def test_thin_client_diff_partitions_moved_pin_under_linked_repository(
 
 @pytest.mark.smoke
 def test_thin_client_diff_partitions_each_link_under_its_own_repository(
-    new_lore_repo, lore_grpc_target
+    new_lore_repo, thin_client_credentials
 ):
     """Two links added in one commit take separate partition indices, and each
     mount entry resolves to the repository it mounts."""
@@ -9524,7 +9545,10 @@ def test_thin_client_diff_partitions_each_link_under_its_own_repository(
     repo.push()
 
     _, after = _wire_identity(repo)
-    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+    target, authorization = thin_client_credentials(repo)
+    changes = revision_diff(
+        target, repository_id, before, after, authorization=authorization
+    )
 
     for link_path, link_repo in (("first", first_repo), ("second", second_repo)):
         mount_changes = _mount_changes(changes, link_path)

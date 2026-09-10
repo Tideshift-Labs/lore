@@ -4,6 +4,9 @@
 import logging
 import os
 import uuid
+from pathlib import Path
+
+from managed_auth import ManagedAuth
 
 import pytest
 from lore_server import (
@@ -37,7 +40,34 @@ class TestForwardedBranch:
     """
 
     @pytest.fixture(scope="class")
-    def server_1_config(self, request, tmp_path_factory):
+    def auth(self, tmp_path_factory):
+        auth = ManagedAuth(tmp_path_factory.mktemp("forwarded-auth"))
+        try:
+            yield auth
+        finally:
+            auth.close()
+
+    @pytest.fixture
+    def signed_client(self, auth, global_dir_name):
+        token = auth.identity()
+        try:
+            yield token
+        finally:
+            with auth.lock:
+                auth.identities.pop(token, None)
+            for name in (
+                "auth.json",
+                "tokenstore.toml",
+                "tokens.toml",
+                "sec-tokenstore_encryption_key",
+            ):
+                path = Path(global_dir_name) / name
+                if path.is_symlink():
+                    raise RuntimeError("Refusing redirected fixture credential cleanup")
+                path.unlink(missing_ok=True)
+
+    @pytest.fixture(scope="class")
+    def server_1_config(self, request, tmp_path_factory, auth):
         """
         Config for Server 1: the delegation *target*. Its internal gRPC server
         is enabled without mTLS so Server 2 can reach it over plain HTTP/2.
@@ -52,6 +82,7 @@ class TestForwardedBranch:
         server_root, server_env = generate_server_config(
             request, tmp_path_factory, ports
         )
+        auth.configure_server(server_root, server_env)
         # Enable the internal gRPC server without mTLS so Server 2 can reach it
         server_env["LORE__SERVER__GRPC_INTERNAL__ENABLED"] = "true"
         server_env["LORE__SERVER__GRPC_INTERNAL__VERIFY_CLIENT_CERTS"] = "false"
@@ -71,7 +102,7 @@ class TestForwardedBranch:
         log_fd.close()
 
     @pytest.fixture(scope="class")
-    def server_2_config(self, request, tmp_path_factory, server_1_config):
+    def server_2_config(self, request, tmp_path_factory, server_1_config, auth):
         """
         Config for Server 2: the delegation *source*. Its local.toml is extended
         with the forwarded_requests block that tells it to forward operations
@@ -89,6 +120,7 @@ class TestForwardedBranch:
             request, tmp_path_factory, ports
         )
 
+        auth.configure_server(server_root, server_env)
         _, server_1_env = server_1_config
         server_1_internal_port = server_1_env["LORE__SERVER__GRPC_INTERNAL__PORT"]
         server_hostname = request.config.getoption("--lore-server-hostname")
@@ -134,6 +166,10 @@ class TestForwardedBranch:
         server_1,
         server_2,
         new_lore_repo,
+        auth,
+        signed_client,
+        global_dir_name,
+        lore_executable_path,
     ):
         """
         Create two lore clients pointing at different servers but sharing the
@@ -147,21 +183,28 @@ class TestForwardedBranch:
         common_repo_name = f"repo-{common_repo_id}"
 
         remote_url_server_1 = (
-            f"lore://{server_hostname}:{server_1_env['LORE__SERVER__GRPC__PORT']}"
+            f"grpc://{server_hostname}:{server_1_env['LORE__SERVER__GRPC__PORT']}"
         )
         remote_url_server_2 = (
-            f"lore://{server_hostname}:{server_2_env['LORE__SERVER__GRPC__PORT']}"
+            f"grpc://{server_hostname}:{server_2_env['LORE__SERVER__GRPC__PORT']}"
         )
+
+        auth.grant(signed_client, common_repo_id)
+        for endpoint in (remote_url_server_1, remote_url_server_2):
+            auth.login(lore_executable_path, global_dir_name, endpoint, signed_client)
+        environment = auth.environment(global_dir_name)
 
         server_1_repo = new_lore_repo(
             remote_url=remote_url_server_1,
             remote_path=f"{remote_url_server_1}/{common_repo_name}",
             repo_id=common_repo_id,
+            environment_vars=environment.copy(),
         )
         server_2_repo = new_lore_repo(
             remote_url=remote_url_server_2,
             remote_path=f"{remote_url_server_2}/{common_repo_name}",
             repo_id=common_repo_id,
+            environment_vars=environment.copy(),
         )
 
         # branch_create requires at least one pushed revision on each server.
@@ -354,10 +397,10 @@ class TestForwardedRepositoryCreate:
         _, server_2_env = server_2_config
 
         remote_url_server_1 = (
-            f"lore://{server_hostname}:{server_1_env['LORE__SERVER__GRPC__PORT']}"
+            f"grpc://{server_hostname}:{server_1_env['LORE__SERVER__GRPC__PORT']}"
         )
         remote_url_server_2 = (
-            f"lore://{server_hostname}:{server_2_env['LORE__SERVER__GRPC__PORT']}"
+            f"grpc://{server_hostname}:{server_2_env['LORE__SERVER__GRPC__PORT']}"
         )
 
         repo_name = f"delegated-repo-{uuid.uuid4().hex[:8]}"

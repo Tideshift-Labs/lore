@@ -2159,10 +2159,15 @@ class TestDirectoryMoveCore:
             },
         )
 
+        repo.move(str(b / nested_before), str(b / nested_before_moved))
         repo.stage_move(str(b / nested_before), str(b / nested_before_moved))
+        repo.move(str(b / nested_file_before), str(b / nested_file_before_moved))
         repo.stage_move(str(b / nested_file_before), str(b / nested_file_before_moved))
+        repo.move(str(b), str(c))
         repo.stage_move(str(b), str(c))
+        repo.move(str(c / nested_after), str(c / nested_after_moved))
         repo.stage_move(str(c / nested_after), str(c / nested_after_moved))
+        repo.move(str(c / nested_file_after), str(c / nested_file_after_moved))
         repo.stage_move(str(c / nested_file_after), str(c / nested_file_after_moved))
 
         repo.remove_file(c / deleted)

@@ -22,9 +22,7 @@ class TestCreate:
         """
         repo: Lore = new_lore_repo(create_repo=False)
         # verify the repo is not yet initialized
-        assert not os.path.isdir(repo.dot_path()), (
-            "Lore repo is already initialized"
-        )
+        assert not os.path.isdir(repo.dot_path()), "Lore repo is already initialized"
 
         with pytest.raises(UninitializedRepositoryError):
             repo.status()
@@ -35,17 +33,13 @@ class TestCreate:
         """
         repo: Lore = new_lore_repo(create_repo=False)
         # verify the repo is not yet initialized
-        assert not os.path.isdir(repo.dot_path()), (
-            "Lore repo is already initialized"
-        )
+        assert not os.path.isdir(repo.dot_path()), "Lore repo is already initialized"
 
         # initialize Lore repo and verify success
         repo.repository_create()
 
         # verify repo was initialized
-        assert os.path.isdir(repo.dot_path()), (
-            "Lore repo was not initialized"
-        )
+        assert os.path.isdir(repo.dot_path()), "Lore repo was not initialized"
 
     def test_initialize_twice_fails(self, new_lore_repo):
         """
@@ -62,21 +56,26 @@ class TestCreate:
             "Lore repo does not exist after second initialization attempt"
         )
 
-    def test_initialize_twice_forced(self, new_lore_repo):
+    def test_initialize_twice_forced(self, new_lore_repo, managed_cli_grant):
         """
         Attempting to initialize a repo repository a second time with a new name using the force flag should succeed.
         """
         new_repo = new_lore_repo()
         new_repo_id = new_repo.get_id()
+        replacement_id = Lore.generate_id()
+        managed_cli_grant(replacement_id)
         new_repo.run(
             [
                 "repository",
                 "create",
                 new_repo.remote + Lore.generate_random_name(),
                 "--force",
+                "--id",
+                replacement_id,
             ]
         )
         second_repo_id = new_repo.get_id()
+        assert second_repo_id == replacement_id
 
         # # verify repository still exists
         assert os.path.isdir(new_repo.dot_path()), (
@@ -93,9 +92,7 @@ class TestCreate:
         generated_id = Lore.generate_id()
         repo = new_lore_repo(repo_id=generated_id, create_repo=False)
         # verify the repo is not yet initialized
-        assert not os.path.isdir(repo.dot_path()), (
-            "Lore repo is already initialized"
-        )
+        assert not os.path.isdir(repo.dot_path()), "Lore repo is already initialized"
         repo.repository_create(repo_id=generated_id)
         created_repo_id = repo.get_id()
 
@@ -114,7 +111,7 @@ class TestCreate:
         new_repo = new_lore_repo()
         new_repo.repository_delete()
 
-    def test_recreate_by_name(self, new_lore_repo):
+    def test_recreate_by_name(self, new_lore_repo, managed_cli_grant):
         """
         Recreate a deleted repo repository by name.
         """
@@ -124,7 +121,14 @@ class TestCreate:
         new_repo.clear_local_files()
 
         # recreate repo after deletion using name
-        new_lore_repo(remote_path=new_repo.remote_path)
+        replacement_id = Lore.generate_id()
+        managed_cli_grant(replacement_id)
+        recreated = new_lore_repo(
+            remote_path=new_repo.remote_path,
+            repo_id=replacement_id,
+            environment_vars=new_repo.environment_vars.copy(),
+        )
+        assert recreated.get_id() == replacement_id
 
     def test_create_then_delete_by_id(self, new_lore_repo):
         """
@@ -159,7 +163,7 @@ class TestCreate:
             "ID of recreated repo is not the same as the original repo."
         )
 
-    def test_clone_empty_repo(self, new_lore_repo):
+    def test_clone_empty_repo(self, new_lore_repo, managed_cli_grant):
         new_repo: Lore = new_lore_repo()
 
         cloned_repo: Lore = new_repo.clone()
@@ -187,6 +191,7 @@ class TestCreate:
         new_repo.repository_delete(new_repo.get_id())
         new_repo.clear_local_files()
 
+        managed_cli_grant(repo_id)
         new_repo.repository_create(repo_id=repo_id)
 
         output = new_repo.status()

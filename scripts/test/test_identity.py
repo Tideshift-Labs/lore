@@ -80,7 +80,9 @@ def test_commit_with_identity_stamps_creator_and_committer(new_lore_repo):
 
     rev = repo.revision_info(metadata=True)
     assert rev.creator == "alice", f"Expected creator='alice', got {rev.creator!r}"
-    assert rev.committer == "alice", f"Expected committer='alice', got {rev.committer!r}"
+    assert rev.committer == "alice", (
+        f"Expected committer='alice', got {rev.committer!r}"
+    )
 
 
 @pytest.mark.smoke
@@ -111,7 +113,9 @@ def test_amend_updates_committer_keeps_creator(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_clone_persists_explicit_identity_to_config(new_lore_repo):
+def test_clone_persists_explicit_identity_to_config(
+    new_lore_repo, managed_cli_identity
+):
     """
     `lore clone --identity X` writes `identity = "X"` into the new clone's
     config.toml so subsequent commands in that clone pick it up automatically.
@@ -123,8 +127,21 @@ def test_clone_persists_explicit_identity_to_config(new_lore_repo):
     repo.commit("seed", offline=True)
     repo.push()
 
-    cloned = repo.clone(identity="charlie")
-    assert _read_identity_in_config(cloned) == "charlie"
+    auth, remote, token = managed_cli_identity
+    original_subject = auth.subject(token)
+    alternate = auth.identity()
+    try:
+        subject = auth.subject(alternate)
+        assert subject != original_subject
+        auth.grant(alternate, repo.get_id())
+        auth.login(repo.lore_executable_path, repo.global_dir, remote, alternate)
+        # Re-select the original default so ignoring --identity cannot pass.
+        auth.login(repo.lore_executable_path, repo.global_dir, remote, token)
+        cloned = repo.clone(identity=subject)
+        assert _read_identity_in_config(cloned) == subject
+    finally:
+        with auth.lock:
+            auth.identities.pop(alternate, None)
 
 
 @pytest.mark.smoke

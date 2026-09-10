@@ -10,6 +10,7 @@ import typing
 
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 from time import sleep
 
 import pytest
@@ -188,19 +189,7 @@ def managed_cli_server(request, tmp_path_factory, lore_server_executable_path):
     }
     try:
         server_root, env = generate_server_config(request, tmp_path_factory, ports)
-        env["SSL_CERT_FILE"] = str(auth.ca_path)
-        env.pop("SSL_CERT_DIR", None)
-        # Use configuration, not authentication-policy overrides in the client.
-        (server_root / "lore-server" / "config" / "local.toml").write_text(
-            "[server.auth]\n"
-            f"jwt_issuer={json.dumps(auth.issuer)}\n"
-            'jwt_audience=["lore-storage","commit0-cli","localhost","127.0.0.1"]\n'
-            "enforce_write_permission=true\n[server.auth.jwk]\n"
-            f"endpoint={json.dumps(auth.jwks_url)}\n"
-            "[environment.endpoint]\n"
-            f"auth_url={json.dumps(auth.url)}\n",
-            encoding="utf-8",
-        )
+        auth.configure_server(server_root, env)
         yield from _managed_server_lifetime(
             auth, server_root, env, lore_server_executable_path, ports
         )
@@ -242,6 +231,44 @@ def managed_cli_identity(managed_cli_server, global_dir_name, lore_executable_pa
             if path.is_symlink():
                 raise RuntimeError("Refusing redirected fixture credential cleanup")
             path.unlink(missing_ok=True)
+
+
+@pytest.fixture
+def managed_cli_grant(managed_cli_identity):
+    auth, _, token = managed_cli_identity
+
+    def grant(repository_id, *, admin=False):
+        auth.grant(token, repository_id, admin=admin)
+
+    return grant
+
+
+@pytest.fixture
+def thin_client_credentials(managed_cli_identity):
+    auth, remote, token = managed_cli_identity
+
+    def credentials(repo):
+        actual = urlsplit(repo.remote)
+        expected = urlsplit(remote)
+        if (actual.scheme, actual.hostname, actual.port) != (
+            expected.scheme,
+            expected.hostname,
+            expected.port,
+        ):
+            raise RuntimeError(
+                "Thin-client repository does not belong to the fixture endpoint"
+            )
+        resource = "urc-" + repo.get_id().replace("-", "")
+        with auth.lock:
+            resources = tuple(auth.identities[token][1])
+        if resource not in resources:
+            raise RuntimeError("Thin-client repository has no current fixture grant")
+        host = actual.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        return f"{host}:{actual.port}", auth.exchange_token(token, resources)
+
+    return credentials
 
 
 @pytest.fixture(scope="function")

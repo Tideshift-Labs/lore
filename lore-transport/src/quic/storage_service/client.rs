@@ -505,6 +505,13 @@ impl ServiceClient for StorageClient {
 
 #[async_trait]
 impl Storage for StorageClient {
+    #[cfg(feature = "test_seams")]
+    fn take_authorize_retry_observations_for_test(
+        &self,
+    ) -> Result<crate::quic::client::AuthorizeRetryObservations, ProtocolError> {
+        Ok(self.quic.take_authorize_retry_observations_for_test())
+    }
+
     async fn session_start(
         &self,
         partition: Partition,

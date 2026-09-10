@@ -142,7 +142,7 @@ def test_merge(new_lore_repo):
             dirs = [
                 f
                 for f in os.listdir(repo.path)
-                if os.path.isdir(os.path.join(repo.path, f))
+                if os.path.isdir(os.path.join(repo.path, f)) and f != ".lore-workflow"
             ]
             assert len(dirs) == 1, (
                 "Unexpected number of directories after reset: " + str(dirs)
@@ -152,6 +152,7 @@ def test_merge(new_lore_repo):
                 f
                 for f in os.listdir(repo.path)
                 if os.path.isfile(os.path.join(repo.path, f))
+                and f != ".lore-workflow.bootstrap.lock"
             ]
             assert len(files) == 1, "Unexpected number of files after reset: " + str(
                 files
@@ -1107,7 +1108,9 @@ def test_merge_conflicting_directories(new_lore_repo):
 
     directory_path = "directory"
     repo.make_dirs(directory_path)
-    with repo.open_file(os.path.join(directory_path, "merge.txt"), "w+b") as output_file:
+    with repo.open_file(
+        os.path.join(directory_path, "merge.txt"), "w+b"
+    ) as output_file:
         output_file.write(os.urandom(1000))
 
     repo.stage(scan=True)
@@ -1118,7 +1121,9 @@ def test_merge_conflicting_directories(new_lore_repo):
 
     directory_path = "directory"
     repo.make_dirs(directory_path)
-    with repo.open_file(os.path.join(directory_path, "merge.txt"), "w+b") as output_file:
+    with repo.open_file(
+        os.path.join(directory_path, "merge.txt"), "w+b"
+    ) as output_file:
         output_file.write(os.urandom(1000))
 
     repo.stage(scan=True)
@@ -1212,7 +1217,9 @@ def test_merge_conflicting_directories(new_lore_repo):
 
     repo.branch_switch("main")
 
-    with repo.open_file(os.path.join(directory_path, "third.txt"), "w+b") as output_file:
+    with repo.open_file(
+        os.path.join(directory_path, "third.txt"), "w+b"
+    ) as output_file:
         output_file.write(os.urandom(1000))
 
     repo.stage(scan=True)
@@ -1317,7 +1324,9 @@ def test_merge_conflicting_directories(new_lore_repo):
     ) as output_file:
         output_file.write(os.urandom(1200))
 
-    with repo.open_file(os.path.join(directory_path, "fifth.txt"), "w+b") as output_file:
+    with repo.open_file(
+        os.path.join(directory_path, "fifth.txt"), "w+b"
+    ) as output_file:
         output_file.write(os.urandom(1200))
 
     repo.stage(scan=True)

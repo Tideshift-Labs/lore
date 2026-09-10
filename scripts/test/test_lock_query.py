@@ -7,7 +7,7 @@ import pytest
 
 from error_types import (
     LockInvalidPath,
-    UserNotAuthenticated,
+    NotAuthenticatedError,
     LockQueryFailed,
     InvalidBranch,
 )
@@ -71,9 +71,12 @@ def test_lock_query(new_lore_repo):
     with pytest.raises(LockInvalidPath):
         repo.run(["lock", "query", "--branch", "main", "--path", outside_repo_path])
 
-    # Fails because the call to auth::userinfo::user_id returns UserInfoError::Authenticate
-    with pytest.raises(UserNotAuthenticated):
-        repo.lock_query("main", owner="<unknown>")
+    # A signed caller can query an owner with no matching locks.
+    assert repo.lock_query("main", owner="<unknown>") == []
+
+    # Selecting an identity with no stored credential must still fail closed.
+    with pytest.raises(NotAuthenticatedError):
+        repo.lock_query("main", identity="missing-" + Lore.generate_id())
 
     with pytest.raises(LockQueryFailed):
         repo.lock_query(path="non_extant_file.txt")

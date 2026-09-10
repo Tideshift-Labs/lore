@@ -371,9 +371,33 @@ pub(crate) async fn dispatch<T, F: Future<Output = Result<T, ProtocolError>>>(
     authorization: String,
     future: F,
 ) -> Result<T, ProtocolError> {
-    let Some(context) = current_caller_operation() else {
+    if current_caller_operation().is_none() {
         return future.await;
-    };
+    }
+    dispatch_recorded_result(
+        repository,
+        rpc,
+        canonical_request,
+        endpoint,
+        authorization,
+        future,
+    )
+    .await?
+}
+
+/// Keep local admission/journal failures separate from the RPC's semantic result.
+/// A decisive inner result is returned only after its original attempt has been settled;
+/// an unknown inner result retains the original unresolved attempt.
+pub(crate) async fn dispatch_recorded_result<T, F: Future<Output = Result<T, ProtocolError>>>(
+    repository: RepositoryId,
+    rpc: GrpcRpc,
+    canonical_request: Vec<u8>,
+    endpoint: String,
+    authorization: String,
+    future: F,
+) -> Result<Result<T, ProtocolError>, ProtocolError> {
+    let context = current_caller_operation()
+        .ok_or_else(|| ProtocolError::internal("recorded dispatch requires a managed caller"))?;
     if repository != context.repository {
         return Err(ProtocolError::internal(
             "managed operation repository mismatch",
@@ -414,7 +438,7 @@ pub(crate) async fn dispatch<T, F: Future<Output = Result<T, ProtocolError>>>(
         result => result,
     };
     settle(&context, attempt, &result).await?;
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
