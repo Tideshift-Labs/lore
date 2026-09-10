@@ -179,14 +179,19 @@ def new_authless_lore_repo(new_lore_repo, lore_remote_url):
 
 
 @pytest.fixture(scope="session")
-def managed_cli_server(request, tmp_path_factory, lore_server_executable_path):
+def managed_cli_ports():
+    return {name: allocate_free_port() for name in ("quic", "grpc", "http", "internal")}
+
+
+@pytest.fixture(scope="session")
+def managed_cli_server(
+    request, tmp_path_factory, lore_server_executable_path, managed_cli_ports
+):
     from managed_auth import ManagedAuth
 
     directory = tmp_path_factory.mktemp("managed-auth")
     auth = ManagedAuth(directory)
-    ports = {
-        name: allocate_free_port() for name in ("quic", "grpc", "http", "internal")
-    }
+    ports = managed_cli_ports
     try:
         server_root, env = generate_server_config(request, tmp_path_factory, ports)
         auth.configure_server(server_root, env)
@@ -271,6 +276,17 @@ def thin_client_credentials(managed_cli_identity):
     return credentials
 
 
+@pytest.fixture
+def rest_client_credentials(thin_client_credentials, managed_cli_ports):
+    def credentials(repo):
+        # The gRPC helper verifies this repository belongs to the same managed
+        # server and exchanges only the current fixture's resource grants.
+        _, jwt = thin_client_credentials(repo)
+        return f"http://127.0.0.1:{managed_cli_ports['http']}", jwt
+
+    return credentials
+
+
 @pytest.fixture(scope="function")
 def global_dir_name(tmp_path_factory):
     path = str(
@@ -319,9 +335,12 @@ def _wait_for_service_ready(lore_executable_path, service_process, attempts=30):
 
 
 class TrackedServices(object):
-    def __init__(self, lore_executable_path: str, global_dir_name: str):
+    def __init__(
+        self, lore_executable_path: str, global_dir_name: str, environment_vars=None
+    ):
         self.lore_executable_path = lore_executable_path
         self.global_dir_name = global_dir_name
+        self.environment_vars = environment_vars or {}
         self.service_processes: typing.Dict[str | None, subprocess.Popen | None] = {}
 
     def start(self, directory: str | None = None):
@@ -331,7 +350,9 @@ class TrackedServices(object):
         assert self.service_processes.get(directory) is None
 
         env = os.environ.copy()
+        env.update(self.environment_vars)
         env["LORE_GLOBAL_PATH"] = self.global_dir_name
+        env.setdefault("LORE_AUTH_PATH", self.global_dir_name)
 
         command_args = [self.lore_executable_path, "service", "run"]
         logger.info("Executing Lore service command: %s", command_args)
@@ -371,12 +392,23 @@ class TrackedServices(object):
         )
     ],
 )
-def lore_service_runner(lore_executable_path, global_dir_name):
+def lore_service_runner(request, lore_executable_path, global_dir_name):
     """Provides a utility able to start the Lore service process, and cleans up any un-terminated service when the test
     ends.
     Automatically marks any test using this as skipped if services aren't supported and as part of the lore_service
     xdist_group"""
-    tracked_services = TrackedServices(lore_executable_path, global_dir_name)
+    environment_vars = {}
+    if (
+        request.config.getoption("--use-grpc")
+        and not request.config.getoption("--lore-remote-url")
+        and not request.config.getoption("--disable-local-server")
+        and not request.config.getoption("--disable-auto-server")
+    ):
+        auth, _, _ = request.getfixturevalue("managed_cli_identity")
+        environment_vars = auth.environment(global_dir_name)
+    tracked_services = TrackedServices(
+        lore_executable_path, global_dir_name, environment_vars
+    )
 
     yield tracked_services
 

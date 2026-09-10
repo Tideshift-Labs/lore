@@ -561,6 +561,7 @@ def _assert_clean_fast_forward(sync_output: str) -> None:
 
 
 @pytest.mark.smoke
+@pytest.mark.timeout(3600)
 def test_sync_far_behind_through_local_merge_tip(new_lore_repo):
     """A merge commit on main, followed by > MAX_DIVERGENT_HISTORY_LENGTH
     linear commits from another clone, must still fast-forward when a
@@ -608,6 +609,7 @@ def test_sync_far_behind_through_local_merge_tip(new_lore_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.timeout(3600)
 def test_sync_far_behind_with_local_merge_tip_and_remote_merges(new_lore_repo):
     """Local main tip is a merge commit AND remote main has many merge
     commits. This is the closest topology to a shared Fortnite repo

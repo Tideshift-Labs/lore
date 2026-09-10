@@ -4,6 +4,7 @@ import http.client
 import logging
 import os
 import re
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.mark.smoke
-def test_rest(new_lore_repo, request, lore_main_server_ports):
+def test_rest(new_lore_repo, rest_client_credentials):
     repo: Lore = new_lore_repo()
     # Generate a file
     file = "some-file.bin"
@@ -37,8 +38,10 @@ def test_rest(new_lore_repo, request, lore_main_server_ports):
     repository_id = match.group(1) if match else None
     assert repository_id is not None, "Repository Id not found in status output"
 
-    hostname = request.config.getoption("--lore-server-hostname")
-    port = lore_main_server_ports["http"]
+    endpoint, token = rest_client_credentials(repo)
+    parsed = urlsplit(endpoint)
+    assert parsed.scheme == "http"
+    hostname, port = parsed.hostname, parsed.port
 
     logger.info(f"Hostname: {hostname}")
     logger.info(f"Port: {port}")
@@ -51,14 +54,13 @@ def test_rest(new_lore_repo, request, lore_main_server_ports):
     logger.info(f"Content context: {describe_output.context}")
     logger.info(f"Request URL: http://{hostname}:{port}{url}")
 
-    conn.request("GET", url)
-    response = conn.getresponse()
-
-    logger.info(f"Status: {response.status}")
-
-    data = response.read()
-
-    conn.close()
+    try:
+        conn.request("GET", url, headers={"Authorization": f"Bearer {token}"})
+        response = conn.getresponse()
+        assert response.status == 200, f"REST content status: {response.status}"
+        data = response.read()
+    finally:
+        conn.close()
 
     if data != contents:
         pytest.fail(

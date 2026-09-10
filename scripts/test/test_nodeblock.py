@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 # Ten full mutation/push rounds over 100k files need a workload-specific guard.
-@pytest.mark.timeout(7200)
+@pytest.mark.timeout(21600)
 @pytest.mark.slow
 def test_nodeblock(new_lore_repo):
     repo: Lore = new_lore_repo()

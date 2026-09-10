@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 import logging
+import json
+from pathlib import Path
+from uuid import UUID
 import os
 
 import pytest
@@ -10,6 +13,39 @@ from lore import Lore
 from service_util import LORE_SERVICE_ENVIRONMENT
 
 logger = logging.getLogger(__name__)
+
+
+def _assert_managed_push_settled(repo):
+    journal = Path(repo.path) / ".lore-workflow"
+    raw = (journal / "attempts").read_bytes()
+    assert raw[0] == 2
+    root = json.loads(raw[1:])
+    stages = [
+        parent for parent in root["parents"] if parent["operation"] == "push-stage"
+    ]
+    assert stages, "service push must publish its durable stages in the caller worktree"
+    assert all(
+        parent["complete"]
+        and parent["body_completed"]
+        and parent.get("parent_uncertainty_code") is None
+        for parent in stages
+    )
+    stage_ids = {parent["id"] for parent in stages}
+    paths = list(journal.glob("attempts-v2-*/*/*.json"))
+    assert 0 < len(paths) < 1000, "bounded service fixture must have durable children"
+    assert not list(journal.glob("attempts-v2-*/pending/*.json"))
+    pushes = []
+    for path in paths:
+        child = json.loads(path.read_text(encoding="utf-8"))
+        assert child["version"] == 2
+        if child.get("managed", {}).get("parent_id") not in stage_ids:
+            continue
+        assert UUID(child["attempt"]["repository"]).hex == UUID(repo.get_id()).hex
+        assert child["attempt"]["state"]["state"] == "resolved"
+        if child["managed"]["rpc"] == "RevisionService.BranchPush":
+            pushes.append(child)
+            assert child["attempt"]["state"]["resolution"] == "applied"
+    assert pushes, "completed stages must contain an Applied BranchPush receipt"
 
 
 @pytest.mark.smoke
@@ -66,6 +102,7 @@ def test_service_resolves_relative_paths_against_caller(
     source.stage(scan=True, offline=True)
     source.commit("Seed", offline=True)
     source.push()
+    _assert_managed_push_settled(source)
 
     # Clone to a relative path from the caller's directory. It must land there,
     # not under the service's directory.
@@ -92,16 +129,29 @@ def test_service_resolves_relative_paths_against_caller(
         path=str(clone_path),
         name=clone_name,
         global_dir=source.global_dir,
-        environment_vars=LORE_SERVICE_ENVIRONMENT.copy(),
+        environment_vars=source.environment_vars.copy(),
         remote_url=source.remote,
         remote_path=source.remote_path,
         create_repo=False,
     )
     file_name = "added.uasset"
-    (clone_path / file_name).write_bytes(os.urandom(30))
+    added_contents = os.urandom(30)
+    (clone_path / file_name).write_bytes(added_contents)
     clone.stage(file_name, relative_paths=True)
 
     status_output = clone.status()
     assert "A " + file_name in map(
         lambda line: line.strip(" "), status_output.splitlines()
     ), f"Staged file should show as added: {status_output}"
+
+    clone.commit("Relative service push", offline=True)
+    clone.run(
+        ["--repository", clone_name, "push"],
+        cwd=str(caller_directory),
+        use_os_dir=True,
+    )
+    _assert_managed_push_settled(clone)
+    assert not (service_directory / ".lore-workflow").exists()
+    verification = clone.clone()
+    with verification.open_file(file_name, "rb") as contents:
+        assert contents.read() == added_contents

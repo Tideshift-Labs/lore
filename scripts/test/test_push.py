@@ -103,11 +103,16 @@ def test_push(new_lore_repo):
 
 
 def _collect_repo_files(repo: Lore) -> set[str]:
-    """Collect all file paths in a repo, relative to root, excluding .lore directory."""
+    """Collect content files, excluding repository metadata at its owned location."""
     files = set()
     for dirpath, dirnames, filenames in os.walk(repo.path):
         dirnames[:] = [d for d in dirnames if d not in (".urc", ".lore")]
+        at_root = os.path.abspath(dirpath) == os.path.abspath(repo.path)
+        if at_root:
+            dirnames[:] = [d for d in dirnames if d != ".lore-workflow"]
         for filename in filenames:
+            if at_root and filename == ".lore-workflow.bootstrap.lock":
+                continue
             rel = os.path.relpath(os.path.join(dirpath, filename), repo.path)
             files.add(rel.replace("\\", "/"))
     return files
@@ -134,7 +139,9 @@ def test_push_fast_forward_merge(new_lore_repo):
     # Create a feature branch with changes in the deep tree
     repo.branch_create("feature-branch")
     repo.make_dirs(os.path.join("src", "core", "utils", "extra"))
-    with repo.open_file(os.path.join("src", "core", "utils", "extra", "new_util.txt"), "w+") as f:
+    with repo.open_file(
+        os.path.join("src", "core", "utils", "extra", "new_util.txt"), "w+"
+    ) as f:
         f.write("new utility from feature branch\n")
     with repo.open_file(os.path.join("src", "core", "utils", "helpers.txt"), "w+") as f:
         f.write("modified helpers from feature branch\n")
@@ -152,10 +159,14 @@ def test_push_fast_forward_merge(new_lore_repo):
     # Now advance main from another clone to simulate a concurrent push.
     clone_b = repo.clone()
     clone_b.make_dirs(os.path.join("assets", "textures", "hdr"))
-    with clone_b.open_file(os.path.join("assets", "textures", "hdr", "sky.bin"), "w+b") as f:
+    with clone_b.open_file(
+        os.path.join("assets", "textures", "hdr", "sky.bin"), "w+b"
+    ) as f:
         f.write(os.urandom(4096))
     clone_b.make_dirs(os.path.join("docs", "api", "v2"))
-    with clone_b.open_file(os.path.join("docs", "api", "v2", "reference.txt"), "w+") as f:
+    with clone_b.open_file(
+        os.path.join("docs", "api", "v2", "reference.txt"), "w+"
+    ) as f:
         f.write("API reference docs\n")
     clone_b.stage(scan=True, offline=True)
     clone_b.commit("Concurrent push from clone B", offline=True)
@@ -265,7 +276,9 @@ def test_push_fast_forward_merge_conflict(new_lore_repo):
     # creates a conflict between the merge (which changed shared.txt via the
     # feature branch) and the concurrent push (which also changes shared.txt)
     clone_b = repo.clone()
-    with clone_b.open_file(os.path.join("src", "core", "utils", "shared.txt"), "w+") as f:
+    with clone_b.open_file(
+        os.path.join("src", "core", "utils", "shared.txt"), "w+"
+    ) as f:
         f.write("concurrent change to shared file on main\n")
     clone_b.stage(scan=True, offline=True)
     clone_b.commit("Concurrent conflicting push", offline=True)

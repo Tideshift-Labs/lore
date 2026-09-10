@@ -5,8 +5,10 @@ import json
 import logging
 import os
 import uuid
+from pathlib import Path
 
 import pytest
+from managed_auth import ManagedAuth
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -49,8 +51,60 @@ def ensure_fragment_exists_output(wants_exists: bool, json_output: str):
 @pytest.mark.xdist_group("replicated_store")
 class TestReplicatedStore:
     @pytest.fixture(scope="class")
+    def auth(self, tmp_path_factory):
+        auth = ManagedAuth(tmp_path_factory.mktemp("replicated-auth"))
+        try:
+            yield auth
+        finally:
+            auth.close()
+
+    @pytest.fixture
+    def signed_client(self, auth, global_dir_name):
+        token = auth.identity()
+        try:
+            yield token
+        finally:
+            with auth.lock:
+                auth.identities.pop(token, None)
+            for name in (
+                "auth.json",
+                "tokenstore.toml",
+                "tokens.toml",
+                "sec-tokenstore_encryption_key",
+            ):
+                path = Path(global_dir_name) / name
+                if path.is_symlink():
+                    raise RuntimeError("Refusing redirected fixture credential cleanup")
+                path.unlink(missing_ok=True)
+
+    @pytest.fixture(scope="class")
+    def replicated_primary_config(self, request, tmp_path_factory, auth):
+        ports = {
+            name: allocate_free_port() for name in ("quic", "grpc", "http", "internal")
+        }
+        root, env = generate_server_config(request, tmp_path_factory, ports)
+        auth.configure_server(root, env)
+        return root, env
+
+    @pytest.fixture(scope="class")
+    def replicated_primary(
+        self, replicated_primary_config, lore_server_executable_path
+    ):
+        root, env = replicated_primary_config
+        process, log, log_fd = launch_lore_server(
+            root, env, lore_server_executable_path
+        )
+        try:
+            yield process
+        finally:
+            try:
+                _kill_server_by_pid(process.pid, log, label="replicated store primary")
+            finally:
+                log_fd.close()
+
+    @pytest.fixture(scope="class")
     def lore_local_server_2_config(
-        self, request, tmp_path_factory, lore_main_server_ports
+        self, request, tmp_path_factory, replicated_primary_config, auth
     ):
         # QUIC and GRPC share one port by convention (UDP vs TCP; no collision)
         shared_port = allocate_free_port()
@@ -63,7 +117,9 @@ class TestReplicatedStore:
         (new_server_root, server_2_env) = generate_server_config(
             request, tmp_path_factory, server_2_ports
         )
-        main_server_internal_port = lore_main_server_ports["internal"]
+        auth.configure_server(new_server_root, server_2_env)
+        _, primary_env = replicated_primary_config
+        main_server_internal_port = primary_env["LORE__SERVER__QUIC_INTERNAL__PORT"]
 
         # we want to test the replicated store in isolation,
         # but the gRPC internal server (not to be confused with the QUIC internal service)
@@ -95,7 +151,10 @@ class TestReplicatedStore:
 
     @pytest.fixture(scope="class")
     def lore_server_with_replicated_store(
-        self, lore_local_server_2_config, lore_server_executable_path
+        self,
+        lore_local_server_2_config,
+        lore_server_executable_path,
+        replicated_primary,
     ):
         """
         Runs a loreserver that delegates store operations to the main lore server
@@ -105,26 +164,31 @@ class TestReplicatedStore:
             server_root, server_env, lore_server_executable_path
         )
 
-        yield server_proc, server_log_path, server_log_fd
-
-        # Server teardown
-        _kill_server_by_pid(
-            server_proc.pid, server_log_path, label="replicated store server 2"
-        )
-        server_log_fd.close()
+        try:
+            yield server_proc, server_log_path, server_log_fd
+        finally:
+            try:
+                _kill_server_by_pid(
+                    server_proc.pid, server_log_path, label="replicated store server 2"
+                )
+            finally:
+                server_log_fd.close()
 
     @pytest.fixture()
     def same_repo_id_different_remotes(
         self,
         request,
-        lore_local_server_config,
+        replicated_primary_config,
         lore_local_server_2_config,
-        auto_lore_local_server,
         lore_server_with_replicated_store,
         new_lore_repo,
+        auth,
+        signed_client,
+        global_dir_name,
+        lore_executable_path,
     ):
         server_host_name = request.config.getoption("--lore-server-hostname")
-        (server_1_root, server_1_env) = lore_local_server_config
+        (server_1_root, server_1_env) = replicated_primary_config
         (server_2_root, server_2_env) = lore_local_server_2_config
 
         common_repo_id = uuid.uuid4().hex
@@ -132,23 +196,31 @@ class TestReplicatedStore:
 
         # specify a repository URL so the specific Lore Server is used to create it
         remote_url_server_1 = (
-            f"lore://{server_host_name}:{server_1_env['LORE__SERVER__GRPC__PORT']}"
+            f"grpc://{server_host_name}:{server_1_env['LORE__SERVER__GRPC__PORT']}"
         )
         remote_url_server_1_path = f"{remote_url_server_1}/{common_repo_name}"
         remote_url_server_2 = (
-            f"lore://{server_host_name}:{server_2_env['LORE__SERVER__GRPC__PORT']}"
+            f"grpc://{server_host_name}:{server_2_env['LORE__SERVER__GRPC__PORT']}"
         )
         remote_url_server_2_path = f"{remote_url_server_2}/{common_repo_name}"
+        auth.grant(signed_client, common_repo_id)
+        for remote in (remote_url_server_1, remote_url_server_2):
+            auth.login(lore_executable_path, global_dir_name, remote, signed_client)
+        environment = auth.environment(global_dir_name)
         server_1_repo = new_lore_repo(
             remote_url=remote_url_server_1,
             remote_path=remote_url_server_1_path,
             repo_id=common_repo_id,
+            environment_vars=environment.copy(),
         )
         server_2_repo = new_lore_repo(
             remote_url=remote_url_server_2,
             remote_path=remote_url_server_2_path,
             repo_id=common_repo_id,
+            environment_vars=environment.copy(),
         )
+        assert server_1_repo.environment_vars["LORE_REMOTE_URL"] == remote_url_server_1
+        assert server_2_repo.environment_vars["LORE_REMOTE_URL"] == remote_url_server_2
 
         return server_1_repo, server_2_repo, common_repo_name
 
