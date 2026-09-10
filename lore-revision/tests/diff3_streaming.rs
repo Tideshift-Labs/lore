@@ -1284,4 +1284,111 @@ mod tests {
             .await
             .expect("Test task failed");
     }
+    #[tokio::test]
+    async fn moved_directory_diff_retains_independent_descendant_changes() {
+        let execution = offline_execution().await;
+        lore_base::lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+            let fixture = DiffFixture::new().await;
+            for name in [
+                "nested_before/file.txt",
+                "nested_after/file.txt",
+                "nested_before.txt",
+                "nested_after.txt",
+                "modified.txt",
+                "kept.txt",
+                "deleted.txt",
+            ] {
+                fixture.write_file(&format!("a/b/{name}"), name.as_bytes());
+            }
+            fixture.stage_and_commit("initial tree").await;
+            for (from, to) in [
+                ("a/b/nested_before", "a/b/nested_before_moved"),
+                ("a/b/nested_before.txt", "a/b/nested_before_moved.txt"),
+                ("a/b", "a/c"),
+                ("a/c/nested_after", "a/c/nested_after_moved"),
+                ("a/c/nested_after.txt", "a/c/nested_after_moved.txt"),
+            ] {
+                fixture.stage_move(from, to).await;
+            }
+            std::fs::remove_file(fixture.repo_path.join("a/c/deleted.txt")).unwrap();
+            fixture.write_file("a/c/modified.txt", b"modified after move");
+            fixture.write_file("a/c/added.txt", b"added after move");
+            fixture.stage_all().await;
+            let (current, staged, _) = lore_revision::state::State::deserialize_current_and_staged(
+                fixture.repository.clone(),
+            )
+            .await
+            .unwrap();
+            let changes = lore_revision::state::diff_collect(
+                fixture.repository.clone(),
+                current,
+                fixture.repository.clone(),
+                staged.unwrap(),
+                None,
+                lore_revision::filter::FilterMode::Full,
+            )
+            .await
+            .unwrap();
+            let rows: Vec<_> = changes
+                .iter()
+                .map(|change| {
+                    (
+                        change.action,
+                        change.path.as_str().trim_end_matches('/').to_owned(),
+                        change
+                            .from_path
+                            .as_ref()
+                            .map(|path| path.as_str().trim_end_matches('/').to_owned()),
+                    )
+                })
+                .collect();
+            for (from, to) in [
+                ("a/b", "a/c"),
+                ("a/b/nested_before", "a/c/nested_before_moved"),
+                ("a/b/nested_before.txt", "a/c/nested_before_moved.txt"),
+                ("a/b/nested_after", "a/c/nested_after_moved"),
+                ("a/b/nested_after.txt", "a/c/nested_after_moved.txt"),
+            ] {
+                assert_eq!(
+                    rows.iter()
+                        .filter(
+                            |row| **row == (FileAction::Move, to.to_owned(), Some(from.to_owned()))
+                        )
+                        .count(),
+                    1,
+                    "missing or duplicate independent move: {rows:?}"
+                );
+            }
+            assert!(
+                rows.iter()
+                    .any(|row| row.0 == FileAction::Add && row.1 == "a/c/added.txt"),
+                "missing addition: {rows:?}"
+            );
+            assert!(
+                rows.iter()
+                    .any(|row| row.0 == FileAction::Delete && row.1 == "a/c/deleted.txt"),
+                "missing destination deletion: {rows:?}"
+            );
+            for inherited in [
+                "a/c/kept.txt",
+                "a/c/nested_before_moved/file.txt",
+                "a/c/nested_after_moved/file.txt",
+            ] {
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| row.0 == FileAction::Move && row.1 == inherited),
+                    "inherited movement must not become an independent rename: {rows:?}"
+                );
+            }
+            // Status checks the filesystem for this staged same-name child. It
+            // must reach that check instead of vanishing below the parent move.
+            assert!(
+                rows.iter().any(|row| row.1 == "a/c/modified.txt"),
+                "modified child never reaches status: {rows:?}"
+            );
+        }))
+        .await
+        .unwrap();
+    }
 }

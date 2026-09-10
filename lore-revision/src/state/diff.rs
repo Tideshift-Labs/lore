@@ -129,6 +129,7 @@ pub async fn diff_subtree(
         DiffPaths {
             from: path.clone(),
             to: path,
+            relocated_staged_directory: false,
         },
         flags,
         graft,
@@ -157,6 +158,17 @@ fn recurse_diff_subtree_node(
 struct DiffPaths {
     from: RelativePath,
     to: RelativePath,
+    relocated_staged_directory: bool,
+}
+
+impl DiffPaths {
+    fn deletion_path(&self, original: &RelativePath) -> RelativePath {
+        if self.relocated_staged_directory {
+            self.to.push_into_buf(original.name()).freeze()
+        } else {
+            original.clone()
+        }
+    }
 }
 
 async fn diff_subtree_node(
@@ -231,6 +243,8 @@ async fn diff_subtree_node_walk(
             && to_nodes.children[to_index].name < from_named_node.name
         {
             add_change_for_solo_to_node(
+                subtasks,
+                flags,
                 DiffContext {
                     sink,
                     from_nodes,
@@ -286,6 +300,8 @@ async fn diff_subtree_node_walk(
 
     for to_index in to_index..to_nodes.children.len() {
         add_change_for_solo_to_node(
+            subtasks,
+            flags,
             DiffContext {
                 sink,
                 from_nodes,
@@ -329,7 +345,7 @@ async fn add_change_for_solo_from_node(
         from_nodes,
         to_nodes,
         filter_mode,
-        ..
+        paths,
     } = context;
     let NodeSearchResult {
         node: from_node,
@@ -370,7 +386,7 @@ async fn add_change_for_solo_from_node(
             from,
             to.invalid(),
             change::FileAction::Delete,
-            from_path,
+            &paths.deletion_path(from_path),
             None,
             sink,
             filter_mode,
@@ -381,6 +397,8 @@ async fn add_change_for_solo_from_node(
 }
 
 async fn add_change_for_solo_to_node(
+    subtasks: &mut JoinSet<Result<OwnedChangeSink, StateError>>,
+    flags: u32,
     context: DiffContext<'_, '_>,
     from: &NodeChangeState,
     to_index: usize,
@@ -435,9 +453,36 @@ async fn add_change_for_solo_to_node(
         address: to_node.address,
     };
 
+    // A moved directory still contains independently changed children. The
+    // generic Move emitter does not recurse, so compare the original subtree
+    // against its new location after emitting the directory move.
+    let moved_from = if file_action == change::FileAction::Move
+        && to_node.is_directory()
+        && !to_node.is_link()
+    {
+        from_nodes
+            .state
+            .try_node(from_nodes.repository.clone(), to_named_node.node)
+            .await
+            .filter(|node| {
+                node.is_directory()
+                    && !node.is_link()
+                    && node.address.context == to_node.address.context
+            })
+            .map(|node| NodeChangeState {
+                repository: from_nodes.repository.clone(),
+                state: from_nodes.state.clone(),
+                node: to_named_node.node,
+                flags: NodeFlags::from_bits_retain(node.flags),
+                address: node.address,
+            })
+    } else {
+        None
+    };
+
     add_change(
         from.invalid(),
-        to,
+        to.clone(),
         file_action,
         &subpath,
         from_path.as_ref(),
@@ -445,6 +490,25 @@ async fn add_change_for_solo_to_node(
         filter_mode,
     )
     .await?;
+    if let (Some(from), Some(from_path)) = (moved_from, from_path) {
+        let task_sink = sink.task_sink();
+        lore_spawn!(subtasks, async move {
+            recurse_diff_subtree_node(
+                from,
+                to,
+                DiffPaths {
+                    from: from_path,
+                    to: subpath,
+                    relocated_staged_directory: true,
+                },
+                flags,
+                None,
+                task_sink,
+                filter_mode,
+            )
+            .await
+        });
+    }
     Ok(())
 }
 
@@ -515,7 +579,7 @@ async fn add_change_for_paired_nodes(
             from,
             to,
             change::FileAction::Delete,
-            from_path,
+            &paths.deletion_path(from_path),
             None,
             sink,
             filter_mode,
@@ -641,6 +705,7 @@ async fn add_change_for_paired_nodes(
                                 DiffPaths {
                                     from: from_path,
                                     to: subpath,
+                                    relocated_staged_directory: false,
                                 },
                                 flags,
                                 // A linked repository merges through its own
@@ -682,6 +747,7 @@ async fn add_change_for_paired_nodes(
                             "Diff node {subpath} directory hash change from {from_address} to {to_address}, recurse diff"
                         );
                         let from_path = from_path.clone();
+                        let relocated_staged_directory = paths.relocated_staged_directory;
                         let task_sink = sink.task_sink();
                         lore_spawn!(subtasks, async move {
                             recurse_diff_subtree_node(
@@ -690,6 +756,7 @@ async fn add_change_for_paired_nodes(
                                 DiffPaths {
                                     from: from_path,
                                     to: subpath,
+                                    relocated_staged_directory,
                                 },
                                 flags,
                                 graft,
@@ -711,7 +778,7 @@ async fn add_change_for_paired_nodes(
                 from.clone(),
                 to.clone(),
                 change::FileAction::Delete,
-                from_path,
+                &paths.deletion_path(from_path),
                 None,
                 sink,
                 filter_mode,
