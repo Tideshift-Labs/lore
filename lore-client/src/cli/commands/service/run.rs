@@ -186,38 +186,11 @@ impl IpcConnection {
             return Ok(());
         };
 
-        //TODO(UCS-16094): Determine if this should be unbounded or bounded
-        // Create a channel so the callback task can send messages to this network thread, so they
-        // can be forwarded to the client.
-        let (to_client_sender, mut to_client_receiver) =
-            mpsc::unbounded_channel::<(MessageToClient, SerializationType)>();
-
-        lore_spawn!(async move {
-            let sender = to_client_sender.clone();
-
-            // Note: this callback is intentionally NOT wrapped with .with_defaults().
-            // It is the server-side event forwarder that must pass every LoreEvent
-            // (including Error and Log) to the remote client so the client's own
-            // wrapped callback can handle them. Wrapping here would swallow those
-            // events on the server side and they would never reach the remote.
-            let cli_result = command
-                .invoke(Some(Box::new(move |event: &LoreEvent| {
-                    if let Err(error) = to_client_sender.send((
-                        MessageToClient::Event(event.clone()),
-                        header.serialization_type,
-                    )) {
-                        eprintln!("Failed to send Event message to connection task: {error}");
-                    }
-                })))
-                .await;
-
-            if let Err(error) = sender.send((
-                MessageToClient::ApiResult(cli_result),
-                header.serialization_type,
-            )) {
-                eprintln!("Failed to send ApiResult message to connection task: {error}");
-            }
-        });
+        let (mut to_client_receiver, command_task) =
+            spawn_command(header.serialization_type, move |callback| {
+                command.invoke(callback)
+            });
+        drop(command_task);
 
         while let Some((message, serialization_type)) = to_client_receiver.recv().await {
             let stream = self.connection.try_clone().internal("cloning connection")?;
@@ -232,3 +205,54 @@ impl IpcConnection {
         Ok(())
     }
 }
+
+/// Spawn command execution independently of the connection's event receiver.
+/// Dropping the returned task handle detaches it; dropping the receiver never
+/// cancels a command that owns a repository fence or durable journal.
+fn spawn_command<Invoke, Fut>(
+    serialization_type: SerializationType,
+    invoke: Invoke,
+) -> (
+    mpsc::UnboundedReceiver<(MessageToClient, SerializationType)>,
+    tokio::task::JoinHandle<()>,
+)
+where
+    Invoke: FnOnce(lore::interface::LoreEventCallback) -> Fut + Send + 'static,
+    Fut: Future<Output = i32> + Send + 'static,
+{
+    //TODO(UCS-16094): Determine if this should be unbounded or bounded
+    // Create a channel so the callback task can send messages to this network thread, so they
+    // can be forwarded to the client.
+    let (to_client_sender, to_client_receiver) =
+        mpsc::unbounded_channel::<(MessageToClient, SerializationType)>();
+
+    let command_task = lore_spawn!(async move {
+        let sender = to_client_sender.clone();
+
+        // Note: this callback is intentionally NOT wrapped with .with_defaults().
+        // It is the server-side event forwarder that must pass every LoreEvent
+        // (including Error and Log) to the remote client so the client's own
+        // wrapped callback can handle them. Wrapping here would swallow those
+        // events on the server side and they would never reach the remote.
+        let cli_result = invoke(Some(Box::new(move |event: &LoreEvent| {
+            if let Err(error) =
+                to_client_sender.send((MessageToClient::Event(event.clone()), serialization_type))
+            {
+                eprintln!("Failed to send Event message to connection task: {error}");
+            }
+        })))
+        .await;
+
+        if let Err(error) =
+            sender.send((MessageToClient::ApiResult(cli_result), serialization_type))
+        {
+            eprintln!("Failed to send ApiResult message to connection task: {error}");
+        }
+    });
+
+    (to_client_receiver, command_task)
+}
+
+#[cfg(test)]
+#[path = "run_tests.rs"]
+mod disconnect_tests;

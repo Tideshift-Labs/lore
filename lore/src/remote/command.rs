@@ -163,4 +163,6 @@ pub enum LoreCommand {
     RevisionTreeCommit(crate::revision_tree::commit::LoreRevisionTreeCommitArgs),
     StorageGetResolved(crate::storage::get_resolved::LoreStorageGetResolvedArgs),
     StoragePutResolved(crate::storage::put_resolved::LoreStoragePutResolvedArgs),
+    // Append wire variants to preserve existing bitcode discriminants.
+    ManagedBranchPush(crate::branch::LoreManagedBranchPushArgs),
 }

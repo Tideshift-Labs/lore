@@ -918,13 +918,32 @@ pub async fn push_with_attempt_store(
 }
 
 /// Managed push adoption for CLI and embedders: one fence, sequential repository stages.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[handler(push_managed_service_local)]
+pub struct LoreManagedBranchPushArgs {
+    pub args: LoreBranchPushArgs,
+}
+
+async fn push_managed_service_local(
+    globals: LoreGlobalArgs,
+    args: LoreManagedBranchPushArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    push_managed_local(globals, args.args, callback, None).await
+}
+
+/// Managed push adoption for CLI and embedders: one fence, sequential repository stages.
 pub async fn push_managed(
     globals: LoreGlobalArgs,
     args: LoreBranchPushArgs,
     callback: LoreEventCallback,
     observer: Option<Arc<dyn lore_revision::managed_push::ManagedPushObserver>>,
 ) -> i32 {
-    if service_delegation_requested() || lore_transport::has_managed_caller() {
+    if lore_transport::has_managed_caller()
+        || lore_transport::current_caller_operation().is_some()
+        || (service_delegation_requested() && observer.is_some())
+    {
         return reject_undelegatable(
             globals,
             callback,
@@ -933,14 +952,50 @@ pub async fn push_managed(
         )
         .await;
     }
-    let guard = match lore_revision::repository_fence::RepositoryMutationGuard::acquire(
-        std::path::Path::new(globals.repository_path.as_str()),
-    )
-    .await
+    if service_delegation_requested() {
+        // Only arguments cross IPC. The daemon opens and owns the complete
+        // workflow; no caller-side observer, journal or fence is discarded.
+        return crate::remote::call::service_call(
+            globals,
+            LoreManagedBranchPushArgs { args },
+            callback,
+        )
+        .await;
+    }
+    push_managed_local(globals, args, callback, observer).await
+}
+
+async fn push_managed_local(
+    mut globals: LoreGlobalArgs,
+    args: LoreBranchPushArgs,
+    callback: LoreEventCallback,
+    observer: Option<Arc<dyn lore_revision::managed_push::ManagedPushObserver>>,
+) -> i32 {
+    if lore_transport::has_managed_caller() || lore_transport::current_caller_operation().is_some()
     {
-        Ok(guard) => Arc::new(guard),
+        return reject_undelegatable(
+            globals,
+            callback,
+            "Managed push requires a fresh in-process workflow, without an existing caller context"
+                .to_owned(),
+        )
+        .await;
+    }
+    let repository_path = match lore_revision::util::path::make_absolute_from(
+        globals.repository_path.as_str(),
+        globals.working_directory().map(std::path::Path::new),
+    ) {
+        Ok(path) => path,
         Err(error) => return reject_undelegatable(globals, callback, error.to_string()).await,
     };
+    globals.repository_path = repository_path.display().to_string().into();
+    let guard =
+        match lore_revision::repository_fence::RepositoryMutationGuard::acquire(&repository_path)
+            .await
+        {
+            Ok(guard) => Arc::new(guard),
+            Err(error) => return reject_undelegatable(globals, callback, error.to_string()).await,
+        };
     let runner = Arc::new(lore_revision::managed_push::ManagedPushRunner::new(
         guard.clone(),
         observer,
@@ -1931,3 +1986,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "branch_managed_service_tests.rs"]
+mod managed_service_tests;
