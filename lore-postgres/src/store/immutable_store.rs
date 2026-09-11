@@ -1094,7 +1094,9 @@ impl PostgresImmutableStore {
         repository: Context,
         address: Address,
     ) -> Result<Fragment, StoreError> {
-        let resolution = Self::resolve_one(coordinator, repository, address).await?;
+        let resolution = Self::resolve_one(coordinator, repository, address)
+            .await
+            .map_err(|error| metadata_store_err("resolve_before", error))?;
         let captured_verdict = resolution.verdict.clone();
         let FragmentVerdict::Readable {
             witness, manifest, ..
@@ -1133,10 +1135,16 @@ impl PostgresImmutableStore {
             )
             .await
             .map_err(provider_store_err)?;
-        let execution = admitted
-            .execute(&mut ledger)
-            .await
-            .map_err(provider_store_err)?;
+        let execution = admitted.execute(&mut ledger).await.map_err(|error| {
+            if let Some(reason) = error.transient_diagnostic() {
+                tracing::warn!(
+                    stage = "head_execute",
+                    reason,
+                    "Fragment metadata store admission refused"
+                );
+            }
+            provider_store_err(error)
+        })?;
         let fragment = match (execution.outcome, execution.response) {
             (
                 ProviderAttemptOutcome::Decisive,
@@ -1152,16 +1160,24 @@ impl PostgresImmutableStore {
             ) {
                 Ok(fragment) => fragment,
                 Err(diagnostic) => {
-                    Self::mark_coordinated_missing(coordinator, &witness, diagnostic).await?;
+                    Self::mark_coordinated_missing(coordinator, &witness, diagnostic)
+                        .await
+                        .map_err(|error| metadata_store_err("head_mark_missing", error))?;
                     return Err(Self::not_found(address.hash));
                 }
             },
             (ProviderAttemptOutcome::Decisive, FragmentTransportResponse::NotFound) => {
                 Self::mark_coordinated_missing(coordinator, &witness, MissingDiagnostic::Absent)
-                    .await?;
+                    .await
+                    .map_err(|error| metadata_store_err("head_mark_missing", error))?;
                 return Err(Self::not_found(address.hash));
             }
-            (ProviderAttemptOutcome::Ambiguous, _) => return Err(StoreError::from(SlowDown)),
+            (ProviderAttemptOutcome::Ambiguous, _) => {
+                return Err(metadata_store_err(
+                    "head_ambiguous",
+                    StoreError::from(SlowDown),
+                ));
+            }
             (ProviderAttemptOutcome::Decisive, FragmentTransportResponse::DefiniteFailure) => {
                 return Err(StoreError::internal(
                     "fragment provider HEAD returned a definite failure",
@@ -1174,9 +1190,14 @@ impl PostgresImmutableStore {
             }
         };
 
-        let revalidated = Self::resolve_one(coordinator, repository, address).await?;
+        let revalidated = Self::resolve_one(coordinator, repository, address)
+            .await
+            .map_err(|error| metadata_store_err("resolve_after", error))?;
         if revalidated.verdict != captured_verdict {
-            return Err(StoreError::from(SlowDown));
+            return Err(metadata_store_err(
+                "verdict_changed",
+                StoreError::from(SlowDown),
+            ));
         }
         Ok(fragment)
     }
@@ -2029,6 +2050,14 @@ impl PostgresImmutableStore {
         tx.commit().await.map_err(db_err)?;
         Ok(count)
     }
+}
+
+/// Preserve the error while recording only a fixed metadata-stage discriminator.
+fn metadata_store_err(stage: &'static str, error: StoreError) -> StoreError {
+    if matches!(&error, StoreError::SlowDown(_)) {
+        tracing::warn!(stage, "Fragment metadata store admission refused");
+    }
+    error
 }
 
 /// Map a query/execute error; transient failures become `SlowDown` so clients

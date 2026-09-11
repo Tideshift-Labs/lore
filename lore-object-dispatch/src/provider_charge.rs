@@ -87,10 +87,15 @@ impl PostgresProviderChargeAuthority {
         &self,
         request: &ProviderChargeRequest,
     ) -> Result<ChargeAttempt, ChargeExecutionError> {
-        let mut lease =
-            self.pool.acquire().await.map_err(|_| {
-                ChargeExecutionError::Public(ProviderChargeError::AuthorityUnavailable)
-            })?;
+        let mut lease = self.pool.acquire().await.map_err(|error| {
+            // DispatchPoolError carries only closed, redaction-safe diagnostics.
+            tracing::warn!(
+                stage = "charge_pool_acquire",
+                reason = ?error,
+                "Provider charge admission refused"
+            );
+            ChargeExecutionError::Public(ProviderChargeError::AuthorityUnavailable)
+        })?;
         let deadline = tokio::time::Instant::now() + self.pool.operation_timeout();
         // Until acquisition is acknowledged the session may already own the lock. An error,
         // timeout, or cancellation must close it, never return it to the pool or guess ownership.
@@ -119,6 +124,11 @@ impl PostgresProviderChargeAuthority {
         })
         .await;
         if !matches!(acquired, Ok(Ok(()))) {
+            tracing::warn!(
+                stage = "charge_lock_setup",
+                timed_out = acquired.is_err(),
+                "Provider charge admission refused"
+            );
             lease.poison();
             return Err(ChargeExecutionError::SessionUnusable(
                 SessionUnusableChargeError::Public(ProviderChargeError::AuthorityUnavailable),
@@ -136,9 +146,15 @@ impl PostgresProviderChargeAuthority {
         .await
         {
             Ok(outcome) => outcome,
-            Err(_) => Err(classify_charge_timeout(
-                commit_started.load(Ordering::SeqCst),
-            )),
+            Err(_) => {
+                let started = commit_started.load(Ordering::SeqCst);
+                tracing::warn!(
+                    stage = "charge_transaction_timeout",
+                    commit_started = started,
+                    "Provider charge admission refused"
+                );
+                Err(classify_charge_timeout(started))
+            }
         };
         if matches!(outcome, Err(ChargeExecutionError::SessionUnusable(_))) {
             lease.poison();
@@ -274,13 +290,25 @@ impl ProviderChargeAuthority for PostgresProviderChargeAuthority {
                 Ok(ChargeAttempt::Refused(error)) => return Err(error),
                 Err(ChargeExecutionError::Retryable) => match retry_delay {
                     Some(delay) => tokio::time::sleep(delay).await,
-                    None => return Err(ProviderChargeError::AuthorityUnavailable),
+                    None => {
+                        tracing::warn!(
+                            stage = "contention_exhausted",
+                            "Provider charge admission refused"
+                        );
+                        return Err(ProviderChargeError::AuthorityUnavailable);
+                    }
                 },
                 Err(ChargeExecutionError::SessionUnusable(
                     SessionUnusableChargeError::Retryable,
                 )) => match retry_delay {
                     Some(delay) => tokio::time::sleep(delay).await,
-                    None => return Err(ProviderChargeError::AuthorityUnavailable),
+                    None => {
+                        tracing::warn!(
+                            stage = "contention_exhausted",
+                            "Provider charge admission refused"
+                        );
+                        return Err(ProviderChargeError::AuthorityUnavailable);
+                    }
                 },
                 Err(ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(
                     error,
@@ -437,12 +465,33 @@ fn classify_precommit_error(error: tokio_postgres::Error) -> ChargeExecutionErro
         }
         // A SQLSTATE is a server refusal on a functioning protocol session. An unknown one still
         // fails closed, but the session itself may be reused after the transaction rolls back.
-        Some(_) => ChargeExecutionError::Public(ProviderChargeError::AuthorityUnavailable),
+        Some(code) => {
+            let reason = if code == &SqlState::QUERY_CANCELED {
+                "query_canceled"
+            } else if code == &SqlState::LOCK_NOT_AVAILABLE {
+                "lock_not_available"
+            } else {
+                "database_refused"
+            };
+            tracing::warn!(
+                stage = "charge_precommit",
+                reason,
+                "Provider charge admission refused"
+            );
+            ChargeExecutionError::Public(ProviderChargeError::AuthorityUnavailable)
+        }
         // With no SQLSTATE, the failure is at the connection/protocol layer. Returning that session
         // to the idle pool would let the next charge inherit state this call could not prove sound.
-        None => ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(
-            ProviderChargeError::AuthorityUnavailable,
-        )),
+        None => {
+            tracing::warn!(
+                stage = "charge_precommit",
+                reason = "connection_or_protocol",
+                "Provider charge admission refused"
+            );
+            ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(
+                ProviderChargeError::AuthorityUnavailable,
+            ))
+        }
     }
 }
 

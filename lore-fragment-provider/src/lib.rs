@@ -451,6 +451,27 @@ pub enum FragmentProviderDisposition {
 }
 
 impl FragmentProviderError {
+    /// A closed diagnostic for retryable refusals. Never contains request data.
+    pub fn transient_diagnostic(&self) -> Option<&'static str> {
+        match self {
+            Self::PutAdmissionTimedOut => Some("put_admission_timeout"),
+            Self::PutAdmissionClosed => Some("put_admission_closed"),
+            Self::Provider(ProviderClientError::ChargeRefused(refusal)) => match refusal {
+                ProviderChargeError::BudgetExhausted => Some("charge_budget_exhausted"),
+                ProviderChargeError::ClassCapExhausted => Some("charge_class_cap_exhausted"),
+                ProviderChargeError::AuthorityUnavailable => Some("charge_authority_unavailable"),
+                ProviderChargeError::Unwired => Some("charge_unwired"),
+                ProviderChargeError::DeadlineExceeded => Some("charge_deadline_exceeded"),
+                ProviderChargeError::BudgetPinRejected
+                | ProviderChargeError::ConfigurationUnresolved
+                | ProviderChargeError::AttemptAlreadyCharged
+                | ProviderChargeError::AmbiguousCommit
+                | ProviderChargeError::RecoveredCommittedCharge => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Classifies this failure for a consumer that cannot see the dispatch
     /// error vocabulary.
     ///
