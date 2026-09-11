@@ -102,6 +102,7 @@ use crate::domain::fragments::FragmentVerdict;
 use crate::domain::fragments::FragmentWriteCapabilityReadiness;
 use crate::domain::fragments::FragmentWriteClaimInput;
 use crate::domain::fragments::FragmentWriteSettlement;
+use crate::domain::fragments::InFlightChargeBound;
 use crate::domain::fragments::InFlightPutBound;
 use crate::domain::fragments::IoObservation;
 use crate::domain::fragments::MissingDiagnostic;
@@ -176,6 +177,7 @@ pub struct ObjectStoreSettings {
 pub struct FragmentProviderRuntimeSettings {
     capabilities: ProviderCapabilities,
     in_flight_puts: InFlightPutBound,
+    in_flight_charges: InFlightChargeBound,
     late_effect_bound: Duration,
     provider_write_authority_revision: Option<String>,
 }
@@ -184,12 +186,14 @@ impl FragmentProviderRuntimeSettings {
     pub fn new(
         capabilities: ProviderCapabilities,
         in_flight_puts: InFlightPutBound,
+        in_flight_charges: InFlightChargeBound,
         late_effect_bound: Duration,
         provider_write_authority_revision: Option<String>,
     ) -> Self {
         Self {
             capabilities,
             in_flight_puts,
+            in_flight_charges,
             late_effect_bound,
             provider_write_authority_revision,
         }
@@ -512,6 +516,7 @@ impl PostgresImmutableStore {
             boundary,
             runtime.capabilities,
             runtime.in_flight_puts,
+            runtime.in_flight_charges,
             transport,
         )
         .await?;

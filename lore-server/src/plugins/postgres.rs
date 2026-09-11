@@ -38,6 +38,7 @@ use lore_postgres::domain::fragments::FragmentDispatchRuntimeConfig;
 use lore_postgres::domain::fragments::FragmentDispatchTls;
 use lore_postgres::domain::fragments::FragmentProcessPoolInventory;
 use lore_postgres::domain::fragments::FragmentWriteCapabilityCutover;
+use lore_postgres::domain::fragments::InFlightChargeBound;
 use lore_postgres::domain::fragments::InFlightPutBound;
 use lore_postgres::domain::fragments::PostgresFragmentCoordinator;
 use lore_postgres::domain::fragments::ProviderCapabilities;
@@ -140,6 +141,20 @@ pub struct PostgresStoreConfig {
     /// closed. Milliseconds; must be positive.
     #[serde(default = "default_fragment_put_admission_wait_millis")]
     pub fragment_put_admission_wait_millis: u64,
+    /// Concurrent charge-carrying non-body attempts (HEAD, version list,
+    /// delete). Separate from `fragment_in_flight_puts` because those attempts
+    /// carry no object body, so CR-031's put bound never governed them.
+    #[serde(default = "default_fragment_in_flight_charges")]
+    pub fragment_in_flight_charges: u32,
+    /// How long such an attempt waits for a slot before failing closed.
+    /// Milliseconds; must be positive.
+    ///
+    /// This wants to be generous, not tight. One charge is issued per fragment
+    /// and charges serialize per provider boundary, so the last attempt in a
+    /// large push queues behind every earlier one. A wait shorter than that queue
+    /// turns a pool refusal into an admission refusal and fixes nothing.
+    #[serde(default = "default_fragment_charge_admission_wait_millis")]
+    pub fragment_charge_admission_wait_millis: u64,
 }
 
 /// S3-compatible object-storage sub-config for immutable fragment objects.
@@ -351,6 +366,24 @@ fn default_fragment_put_admission_wait_millis() -> u64 {
     5_000
 }
 
+fn default_fragment_in_flight_charges() -> u32 {
+    lore_postgres::domain::fragments::DEFAULT_IN_FLIGHT_CHARGES
+}
+
+/// Thirty seconds: long enough to queue behind a realistic burst, short enough
+/// to stay well inside the attempt-deadline horizon and to not park a read.
+///
+/// It was briefly 300_000, which was wrong twice over. The horizon is anchored to
+/// the attempt id's own timestamp, minted BEFORE the queue, and the governed
+/// client refuses a deadline beyond `attempt_ts + 300_000` — so a wait at the
+/// horizon makes the shifted deadline invalid and turns a queue into a hard
+/// `Internal` failure. And a HEAD on the read path has no outer timeout, so a
+/// five-minute park outlives the client that asked for it and serves nobody.
+/// `validate_fragment_charge_bound` now refuses any wait that cannot fit.
+fn default_fragment_charge_admission_wait_millis() -> u64 {
+    30_000
+}
+
 fn config_error(name: &str, message: impl Into<String>) -> PluginError {
     PluginError::from(PluginConfigError {
         plugin_name: name.to_string(),
@@ -541,6 +574,58 @@ fn validate_fragment_put_bound(
     })
 }
 
+/// Validates the charge-admission configuration through the seam's own type, for
+/// the same reason [`validate_fragment_put_bound`] does: the startup check and the
+/// runtime bound cannot then drift apart.
+fn validate_fragment_charge_bound(
+    name: &str,
+    cfg: &PostgresStoreConfig,
+) -> Result<InFlightChargeBound, PluginError> {
+    // The queue must fit inside the attempt-deadline horizon, and this is checked
+    // at boot rather than hoped for. The seam shifts a queued attempt's deadline
+    // forward by the time it waited, but the horizon is anchored to the attempt
+    // id's own timestamp, which is minted before the wait. So if
+    // wait + per-operation timeout can exceed the horizon, a sufficiently deep
+    // queue yields a deadline the governed client refuses outright — a hard
+    // failure, not a late success. Refusing the configuration is the only place
+    // this can be caught before it costs a push.
+    let horizon = FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS;
+    // `timeout_millis` is the per-operation budget the caller stamps into the
+    // deadline, and it lives on the optional object-store block. Absent that
+    // block there is no fragment route at all, so the wait alone must fit.
+    let io_timeout = cfg
+        .object_store
+        .as_ref()
+        .map_or(0, |object_store| object_store.timeout_millis);
+    let combined = cfg
+        .fragment_charge_admission_wait_millis
+        .saturating_add(io_timeout);
+    if combined > horizon {
+        return Err(PluginError::from(PluginConfigError {
+            plugin_name: name.to_string(),
+            message: format!(
+                "fragment_charge_admission_wait_millis ({}) + object_store.timeout_millis ({}) = \
+                 {} exceeds the provider attempt deadline horizon of {horizon} ms; a queued \
+                 attempt would be refused for an out-of-horizon deadline instead of admitted late",
+                cfg.fragment_charge_admission_wait_millis, io_timeout, combined
+            ),
+        }));
+    }
+    InFlightChargeBound::new(
+        cfg.fragment_in_flight_charges,
+        std::time::Duration::from_millis(cfg.fragment_charge_admission_wait_millis),
+    )
+    .map_err(|error| {
+        PluginError::from(PluginConfigError {
+            plugin_name: name.to_string(),
+            message: format!(
+                "Invalid fragment lifecycle provider charge-admission config \
+                 (fragment_in_flight_charges, fragment_charge_admission_wait_millis): {error}"
+            ),
+        })
+    })
+}
+
 fn default_slow_threshold() -> u64 {
     u64::MAX
 }
@@ -571,6 +656,16 @@ fn parse_config(name: &str, config: &toml::Value) -> Result<PostgresStoreConfig,
         })
     })?;
     validate_fragment_put_bound(name, &parsed)?;
+    // Beside its sibling on purpose. Both fields sit on the shared
+    // `PostgresStoreConfig`, so all three factories deserialize both, and the
+    // put-bound field's own documentation promises that an operator who sets it
+    // under the mutable or lock section is told the value is impossible rather
+    // than that it was ignored. Validating only inside the immutable-store
+    // construction path would have made that promise true of one field and false
+    // of the other: a lock-store factory handed `fragment_in_flight_charges = 0`
+    // would have proceeded to a live connection attempt and failed with a
+    // connection error instead of the admission message.
+    validate_fragment_charge_bound(name, &parsed)?;
     let _ = enabled_fragment_provider_config(name, &parsed)?;
     Ok(parsed)
 }
@@ -752,6 +847,7 @@ pub(crate) async fn connect_immutable_store(
     let cfg = parse_config(plugin_name, config)?;
     let fragment_provider = enabled_fragment_provider_config(plugin_name, &cfg)?;
     let in_flight_puts = validate_fragment_put_bound(plugin_name, &cfg)?;
+    let in_flight_charges = validate_fragment_charge_bound(plugin_name, &cfg)?;
     let fragment_activation = match fragment_provider {
         None => None,
         Some(fragment_provider) => {
@@ -960,6 +1056,7 @@ pub(crate) async fn connect_immutable_store(
             FragmentProviderRuntimeSettings::new(
                 ProviderCapabilities::none(),
                 in_flight_puts,
+                in_flight_charges,
                 fragment_provider.provider_late_effect_bound,
                 fragment_provider.provider_write_authority_revision,
             ),
@@ -1553,6 +1650,237 @@ bucket = "fragments"
         assert_eq!(
             bound.acquire_timeout(),
             std::time::Duration::from_millis(250)
+        );
+    }
+
+    // The charge-admission bound (CR-033 charge authority pool exhaustion).
+    // Same fixture shape as the in-flight-put-bound tests directly above --
+    // `fragment_in_flight_charges`/`fragment_charge_admission_wait_millis` sit
+    // on the same shared `PostgresStoreConfig`.
+
+    #[test]
+    fn the_fragment_in_flight_charge_bound_defaults_to_the_seams_own_default() {
+        let parsed: PostgresStoreConfig = match immutable_config("").try_into() {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("fixture config must deserialize: {error}"),
+        };
+        assert_eq!(
+            parsed.fragment_in_flight_charges,
+            lore_postgres::domain::fragments::DEFAULT_IN_FLIGHT_CHARGES,
+        );
+        assert!(validate_fragment_charge_bound(PLUGIN_NAME, &parsed).is_ok());
+    }
+
+    /// The bad values, and the strings that must name them.
+    const IMPOSSIBLE_CHARGE_BOUNDS: [&str; 3] = [
+        "fragment_in_flight_charges = 0",
+        "fragment_in_flight_charges = 100000",
+        "fragment_charge_admission_wait_millis = 0",
+    ];
+
+    const CHARGE_ADMISSION_REFUSAL: &str = "fragment lifecycle provider charge-admission config";
+
+    /// Mirrors `an_impossible_fragment_put_bound_is_refused_by_every_validate_config`
+    /// exactly. The field lives on the same `PostgresStoreConfig` as the put
+    /// bound, so the same claim -- any of the three `[plugins.postgres.*]`
+    /// sections gets refused by name -- should hold for it too.
+    #[test]
+    fn an_impossible_fragment_charge_bound_is_refused_by_every_validate_config() {
+        type ValidateFn<'a> = &'a dyn Fn(&toml::Value) -> Result<(), PluginError>;
+
+        let factories: [(&str, ValidateFn<'_>); 3] = [
+            ("immutable", &|config| {
+                PostgresImmutableStorePluginFactory.validate_config(config)
+            }),
+            ("mutable", &|config| {
+                PostgresMutableStorePluginFactory.validate_config(config)
+            }),
+            ("lock", &|config| {
+                PostgresLockStorePluginFactory.validate_config(config)
+            }),
+        ];
+        for extra in IMPOSSIBLE_CHARGE_BOUNDS {
+            let config = immutable_config(extra);
+            for (label, validate) in &factories {
+                let error = validate(&config)
+                    .expect_err("an impossible in-flight charge bound must be refused");
+                assert!(
+                    format!("{error}").contains(CHARGE_ADMISSION_REFUSAL),
+                    "{extra} must be refused by name in the {label} factory, got {error}",
+                );
+            }
+        }
+    }
+
+    /// Mirrors `an_impossible_fragment_put_bound_refuses_the_construction_path`:
+    /// the lock store's `create()` (no database needed -- the URL points
+    /// nowhere) and the immutable store's shared `connect_immutable_store`
+    /// path must both refuse before any connection is attempted.
+    #[test]
+    fn an_impossible_fragment_charge_bound_refuses_the_construction_path() {
+        for extra in IMPOSSIBLE_CHARGE_BOUNDS {
+            let config = immutable_config(extra);
+
+            match PostgresLockStorePluginFactory.create(&config) {
+                Err(error) => assert!(
+                    format!("{error}").contains(CHARGE_ADMISSION_REFUSAL),
+                    "{extra} must be refused by the lock store's create(), got {error}",
+                ),
+                Ok(_) => panic!("{extra} must not produce a lock store"),
+            }
+
+            let immutable = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|runtime| runtime.block_on(connect_immutable_store(&config, None)));
+            match immutable {
+                Ok(Err(error)) => assert!(
+                    format!("{error}").contains(CHARGE_ADMISSION_REFUSAL),
+                    "{extra} must be refused by connect_immutable_store, got {error}",
+                ),
+                Ok(Ok(_)) => panic!("{extra} must not produce an immutable store"),
+                Err(error) => panic!("the test runtime must build: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_valid_fragment_charge_bound_passes_config_validation() {
+        let config = immutable_config(
+            "fragment_in_flight_charges = 8\nfragment_charge_admission_wait_millis = 1500",
+        );
+        assert!(
+            PostgresImmutableStorePluginFactory
+                .validate_config(&config)
+                .is_ok()
+        );
+        let parsed: PostgresStoreConfig = match config.try_into() {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("fixture config must deserialize: {error}"),
+        };
+        let bound = match validate_fragment_charge_bound(PLUGIN_NAME, &parsed) {
+            Ok(bound) => bound,
+            Err(error) => panic!("a valid bound must validate: {error}"),
+        };
+        assert_eq!(bound.permits(), 8);
+        assert_eq!(
+            bound.acquire_timeout(),
+            std::time::Duration::from_millis(1500)
+        );
+    }
+
+    // The horizon guard (`validate_fragment_charge_bound`'s own refusal, on top
+    // of the impossible-bound checks above): `fragment_charge_admission_wait_millis`
+    // plus `object_store.timeout_millis` must fit inside
+    // `FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS`, because `admit_operation`
+    // shifts a queued attempt's deadline forward by exactly the wait, but the
+    // horizon is anchored to the attempt id's timestamp minted before that
+    // wait. `immutable_config`'s object-store block always deserializes with
+    // the seam's own `default_timeout()` (5_000ms) for `timeout_millis`, so
+    // these three pin the sum at, one over, and without that contribution at
+    // all.
+
+    #[test]
+    fn a_fragment_charge_bound_exactly_at_the_deadline_horizon_passes_config_validation() {
+        let wait_millis = FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS - default_timeout();
+        let config = immutable_config(&format!(
+            "fragment_charge_admission_wait_millis = {wait_millis}"
+        ));
+        let parsed: PostgresStoreConfig = match config.try_into() {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("fixture config must deserialize: {error}"),
+        };
+        assert_eq!(
+            parsed
+                .object_store
+                .as_ref()
+                .map(|object_store| object_store.timeout_millis),
+            Some(default_timeout()),
+            "fixture must exercise the seam's own default object_store timeout"
+        );
+        assert_eq!(
+            wait_millis + default_timeout(),
+            FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS,
+            "fixture arithmetic must land exactly on the horizon"
+        );
+        assert!(
+            validate_fragment_charge_bound(PLUGIN_NAME, &parsed).is_ok(),
+            "a combination exactly equal to the horizon must be admitted, not refused"
+        );
+    }
+
+    #[test]
+    fn a_fragment_charge_bound_one_millisecond_over_the_horizon_is_refused_naming_both_keys() {
+        let wait_millis = FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS - default_timeout() + 1;
+        let config = immutable_config(&format!(
+            "fragment_charge_admission_wait_millis = {wait_millis}"
+        ));
+        let parsed: PostgresStoreConfig = match config.try_into() {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("fixture config must deserialize: {error}"),
+        };
+        let error = validate_fragment_charge_bound(PLUGIN_NAME, &parsed)
+            .expect_err("one millisecond over the horizon must be refused");
+        let message = format!("{error}");
+        assert!(
+            message.contains("fragment_charge_admission_wait_millis"),
+            "error must name fragment_charge_admission_wait_millis, got {message}"
+        );
+        assert!(
+            message.contains("object_store.timeout_millis"),
+            "error must name object_store.timeout_millis, got {message}"
+        );
+    }
+
+    /// An absent `[object_store]` block contributes 0 to the horizon sum, not
+    /// some other default. Pinned by proving the full horizon is still
+    /// admissible as a wait alone when the block is entirely absent -- if
+    /// absence contributed any nonzero amount (e.g. the seam's own
+    /// `default_timeout()`), this combination would be refused.
+    #[test]
+    fn an_absent_object_store_block_contributes_zero_to_the_charge_bound_horizon_sum() {
+        let text = format!(
+            "url = \"postgres://localhost/lore\"\n\
+             fragment_charge_admission_wait_millis = {FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS}\n"
+        );
+        let config: toml::Value = match toml::from_str(&text) {
+            Ok(config) => config,
+            Err(error) => panic!("fixture config must parse: {error}"),
+        };
+        let parsed: PostgresStoreConfig = match config.try_into() {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("fixture config must deserialize: {error}"),
+        };
+        assert!(
+            parsed.object_store.is_none(),
+            "fixture must exercise the truly-absent case, not a present-but-default block"
+        );
+        assert!(
+            validate_fragment_charge_bound(PLUGIN_NAME, &parsed).is_ok(),
+            "a wait equal to the full horizon must be admitted when object_store is absent, \
+             proving the absent block contributes 0 to the sum rather than some nonzero default"
+        );
+    }
+
+    /// `fragment_in_flight_charges`/`fragment_charge_admission_wait_millis`
+    /// live on the shared `PostgresStoreConfig`, not on
+    /// `FragmentProviderConfig` -- which is `#[serde(deny_unknown_fields)]`.
+    /// Putting either key under `[fragment_provider]` instead of the
+    /// top-level table must be a hard deserialization refusal naming the
+    /// misplaced key, not a silently-ignored value.
+    #[test]
+    fn a_charge_bound_key_under_fragment_provider_is_an_unknown_field() {
+        let config = enabled_fragment_provider_config("fragment_in_flight_charges = 8");
+        let parsed: Result<PostgresStoreConfig, _> = config.try_into();
+        let error = match parsed {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("fragment_in_flight_charges under [fragment_provider] must not deserialize")
+            }
+        };
+        assert!(
+            format!("{error}").contains("fragment_in_flight_charges"),
+            "the deserialization error must name the misplaced key, got {error}",
         );
     }
 

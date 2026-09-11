@@ -184,6 +184,25 @@ delta produced. Keep it durable, not chronological — chronological execution n
   exercises the function's refusal of a non-serializable caller.
   Comparing a crate's counts across two commits needs `--no-fail-fast`; the default stops at the
   first failing target and tallies only what it reached (19 of 47 here), a plausible-looking count.
+- **CR-033 charge-admission deadline horizon guard [SERVER]**: `admit_operation`
+  (`lore-fragment-provider/src/lib.rs`, the gateway method, not `FragmentProviderEntry`'s
+  forwarder) shifts a queued attempt's `deadline_unix_ms` forward by the time actually spent
+  waiting for a charge slot, because callers (`lore-postgres`) mint that deadline from
+  `now + io_timeout` *before* the wait. But the governed client's own deadline horizon
+  (`PROVIDER_ATTEMPT_DEADLINE_HORIZON_MS`, `lore-object-dispatch/src/provider_client.rs`, 300_000ms)
+  is anchored to the attempt id's timestamp, minted before the wait too — so a wait deep enough to
+  push the shifted deadline past that horizon fails hard (`Internal`) instead of admitting late.
+  `lore-server/src/plugins/postgres.rs`'s `validate_fragment_charge_bound` closes this at config
+  time: refuses any `fragment_charge_admission_wait_millis + object_store.timeout_millis` (0 when
+  `object_store` is absent) exceeding `FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS` (a re-export of
+  the horizon), naming both keys in the error. Pinned at the config boundary only — driving a real
+  `admit_operation` queue against the horizon needs `lore-object-dispatch` internals
+  `lore-postgres` deliberately can't name (see this file's crate-layout doc), so proving "a shift
+  can never land outside the horizon under a *validated* config" end-to-end is not cheaply
+  expressible from `lore-server`'s or `lore-postgres`'s own test tiers; not attempted here.
+  Gate: `cargo test -p lore-server --lib -- charge_bound` (also runs the pre-existing
+  impossible/valid/default charge-bound cases in the same file; libtest's filter is one substring,
+  not a name list).
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

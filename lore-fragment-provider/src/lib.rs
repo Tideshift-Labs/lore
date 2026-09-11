@@ -304,6 +304,28 @@ pub const MAX_IN_FLIGHT_PUTS: u32 = 1_024;
 /// shared cell budget on its own.
 pub const DEFAULT_IN_FLIGHT_PUTS: u32 = 4;
 
+/// Largest accepted concurrent charge-carrying non-body attempt count.
+pub const MAX_IN_FLIGHT_CHARGES: u32 = 1_024;
+
+/// The concurrent charge-carrying non-body attempt count a cell uses until its
+/// own configuration says otherwise.
+///
+/// A HEAD, a version list and a delete each carry a charge but no object body,
+/// so [`DEFAULT_IN_FLIGHT_PUTS`] never governed them and nothing else did
+/// either. Measured consequence: a 1550-fragment push issued charge attempts as
+/// fast as its stream fan-out allowed, and the cell-local charge authority
+/// refused 50 of them outright with `PoolExhausted` — every waiter takes a
+/// dispatch-pool lease before it can charge, and the pool is at most
+/// `dispatch_pool_max`. Bounding the attempts turns that stampede into a queue.
+///
+/// 4 rather than a larger number on purpose: the charge itself is serialized per
+/// provider boundary by a session advisory lock, so concurrency above the
+/// dispatch pool's width buys no throughput and only converts a Rust wait into a
+/// pool refusal. Deliberately equal to [`DEFAULT_IN_FLIGHT_PUTS`] in value while
+/// being a separate number, because CR-031 defines that one as a *put* bound and
+/// overloading it would make the configured count mean something it does not.
+pub const DEFAULT_IN_FLIGHT_CHARGES: u32 = 4;
+
 /// Largest configured send window accepted by the fragment route.
 ///
 /// This is derived from the governed client's request-deadline horizon rather
@@ -385,6 +407,24 @@ pub enum FragmentProviderError {
     #[error("in-flight put admission is closed")]
     PutAdmissionClosed,
 
+    /// The configured concurrent charge count is outside the accepted range.
+    #[error("configured in-flight charge count is outside 1..={MAX_IN_FLIGHT_CHARGES}")]
+    InvalidInFlightChargeBound,
+
+    /// No charge-admission slot became free inside the configured wait.
+    ///
+    /// Named separately from [`FragmentProviderError::PutAdmissionTimedOut`]
+    /// rather than reusing it: a HEAD that waited out the charge queue has
+    /// nothing to do with a put bound, and an operation refused under the wrong
+    /// name sends the next reader to the wrong knob.
+    #[error("no charge admission slot became available within the configured admission wait")]
+    ChargeAdmissionTimedOut,
+
+    /// The charge-admission gate was closed. Unreachable while the gateway owns
+    /// its own semaphore; fails closed rather than admitting unbounded.
+    #[error("charge admission is closed")]
+    ChargeAdmissionClosed,
+
     /// The governed provider client refused, or its charge/transport kernel
     /// failed. Source-preserving.
     #[error("governed provider client refused the attempt: {0}")]
@@ -456,6 +496,11 @@ impl FragmentProviderError {
         match self {
             Self::PutAdmissionTimedOut => Some("put_admission_timeout"),
             Self::PutAdmissionClosed => Some("put_admission_closed"),
+            // Without these two the `_ => None` arm below would drop them, and a
+            // charge queue that timed out would be as invisible as the pool
+            // exhaustion this bound exists to prevent.
+            Self::ChargeAdmissionTimedOut => Some("charge_admission_timeout"),
+            Self::ChargeAdmissionClosed => Some("charge_admission_closed"),
             Self::Provider(ProviderClientError::ChargeRefused(refusal)) => match refusal {
                 ProviderChargeError::BudgetExhausted => Some("charge_budget_exhausted"),
                 ProviderChargeError::ClassCapExhausted => Some("charge_class_cap_exhausted"),
@@ -481,14 +526,16 @@ impl FragmentProviderError {
     pub fn disposition(&self) -> FragmentProviderDisposition {
         match self {
             Self::InvalidInFlightPutBound
+            | Self::InvalidInFlightChargeBound
             | Self::AttemptClassNotPermitted { .. }
             | Self::IngressCapExceeded
             | Self::OperationRequired
             | Self::OperationMismatch
             | Self::InvalidObjectKey => FragmentProviderDisposition::InvalidInput,
-            Self::PutAdmissionTimedOut | Self::PutAdmissionClosed => {
-                FragmentProviderDisposition::Transient
-            }
+            Self::PutAdmissionTimedOut
+            | Self::PutAdmissionClosed
+            | Self::ChargeAdmissionTimedOut
+            | Self::ChargeAdmissionClosed => FragmentProviderDisposition::Transient,
             Self::Provider(ProviderClientError::ChargeAmbiguous)
             | Self::Provider(ProviderClientError::ChargeRecovered) => {
                 FragmentProviderDisposition::OutcomeUnknown
@@ -1079,6 +1126,48 @@ impl InFlightPutBound {
     }
 }
 
+/// A validated bound on concurrent charge-carrying non-body attempts.
+///
+/// Its own type rather than a second [`InFlightPutBound`], for the same reason
+/// its error variants are their own: the two numbers govern different traffic and
+/// a shared type invites a caller to pass one where the other belongs.
+///
+/// The wait matters more here than for puts. A large push issues one charge per
+/// fragment and the charge is serialized per provider boundary, so the last
+/// waiter in a 1550-fragment push queues behind every earlier one. A timeout
+/// shorter than that queue converts a pool refusal into an admission refusal and
+/// fixes nothing — this bound exists to apply backpressure, not to fail faster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InFlightChargeBound {
+    permits: usize,
+    acquire_timeout: Duration,
+}
+
+impl InFlightChargeBound {
+    /// Validates a configured count and wait.
+    pub fn new(permits: u32, acquire_timeout: Duration) -> Result<Self, FragmentProviderError> {
+        if permits == 0 || permits > MAX_IN_FLIGHT_CHARGES || acquire_timeout.is_zero() {
+            return Err(FragmentProviderError::InvalidInFlightChargeBound);
+        }
+        let permits = usize::try_from(permits)
+            .map_err(|_| FragmentProviderError::InvalidInFlightChargeBound)?;
+        Ok(Self {
+            permits,
+            acquire_timeout,
+        })
+    }
+
+    /// The concurrent charge-carrying non-body attempt count.
+    pub fn permits(&self) -> usize {
+        self.permits
+    }
+
+    /// How long a charge-carrying attempt waits for a slot before failing closed.
+    pub fn acquire_timeout(&self) -> Duration {
+        self.acquire_timeout
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The attempt a caller describes
 // ---------------------------------------------------------------------------
@@ -1464,6 +1553,8 @@ pub struct FragmentProviderGateway {
     attestation: CellSchemaAttestation,
     bound: InFlightPutBound,
     in_flight_puts: Semaphore,
+    charge_bound: InFlightChargeBound,
+    in_flight_charges: Semaphore,
     port_wired: bool,
 }
 
@@ -1653,6 +1744,7 @@ impl FragmentProviderEntry {
         boundary: CellProviderBoundary,
         capabilities: ProviderCapabilities,
         bound: InFlightPutBound,
+        charge_bound: InFlightChargeBound,
         transport: P,
     ) -> Result<Self, FragmentProviderActivationError>
     where
@@ -1694,6 +1786,7 @@ impl FragmentProviderEntry {
             attestation,
             capabilities,
             bound,
+            charge_bound,
             charge_authority,
             transport,
         );
@@ -1769,6 +1862,10 @@ pub struct AdmittedFragmentAttempt<'a> {
     gateway: &'a FragmentProviderGateway,
     attempt: FragmentProviderAttempt,
     operation: FragmentTransportOperation,
+    /// Held for the whole admission, released on drop. Named with a leading
+    /// underscore for the same reason `AdmittedFragmentPutAttempt` does: it is
+    /// owned for its lifetime, never read.
+    _charge_permit: SemaphorePermit<'a>,
 }
 
 impl<'a> AdmittedFragmentAttempt<'a> {
@@ -1845,11 +1942,13 @@ impl FragmentProviderGateway {
         attestation: CellSchemaAttestation,
         capabilities: ProviderCapabilities,
         bound: InFlightPutBound,
+        charge_bound: InFlightChargeBound,
     ) -> Self {
         Self::new(
             attestation,
             capabilities,
             bound,
+            charge_bound,
             UnwiredChargeAuthority,
             UnwiredProviderTransport,
         )
@@ -1873,6 +1972,7 @@ impl FragmentProviderGateway {
         attestation: CellSchemaAttestation,
         capabilities: ProviderCapabilities,
         bound: InFlightPutBound,
+        charge_bound: InFlightChargeBound,
         charge_authority: C,
         transport: T,
     ) -> Self
@@ -1891,6 +1991,8 @@ impl FragmentProviderGateway {
             attestation,
             bound,
             in_flight_puts: Semaphore::new(bound.permits()),
+            charge_bound,
+            in_flight_charges: Semaphore::new(charge_bound.permits()),
             port_wired: false,
         }
     }
@@ -1902,6 +2004,7 @@ impl FragmentProviderGateway {
         attestation: CellSchemaAttestation,
         capabilities: ProviderCapabilities,
         bound: InFlightPutBound,
+        charge_bound: InFlightChargeBound,
         charge_authority: C,
         transport: P,
     ) -> Self
@@ -1920,6 +2023,8 @@ impl FragmentProviderGateway {
             attestation,
             bound,
             in_flight_puts: Semaphore::new(bound.permits()),
+            charge_bound,
+            in_flight_charges: Semaphore::new(charge_bound.permits()),
             port_wired: true,
         }
     }
@@ -1952,7 +2057,7 @@ impl FragmentProviderGateway {
     /// Validate and admit one explicit body-free operation.
     pub async fn admit_operation(
         &self,
-        attempt: FragmentProviderAttempt,
+        mut attempt: FragmentProviderAttempt,
         operation: FragmentTransportOperation,
     ) -> Result<AdmittedFragmentAttempt<'_>, FragmentProviderError> {
         if !self.port_wired {
@@ -1981,10 +2086,33 @@ impl FragmentProviderGateway {
         if !matches || attempt.put_body.is_some() {
             return Err(FragmentProviderError::OperationMismatch);
         }
+        // Last, so a refusal above costs nothing — the same ordering `admit_put`
+        // states. Every class this door accepts (HeadObject, ListObjectVersions,
+        // DeleteObject) charges, and each charge first takes a dispatch-pool
+        // lease, so without this slot a large push hands the charge authority
+        // more concurrent work than its pool can hold and it refuses with
+        // `PoolExhausted`.
+        //
+        // THE DEADLINE MUST SURVIVE THE QUEUE, and this is the half of the fix
+        // that is easy to miss. Callers mint `deadline_unix_ms` while building
+        // the attempt, i.e. BEFORE this wait — `lore-postgres` uses
+        // `now + io_timeout`, whose default is five seconds. A queue deeper than
+        // that would spend the whole budget waiting and then fail as
+        // `charge_deadline_exceeded`, which is the same push failure wearing a
+        // different name. Shifting the deadline by exactly the time waited makes
+        // it mean "io_timeout from admission" instead of "from construction", so
+        // each attempt gets the budget its caller intended. The shift is bounded
+        // by the wait, so the deadline can never exceed
+        // `admission + io_timeout`.
+        let queued_at = tokio::time::Instant::now();
+        let charge_permit = self.admit_charge_permit().await?;
+        let waited_millis = i64::try_from(queued_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+        attempt.deadline_unix_ms = attempt.deadline_unix_ms.saturating_add(waited_millis);
         Ok(AdmittedFragmentAttempt {
             gateway: self,
             attempt,
             operation,
+            _charge_permit: charge_permit,
         })
     }
 
@@ -2173,6 +2301,33 @@ impl FragmentProviderGateway {
         self.admit_put_permit().await.map(Some)
     }
 
+    /// Takes a charge-admission slot for a charge-carrying non-body attempt.
+    ///
+    /// Mirrors [`Self::admit_put_permit`] deliberately, including the
+    /// try-then-wait shape: the fast path costs nothing when the queue is short,
+    /// and a busy queue waits rather than refusing, because refusing is what the
+    /// caller cannot recover from. A refused charge reaches the client as
+    /// `SlowDown` and ends the push.
+    async fn admit_charge_permit(&self) -> Result<SemaphorePermit<'_>, FragmentProviderError> {
+        match self.in_flight_charges.try_acquire() {
+            Ok(permit) => return Ok(permit),
+            Err(TryAcquireError::Closed) => {
+                return Err(FragmentProviderError::ChargeAdmissionClosed);
+            }
+            Err(TryAcquireError::NoPermits) => {}
+        }
+        match tokio::time::timeout(
+            self.charge_bound.acquire_timeout(),
+            self.in_flight_charges.acquire(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(FragmentProviderError::ChargeAdmissionClosed),
+            Err(_) => Err(FragmentProviderError::ChargeAdmissionTimedOut),
+        }
+    }
+
     async fn admit_put_permit(&self) -> Result<SemaphorePermit<'_>, FragmentProviderError> {
         match self.in_flight_puts.try_acquire() {
             Ok(permit) => return Ok(permit),
@@ -2213,6 +2368,7 @@ impl std::fmt::Debug for FragmentProviderGateway {
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicI64;
     use std::sync::atomic::AtomicU32;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -2275,6 +2431,16 @@ mod tests {
         }
     }
 
+    /// Wide enough that no existing test queues on it, so adding the charge bound
+    /// changes no assertion that was not about the charge bound. A test that wants
+    /// to observe the queue builds its own narrow bound instead.
+    fn test_charge_bound() -> InFlightChargeBound {
+        match InFlightChargeBound::new(64, Duration::from_millis(50)) {
+            Ok(bound) => bound,
+            Err(error) => panic!("fixture charge bound must be valid: {error}"),
+        }
+    }
+
     fn pin() -> BudgetPin {
         BudgetPin {
             revision: "cell-alpha-budget-r1".to_string(),
@@ -2331,6 +2497,11 @@ mod tests {
     struct ScriptedChargeAuthority {
         script: ChargeScript,
         calls: AtomicU32,
+        /// The most recent `deadline_unix_ms` this authority observed in a
+        /// charge request. There is no public accessor on an admitted
+        /// attempt, so this is the closest honest way to see whether
+        /// `admit_operation` shifted the deadline it built its request from.
+        last_seen_deadline_unix_ms: AtomicI64,
     }
 
     impl ScriptedChargeAuthority {
@@ -2338,6 +2509,7 @@ mod tests {
             Self {
                 script,
                 calls: AtomicU32::new(0),
+                last_seen_deadline_unix_ms: AtomicI64::new(0),
             }
         }
     }
@@ -2348,6 +2520,8 @@ mod tests {
             request: &ProviderChargeRequest,
         ) -> Result<ProviderChargeGrant, ProviderChargeError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.last_seen_deadline_unix_ms
+                .store(request.deadline_unix_ms(), Ordering::SeqCst);
             let grant = |ordinal: u32| ProviderChargeGrant {
                 grant_id: GRANT_ID.to_string(),
                 traffic_class: request.traffic_class(),
@@ -2452,6 +2626,7 @@ mod tests {
                     CellSchemaAttestation::for_tests(boundary),
                     ProviderCapabilities::none().with_listing(),
                     bound,
+                    test_charge_bound(),
                     SharedAuthority(Arc::clone(&authority)),
                     SharedTransport(Arc::clone(&transport)),
                 ),
@@ -2623,6 +2798,22 @@ mod tests {
         Arc<ScriptedChargeAuthority>,
         Arc<CountingGetPort>,
     ) {
+        port_harness_with_bounds(script, requests_per_call, put_bound, test_charge_bound())
+    }
+
+    /// Same as [`port_harness`], with the charge bound also caller-supplied, so
+    /// a test that wants to observe the charge queue does not have to widen the
+    /// put bound to get there.
+    fn port_harness_with_bounds(
+        script: ChargeScript,
+        requests_per_call: u32,
+        put_bound: InFlightPutBound,
+        charge_bound: InFlightChargeBound,
+    ) -> (
+        FragmentProviderGateway,
+        Arc<ScriptedChargeAuthority>,
+        Arc<CountingGetPort>,
+    ) {
         let authority = Arc::new(ScriptedChargeAuthority::new(script));
         let port = Arc::new(CountingGetPort {
             get_calls: AtomicUsize::new(0),
@@ -2636,6 +2827,7 @@ mod tests {
             CellSchemaAttestation::for_tests(boundary()),
             ProviderCapabilities::none().with_listing(),
             put_bound,
+            charge_bound,
             SharedAuthority(Arc::clone(&authority)),
             SharedGetPort(Arc::clone(&port)),
         );
@@ -2660,6 +2852,33 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("an in-flight put never took its admission permit");
+    }
+
+    /// Waits until the scripted authority has observed `n` charge calls.
+    ///
+    /// Mirrors [`wait_until_puts_are_saturated`]'s bounded-spin shape for the
+    /// same reason: an open loop would hang the suite, not fail it, if
+    /// admission ever stopped reaching the limiter. Reaching the limiter
+    /// proves the admission permit was already taken, since
+    /// `admit_operation`/`admit_put` acquire it before `execute` can ever call
+    /// the charge authority.
+    async fn wait_until_charge_calls_reach(authority: &ScriptedChargeAuthority, n: u32) {
+        for _ in 0..100_000 {
+            if authority.calls.load(Ordering::SeqCst) >= n {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the charge authority never observed {n} call(s)");
+    }
+
+    /// A one-permit charge bound, so a second concurrent charge-carrying
+    /// attempt has nowhere to go and must queue or fail closed.
+    fn narrow_charge_bound() -> InFlightChargeBound {
+        match InFlightChargeBound::new(1, Duration::from_millis(40)) {
+            Ok(bound) => bound,
+            Err(error) => panic!("fixture charge bound must be valid: {error}"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3071,6 +3290,7 @@ mod tests {
             CellSchemaAttestation::for_tests(boundary()),
             ProviderCapabilities::none(),
             bound(),
+            test_charge_bound(),
         );
         let mut ledger = ledger();
         let outcome = gateway
@@ -3461,6 +3681,343 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // The charge-admission bound (CR-033 charge authority pool exhaustion)
+    // -----------------------------------------------------------------------
+
+    /// CR-033's cell charge authority pool is at most 4-5 leases, and every
+    /// charge takes one of them. With no bound on the attempts themselves, a
+    /// 1550-fragment push issued HeadObject/ListObjectVersions/DeleteObject
+    /// charges as fast as its fan-out allowed and the pool refused 50 of them
+    /// with `PoolExhausted`. This drives the narrow charge bound to exhaustion
+    /// with a real held admission for every accepted non-body class and proves
+    /// a concurrent second attempt of that class fails closed rather than
+    /// joining an unbounded queue, then proves the slot is usable again once
+    /// released — the same shape as
+    /// `a_put_beyond_the_configured_bound_fails_closed_while_a_slot_is_held`
+    /// for the put bound.
+    #[tokio::test]
+    async fn a_charge_carrying_attempt_beyond_the_configured_bound_fails_closed_then_releases() {
+        let (gateway, _authority, _port) =
+            port_harness_with_bounds(ChargeScript::Grant, 1, bound(), narrow_charge_bound());
+        let gateway = Arc::new(gateway);
+
+        for (class, operation) in [
+            (
+                ProviderAttemptClass::HeadObject,
+                FragmentTransportOperation::Head {
+                    object_key: "objects/fragment.bin".to_string(),
+                },
+            ),
+            (
+                ProviderAttemptClass::ListObjectVersions,
+                FragmentTransportOperation::ListVersions {
+                    object_key: "objects/fragment.bin".to_string(),
+                },
+            ),
+            (
+                ProviderAttemptClass::DeleteObject,
+                FragmentTransportOperation::DeleteVersion {
+                    object_key: "objects/fragment.bin".to_string(),
+                    version_id: "v1".to_string(),
+                },
+            ),
+        ] {
+            let admitted_signal = Arc::new(tokio::sync::Notify::new());
+            let release_signal = Arc::new(tokio::sync::Notify::new());
+            let holder = Arc::clone(&gateway);
+            let holder_operation = operation.clone();
+            let admitted_signal_task = Arc::clone(&admitted_signal);
+            let release_signal_task = Arc::clone(&release_signal);
+            let held = lore_base::lore_spawn!(async move {
+                let admitted = holder
+                    .admit_operation(attempt(class), holder_operation)
+                    .await
+                    .expect("the first attempt must take the only charge slot");
+                admitted_signal_task.notify_one();
+                release_signal_task.notified().await;
+                drop(admitted);
+            });
+            admitted_signal.notified().await;
+
+            // A second attempt of the same class queues behind the held slot
+            // and times out rather than joining an unbounded queue.
+            let refused = gateway
+                .admit_operation(attempt(class), operation.clone())
+                .await
+                .err();
+            assert_eq!(
+                refused,
+                Some(FragmentProviderError::ChargeAdmissionTimedOut),
+                "{} must fail closed while the only charge slot is held",
+                class.metric_label(),
+            );
+
+            release_signal.notify_one();
+            held.await.expect("holder task must complete");
+
+            // Once released, a fresh attempt of the same class admits again
+            // rather than hanging behind a permit that was never returned.
+            let admitted = tokio::time::timeout(
+                Duration::from_millis(200),
+                gateway.admit_operation(attempt(class), operation),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{} admission must not hang once the charge slot is released",
+                    class.metric_label(),
+                )
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} must admit once the charge slot is released: {error}",
+                    class.metric_label(),
+                )
+            });
+            drop(admitted);
+        }
+    }
+
+    /// The charge bound governs non-body attempts only. A put must proceed
+    /// while the charge bound is fully saturated, or CR-031's put bound would
+    /// stop meaning what it says — the two numbers must stay independent in
+    /// both directions, and `a_non_body_class_takes_no_in_flight_put_slot`
+    /// above already pins the other direction (a saturated put bound does not
+    /// block a non-body attempt).
+    #[tokio::test]
+    async fn charge_admission_saturation_does_not_block_a_put() {
+        let (gateway, authority, _port) =
+            port_harness_with_bounds(ChargeScript::Hang, 1, bound(), narrow_charge_bound());
+        let gateway = Arc::new(gateway);
+
+        let holder = Arc::clone(&gateway);
+        let held = lore_base::lore_spawn!(async move {
+            let mut ledger = ledger();
+            let admitted = holder
+                .admit_operation(
+                    attempt(ProviderAttemptClass::HeadObject),
+                    FragmentTransportOperation::Head {
+                        object_key: "objects/fragment.bin".to_string(),
+                    },
+                )
+                .await;
+            if let Ok(admitted) = admitted {
+                let _ = admitted.execute(&mut ledger).await;
+            }
+        });
+        // Wait for the HEAD to actually own the only charge slot and reach the
+        // (hanging) limiter. No sleep: the call count is the condition, so this
+        // cannot pass early.
+        wait_until_charge_calls_reach(&authority, 1).await;
+
+        // The scripted authority hangs, so a put that queued behind the charge
+        // bound would time out on admission first. Racing it against a bounded
+        // timeout separates "queued behind the charge bound" from "reached the
+        // limiter and is waiting there", the two outcomes this test has to
+        // tell apart — the mirror of `a_non_body_class_takes_no_in_flight_put_slot`.
+        let body = vec![0x5a; 1_024];
+        let mut ledger = ledger();
+        let raced = tokio::time::timeout(Duration::from_millis(200), async {
+            gateway
+                .admit_put(
+                    attempt(ProviderAttemptClass::PutObject),
+                    put_operation(&body),
+                )
+                .await?
+                .execute_direct_put(&mut ledger, &body)
+                .await
+        })
+        .await;
+        match raced {
+            Err(_elapsed) => {
+                assert_eq!(
+                    authority.calls.load(Ordering::SeqCst),
+                    2,
+                    "the put must have reached the limiter, not queued behind the charge bound",
+                );
+            }
+            Ok(outcome) => {
+                panic!("a put must not resolve while the limiter hangs, got {outcome:?}")
+            }
+        }
+        held.abort();
+    }
+
+    /// **The deadline must survive the charge queue.** Callers mint
+    /// `deadline_unix_ms` while building the attempt, before any admission
+    /// wait. Without `admit_operation` shifting it by the time actually
+    /// spent queueing, a deep charge queue would burn the caller's whole
+    /// `io_timeout` waiting and then fail as `charge_deadline_exceeded` — the
+    /// same push failure wearing a different name.
+    ///
+    /// There is no public accessor on an admitted attempt or on
+    /// `AdmittedFragmentAttempt`, so this observes the shift the closest
+    /// honest way available: the exact `deadline_unix_ms` the scripted charge
+    /// authority receives in the request `execute` builds from the (shifted)
+    /// attempt. **Missing observability, not filled in here** — flagged as
+    /// requested rather than adding a public accessor.
+    ///
+    /// This deliberately stays on the real, unpaused clock rather than
+    /// `#[tokio::test(start_paused = true)]`. The holder task below is
+    /// dispatched with `lore_base::lore_spawn!`, which puts it on
+    /// `lore_base::runtime::runtime()` — a separate, lazily-built, real
+    /// multi-thread Tokio runtime shared process-wide (see
+    /// `lore-base/src/runtime.rs`), not on this test's own `#[tokio::test]`
+    /// runtime. Pausing time is scoped to the calling runtime's time driver;
+    /// it would not slow or synchronize the holder's `tokio::time::sleep`,
+    /// which runs for real regardless. Worse, `admit_operation`'s own
+    /// `queued_at.elapsed()` is read from *this* task's (paused) clock, so
+    /// pausing here would make the production shift arithmetic observe ~0ms
+    /// waited despite the holder genuinely sleeping for real — an unsound
+    /// combination, the same shape as the `IoDriver` case in
+    /// `docs/testing-gotchas.md`'s "Deterministic async tests" section.
+    ///
+    /// So instead of a tight real-clock margin, this widens both sides: the
+    /// hold is long enough (400ms) that ordinary scheduling jitter under a
+    /// loaded machine (this rig also runs Docker and cargo builds) cannot
+    /// plausibly eat the whole interval, and the assertion only requires a
+    /// third of that (100ms) rather than requiring most of it — proving a
+    /// real, substantial forward shift occurred without demanding a value
+    /// close to the nominal hold.
+    #[tokio::test]
+    async fn a_charge_carrying_attempts_deadline_survives_the_admission_queue() {
+        const HOLD: Duration = Duration::from_millis(400);
+        const MIN_OBSERVED_SHIFT_MS: i64 = 100;
+
+        let generous = match InFlightChargeBound::new(1, Duration::from_secs(5)) {
+            Ok(bound) => bound,
+            Err(error) => panic!("fixture charge bound must be valid: {error}"),
+        };
+        let (gateway, authority, _port) =
+            port_harness_with_bounds(ChargeScript::Grant, 1, bound(), generous);
+        let gateway = Arc::new(gateway);
+
+        let admitted_signal = Arc::new(tokio::sync::Notify::new());
+        let holder = Arc::clone(&gateway);
+        let admitted_signal_task = Arc::clone(&admitted_signal);
+        let held = lore_base::lore_spawn!(async move {
+            let admitted = holder
+                .admit_operation(
+                    attempt(ProviderAttemptClass::HeadObject),
+                    FragmentTransportOperation::Head {
+                        object_key: "objects/fragment.bin".to_string(),
+                    },
+                )
+                .await
+                .expect("the first attempt must take the only charge slot");
+            admitted_signal_task.notify_one();
+            // Hold the slot for a measurable interval so the second attempt
+            // has a real, known-minimum wait to observe.
+            tokio::time::sleep(HOLD).await;
+            drop(admitted);
+        });
+        admitted_signal.notified().await;
+
+        let mut ledger = ledger();
+        let admitted = gateway
+            .admit_operation(
+                attempt(ProviderAttemptClass::HeadObject),
+                FragmentTransportOperation::Head {
+                    object_key: "objects/fragment.bin".to_string(),
+                },
+            )
+            .await
+            .expect("the second attempt must admit once the slot frees");
+        admitted
+            .execute(&mut ledger)
+            .await
+            .expect("a granted charge must execute");
+        held.await.expect("holder task must complete");
+
+        let observed = authority.last_seen_deadline_unix_ms.load(Ordering::SeqCst);
+        assert!(
+            observed >= DEADLINE_MS + MIN_OBSERVED_SHIFT_MS,
+            "the deadline the charge authority observed ({observed}) must be shifted forward \
+             by a substantial fraction of the {HOLD:?} the second attempt waited for the charge \
+             slot, starting from {DEADLINE_MS}",
+        );
+    }
+
+    /// The companion negative control: an admission that never queues must
+    /// not shift the deadline. Without this, the test above alone could pass
+    /// against an implementation that inflates every deadline unconditionally
+    /// rather than by the actual wait.
+    ///
+    /// Unlike the queueing test above, this one calls `admit_operation`
+    /// directly with no `lore_spawn!` holder and no real wait at all, so it
+    /// is safe to run on a fully paused virtual clock: `queued_at` and the
+    /// `Instant::now()` it is measured against both come from this same
+    /// test's own runtime, and nothing here ever calls `tokio::time::advance`,
+    /// so the clock cannot move. That makes the old ~50ms real-clock
+    /// tolerance unnecessary — the wait is exactly zero, deterministically,
+    /// not just usually.
+    #[tokio::test(start_paused = true)]
+    async fn a_charge_carrying_attempts_deadline_is_unchanged_on_the_fast_path() {
+        let (gateway, authority, _port) = port_harness(ChargeScript::Grant, 1, bound());
+
+        let mut ledger = ledger();
+        let admitted = gateway
+            .admit_operation(
+                attempt(ProviderAttemptClass::HeadObject),
+                FragmentTransportOperation::Head {
+                    object_key: "objects/fragment.bin".to_string(),
+                },
+            )
+            .await
+            .expect("an unsaturated charge bound must admit immediately");
+        admitted
+            .execute(&mut ledger)
+            .await
+            .expect("a granted charge must execute");
+
+        let observed = authority.last_seen_deadline_unix_ms.load(Ordering::SeqCst);
+        assert_eq!(
+            observed, DEADLINE_MS,
+            "an immediate admission on a paused clock that never advances must not shift the \
+             deadline at all",
+        );
+    }
+
+    #[test]
+    fn the_in_flight_charge_bound_refuses_every_out_of_domain_configuration() {
+        assert_eq!(
+            InFlightChargeBound::new(0, Duration::from_millis(1)),
+            Err(FragmentProviderError::InvalidInFlightChargeBound)
+        );
+        assert_eq!(
+            InFlightChargeBound::new(MAX_IN_FLIGHT_CHARGES + 1, Duration::from_millis(1)),
+            Err(FragmentProviderError::InvalidInFlightChargeBound)
+        );
+        assert_eq!(
+            InFlightChargeBound::new(1, Duration::ZERO),
+            Err(FragmentProviderError::InvalidInFlightChargeBound)
+        );
+        let valid =
+            match InFlightChargeBound::new(DEFAULT_IN_FLIGHT_CHARGES, Duration::from_secs(1)) {
+                Ok(bound) => bound,
+                Err(error) => panic!("a valid charge bound must construct: {error}"),
+            };
+        assert_eq!(valid.permits(), DEFAULT_IN_FLIGHT_CHARGES as usize);
+        assert_eq!(valid.acquire_timeout(), Duration::from_secs(1));
+        assert!(InFlightChargeBound::new(MAX_IN_FLIGHT_CHARGES, Duration::from_secs(1)).is_ok());
+    }
+
+    /// Without these two arms, `transient_diagnostic`'s `_ => None` catch-all
+    /// would swallow both — exactly the blindness the charge bound exists to
+    /// fix, since a refusal that cannot be counted is invisible.
+    #[test]
+    fn charge_admission_refusals_carry_their_own_transient_diagnostic() {
+        assert_eq!(
+            FragmentProviderError::ChargeAdmissionTimedOut.transient_diagnostic(),
+            Some("charge_admission_timeout"),
+        );
+        assert_eq!(
+            FragmentProviderError::ChargeAdmissionClosed.transient_diagnostic(),
+            Some("charge_admission_closed"),
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Property 5: the cell's own region and nothing else
     // -----------------------------------------------------------------------
 
@@ -3613,6 +4170,18 @@ mod tests {
             ),
             (
                 FragmentProviderError::PutAdmissionClosed,
+                FragmentProviderDisposition::Transient,
+            ),
+            (
+                FragmentProviderError::InvalidInFlightChargeBound,
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                FragmentProviderError::ChargeAdmissionTimedOut,
+                FragmentProviderDisposition::Transient,
+            ),
+            (
+                FragmentProviderError::ChargeAdmissionClosed,
                 FragmentProviderDisposition::Transient,
             ),
             (

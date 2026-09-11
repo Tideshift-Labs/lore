@@ -35,3 +35,7 @@ tokio = { workspace = true }
 [dev-dependencies]
 # Test-only. The seam itself spawns nothing; the admission tests do.
 lore-base = { workspace = true }
+# "test-util" for `#[tokio::test(start_paused = true)]` / `tokio::time::pause`,
+# used by the deadline-shift admission tests. Only sound for a path with no
+# real cross-runtime wait — see the fast-path test's own comment.
+tokio = { workspace = true, features = ["test-util"] }

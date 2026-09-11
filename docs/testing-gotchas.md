@@ -49,6 +49,22 @@ topic — chronological execution notes belong in `docs/worklogs/`.
   checked: a comparison broken to resolve on the first check still took the full 10ms), because
   paused-clock auto-advance races ahead of the real I/O completion. Use the real, unpaused clock
   instead against the function's own small budget — `state.rs`'s `wait_until_settled_*` tests.
+- `lore_base::lore_spawn!`'s no-joinset form spawns onto `lore_base::runtime::runtime()` — a
+  separate, lazily-built, process-wide Tokio runtime (`lore-base/src/runtime.rs`), not the calling
+  `#[tokio::test]`'s own runtime. Pausing time is scoped to the runtime that owns the time driver
+  a task is polled on; pausing the test's runtime does not pause, slow, or synchronize with a
+  `tokio::time::sleep` inside a `lore_spawn!`-spawned task, which keeps running on the real clock
+  regardless. Worse than merely "no speedup": if the *test* task also reads
+  `tokio::time::Instant::now()`/`.elapsed()` around waiting on that spawned task (e.g. to observe
+  how long an admission queue took), pausing the test's own clock makes that measurement compute
+  against the frozen virtual clock while the real wait genuinely elapses elsewhere — reporting
+  ~0ms elapsed no matter how long the spawned task actually held something. Same failure shape as
+  the `IoDriver` case above, different cause (cross-runtime dispatch, not cross-thread I/O). Only
+  pause a test whose entire awaited chain resolves on the same runtime with no `lore_spawn!`/
+  `lore_spawn_net!`/`lore_spawn_core!` in it; otherwise keep a real clock and a margin wide enough
+  that ordinary scheduler jitter can't plausibly close it (`lore-fragment-provider/src/lib.rs`'s
+  `a_charge_carrying_attempts_deadline_survives_the_admission_queue` widened from a ~150ms hold
+  with a 100ms margin to a 400ms hold with the same 100ms margin, rather than pausing).
 - Use near-zero retry policies for behavioral tests; keep one explicit real-default test when the
   default delay itself is part of the contract.
 - Exact-selection lifecycle callbacks provide deterministic filesystem fault points without a
