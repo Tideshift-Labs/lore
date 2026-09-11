@@ -112,27 +112,22 @@ will update an older check constraint or state schema.
   the three constants in the *same commit* as any proto edit. Regenerate with `protoc` before
   accepting a fingerprint change. Gate: `cargo test -p lore-proto --test v1_object_dispatch -j 4`.
 - **CR-033 cell dispatch authority: continuity family and separate-process service shell removed
-  [SERVER]** (2026-08-28 re-scope: the cell's own PostgreSQL is the one authority; see the CR-033
-  record for exactly which modules and RPCs were removed, not this guide). Two testing lessons
-  survive the removal: a module simplified rather than deleted, with **zero** prior `tests/`
-  coverage of its own (its only exercise was through a sibling module that WAS deleted), needs fresh
-  test files, not edits — `config.rs`/`metrics.rs` and the `authority.rs` fold (new coverage landed
-  in `tests/request_fingerprint.rs`) are both this shape. And:
+  [SERVER]** (the cell's own PostgreSQL is the one authority; the CR-033 record, not this guide,
+  lists which modules and RPCs went). A module simplified rather than deleted, with **zero** prior
+  `tests/` coverage of its own, needs fresh test files, not edits — `config.rs`/`metrics.rs` and the
+  `authority.rs` fold (new coverage in `tests/request_fingerprint.rs`) are both this shape. Also:
   `ObjectStoreCompactDependencyFloorKind::Continuity`'s wire value `5` is explicitly retained (D5)
   even though its sibling `ContinuityQuarantined`/`ContinuityAdjudicated` variants were removed —
   don't remove that variant chasing the rest of the family out.
-  `ContinuityWireLimits`/`RequestStateWireLimits` were always one struct behind a `pub type` alias
-  whose owning side can invert across waves — check current ownership before assuming a direction.
-  Either way it's one struct: a test importing the alias needs a plain rename to the surviving type
-  when the aliasing module goes, not a field-by-field rewrite.
-  Symptom: a retained suite (`tests/canonical_id.rs`) breaks even though it never imports the removed
-  module by name. Cause: it tests a crate-private helper (`contract::validate_canonical_id`)
-  exclusively through *whichever public wrapper is convenient* (`auth::AuthorizedCallerRegistry`),
-  and deleting that wrapper module breaks the suite without deleting the private helper it exists to
-  cover. What to do: before declaring a module deletion's test-side cleanup complete, `grep` every
-  symbol the deleted module publicly exported across all of `tests/`, not just files named after the
-  module; re-point the character-class/behavior matrix through a surviving public caller with the
-  same private-helper contract (here, `spool.rs`'s `SpoolLayout::derive_boundary_binding`) rather than
+  `ContinuityWireLimits`/`RequestStateWireLimits` are one struct behind a `pub type` alias whose
+  owning side can invert across waves — a test importing the alias needs a plain rename to the
+  surviving type when the aliasing module goes, not a field-by-field rewrite.
+  A suite that covers a crate-private helper through whichever public wrapper was convenient breaks
+  when that wrapper's module is deleted, even though it never named the module and the helper still
+  exists (`tests/canonical_id.rs` on `contract::validate_canonical_id` via
+  `auth::AuthorizedCallerRegistry`). Before calling a module deletion's test cleanup done, `grep`
+  every symbol it publicly exported across all of `tests/`, not just files named after it, and
+  re-point the matrix through a surviving caller with the same private-helper contract rather than
   losing the coverage.
   The pure ReservePut/no-dispatch/upload contracts remain unwired and effect-free. Their offline
   suites pin the no-dispatch and upload canonical goldens, all 80 ReservePut evidence-presence masks
@@ -165,27 +160,18 @@ will update an older check constraint or state schema.
   the drain matrix rejects any head evolution unless its revision delta exactly equals the open-lease
   decrement and its commit time is not older than the reservation. This remains pure `[SERVER]`
   source with no loreserver composition, provider traffic, credentials, or deployment authority.
-  The eleven `local_authority_*` live tests (the retained cell-authority half; CR-033 D5's install
-  set was 15 artifacts through 0019 and is 16 through the INV-EM fix migration 0020) have a
+  The eleven `local_authority_*` live tests (the retained cell-authority half) have a
   checked-in provisioning harness:
-  `lore-object-dispatch/tests/run-local-authority-live.ps1`. Unlike the retention-client live
-  tier, these tests call `tokio_postgres::connect` with `NoTls` -- no certificates, no
-  `pg_hba.conf`, no `ssl=on`; the container runs with `POSTGRES_HOST_AUTH_METHOD=trust` and plain
-  `postgresql://postgres@...` URLs. Ten of the eleven self-provision: each idempotently creates
-  the four `object_dispatch_retention_*` roles itself and installs its own required migration
-  subset from its own `include_str!`'d copy of the migration file, so the harness only needs to
-  hand each an empty fresh database. The one exception is `local_authority_canonical_codec.rs`'s
-  live test, which installs neither roles nor migrations itself and documents its exact
-  requirement in its own `#[ignore = "..."]` message ("requires disposable PostgreSQL with
-  migrations 0002 and 0009 installed") -- the harness must pre-install precisely that pair, not
-  the full chain, matching what the test's calls actually touch (0009's codec functions need only
-  0002's schema/roles, not 0007/0008's dispatch tables). The harness also runs the full CD-1
-  install set (0002, 0003, 0007-0020) once into its own dedicated database as first executed
-  proof the post-deletion chain installs cleanly, and cheaply asserts CD-1's documented inert
-  state: four of the five tables 0002 creates (the ones inert while 0004-0006 are uninstalled;
-  the fifth, `object_dispatch_retention_schema_state`, is written by 0003's install procedure)
-  exist, and none of 0004-0006's mutation/readback procedures (which nothing installed can call)
-  are present. Run:
+  `lore-object-dispatch/tests/run-local-authority-live.ps1`. Unlike the retention-client live tier,
+  these tests use `NoTls` against a `POSTGRES_HOST_AUTH_METHOD=trust` container and plain
+  `postgresql://postgres@...` URLs -- no certificates, no `pg_hba.conf`. Ten of the eleven
+  self-provision (roles plus their own `include_str!`'d migration subset), so the harness need only
+  hand each an empty fresh database. The exception is `local_authority_canonical_codec.rs`'s live
+  test: it installs nothing and states its requirement in its own `#[ignore = "..."]` message, so
+  the harness must pre-install precisely that pair, not the full chain -- match what a test's calls
+  actually touch. The harness also installs the full chain
+  once into its own dedicated database as executed proof it installs cleanly, and asserts the
+  documented inert state (0002's tables present, 0004-0006's uninstalled procedures absent). Run:
   `pwsh -File lore-object-dispatch/tests/run-local-authority-live.ps1` (add `-KeepOnFailure` to
   leave the labelled container up for debugging). All eleven tests stay `#[ignore]`; the harness
   opts them in explicitly with `--ignored --exact <name>`, it does not un-ignore them, so the
@@ -196,12 +182,12 @@ will update an older check constraint or state schema.
   offline-only suite, `tests/cell_schema_install.rs` — no Postgres, no `#[ignore]`. It re-reads
   `migrations/*.sql` from disk independently of the module's own `include_str!` copies (so a
   frozen-bytes claim is checked against ground truth, not against itself), and pins: the exact
-  16-artifact install set against the on-disk directory (a future migration must be classified
-  installed-or-deferred or the test fails); the interleaved 20-step install plan; each schema
+  install set against the on-disk directory, so a future migration must be classified
+  installed-or-deferred or the test fails (read its current size from `CELL_INSTALL_SET`, never
+  from a number written here — it grows every CD wave); the interleaved install plan; each schema
   layer's install/read_state function names, revisions, and digest against the migration that
-  creates them; the 5-entry `CREATE OR REPLACE FUNCTION` replacement inventory across 0012-0020
-  (scanned by text, not hand-enumerated, so an unpinned replace/one dropped from the pinned list
-  both fail); and a `local_authority_put_reservation_provisioning.rs`-style "runtime source never
+  creates them; the `CREATE OR REPLACE FUNCTION` replacement inventory (scanned by text, not
+  hand-enumerated, so an unpinned replace and one dropped from the pinned list both fail); and a `local_authority_put_reservation_provisioning.rs`-style "runtime source never
   calls the install entrypoints" guard extended to the new bin target. Gate:
   `cargo test -p lore-object-dispatch --test cell_schema_install`. One test
   (`cell_schema_error_is_a_standard_redacted_error_type`) is a type-level stub pending the real
@@ -211,35 +197,44 @@ will update an older check constraint or state schema.
   crate-private-constructed, and a transport reporting `provider_requests_issued != 1` poisons the
   ledger. That bounds what a transport may issue *and admit to*; it does not prove SDK auto-retry is
   off, because an SDK retry happens below the one call and reports one honestly. Disabling it is
-  CD-6's construction obligation, and `ProviderRetryPolicy` is only the declaration. `record_no_dispatch`
-  refuses after any issued attempt regardless of outcome (decisive or ambiguous) — a hand-listed
-  audit-mirroring test missed the ambiguous case, and its successor matrix then missed it again by
-  applying the no-dispatch only *before* the outcome sequence; generate such state matrices by
-  driving the real API, and give a sequencing rule an axis on both sides of the sequence.
-  `ProviderAttemptLedger::audit` calls `compaction`'s own `provider_attempt_audit_is_valid` rather
-  than restating the algebra, which removes today's duplicate; nothing stops a future restatement,
-  so keep the call. The matrix's pinned state set is a change-detector, not an oracle: it is
-  invariant under swapping the decisive/ambiguous arms, so the two tests that pin that mapping
-  directly are load-bearing rather than redundant with it.
+  CD-6's construction obligation, and `ProviderRetryPolicy` is only the declaration.
+  `record_no_dispatch` refuses after any issued attempt regardless of outcome: generate such state
+  matrices by driving the real API, and give a sequencing rule an axis on both sides of the sequence
+  (two successive hand-listed versions both missed the ambiguous case). Keep
+  `ProviderAttemptLedger::audit`'s call into `compaction`'s `provider_attempt_audit_is_valid` rather
+  than restating the algebra. The matrix's pinned state set is a change-detector, not an oracle — it
+  is invariant under swapping the decisive/ambiguous arms, so the two tests pinning that mapping
+  directly are load-bearing.
   `validate_endpoint_host` accepts a single-label host (`minio`, `localhost`).
   Double pattern: one closure-scripted double per trait, `new` returning `(Self, Rc<Cell<u32>>)`
   (the counter handle must outlive the double once moved into the client); close over an
   `Rc<RefCell<Option<T>>>` in the same closure to capture what it *receives*, not just call counts.
   When the received type is deliberately non-`Clone` (`ProviderChargeRequest`, so nothing can retain
   a chargeable value past the call), copy the asserted fields into your own plain struct instead.
-  INV-EJ P1 (round 4):
-  `ProviderAttemptLedger::new` now takes `(provider_boundary_id, logical_request_id) ->
-  Result<Self, _>` (no `Default`), and `execute` refuses a request naming a different
-  boundary/logical-request than the ledger is bound to with `LedgerRequestMismatch`, checked before
-  `authorize` and unpoisoned — one ledger can no longer accumulate two requests' attempts.
-  `authorize` is crate-private now; `validate_attempt` (`Result<(), _>`) is its public replacement,
-  so a test asserting the `ProviderChargeRequest` an authority receives needs the capture-closure
-  pattern above during a real `execute()` call, not a direct call. `audit_for(logical_request_id)`
-  replaced `audit()` for the same reason the input is bound: bare counters could be attached to
-  another request's receipt. Adding an identity field to a type whose `Debug` is `#[derive]`d is how
-  this module's redaction regressed once — the ledger leaked both strings until the same round gave
-  it the hand-written impl its siblings already had, and a test now guards it. Gate: `cargo test -p
-  lore-object-dispatch --test provider_client -j 4` (no `#[ignore]`).
+  `ProviderAttemptLedger::new` takes `(provider_boundary_id, logical_request_id) -> Result<Self, _>`
+  (no `Default`); `execute` refuses a request naming a different boundary/logical-request with
+  `LedgerRequestMismatch`, and `audit_for(logical_request_id)` replaced `audit()` for the same
+  reason — one ledger cannot accumulate two requests' attempts. `authorize` is crate-private; its
+  public replacement is `validate_attempt`, so a test asserting the `ProviderChargeRequest` an
+  authority receives needs the capture-closure pattern above during a real `execute()`, not a direct
+  call. Adding an identity field to a type whose `Debug` is `#[derive]`d is how this module's
+  redaction regressed once — check for a hand-written impl whenever a type gains an identity string.
+  Gate: `cargo test -p lore-object-dispatch --test provider_client -j 4` (no `#[ignore]`).
+  WP-114 CD-4's shared limiter (`provider_charge.rs`, migrations 0021/0022) splits its evidence
+  across two tiers. `tests/run-provider-charge-live.ps1` (six `#[ignore]`d tests, disposable
+  PostgreSQL 16) owns the effect claims: fusing the debit into the check loop, so a class-cap
+  refusal leaves the shared bucket debited, fails
+  `..._last_unit_charges_are_atomic_and_fail_closed` at "shared debit must roll back"
+  (revert-checked). It does NOT own the locking claims — deleting both the per-boundary
+  `pg_advisory_xact_lock` and the check loop's `FOR UPDATE OF state` leaves all six green, since
+  SERIALIZABLE plus the harness's own `40001` retry still delivers the outcome. Only
+  `provider_charge_schema.rs`'s `charge_locks_and_checks_every_cap_before_inserting_or_debiting`
+  (source order lock < grant insert < debit) catches that, so it is load-bearing, not a redundant
+  change-detector. `concurrent_charges` is `tokio::join!` over two connections with no barrier, so
+  every assertion also holds sequentially: it proves the rollback, not the race. Open gap: nothing
+  exercises the function's refusal of a non-serializable caller.
+  Comparing a crate's counts across two commits needs `--no-fail-fast`; the default stops at the
+  first failing target and tallies only what it reached (19 of 47 here), a plausible-looking count.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.
@@ -496,7 +491,16 @@ will update an older check constraint or state schema.
   neither file is reached by the default (non-`integration_tests`-feature) build; only
   `cargo test -p lore-integration-tests --features integration_tests` does. Both are auth-OFF
   harnesses (`jwt_verifier: None`), so the bool is a no-op per the method's own doc comment — pass
-  `false` for clarity.
+  `false` for clarity. Same drift recurred (2026-08-30): `GrpcServerBuilder::with_lock_store` now
+  returns `GrpcServerBuilder<MaybeDomainContext>` (CR-029), which needs `.with_domain_context(None)`
+  before `.with_notification(..)` compiles; `remote_store_test.rs`, `storage_copy_on_write_test.rs`,
+  and `storage_remote_test.rs` are all stale against it as of this writing. Because
+  `lore-integration-tests` sets `autotests = false` and pulls every `tests/*.rs` into ONE
+  `[[test]] name = "integration"` binary via `mod`, a stale file anywhere blocks
+  `cargo test -p lore-integration-tests --features integration_tests` for every file, including a
+  brand-new one added correctly. To verify your own new file in isolation without touching files
+  you don't own: temporarily comment out the offending `mod` lines in `tests/integration.rs`, run,
+  then restore the file exactly (`git diff` should show only your intended lines) before finishing.
 - If an untouched file reports an impossible macro/import/rlib error after alternating Clippy and
   test builds, suspect stale incremental state. Clean only the affected crate before escalating.
 - Regenerate protobuf output and `Cargo.lock` from their sources; do not hand-splice generated files.
@@ -674,7 +678,12 @@ to do: query the value's own storage directly, with a query that cannot normalis
 functions), or `file <path>` on the inputs; add a `text eol=lf` rule for every `migrations/*.sql`
 path. Compare things where they live, never where they were rendered. A `git worktree add`
 reproduction is itself a checkout and can manufacture the very CRLF condition under test — it is
-not independent confirmation that a failure pre-existed.
+not independent confirmation that a failure pre-existed. Concretely: this rig's global
+`core.autocrlf=true` plus no `*.rs` rule in `.gitattributes` means `git worktree add` writes CRLF
+`.rs` while the main checkout holds LF, so every `include_str!` source-text assertion spanning a
+newline fails in the worktree only. Create it, or re-checkout into it, with
+`git -c core.autocrlf=false`; `checkout-index -f` alone will not rewrite a file whose stat still
+matches, so delete the tree first.
 
 ### Poisoning a persisted `State`/`Tree` field for a fault-injection test
 
