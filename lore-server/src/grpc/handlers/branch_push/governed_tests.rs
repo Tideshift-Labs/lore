@@ -78,6 +78,8 @@ use crate::plugins::remote_notification::fake_gateway::ScriptedResponse;
 
 mod membership_tests;
 
+mod refusal_handler_tests;
+
 // ---------------------------------------------------------------------------
 // Shared fixtures — live Postgres (Section A/C)
 // ---------------------------------------------------------------------------
@@ -740,6 +742,157 @@ fn scripted_witness() -> PushLockWitness {
 
 fn scripted_owner() -> VerifiedLockOwner {
     owner("https://issuer.example", "pusher")
+}
+
+#[test]
+fn carried_push_preparation_failures_remain_unknown_while_internal_preprepare_errors_keep_their_status()
+ {
+    use crate::domain::AdmissionSource;
+    use crate::domain::InternalAdmission;
+    use crate::grpc::domain_operation_metadata::DomainOperationMetadata;
+    let key = dummy_operation().key;
+    let carried = AdmittedOperation {
+        key: key.clone(),
+        source: AdmissionSource::Carried(Box::new(DomainOperationMetadata {
+            operation_id: key.operation_id,
+            fingerprint_version: 1,
+            fingerprint: vec![8; 32],
+            prepare_token: [7; 32],
+            mediated_scope: None,
+            claim_witness: None,
+        })),
+    };
+    let internal = AdmittedOperation {
+        key,
+        source: AdmissionSource::Internal(InternalAdmission {
+            repository_id: vec![1; 16],
+            bearer: "private-test-bearer".into(),
+            client_attempt_id: None,
+        }),
+    };
+    for code in [
+        Code::InvalidArgument,
+        Code::ResourceExhausted,
+        Code::FailedPrecondition,
+    ] {
+        let error =
+            carried_push_preparation_error(Some(&carried), Status::new(code, "preparation failed"));
+        assert_eq!(error.code(), Code::Aborted);
+        assert_eq!(error.message(), crate::grpc::DOMAIN_OUTCOME_UNKNOWN_DETAIL);
+        assert_eq!(
+            carried_push_preparation_error(Some(&internal), Status::new(code, "ordinary")).code(),
+            code
+        );
+        assert_eq!(
+            carried_push_preparation_error(None, Status::new(code, "ordinary")).code(),
+            code
+        );
+    }
+}
+
+#[tokio::test]
+async fn push_refusal_requires_exact_terminal_not_applied_and_preserves_original_failure() {
+    for soft_failure in [false, true] {
+        let script = Arc::new(ScriptedDomainStore::new(MutationResult::rejected("unused")));
+        *script.refusal_result.lock().unwrap() = Some(Ok(DomainOutcome::NotApplied {
+            reason_version: 1,
+            reason: "BRANCH_PUSH_REFUSED_V1".into(),
+        }));
+        let mut governed = build_governed(
+            Arc::new(DomainContext::new(script.clone(), false)),
+            vec![1; 32],
+            scripted_witness(),
+            scripted_owner(),
+            1,
+            1,
+        );
+        governed.operation.binding.method = "branch.push".into();
+        let result = if soft_failure {
+            Ok(PushResult {
+                success: false,
+                advanced: false,
+                fast_forward_merged: false,
+                revision: Hash::hash_buffer(b"refused"),
+                revision_number: 7,
+            })
+        } else {
+            Err(Status::resource_exhausted("original overload"))
+        };
+        let settled = settle_governed_push(Some(&governed), result).await;
+        if soft_failure {
+            assert!(!settled.unwrap().success);
+        } else {
+            let error = settled.unwrap_err();
+            assert_eq!(error.code(), Code::ResourceExhausted);
+            assert_eq!(error.message(), "original overload");
+        }
+        let calls = script.refusal_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].key, governed.operation.key);
+        assert_eq!(calls[0].binding, governed.operation.binding);
+        assert_eq!(calls[0].prepare_token, governed.operation.prepare_token);
+        assert!(script.recorded_branch_push_commit_calls().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn push_refusal_after_applied_or_failed_terminalization_is_unknown() {
+    for refusal in [
+        Ok(DomainOutcome::Applied),
+        Err(DomainError::Internal("lost commit".into())),
+    ] {
+        let script = Arc::new(ScriptedDomainStore::new(MutationResult::rejected("unused")));
+        *script.refusal_result.lock().unwrap() = Some(refusal);
+        let governed = build_governed(
+            Arc::new(DomainContext::new(script.clone(), false)),
+            vec![1; 32],
+            scripted_witness(),
+            scripted_owner(),
+            1,
+            1,
+        );
+        let error = settle_governed_push(
+            Some(&governed),
+            Err(Status::resource_exhausted("early overload")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::Aborted);
+        assert_eq!(error.message(), crate::grpc::DOMAIN_OUTCOME_UNKNOWN_DETAIL);
+        assert_eq!(script.refusal_calls.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn successful_push_and_ungoverned_errors_do_not_terminalize_again() {
+    let script = Arc::new(ScriptedDomainStore::new(MutationResult::rejected("unused")));
+    let governed = build_governed(
+        Arc::new(DomainContext::new(script.clone(), false)),
+        vec![1; 32],
+        scripted_witness(),
+        scripted_owner(),
+        1,
+        1,
+    );
+    let push = PushResult {
+        success: true,
+        advanced: true,
+        fast_forward_merged: false,
+        revision: Hash::hash_buffer(b"applied"),
+        revision_number: 9,
+    };
+    assert_eq!(
+        settle_governed_push(Some(&governed), Ok(push))
+            .await
+            .unwrap()
+            .revision_number,
+        9
+    );
+    let error = settle_governed_push(None, Err(Status::resource_exhausted("ordinary")))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert!(script.refusal_calls.lock().unwrap().is_empty());
 }
 
 async fn local_repository_context() -> RepositoryContext {

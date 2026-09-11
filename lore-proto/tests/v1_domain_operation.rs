@@ -34,6 +34,36 @@ const PROTO: &str = include_str!("../proto/lore/domain/v1/domain_operation.proto
 const GENERATED: &str = include_str!("../src/grpc/lore.domain.v1.rs");
 
 #[test]
+fn attempt_acquire_recovery_uses_additive_repeated_tag_nine_and_original_lock_token_field() {
+    use lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetResponse;
+    let response = DomainOperationAttemptReceiptGetResponse {
+        acquired_locks: [0x35, 0x79]
+            .into_iter()
+            .map(|byte| lore_proto::lock::Lock {
+                ownership_token: vec![byte; 32].into(),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let mut expected = vec![0x4a, 0x22, 0x22, 0x20];
+    expected.extend_from_slice(&[0x35; 32]);
+    expected.extend_from_slice(&[0x4a, 0x22, 0x22, 0x20]);
+    expected.extend_from_slice(&[0x79; 32]);
+    assert_eq!(response.encode_to_vec(), expected);
+    assert_eq!(
+        DomainOperationAttemptReceiptGetResponse::decode(expected.as_slice()).unwrap(),
+        response
+    );
+    assert!(
+        DomainOperationAttemptReceiptGetResponse::decode(&[][..])
+            .unwrap()
+            .acquired_locks
+            .is_empty()
+    );
+}
+
+#[test]
 fn request_and_response_field_shapes_are_frozen() {
     let DomainOperationClockGetRequest {} = DomainOperationClockGetRequest::default();
     let DomainOperationClockGetResponse {

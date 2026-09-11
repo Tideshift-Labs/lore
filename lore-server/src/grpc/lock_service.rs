@@ -228,7 +228,9 @@ fn fenced_lock_to_wire(lock: FencedLock) -> Result<lore_proto::lock::Lock, Statu
 /// silently empty token on an acquire response would look to the client exactly
 /// like the read paths' deliberate blank, and it would then be unable to release
 /// what it just took.
-fn fenced_lock_to_wire_with_token(lock: FencedLock) -> Result<lore_proto::lock::Lock, Status> {
+pub(crate) fn fenced_lock_to_wire_with_token(
+    lock: FencedLock,
+) -> Result<lore_proto::lock::Lock, Status> {
     let token = lock.ownership_token.ok_or_else(|| {
         Status::internal("Acquired lock carries no ownership token to return to its owner")
     })?;

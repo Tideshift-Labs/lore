@@ -9,6 +9,7 @@
 //! or retry policy of its own.
 
 mod coordinator;
+pub(crate) use coordinator::decode_canonical_result;
 pub mod schema;
 
 pub use coordinator::AcquireOrRenewInput;

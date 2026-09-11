@@ -3376,6 +3376,7 @@ pub(crate) mod test_support {
 
     use async_trait::async_trait;
     use lore_postgres::domain::DomainError;
+    use lore_postgres::domain::DomainOutcome;
     use lore_postgres::domain::PostgresDomainStore;
     use lore_postgres::domain::backfill::BranchFacts;
     use lore_postgres::domain::backfill::DomainBackfill;
@@ -3913,6 +3914,8 @@ pub(crate) mod test_support {
     /// signature drift fails to compile rather than silently inheriting a body.
     pub(crate) struct ScriptedDomainStore {
         result: MutationResult,
+        pub(crate) refusal_result: std::sync::Mutex<Option<Result<DomainOutcome, DomainError>>>,
+        pub(crate) refusal_calls: std::sync::Mutex<Vec<GovernedOperation>>,
         pub(crate) create_snapshot:
             std::sync::Mutex<Option<Result<Option<RepositorySnapshot>, DomainError>>>,
         pub(crate) parent_snapshot:
@@ -3932,6 +3935,8 @@ pub(crate) mod test_support {
         pub(crate) fn new(result: MutationResult) -> Self {
             Self {
                 result,
+                refusal_result: std::sync::Mutex::new(None),
+                refusal_calls: std::sync::Mutex::new(Vec::new()),
                 create_snapshot: std::sync::Mutex::new(None),
                 parent_snapshot: std::sync::Mutex::new(None),
                 create_calls: std::sync::Mutex::new(Vec::new()),
@@ -4114,6 +4119,18 @@ pub(crate) mod test_support {
             _input: &MetadataCasInput,
         ) -> Result<MutationResult, DomainError> {
             unreachable!("ScriptedDomainStore only scripts branch_push_commit")
+        }
+
+        async fn branch_push_refuse(
+            &self,
+            operation: &GovernedOperation,
+        ) -> Result<DomainOutcome, DomainError> {
+            self.refusal_calls.lock().unwrap().push(operation.clone());
+            self.refusal_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted refusal result")
         }
 
         async fn branch_push_commit(

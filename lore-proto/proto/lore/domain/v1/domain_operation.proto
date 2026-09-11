@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 syntax = "proto3";
+import "lock.proto";
 
 package lore.domain.v1;
 
@@ -178,6 +179,13 @@ message DomainOperationAttemptReceiptGetResponse {
   // recorded the method before dispatch, so this is checkable rather than
   // merely informative.
   string method = 8;
+  // Original ownership result for this authenticated caller's exact committed,
+  // applied lock.acquire or lock.admin_acquire attempt. Administrative recovery
+  // belongs to the initiating administrator and retains the original target
+  // owner; it does not grant authority to impersonate that owner.
+  // Empty for all other methods/states and when
+  // the historical result is unavailable. Never reconstructed from live locks.
+  repeated urc.lock.Lock acquired_locks = 9;
 }
 
 enum DomainOperationVerifiedStaleFinalizeStatus {

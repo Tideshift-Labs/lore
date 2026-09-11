@@ -161,7 +161,11 @@ async fn direct_prepare_persists_evidence_through_commit_without_a_mediated_fenc
             from_future_marker: false
         }
     ));
-    let receipts::AttemptReceipt { lookup, method } = store
+    let receipts::AttemptReceipt {
+        lookup,
+        method,
+        acquired_locks,
+    } = store
         .domain_operation_attempt_receipt_get(
             &key.verified_issuer,
             &key.authenticated_subject,
@@ -177,6 +181,7 @@ async fn direct_prepare_persists_evidence_through_commit_without_a_mediated_fenc
         }
     ));
     assert_eq!(method.as_deref(), Some("branch.push"));
+    assert!(acquired_locks.is_empty());
 }
 
 #[tokio::test]

@@ -172,12 +172,21 @@ fn main() -> Result<()> {
     // FORK-LOCAL (Tideshift, CR-029). Private control-plane prepare/receipt
     // service. Reconcile package, message/enum tags, and the three pinned
     // method paths before regeneration if upstream adds lore.domain.v1.
+    // Imported services are generated even when their message types use an
+    // extern_path. Isolate this pass so it cannot overwrite the legacy lock
+    // bindings with an imported service-only file.
+    let domain_output = PathBuf::from(
+        env::var_os("OUT_DIR").ok_or_else(|| std::io::Error::other("No build output directory"))?,
+    )
+    .join("domain-proto");
+    std::fs::create_dir_all(&domain_output)?;
     let mut config = tonic_prost_build::Config::new();
+    config.extern_path(".urc.lock", "crate::lock");
     config.enable_type_names();
     config.bytes(["."]);
 
     tonic_prost_build::configure()
-        .out_dir(&output_dir)
+        .out_dir(&domain_output)
         .codec_path("crate::DomainOperationV2StrictCodec")
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_with_config(
@@ -185,6 +194,10 @@ fn main() -> Result<()> {
             &["./proto/lore/domain/v1/domain_operation.proto"],
             &["./proto"],
         )?;
+    std::fs::copy(
+        domain_output.join("lore.domain.v1.rs"),
+        output_dir.join("lore.domain.v1.rs"),
+    )?;
 
     // FORK-LOCAL (Tideshift, CR-033). This private, server-only package is the canonical record
     // schema for the in-process cell dispatch authority and declares no service. Reconcile

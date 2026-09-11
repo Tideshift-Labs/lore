@@ -55,6 +55,12 @@ $inventory = @(
         Exact         = $true
         ExactPrefixes = @()
         Cases         = @(
+            'receipt_recovery_cases::acquire_attempt_recovers_original_tokens_after_release_without_exposing_them_to_other_principals',
+            'receipt_recovery_cases::acquire_attempt_missing_historical_result_is_empty_but_malformed_result_refuses',
+            'receipt_recovery_cases::attempt_recovery_never_combines_unique_prepared_snapshot_with_later_duplicate_and_tokens',
+            'receipt_recovery_cases::branch_publication_and_refusal_serialize_both_orders_without_overwriting_applied',
+            'receipt_recovery_cases::branch_refusal_without_exact_admission_is_unknown_and_keeps_prepared_receipt',
+            'receipt_recovery_cases::admin_acquire_recovers_original_target_token_only_for_original_administrator',
             'two_coordinators_racing_one_resource_choose_exactly_one_owner_pair',
             'racing_batches_are_all_or_nothing',
             'same_subject_under_different_issuers_is_foreign_for_every_owner_operation',
@@ -138,9 +144,11 @@ $inventory = @(
         # the same shared-module treatment `grpc::handlers::branch_push::tests::`
         # already gets.
         ExactPrefixes = @(
+            'grpc::handlers::branch_push::governed_tests::refusal_handler_tests::',
             'grpc::handlers::branch_push::governed_tests::enforce_fenced_locks_'
         )
         Cases         = @(
+            'grpc::handlers::branch_push::governed_tests::refusal_handler_tests::both_push_handlers_terminalize_actual_early_store_slowdown_without_publication',
             'domain::tests::a_never_migrated_postgres_cell_boots_on_the_legacy_lock_route',
             'grpc::handlers::branch_push::tests::real_witness_capture_precedes_both_cr019_bypass_conditions',
             'grpc::handlers::branch_push::governed_tests::enforce_fenced_locks_blocks_a_push_from_a_foreign_owner_pair',

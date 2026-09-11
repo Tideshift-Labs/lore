@@ -1172,7 +1172,7 @@ pub async fn consume(
 /// branch advance, delete, obliteration, repair, or re-store cannot erase or
 /// rewrite the receipt it reads.
 /// One receipt found by the client's own attempt identity, with the method it was filed under.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AttemptReceipt {
     /// What the row says. `NotFound` covers both no match and an ambiguous one.
     pub lookup: ReceiptLookup,
@@ -1184,6 +1184,19 @@ pub struct AttemptReceipt {
     /// alongside a `NotFound` in the narrow case where the row disappears between finding its key
     /// and reading it, which would have contradicted what the wire contract promises.
     pub method: Option<String>,
+    /// Original acquire result, available only to this attempt's authenticated owner.
+    /// Never reconstructed from current lock rows or returned for another method.
+    pub acquired_locks: Vec<crate::domain::locks::FencedLock>,
+}
+
+impl std::fmt::Debug for AttemptReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttemptReceipt")
+            .field("lookup", &self.lookup)
+            .field("method", &self.method)
+            .field("acquired_lock_count", &self.acquired_locks.len())
+            .finish()
+    }
 }
 
 /// Find a receipt by the attempt identity its client chose, within one verified principal.
@@ -1231,6 +1244,7 @@ pub async fn attempt_receipt_get(
         return Ok(AttemptReceipt {
             lookup: ReceiptLookup::NotFound,
             method: None,
+            acquired_locks: Vec::new(),
         });
     }
 
@@ -1259,11 +1273,58 @@ pub async fn attempt_receipt_get(
     // Dropped when the delegated read found nothing after all. The two statements run in one
     // transaction so this is close to unreachable, but "close to" is not the same as a promise,
     // and the contract says a caller learns a method only for a receipt that exists.
+    let acquired_locks = if matches!(
+        binding.method.as_str(),
+        "lock.acquire" | "lock.admin_acquire"
+    ) && matches!(
+        &lookup,
+        ReceiptLookup::Committed {
+            outcome: DomainOutcome::Applied,
+            from_future_marker: false,
+        }
+    ) {
+        match lock_receipt_row(tx, &key).await? {
+            Some(row)
+                if row.matches(&binding)
+                    && row.state == schema::RECEIPT_STATE_COMMITTED
+                    && row.committed_outcome()? == DomainOutcome::Applied =>
+            {
+                let locks = match row.public_result {
+                    Some(bytes) => crate::domain::locks::decode_canonical_result(&bytes)?,
+                    None => Vec::new(),
+                };
+                // The lookup key belongs to the authenticated initiator. An
+                // administrative acquire originally returned another subject's
+                // token to that initiator; recover that same result, retaining
+                // its target owner rather than substituting the administrator.
+                if locks.iter().any(|lock| {
+                    lock.owner.verified_issuer != verified_issuer
+                        || lock.owner.authenticated_subject.is_empty()
+                        || (binding.method == "lock.acquire"
+                            && lock.owner.authenticated_subject != authenticated_subject)
+                        || lock.branch_id.len() != 16
+                        || lock.ownership_token.is_none_or(|token| token == [0; 32])
+                }) {
+                    return Err(DomainError::Internal(
+                        "stored acquire result has invalid ownership".to_owned(),
+                    ));
+                }
+                locks
+            }
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
     let method = match lookup {
         ReceiptLookup::NotFound => None,
         _ => Some(binding.method),
     };
-    Ok(AttemptReceipt { method, lookup })
+    Ok(AttemptReceipt {
+        method,
+        lookup,
+        acquired_locks,
+    })
 }
 
 /// Internal BranchCreate retry: read terminal evidence without a consume token

@@ -150,6 +150,7 @@ impl RecordingStore {
                     + Duration::from_millis(CLOCK_MILLIS + 900_000),
             }),
             attempt_receipt_result: Mutex::new(AttemptReceipt {
+                acquired_locks: Vec::new(),
                 lookup: ReceiptLookup::NotFound,
                 method: None,
             }),
@@ -207,6 +208,7 @@ impl DomainTransactionStore for RecordingStore {
             && (owner_issuer != verified_issuer || owner_subject != authenticated_subject)
         {
             return Ok(AttemptReceipt {
+                acquired_locks: Vec::new(),
                 lookup: ReceiptLookup::NotFound,
                 method: None,
             });
@@ -1615,12 +1617,106 @@ async fn receipt_get_sends_the_same_wire_constants_the_maintenance_rail_reads() 
 // -------------------------------------------------------------------------------------------
 
 #[tokio::test]
+async fn attempt_receipt_acquire_result_is_only_exposed_for_exact_applied_acquire() {
+    use lore_postgres::domain::locks::FencedLock;
+    use lore_postgres::domain::locks::VerifiedLockOwner;
+    let lock = FencedLock {
+        branch_id: vec![0x31; 16],
+        resource_hash: vec![0x42; 32],
+        description: "asset".into(),
+        owner: VerifiedLockOwner {
+            verified_issuer: "https://issuer.example".into(),
+            authenticated_subject: "owner".into(),
+        },
+        ownership_token: Some([0x55; 32]),
+        fence: 3,
+        repository_lock_generation: 4,
+        branch_lock_generation: 5,
+        acquired_at: SystemTime::UNIX_EPOCH + Duration::from_millis(CLOCK_MILLIS),
+        expires_at: None,
+    };
+    for (method, applied, marker, expected) in [
+        ("lock.acquire", true, false, 1),
+        ("lock.admin_acquire", true, false, 1),
+        ("lock.release", true, false, 0),
+        ("branch.push", true, false, 0),
+        ("lock.acquire", false, false, 0),
+        ("lock.acquire", true, true, 0),
+    ] {
+        let (service, store, _) = service();
+        let mut result_lock = lock.clone();
+        if method == "lock.admin_acquire" {
+            result_lock.owner.authenticated_subject = "target".into();
+        }
+        *store.attempt_receipt_result.lock().unwrap() = AttemptReceipt {
+            lookup: ReceiptLookup::Committed {
+                outcome: if applied {
+                    DomainOutcome::Applied
+                } else {
+                    DomainOutcome::NotApplied {
+                        reason_version: 1,
+                        reason: "refused".into(),
+                    }
+                },
+                from_future_marker: marker,
+            },
+            method: Some(method.into()),
+            acquired_locks: vec![result_lock],
+        };
+        *store.attempt_receipt_owner.lock().unwrap() =
+            Some(("https://issuer.example".into(), "owner".into()));
+        let result = service
+            .domain_operation_attempt_receipt_get(authenticated_as(
+                valid_attempt_receipt_get(),
+                human_token("https://issuer.example", "owner"),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            result.acquired_locks.len(),
+            expected,
+            "{method}/{applied}/{marker}"
+        );
+        if expected == 1 {
+            assert_eq!(
+                result.acquired_locks[0].ownership_token.as_ref(),
+                &[0x55; 32]
+            );
+            assert_eq!(
+                result.acquired_locks[0]
+                    .resource
+                    .as_ref()
+                    .unwrap()
+                    .hash
+                    .as_ref(),
+                &[0x42; 32]
+            );
+        }
+        let foreign = service
+            .domain_operation_attempt_receipt_get(authenticated_as(
+                valid_attempt_receipt_get(),
+                human_token("https://issuer.example", "foreign"),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            foreign.status,
+            DomainOperationReceiptStatus::NotFound as i32
+        );
+        assert!(foreign.acquired_locks.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn attempt_receipt_get_maps_prepared_with_both_timestamps() {
     let (service, store, _) = service();
     *store
         .attempt_receipt_result
         .lock()
         .expect("attempt receipt result") = AttemptReceipt {
+        acquired_locks: Vec::new(),
         lookup: ReceiptLookup::Prepared {
             prepared_at: SystemTime::UNIX_EPOCH + Duration::from_millis(CLOCK_MILLIS),
             hard_expires_at: SystemTime::UNIX_EPOCH + Duration::from_millis(CLOCK_MILLIS + 900_000),
@@ -1657,6 +1753,7 @@ async fn attempt_receipt_get_maps_committed_applied() {
         .attempt_receipt_result
         .lock()
         .expect("attempt receipt result") = AttemptReceipt {
+        acquired_locks: Vec::new(),
         lookup: ReceiptLookup::Committed {
             outcome: DomainOutcome::Applied,
             from_future_marker: false,
@@ -1689,6 +1786,7 @@ async fn attempt_receipt_get_maps_committed_not_applied_with_its_versioned_reaso
         .attempt_receipt_result
         .lock()
         .expect("attempt receipt result") = AttemptReceipt {
+        acquired_locks: Vec::new(),
         lookup: ReceiptLookup::Committed {
             outcome: DomainOutcome::NotApplied {
                 reason_version: 2,
@@ -1739,6 +1837,7 @@ async fn attempt_receipt_get_maps_mismatch_expired_and_expired_or_unknown() {
             .attempt_receipt_result
             .lock()
             .expect("attempt receipt result") = AttemptReceipt {
+            acquired_locks: Vec::new(),
             lookup,
             method: Some("RevisionService.BranchPush".to_string()),
         };
@@ -1767,6 +1866,7 @@ async fn attempt_receipt_get_not_found_reports_no_method() {
         .attempt_receipt_result
         .lock()
         .expect("attempt receipt result") = AttemptReceipt {
+        acquired_locks: Vec::new(),
         lookup: ReceiptLookup::NotFound,
         method: None,
     };
@@ -1891,6 +1991,7 @@ async fn attempt_receipt_get_passes_only_the_tokens_verified_identity_to_the_sto
         .attempt_receipt_result
         .lock()
         .expect("attempt receipt result") = AttemptReceipt {
+        acquired_locks: Vec::new(),
         lookup: ReceiptLookup::NotFound,
         method: None,
     };
@@ -1931,6 +2032,7 @@ async fn attempt_receipt_get_two_different_callers_pass_two_different_identities
         .attempt_receipt_result
         .lock()
         .expect("attempt receipt result") = AttemptReceipt {
+        acquired_locks: Vec::new(),
         lookup: ReceiptLookup::NotFound,
         method: None,
     };
@@ -1984,6 +2086,7 @@ async fn attempt_receipt_get_another_subjects_attempt_reads_as_absent() {
         .attempt_receipt_result
         .lock()
         .expect("attempt receipt result") = AttemptReceipt {
+        acquired_locks: Vec::new(),
         lookup: ReceiptLookup::Committed {
             outcome: DomainOutcome::Applied,
             from_future_marker: false,
@@ -2040,6 +2143,7 @@ async fn attempt_receipt_get_a_service_account_token_reads_only_its_own_identity
         .attempt_receipt_result
         .lock()
         .expect("attempt receipt result") = AttemptReceipt {
+        acquired_locks: Vec::new(),
         lookup: ReceiptLookup::NotFound,
         method: None,
     };

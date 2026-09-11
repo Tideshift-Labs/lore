@@ -728,6 +728,7 @@ impl DomainOperationService for LoreDomainOperationV1Service {
             // Empty on the wire when there is no receipt, because proto3 has no absent string.
             // The status field is what a caller branches on; this is context for the one it found.
             method: found.method.unwrap_or_default(),
+            acquired_locks: Vec::new(),
         };
         match found.lookup {
             ReceiptLookup::Prepared {
@@ -748,6 +749,18 @@ impl DomainOperationService for LoreDomainOperationV1Service {
                 response.outcome = outcome as i32;
                 response.reason_version = version;
                 response.reason = reason;
+                if matches!(
+                    response.method.as_str(),
+                    "lock.acquire" | "lock.admin_acquire"
+                ) && response.outcome == DomainOperationOutcome::Applied as i32
+                    && !from_future_marker
+                {
+                    response.acquired_locks = found
+                        .acquired_locks
+                        .into_iter()
+                        .map(crate::grpc::lock_service::fenced_lock_to_wire_with_token)
+                        .collect::<Result<Vec<_>, _>>()?;
+                }
             }
             ReceiptLookup::Mismatch => {
                 response.status = DomainOperationReceiptStatus::Mismatch as i32;

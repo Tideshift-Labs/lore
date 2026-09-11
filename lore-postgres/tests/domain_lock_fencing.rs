@@ -9,6 +9,9 @@
 #[path = "active_active_support/barrier.rs"]
 mod barrier;
 
+#[path = "domain_receipt_recovery_cases.rs.inc"]
+mod receipt_recovery_cases;
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 use std::time::SystemTime;

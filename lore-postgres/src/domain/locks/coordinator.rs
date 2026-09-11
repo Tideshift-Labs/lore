@@ -2651,7 +2651,12 @@ fn append_system_time(target: &mut Vec<u8>, value: SystemTime) -> Result<(), Dom
     Ok(())
 }
 
-fn decode_canonical_result(bytes: &[u8]) -> Result<Vec<FencedLock>, DomainError> {
+pub(crate) fn decode_canonical_result(bytes: &[u8]) -> Result<Vec<FencedLock>, DomainError> {
+    if bytes.len() > receipts::PUBLIC_RESULT_MAX_BYTES {
+        return Err(DomainError::Internal(
+            "stored lock result exceeds receipt bound".to_owned(),
+        ));
+    }
     let mut reader = ResultReader::new(bytes);
     reader.expect_bytes(b"lock-result-v1\0")?;
     let count = usize::try_from(reader.u32()?)

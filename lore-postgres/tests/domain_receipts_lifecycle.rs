@@ -741,6 +741,7 @@ async fn attempt_receipt_get_finds_a_persisted_client_attempt_id_only_under_its_
     assert_eq!(
         wrong_subject,
         AttemptReceipt {
+            acquired_locks: Vec::new(),
             lookup: ReceiptLookup::NotFound,
             method: None,
         },

@@ -346,8 +346,13 @@ impl DomainTransactionStore for PostgresDomainStore {
             .instruments()
             .start("domain_operation_attempt_receipt_get", self.pool().status());
         let mut client = self.checkout().await?;
+        // Uniqueness, outcome and original ownership bytes must come from one
+        // snapshot. Concurrent terminalization may abort this read, never turn
+        // a previously unique attempt into an ambiguously attributed token.
         let tx = client
-            .transaction()
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .start()
             .await
             .map_err(|e| DomainError::from_pg("domain operation attempt receipt transaction", e))?;
         // Commits for the same reason the keyed lookup does: it delegates to `receipt_get`,
@@ -1423,6 +1428,43 @@ impl DomainTransactionStore for PostgresDomainStore {
             branch_generation,
             observed_pointer: None,
         })
+    }
+
+    async fn branch_push_refuse(
+        &self,
+        operation: &GovernedOperation,
+    ) -> Result<DomainOutcome, DomainError> {
+        if operation.binding.method != "branch.push" {
+            return Err(DomainError::OutcomeUnknown(
+                "branch push refusal has a different method".to_owned(),
+            ));
+        }
+        let _t = self
+            .instruments()
+            .start("branch_push_refuse", self.pool().status());
+        let mut client = self.checkout().await?;
+        let mut sequence = LockSequence::new();
+        let (tx, clock) = match self
+            .begin_admitted(&mut client, operation, &mut sequence)
+            .await?
+        {
+            BeginAdmitted::Admitted(tx, clock) => (tx, clock),
+            BeginAdmitted::Committed(outcome, _) => return Ok(outcome),
+            BeginAdmitted::Rejected => {
+                return Err(DomainError::OutcomeUnknown(
+                    "branch push refusal has no exact terminal proof".to_owned(),
+                ));
+            }
+        };
+        // Publication takes this same receipt lock before any branch effect.
+        // Whichever transaction wins fixes the outcome for both callers.
+        let outcome = DomainOutcome::NotApplied {
+            reason_version: receipts::REASON_VERSION,
+            reason: "BRANCH_PUSH_REFUSED_V1".to_owned(),
+        };
+        receipts::commit_terminal(&tx, &operation.key, &outcome, None, clock).await?;
+        classify_commit(tx.commit().await, "branch push refusal commit")?;
+        Ok(outcome)
     }
 
     async fn branch_push_commit(

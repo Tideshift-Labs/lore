@@ -204,7 +204,7 @@ impl ::prost::Name for DomainOperationAttemptReceiptGetRequest {
         "/lore.domain.v1.DomainOperationAttemptReceiptGetRequest".into()
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DomainOperationAttemptReceiptGetResponse {
     #[prost(enumeration = "DomainOperationReceiptStatus", tag = "1")]
     pub status: i32,
@@ -228,6 +228,14 @@ pub struct DomainOperationAttemptReceiptGetResponse {
     /// merely informative.
     #[prost(string, tag = "8")]
     pub method: ::prost::alloc::string::String,
+    /// Original ownership result for this authenticated caller's exact committed,
+    /// applied lock.acquire or lock.admin_acquire attempt. Administrative recovery
+    /// belongs to the initiating administrator and retains the original target
+    /// owner; it does not grant authority to impersonate that owner.
+    /// Empty for all other methods/states and when
+    /// the historical result is unavailable. Never reconstructed from live locks.
+    #[prost(message, repeated, tag = "9")]
+    pub acquired_locks: ::prost::alloc::vec::Vec<crate::lock::Lock>,
 }
 impl ::prost::Name for DomainOperationAttemptReceiptGetResponse {
     const NAME: &'static str = "DomainOperationAttemptReceiptGetResponse";

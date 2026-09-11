@@ -38,6 +38,7 @@ use crate::grpc::handlers::branch_push::dispatch_response_message;
 use crate::grpc::handlers::branch_push::extract_client_ip;
 use crate::grpc::handlers::branch_push::prepare_governed_push;
 use crate::grpc::handlers::branch_push::push_with_governance;
+use crate::grpc::handlers::branch_push::settle_governed_push;
 use crate::grpc::handlers::push_lock_guard;
 use crate::grpc::hook_error_to_status;
 use crate::hooks::HookContext;
@@ -105,9 +106,12 @@ pub async fn handler(
     // before it is rejected (INV-EE P2-10).
     if revision.is_zero() {
         info!("Invalid branch push request, revision_signature is zero");
-        return Err(Status::invalid_argument(
-            "revision_signature must be non-zero",
-        ));
+        return Err(
+            crate::grpc::handlers::branch_push::carried_push_preparation_error(
+                admitted.as_ref(),
+                Status::invalid_argument("revision_signature must be non-zero"),
+            ),
+        );
     }
 
     let fenced_coordinator = domain_context.and_then(|domain| domain.lock_coordinator().cloned());
@@ -155,59 +159,66 @@ pub async fn handler(
 
             let mut hook_ctx = ctx_builder.build();
 
-            hook_dispatcher
-                .dispatch_pre(HookPoint::BranchPush, &hook_ctx)
-                .map_err(hook_error_to_status)?;
+            let push_result = async {
+                hook_dispatcher
+                    .dispatch_pre(HookPoint::BranchPush, &hook_ctx)
+                    .map_err(hook_error_to_status)?;
 
-            ensure_branch_pushable(repository.clone(), branch_id).await?;
+                ensure_branch_pushable(repository.clone(), branch_id).await?;
 
-            // On a fenced cell the coordinator checks every push, governed or
-            // not, because it is the only authority holding a lock's verified
-            // owner pair; off a fenced cell CR-019's opt-in guard applies.
-            // See the shared v0 handler.
-            if let Some(coordinator) = fenced_coordinator.as_ref() {
-                let pusher = match governed_push.as_ref() {
-                    Some(governed) => governed.owner.clone(),
-                    None => push_lock_guard::verified_push_owner(request_authorization.as_ref())?,
-                };
-                crate::grpc::handlers::branch_push::enforce_fenced_locks(
-                    coordinator,
+                // On a fenced cell the coordinator checks every push, governed or
+                // not, because it is the only authority holding a lock's verified
+                // owner pair; off a fenced cell CR-019's opt-in guard applies.
+                // See the shared v0 handler.
+                if let Some(coordinator) = fenced_coordinator.as_ref() {
+                    let pusher = match governed_push.as_ref() {
+                        Some(governed) => governed.owner.clone(),
+                        None => {
+                            push_lock_guard::verified_push_owner(request_authorization.as_ref())?
+                        }
+                    };
+                    crate::grpc::handlers::branch_push::enforce_fenced_locks(
+                        coordinator,
+                        repository.clone(),
+                        branch_id,
+                        revision,
+                        &pusher,
+                    )
+                    .await?;
+                } else if let Some(enforcement) = lock_enforcement {
+                    let pusher =
+                        push_lock_guard::verified_push_owner(request_authorization.as_ref())?;
+                    push_lock_guard::enforce_push_locks(
+                        repository.clone(),
+                        enforcement,
+                        branch_id,
+                        revision,
+                        &pusher,
+                    )
+                    .await?;
+                }
+
+                push_with_governance(
                     repository.clone(),
                     branch_id,
                     revision,
-                    &pusher,
+                    bypass_protection,
+                    force,
+                    fast_forward_merge,
+                    history_step_size,
+                    acceleration,
+                    governed_push.as_ref(),
                 )
-                .await?;
-            } else if let Some(enforcement) = lock_enforcement {
-                let pusher = push_lock_guard::verified_push_owner(request_authorization.as_ref())?;
-                push_lock_guard::enforce_push_locks(
-                    repository.clone(),
-                    enforcement,
-                    branch_id,
-                    revision,
-                    &pusher,
-                )
-                .await?;
+                .await
             }
-
+            .await;
             let PushResult {
                 success,
                 advanced,
                 fast_forward_merged,
                 revision: resulting_revision,
                 revision_number,
-            } = push_with_governance(
-                repository.clone(),
-                branch_id,
-                revision,
-                bypass_protection,
-                force,
-                fast_forward_merge,
-                history_step_size,
-                acceleration,
-                governed_push.as_ref(),
-            )
-            .await?;
+            } = settle_governed_push(governed_push.as_ref(), push_result).await?;
 
             if advanced {
                 instrument_provider

@@ -48,7 +48,8 @@ pub struct Lock {
     pub locked_at: ::core::option::Option<::prost_types::Timestamp>,
     /// FORK-LOCAL (Tideshift, CR-030/WP-120). The 32-byte ownership token minted
     /// for this row, returned ONLY to the caller that just acquired or renewed it
-    /// (Lock and AdminLock responses).
+    /// (Lock and AdminLock responses), or recovering its own exact committed
+    /// acquire or administrative acquire attempt through DomainOperationAttemptReceiptGet.
     ///
     /// Deliberately empty on Query and Status. Those read every lock in a
     /// repository, including other people's, and a token is the bearer secret that

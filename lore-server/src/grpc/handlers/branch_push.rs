@@ -145,7 +145,10 @@ pub async fn handler(
     // before it is rejected (INV-EE P2-10).
     if revision.is_zero() {
         warn!("Invalid branch push request, revision is zero");
-        return Err(Status::invalid_argument("Invalid revision"));
+        return Err(carried_push_preparation_error(
+            admitted.as_ref(),
+            Status::invalid_argument("Invalid revision"),
+        ));
     }
 
     let fenced_coordinator = domain_context.and_then(|domain| domain.lock_coordinator().cloned());
@@ -190,53 +193,66 @@ pub async fn handler(
 
             let mut hook_ctx = ctx_builder.build();
 
-            hook_dispatcher
-                .dispatch_pre(HookPoint::BranchPush, &hook_ctx)
-                .map_err(hook_error_to_status)?;
+            let push_result = async {
+                hook_dispatcher
+                    .dispatch_pre(HookPoint::BranchPush, &hook_ctx)
+                    .map_err(hook_error_to_status)?;
 
-            // On a fenced cell the coordinator is the only authority that can
-            // read a lock's verified owner pair, so it checks every push,
-            // governed or not, and the legacy subject-only guard is skipped.
-            // Off a fenced cell CR-019's opt-in guard applies: `Some` only when
-            // the `enforce_locks_on_push` feature is on AND a lock store exists;
-            // absent → no behavior change (Lore's default advisory semantics).
-            if let Some(coordinator) = fenced_coordinator.as_ref() {
-                let pusher = match governed_push.as_ref() {
-                    Some(governed) => governed.owner.clone(),
-                    None => push_lock_guard::verified_push_owner(request_authorization.as_ref())?,
-                };
-                enforce_fenced_locks(coordinator, repository.clone(), branch, revision, &pusher)
+                // On a fenced cell the coordinator is the only authority that can
+                // read a lock's verified owner pair, so it checks every push,
+                // governed or not, and the legacy subject-only guard is skipped.
+                // Off a fenced cell CR-019's opt-in guard applies: `Some` only when
+                // the `enforce_locks_on_push` feature is on AND a lock store exists;
+                // absent → no behavior change (Lore's default advisory semantics).
+                if let Some(coordinator) = fenced_coordinator.as_ref() {
+                    let pusher = match governed_push.as_ref() {
+                        Some(governed) => governed.owner.clone(),
+                        None => {
+                            push_lock_guard::verified_push_owner(request_authorization.as_ref())?
+                        }
+                    };
+                    enforce_fenced_locks(
+                        coordinator,
+                        repository.clone(),
+                        branch,
+                        revision,
+                        &pusher,
+                    )
                     .await?;
-            } else if let Some(enforcement) = lock_enforcement {
-                let pusher = push_lock_guard::verified_push_owner(request_authorization.as_ref())?;
-                push_lock_guard::enforce_push_locks(
+                } else if let Some(enforcement) = lock_enforcement {
+                    let pusher =
+                        push_lock_guard::verified_push_owner(request_authorization.as_ref())?;
+                    push_lock_guard::enforce_push_locks(
+                        repository.clone(),
+                        enforcement,
+                        branch,
+                        revision,
+                        &pusher,
+                    )
+                    .await?;
+                }
+
+                push_with_governance(
                     repository.clone(),
-                    enforcement,
                     branch,
                     revision,
-                    &pusher,
+                    bypass_protection,
+                    force,
+                    fast_forward_merge,
+                    history_step_size,
+                    acceleration,
+                    governed_push.as_ref(),
                 )
-                .await?;
+                .await
             }
-
+            .await;
             let PushResult {
                 success,
                 advanced,
                 fast_forward_merged,
                 revision,
                 revision_number,
-            } = push_with_governance(
-                repository.clone(),
-                branch,
-                revision,
-                bypass_protection,
-                force,
-                fast_forward_merge,
-                history_step_size,
-                acceleration,
-                governed_push.as_ref(),
-            )
-            .await?;
+            } = settle_governed_push(governed_push.as_ref(), push_result).await?;
 
             if advanced {
                 lore_spawn!({
@@ -358,6 +374,30 @@ pub struct PushResult {
     pub revision_number: u64,
 }
 
+/// Return a refusal only once the exact publication receipt proves it terminal.
+pub(crate) async fn settle_governed_push(
+    governed: Option<&GovernedPushCommit>,
+    result: Result<PushResult, Status>,
+) -> Result<PushResult, Status> {
+    if result.as_ref().is_ok_and(|push| push.success) {
+        return result;
+    }
+    let Some(governed) = governed else {
+        return result;
+    };
+    match governed
+        .domain
+        .store()
+        .branch_push_refuse(&governed.operation)
+        .await
+    {
+        Ok(DomainOutcome::NotApplied { .. }) => result,
+        // A lost publication response can reach here after Applied. Do not
+        // fabricate its response or turn it into a decisive local refusal.
+        Ok(DomainOutcome::Applied) | Err(_) => Err(unknown_push_refusal()),
+    }
+}
+
 /// Preflight state consumed exactly once at the final publication boundary.
 pub(crate) struct GovernedPushCommit {
     domain: Arc<DomainContext>,
@@ -382,6 +422,66 @@ pub(crate) struct GovernedPushCommit {
 /// Capture SCHEMA-117's witness independently of CR-019 and prepare the
 /// governed final-push call when operation identity is present.
 pub(crate) async fn prepare_governed_push(
+    domain: Option<&Arc<DomainContext>>,
+    admitted: Option<AdmittedOperation>,
+    repository_id: RepositoryId,
+    branch_id: BranchId,
+    requested_revision: Hash,
+    force: bool,
+    fast_forward_merge: bool,
+) -> Result<Option<GovernedPushCommit>, Status> {
+    let carried = admitted.as_ref().is_some_and(|operation| {
+        matches!(operation.source, crate::domain::AdmissionSource::Carried(_))
+    });
+    prepare_governed_push_inner(
+        domain,
+        admitted,
+        repository_id,
+        branch_id,
+        requested_revision,
+        force,
+        fast_forward_merge,
+    )
+    .await
+    .map_err(|status| {
+        if carried {
+            unknown_push_refusal()
+        } else {
+            status
+        }
+    })
+}
+
+pub(crate) fn carried_push_preparation_error(
+    admitted: Option<&AdmittedOperation>,
+    status: Status,
+) -> Status {
+    if admitted.is_some_and(|operation| {
+        matches!(operation.source, crate::domain::AdmissionSource::Carried(_))
+    }) {
+        unknown_push_refusal()
+    } else {
+        status
+    }
+}
+
+fn unknown_push_refusal() -> Status {
+    crate::grpc::map_domain_error_to_status(
+        &lore_postgres::domain::errors::DomainError::OutcomeUnknown(
+            "branch push refusal could not be proved".to_owned(),
+        ),
+    )
+}
+
+fn push_store_refusal(stage: &'static str, status: Status) -> Status {
+    // The active execution span carries correlation. Keep this discriminator
+    // fixed and bounded: no request bodies, ownership tokens or provider keys.
+    warn!(stage, code = ?status.code(), "Branch push store admission refused");
+    status
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_governed_push_inner(
     domain: Option<&Arc<DomainContext>>,
     admitted: Option<AdmittedOperation>,
     repository_id: RepositoryId,
@@ -709,7 +809,8 @@ pub(crate) async fn push_with_governance(
     // Verify the validity of the revision to push to latest
     let state = State::deserialize(repository.clone(), latest)
         .await
-        .filter_slow_down()?
+        .filter_slow_down()
+        .map_err(|status| push_store_refusal("state_load", status))?
         .warn_map_err(|err| {
             if err.is_not_found() {
                 Status::not_found(format!(
@@ -772,7 +873,8 @@ pub(crate) async fn push_with_governance(
 
         let state_parent = State::deserialize(repository.clone(), state.parent_self())
             .await
-            .filter_slow_down()?
+            .filter_slow_down()
+            .map_err(|status| push_store_refusal("parent_load", status))?
             .warn_map_err(|err| {
                 Status::internal(format!("Failed to load incoming state: {err}"))
             })?;
@@ -782,7 +884,8 @@ pub(crate) async fn push_with_governance(
         if !state.parent_other().is_zero() {
             let state_parent = State::deserialize(repository.clone(), state.parent_other())
                 .await
-                .filter_slow_down()?
+                .filter_slow_down()
+                .map_err(|status| push_store_refusal("other_parent_load", status))?
                 .warn_map_err(|err| {
                     Status::internal(format!("Failed to load other parent state: {err}"))
                 })?;
@@ -889,7 +992,8 @@ async fn try_fast_forward_merge(
     // client could reference fragments that were never fully uploaded.
     let base_state = State::deserialize(repository.clone(), original_base)
         .await
-        .filter_slow_down()?
+        .filter_slow_down()
+        .map_err(|status| push_store_refusal("merge_base_load", status))?
         .warn_map_err(|err| {
             Status::internal(format!(
                 "Failed to load base state for fragment verification: {err}"
@@ -941,7 +1045,8 @@ async fn try_fast_forward_merge(
         // Deserialize the current head state to use as base for the new merge revision
         let state_current = State::deserialize(repository.clone(), current_head)
             .await
-            .filter_slow_down()?
+            .filter_slow_down()
+            .map_err(|status| push_store_refusal("merge_current_load", status))?
             .warn_map_err(|err| {
                 Status::internal(format!(
                     "Failed to deserialize current head for fast-forward merge: {err}"
@@ -969,7 +1074,8 @@ async fn try_fast_forward_merge(
         let state_current_number = {
             let parent_state = State::deserialize(repository.clone(), current_head)
                 .await
-                .filter_slow_down()?
+                .filter_slow_down()
+                .map_err(|status| push_store_refusal("merge_parent_load", status))?
                 .warn_map_err(|err| {
                     Status::internal(format!("Failed to load current head state: {err}"))
                 })?;
@@ -1192,7 +1298,7 @@ async fn verify_fragments(
     )
     .instrument(span!(Level::DEBUG, "collect_new_fragments"))
     .await
-    .filter_slow_down()?
+    .filter_slow_down().map_err(|status| push_store_refusal("fragment_collect", status))?
     .warn_map_err(|err| {
         if let Some(converted_error) = err.as_address_not_found() {
             return Status::not_found(format!(

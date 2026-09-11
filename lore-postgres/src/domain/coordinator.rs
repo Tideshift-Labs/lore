@@ -744,6 +744,17 @@ pub trait DomainTransactionStore: Send + Sync {
         input: &BranchPushCommitInput,
     ) -> Result<MutationResult, DomainError>;
 
+    /// Close a failed branch push against the exact receipt used by publication.
+    /// Existing terminal outcomes are preserved. An unprovable refusal is unknown.
+    async fn branch_push_refuse(
+        &self,
+        _operation: &GovernedOperation,
+    ) -> Result<DomainOutcome, DomainError> {
+        Err(DomainError::OutcomeUnknown(
+            "branch push refusal is unavailable".to_owned(),
+        ))
+    }
+
     /// Increment a repository's generation as the obliteration fence.
     ///
     /// Called by the immutable-lifecycle package's obliteration-begin
