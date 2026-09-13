@@ -1822,7 +1822,10 @@ async fn configure_notification(
     notification_settings: &Option<NotificationSettings>,
     immutable_store: Option<&Arc<dyn ImmutableStore>>,
     plugins: &HashMap<String, toml::Value>,
-    durable_receiver: Option<crate::event_relay::wiring::DurableReceiverWiring>,
+    durable_receiver: Option<(
+        crate::event_relay::wiring::DurableReceiverWiring,
+        tokio::sync::watch::Receiver<bool>,
+    )>,
 ) -> Result<(
     Arc<dyn NotificationSender>,
     Option<NotificationService>,
@@ -1858,7 +1861,9 @@ async fn configure_notification(
 
             let mut receiver_readiness = None;
             let output = match durable_receiver {
-                Some(wiring) if plugin_name == crate::plugins::remote_notification::PLUGIN_NAME => {
+                Some((wiring, shutdown))
+                    if plugin_name == crate::plugins::remote_notification::PLUGIN_NAME =>
+                {
                     // Deliberately not through the registry. The factory trait
                     // returns a plugin and nothing else, and the receiver's
                     // readiness facet has to reach the relay's readiness
@@ -1870,6 +1875,7 @@ async fn configure_notification(
                             &plugin_config,
                             wiring.transport,
                             wiring.runtime,
+                            shutdown,
                         )
                         .map_err(|e| {
                             anyhow::anyhow!(
@@ -1905,7 +1911,8 @@ async fn configure_notification(
             // Spawn background tasks for the receiver tasks from the plugin.
             // With a durable receiver attached this is two tasks rather than
             // one: the live-hint worker and the receiver, both owned by the
-            // server's `JoinSet` and both stopped by the same shutdown.
+            // server's `JoinSet`. The durable receiver observes shutdown;
+            // the live-hint worker drains when its sender handles are dropped.
             for task in output.receivers {
                 lore_spawn!(endpoints, async move {
                     task.await.map_err(|e| {
@@ -2471,7 +2478,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             &settings.plugins,
             event_relay_prepared
                 .as_ref()
-                .and_then(|prepared| prepared.durable_receiver()),
+                .and_then(|prepared| prepared.durable_receiver())
+                .map(|wiring| (wiring, _shutdown_rx.clone())),
         )
         .await?;
 

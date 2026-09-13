@@ -130,6 +130,7 @@ async fn local_mode_is_refused_before_any_gateway_client_or_receiver_is_built() 
     let store = InMemoryReceiverStore::new("sfo3-cell-a");
     let stream = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 900);
     let target = RecordingInvalidationTarget::new();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let receiver_err = match create_with_receiver(
         &config,
         Arc::new(gateway.clone()),
@@ -138,6 +139,7 @@ async fn local_mode_is_refused_before_any_gateway_client_or_receiver_is_built() 
             stream: Arc::new(stream),
             target: Arc::new(target),
         },
+        shutdown_rx,
     ) {
         Err(error) => error,
         Ok(_) => panic!("local mode must not accept a receiver runtime either"),
@@ -164,15 +166,17 @@ async fn remote_mode_spawns_a_durable_receiver_that_reaches_readiness() {
     let store = InMemoryReceiverStore::new("sfo3-cell-a");
     let stream = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 900);
     let target = RecordingInvalidationTarget::new();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let (plugin, sender, readiness) = create_with_receiver(
         &remote_config(),
         Arc::new(gateway.clone()),
         ReceiverRuntime {
-            store: Arc::new(store),
+            store: Arc::new(store.clone()),
             stream: Arc::new(stream),
             target: Arc::new(target),
         },
+        shutdown_rx,
     )
     .expect("remote mode builds a receiver runtime");
 
@@ -186,11 +190,10 @@ async fn remote_mode_spawns_a_durable_receiver_that_reaches_readiness() {
         "a receiver that has not bootstrapped yet must not read as ready"
     );
 
-    let mut receivers = plugin.receivers;
-    let receiver_task = receivers.remove(1);
-    drop(receivers); // the unpolled live-hint worker future is simply dropped, unstarted
-    drop(sender);
-    let receiver_handle = lore_base::lore_spawn!(receiver_task);
+    let mut tasks = tokio::task::JoinSet::new();
+    for receiver in plugin.receivers {
+        lore_base::lore_spawn!(tasks, receiver);
+    }
 
     let reached_ready = wait_until(|| readiness.is_ready(), Duration::from_secs(5)).await;
     assert!(
@@ -199,7 +202,75 @@ async fn remote_mode_spawns_a_durable_receiver_that_reaches_readiness() {
     );
     assert_eq!(readiness.snapshot().generation, Some(1));
 
-    receiver_handle.abort();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), tasks.join_next())
+            .await
+            .is_err(),
+        "an idle receiver and live sender must remain running before shutdown"
+    );
+    shutdown_tx
+        .send(true)
+        .expect("receiver still observes shutdown");
+    sender.begin_drain();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut completed = 0;
+        while let Some(result) = tasks.join_next().await {
+            result
+                .expect("receiver must finish without abort")
+                .expect("receiver succeeds");
+            completed += 1;
+        }
+        assert_eq!(completed, 2, "both factory workers must finish");
+    })
+    .await
+    .expect("factory workers must finish within the shutdown budget");
+    assert_eq!(readiness.snapshot().reason, Some("stopped"));
+    drop(sender);
+    drop(plugin.sender);
+}
+
+#[tokio::test]
+async fn shutdown_before_start_does_not_bootstrap_a_receiver() {
+    receiver_shutdown_before_start(true).await;
+}
+
+#[tokio::test]
+async fn a_closed_shutdown_channel_stops_the_factory_receiver() {
+    receiver_shutdown_before_start(false).await;
+}
+
+async fn receiver_shutdown_before_start(signalled: bool) {
+    let store = InMemoryReceiverStore::new("sfo3-cell-a");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(signalled);
+    let (plugin, sender, readiness) = create_with_receiver(
+        &remote_config(),
+        Arc::new(FakeGateway::accepting()),
+        ReceiverRuntime {
+            store: Arc::new(store.clone()),
+            stream: Arc::new(FakeDurableStream::at(
+                StreamPlacement::new("DURABLE-sfo3-cell-a", 8),
+                900,
+            )),
+            target: Arc::new(RecordingInvalidationTarget::new()),
+        },
+        shutdown_rx,
+    )
+    .expect("factory builds");
+    if !signalled {
+        drop(shutdown_tx);
+    }
+    sender.begin_drain();
+    for receiver in plugin.receivers {
+        tokio::time::timeout(Duration::from_secs(2), receiver)
+            .await
+            .expect("pre-start shutdown must finish promptly")
+            .expect("normal shutdown succeeds");
+    }
+    assert_eq!(readiness.snapshot().reason, Some("stopped"));
+    assert!(
+        store.calls().is_empty(),
+        "shutdown before start must not bootstrap"
+    );
 }
 
 /// `local-shadow-remote`'s shadow branch publishes `SHADOW_OBSERVATION` and

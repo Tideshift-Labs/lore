@@ -108,6 +108,8 @@ pub fn create_with_transport(
 /// receiver task comes back as a second entry in `NotificationPlugin.receivers`
 /// so the server's `JoinSet` owns its lifecycle exactly as it owns the live-hint
 /// worker's.
+/// The shutdown signal lets the receiver finish its current work and checkpoint
+/// before returning to that join set.
 ///
 /// Returns the plugin, the concrete sender, and the receiver's readiness facet
 /// — which is a handle rather than a value, so an aggregator can keep reading
@@ -119,6 +121,7 @@ pub fn create_with_receiver(
     config: &toml::Value,
     transport: std::sync::Arc<dyn PublishTransport>,
     runtime: ReceiverRuntime,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<
     (
         NotificationPlugin,
@@ -139,8 +142,13 @@ pub fn create_with_receiver(
         .into_plugin_error(PLUGIN_NAME));
     }
     let client = PrivateGatewayClient::with_transport(&config, transport);
-    let (plugin, sender, readiness) =
-        build_plugin_with_readiness(&config, client, PluginMode::Remote, Some(runtime));
+    let (plugin, sender, readiness) = build_plugin_with_readiness(
+        &config,
+        client,
+        PluginMode::Remote,
+        Some(runtime),
+        Some(shutdown),
+    );
     let readiness = readiness.ok_or_else(|| {
         RemoteNotificationError::field(
             "receiver",
@@ -193,7 +201,7 @@ fn build_plugin(
     NotificationPlugin,
     std::sync::Arc<sender::RemoteNotificationSender>,
 ) {
-    let (plugin, sender, _) = build_plugin_with_readiness(config, client, mode, runtime);
+    let (plugin, sender, _) = build_plugin_with_readiness(config, client, mode, runtime, None);
     (plugin, sender)
 }
 
@@ -202,6 +210,7 @@ fn build_plugin_with_readiness(
     client: PrivateGatewayClient,
     mode: PluginMode,
     runtime: Option<ReceiverRuntime>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> (
     NotificationPlugin,
     std::sync::Arc<sender::RemoteNotificationSender>,
@@ -224,7 +233,10 @@ fn build_plugin_with_readiness(
             match DurableReceiver::new(config, runtime) {
                 Some(receiver) => {
                     readiness = Some(receiver.readiness());
-                    receivers.push(Box::pin(receiver.run()));
+                    receivers.push(match shutdown {
+                        Some(shutdown) => Box::pin(receiver.run_with_shutdown(shutdown)),
+                        None => Box::pin(receiver.run()),
+                    });
                 }
                 None => tracing::warn!(
                     "a durable receiver runtime was supplied but no `[plugins.remote.receiver]` \

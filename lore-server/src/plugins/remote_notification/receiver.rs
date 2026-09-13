@@ -453,6 +453,28 @@ impl DurableReceiver {
         self.cancel.clone()
     }
 
+    /// Observe the server shutdown signal and finish through the normal
+    /// cancellation path, including the final checkpoint of accepted work.
+    ///
+    /// # Errors
+    /// Returns any error from [`Self::run`].
+    pub async fn run_with_shutdown(
+        self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), PluginError> {
+        let cancel = self.cancellation_token();
+        let run = self.run();
+        tokio::pin!(run);
+        tokio::select! {
+            biased;
+            // A dropped signal owner also ends this receiver. Treat channel
+            // closure like shutdown, matching the server endpoint listeners.
+            _ = shutdown.wait_for(|&value| value) => cancel.cancel(),
+            result = &mut run => return result,
+        }
+        run.await
+    }
+
     /// The receiver identity this task binds to.
     pub fn receiver_identity(&self) -> &str {
         &self.receiver.membership_identity
@@ -2243,6 +2265,52 @@ mod tests {
         let cancel = harness.receiver.cancellation_token();
         cancel.cancel();
         assert!(harness.receiver.run().await.is_ok());
+        assert_eq!(readiness.snapshot().reason, Some(REASON_STOPPED));
+    }
+
+    #[tokio::test]
+    async fn shutdown_checkpoints_an_applied_event_before_returning() {
+        let mut harness = harness(900);
+        harness.receiver.receiver.checkpoint_interval = Duration::from_secs(60);
+        let readiness = harness.receiver.readiness();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let run = harness.receiver.run_with_shutdown(shutdown_rx);
+        tokio::pin!(run);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    result = &mut run => panic!("receiver stopped before shutdown: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+                if readiness.is_ready() {
+                    break;
+                }
+            }
+            harness.stream.push_envelope(900, durable(0x9f, 1, None));
+            while harness.stream.acked().is_empty() {
+                tokio::select! {
+                    result = &mut run => panic!("receiver stopped before application: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+            }
+        })
+        .await
+        .expect("receiver must apply the event");
+        let before_shutdown = harness.store.calls().len();
+        shutdown_tx.send(true).expect("receiver observes shutdown");
+        tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("receiver must finish promptly")
+            .expect("shutdown succeeds");
+        assert_eq!(harness.stream.acked(), vec![900]);
+        assert!(
+            harness.store.calls()[before_shutdown..]
+                .iter()
+                .any(|call| matches!(
+                    call, StoreCall::Checkpoint(report) if report.contiguous_frontier == 900
+                )),
+            "shutdown must persist the accepted frontier before returning"
+        );
         assert_eq!(readiness.snapshot().reason, Some(REASON_STOPPED));
     }
 
