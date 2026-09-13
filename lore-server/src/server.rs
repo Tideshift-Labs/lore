@@ -724,6 +724,7 @@ async fn launch_grpc_server(
             forwarded_requests,
         )
         .with_caller_capability_policy(grpc_settings.caller_capability_policy)
+        .with_drain_state(graceful_drain.then(|| drain_state.clone()))
         .with_jwt_verifier(jwt_verifier, enforce_write_permission)?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
@@ -734,8 +735,7 @@ async fn launch_grpc_server(
             // the in-flight work the drain exists to protect.
             if graceful_drain {
                 info!("Draining gRPC server: serving until active transfers finish");
-                drain_state.wait_idle().await;
-                info!("gRPC server drained");
+                drain_state.wait_quic_idle().await;
             }
         })
         .await
@@ -937,7 +937,7 @@ async fn launch_http_server(
         async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
             // Under graceful drain, keep the health/status surface up until
-            // the QUIC endpoints are empty so the load balancer keeps seeing
+            // QUIC and public gRPC work have finished so the load balancer keeps seeing
             // the draining 503 and a deploy controller can poll
             // /drain_status through the whole drain.
             if graceful_drain {

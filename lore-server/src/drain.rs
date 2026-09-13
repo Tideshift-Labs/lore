@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! Graceful-drain support for the QUIC endpoints.
+//! Graceful-drain support for QUIC endpoints and public gRPC work.
 //!
 //! When `[server] graceful_drain = true`, a shutdown signal stops the QUIC
 //! accept loops from admitting new connections but lets established
@@ -193,12 +193,14 @@ impl<C> Drop for HandshakeGuard<C> {
     }
 }
 
-/// Aggregate drain view across all QUIC endpoints of the process. Feeds the
+/// Aggregate drain view across QUIC endpoints and public RPCs. Feeds the
 /// `/health_check` 503, the `/drain_status` JSON, and the drain gauges.
 #[derive(Default)]
 pub struct DrainState {
     draining: AtomicBool,
     registries: Mutex<Vec<Arc<QuinnConnectionRegistry>>>,
+    active_rpc_requests: AtomicU64,
+    public_grpc_servers: AtomicU64,
 }
 
 impl DrainState {
@@ -220,9 +222,8 @@ impl DrainState {
         self.draining.load(Ordering::Relaxed)
     }
 
-    /// Established connections plus pending handshakes across all endpoints,
-    /// so `wait_idle` (and the status surface) cannot report empty while a
-    /// connection is mid-handshake.
+    /// QUIC connections plus pending handshakes across all endpoints. RPCs have
+    /// their own counter; this legacy connection count alone cannot prove idle.
     pub fn total_active(&self) -> u64 {
         self.lock_registries()
             .iter()
@@ -237,8 +238,55 @@ impl DrainState {
             .collect()
     }
 
-    /// Resolves once no endpoint holds an active connection.
+    /// Public RPCs whose handler or response body is still live.
+    pub fn active_rpc_requests(&self) -> u64 {
+        self.active_rpc_requests.load(Ordering::Acquire)
+    }
+
+    pub fn begin_rpc(self: &Arc<Self>) -> RpcGuard {
+        self.active_rpc_requests.fetch_add(1, Ordering::AcqRel);
+        RpcGuard {
+            state: self.clone(),
+        }
+    }
+
+    /// Keep HTTP drain status available until tonic has stopped admitting calls
+    /// and its server future has completed. An instantaneous zero RPC count is
+    /// not an admission barrier.
+    pub fn register_public_grpc(self: &Arc<Self>) -> PublicGrpcGuard {
+        self.public_grpc_servers.fetch_add(1, Ordering::AcqRel);
+        PublicGrpcGuard {
+            state: self.clone(),
+        }
+    }
+
+    /// A zero request count alone is not proof that gRPC admission has ended.
+    pub fn is_drained(&self) -> bool {
+        self.is_draining() && self.is_idle()
+    }
+
+    fn is_idle(&self) -> bool {
+        self.total_active() == 0
+            && self.public_grpc_servers.load(Ordering::Acquire) == 0
+            && self.active_rpc_requests() == 0
+    }
+
+    /// Resolves after QUIC, public gRPC serving, and all counted RPC work ends.
     pub async fn wait_idle(&self) {
+        let mut ticker = tokio::time::interval(WAIT_IDLE_TICK);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            if self.is_idle() {
+                return;
+            }
+            ticker.tick().await;
+        }
+    }
+
+    /// Keep public gRPC available for QUIC finalization, then let tonic close
+    /// admission and finish its accepted calls. Waiting for the public server
+    /// itself here would deadlock its shutdown future.
+    pub async fn wait_quic_idle(&self) {
         let mut ticker = tokio::time::interval(WAIT_IDLE_TICK);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
@@ -255,6 +303,44 @@ impl DrainState {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+}
+
+pub struct RpcGuard {
+    state: Arc<DrainState>,
+}
+
+impl Drop for RpcGuard {
+    fn drop(&mut self) {
+        self.state
+            .active_rpc_requests
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub struct PublicGrpcGuard {
+    state: Arc<DrainState>,
+}
+
+impl PublicGrpcGuard {
+    pub(crate) fn active_requests(&self) -> u64 {
+        self.state.active_rpc_requests()
+    }
+
+    pub(crate) async fn wait_for_requests(&self) {
+        let mut ticker = tokio::time::interval(WAIT_IDLE_TICK);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        while self.active_requests() != 0 {
+            ticker.tick().await;
+        }
+    }
+}
+
+impl Drop for PublicGrpcGuard {
+    fn drop(&mut self) {
+        self.state
+            .public_grpc_servers
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -361,6 +447,7 @@ impl InstrumentProvider for DrainInstrumentProvider {
 
 struct DrainInstruments {
     active_connections: Gauge<u64>,
+    active_rpc_requests: Gauge<u64>,
     draining: Gauge<u64>,
 }
 
@@ -371,6 +458,7 @@ impl DrainInstruments {
             let provider = DrainInstrumentProvider;
             DrainInstruments {
                 active_connections: provider.gauge("drain.active_connections"),
+                active_rpc_requests: provider.gauge("drain.active_rpc_requests"),
                 draining: provider.gauge("drain.draining"),
             }
         })
@@ -378,7 +466,7 @@ impl DrainInstruments {
 }
 
 /// Periodically records the aggregate drain gauges (per-endpoint active
-/// connections and the draining flag) so a deploy controller can also watch
+/// connections, public RPC requests and the draining flag) so a deploy controller can also watch
 /// the drain through the metrics pipeline.
 pub fn spawn_drain_metrics(state: Arc<DrainState>, interval: Duration) {
     lore_spawn!(async move {
@@ -388,6 +476,9 @@ pub fn spawn_drain_metrics(state: Arc<DrainState>, interval: Duration) {
             ticker.tick().await;
             let instruments = DrainInstruments::instance();
             instruments.draining.record(state.is_draining() as u64, &[]);
+            instruments
+                .active_rpc_requests
+                .record(state.active_rpc_requests(), &[]);
             for (endpoint, active) in state.endpoint_counts() {
                 instruments
                     .active_connections
@@ -902,3 +993,7 @@ mod tests {
             .expect("shutdown_signal task panicked");
     }
 }
+
+#[cfg(test)]
+#[path = "drain_rpc_tests.rs"]
+mod rpc_tests;

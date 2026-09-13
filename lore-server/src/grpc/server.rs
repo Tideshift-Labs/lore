@@ -53,6 +53,8 @@ use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
 use crate::correlation::span::MakeCorrelationIdSpan;
 use crate::domain::DomainContext;
+use crate::drain::DrainState;
+use crate::drain::PublicGrpcGuard;
 use crate::grpc::admin_service::LoreAdminService;
 use crate::grpc::domain::v1::LoreDomainOperationV1Service;
 use crate::grpc::environment::LoreEnvironmentV1Service;
@@ -66,6 +68,7 @@ use crate::grpc::revision::LoreRevisionV1Service;
 use crate::grpc::revision_service::LoreRevisionService;
 use crate::grpc::storage_service::LoreStorageService;
 use crate::grpc::thinclient::LoreThinClientV1Service;
+use crate::grpc::tower::drain::GrpcDrainLayer;
 use crate::grpc::tower::grpc_response_trace::GrpcResponseTraceLayer;
 use crate::grpc::tower::tracing::LoreTracingLayer;
 use crate::hooks::HookDispatcher;
@@ -95,7 +98,7 @@ type GrpcRouter = tonic::transport::server::Router<
                             >,
                             CorrelationIdLayer,
                         >,
-                        Stack<CoreHopLayer, tower::layer::util::Identity>,
+                        Stack<GrpcDrainLayer, Stack<CoreHopLayer, tower::layer::util::Identity>>,
                     >,
                 >,
             >,
@@ -573,12 +576,14 @@ impl GrpcServerBuilder<WantsHttp2Config> {
             user_agent_filter,
             forwarded_requests,
             caller_capability_policy: CallerCapabilityPolicy::default(),
+            drain_state: None,
         })
     }
 }
 
 pub struct MaybeJwtVerifier {
     caller_capability_policy: CallerCapabilityPolicy,
+    drain_state: Option<Arc<DrainState>>,
     environment: EnvironmentConfig,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
@@ -600,6 +605,11 @@ pub struct MaybeJwtVerifier {
 }
 
 impl GrpcServerBuilder<MaybeJwtVerifier> {
+    pub fn with_drain_state(mut self, state: Option<Arc<DrainState>>) -> Self {
+        self.0.drain_state = state;
+        self
+    }
+
     pub fn with_caller_capability_policy(mut self, policy: CallerCapabilityPolicy) -> Self {
         self.0.caller_capability_policy = policy;
         self
@@ -830,10 +840,16 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             config.grpc_codes_as_success.push(GrpcCode::Unauthenticated);
             config
         };
+        let public_grpc_guard = self
+            .0
+            .drain_state
+            .as_ref()
+            .map(DrainState::register_public_grpc);
         let mut router = server
             // Outermost, so everything inward runs on core: this stack is served
             // from net.
             .layer(CoreHopLayer)
+            .layer(GrpcDrainLayer(self.0.drain_state))
             .layer(
                 CorrelationIdLayerBuilder::new()
                     .with_grpc_tracer(trace_layer_config)
@@ -952,12 +968,34 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                 ));
             }
         }
-        Ok(GrpcServerBuilder(WantsAddress { router }))
+        Ok(GrpcServerBuilder(WantsAddress {
+            router,
+            public_grpc_guard,
+        }))
     }
 }
 
 pub struct WantsAddress {
     router: GrpcRouter,
+    public_grpc_guard: Option<PublicGrpcGuard>,
+}
+
+/// Runs on net with tonic itself. Cancelling the caller's join handle must not
+/// drop this registration while the detached server can still admit requests.
+pub(crate) async fn serve_with_drain_guard<T>(
+    guard: Option<PublicGrpcGuard>,
+    serving: impl Future<Output = T>,
+) -> T {
+    let result = serving.await;
+    if let Some(guard) = guard {
+        // CoreHop handlers can outlive a cancelled transport future.
+        guard.wait_for_requests().await;
+        info!(
+            active_rpc_requests = guard.active_requests(),
+            "gRPC server drained"
+        );
+    }
+    result
 }
 
 impl GrpcServerBuilder<WantsAddress> {
@@ -969,8 +1007,11 @@ impl GrpcServerBuilder<WantsAddress> {
         addr: SocketAddr,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
-        lore_spawn_net!(async move { self.0.router.serve_with_shutdown(addr, signal).await })
-            .await??;
+        lore_spawn_net!(serve_with_drain_guard(
+            self.0.public_grpc_guard,
+            async move { self.0.router.serve_with_shutdown(addr, signal).await }
+        ))
+        .await??;
         Ok(())
     }
 
@@ -990,18 +1031,21 @@ impl GrpcServerBuilder<WantsAddress> {
         listener: std::net::TcpListener,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
-        lore_spawn_net!(async move {
-            listener.set_nonblocking(true)?;
-            let listener = tokio::net::TcpListener::from_std(listener)?;
-            self.0
-                .router
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    signal,
-                )
-                .await
-                .map_err(anyhow::Error::from)
-        })
+        lore_spawn_net!(serve_with_drain_guard(
+            self.0.public_grpc_guard,
+            async move {
+                listener.set_nonblocking(true)?;
+                let listener = tokio::net::TcpListener::from_std(listener)?;
+                self.0
+                    .router
+                    .serve_with_incoming_shutdown(
+                        tokio_stream::wrappers::TcpListenerStream::new(listener),
+                        signal,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+        ))
         .await??;
         Ok(())
     }
