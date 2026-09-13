@@ -69,6 +69,13 @@ const MAX_METADATA_VALUE_BYTES: usize = 4 * 1_024 * 1_024;
 const MAX_BINARY_METADATA_PAYLOAD_BYTES: u64 = 64 * 1_024 * 1_024;
 const MAX_AGGREGATE_INPUT_BYTES: usize = 64 * 1_024 * 1_024;
 
+// Event callbacks run asynchronously. Fault tests need a per-task boundary after
+// staging has finished and before the commit path reads selected file content.
+#[cfg(test)]
+tokio::task_local! {
+    static AFTER_EXACT_STAGE: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>>;
+}
+
 /// Effective file action authorized by an exact-selection caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1539,6 +1546,13 @@ pub async fn commit_exact_selection(
     .await
     .map_err(|err| ExactSelectionError::internal("staging exact selection", err))?;
 
+    #[cfg(test)]
+    let _ = AFTER_EXACT_STAGE.try_with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+
     // Even an empty/restored-to-base staging pass must enter admission with the
     // current revision as its parent. A freshly deserialized current state still
     // names its own historical parent, which the ordinary commit path correctly
@@ -2815,5 +2829,55 @@ mod tests {
                 );
             })
             .await;
+    }
+    #[allow(clippy::disallowed_methods)] // Remove only the isolated fixture's selected Add.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn vanished_add_after_stage_rejects_before_fragmentation_and_preserves_anchors() {
+        LORE_CONTEXT.scope(store_order_execution(), async {
+            let (_tempdir, repository, token, root, branch, armed, triggered) =
+                build_exact_selection_store_order_fixture().await;
+            assert!(!armed.load(Ordering::SeqCst));
+            let added = b"vanishing add\n";
+            let path = root.join("vanish.bin");
+            std::fs::write(&path, added).expect("write selected Add");
+            let before = vanished_add_anchors(&repository, branch).await;
+            let removed = Arc::new(AtomicBool::new(false));
+            let hook_removed = removed.clone();
+            let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+                std::fs::remove_file(path).expect("remove selected Add synchronously after stage");
+                hook_removed.store(true, Ordering::SeqCst);
+            });
+            let error = AFTER_EXACT_STAGE.scope(std::cell::RefCell::new(Some(hook)),
+                commit_exact_selection(repository.clone(), &token, ExactSelectionOptions {
+                    message: "vanished Add".to_string(),
+                    files: vec![exact_add("vanish.bin", added)],
+                    revision_metadata: Vec::new(),
+                    stats: false,
+                })
+            ).await.expect_err("Add removed after staging must reject");
+            assert!(removed.load(Ordering::SeqCst), "post-stage hook must run");
+            assert!(matches!(error.kind(), ExactSelectionErrorKind::PreFragmentationFileRead { path, .. } if path == "vanish.bin"), "unexpected vanished-Add error: {error:?}");
+            assert_eq!(vanished_add_anchors(&repository, branch).await, before);
+            assert!(!triggered.load(Ordering::SeqCst), "no unrelated store fault may fire");
+        }).await;
+    }
+
+    async fn vanished_add_anchors(
+        repository: &Arc<RepositoryContext>,
+        branch: BranchId,
+    ) -> (Hash, Option<Hash>, Hash) {
+        (
+            crate::instance::load_current_anchor(repository)
+                .await
+                .expect("current anchor")
+                .0,
+            crate::instance::load_staged_revision(repository)
+                .await
+                .expect("staged anchor"),
+            branch::load_latest_history(repository.clone(), branch, None)
+                .await
+                .expect("branch latest anchor")
+                .revision,
+        )
     }
 }

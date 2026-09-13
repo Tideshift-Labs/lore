@@ -102,6 +102,20 @@ fn ambiguous_commit_and_dead_sessions_poison_while_retry_sleep_follows_release()
             .expect_err("returning a dead session to the pool must fail this proof");
     assert!(panic_text(failure).contains("every unusable session must poison the lease"));
 
+    for replacement in ["lease.release().await;", "if false { lease.poison(); }"] {
+        let changed = CHARGE_SOURCE.replacen(
+            "            lease.poison();",
+            &format!("            {replacement}"),
+            1,
+        );
+        assert_ne!(
+            changed, CHARGE_SOURCE,
+            "negative control must change lock setup"
+        );
+        std::panic::catch_unwind(|| assert_charge_session_disposition(&changed))
+            .expect_err("lock setup must unconditionally poison an unusable session");
+    }
+
     let rollback_release = CHARGE_SOURCE.replacen(
         "Err(_) => failure.on_unusable_session(),",
         "Err(_) => failure,",
@@ -195,6 +209,20 @@ fn outer_charge_timeout_distinguishes_precommit_from_commit_started_and_retires_
         panic_text(failure).contains("actual COMMIT marker load must feed timeout classification")
     );
 
+    let disconnected_classifier = CHARGE_SOURCE.replacen(
+        "Err(classify_charge_timeout(started))",
+        "Err(classify_charge_timeout(false))",
+        1,
+    );
+    assert_ne!(disconnected_classifier, CHARGE_SOURCE);
+    let failure = std::panic::catch_unwind(|| {
+        assert_charge_timeout_wall(&disconnected_classifier, POOL_SOURCE)
+    })
+    .expect_err("a loaded but unused COMMIT marker must fail this proof");
+    assert!(
+        panic_text(failure).contains("actual COMMIT marker load must feed timeout classification")
+    );
+
     let reusable_timeout = CHARGE_SOURCE.replacen(
         "if matches!(outcome, Err(ChargeExecutionError::SessionUnusable(_))) {\n            lease.poison();",
         "if matches!(outcome, Err(ChargeExecutionError::SessionUnusable(_))) {\n            lease.release().await;",
@@ -207,6 +235,8 @@ fn outer_charge_timeout_distinguishes_precommit_from_commit_started_and_retires_
 }
 
 fn assert_charge_timeout_wall(charge_source: &str, pool_source: &str) {
+    let normalized = without_diagnostic_warnings(charge_source);
+    let charge_source = normalized.as_str();
     let charge_once = section(
         charge_source,
         "async fn charge_once(",
@@ -227,7 +257,7 @@ fn assert_charge_timeout_wall(charge_source: &str, pool_source: &str) {
     assert!(charge_once.contains("let commit_started = AtomicBool::new(false);"));
     assert!(
         charge_once.contains(
-            "Err(_) => Err(classify_charge_timeout(\n                commit_started.load(Ordering::SeqCst),\n            )),"
+            "Err(_) => {\n                let started = commit_started.load(Ordering::SeqCst);\n                Err(classify_charge_timeout(started))\n            }"
         ),
         "the actual COMMIT marker load must feed timeout classification"
     );
@@ -278,6 +308,8 @@ fn assert_charge_timeout_wall(charge_source: &str, pool_source: &str) {
 }
 
 fn assert_charge_session_disposition(source: &str) {
+    let normalized = without_diagnostic_warnings(source);
+    let source = normalized.as_str();
     let charge_once = section(
         source,
         "async fn charge_once(",
@@ -373,4 +405,26 @@ fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
                 .map(|value| (*value).to_string())
         })
         .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+// These guards inspect control flow. Standalone diagnostic macros can be inserted
+// between statements without changing that flow; retain every other source line.
+fn without_diagnostic_warnings(source: &str) -> String {
+    let mut output = String::new();
+    let mut diagnostic = false;
+    for line in source.lines() {
+        if line.trim() == "tracing::warn!(" {
+            assert!(!diagnostic, "nested diagnostic macro");
+            diagnostic = true;
+        } else if diagnostic {
+            if line.trim() == ");" {
+                diagnostic = false;
+            }
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    assert!(!diagnostic, "unterminated diagnostic macro");
+    output
 }

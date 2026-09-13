@@ -1115,6 +1115,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_authz_cache_evicts_seeded_entry() {
+        let _guard = refresh_test_guard().await;
         let key = (
             "https://auth.cr017-test.example".to_string(),
             "identity-cr017".to_string(),
@@ -1134,6 +1135,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_authz_cache_is_noop_when_never_populated() {
+        let _guard = refresh_test_guard().await;
         // `AUTHZ_CACHE` is a process-global `OnceLock` shared with every other
         // test in this crate's test binary, so this can't prove the OnceLock
         // is literally unset when this runs -- it proves the no-op path
@@ -1837,6 +1839,7 @@ mod tests {
     /// stub under its own scheme also keeps this off the network.
     #[tokio::test]
     async fn one_supplied_credential_is_never_served_anothers_authorization() {
+        let _guard = refresh_test_guard().await;
         use crate::error::ProtocolError;
         use crate::traits::Authentication;
         use crate::types::AuthSession;

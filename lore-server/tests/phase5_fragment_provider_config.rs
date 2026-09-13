@@ -232,11 +232,31 @@ fn provider_send_uses_the_five_minute_maximum_while_late_effect_is_independent()
         "provider_late_effect_bound_millis = 4000",
         &format!("provider_late_effect_bound_millis = {FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS}"),
     ));
+    let admission_wait = 30_000;
+    exact
+        .as_table_mut()
+        .expect("root configuration table")
+        .insert(
+            "fragment_charge_admission_wait_millis".to_string(),
+            toml::Value::Integer(admission_wait),
+        );
     exact["object_store"]["timeout_millis"] = toml::Value::Integer(
         i64::try_from(FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS)
-            .expect("shared maximum fits TOML integer"),
+            .expect("shared maximum fits TOML integer")
+            - admission_wait,
     );
-    validate(&exact).expect("the exact shared five-minute maximum must be accepted");
+    validate(&exact)
+        .expect("admission wait plus send at the exact five-minute maximum must be accepted");
+
+    let mut combined_over = exact.clone();
+    combined_over["fragment_charge_admission_wait_millis"] =
+        toml::Value::Integer(admission_wait + 1);
+    let error =
+        validate(&combined_over).expect_err("combined admission and send max+1 must be refused");
+    assert!(
+        error.contains("fragment_charge_admission_wait_millis"),
+        "combined-window refusal was misclassified: {error}"
+    );
 
     let over = FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS + 1;
     let mut invalid_send = exact.clone();

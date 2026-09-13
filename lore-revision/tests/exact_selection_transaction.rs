@@ -1096,54 +1096,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn vanished_add_after_stage_rejects_before_fragmentation_and_preserves_anchors() {
-        LORE_CONTEXT
-            .scope(execution(), async {
-                let fixture = Fixture::new().await;
-                fixture.write("seed.bin", b"seed\n");
-                fixture.seed_commit("baseline").await;
-                let added = b"vanishing add\n";
-                fixture.write("vanish.bin", added);
-                let before = fixture.anchors().await;
-                let vanished = Arc::new(AtomicBool::new(false));
-                let callback_vanished = vanished.clone();
-                let vanish_path = fixture.absolute("vanish.bin");
-                let callback_execution = execution_with_callback(move |event| {
-                    if matches!(event, LoreEvent::FileStageEnd(_))
-                        && !callback_vanished.swap(true, Ordering::SeqCst)
-                    {
-                        std::fs::remove_file(&vanish_path)
-                            .expect("remove Add from FileStageEnd callback");
-                    }
-                });
-
-                let error = LORE_CONTEXT
-                    .scope(callback_execution, async {
-                        fixture
-                            .exact(
-                                "vanished Add",
-                                vec![selected(
-                                    "vanish.bin",
-                                    ExpectedFileAction::Add,
-                                    Some(added),
-                                )],
-                            )
-                            .await
-                    })
-                    .await
-                    .expect_err("Add removed after staging must reject");
-
-                assert!(vanished.load(Ordering::SeqCst), "FileStageEnd callback did not run");
-                assert!(
-                    matches!(error.kind(), ExactSelectionErrorKind::PreFragmentationFileRead { path, .. } if path == "vanish.bin"),
-                    "unexpected vanished-Add error: {error:?}"
-                );
-                assert_eq!(fixture.anchors().await, before);
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn filesystem_mutation_after_fragment_capture_cannot_change_committed_bytes() {
         LORE_CONTEXT
             .scope(execution(), async {
