@@ -16,6 +16,10 @@
 //! 7. commit the terminal receipt in the same transaction, then commit and
 //!    classify the acknowledgement.
 //!
+//! Deletes first lock and validate the receipt without consuming or expiring it.
+//! They check live target state under the domain locks before admission. Absence
+//! or a tombstone leaves receipt state unchanged; recovery is receipt lookup.
+//!
 //! Step 4 is the part most likely to be misread. A losing writer today gets
 //! silence, a swallowed error, or `Status::internal` depending on which of the
 //! 37 call sites it hit (worklog 254 §A.1-A.5). Here it gets one committed,
@@ -200,6 +204,32 @@ fn next_generation(current: i64) -> Result<i64, DomainError> {
 }
 
 impl PostgresDomainStore {
+    /// Preserve receipt-first lock order without admitting a delete before its
+    /// target is known to be live. No receipt is created or changed here.
+    async fn begin_delete<'a>(
+        &self,
+        client: &'a mut deadpool_postgres::Client,
+        operation: &GovernedOperation,
+        sequence: &mut LockSequence,
+    ) -> Result<Option<deadpool_postgres::Transaction<'a>>, DomainError> {
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("delete transaction begin", e))?;
+        sequence.enter(LockClass::OperationReceipt)?;
+        if !receipts::lock_delete_receipt(
+            &tx,
+            &operation.key,
+            &operation.binding,
+            &operation.prepare_token,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(tx))
+    }
+
     /// Opens the governed transaction and resolves the prepared receipt.
     ///
     /// A matching PREPARED row admits the mutation. A committed row returns its
@@ -994,40 +1024,42 @@ impl DomainTransactionStore for PostgresDomainStore {
         validate_pending_events(&input.events, "repository_delete")?;
         let mut client = self.checkout().await?;
         let mut sequence = LockSequence::new();
-        let (tx, clock) = match self
-            .begin_admitted(&mut client, operation, &mut sequence)
+        let Some(tx) = self
+            .begin_delete(&mut client, operation, &mut sequence)
             .await?
-        {
-            BeginAdmitted::Admitted(tx, clock) => (tx, clock),
-            BeginAdmitted::Committed(outcome, public_result) => {
-                return Ok(replayed_mutation(outcome, public_result));
-            }
-            BeginAdmitted::Rejected => {
-                return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
-            }
+        else {
+            return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
         };
 
         let Some(existing) = lock_repository(&tx, &mut sequence, &input.repository_id).await?
         else {
-            let result = MutationResult::rejected(NOT_FOUND_V1);
-            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
-            classify_commit(tx.commit().await, "repository delete not-found commit")?;
-            return Ok(result);
+            return Ok(MutationResult::rejected(NOT_FOUND_V1));
         };
 
         if existing.state == schema::STATE_TOMBSTONED {
-            // The tombstone preserves its record, so an exact delete retry is
-            // idempotent rather than an error.
-            let outcome = DomainOutcome::Applied;
-            receipts::commit_terminal(&tx, &operation.key, &outcome, None, clock).await?;
-            classify_commit(tx.commit().await, "repository delete retry commit")?;
-            return Ok(MutationResult {
-                outcome,
-                repository_generation: Some(existing.generation),
-                branch_generation: None,
-                observed_pointer: None,
-            });
+            return Ok(MutationResult::rejected(NOT_FOUND_V1));
         }
+
+        // The receipt lock is already held. Only a live target may now admit
+        // or terminalize this operation; committed success is lookup-only.
+        let clock = match receipts::consume(
+            &tx,
+            &operation.key,
+            &operation.binding,
+            &operation.prepare_token,
+        )
+        .await?
+        {
+            ConsumeResult::Admitted(admission) => admission.admission_clock,
+            ConsumeResult::Committed { outcome, .. } => {
+                if matches!(outcome, DomainOutcome::Applied) {
+                    return Ok(MutationResult::rejected(NOT_FOUND_V1));
+                }
+                classify_commit(tx.commit().await, "delete terminal admission commit")?;
+                return Ok(replayed_mutation(outcome, None));
+            }
+            ConsumeResult::Rejected => return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1)),
+        };
 
         if let Some(expected) = input.expected_generation
             && expected != existing.generation
@@ -1093,10 +1125,8 @@ impl DomainTransactionStore for PostgresDomainStore {
 
         apply_projection(&tx, &input.projection).await?;
         // One bounded generation event for the whole tombstone, including every
-        // branch this transaction's single `UPDATE` just hid. The exact-retry
-        // arm above returns before reaching here, which is CR-032's "exact
-        // create/delete retry: No new event" enforced in the coordinator rather
-        // than trusted to the caller.
+        // branch this transaction's single `UPDATE` just hid. Tombstoned targets
+        // return before publication; separate receipt lookup emits no event.
         append_events(
             &tx,
             &mut sequence,
@@ -1110,7 +1140,7 @@ impl DomainTransactionStore for PostgresDomainStore {
         .await?;
 
         let outcome = DomainOutcome::Applied;
-        receipts::commit_terminal(&tx, &operation.key, &outcome, None, clock).await?;
+        receipts::commit_delete(&tx, &operation.key, &input.delete_proof, clock).await?;
         classify_commit(tx.commit().await, "repository delete commit")?;
 
         Ok(MutationResult {
@@ -1134,66 +1164,51 @@ impl DomainTransactionStore for PostgresDomainStore {
         validate_pending_events(&input.events, "branch_delete")?;
         let mut client = self.checkout().await?;
         let mut sequence = LockSequence::new();
-        let (tx, clock) = match self
-            .begin_admitted(&mut client, operation, &mut sequence)
+        let Some(tx) = self
+            .begin_delete(&mut client, operation, &mut sequence)
             .await?
-        {
-            BeginAdmitted::Admitted(tx, clock) => (tx, clock),
-            BeginAdmitted::Committed(outcome, public_result) => {
-                return Ok(replayed_mutation(outcome, public_result));
-            }
-            BeginAdmitted::Rejected => {
-                return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
-            }
+        else {
+            return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1));
         };
 
         let Some(repository) = lock_repository(&tx, &mut sequence, &input.repository_id).await?
         else {
-            let result = MutationResult::rejected(NOT_FOUND_V1);
-            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
-            classify_commit(
-                tx.commit().await,
-                "branch delete repository not-found commit",
-            )?;
-            return Ok(result);
+            return Ok(MutationResult::rejected(NOT_FOUND_V1));
         };
         if repository.state == schema::STATE_TOMBSTONED {
-            // A branch of a tombstoned repository is already hidden by the
-            // repository's own tombstone, and resurrecting the branch row to
-            // tombstone it a second time would publish a `branch.deleted` for a
-            // transition the repository event already covered.
-            let result = MutationResult::rejected(TOMBSTONED_V1);
-            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
-            classify_commit(
-                tx.commit().await,
-                "branch delete repository tombstone commit",
-            )?;
-            return Ok(result);
+            return Ok(MutationResult::rejected(NOT_FOUND_V1));
         }
 
         let Some(existing) =
             lock_branch(&tx, &mut sequence, &input.repository_id, &input.branch_id).await?
         else {
-            let result = MutationResult::rejected(NOT_FOUND_V1);
-            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
-            classify_commit(tx.commit().await, "branch delete not-found commit")?;
-            return Ok(result);
+            return Ok(MutationResult::rejected(NOT_FOUND_V1));
         };
 
         if existing.state == schema::STATE_TOMBSTONED {
-            // The tombstone preserves its record, so an exact delete retry is
-            // idempotent rather than an error — and returns before the append
-            // step, so the retry emits no second event.
-            let outcome = DomainOutcome::Applied;
-            receipts::commit_terminal(&tx, &operation.key, &outcome, None, clock).await?;
-            classify_commit(tx.commit().await, "branch delete retry commit")?;
-            return Ok(MutationResult {
-                outcome,
-                repository_generation: Some(repository.generation),
-                branch_generation: Some(existing.generation),
-                observed_pointer: None,
-            });
+            return Ok(MutationResult::rejected(NOT_FOUND_V1));
         }
+
+        // The receipt lock is already held. Only a live target may now admit
+        // or terminalize this operation; committed success is lookup-only.
+        let clock = match receipts::consume(
+            &tx,
+            &operation.key,
+            &operation.binding,
+            &operation.prepare_token,
+        )
+        .await?
+        {
+            ConsumeResult::Admitted(admission) => admission.admission_clock,
+            ConsumeResult::Committed { outcome, .. } => {
+                if matches!(outcome, DomainOutcome::Applied) {
+                    return Ok(MutationResult::rejected(NOT_FOUND_V1));
+                }
+                classify_commit(tx.commit().await, "delete terminal admission commit")?;
+                return Ok(replayed_mutation(outcome, None));
+            }
+            ConsumeResult::Rejected => return Ok(MutationResult::rejected(ADMISSION_REJECTED_V1)),
+        };
 
         // Rechecked under the locked repository row, not trusted from the
         // handler's preflight: the default branch can move between a preflight
@@ -1274,7 +1289,7 @@ impl DomainTransactionStore for PostgresDomainStore {
         .await?;
 
         let outcome = DomainOutcome::Applied;
-        receipts::commit_terminal(&tx, &operation.key, &outcome, None, clock).await?;
+        receipts::commit_delete(&tx, &operation.key, &input.delete_proof, clock).await?;
         classify_commit(tx.commit().await, "branch delete commit")?;
 
         Ok(MutationResult {

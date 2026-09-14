@@ -27,6 +27,9 @@ use uuid::NoContext;
 use uuid::Timestamp;
 use uuid::Uuid;
 
+#[path = "delete_contract/mod.rs"]
+mod delete_contract;
+
 fn pg_url() -> Option<String> {
     std::env::var("LORE_TEST_PG_URL").ok()
 }

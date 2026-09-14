@@ -54,7 +54,6 @@ use lore_postgres::domain::coordinator::PendingEvent;
 use lore_postgres::domain::coordinator::ProjectionWrite;
 use lore_postgres::domain::coordinator::RepositoryCreateInput;
 use lore_postgres::domain::coordinator::RepositoryDeleteInput;
-use lore_postgres::domain::coordinator::TOMBSTONED_V1;
 use lore_postgres::domain::errors::DomainError;
 use lore_postgres::domain::errors::DomainOutcome;
 use lore_postgres::domain::outbox::version::AggregateVersion;
@@ -752,7 +751,7 @@ async fn repository_delete_commits_exactly_one_row_at_the_tombstone_generation()
 }
 
 /// An exact delete retry against an already-tombstoned repository is
-/// idempotent success and must not create a second row -- the coordinator
+/// refused and must not create a second row -- the coordinator
 /// returns before `append_event` on the tombstone-preserved path.
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
@@ -814,8 +813,10 @@ async fn repository_delete_retry_on_an_already_tombstoned_repository_leaves_no_s
     let second = store
         .repository_delete(&second_delete_op, &second_delete)
         .await
-        .expect("retry delete must succeed idempotently");
-    assert!(matches!(second.outcome, DomainOutcome::Applied));
+        .expect("retry delete must be refused");
+    assert!(
+        matches!(&second.outcome, DomainOutcome::NotApplied { reason, .. } if reason == NOT_FOUND_V1)
+    );
 
     assert_eq!(
         outbox_row_count_for_repository(&db, &repository_id).await,
@@ -970,8 +971,10 @@ async fn repository_delete_with_three_extra_live_branches_still_commits_exactly_
     let retried = store
         .repository_delete(&retry_op, &retry_input)
         .await
-        .expect("exact retry delete must succeed idempotently");
-    assert!(matches!(retried.outcome, DomainOutcome::Applied));
+        .expect("exact retry delete must be refused");
+    assert!(
+        matches!(&retried.outcome, DomainOutcome::NotApplied { reason, .. } if reason == NOT_FOUND_V1)
+    );
     assert_eq!(
         outbox_row_count_for_repository(&db, &repository_id).await,
         1,
@@ -1224,7 +1227,7 @@ async fn branch_delete_missing_repository_leaves_no_row() {
     );
 }
 
-/// A branch under an already-tombstoned repository is refused `TOMBSTONED_V1`
+/// A branch under an already-tombstoned repository is refused `NOT_FOUND_V1`
 /// -- the repository's own tombstone already hides it, so branch_delete must
 /// not resurrect the branch row to tombstone it a second time.
 #[tokio::test]
@@ -1265,7 +1268,7 @@ async fn branch_delete_under_a_tombstoned_repository_leaves_no_row() {
         .await
         .expect("delete under a tombstoned repository must return a decisive result");
     assert!(
-        matches!(&result.outcome, DomainOutcome::NotApplied { reason, .. } if reason == TOMBSTONED_V1)
+        matches!(&result.outcome, DomainOutcome::NotApplied { reason, .. } if reason == NOT_FOUND_V1)
     );
 
     assert_eq!(
@@ -1381,8 +1384,8 @@ async fn branch_delete_of_the_default_branch_leaves_no_row() {
     );
 }
 
-/// An exact delete retry against an already-tombstoned branch is idempotent
-/// success and must not create a second row -- the coordinator returns
+/// An exact delete retry against an already-tombstoned branch is refused
+/// and must not create a second row -- the coordinator returns
 /// before `append_events` on the tombstone-preserved path.
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
@@ -1424,12 +1427,13 @@ async fn branch_delete_retry_on_an_already_tombstoned_branch_leaves_no_second_ro
     let second = store
         .branch_delete(&second_op, &second_input)
         .await
-        .expect("retry delete must succeed idempotently");
-    assert!(matches!(second.outcome, DomainOutcome::Applied));
+        .expect("retry delete must be refused");
+    assert!(
+        matches!(&second.outcome, DomainOutcome::NotApplied { reason, .. } if reason == NOT_FOUND_V1)
+    );
     assert_eq!(
-        second.branch_generation,
-        Some(2),
-        "the retry must report the existing generation, not a re-bumped one"
+        second.branch_generation, None,
+        "a missing-target rejection carries no committed generation"
     );
 
     assert_eq!(

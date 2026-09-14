@@ -441,6 +441,42 @@ pub async fn commit_terminal(
     public_result: Option<&[u8]>,
     admission_clock: SystemTime,
 ) -> Result<(), DomainError> {
+    commit_terminal_evidence(tx, key, outcome, public_result, None, admission_clock).await
+}
+
+/// Persist a successful delete's supplied proof with its terminal receipt.
+/// This stores evidence; it does not define the proof's derivation or expose it
+/// on a public receipt transport. The empty public result remains independent.
+pub(crate) async fn commit_delete(
+    tx: &Transaction<'_>,
+    key: &ReceiptKey,
+    tombstone_proof: &[u8],
+    admission_clock: SystemTime,
+) -> Result<(), DomainError> {
+    if tombstone_proof.len() != 32 {
+        return Err(DomainError::InvalidInput(
+            "delete tombstone proof must be 32 bytes".to_owned(),
+        ));
+    }
+    commit_terminal_evidence(
+        tx,
+        key,
+        &DomainOutcome::Applied,
+        None,
+        Some(tombstone_proof),
+        admission_clock,
+    )
+    .await
+}
+
+async fn commit_terminal_evidence(
+    tx: &Transaction<'_>,
+    key: &ReceiptKey,
+    outcome: &DomainOutcome,
+    public_result: Option<&[u8]>,
+    tombstone_proof: Option<&[u8]>,
+    admission_clock: SystemTime,
+) -> Result<(), DomainError> {
     if public_result.is_some_and(|result| result.len() > PUBLIC_RESULT_MAX_BYTES) {
         return Err(DomainError::InvalidInput(format!(
             "receipt public result exceeds {PUBLIC_RESULT_MAX_BYTES} bytes"
@@ -469,7 +505,7 @@ pub async fn commit_terminal(
              SET state = $1, consume_token = NULL, outcome = $2, \
                  not_applied_reason_version = $3, not_applied_reason = $4, \
                  public_result = $5, committed_at = $6, \
-                 full_result_expires_at = $7, compact_expires_at = $8 \
+                 full_result_expires_at = $7, compact_expires_at = $8, tombstone_proof = $14 \
              WHERE verified_issuer = $9 AND authenticated_subject = $10 \
                AND tenant_scope_key = $11 AND operation_id = $12 \
                AND state = $13",
@@ -487,6 +523,7 @@ pub async fn commit_terminal(
                 &key.tenant_scope_key,
                 &key.operation_id.as_bytes().as_slice(),
                 &schema::RECEIPT_STATE_PREPARED,
+                &tombstone_proof,
             ],
         )
         .await
@@ -1107,6 +1144,30 @@ async fn insert_future_marker(
         reason_version: REASON_VERSION,
         reason: UUID_FUTURE_HORIZON_EXCEEDED_V1.to_owned(),
     }))
+}
+
+/// Lock and validate delete receipt identity without admitting or expiring it.
+/// Delete must check the locked live target before any terminal transition.
+/// A matching committed row remains available to receipt lookup, but is not
+/// permission to replay the delete mutation.
+pub(crate) async fn lock_delete_receipt(
+    tx: &Transaction<'_>,
+    key: &ReceiptKey,
+    binding: &OperationBinding,
+    token: &[u8; 32],
+) -> Result<bool, DomainError> {
+    let Some(row) = lock_receipt_row(tx, key).await? else {
+        return Ok(false);
+    };
+    if !row.matches(binding) {
+        return Ok(false);
+    }
+    Ok(row.state == schema::RECEIPT_STATE_COMMITTED
+        || (row.state == schema::RECEIPT_STATE_PREPARED
+            && row
+                .consume_token
+                .as_deref()
+                .is_some_and(|stored| tokens_match(stored, token))))
 }
 
 /// Lock and consume the `PREPARED` row inside the mutation transaction.
