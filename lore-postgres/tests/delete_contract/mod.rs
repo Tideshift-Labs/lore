@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: MIT
 //! Delete mutations must reject missing targets without changing receipt evidence.
 
+#[path = "../common/delete_observations.rs"]
+mod delete_observations;
+
 use lore_postgres::domain::coordinator::BranchDeleteInput;
 use lore_postgres::domain::coordinator::NOT_FOUND_V1;
 use lore_postgres::domain::coordinator::RepositoryDeleteInput;
@@ -51,9 +54,9 @@ impl Target {
                     &RepositoryDeleteInput {
                         repository_id: self.repository.clone(),
                         expected_generation: None,
-                        delete_proof: proof.to_vec(),
                         projection: Vec::new(),
                         events: Vec::new(),
+                        ..delete_observations::repository_delete_input(&self.repository).await
                     },
                 )
                 .await
@@ -92,6 +95,24 @@ async fn receipt(db: &Client, op: &GovernedOperation) -> Option<String> {
 }
 
 async fn assert_proof(db: &Client, target: &Target, op: &GovernedOperation, proof: &[u8]) {
+    let repository_proof;
+    let proof = if target.branch.is_none() {
+        let preimage = lore_postgres::domain::delete_proof::repository_delete_preimage(
+            &lore_postgres::domain::delete_proof::DeleteProofReceipt {
+                key: &op.key,
+                binding: &op.binding,
+                client_attempt_id: None,
+            },
+            &target.repository,
+            1,
+            2,
+        )
+        .unwrap();
+        repository_proof = *blake3::hash(&preimage).as_bytes();
+        &repository_proof[..]
+    } else {
+        proof
+    };
     let row = db.query_one("SELECT tombstone_proof,public_result FROM lore_domain_operation_receipts WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4", &[&op.key.verified_issuer,&op.key.authenticated_subject,&op.key.tenant_scope_key,&op.key.operation_id.as_bytes().as_slice()]).await.unwrap();
     assert_eq!(row.get::<_, Option<Vec<u8>>>(0).as_deref(), Some(proof));
     assert_eq!(row.get::<_, Option<Vec<u8>>>(1), None);
@@ -187,17 +208,30 @@ async fn delete_malformed_proof_rolls_back_receipt_and_lifecycle() {
     let url = pg_url().expect("LORE_TEST_PG_URL required");
     let store = store(&url).await;
     let db = client(&url).await;
-    for branch in [false, true] {
-        let target = fixture(&store, &db, branch).await;
-        for width in [0, 31, 33] {
-            let (op, _) = admitted_operation(&store, target.method()).await;
-            let before = receipt(&db, &op).await;
-            let lifecycle = target.row(&db).await;
-            assert!(target.delete(&store, &op, &vec![41; width]).await.is_err());
-            assert_eq!(receipt(&db, &op).await, before);
-            assert_eq!(target.row(&db).await, lifecycle);
-        }
+    let target = fixture(&store, &db, true).await;
+    for width in [0, 31, 33] {
+        let (op, _) = admitted_operation(&store, target.method()).await;
+        let before = receipt(&db, &op).await;
+        let lifecycle = target.row(&db).await;
+        assert!(target.delete(&store, &op, &vec![41; width]).await.is_err());
+        assert_eq!(receipt(&db, &op).await, before);
+        assert_eq!(target.row(&db).await, lifecycle);
     }
+    // Repository proofs no longer accept caller bytes. A stored generation that
+    // cannot advance must fail before any receipt or lifecycle write commits.
+    let target = fixture(&store, &db, false).await;
+    db.execute(
+        "UPDATE lore_domain_repositories SET generation=$2 WHERE repository_id=$1",
+        &[&target.repository, &i64::MAX],
+    )
+    .await
+    .unwrap();
+    let (op, _) = admitted_operation(&store, target.method()).await;
+    let before = receipt(&db, &op).await;
+    let lifecycle = target.row(&db).await;
+    assert!(target.delete(&store, &op, &[41; 32]).await.is_err());
+    assert_eq!(receipt(&db, &op).await, before);
+    assert_eq!(target.row(&db).await, lifecycle);
 }
 
 #[tokio::test]

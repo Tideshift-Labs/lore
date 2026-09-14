@@ -20,6 +20,9 @@
 
 #![allow(dead_code)]
 
+#[path = "../common/delete_observations.rs"]
+mod delete_observations;
+
 use std::time::SystemTime;
 
 use lore_postgres::domain::PostgresDomainStore;
@@ -178,14 +181,8 @@ pub async fn create_repository(
 }
 
 /// A delete input that tombstones whatever generation is current.
-pub fn delete_input(repository_id: [u8; 16], ids: &mut Identities) -> RepositoryDeleteInput {
-    RepositoryDeleteInput {
-        repository_id: repository_id.to_vec(),
-        expected_generation: None,
-        delete_proof: ids.id32().to_vec(),
-        projection: Vec::new(),
-        events: Vec::new(),
-    }
+pub async fn delete_input(repository_id: [u8; 16], _ids: &mut Identities) -> RepositoryDeleteInput {
+    delete_observations::repository_delete_input(&repository_id).await
 }
 
 /// A push input carrying the exact five-scalar preflight the caller observed.

@@ -547,6 +547,8 @@ struct RepositoryCreateScriptedStore {
     result: MutationResult,
     snapshot: Option<RepositorySnapshot>,
     captured_input: Arc<Mutex<Option<RepositoryCreateInput>>>,
+    captured_delete: Arc<Mutex<Option<RepositoryDeleteInput>>>,
+    delete_branch_snapshot: Option<BranchSnapshot>,
 }
 
 #[async_trait]
@@ -659,9 +661,7 @@ impl DomainTransactionStore for RepositoryCreateScriptedStore {
         _repository_id: &[u8],
         _branch_id: &[u8],
     ) -> Result<Option<BranchSnapshot>, DomainError> {
-        unreachable!(
-            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
-        )
+        Ok(self.delete_branch_snapshot.clone())
     }
     async fn branch_create_terminal_replay(
         &self,
@@ -696,13 +696,11 @@ impl DomainTransactionStore for RepositoryCreateScriptedStore {
     async fn repository_delete(
         &self,
         _operation: &GovernedOperation,
-        _input: &RepositoryDeleteInput,
+        input: &RepositoryDeleteInput,
     ) -> Result<MutationResult, DomainError> {
-        unreachable!(
-            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
-        )
+        *self.captured_delete.lock().unwrap() = Some(input.clone());
+        Ok(self.result.clone())
     }
-
     async fn branch_delete(
         &self,
         _operation: &GovernedOperation,
@@ -781,6 +779,8 @@ fn build_governed_repository_create(
         result,
         snapshot,
         captured_input: Arc::clone(&captured_input),
+        captured_delete: Arc::new(Mutex::new(None)),
+        delete_branch_snapshot: None,
     });
     let domain = Arc::new(DomainContext::new(store, true).with_cell_id(cell_id.map(str::to_owned)));
     let governed = GovernedRepositoryCreate {
@@ -1074,10 +1074,12 @@ fn projection_reproduces_two_plus_three_n_rows_matching_the_legacy_key_derivatio
     let name = "my-deleted-repo";
     let named_branch = RepositoryDeleteBranch {
         branch_id: [0x22u8; 16].to_vec(),
+        metadata_hash: vec![0x77; 32],
         name: "Feature/Some-Branch".to_owned(),
     };
     let empty_name_branch = RepositoryDeleteBranch {
         branch_id: [0x33u8; 16].to_vec(),
+        metadata_hash: vec![0x88; 32],
         name: String::new(),
     };
     let branches = [named_branch.clone(), empty_name_branch.clone()];
@@ -1087,7 +1089,7 @@ fn projection_reproduces_two_plus_three_n_rows_matching_the_legacy_key_derivatio
         name,
         expected_generation: Some(4),
         branches: &branches,
-        delete_proof: RepositoryDeleteProof::Unfrozen,
+        metadata_hash: &[0x66; 32],
     };
 
     let rows = publication.projection();
@@ -1172,7 +1174,7 @@ fn projection_with_no_branches_is_exactly_the_two_base_rows() {
         name: "no-branches-repo",
         expected_generation: None,
         branches: &[],
-        delete_proof: RepositoryDeleteProof::Unfrozen,
+        metadata_hash: &[0x66; 32],
     };
     let rows = publication.projection();
     assert_eq!(rows.len(), 2);
@@ -1180,33 +1182,49 @@ fn projection_with_no_branches_is_exactly_the_two_base_rows() {
     assert_eq!(rows[1].key_type, KeyType::RepositoryId as i16);
 }
 
-/// `GovernedRepositoryDelete::commit` refuses on `RepositoryDeleteProof::Unfrozen`
-/// before it builds a projection, derives an event, or reaches the
-/// coordinator -- `UnreachableDomainStore` backs the domain context, so a
-/// regression that called into the store at all would panic the test rather
-/// than merely fail an assertion.
+/// The publication forwards verified observations and projection into one coordinator call.
 #[tokio::test]
-async fn commit_refuses_on_the_unfrozen_delete_proof_before_touching_the_coordinator() {
-    let domain = Arc::new(context(true));
+async fn repository_delete_commit_passes_observations_to_the_coordinator() {
+    let captured = Arc::new(Mutex::new(None));
+    let store = Arc::new(RepositoryCreateScriptedStore {
+        result: MutationResult {
+            outcome: DomainOutcome::Applied,
+            repository_generation: Some(2),
+            branch_generation: None,
+            observed_pointer: None,
+        },
+        snapshot: None,
+        captured_input: Arc::new(Mutex::new(None)),
+        captured_delete: Arc::clone(&captured),
+        delete_branch_snapshot: None,
+    });
+    let domain = Arc::new(DomainContext::new(store, true).with_cell_id(Some("cell-delete".into())));
     let mut operation = dummy_create_operation();
-    operation.binding.method = "repository_delete".to_owned();
+    operation.binding.method = "repository.delete".into();
     let governed = GovernedRepositoryDelete { domain, operation };
+    let branches = [RepositoryDeleteBranch {
+        branch_id: vec![0x77; 16],
+        name: "main".into(),
+        metadata_hash: vec![0x88; 32],
+    }];
     let publication = RepositoryDeletePublication {
-        salt: b"wp119-part-d-salt",
-        repository_id: &[0x55u8; 16],
-        name: "unfrozen-proof-repo",
-        expected_generation: None,
-        branches: &[],
-        delete_proof: RepositoryDeleteProof::Unfrozen,
+        salt: b"delete-salt",
+        repository_id: &[0x55; 16],
+        name: "delete-repo",
+        metadata_hash: &[0x66; 32],
+        expected_generation: Some(1),
+        branches: &branches,
     };
-
-    let result = governed.commit(&publication).await;
-    let Err(error) = result else {
-        panic!("an unfrozen delete_proof must refuse, not commit");
-    };
-    assert_eq!(error.code(), Code::Unimplemented);
+    governed.commit(&publication).await.unwrap();
+    let input = captured.lock().unwrap().take().expect("coordinator called");
+    assert_eq!(input.expected_name, "delete-repo");
+    assert_eq!(input.expected_metadata_hash, vec![0x66; 32]);
+    assert_eq!(input.branches.len(), 1);
+    assert_eq!(input.branches[0].metadata_hash, vec![0x88; 32]);
+    assert_eq!(input.projection.len(), 5);
+    assert_eq!(input.events.len(), 1);
+    assert_eq!(input.events[0].event_kind, "repository.tombstoned");
 }
-
 // ---------------------------------------------------------------------------
 // GovernedBranchDelete: fenced the same way GovernedRepositoryDelete is, on two
 // missing artefacts (BranchDeleteProof::Unfrozen, and the absent
@@ -2175,4 +2193,239 @@ async fn repository_create_auth_resource_missing_resource_context_wins_over_the_
         error.message(),
         "Invalid repository name - missing Organization context"
     );
+}
+
+struct DeleteMustNotVerify;
+#[async_trait]
+impl crate::authnz::rebac::RepositoryOperationAuthorizationVerifier for DeleteMustNotVerify {
+    async fn verify_repository_operation_authorization(
+        &self,
+        _: Request<lore_proto::rebac::VerifyRepositoryOperationAuthorizationRequest>,
+    ) -> Result<lore_proto::rebac::VerifyRepositoryOperationAuthorizationResponse, Status> {
+        panic!("delete fence must not verify")
+    }
+    async fn claim_repository_operation_stale_finalize_permit(
+        &self,
+        _: Request<lore_proto::rebac::DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<lore_proto::rebac::DomainOperationMaintenanceVerificationResponse, Status> {
+        panic!("delete fence must not verify")
+    }
+    async fn verify_repository_operation_terminal_status_attach(
+        &self,
+        _: Request<lore_proto::rebac::DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<lore_proto::rebac::DomainOperationMaintenanceVerificationResponse, Status> {
+        panic!("delete fence must not verify")
+    }
+    async fn verify_repository_operation_proof_namespace_materialize(
+        &self,
+        _: Request<lore_proto::rebac::DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<lore_proto::rebac::DomainOperationMaintenanceVerificationResponse, Status> {
+        panic!("delete fence must not verify")
+    }
+    async fn verify_repository_operation_proof_namespace_retire(
+        &self,
+        _: Request<lore_proto::rebac::DomainOperationMaintenanceVerificationRequest>,
+    ) -> Result<lore_proto::rebac::DomainOperationMaintenanceVerificationResponse, Status> {
+        panic!("delete fence must not verify")
+    }
+    async fn authorize_direct_repository_operation(
+        &self,
+        _: Request<lore_proto::rebac::AuthorizeDirectRepositoryOperationRequest>,
+    ) -> Result<lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse, Status> {
+        panic!("delete fence must not authorize")
+    }
+}
+
+#[tokio::test]
+async fn repository_delete_internal_admission_is_typed_and_never_prepares_or_verifies() {
+    let domain =
+        Arc::new(context(true).with_operation_verifier(Some(Arc::new(DeleteMustNotVerify))));
+    let admitted = AdmittedOperation {
+        key: dummy_create_operation().key,
+        source: AdmissionSource::Internal(InternalAdmission {
+            repository_id: vec![9; 16],
+            bearer: "Bearer fixture-only".into(),
+            client_attempt_id: Some(Uuid::new_v4()),
+        }),
+    };
+    // The context store panics on any prepare or lookup. The verifier also
+    // panics on every port, proving that the refusal precedes external effects.
+    let result =
+        GovernedRepositoryDelete::prepare(Some(&domain), Some(admitted), vec![3; 32]).await;
+    let Err(status) = result else {
+        panic!("internal delete must refuse")
+    };
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(status.details(), b"INTERNAL_DELETE_PREPARATION_DEFERRED_V1");
+}
+
+#[tokio::test]
+async fn repository_delete_preflight_checks_snapshot_and_loads_branch_metadata() {
+    for case in 0..3 {
+        let (immutable, mutable, execution) = crate::store::test_store_create().await.unwrap();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let bytes = dummy_publication_bytes();
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable,
+                    mutable,
+                    RepositoryId::from(bytes.repository_id),
+                ));
+                let captured = Arc::new(Mutex::new(None));
+                let snapshot = if case == 0 {
+                    None
+                } else {
+                    Some(bytes.snapshot(1))
+                };
+                let branch_id = Context::from([0x47; 16]);
+                let mut metadata = lore_revision::metadata::Metadata::new();
+                branch::metadata_populate(
+                    &mut metadata,
+                    branch_id,
+                    "main",
+                    "default",
+                    "fixture",
+                    0,
+                    vec![],
+                )
+                .unwrap();
+                let branch_hash = metadata.serialize(repository.clone()).await.unwrap();
+                branch::store_name_to_id(repository.clone(), branch_id, "main")
+                    .await
+                    .unwrap();
+                let store = Arc::new(RepositoryCreateScriptedStore {
+                    result: MutationResult {
+                        outcome: DomainOutcome::Applied,
+                        repository_generation: Some(2),
+                        branch_generation: None,
+                        observed_pointer: None,
+                    },
+                    snapshot,
+                    captured_input: Arc::new(Mutex::new(None)),
+                    captured_delete: Arc::clone(&captured),
+                    delete_branch_snapshot: Some(BranchSnapshot {
+                        repository_id: bytes.repository_id.to_vec(),
+                        branch_id: branch_id.data().to_vec(),
+                        live: true,
+                        generation: 1,
+                        repository_generation: 1,
+                        name: "main".into(),
+                        metadata_hash: branch_hash.as_ref().to_vec(),
+                        latest_hash: vec![0; 32],
+                    }),
+                });
+                let domain = Arc::new(
+                    DomainContext::new(store, true).with_cell_id(Some("cell-preflight".into())),
+                );
+                let governed = GovernedRepositoryDelete {
+                    domain,
+                    operation: dummy_create_operation(),
+                };
+                let name = if case == 1 { "changed-name" } else { "my-repo" };
+                let result = governed
+                    .commit_repository(repository, name, Hash::from(bytes.metadata_hash))
+                    .await;
+                match case {
+                    0 | 1 => {
+                        let Err(error) = result else {
+                            panic!("invalid preflight must refuse")
+                        };
+                        assert_eq!(
+                            error.code(),
+                            if case == 0 {
+                                Code::NotFound
+                            } else {
+                                Code::Aborted
+                            }
+                        );
+                        assert!(captured.lock().unwrap().is_none());
+                    }
+                    2 => {
+                        result.unwrap();
+                        let input = captured.lock().unwrap().take().unwrap();
+                        assert_eq!(input.branches.len(), 1);
+                        assert_eq!(input.branches[0].name, "main");
+                        assert_eq!(input.branches[0].metadata_hash, branch_hash.as_ref());
+                        assert_eq!(input.expected_generation, Some(1));
+                        assert_eq!(input.expected_metadata_hash, bytes.metadata_hash);
+                        assert_eq!(input.projection.len(), 5);
+                    }
+                    _ => unreachable!(),
+                }
+            })
+            .await;
+    }
+}
+
+struct DeleteTestInstruments;
+impl lore_telemetry::InstrumentProvider for DeleteTestInstruments {
+    fn namespace(&self) -> &'static str {
+        "delete-fence-test"
+    }
+}
+fn internal_delete_request<T>(body: T) -> Request<T> {
+    let mut request = Request::new(body);
+    request
+        .metadata_mut()
+        .insert("authorization", "Bearer verified-lore-jwt".parse().unwrap());
+    request.metadata_mut().insert(
+        "lore-authn-bearer",
+        "Bearer distinct-authn-jwt".parse().unwrap(),
+    );
+    request
+        .extensions_mut()
+        .insert(crate::auth::jwt::AuthorizationToken {
+            issuer: "https://delete-fence.invalid".into(),
+            user_id: "human-delete-user".into(),
+            is_service_account: Some(false),
+            ..Default::default()
+        });
+    request
+}
+#[tokio::test]
+async fn both_repository_delete_handlers_refuse_internal_admission_before_lookup_or_verifier() {
+    for v1 in [false, true] {
+        let (immutable, mutable, execution) = crate::store::test_store_create().await.unwrap();
+        let domain =
+            Arc::new(context(true).with_operation_verifier(Some(Arc::new(DeleteMustNotVerify))));
+        let error = LORE_CONTEXT
+            .scope(execution, async {
+                if v1 {
+                    crate::grpc::repository::v1::repository_delete::handler(
+                        internal_delete_request(
+                            lore_proto::lore::repository::v1::RepositoryDeleteRequest {
+                                id: bytes::Bytes::from_static(&[8; 16]),
+                            },
+                        ),
+                        None,
+                        immutable,
+                        mutable,
+                        &DeleteTestInstruments,
+                        Some(&domain),
+                    )
+                    .await
+                    .unwrap_err()
+                } else {
+                    crate::grpc::handlers::repository_delete::handler(
+                        internal_delete_request(lore_proto::RepositoryDeleteRequest {
+                            id: bytes::Bytes::from_static(&[8; 16]),
+                        }),
+                        None,
+                        immutable,
+                        mutable,
+                        &DeleteTestInstruments,
+                        Some(&domain),
+                    )
+                    .await
+                    .unwrap_err()
+                }
+            })
+            .await;
+        assert_eq!(error.code(), Code::FailedPrecondition, "v1={v1}");
+        assert_eq!(
+            error.details(),
+            b"INTERNAL_DELETE_PREPARATION_DEFERRED_V1",
+            "v1={v1}"
+        );
+    }
 }

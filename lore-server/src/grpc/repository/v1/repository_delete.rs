@@ -24,9 +24,11 @@ use tracing::info;
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
 use crate::domain::DomainContext;
+use crate::domain::GovernedRepositoryDelete;
 use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
-use crate::domain::reject_unwired_governed_operation;
+use crate::domain_intent::CanonicalIntent;
+use crate::domain_intent::canonical_intent_digest;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -63,27 +65,23 @@ pub async fn handler(
 
     // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
     // at handler entry, before any handler logic or authorization side effect.
-    if let Some(admitted) = admit_at_entry(
+    let admitted = admit_at_entry(
         domain_context,
         &request_metadata,
         request_authorization.as_ref(),
         GovernedScope::TargetRepository {
             repository_id: &req.id,
         },
-    )? {
-        // BLOCKED(WP-116): delete_proof derivation unfrozen in CR-029.
-        // Same blocker as the v0 handler, which carries the full record. Both
-        // delete entry points now share one built seam,
-        // `crate::domain::GovernedRepositoryDelete` — one projection, one
-        // classified `repository.tombstoned` event, one coordinator call — and
-        // one missing artefact: a frozen `delete_proof` preimage in CR-029. The
-        // refusal stays at entry so no authorization side effect precedes it.
-        return Err(reject_unwired_governed_operation(
-            &admitted,
-            "lore.repository.v1.RepositoryService/RepositoryDelete",
-        ));
-    }
-
+    )?;
+    let governed = if admitted.is_some() {
+        let digest = canonical_intent_digest(&CanonicalIntent::RepositoryDelete {
+            repository_id: &req.id,
+        })
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        GovernedRepositoryDelete::prepare(domain_context, admitted, digest).await?
+    } else {
+        None
+    };
     // TODO(mjansson): Once the authz model has read/write/admin, replace
     // the service-account bypass with a proper permission check.
     let mut bypass_protection = false;
@@ -118,6 +116,17 @@ pub async fn handler(
                 return Err(Status::permission_denied("Not repository owner"));
             }
 
+            if let Some(governed) = governed {
+                governed
+                    .commit_repository(repository.clone(), &metadata.name, metadata_hash)
+                    .await?;
+                instrument_provider
+                    .counter("num_repositories_deleted")
+                    .add(1, &[]);
+                return Ok(Response::new(RepositoryDeleteResponse {
+                    repository: Some(build_repository(id, &metadata, metadata_hash)),
+                }));
+            }
             repository::store_name_to_id(
                 repository.clone(),
                 metadata.name.as_str(),

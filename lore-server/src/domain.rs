@@ -2197,50 +2197,6 @@ impl GovernedRepositoryCreate {
 /// canonical-intent digest.
 const CREATION_FINGERPRINT_VERSION_V1: i32 = 1;
 
-/// The 32-byte attempt-compatible delete proof CR-029 records on a tombstone.
-///
-/// BLOCKED(WP-116): delete_proof derivation unfrozen in CR-029.
-///
-/// A typed placeholder rather than a `Vec<u8>` with a comment, because the
-/// difference between "the bytes are missing" and "the bytes are wrong" has to
-/// survive review. `lore_domain_repositories` carries a `NOT NULL` `CHECK` of
-/// exactly 32 bytes on any tombstoned row, CR-029 names the field three times
-/// only as an "attempt-compatible immutable delete proof", and it freezes no
-/// preimage, no field order, no framing, and no domain separator. Nothing in
-/// either repository computes one.
-///
-/// Minting 32 bytes here would be CR-029's own MISSING-2 failure verbatim: one
-/// side invents a value, the other cannot reproduce it, and the divergence is
-/// silent. Worse than silent here, because the proof is committed into the
-/// principal-scoped receipt and returned by receipt lookup, so a wrong shape
-/// becomes permanent evidence.
-///
-/// Missing artefact: a frozen `delete_proof` derivation in CR-029 on the same
-/// terms as its canonical-intent digest contract — one canonical preimage, its
-/// exact field order and framing, and independently computed golden vectors on
-/// both sides. Adding the variant that carries real bytes is the whole of the
-/// remaining work; every other input this seam needs is built below.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepositoryDeleteProof {
-    /// No derivation exists. [`GovernedRepositoryDelete::commit`] refuses.
-    Unfrozen,
-}
-
-impl RepositoryDeleteProof {
-    /// The 32 proof bytes the tombstone row requires, or `None` while CR-029
-    /// freezes no derivation.
-    ///
-    /// The `match` is exhaustive on purpose and has no `_` arm: adding the
-    /// variant that carries real bytes must be a compile error here until it is
-    /// handled, rather than silently falling through to a refusal that now
-    /// looks like a bug.
-    fn bytes(self) -> Option<Vec<u8>> {
-        match self {
-            Self::Unfrozen => None,
-        }
-    }
-}
-
 /// One branch a repository delete tombstones, as the handler enumerated it.
 ///
 /// The name is what the projection needs: the branch name-to-id row is keyed on
@@ -2255,6 +2211,8 @@ pub struct RepositoryDeleteBranch {
     /// which case no name row is retired, exactly as `delete_name_to_id` is
     /// skipped there.
     pub name: String,
+    /// Immutable metadata pointer observed before the transaction.
+    pub metadata_hash: Vec<u8>,
 }
 
 /// Everything one repository delete retires, as the handler observed it.
@@ -2267,10 +2225,10 @@ pub struct RepositoryDeletePublication<'a> {
     pub name: &'a str,
     /// Generation the caller expects to be tombstoning, when it read one.
     pub expected_generation: Option<i64>,
+    /// Immutable repository metadata pointer used by preflight.
+    pub metadata_hash: &'a [u8],
     /// Every live branch, as `branch::list` enumerated it.
     pub branches: &'a [RepositoryDeleteBranch],
-    /// BLOCKED(WP-116): delete_proof derivation unfrozen in CR-029.
-    pub delete_proof: RepositoryDeleteProof,
 }
 
 impl RepositoryDeletePublication<'_> {
@@ -2378,28 +2336,101 @@ pub struct RepositoryDeleteOutcome {
 /// identical. Two copies of a governed mutation path is how the two come to
 /// mean different things, which is the divergence CR-029 exists to end.
 ///
-/// # Fenced by one missing value, not by missing plumbing
-///
-/// The projection rows, the classified event, the coordinator input, and the
-/// outcome mapping are all here and complete. [`RepositoryDeleteProof`] is the
-/// only input with no derivation, and [`Self::commit`] refuses on it before it
-/// touches the coordinator.
-///
-/// **[`Self::prepare`] has no caller today.** Both delete handlers still refuse
-/// at entry through `reject_unwired_governed_operation`, so the entry check is
-/// the only fence that actually runs and this seam's refusal is the one that
-/// will run once the handlers are wired — not a second fence standing behind
-/// the first right now. The entry refusal is what keeps a delete that will
-/// certainly refuse from first performing the ReBAC `DeleteResource` callback,
-/// and it stays there for that reason when the wiring lands.
-/// `lore-server/tests/p12_governed_wiring.rs` pins both facts: that the sites
-/// stay fenced, and that this seam is otherwise complete.
 pub struct GovernedRepositoryDelete {
     domain: Arc<DomainContext>,
     operation: GovernedOperation,
 }
 
+/// D6: internal deletes need atomic target-aware preparation before activation.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum DeleteAdmissionError {
+    #[error("Internal delete preparation is deferred; carried operation required")]
+    InternalPreparationDeferred,
+}
+
+impl From<DeleteAdmissionError> for Status {
+    fn from(error: DeleteAdmissionError) -> Self {
+        Status::with_details(
+            tonic::Code::FailedPrecondition,
+            error.to_string(),
+            bytes::Bytes::from_static(b"INTERNAL_DELETE_PREPARATION_DEFERRED_V1"),
+        )
+    }
+}
+
+fn require_carried_delete(admitted: &AdmittedOperation) -> Result<(), DeleteAdmissionError> {
+    match &admitted.source {
+        AdmissionSource::Carried(_) => Ok(()),
+        AdmissionSource::Internal(_) => Err(DeleteAdmissionError::InternalPreparationDeferred),
+    }
+}
+
 impl GovernedRepositoryDelete {
+    /// Preload immutable branch facts; the transaction checks this exact set.
+    pub async fn commit_repository(
+        &self,
+        repository: Arc<lore_revision::repository::RepositoryContext>,
+        name: &str,
+        metadata_hash: Hash,
+    ) -> Result<RepositoryDeleteOutcome, Status> {
+        use tokio_stream::StreamExt;
+        let snapshot = self
+            .domain
+            .store()
+            .repository_snapshot(repository.id.data())
+            .await
+            .map_err(|e| crate::grpc::map_domain_error_to_status(&e))?
+            .filter(|row| row.live)
+            .ok_or_else(|| Status::not_found("Repository does not exist"))?;
+        if snapshot.name != name || snapshot.metadata_hash != metadata_hash.as_ref() {
+            return Err(Status::aborted(
+                "Repository metadata changed during delete preflight",
+            ));
+        }
+        let mut stream = branch::list(repository.clone())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut branches = Vec::new();
+        while let Some(id) = stream.next().await {
+            let row = self
+                .domain
+                .store()
+                .branch_snapshot(repository.id.data(), id.data())
+                .await
+                .map_err(|e| crate::grpc::map_domain_error_to_status(&e))?
+                .filter(|row| row.live)
+                .ok_or_else(|| Status::aborted("Branch set changed during delete preflight"))?;
+            checked_id_16(&row.branch_id, "branch_id")?;
+            if row.metadata_hash.len() != 32 {
+                return Err(Status::internal("Invalid stored branch metadata hash"));
+            }
+            let metadata =
+                branch::load_metadata(repository.clone(), Hash::from(row.metadata_hash.as_slice()))
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            let name = branch::name(&metadata).unwrap_or_default();
+            if name != row.name {
+                return Err(Status::internal(
+                    "Branch metadata name disagrees with domain row",
+                ));
+            }
+            branches.push(RepositoryDeleteBranch {
+                branch_id: row.branch_id,
+                name: name.to_owned(),
+                metadata_hash: row.metadata_hash,
+            });
+        }
+        self.commit(&RepositoryDeletePublication {
+            salt: repository.salt(),
+            repository_id: repository.id.data(),
+            name,
+            expected_generation: Some(snapshot.generation),
+            metadata_hash: metadata_hash.as_ref(),
+            branches: &branches,
+        })
+        .await
+    }
+
     /// Prepare the governed call, or `Ok(None)` for the ungoverned path.
     ///
     /// Identical admission rules to [`GovernedRepositoryCreate::prepare`],
@@ -2421,6 +2452,7 @@ impl GovernedRepositoryDelete {
         let Some(admitted) = admitted else {
             return Ok(None);
         };
+        require_carried_delete(&admitted)?;
         let Some(domain) = domain else {
             return Err(Status::failed_precondition(
                 "Domain coordinator is unavailable",
@@ -2451,21 +2483,6 @@ impl GovernedRepositoryDelete {
         &self,
         publication: &RepositoryDeletePublication<'_>,
     ) -> Result<RepositoryDeleteOutcome, Status> {
-        // BLOCKED(WP-116): delete_proof derivation unfrozen in CR-029.
-        //
-        // Fails closed, first, before the projection is built and before the
-        // coordinator is reached. Everything past this line is the rest of the
-        // wiring and runs unchanged the moment the proof has a derivation.
-        let Some(delete_proof) = publication.delete_proof.bytes() else {
-            warn!(
-                operation_id = %self.operation.key.operation_id,
-                "Refusing a governed repository delete: CR-029 freezes no delete_proof \
-                 derivation, and a minted proof would become permanent receipt evidence"
-            );
-            return Err(Status::unimplemented(
-                "Governed repository delete requires a frozen CR-029 delete_proof derivation",
-            ));
-        };
         // Every id that becomes a `lore_mutable` key is checked for width here,
         // before the first key is derived. `hash_function_arg` hashes whatever
         // it is handed, so a short or long id produces a plausible key for a row
@@ -2477,7 +2494,7 @@ impl GovernedRepositoryDelete {
         for branch_entry in publication.branches {
             checked_id_16(&branch_entry.branch_id, "branch_id")?;
         }
-        let input = self.input(publication, delete_proof)?;
+        let input = self.input(publication)?;
         self.publish(&input).await
     }
 
@@ -2486,12 +2503,11 @@ impl GovernedRepositoryDelete {
     ///
     /// Split out of [`Self::commit`] so the carriage is real, reviewable code
     /// rather than a promise inside a branch nothing reaches. `commit` calls it
-    /// today; what nothing reaches today is `commit` itself, because
-    /// [`RepositoryDeleteProof`] has no derivable variant.
+    /// after preflight validates every immutable observation.
+    /// The coordinator derives the proof from persisted receipt evidence.
     fn input(
         &self,
         publication: &RepositoryDeletePublication<'_>,
-        delete_proof: Vec<u8>,
     ) -> Result<RepositoryDeleteInput, Status> {
         // CR-032 classifies a repository tombstone as ONE bounded generation
         // event covering everything it hides, not one row per branch and not
@@ -2509,7 +2525,19 @@ impl GovernedRepositoryDelete {
         Ok(RepositoryDeleteInput {
             repository_id: publication.repository_id.to_vec(),
             expected_generation: publication.expected_generation,
-            delete_proof,
+            expected_name: publication.name.to_owned(),
+            expected_metadata_hash: publication.metadata_hash.to_vec(),
+            branches: publication
+                .branches
+                .iter()
+                .map(|branch| {
+                    lore_postgres::domain::coordinator::RepositoryDeleteBranchObservation {
+                        branch_id: branch.branch_id.clone(),
+                        name: branch.name.clone(),
+                        metadata_hash: branch.metadata_hash.clone(),
+                    }
+                })
+                .collect(),
             projection: publication.projection(),
             events,
         })
@@ -2544,8 +2572,8 @@ impl GovernedRepositoryDelete {
 /// The 32 proof bytes a branch tombstone requires, or the fence while CR-029
 /// derives none.
 ///
-/// The exact shape of [`RepositoryDeleteProof`], and blocked on the exact same
-/// missing artefact, so the two are deliberately separate types rather than one
+/// A temporary branch-only fence until branch proof wiring lands.
+/// Branch activation is independent of repository deletion; this is not a
 /// shared enum: freezing a repository delete proof must not silently open the
 /// branch path, and vice versa. `lore_domain_branches_tombstone_evidence`
 /// requires 32 bytes on a tombstoned branch row, so this is not a value the
@@ -2566,7 +2594,7 @@ impl BranchDeleteProof {
     /// freezes no derivation.
     ///
     /// Exhaustive with no `_` arm, for the reason
-    /// [`RepositoryDeleteProof::bytes`] is: the variant that carries real bytes
+    /// the repository seam used: a variant carrying real bytes
     /// must be a compile error here until it is handled.
     fn bytes(self) -> Option<Vec<u8>> {
         match self {
@@ -2660,7 +2688,7 @@ pub struct BranchDeleteOutcome {
 ///
 /// - [`BranchDeleteProof`] has no frozen preimage, and [`Self::commit`] refuses
 ///   on it before it touches the coordinator. Same artefact as
-///   [`RepositoryDeleteProof`].
+///   the previously fenced repository delete seam.
 /// - **There is no `CanonicalIntent::BranchDelete` family.** CR-029's
 ///   canonical-intent contract freezes six, `lore-server/src/domain_intent.rs`
 ///   defines those six, and `packages/control-plane/src/repository-operation-intent.ts`

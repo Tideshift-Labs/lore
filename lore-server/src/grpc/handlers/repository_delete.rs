@@ -29,9 +29,11 @@ use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
 use crate::domain::DomainContext;
+use crate::domain::GovernedRepositoryDelete;
 use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
-use crate::domain::reject_unwired_governed_operation;
+use crate::domain_intent::CanonicalIntent;
+use crate::domain_intent::canonical_intent_digest;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -61,52 +63,23 @@ pub async fn handler(
 
     // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
     // at handler entry, before any handler logic or authorization side effect.
-    if let Some(admitted) = admit_at_entry(
+    let admitted = admit_at_entry(
         domain_context,
         &request_metadata,
         request_authorization.as_ref(),
         GovernedScope::TargetRepository {
             repository_id: &req.id,
         },
-    )? {
-        // BLOCKED(WP-116): delete_proof derivation unfrozen in CR-029.
-        //
-        // Everything else this site needs is now built and shared with the v1
-        // site: `crate::domain::GovernedRepositoryDelete` carries the
-        // projection rows (`RepositoryDeletePublication::projection`, the mirror
-        // image of the create seam's, 2 + 3N rows), the one classified
-        // `repository.tombstoned` event CR-032 assigns to a repository
-        // tombstone, the `RepositoryDeleteInput` carriage, the coordinator call,
-        // and the outcome mapping. `GovernedRepositoryDelete::commit` fails
-        // closed on `RepositoryDeleteProof::Unfrozen` before it reaches any of
-        // it. The proof is the only missing input.
-        //
-        // The refusal stays HERE rather than at the seam so it happens at entry,
-        // before the ReBAC `DeleteResource` callback and before any branch
-        // enumeration: a governed delete that will certainly refuse must not
-        // first perform an authorization side effect. The seam's own refusal is
-        // the second, typed fence behind it.
-        //
-        // Why no proof is minted: the tombstone row requires exactly 32 bytes
-        // (`lore-postgres/src/domain/schema.rs`, a NOT NULL CHECK on any
-        // tombstoned row); CR-029 names the field three times, each time only as
-        // an "attempt-compatible immutable delete proof", and freezes no
-        // preimage, no field list, no serialisation, and no domain separator.
-        // Inventing 32 bytes here is CR-029's own MISSING-2 failure verbatim,
-        // and the proof is committed into the principal-scoped receipt and
-        // returned by receipt lookup, so a wrong shape becomes permanent
-        // evidence.
-        //
-        // Missing artefact: a frozen `delete_proof` derivation in CR-029, on
-        // the same terms as its canonical-intent digest contract: one canonical
-        // preimage, its exact field order and framing, and independently
-        // computed golden vectors on both sides.
-        return Err(reject_unwired_governed_operation(
-            &admitted,
-            "lore.RepositoryService/RepositoryDelete",
-        ));
-    }
-
+    )?;
+    let governed = if admitted.is_some() {
+        let digest = canonical_intent_digest(&CanonicalIntent::RepositoryDelete {
+            repository_id: &req.id,
+        })
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        GovernedRepositoryDelete::prepare(domain_context, admitted, digest).await?
+    } else {
+        None
+    };
     // TODO(mjansson): Once we have authz permission model with read/write/admin
     // this should be upgraded to check for the correct permission rather than
     // hardwired to service accounts. For now used to protect while allowing mirroring
@@ -128,9 +101,15 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            repository_delete(repository, bypass_protection, auth_url, authorization)
-                .await
-                .inspect_err(|err| warn!("Repository delete failed: {err}"))?;
+            repository_delete(
+                repository,
+                bypass_protection,
+                auth_url,
+                authorization,
+                governed,
+            )
+            .await
+            .inspect_err(|err| warn!("Repository delete failed: {err}"))?;
 
             let num_repositories_deleted = instrument_provider.counter("num_repositories_deleted");
             num_repositories_deleted.add(1, &[]);
@@ -145,6 +124,7 @@ async fn repository_delete(
     force: bool,
     auth_url: Option<String>,
     authorization: Option<String>,
+    governed: Option<GovernedRepositoryDelete>,
 ) -> Result<(), Status> {
     let Ok(data) = repository_query_id(
         repository.clone(),
@@ -177,6 +157,12 @@ async fn repository_delete(
         }
     }
 
+    if let Some(governed) = governed {
+        governed
+            .commit_repository(repository.clone(), &metadata.name, data.metadata)
+            .await?;
+        return Ok(());
+    }
     repository::store_name_to_id(
         repository.clone(),
         metadata.name.as_str(),

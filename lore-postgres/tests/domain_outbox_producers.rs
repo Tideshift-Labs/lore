@@ -35,6 +35,9 @@
 //! Gated on `LORE_TEST_PG_URL`; skipped when unset. Isolated per test by
 //! random repository/branch/cell identities since the tables are shared.
 
+#[path = "common/delete_observations.rs"]
+mod delete_observations;
+
 use std::time::SystemTime;
 
 use lore_base::types::KeyType;
@@ -670,13 +673,13 @@ async fn repository_delete_not_found_rejection_leaves_no_row() {
     let input = RepositoryDeleteInput {
         repository_id: repository_id.clone(),
         expected_generation: None,
-        delete_proof: rand::random::<[u8; 32]>().to_vec(),
         projection: Vec::new(),
         events: vec![pending_event(
             repository_id.clone(),
             CommittedOrdinal::RepositoryGeneration,
             Vec::new(),
         )],
+        ..delete_observations::repository_delete_input(&repository_id).await
     };
     let result = store
         .repository_delete(&operation, &input)
@@ -720,7 +723,6 @@ async fn repository_delete_commits_exactly_one_row_at_the_tombstone_generation()
     let delete_input = RepositoryDeleteInput {
         repository_id: repository_id.clone(),
         expected_generation: Some(1),
-        delete_proof: rand::random::<[u8; 32]>().to_vec(),
         projection: Vec::new(),
         events: vec![{
             let mut e = pending_event(
@@ -731,6 +733,7 @@ async fn repository_delete_commits_exactly_one_row_at_the_tombstone_generation()
             e.event_kind = "repository.tombstoned".to_string();
             e
         }],
+        ..delete_observations::repository_delete_input(&repository_id).await
     };
     let result = store
         .repository_delete(&delete_op, &delete_input)
@@ -773,18 +776,17 @@ async fn repository_delete_retry_on_an_already_tombstoned_repository_leaves_no_s
         .await
         .expect("create must succeed");
 
-    let delete_proof = rand::random::<[u8; 32]>().to_vec();
     let (first_delete_op, _w) = admitted_operation(&store, "repository_delete").await;
     let first_delete = RepositoryDeleteInput {
         repository_id: repository_id.clone(),
         expected_generation: None,
-        delete_proof: delete_proof.clone(),
         projection: Vec::new(),
         events: vec![pending_event(
             repository_id.clone(),
             CommittedOrdinal::RepositoryGeneration,
             Vec::new(),
         )],
+        ..delete_observations::repository_delete_input(&repository_id).await
     };
     let first = store
         .repository_delete(&first_delete_op, &first_delete)
@@ -802,13 +804,13 @@ async fn repository_delete_retry_on_an_already_tombstoned_repository_leaves_no_s
     let second_delete = RepositoryDeleteInput {
         repository_id: repository_id.clone(),
         expected_generation: None,
-        delete_proof,
         projection: Vec::new(),
         events: vec![pending_event(
             repository_id.clone(),
             CommittedOrdinal::RepositoryGeneration,
             Vec::new(),
         )],
+        ..delete_observations::repository_delete_input(&repository_id).await
     };
     let second = store
         .repository_delete(&second_delete_op, &second_delete)
@@ -892,12 +894,10 @@ async fn repository_delete_with_three_extra_live_branches_still_commits_exactly_
         .await;
     }
 
-    let delete_proof = rand::random::<[u8; 32]>().to_vec();
     let (delete_op, _w) = admitted_operation(&store, "repository_delete").await;
     let delete_input = RepositoryDeleteInput {
         repository_id: repository_id.clone(),
         expected_generation: None,
-        delete_proof: delete_proof.clone(),
         projection: Vec::new(),
         events: vec![{
             let mut e = pending_event(
@@ -908,6 +908,7 @@ async fn repository_delete_with_three_extra_live_branches_still_commits_exactly_
             e.event_kind = "repository.tombstoned".to_string();
             e
         }],
+        ..delete_observations::repository_delete_input(&repository_id).await
     };
     let result = store
         .repository_delete(&delete_op, &delete_input)
@@ -956,7 +957,6 @@ async fn repository_delete_with_three_extra_live_branches_still_commits_exactly_
     let retry_input = RepositoryDeleteInput {
         repository_id: repository_id.clone(),
         expected_generation: None,
-        delete_proof,
         projection: Vec::new(),
         events: vec![{
             let mut e = pending_event(
@@ -967,6 +967,7 @@ async fn repository_delete_with_three_extra_live_branches_still_commits_exactly_
             e.event_kind = "repository.tombstoned".to_string();
             e
         }],
+        ..delete_observations::repository_delete_input(&repository_id).await
     };
     let retried = store
         .repository_delete(&retry_op, &retry_input)
@@ -1249,9 +1250,9 @@ async fn branch_delete_under_a_tombstoned_repository_leaves_no_row() {
             &RepositoryDeleteInput {
                 repository_id: repository_id.clone(),
                 expected_generation: None,
-                delete_proof: rand_delete_proof(),
                 projection: Vec::new(),
                 events: Vec::new(),
+                ..delete_observations::repository_delete_input(&repository_id).await
             },
         )
         .await
@@ -2203,9 +2204,9 @@ async fn begin_obliterate_on_a_tombstoned_repository_leaves_no_row() {
             &RepositoryDeleteInput {
                 repository_id: repository_id.clone(),
                 expected_generation: None,
-                delete_proof: rand::random::<[u8; 32]>().to_vec(),
                 projection: Vec::new(),
                 events: Vec::new(),
+                ..delete_observations::repository_delete_input(&repository_id).await
             },
         )
         .await

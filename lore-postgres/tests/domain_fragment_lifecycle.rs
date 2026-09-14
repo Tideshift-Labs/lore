@@ -18,6 +18,9 @@ mod case_namespace;
 
 mod domain_fragment_membership;
 
+#[path = "common/delete_observations.rs"]
+mod delete_observations;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ops::Deref;
@@ -3083,9 +3086,9 @@ async fn stale_association_rejection_comes_from_repository_tombstone_not_generat
             &RepositoryDeleteInput {
                 repository_id: repository_id.to_vec(),
                 expected_generation: None,
-                delete_proof: rand::random::<[u8; 32]>().to_vec(),
                 projection: Vec::new(),
                 events: Vec::new(),
+                ..delete_observations::repository_delete_input(&repository_id).await
             },
         )
         .await

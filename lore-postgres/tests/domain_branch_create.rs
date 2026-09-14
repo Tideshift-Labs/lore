@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: MIT
 //! SERVER transaction tests. Each ignored case requires an owned PostgreSQL database.
 
+#[path = "common/delete_observations.rs"]
+mod delete_observations;
+
 use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::coordinator::*;
 use lore_postgres::domain::errors::DomainOutcome;
@@ -348,11 +351,11 @@ async fn fresh_create_is_atomic_and_exact_replay_survives_deleted_state() {
     assert_eq!(snapshot.metadata_hash, input.metadata_hash);
     assert_eq!(snapshot.latest_hash, input.latest_hash);
     let delete = RepositoryDeleteInput {
-        repository_id: repo.repository_id,
+        repository_id: repo.repository_id.clone(),
         expected_generation: Some(1),
-        delete_proof: vec![7; 32],
         projection: vec![],
         events: vec![],
+        ..delete_observations::repository_delete_input(&repo.repository_id).await
     };
     assert_eq!(
         store
@@ -706,16 +709,35 @@ async fn repository_delete_racing_create_never_publishes_after_the_tombstone() {
     let delete = RepositoryDeleteInput {
         repository_id: repo.repository_id.clone(),
         expected_generation: Some(1),
-        delete_proof: vec![8; 32],
         projection: vec![],
         events: vec![],
+        ..delete_observations::repository_delete_input(&repo.repository_id).await
     };
     let (created, deleted) = tokio::join!(
         store.branch_create(&create_op, &input),
         store.repository_delete(&delete_op, &delete)
     );
-    assert_eq!(deleted.unwrap().outcome, DomainOutcome::Applied);
     let created = created.unwrap();
+    let deleted = deleted.unwrap();
+    if created.outcome == DomainOutcome::Applied {
+        rejected(
+            deleted.outcome,
+            lore_postgres::domain::coordinator::GENERATION_MISMATCH_V1,
+        );
+        // The newly created branch was absent from delete's preflight. A fresh
+        // operation and complete observation must be used to delete it.
+        let refreshed = delete_observations::repository_delete_input(&repo.repository_id).await;
+        assert_eq!(
+            store
+                .repository_delete(&operation(&store, "repository.delete").await, &refreshed)
+                .await
+                .unwrap()
+                .outcome,
+            DomainOutcome::Applied
+        );
+    } else {
+        assert_eq!(deleted.outcome, DomainOutcome::Applied);
+    }
     match created.outcome {
         DomainOutcome::Applied => {
             assert_eq!(created.public_result, Some(input.public_result.clone()))

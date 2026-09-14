@@ -12,6 +12,9 @@ mod barrier;
 #[path = "domain_receipt_recovery_cases.rs.inc"]
 mod receipt_recovery_cases;
 
+#[path = "common/delete_observations.rs"]
+mod delete_observations;
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -1861,9 +1864,9 @@ async fn obsolete_repository_and_branch_generations_make_rows_logically_absent()
             &RepositoryDeleteInput {
                 repository_id: repository_id.to_vec(),
                 expected_generation: obliterate.repository_generation,
-                delete_proof: rand::random::<[u8; 32]>().to_vec(),
                 projection: Vec::new(),
                 events: Vec::new(),
+                ..delete_observations::repository_delete_input(&repository_id).await
             },
         )
         .await

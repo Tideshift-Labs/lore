@@ -45,6 +45,7 @@
 pub mod backfill;
 pub mod bypass;
 pub mod coordinator;
+pub mod delete_proof;
 pub mod errors;
 pub mod fragments;
 pub mod lock_order;

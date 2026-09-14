@@ -24,6 +24,9 @@
 //! env panics rather than returning: a case that quietly does nothing is NOT
 //! RUN, and must never be countable as a pass.
 
+#[path = "common/delete_observations.rs"]
+mod delete_observations;
+
 use std::time::SystemTime;
 
 use lore_postgres::domain::PostgresDomainStore;
@@ -221,9 +224,9 @@ async fn begin_obliterate_advances_live_generation_and_refuses_a_tombstoned_repo
     let delete_input = RepositoryDeleteInput {
         repository_id: repository_id.to_vec(),
         expected_generation: None,
-        delete_proof: rand::random::<[u8; 32]>().to_vec(),
         projection: Vec::new(),
         events: Vec::new(),
+        ..delete_observations::repository_delete_input(&repository_id).await
     };
     let deleted = store
         .repository_delete(&delete_op, &delete_input)

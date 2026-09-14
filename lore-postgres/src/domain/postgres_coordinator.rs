@@ -1070,7 +1070,47 @@ impl DomainTransactionStore for PostgresDomainStore {
             return Ok(result);
         }
 
+        // Enumerate under the repository lock and lock branches in binary ID order.
+        sequence.enter(LockClass::Branch)?;
+        let branches = tx.query(
+            "SELECT branch_id, name, metadata_hash, generation FROM lore_domain_branches WHERE repository_id=$1 AND state=$2 ORDER BY branch_id FOR UPDATE",
+            &[&input.repository_id, &schema::STATE_LIVE],
+        ).await.map_err(|e| DomainError::from_pg("repository delete branch set", e))?;
+        let mut observed = input.branches.iter().collect::<Vec<_>>();
+        observed.sort_by(|a, b| a.branch_id.cmp(&b.branch_id));
+        let matches = existing.name == input.expected_name
+            && existing.metadata_hash == input.expected_metadata_hash
+            && branches.len() == observed.len()
+            && branches.iter().zip(&observed).all(|(row, expected)| {
+                row.get::<_, Vec<u8>>("branch_id") == expected.branch_id
+                    && row.get::<_, String>("name") == expected.name
+                    && row.get::<_, Vec<u8>>("metadata_hash") == expected.metadata_hash
+            });
+        if !matches {
+            let result = MutationResult::rejected(GENERATION_MISMATCH_V1);
+            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
+            classify_commit(tx.commit().await, "repository delete observation commit")?;
+            return Ok(result);
+        }
+        for branch in &branches {
+            let prior: i64 = branch.get("generation");
+            super::delete_proof::generation(prior)?;
+            next_generation(prior)?;
+        }
         let generation = next_generation(existing.generation)?;
+        let (binding, attempt) =
+            super::delete_proof::persisted_receipt(&tx, &operation.key).await?;
+        let preimage = super::delete_proof::repository_delete_preimage(
+            &super::delete_proof::DeleteProofReceipt {
+                key: &operation.key,
+                binding: &binding,
+                client_attempt_id: attempt.as_deref(),
+            },
+            &input.repository_id,
+            super::delete_proof::generation(existing.generation)?,
+            super::delete_proof::generation(generation)?,
+        )?;
+        let delete_proof = blake3::hash(&preimage).as_bytes().to_vec();
 
         tx.execute(
             "UPDATE lore_domain_repositories \
@@ -1081,7 +1121,7 @@ impl DomainTransactionStore for PostgresDomainStore {
                 &schema::STATE_TOMBSTONED,
                 &generation,
                 &clock,
-                &input.delete_proof,
+                &delete_proof,
             ],
         )
         .await
@@ -1115,7 +1155,7 @@ impl DomainTransactionStore for PostgresDomainStore {
                 &input.repository_id,
                 &schema::STATE_TOMBSTONED,
                 &clock,
-                &input.delete_proof,
+                &delete_proof,
                 &generation,
                 &schema::STATE_LIVE,
             ],
@@ -1140,7 +1180,7 @@ impl DomainTransactionStore for PostgresDomainStore {
         .await?;
 
         let outcome = DomainOutcome::Applied;
-        receipts::commit_delete(&tx, &operation.key, &input.delete_proof, clock).await?;
+        receipts::commit_delete(&tx, &operation.key, &delete_proof, clock).await?;
         classify_commit(tx.commit().await, "repository delete commit")?;
 
         Ok(MutationResult {

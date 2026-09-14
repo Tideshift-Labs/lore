@@ -78,6 +78,11 @@ Metadata-upload throttling returns `RESOURCE_EXHAUSTED`. If creation is already 
 authoritative metadata cannot be read, `ABORTED` requires receipt reconciliation; it does not mean
 the committed repository was rolled back. Ordinary uploads still require an existing repository.
 
+Governed repository deletion accepts carried operation identity and derives its delete proof from
+the persisted receipt. The transaction checks the observed repository metadata and live branch set
+before applying tombstones. Internal preparation remains unavailable: these deletes return
+`FAILED_PRECONDITION` with details `INTERNAL_DELETE_PREPARATION_DEFERRED_V1` before preparation.
+
 The fork-private `DomainOperationProofNamespaceStateGet` RPC reads proof-namespace state for an
 org-bound `lorehub-control-plane` service account. It uses the configured Postgres domain store
 for a consistent read-only snapshot. It does not repair state or authorize release when state is

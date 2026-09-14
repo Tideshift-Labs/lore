@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Independent test-only implementation of the ratified repository-delete proof v1.
-//! This pins cross-language bytes; it does not add a production proof producer.
+//! Pins the independent oracle and the production producer to cross-language bytes.
 
+use lore_postgres::domain::delete_proof::DeleteProofReceipt;
+use lore_postgres::domain::delete_proof::repository_delete_preimage;
+use lore_postgres::domain::receipts::OperationBinding;
+use lore_postgres::domain::receipts::ReceiptKey;
 use serde_json::Value;
 
 const FIXTURE: &str = include_str!("fixtures/repository-delete-proof-v1.json");
@@ -87,6 +91,43 @@ fn repository_delete_proof_v1_matches_every_golden_preimage_and_digest() {
         let name = string(vector, "name");
         assert!(names.insert(name), "duplicate vector name: {name}");
         let actual = preimage(vector);
+        let key = ReceiptKey {
+            verified_issuer: string(vector, "verifiedIssuer").to_owned(),
+            authenticated_subject: string(vector, "authenticatedSubject").to_owned(),
+            tenant_scope_key: bytes(vector, "tenantScopeKeyHex", None),
+            operation_id: uuid::Uuid::from_slice(&bytes(vector, "operationIdHex", Some(16)))
+                .unwrap(),
+        };
+        let binding = OperationBinding {
+            method: string(vector, "method").to_owned(),
+            scope: bytes(vector, "canonicalScopeHex", None),
+            fingerprint_version: vector["fingerprintVersion"]
+                .as_i64()
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            fingerprint: bytes(vector, "fingerprintHex", Some(32)),
+            canonical_intent_digest: bytes(vector, "canonicalIntentDigestHex", Some(32)),
+        };
+        let attempt = vector["clientAttemptIdHex"]
+            .as_str()
+            .map(|_| bytes(vector, "clientAttemptIdHex", Some(16)));
+        let receipt = DeleteProofReceipt {
+            key: &key,
+            binding: &binding,
+            client_attempt_id: attempt.as_deref(),
+        };
+        let produced = repository_delete_preimage(
+            &receipt,
+            &bytes(vector, "repositoryIdHex", Some(16)),
+            string(vector, "priorGeneration").parse().unwrap(),
+            string(vector, "committedGeneration").parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            produced, actual,
+            "{name}: production versus independent encoder"
+        );
         assert_eq!(
             actual,
             bytes(vector, "expectedPreimageHex", None),

@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: MIT
 //! WP118 create metadata witness transaction tests; schema-valid provider observations are fixture-only.
 //! Real provider upload is proved separately by clean_init_single_server_rpc.
+#[path = "common/delete_observations.rs"]
+mod delete_observations;
+
 use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
@@ -340,9 +343,9 @@ async fn conflicting_same_identity_and_tombstone_never_bind_speculative_metadata
     let delete = lore_postgres::domain::coordinator::RepositoryDeleteInput {
         repository_id: first.repository_id.clone(),
         expected_generation: Some(1),
-        delete_proof: vec![0x62; 32],
         projection: Vec::new(),
         events: Vec::new(),
+        ..delete_observations::repository_delete_input(&first.repository_id).await
     };
     assert_eq!(
         store

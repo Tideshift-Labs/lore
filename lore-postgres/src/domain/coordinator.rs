@@ -342,6 +342,14 @@ pub struct PendingEvent {
     pub payload: Vec<u8>,
 }
 
+/// Branch facts used to build projection keys, checked against locked live rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryDeleteBranchObservation {
+    pub branch_id: Vec<u8>,
+    pub name: String,
+    pub metadata_hash: Vec<u8>,
+}
+
 /// Tombstone one repository, releasing its name in the same transaction.
 #[derive(Debug, Clone)]
 pub struct RepositoryDeleteInput {
@@ -349,8 +357,11 @@ pub struct RepositoryDeleteInput {
     pub repository_id: Vec<u8>,
     /// Generation the caller expects to be tombstoning.
     pub expected_generation: Option<i64>,
-    /// Attempt-compatible immutable delete proof recorded on the tombstone.
-    pub delete_proof: Vec<u8>,
+    /// Preloaded immutable repository facts; both must match the locked row.
+    pub expected_name: String,
+    pub expected_metadata_hash: Vec<u8>,
+    /// Exact live branch set, including immutable facts used by projection.
+    pub branches: Vec<RepositoryDeleteBranchObservation>,
     /// Projection rows to remove in step.
     pub projection: Vec<ProjectionWrite>,
     /// Classified events to append last, in the order given.
