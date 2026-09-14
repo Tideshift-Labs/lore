@@ -169,6 +169,12 @@ impl DomainTransactionStore for PausedStore {
         }
         self.inner.branch_push_commit(operation, input).await
     }
+    async fn branch_push_refuse(
+        &self,
+        operation: &GovernedOperation,
+    ) -> Result<DomainOutcome, DomainError> {
+        self.inner.branch_push_refuse(operation).await
+    }
     async fn begin_obliterate(
         &self,
         operation: &GovernedOperation,
