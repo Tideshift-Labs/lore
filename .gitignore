@@ -1,6 +1,7 @@
 # Build output
 /bin/
 **/target/
+target-*/
 *.dSYM
 
 # Local files
