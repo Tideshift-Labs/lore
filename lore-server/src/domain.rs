@@ -3514,6 +3514,16 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl DomainTransactionStore for UnreachableDomainStore {
+        async fn branch_push_refuse(
+            &self,
+            _operation: &GovernedOperation,
+        ) -> Result<DomainOutcome, DomainError> {
+            // Admission-only tests never reach push refusal; no real store can settle it.
+            Err(DomainError::OutcomeUnknown(
+                "UnreachableDomainStore does not model push refusal".to_owned(),
+            ))
+        }
+
         async fn domain_operation_prepare_direct(
             &self,
             _key: &ReceiptKey,
@@ -3712,6 +3722,16 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl DomainTransactionStore for PreparingDomainStore {
+        async fn branch_push_refuse(
+            &self,
+            _operation: &GovernedOperation,
+        ) -> Result<DomainOutcome, DomainError> {
+            // Preparation-only tests never reach push refusal; no real store can settle it.
+            Err(DomainError::OutcomeUnknown(
+                "PreparingDomainStore does not model push refusal".to_owned(),
+            ))
+        }
+
         async fn domain_operation_prepare_direct(
             &self,
             key: &ReceiptKey,

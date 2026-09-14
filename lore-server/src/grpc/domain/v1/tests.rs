@@ -171,6 +171,16 @@ impl RecordingStore {
 
 #[async_trait]
 impl DomainTransactionStore for RecordingStore {
+    async fn branch_push_refuse(
+        &self,
+        _: &GovernedOperation,
+    ) -> Result<DomainOutcome, DomainError> {
+        // Receipt-rail tests never reach push refusal; no real store can settle it.
+        Err(DomainError::OutcomeUnknown(
+            "RecordingStore does not model push refusal".to_owned(),
+        ))
+    }
+
     async fn domain_operation_prepare_direct(
         &self,
         _key: &ReceiptKey,

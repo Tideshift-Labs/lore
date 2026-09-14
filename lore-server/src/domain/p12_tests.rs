@@ -216,6 +216,16 @@ impl MetadataCasScriptedStore {
 
 #[async_trait]
 impl DomainTransactionStore for MetadataCasScriptedStore {
+    async fn branch_push_refuse(
+        &self,
+        _operation: &GovernedOperation,
+    ) -> Result<DomainOutcome, DomainError> {
+        // Metadata-CAS tests never reach push refusal; no real store can settle it.
+        Err(DomainError::OutcomeUnknown(
+            "MetadataCasScriptedStore does not model push refusal".to_owned(),
+        ))
+    }
+
     async fn domain_operation_prepare_direct(
         &self,
         _key: &ReceiptKey,
@@ -541,6 +551,16 @@ struct RepositoryCreateScriptedStore {
 
 #[async_trait]
 impl DomainTransactionStore for RepositoryCreateScriptedStore {
+    async fn branch_push_refuse(
+        &self,
+        _operation: &GovernedOperation,
+    ) -> Result<DomainOutcome, DomainError> {
+        // Repository-create tests never reach push refusal; no real store can settle it.
+        Err(DomainError::OutcomeUnknown(
+            "RepositoryCreateScriptedStore does not model push refusal".to_owned(),
+        ))
+    }
+
     async fn domain_operation_prepare_direct(
         &self,
         _key: &ReceiptKey,
