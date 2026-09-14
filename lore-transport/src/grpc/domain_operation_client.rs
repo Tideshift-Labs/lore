@@ -588,8 +588,58 @@ mod live_tests {
         seen_authorization_id_equals_operation_id: Arc<Mutex<Option<bool>>>,
     }
 
+    #[tokio::test]
+    async fn namespace_snapshot_is_explicitly_unimplemented_by_receipt_get_double() {
+        let server = FakeDomainOperationServer {
+            behavior: ReceiptGetBehavior::Fail(tonic::Code::Aborted, "receipt-get only"),
+            calls: Arc::new(AtomicUsize::new(0)),
+            seen_authorization: Arc::new(Mutex::new(None)),
+            seen_repository_id: Arc::new(Mutex::new(None)),
+            seen_authorization_id_equals_operation_id: Arc::new(Mutex::new(None)),
+        };
+        let request =
+            lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetRequestV1 {
+                protocol_revision: 2,
+                org_uuid: vec![0x11; 16].into(),
+                initiating_principal_namespace:
+                    b"principal-v1\0aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                        .as_slice()
+                        .into(),
+                namespace_epoch: vec![0x22; 16].into(),
+                namespace_claim_revision: 7,
+                namespace_claim_nonce: vec![0x33; 32].into(),
+            };
+        let error = server
+            .domain_operation_proof_namespace_state_get(Request::new(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+        assert!(server.seen_authorization.lock().unwrap().is_none());
+        assert!(server.seen_repository_id.lock().unwrap().is_none());
+        assert!(
+            server
+                .seen_authorization_id_equals_operation_id
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[tonic::async_trait]
     impl DomainOperationServiceTrait for FakeDomainOperationServer {
+        async fn domain_operation_proof_namespace_state_get(
+            &self,
+            _request: Request<
+                lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetRequestV1,
+            >,
+        ) -> Result<
+            Response<lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetResponseV1>,
+            Status,
+        > {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
         async fn domain_operation_clock_get(
             &self,
             _request: Request<DomainOperationClockGetRequest>,

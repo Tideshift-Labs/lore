@@ -32,6 +32,27 @@ pub(super) fn service(probe: Arc<ReceiptProbe>) -> DomainOperationServiceServer<
 }
 #[tonic::async_trait]
 impl DomainOperationService for ReceiptService {
+    async fn domain_operation_proof_namespace_state_get(
+        &self,
+        request: Request<DomainOperationProofNamespaceStateGetRequestV1>,
+    ) -> Result<Response<DomainOperationProofNamespaceStateGetResponseV1>, Status> {
+        if request.get_ref().protocol_revision != 2 {
+            return Err(Status::invalid_argument(
+                "unsupported proof namespace protocol",
+            ));
+        }
+        // This receipt fixture has no proof-namespace inventory or materialization.
+        // Its empty snapshot is ABSENT, which grants no release authority.
+        Ok(Response::new(
+            DomainOperationProofNamespaceStateGetResponseV1 {
+                status: ProofNamespaceStateStatus::Absent as i32,
+                quota_revision: None,
+                final_high_water: None,
+                final_range_set_digest: None,
+            },
+        ))
+    }
+
     async fn domain_operation_attempt_receipt_get(
         &self,
         request: Request<DomainOperationAttemptReceiptGetRequest>,
@@ -107,5 +128,67 @@ impl DomainOperationService for ReceiptService {
         _: Request<DomainOperationProofNamespaceRetireRequestV1>,
     ) -> Result<Response<DomainOperationProofNamespaceRetireAckV1>, Status> {
         Err(Status::unimplemented("unused"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bound_namespace_request() -> DomainOperationProofNamespaceStateGetRequestV1 {
+        DomainOperationProofNamespaceStateGetRequestV1 {
+            protocol_revision: 2,
+            org_uuid: vec![0x11; 16].into(),
+            initiating_principal_namespace: b"principal-v1\0aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                .as_slice()
+                .into(),
+            namespace_epoch: vec![0x22; 16].into(),
+            namespace_claim_revision: 7,
+            namespace_claim_nonce: vec![0x33; 32].into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_snapshot_is_absent_without_touching_receipt_probe() {
+        let probe = Arc::new(ReceiptProbe::default());
+        let service = ReceiptService(probe.clone());
+        let response = service
+            .domain_operation_proof_namespace_state_get(Request::new(bound_namespace_request()))
+            .await
+            .expect("fixture supports namespace snapshot reads")
+            .into_inner();
+
+        assert_eq!(
+            response,
+            DomainOperationProofNamespaceStateGetResponseV1 {
+                status: ProofNamespaceStateStatus::Absent as i32,
+                quota_revision: None,
+                final_high_water: None,
+                final_range_set_digest: None,
+            }
+        );
+        assert!(probe.calls().is_empty());
+        assert!(probe.expected.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn namespace_snapshot_rejects_other_protocols_without_receipt_probe_activity() {
+        let probe = Arc::new(ReceiptProbe::default());
+        let service = ReceiptService(probe.clone());
+        for protocol_revision in [0, 1, 3, u32::MAX] {
+            let mut request = bound_namespace_request();
+            request.protocol_revision = protocol_revision;
+            let error = service
+                .domain_operation_proof_namespace_state_get(Request::new(request))
+                .await
+                .expect_err("only receipt protocol v2 is supported");
+            assert_eq!(
+                error.code(),
+                tonic::Code::InvalidArgument,
+                "protocol {protocol_revision}"
+            );
+        }
+        assert!(probe.calls().is_empty());
+        assert!(probe.expected.lock().is_none());
     }
 }
