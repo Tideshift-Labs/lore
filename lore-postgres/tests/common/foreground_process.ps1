@@ -104,7 +104,7 @@ exit $target.ExitCode
         $child.StandardInput.WriteLine($command)
         $child.StandardInput.Close()
         $timedOut = $false
-        while (-not ($child.HasExited -and $stdout.IsCompleted -and $stderr.IsCompleted -and $job.ActiveProcesses -eq 0)) {
+        while (-not ($child.HasExited -and $stdout.IsCompleted -and $stderr.IsCompleted)) {
             if ($deadline.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
                 $timedOut = $true
                 $job.Terminate()
@@ -112,7 +112,11 @@ exit $target.ExitCode
             }
             Start-Sleep -Milliseconds 25
         }
-        # Cleanup has its own finite grace after the command deadline. Do not claim
+        $exitCode = if ($timedOut) { 124 } else { $child.ExitCode }
+        # Detached helpers such as MSVC telemetry are cleanup work once the command
+        # and its pipes finish, not a reason to wait for the command deadline.
+        if (-not $timedOut -and $job.ActiveProcesses -ne 0) { $job.Terminate() }
+        # Cleanup has its own finite grace after command completion. Do not claim
         # termination until the job is empty and every inherited pipe has closed.
         $cleanup = [Diagnostics.Stopwatch]::StartNew()
         while (-not ($child.HasExited -and $stdout.IsCompleted -and $stderr.IsCompleted -and $job.ActiveProcesses -eq 0)) {
@@ -123,7 +127,7 @@ exit $target.ExitCode
         if ($timedOut) { $output += "`nTimed out after $TimeoutSeconds seconds; owned job is empty and output pipes are closed." }
         [pscustomobject]@{
             Output = $output
-            ExitCode = $(if ($timedOut) { 124 } else { $child.ExitCode })
+            ExitCode = $exitCode
             TimedOut = $timedOut
             ProcessId = $child.Id
         }

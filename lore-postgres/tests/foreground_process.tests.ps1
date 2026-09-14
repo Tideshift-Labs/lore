@@ -36,4 +36,13 @@ if (Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue) { throw 'E
 if ($orphan.Output -notmatch 'DESCENDANT=(\d+)') { throw 'Parent-exits-first fixture did not start a descendant' }
 if (Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue) { throw 'Descendant outlived exited parent and job cleanup' }
 if ($orphan.Output -notmatch 'owned job is empty and output pipes are closed') { throw 'Missing verified cleanup result' }
-Write-Host 'PASS: output drain, exit code, parent-held timeout, parent-exits-first timeout and descendant reaping (4 cases)'
+$detachedOutput = $parentExitsFirst -replace '\$info.CreateNoWindow = \$true', '$info.CreateNoWindow = $true; $info.UseShellExecute = $true; $info.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden'
+$elapsed.Restart()
+$completed = Invoke-ForegroundProcess pwsh @('-NoProfile', '-Command', $detachedOutput) $testRoot 20
+if ($completed.ExitCode -ne 0 -or $completed.TimedOut) { throw 'Completed command was changed into a timeout by its detached helper' }
+if ($elapsed.Elapsed.TotalSeconds -gt 14) { throw 'Completed command waited for detached helper instead of bounded cleanup' }
+if ($completed.Output -notmatch 'PARENT_EXITING=(\d+)') { throw 'Normal-completion fixture did not reach parent exit' }
+if (Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue) { throw 'Completed parent survived' }
+if ($completed.Output -notmatch 'DESCENDANT=(\d+)') { throw 'Normal-completion fixture did not start its detached helper' }
+if (Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue) { throw 'Detached helper survived successful command cleanup' }
+Write-Host 'PASS: output drain, exit code, parent-held timeout, inherited-pipe timeout, and normal completion with detached-helper cleanup (5 cases)'
