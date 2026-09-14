@@ -339,3 +339,123 @@ async fn repository_delete_overflow_rolls_back_receipt_and_every_lifecycle_row()
         assert_no_publication(&db, &created.repository_id).await;
     }
 }
+
+async fn branch_fixture() -> (PostgresDomainStore, Client, Vec<u8>, Vec<u8>) {
+    let (store, db, created) = fixture().await;
+    let branch = Uuid::new_v4().as_bytes().to_vec();
+    db.execute("INSERT INTO lore_domain_branches (repository_id,branch_id,repository_generation,state,generation,name,metadata_hash,latest_hash,creation_fingerprint_version,creation_fingerprint,created_at) VALUES ($1,$2,1,0,1,'feature',$3,$4,1,$3,clock_timestamp())", &[&created.repository_id,&branch,&vec![90u8;32],&vec![91u8;32]]).await.unwrap();
+    (store, db, created.repository_id, branch)
+}
+
+#[tokio::test]
+#[ignore = "requires owned Postgres; run with --ignored --test-threads=1"]
+async fn branch_proof_binds_persisted_attempt_generations_and_final_tip() {
+    for attempt in [None, Some(Uuid::new_v4())] {
+        let (store, db, repo, branch) = branch_fixture().await;
+        db.execute(
+            "UPDATE lore_domain_repositories SET generation=7 WHERE repository_id=$1",
+            &[&repo],
+        )
+        .await
+        .unwrap();
+        db.execute("UPDATE lore_domain_branches SET repository_generation=7,generation=11 WHERE repository_id=$1 AND branch_id=$2", &[&repo,&branch]).await.unwrap();
+        let input = delete_observations::branch_delete_input(&repo, &branch).await;
+        let (op, _) = admitted_operation(&store, "branch.delete", attempt).await;
+        assert_eq!(
+            store.branch_delete(&op, &input).await.unwrap().outcome,
+            DomainOutcome::Applied
+        );
+        let expected = blake3::hash(
+            &lore_postgres::domain::delete_proof::branch_delete_preimage(
+                &DeleteProofReceipt {
+                    key: &op.key,
+                    binding: &op.binding,
+                    client_attempt_id: attempt.as_ref().map(|a| a.as_bytes().as_slice()),
+                },
+                &repo,
+                &branch,
+                7,
+                11,
+                12,
+                &[91; 32],
+            )
+            .unwrap(),
+        );
+        let row=db.query_one("SELECT generation,delete_proof,latest_hash FROM lore_domain_branches WHERE repository_id=$1 AND branch_id=$2", &[&repo,&branch]).await.unwrap();
+        assert_eq!(row.get::<_, i64>(0), 12);
+        assert_eq!(row.get::<_, Vec<u8>>(1), expected.as_bytes());
+        assert_eq!(row.get::<_, Vec<u8>>(2), vec![91; 32]);
+        let receipt=db.query_one("SELECT tombstone_proof,public_result,client_attempt_id FROM lore_domain_operation_receipts WHERE verified_issuer=$1 AND operation_id=$2", &[&op.key.verified_issuer,&op.key.operation_id.as_bytes().as_slice()]).await.unwrap();
+        assert_eq!(receipt.get::<_, Vec<u8>>(0), expected.as_bytes());
+        assert_eq!(receipt.get::<_, Option<Vec<u8>>>(1), None);
+        assert_eq!(
+            receipt.get::<_, Option<Vec<u8>>>(2),
+            attempt.map(|id| id.as_bytes().to_vec())
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires owned Postgres; run with --ignored --test-threads=1"]
+async fn branch_delete_rejects_stale_observations_protection_and_default_without_publication() {
+    use lore_postgres::domain::coordinator::DEFAULT_BRANCH_V1;
+    use lore_postgres::domain::coordinator::DELETE_PROTECTED_V1;
+    for case in 0..6 {
+        let (store, db, repo, branch) = branch_fixture().await;
+        let mut input = delete_observations::branch_delete_input(&repo, &branch).await;
+        let expected = match case {
+            0 => {
+                input.expected_name.push_str("-stale");
+                GENERATION_MISMATCH_V1
+            }
+            1 => {
+                db.execute("UPDATE lore_domain_branches SET metadata_hash=$3 WHERE repository_id=$1 AND branch_id=$2", &[&repo,&branch,&vec![92u8;32]]).await.unwrap();
+                GENERATION_MISMATCH_V1
+            }
+            2 => {
+                db.execute("UPDATE lore_domain_branches SET latest_hash=$3 WHERE repository_id=$1 AND branch_id=$2", &[&repo,&branch,&vec![93u8;32]]).await.unwrap();
+                GENERATION_MISMATCH_V1
+            }
+            3 => {
+                input.delete_protected = true;
+                DELETE_PROTECTED_V1
+            }
+            4 => {
+                input.legacy_default = true;
+                DEFAULT_BRANCH_V1
+            }
+            5 => {
+                db.execute("UPDATE lore_domain_repositories SET default_branch_id=$2 WHERE repository_id=$1", &[&repo,&branch]).await.unwrap();
+                DEFAULT_BRANCH_V1
+            }
+            _ => unreachable!(),
+        };
+        input
+            .projection
+            .push(lore_postgres::domain::coordinator::ProjectionWrite {
+                partition: repo.clone(),
+                key_type: lore_base::types::KeyType::BranchId as i16,
+                key: vec![0xE1; 32],
+                value: Some(vec![0xE2; 32]),
+            });
+        input.events.push(PendingEvent {
+            cell_id: "branch-delete-test".into(),
+            event_kind: "branch.deleted".into(),
+            aggregate_kind: "branch".into(),
+            aggregate_id: branch.clone(),
+            aggregate_ordinal:
+                lore_postgres::domain::coordinator::CommittedOrdinal::BranchGeneration,
+            aggregate_identity: vec![91; 32],
+            payload_schema_version: 1,
+            payload: b"{}".to_vec(),
+        });
+        let before = lifecycle(&db, &repo).await;
+        let (op, _) = admitted_operation(&store, "branch.delete", None).await;
+        assert!(
+            matches!(store.branch_delete(&op,&input).await.unwrap().outcome,DomainOutcome::NotApplied{reason,..} if reason==expected),
+            "case {case}"
+        );
+        assert_eq!(lifecycle(&db, &repo).await, before);
+        assert_no_publication(&db, &repo).await;
+    }
+}

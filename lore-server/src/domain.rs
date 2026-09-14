@@ -44,6 +44,7 @@ use lore_postgres::domain::coordinator::BranchDeleteInput;
 use lore_postgres::domain::coordinator::BranchSnapshot;
 use lore_postgres::domain::coordinator::CAS_MISMATCH_V1;
 use lore_postgres::domain::coordinator::DEFAULT_BRANCH_V1;
+use lore_postgres::domain::coordinator::DELETE_PROTECTED_V1;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
 use lore_postgres::domain::coordinator::MetadataCasInput;
@@ -83,6 +84,8 @@ use crate::store::configuration::resolve_plugin_config_with_fallback;
 /// The `mode` string that selects the Postgres backend.
 const POSTGRES_MODE: &str = "postgres";
 const CONTROL_PLANE_SERVICE_SUBJECT: &str = "lorehub-control-plane";
+/// CR-029 semantic method shared by both local branch-delete adapters.
+pub const PLATFORM_METHOD_BRANCH_DELETE: &str = "branch.delete";
 
 // PIN(WP-120, 2026-09-04): the loreserver-internal prepare's wire contract with
 // auth-grpc, agreed with the platform lane and frozen here so a later reader can
@@ -2569,40 +2572,6 @@ impl GovernedRepositoryDelete {
     }
 }
 
-/// The 32 proof bytes a branch tombstone requires, or the fence while CR-029
-/// derives none.
-///
-/// A temporary branch-only fence until branch proof wiring lands.
-/// Branch activation is independent of repository deletion; this is not a
-/// shared enum: freezing a repository delete proof must not silently open the
-/// branch path, and vice versa. `lore_domain_branches_tombstone_evidence`
-/// requires 32 bytes on a tombstoned branch row, so this is not a value the
-/// coordinator can be called without.
-///
-/// Missing artefact: a frozen `delete_proof` derivation in CR-029 on the same
-/// terms as its canonical-intent digest contract — one canonical preimage, its
-/// exact field order and framing, and independently computed golden vectors on
-/// both sides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BranchDeleteProof {
-    /// No derivation exists. [`GovernedBranchDelete::commit`] refuses.
-    Unfrozen,
-}
-
-impl BranchDeleteProof {
-    /// The 32 proof bytes the tombstone row requires, or `None` while CR-029
-    /// freezes no derivation.
-    ///
-    /// Exhaustive with no `_` arm, for the reason
-    /// the repository seam used: a variant carrying real bytes
-    /// must be a compile error here until it is handled.
-    fn bytes(self) -> Option<Vec<u8>> {
-        match self {
-            Self::Unfrozen => None,
-        }
-    }
-}
-
 /// Everything one branch delete retires, as the handler observed it.
 pub struct BranchDeletePublication<'a> {
     /// Repository-format salt, from the target `RepositoryContext`.
@@ -2622,8 +2591,10 @@ pub struct BranchDeletePublication<'a> {
     /// 32-byte tip the branch is being tombstoned at. The `branch.deleted`
     /// event's aggregate identity, per CR-032's branch row.
     pub final_latest_hash: &'a [u8],
-    /// BLOCKED(WP-116): delete_proof derivation unfrozen in CR-029.
-    pub delete_proof: BranchDeleteProof,
+    /// Immutable metadata pointer used to verify protection under lock.
+    pub metadata_hash: &'a [u8],
+    pub delete_protected: bool,
+    pub legacy_default: bool,
 }
 
 impl BranchDeletePublication<'_> {
@@ -2663,8 +2634,7 @@ impl BranchDeletePublication<'_> {
 
 /// What a governed branch delete committed.
 pub struct BranchDeleteOutcome {
-    /// Branch generation this transaction committed, or the existing one an
-    /// exact retry found.
+    /// Branch generation this transaction committed. Recovery uses receipt lookup.
     pub branch_generation: Option<i64>,
 }
 
@@ -2675,43 +2645,75 @@ pub struct BranchDeleteOutcome {
 /// everything between admission and the coordinator is identical. Two copies of
 /// a governed mutation path is how the two come to mean different things.
 ///
-/// This is the only seam that can emit `branch.deleted`, the last unemitted row
-/// in CR-032's classification table. The ungoverned writers it replaces
+/// This seam emits the classified `branch.deleted` event. The ungoverned writers it replaces
 /// (WP-119 writer inventory B4 and B5) each perform one unsynchronised
 /// `MutableStore::store` with no domain row, no generation, and no event.
 ///
-/// # Fenced by two missing values, not by missing plumbing
-///
-/// The projection row, the classified event, the coordinator input, the
-/// coordinator call and the outcome mapping are all here and complete. Two
-/// inputs have no derivation, and they fence at different layers:
-///
-/// - [`BranchDeleteProof`] has no frozen preimage, and [`Self::commit`] refuses
-///   on it before it touches the coordinator. Same artefact as
-///   the previously fenced repository delete seam.
-/// - **There is no `CanonicalIntent::BranchDelete` family.** CR-029's
-///   canonical-intent contract freezes six, `lore-server/src/domain_intent.rs`
-///   defines those six, and `packages/control-plane/src/repository-operation-intent.ts`
-///   defines the same six on the platform side. `AdmittedOperation::into_governed`
-///   requires a digest and `receipts::consume` compares the resulting binding
-///   against the `PREPARED` row the platform wrote, so a Lore-side seventh family
-///   with no platform counterpart would fail every admission it was offered.
-///   Freezing it is a CR-029 amendment with cross-language golden vectors, not a
-///   Lore-side edit.
-///
-/// The second is why **both handlers still refuse at entry** through
-/// `reject_unwired_governed_operation` rather than calling [`Self::prepare`]:
-/// they have no digest to hand it. That entry refusal is also what stops a
-/// delete that will certainly refuse from first running its pre-hook and
-/// notification side effects. `lore-server/tests/p12_governed_wiring.rs` pins
-/// both facts: that the two sites stay guarded, and that this seam is otherwise
-/// complete.
 pub struct GovernedBranchDelete {
     domain: Arc<DomainContext>,
     operation: GovernedOperation,
 }
 
+/// Immutable observations from the branch transaction, for the v1 response.
+pub struct BranchDeleteRecord {
+    pub metadata: lore_revision::metadata::Metadata,
+    pub metadata_hash: Hash,
+    pub final_latest_hash: Hash,
+}
+
 impl GovernedBranchDelete {
+    pub async fn commit_branch(
+        &self,
+        repository: Arc<RepositoryContext>,
+        branch_id: lore_revision::lore::BranchId,
+    ) -> Result<BranchDeleteRecord, Status> {
+        if let Ok((_, current)) = lore_revision::instance::load_current_anchor(&repository).await
+            && current == branch_id
+        {
+            return Err(Status::failed_precondition(
+                "Branch is currently checked out",
+            ));
+        }
+        let row = self
+            .domain
+            .store()
+            .branch_snapshot(repository.id.data(), branch_id.data())
+            .await
+            .map_err(|e| crate::grpc::map_domain_error_to_status(&e))?
+            .filter(|row| row.live)
+            .ok_or_else(|| Status::not_found("Branch does not exist"))?;
+        if row.metadata_hash.len() != 32 || row.latest_hash.len() != 32 {
+            return Err(Status::internal("Invalid stored branch hash"));
+        }
+        let metadata_hash = Hash::from(row.metadata_hash.as_slice());
+        let metadata = branch::load_metadata(repository.clone(), metadata_hash)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let name = branch::name(&metadata).unwrap_or_default();
+        if name != row.name {
+            return Err(Status::internal(
+                "Branch metadata name disagrees with domain row",
+            ));
+        }
+        self.commit(&BranchDeletePublication {
+            salt: repository.salt(),
+            repository_id: repository.id.data(),
+            branch_id: branch_id.data(),
+            name,
+            expected_generation: Some(row.generation),
+            metadata_hash: &row.metadata_hash,
+            final_latest_hash: &row.latest_hash,
+            delete_protected: branch::protected(&metadata),
+            legacy_default: branch::stack(&metadata).is_empty(),
+        })
+        .await?;
+        Ok(BranchDeleteRecord {
+            metadata,
+            metadata_hash,
+            final_latest_hash: Hash::from(row.latest_hash.as_slice()),
+        })
+    }
+
     /// Prepare the governed call, or `Ok(None)` for the ungoverned path.
     ///
     /// Identical admission rules to [`GovernedRepositoryDelete::prepare`],
@@ -2728,12 +2730,13 @@ impl GovernedBranchDelete {
     pub async fn prepare(
         domain: Option<&Arc<DomainContext>>,
         admitted: Option<AdmittedOperation>,
-        method: &'static str,
         digest: Vec<u8>,
     ) -> Result<Option<Self>, Status> {
         let Some(admitted) = admitted else {
             return Ok(None);
         };
+        require_carried_delete(&admitted)?;
+        let method = PLATFORM_METHOD_BRANCH_DELETE;
         let Some(domain) = domain else {
             return Err(Status::failed_precondition(
                 "Domain coordinator is unavailable",
@@ -2762,26 +2765,6 @@ impl GovernedBranchDelete {
         &self,
         publication: &BranchDeletePublication<'_>,
     ) -> Result<BranchDeleteOutcome, Status> {
-        // BLOCKED(WP-116): branch delete_proof derivation unfrozen in CR-029.
-        //
-        // Fails closed, first, before the projection is built and before the
-        // coordinator is reached. Everything past this line is the rest of the
-        // wiring and runs unchanged the moment the proof has a derivation.
-        //
-        // Named "branch delete_proof" rather than reusing the repository seam's
-        // marker text so the two are individually greppable and individually
-        // pinnable: freezing the repository derivation must not read as having
-        // freed this one.
-        let Some(delete_proof) = publication.delete_proof.bytes() else {
-            warn!(
-                operation_id = %self.operation.key.operation_id,
-                "Refusing a governed branch delete: CR-029 freezes no branch delete_proof \
-                 derivation, and a minted proof would become permanent receipt evidence"
-            );
-            return Err(Status::unimplemented(
-                "Governed branch delete requires a frozen CR-029 delete_proof derivation",
-            ));
-        };
         // Both ids become part of a `lore_mutable` key or an event identity, so
         // both are width-checked before the first key is derived.
         // `hash_function_arg` hashes whatever it is handed, so a short or long id
@@ -2799,7 +2782,7 @@ impl GovernedBranchDelete {
                 "branch name must be known to release its live-name row",
             ));
         }
-        let input = self.input(publication, delete_proof)?;
+        let input = self.input(publication)?;
         self.publish(&input).await
     }
 
@@ -2811,7 +2794,6 @@ impl GovernedBranchDelete {
     fn input(
         &self,
         publication: &BranchDeletePublication<'_>,
-        delete_proof: Vec<u8>,
     ) -> Result<BranchDeleteInput, Status> {
         // CR-032 classifies a branch tombstone as ONE `branch.deleted` row on
         // the branch aggregate, keyed on the committed branch generation with
@@ -2836,7 +2818,11 @@ impl GovernedBranchDelete {
             repository_id: publication.repository_id.to_vec(),
             branch_id: publication.branch_id.to_vec(),
             expected_generation: publication.expected_generation,
-            delete_proof,
+            expected_name: publication.name.to_owned(),
+            expected_metadata_hash: publication.metadata_hash.to_vec(),
+            expected_latest_hash: publication.final_latest_hash.to_vec(),
+            delete_protected: publication.delete_protected,
+            legacy_default: publication.legacy_default,
             projection: publication.projection(),
             events,
         })
@@ -2864,12 +2850,8 @@ impl GovernedBranchDelete {
 /// Map a branch-delete-specific rejection, deferring to the shared mapper
 /// elsewhere.
 ///
-/// Exactly one reason is answered here rather than by
-/// [`crate::grpc::map_domain_rejection_to_status`], on the same terms
-/// [`map_repository_create_rejection`] answers exactly one: the shared mapper's
-/// vocabulary is what every family agrees on, and `DEFAULT_BRANCH_V1` is a
-/// reason only this family can produce. Adding it to the shared mapper would
-/// oblige every other family to have an opinion about it.
+/// Default-branch and protection refusals belong to this family. Other reasons
+/// use the shared domain mapper.
 ///
 /// `FAILED_PRECONDITION` matches what the ungoverned handlers already return for
 /// the same refusal, so the governed and legacy paths answer a default-branch
@@ -2879,7 +2861,7 @@ impl GovernedBranchDelete {
 /// branch the caller just read would be an answer to a question nobody asked.
 fn map_branch_delete_rejection(reason: &str) -> Status {
     match reason {
-        DEFAULT_BRANCH_V1 => Status::failed_precondition(reason.to_owned()),
+        DEFAULT_BRANCH_V1 | DELETE_PROTECTED_V1 => Status::failed_precondition(reason.to_owned()),
         other => crate::grpc::map_domain_rejection_to_status(other),
     }
 }

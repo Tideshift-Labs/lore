@@ -549,6 +549,7 @@ struct RepositoryCreateScriptedStore {
     captured_input: Arc<Mutex<Option<RepositoryCreateInput>>>,
     captured_delete: Arc<Mutex<Option<RepositoryDeleteInput>>>,
     delete_branch_snapshot: Option<BranchSnapshot>,
+    captured_branch_delete: Arc<Mutex<Option<BranchDeleteInput>>>,
 }
 
 #[async_trait]
@@ -704,13 +705,11 @@ impl DomainTransactionStore for RepositoryCreateScriptedStore {
     async fn branch_delete(
         &self,
         _operation: &GovernedOperation,
-        _input: &BranchDeleteInput,
+        input: &BranchDeleteInput,
     ) -> Result<MutationResult, DomainError> {
-        unreachable!(
-            "RepositoryCreateScriptedStore only scripts repository_create/repository_snapshot"
-        )
+        *self.captured_branch_delete.lock().unwrap() = Some(input.clone());
+        Ok(self.result.clone())
     }
-
     async fn metadata_compare_and_swap(
         &self,
         _operation: &GovernedOperation,
@@ -781,6 +780,7 @@ fn build_governed_repository_create(
         captured_input: Arc::clone(&captured_input),
         captured_delete: Arc::new(Mutex::new(None)),
         delete_branch_snapshot: None,
+        captured_branch_delete: Arc::new(Mutex::new(None)),
     });
     let domain = Arc::new(DomainContext::new(store, true).with_cell_id(cell_id.map(str::to_owned)));
     let governed = GovernedRepositoryCreate {
@@ -1197,6 +1197,7 @@ async fn repository_delete_commit_passes_observations_to_the_coordinator() {
         captured_input: Arc::new(Mutex::new(None)),
         captured_delete: Arc::clone(&captured),
         delete_branch_snapshot: None,
+        captured_branch_delete: Arc::new(Mutex::new(None)),
     });
     let domain = Arc::new(DomainContext::new(store, true).with_cell_id(Some("cell-delete".into())));
     let mut operation = dummy_create_operation();
@@ -1226,17 +1227,11 @@ async fn repository_delete_commit_passes_observations_to_the_coordinator() {
     assert_eq!(input.events[0].event_kind, "repository.tombstoned");
 }
 // ---------------------------------------------------------------------------
-// GovernedBranchDelete: fenced the same way GovernedRepositoryDelete is, on two
-// missing artefacts (BranchDeleteProof::Unfrozen, and the absent
-// CanonicalIntent::BranchDelete family), so `prepare`/`commit`'s own admission
-// and proof-refusal logic is what's reachable and testable here -- the
-// coordinator call inside `publish()` is not reachable through `commit()`
-// today, the same shape as GovernedRepositoryDelete's own tests above.
-// ---------------------------------------------------------------------------
+// Governed branch delete admission and publication, with server-derived proof.
 
 fn dummy_branch_delete_operation() -> GovernedOperation {
     let mut operation = dummy_create_operation();
-    operation.binding.method = "branch_delete".to_owned();
+    operation.binding.method = "branch.delete".to_owned();
     operation
 }
 
@@ -1244,7 +1239,7 @@ fn dummy_branch_delete_operation() -> GovernedOperation {
 /// carve-out, exactly like every other governed seam's `Ok(None)` path.
 #[tokio::test]
 async fn branch_delete_prepare_with_no_admitted_operation_is_the_legacy_path() {
-    let result = GovernedBranchDelete::prepare(None, None, "branch_delete", vec![0u8; 32]).await;
+    let result = GovernedBranchDelete::prepare(None, None, vec![0u8; 32]).await;
     assert!(matches!(result, Ok(None)));
 }
 
@@ -1273,13 +1268,7 @@ async fn branch_delete_prepare_refuses_carriage_when_enforcement_is_off() {
     };
     // `GovernedBranchDelete` has no `Debug` impl -- match explicitly, same
     // convention as this file's other `Debug`-less-type cases.
-    let result = GovernedBranchDelete::prepare(
-        Some(&domain),
-        Some(admitted),
-        "branch_delete",
-        vec![0u8; 32],
-    )
-    .await;
+    let result = GovernedBranchDelete::prepare(Some(&domain), Some(admitted), vec![0u8; 32]).await;
     let Err(error) = result else {
         panic!("carriage with enforcement off must be refused, not admitted");
     };
@@ -1307,47 +1296,55 @@ async fn branch_delete_prepare_admits_carriage_when_enforcement_is_on() {
             claim_witness: None,
         })),
     };
-    let result = GovernedBranchDelete::prepare(
-        Some(&domain),
-        Some(admitted),
-        "branch_delete",
-        vec![0u8; 32],
-    )
-    .await
-    .expect("carriage with enforcement on must be admitted");
+    let result = GovernedBranchDelete::prepare(Some(&domain), Some(admitted), vec![0u8; 32])
+        .await
+        .expect("carriage with enforcement on must be admitted");
     assert!(result.is_some());
 }
 
-/// `GovernedBranchDelete::commit` refuses on `BranchDeleteProof::Unfrozen`
-/// before it builds a projection, derives an event, or reaches the
-/// coordinator -- `UnreachableDomainStore` backs the domain context, so a
-/// regression that called into the store at all would panic the test rather
-/// than merely fail an assertion. Mirrors
-/// `commit_refuses_on_the_unfrozen_delete_proof_before_touching_the_coordinator`
-/// above, for the branch-delete seam's own (separate) proof type.
 #[tokio::test]
-async fn branch_delete_commit_refuses_on_the_unfrozen_delete_proof_before_touching_the_coordinator()
-{
-    let domain = Arc::new(context(true));
-    let operation = dummy_branch_delete_operation();
-    let governed = GovernedBranchDelete { domain, operation };
+async fn branch_delete_commit_passes_observations_and_protection_to_one_coordinator_call() {
+    let captured = Arc::new(Mutex::new(None));
+    let store = Arc::new(RepositoryCreateScriptedStore {
+        result: MutationResult {
+            outcome: DomainOutcome::Applied,
+            repository_generation: Some(1),
+            branch_generation: Some(2),
+            observed_pointer: None,
+        },
+        snapshot: None,
+        captured_input: Arc::new(Mutex::new(None)),
+        captured_delete: Arc::new(Mutex::new(None)),
+        delete_branch_snapshot: None,
+        captured_branch_delete: Arc::clone(&captured),
+    });
+    let domain =
+        Arc::new(DomainContext::new(store, true).with_cell_id(Some("branch-delete-cell".into())));
+    let governed = GovernedBranchDelete {
+        domain,
+        operation: dummy_branch_delete_operation(),
+    };
     let publication = BranchDeletePublication {
-        salt: b"wp119-branch-delete-salt",
-        repository_id: &[0x66u8; 16],
-        branch_id: &[0x77u8; 16],
-        name: "unfrozen-proof-branch",
-        expected_generation: None,
-        final_latest_hash: &[0x88u8; 32],
-        delete_proof: BranchDeleteProof::Unfrozen,
+        salt: b"branch-test",
+        repository_id: &[0x66; 16],
+        branch_id: &[0x77; 16],
+        name: "feature",
+        expected_generation: Some(1),
+        final_latest_hash: &[0x88; 32],
+        metadata_hash: &[0x99; 32],
+        delete_protected: true,
+        legacy_default: false,
     };
-
-    let result = governed.commit(&publication).await;
-    let Err(error) = result else {
-        panic!("an unfrozen delete_proof must refuse, not commit");
-    };
-    assert_eq!(error.code(), Code::Unimplemented);
+    governed.commit(&publication).await.unwrap();
+    let input = captured.lock().unwrap().take().unwrap();
+    assert_eq!(input.expected_metadata_hash, vec![0x99; 32]);
+    assert_eq!(input.expected_latest_hash, vec![0x88; 32]);
+    assert!(input.delete_protected);
+    assert!(!input.legacy_default);
+    assert_eq!(input.projection.len(), 1);
+    assert_eq!(input.events.len(), 1);
+    assert_eq!(input.events[0].event_kind, "branch.deleted");
 }
-
 /// `BranchDeletePublication::projection()` reproduces exactly the one row the
 /// legacy writer leaves (`lore_revision::branch::delete` calls only
 /// `delete_name_to_id`, unlike a repository delete's 2 + 3N): `KeyType::BranchId`,
@@ -1372,7 +1369,9 @@ fn branch_delete_projection_reproduces_the_one_row_matching_the_legacy_key_deriv
         name,
         expected_generation: Some(4),
         final_latest_hash: &[0x99u8; 32],
-        delete_proof: BranchDeleteProof::Unfrozen,
+        metadata_hash: &[0x99; 32],
+        delete_protected: false,
+        legacy_default: false,
     };
 
     let rows = publication.projection();
@@ -2303,6 +2302,7 @@ async fn repository_delete_preflight_checks_snapshot_and_loads_branch_metadata()
                     snapshot,
                     captured_input: Arc::new(Mutex::new(None)),
                     captured_delete: Arc::clone(&captured),
+                    captured_branch_delete: Arc::new(Mutex::new(None)),
                     delete_branch_snapshot: Some(BranchSnapshot {
                         repository_id: bytes.repository_id.to_vec(),
                         branch_id: branch_id.data().to_vec(),
@@ -2427,5 +2427,184 @@ async fn both_repository_delete_handlers_refuse_internal_admission_before_lookup
             b"INTERNAL_DELETE_PREPARATION_DEFERRED_V1",
             "v1={v1}"
         );
+    }
+}
+
+struct DeleteForwardMustNotConnect(crate::grpc::forwarded_requests::RpcFlags);
+impl crate::grpc::forwarded_requests::ForwardedRequests for DeleteForwardMustNotConnect {
+    fn rpc_flags(&self) -> &crate::grpc::forwarded_requests::RpcFlags {
+        &self.0
+    }
+    fn forwarded_revision_service(
+        &self,
+    ) -> Box<dyn crate::grpc::forwarded_requests::revision_service::ForwardedRevisionServiceClient>
+    {
+        panic!("governed delete must not forward")
+    }
+    fn forwarded_repository_service(
+        &self,
+    ) -> Box<
+        dyn crate::grpc::forwarded_requests::repository_service::ForwardedRepositoryServiceClient,
+    > {
+        panic!("governed delete must not forward")
+    }
+}
+
+#[tokio::test]
+async fn branch_delete_handlers_refuse_internal_admission_and_carried_forwarding_without_effects() {
+    for case in 0..3 {
+        let (immutable, mutable, execution) = crate::store::test_store_create().await.unwrap();
+        let domain =
+            Arc::new(context(true).with_operation_verifier(Some(Arc::new(DeleteMustNotVerify))));
+        let notifications = Arc::new(crate::notification::testing::MockNotificationSender::new());
+        let hooks = crate::hooks::HookDispatcher::empty();
+        let forward: Option<Arc<dyn crate::grpc::forwarded_requests::ForwardedRequests>> =
+            Some(Arc::new(DeleteForwardMustNotConnect(
+                crate::grpc::forwarded_requests::RpcFlags {
+                    revision_branch_delete: true,
+                    ..Default::default()
+                },
+            )));
+        let status = LORE_CONTEXT
+            .scope(execution, async {
+                if case == 0 {
+                    let mut request = internal_delete_request(lore_proto::BranchDeleteRequest {
+                        branch: bytes::Bytes::from_static(&[6; 16]),
+                    });
+                    request.metadata_mut().insert_bin(
+                        lore_transport::grpc::REPOSITORY_ID_KEY,
+                        BinaryMetadataValue::from_bytes(&[5; 16]),
+                    );
+                    crate::grpc::handlers::branch_delete::handler(
+                        request,
+                        immutable,
+                        mutable,
+                        notifications,
+                        &hooks,
+                        &DeleteTestInstruments,
+                        Some(&domain),
+                    )
+                    .await
+                    .unwrap_err()
+                } else {
+                    let mut request = internal_delete_request(
+                        lore_proto::lore::revision::v1::BranchDeleteRequest {
+                            id: bytes::Bytes::from_static(&[6; 16]),
+                        },
+                    );
+                    if case == 2 {
+                        *request.metadata_mut() = carriage(false);
+                    }
+                    request.metadata_mut().insert_bin(
+                        lore_transport::grpc::REPOSITORY_ID_KEY,
+                        BinaryMetadataValue::from_bytes(&[5; 16]),
+                    );
+                    crate::grpc::revision::v1::branch_delete::handler(
+                        request,
+                        immutable,
+                        mutable,
+                        notifications,
+                        &forward,
+                        &hooks,
+                        &DeleteTestInstruments,
+                        Some(&domain),
+                    )
+                    .await
+                    .unwrap_err()
+                }
+            })
+            .await;
+        assert_eq!(status.code(), Code::FailedPrecondition, "case {case}");
+        if case < 2 {
+            assert_eq!(status.details(), b"INTERNAL_DELETE_PREPARATION_DEFERRED_V1");
+        } else {
+            assert_eq!(
+                status.message(),
+                "Governed branch delete forwarding is disabled"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn branch_delete_preflight_loads_metadata_and_returns_only_the_committed_record() {
+    for applied in [true, false] {
+        let (immutable, mutable, execution) = crate::store::test_store_create().await.unwrap();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable,
+                    mutable,
+                    RepositoryId::from([0x61; 16]),
+                ));
+                let id = Context::from([0x62; 16]);
+                let mut metadata = lore_revision::metadata::Metadata::new();
+                branch::metadata_populate(
+                    &mut metadata,
+                    id,
+                    "feature",
+                    "default",
+                    "fixture",
+                    0,
+                    vec![lore_base::types::BranchPoint {
+                        branch: Context::from([0x60; 16]),
+                        revision: Hash::from([0x64; 32]),
+                    }],
+                )
+                .unwrap();
+                let metadata_hash = metadata.serialize(repository.clone()).await.unwrap();
+                let captured = Arc::new(Mutex::new(None));
+                let store = Arc::new(RepositoryCreateScriptedStore {
+                    result: MutationResult {
+                        outcome: if applied {
+                            DomainOutcome::Applied
+                        } else {
+                            DomainOutcome::NotApplied {
+                                reason: GENERATION_MISMATCH_V1.into(),
+                                reason_version: 1,
+                            }
+                        },
+                        repository_generation: Some(1),
+                        branch_generation: Some(2),
+                        observed_pointer: None,
+                    },
+                    snapshot: None,
+                    captured_input: Arc::new(Mutex::new(None)),
+                    captured_delete: Arc::new(Mutex::new(None)),
+                    captured_branch_delete: Arc::clone(&captured),
+                    delete_branch_snapshot: Some(BranchSnapshot {
+                        repository_id: vec![0x61; 16],
+                        branch_id: vec![0x62; 16],
+                        live: true,
+                        generation: 1,
+                        repository_generation: 1,
+                        name: "feature".into(),
+                        metadata_hash: metadata_hash.as_ref().to_vec(),
+                        latest_hash: vec![0x63; 32],
+                    }),
+                });
+                let domain = Arc::new(DomainContext::new(store, true));
+                let governed = GovernedBranchDelete {
+                    domain,
+                    operation: dummy_branch_delete_operation(),
+                };
+                let result = governed.commit_branch(repository, id).await;
+                if !applied {
+                    assert!(matches!(result, Err(ref status) if status.code() == Code::Aborted));
+                    return;
+                }
+                let record = result.unwrap();
+                assert_eq!(record.metadata_hash, metadata_hash);
+                assert_eq!(record.final_latest_hash.as_ref(), &[0x63; 32]);
+                assert_eq!(branch::name(&record.metadata).unwrap(), "feature");
+                let input = captured.lock().unwrap().take().unwrap();
+                assert_eq!(input.expected_latest_hash, vec![0x63; 32]);
+                assert_eq!(input.expected_metadata_hash, metadata_hash.as_ref());
+                assert!(
+                    !input.legacy_default,
+                    "nonempty immutable stack is not a legacy default"
+                );
+            })
+            .await;
     }
 }

@@ -757,6 +757,10 @@ fn intent_surface_excludes_authority_and_server_derived_seams() {
                 caller_created: _,
             } => {}
             CanonicalIntent::RepositoryDelete { repository_id: _ } => {}
+            CanonicalIntent::BranchDelete {
+                repository_id: _,
+                branch_id: _,
+            } => {}
             CanonicalIntent::RepositoryMetadataCas {
                 repository_id: _,
                 expected_hash: _,
@@ -793,4 +797,57 @@ fn intent_surface_excludes_authority_and_server_derived_seams() {
         creator: None,
         stack: &[],
     });
+}
+
+#[test]
+fn branch_delete_matches_the_independent_literal_vector() {
+    assert_vector(
+        CanonicalIntent::BranchDelete {
+            repository_id: &REPOSITORY_ID,
+            branch_id: &BRANCH_ID,
+        },
+        "6c6f72652d6272616e63682d64656c6574652d696e74656e742d763100000000100191234567897abc8def0123456789ab000000100191234567897abc8def0123456789ac",
+        "71b8bf3696acecac088f8adb6d0d7a502a7ddb7909197081cc0e651f579f6e8e",
+    );
+}
+
+#[test]
+fn branch_delete_intent_rejects_wrong_widths_and_binds_both_identities() {
+    for width in [0, 15, 17] {
+        assert!(
+            canonical_intent_preimage(&CanonicalIntent::BranchDelete {
+                repository_id: &vec![1; width],
+                branch_id: &BRANCH_ID
+            })
+            .is_err()
+        );
+        assert!(
+            canonical_intent_preimage(&CanonicalIntent::BranchDelete {
+                repository_id: &REPOSITORY_ID,
+                branch_id: &vec![1; width]
+            })
+            .is_err()
+        );
+    }
+    let original = canonical_intent_digest(&CanonicalIntent::BranchDelete {
+        repository_id: &REPOSITORY_ID,
+        branch_id: &BRANCH_ID,
+    })
+    .unwrap();
+    assert_ne!(
+        original,
+        canonical_intent_digest(&CanonicalIntent::BranchDelete {
+            repository_id: &BRANCH_ID,
+            branch_id: &BRANCH_ID
+        })
+        .unwrap()
+    );
+    assert_ne!(
+        original,
+        canonical_intent_digest(&CanonicalIntent::BranchDelete {
+            repository_id: &REPOSITORY_ID,
+            branch_id: &REPOSITORY_ID
+        })
+        .unwrap()
+    );
 }

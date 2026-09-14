@@ -421,12 +421,14 @@ pub struct BranchDeleteInput {
     /// one. `None` skips the fence, matching
     /// [`RepositoryDeleteInput::expected_generation`].
     pub expected_generation: Option<i64>,
-    /// Attempt-compatible immutable delete proof recorded on the tombstone.
-    ///
-    /// `lore_domain_branches_tombstone_evidence` requires exactly 32 bytes on a
-    /// tombstoned row, so this is not optional at the schema level even though
-    /// CR-029 freezes no derivation for it yet.
-    pub delete_proof: Vec<u8>,
+    /// Immutable preflight facts, checked against the locked branch row.
+    pub expected_name: String,
+    pub expected_metadata_hash: Vec<u8>,
+    pub expected_latest_hash: Vec<u8>,
+    /// Protection observations from the immutable blob at the checked hash.
+    pub delete_protected: bool,
+    /// The legacy default-branch rule also rejects an empty stack.
+    pub legacy_default: bool,
     /// Projection rows to remove in step.
     pub projection: Vec<ProjectionWrite>,
     /// Classified events to append last, in the order given.
@@ -562,12 +564,11 @@ pub const ADMISSION_REJECTED_V1: &str = "ADMISSION_REJECTED_V1";
 /// every family agrees on, and a reason only one family can produce belongs with
 /// that family.
 ///
-/// The **protection** half of CR-029's "default/protected rules" recheck has no
-/// counterpart here on purpose: protection lives in the branch metadata blob,
-/// which the domain rows do not carry, so the transaction cannot recheck it. The
-/// handler's preflight remains the only enforcement of that rule, and pretending
-/// otherwise with a reason nothing can raise would be worse than naming the gap.
+/// Protection is read from immutable metadata during preflight. The coordinator
+/// checks its hash under lock before using that observation.
 pub const DEFAULT_BRANCH_V1: &str = "DEFAULT_BRANCH_V1";
+/// Protection from immutable metadata whose hash was rechecked under lock.
+pub const DELETE_PROTECTED_V1: &str = "DELETE_PROTECTED_V1";
 
 /// The narrow server-facing domain transaction API.
 ///
@@ -726,9 +727,8 @@ pub trait DomainTransactionStore: Send + Sync {
     /// `MutableStore::store` with no domain row, no generation, and no event, so
     /// a crash between it and the notification leaves nothing to re-drive.
     ///
-    /// Deleting an already-tombstoned branch is `APPLIED` with the existing
-    /// generation and **no** new event, which is CR-032's "exact create/delete
-    /// retry: No new event" enforced here rather than trusted to the caller.
+    /// An absent or already-tombstoned branch returns `NOT_FOUND` without
+    /// consuming admission. Existing success is recovered through receipt lookup.
     async fn branch_delete(
         &self,
         operation: &GovernedOperation,

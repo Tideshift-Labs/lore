@@ -10,6 +10,7 @@ use std::convert::TryFrom;
 
 const REPOSITORY_CREATE_DOMAIN: &[u8] = b"lore-repository-create-intent-v1\0";
 const REPOSITORY_DELETE_DOMAIN: &[u8] = b"lore-repository-delete-intent-v1\0";
+const BRANCH_DELETE_DOMAIN: &[u8] = b"lore-branch-delete-intent-v1\0";
 const REPOSITORY_METADATA_CAS_DOMAIN: &[u8] = b"lore-repository-metadata-cas-intent-v1\0";
 const BRANCH_METADATA_CAS_DOMAIN: &[u8] = b"lore-branch-metadata-cas-intent-v1\0";
 const BRANCH_PUSH_DOMAIN: &[u8] = b"lore-branch-push-intent-v1\0";
@@ -49,6 +50,10 @@ pub enum CanonicalIntent<'a> {
     },
     RepositoryDelete {
         repository_id: &'a [u8],
+    },
+    BranchDelete {
+        repository_id: &'a [u8],
+        branch_id: &'a [u8],
     },
     RepositoryMetadataCas {
         repository_id: &'a [u8],
@@ -147,6 +152,18 @@ pub fn canonical_intent_preimage(
 ) -> Result<Vec<u8>, CanonicalIntentError> {
     let mut out = Vec::new();
     match intent {
+        CanonicalIntent::BranchDelete {
+            repository_id,
+            branch_id,
+        } => {
+            out.extend_from_slice(BRANCH_DELETE_DOMAIN);
+            framed(
+                &mut out,
+                "repository_id",
+                fixed("repository_id", repository_id, 16)?,
+            )?;
+            framed(&mut out, "branch_id", fixed("branch_id", branch_id, 16)?)?;
+        }
         CanonicalIntent::BranchCreate {
             repository_id,
             branch_id,

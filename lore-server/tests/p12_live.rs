@@ -4,6 +4,9 @@
 #[path = "support/direct_authorization.rs"]
 mod direct_authorization;
 
+#[path = "../../lore-postgres/tests/common/delete_observations.rs"]
+mod delete_observations;
+
 use std::sync::Arc;
 
 use lore_base::types::KeyType;
@@ -601,22 +604,9 @@ async fn governed_create_projection_rows_match_the_legacy_writers_exactly() {
 ///
 /// # Bypassing the seam, deliberately -- this is NOT evidence branch delete is wired
 ///
-/// `GovernedBranchDelete::commit()` is unconditionally refused on
-/// `BranchDeleteProof::Unfrozen` -- there is no frozen CR-029 branch
-/// tombstone-proof derivation yet (see `p12_tests.rs`'s own pin of that
-/// refusal, and its OFFLINE pin of the private `projection()`'s key
-/// derivation against a fixed test salt, since `projection()` is only
-/// reachable from `p12_tests`, a child module of `domain.rs`). Neither
-/// `commit()` nor the private `projection()` is reachable from this external
-/// integration-test crate, so this test drives `store.branch_delete(...)`
-/// (public, ungated) directly with 32 arbitrary proof bytes, exactly as
-/// `domain_outbox_producers.rs`'s coordinator-level cases do. That proves
-/// PROJECTION AGREEMENT ONLY: that a delete-shaped `ProjectionWrite` computed
-/// the same way the seam's private `projection()` computes it removes the
-/// same row a real legacy delete removes. It is not evidence the governed
-/// path is reachable -- no caller can reach `GovernedBranchDelete::commit()`
-/// today -- and no `repository_delete` analog exists in this file, for the
-/// identical reason (`RepositoryDeleteProof::Unfrozen`).
+/// This test calls the public coordinator with real preflight observations.
+/// It proves projection agreement between governed and legacy deletes; the
+/// handler and metadata-preflight behavior is covered in domain/p12_tests.rs.).
 ///
 /// # Non-vacuity
 ///
@@ -897,7 +887,6 @@ async fn branch_delete_governed_and_real_legacy_delete_agree_on_the_lore_mutable
                 repository_id: repository_partition.clone(),
                 branch_id: governed_branch_id_bytes.to_vec(),
                 expected_generation: None,
-                delete_proof: rand::random::<[u8; 32]>().to_vec(),
                 projection: vec![ProjectionWrite {
                     partition: repository_partition.clone(),
                     key_type: name_key_type,
@@ -905,6 +894,11 @@ async fn branch_delete_governed_and_real_legacy_delete_agree_on_the_lore_mutable
                     value: None,
                 }],
                 events: Vec::new(),
+                ..delete_observations::branch_delete_input(
+                    &repository_partition,
+                    &governed_branch_id_bytes,
+                )
+                .await
             };
             let result = domain_store
                 .branch_delete(&operation, &input)

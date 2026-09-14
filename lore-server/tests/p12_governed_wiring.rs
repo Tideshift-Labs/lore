@@ -14,12 +14,10 @@ struct Site {
     family: &'static str,
 }
 
-/// Forwarded create and both local branch deletes remain fenced.
-const GUARDED_SITES: [&str; 3] = [
-    include_str!("../src/grpc/forwarded_repository/v1/repository_create.rs"),
-    include_str!("../src/grpc/handlers/branch_delete.rs"),
-    include_str!("../src/grpc/revision/v1/branch_delete.rs"),
-];
+/// Authenticated forwarding remains outside the local governed deliverable.
+const GUARDED_SITES: [&str; 1] = [include_str!(
+    "../src/grpc/forwarded_repository/v1/repository_create.rs"
+)];
 /// The shared governed seam both create sites commit through.
 const GOVERNED_SEAM: &str = include_str!("../src/domain.rs");
 
@@ -340,232 +338,27 @@ fn repository_delete_is_locally_wired_with_authoritative_observations() {
 /// `PostgresDomainStore::branch_delete` plus this seam — and the two sites stay
 /// guarded for a reason narrower and more checkable than "not wired yet".
 #[test]
-fn the_branch_delete_seam_is_complete_except_its_unfrozen_proof() {
-    // The one classified event CR-032 assigns to a branch tombstone, built
-    // through the shared pinned builder exactly once in the whole seam. More
-    // than one call is a second definition of the same classification; zero is
-    // an unfed outbox.
-    assert_eq!(
-        GOVERNED_SEAM
-            .matches("outbox_builders::branch_deleted(")
-            .count(),
-        1,
-        "the governed branch-delete seam must build branch.deleted through \
-         exactly one call to the shared pinned builder"
-    );
-
-    // Scoped to the branch-delete seam's own input builder, for the reason every
-    // other pin in this file is scoped: `include_str!` pulls in the whole file,
-    // and the repository-delete seam legitimately builds a different event a few
-    // hundred lines up.
-    let branch_input_fn = {
-        let start = GOVERNED_SEAM
-            .find("        delete_proof: Vec<u8>,\n    ) -> Result<BranchDeleteInput, Status> {")
-            .expect("the governed branch-delete seam must build its input in one named function");
-        let rest = &GOVERNED_SEAM[start..];
-        let end = rest
-            .find("\n    }")
-            .expect("the governed branch-delete input builder must terminate");
-        &rest[..end]
-    };
-    assert_eq!(
-        branch_input_fn
-            .matches("outbox_builders::branch_deleted(")
-            .count(),
-        1,
-        "the branch-delete input builder must build exactly one classified event"
-    );
-    // The mirror of the repository seam's pin, in the other direction: a branch
-    // tombstone is ONE branch-aggregate row and never a repository-generation
-    // row. Emitting `repository.tombstoned` here would tell every consumer the
-    // whole repository went away because one branch did.
-    assert!(
-        !branch_input_fn.contains("outbox_builders::repository_tombstoned("),
-        "a branch tombstone emits one branch.deleted row, never a \
-         repository-generation event"
-    );
-
-    // The event must actually reach the coordinator. Scoped to the
-    // `BranchDeleteInput` literal for the same reason the create, push and
-    // repository-delete pins are scoped to theirs: a file-wide check is both
-    // unsound (a fixture elsewhere trips it) and too weak (a
-    // `let events = Vec::new();` above the literal satisfies it).
-    let literal = {
-        let start = GOVERNED_SEAM
-            .find("Ok(BranchDeleteInput {")
-            .expect("the governed branch-delete seam must build its input as a literal");
-        let rest = &GOVERNED_SEAM[start..];
-        let end = rest
-            .find("\n        })")
-            .expect("the BranchDeleteInput literal must terminate");
-        &rest[..end]
-    };
-    assert!(
-        literal.contains("\n            events,"),
-        "the governed branch delete must pass its built event to the \
-         coordinator; a literal that sets `events: Vec::new()`, or omits the \
-         field, has regressed to an unfed outbox"
-    );
-    assert!(
-        !literal.contains("events: Vec::new()"),
-        "the governed branch delete must not regress to an unfed outbox"
-    );
-    assert!(
-        literal.contains("projection: publication.projection()"),
-        "the governed branch delete must commit its projection row with the \
-         tombstone"
-    );
-
-    // The seam reaches the one coordinator method.
-    assert!(
-        GOVERNED_SEAM.contains(".branch_delete(&self.operation"),
-        "the governed branch-delete seam must call the one coordinator method"
-    );
-
-    // The projection is the LOAD-BEARING correctness claim here, and it is the
-    // one a reader is most likely to get wrong by analogy with the repository
-    // delete. `lore_revision::branch::delete` calls `delete_name_to_id` and
-    // nothing else, so a branch delete retires exactly ONE `lore_mutable` row:
-    // the live-name key. The branch metadata and latest rows deliberately
-    // survive, because the v1 handler builds its idempotent response from them
-    // AFTER the delete. Retiring them here would make the governed delete answer
-    // differently from the legacy one.
-    let branch_projection_fn = {
-        let start = GOVERNED_SEAM
-            .find("impl BranchDeletePublication<'_> {")
-            .expect("the branch-delete publication must have its own impl block");
-        let rest = &GOVERNED_SEAM[start..];
-        let end = rest
-            .find("\n}")
-            .expect("the BranchDeletePublication impl must terminate");
-        &rest[..end]
-    };
-    assert!(
-        !branch_projection_fn.contains("branch::METADATA"),
-        "a branch delete must not retire the branch metadata row; the legacy \
-         writer leaves it, and the v1 idempotent response reads it after the \
-         delete"
-    );
-    assert!(
-        !branch_projection_fn.contains("branch::LATEST"),
-        "a branch delete must not retire the branch latest pointer; the legacy \
-         writer leaves it"
-    );
-    assert_eq!(
-        branch_projection_fn.matches("ProjectionWrite {").count(),
-        1,
-        "a branch delete retires exactly one lore_mutable row, the live-name key"
-    );
-    // The live-name key folds case, because `branch::mutable_name_key` hashes
-    // `name.to_lowercase()`. Getting this wrong retires a key nothing wrote and
-    // leaves the real one behind, which is invisible until a name is reused.
-    assert!(
-        branch_projection_fn.contains("self.name.to_lowercase()"),
-        "the branch live-name key folds case, unlike the repository name key"
-    );
-
-    // The proof is the fence at the seam. `bytes()` returning `None` is what
-    // refuses; an `Unfrozen` variant that never reaches a refusal would be a
-    // comment, not a guard.
-    assert!(
-        GOVERNED_SEAM
-            .contains("BLOCKED(WP-116): branch delete_proof derivation unfrozen in CR-029"),
-        "the branch seam must record why it is fenced, in the agreed marker form"
-    );
-    // Repository proof ratification must not open the branch path early.
-    assert_eq!(
-        GOVERNED_SEAM
-            .matches("publication.delete_proof.bytes()")
-            .count(),
-        1,
-        "the branch delete seam remains fenced until its own proof is implemented"
-    );
-    // The strong form of "the proof is still unfrozen": the enum has exactly one
-    // variant. A taboo on one guessed variant NAME would be satisfied by calling
-    // the new variant anything else.
-    let proof_variants = {
-        let start = GOVERNED_SEAM
-            .find("pub enum BranchDeleteProof {")
-            .expect("the branch delete proof must stay a closed enum");
-        let rest = &GOVERNED_SEAM[start..];
-        let end = rest
-            .find("\n}")
-            .expect("the BranchDeleteProof body must terminate");
-        rest[..end]
-            .lines()
-            .skip(1)
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with("///") && !line.starts_with("//"))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        proof_variants,
-        vec!["Unfrozen,"],
-        "BranchDeleteProof must carry exactly the one unfrozen variant until \
-         CR-029 freezes a branch tombstone-proof preimage with golden vectors \
-         on both sides; adding any variant here opens the governed branch \
-         delete path"
-    );
-
-    // And the second, independent blocker: no handler may call the seam while
-    // CR-029 freezes no branch-delete canonical-intent family, because
-    // `prepare` takes a digest none of the six frozen families can produce.
-    // This is what keeps the two sites at an ENTRY refusal rather than at the
-    // seam's own fence.
-    // The forwarded entry point is the one branch-delete path with no gate at
-    // all. Pinned as an explicit negative so the omission from GUARDED_SITES is
-    // a recorded decision, and so this fails the moment the gap closes rather
-    // than passing quietly forever.
-    assert!(
-        !FORWARDED_BRANCH_DELETE.contains("admit_at_entry("),
-        "the forwarded v1 branch delete has no domain context and no verified \
-         principal, so it is fenced by CR-029's CARRIAGE-02-LORE forwarding \
-         contract rather than by a gate. If a gate has landed here, move this \
-         site into GUARDED_SITES and delete this pin"
-    );
-
-    for source in [GUARDED_SITES[1], GUARDED_SITES[2]] {
-        assert!(
-            !source.contains("GovernedBranchDelete::prepare("),
-            "a branch-delete handler must not reach the seam until CR-029 \
-             freezes a CanonicalIntent::BranchDelete family; there is no digest \
-             it could pass"
-        );
-        assert!(
-            source.contains("admit_at_entry("),
-            "a branch-delete handler must read the domain-operation headers at \
-             entry; silently ignoring carriage is the R-BLOCK-2 failure the \
-             gate exists to prevent"
-        );
+fn branch_delete_is_locally_wired_and_keeps_forwarding_disabled() {
+    for source in [
+        include_str!("../src/grpc/handlers/branch_delete.rs"),
+        include_str!("../src/grpc/revision/v1/branch_delete.rs"),
+    ] {
+        assert!(source.contains("CanonicalIntent::BranchDelete"));
+        assert!(source.contains("GovernedBranchDelete::prepare("));
+        assert!(source.contains(".commit_branch("));
+        assert!(!source.contains("reject_unwired_governed_operation("));
     }
-    // The second blocker, pinned where it actually lives. Asserting on the
-    // seam's text would be unsound: the seam's own doc comment names
-    // `CanonicalIntent::BranchDelete` while explaining that no such family
-    // exists, so a prose mention would trip the pin and, worse, deleting the
-    // explanation would satisfy it. The families are declared in exactly one
-    // place, so that is the place to check.
-    // Two needles, because each is weak alone. The domain separator is the
-    // actual frozen artefact and cannot be spelled any other way, so it catches
-    // a family added under a different Rust name. The variant shape catches a
-    // family added before its separator is written.
-    assert_eq!(
-        INTENT_FAMILIES.matches("branch-delete-intent-v1").count(),
-        0,
-        "a branch-delete canonical-intent domain separator must not exist on \
-         the Lore side alone; the preimage is frozen jointly with the platform \
-         canonicalizer, with golden vectors computed independently on both sides"
-    );
-    assert_eq!(
-        INTENT_FAMILIES.matches("    BranchDelete {").count(),
-        0,
-        "a seventh canonical-intent family is a CR-029 amendment with \
-         cross-language golden vectors on both sides, not a Lore-side edit; a \
-         Lore-only family would fail every admission the platform offered it. \
-         When CR-029 freezes one, wire both branch-delete sites in the same \
-         change and move them out of GUARDED_SITES"
-    );
+    let seam = rust_fn_body(GOVERNED_SEAM, "impl GovernedBranchDelete {");
+    assert!(seam.contains("PLATFORM_METHOD_BRANCH_DELETE"));
+    assert!(seam.contains("require_carried_delete(&admitted)"));
+    assert!(seam.contains("expected_latest_hash:"));
+    assert_eq!(seam.matches("outbox_builders::branch_deleted(").count(), 1);
+    assert!(!GOVERNED_SEAM.contains("pub enum BranchDeleteProof"));
+    assert!(INTENT_FAMILIES.contains("lore-branch-delete-intent-v1"));
+    let local = include_str!("../src/grpc/revision/v1/branch_delete.rs");
+    assert!(local.contains("Governed branch delete forwarding is disabled"));
+    assert!(!FORWARDED_BRANCH_DELETE.contains("GovernedBranchDelete::prepare("));
 }
-
 #[test]
 fn the_removed_inline_branch_push_definition_cannot_return() {
     const PUSH: &str = include_str!("../src/grpc/handlers/branch_push.rs");
@@ -942,7 +735,8 @@ fn the_governed_delete_seam_binds_its_method_by_construction_too() {
 #[test]
 fn every_governed_family_binds_its_method_from_the_one_reserved_table() {
     // (constant name, frozen value, whether a platform producer writes it)
-    let table: [(&str, &str, bool); 6] = [
+    let table: [(&str, &str, bool); 7] = [
+        ("PLATFORM_METHOD_BRANCH_DELETE", "branch.delete", false),
         (
             "PLATFORM_METHOD_REPOSITORY_CREATE",
             "repository.create",
@@ -1014,6 +808,7 @@ fn no_governed_handler_can_spell_its_own_method() {
     for seam in [
         "impl GovernedRepositoryCreate {",
         "impl GovernedRepositoryDelete {",
+        "impl GovernedBranchDelete {",
     ] {
         let body = rust_fn_body(GOVERNED_SEAM, seam);
         let signature = {

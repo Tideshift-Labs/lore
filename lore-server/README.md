@@ -78,9 +78,11 @@ Metadata-upload throttling returns `RESOURCE_EXHAUSTED`. If creation is already 
 authoritative metadata cannot be read, `ABORTED` requires receipt reconciliation; it does not mean
 the committed repository was rolled back. Ordinary uploads still require an existing repository.
 
-Governed repository deletion accepts carried operation identity and derives its delete proof from
-the persisted receipt. The transaction checks the observed repository metadata and live branch set
-before applying tombstones. Internal preparation remains unavailable: these deletes return
+Governed repository and branch deletion accept carried operation identity and derive delete proofs
+from persisted receipts and locked state. Repository deletion checks the observed metadata and live
+branch set before applying tombstones. Branch deletion binds protection checks to immutable metadata
+and rechecks the default branch under lock; governed branch-delete forwarding is disabled.
+Internal preparation remains unavailable for both delete operations: these requests return
 `FAILED_PRECONDITION` with details `INTERNAL_DELETE_PREPARATION_DEFERRED_V1` before preparation.
 
 The fork-private `DomainOperationProofNamespaceStateGet` RPC reads proof-namespace state for an

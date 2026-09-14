@@ -31,7 +31,6 @@ impl Target {
         &self,
         store: &PostgresDomainStore,
         op: &GovernedOperation,
-        proof: &[u8],
     ) -> Result<MutationResult, DomainError> {
         if let Some(branch) = &self.branch {
             store
@@ -41,9 +40,9 @@ impl Target {
                         repository_id: self.repository.clone(),
                         branch_id: branch.clone(),
                         expected_generation: None,
-                        delete_proof: proof.to_vec(),
                         projection: Vec::new(),
                         events: Vec::new(),
+                        ..delete_observations::branch_delete_input(&self.repository, branch).await
                     },
                 )
                 .await
@@ -94,10 +93,26 @@ async fn receipt(db: &Client, op: &GovernedOperation) -> Option<String> {
     db.query_opt("SELECT row_to_json(r)::text FROM lore_domain_operation_receipts r WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4", &[&op.key.verified_issuer,&op.key.authenticated_subject,&op.key.tenant_scope_key,&op.key.operation_id.as_bytes().as_slice()]).await.unwrap().map(|r| r.get(0))
 }
 
-async fn assert_proof(db: &Client, target: &Target, op: &GovernedOperation, proof: &[u8]) {
-    let repository_proof;
-    let proof = if target.branch.is_none() {
-        let preimage = lore_postgres::domain::delete_proof::repository_delete_preimage(
+async fn assert_proof(db: &Client, target: &Target, op: &GovernedOperation) {
+    let preimage = if let Some(branch) = &target.branch {
+        let row = db.query_one("SELECT latest_hash FROM lore_domain_branches WHERE repository_id=$1 AND branch_id=$2", &[&target.repository,branch]).await.unwrap();
+        let latest: Vec<u8> = row.get(0);
+        lore_postgres::domain::delete_proof::branch_delete_preimage(
+            &lore_postgres::domain::delete_proof::DeleteProofReceipt {
+                key: &op.key,
+                binding: &op.binding,
+                client_attempt_id: None,
+            },
+            &target.repository,
+            branch,
+            1,
+            1,
+            2,
+            &latest,
+        )
+        .unwrap()
+    } else {
+        lore_postgres::domain::delete_proof::repository_delete_preimage(
             &lore_postgres::domain::delete_proof::DeleteProofReceipt {
                 key: &op.key,
                 binding: &op.binding,
@@ -107,12 +122,10 @@ async fn assert_proof(db: &Client, target: &Target, op: &GovernedOperation, proo
             1,
             2,
         )
-        .unwrap();
-        repository_proof = *blake3::hash(&preimage).as_bytes();
-        &repository_proof[..]
-    } else {
-        proof
+        .unwrap()
     };
+    let repository_proof = *blake3::hash(&preimage).as_bytes();
+    let proof = &repository_proof[..];
     let row = db.query_one("SELECT tombstone_proof,public_result FROM lore_domain_operation_receipts WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4", &[&op.key.verified_issuer,&op.key.authenticated_subject,&op.key.tenant_scope_key,&op.key.operation_id.as_bytes().as_slice()]).await.unwrap();
     assert_eq!(row.get::<_, Option<Vec<u8>>>(0).as_deref(), Some(proof));
     assert_eq!(row.get::<_, Option<Vec<u8>>>(1), None);
@@ -139,16 +152,15 @@ async fn delete_success_preserves_proof_and_lookup_but_rejects_old_and_fresh_red
     for branch in [false, true] {
         let target = fixture(&store, &db, branch).await;
         let (op, _) = admitted_operation(&store, target.method()).await;
-        let proof = [83; 32];
         assert_eq!(
-            target.delete(&store, &op, &proof).await.unwrap().outcome,
+            target.delete(&store, &op).await.unwrap().outcome,
             DomainOutcome::Applied
         );
-        assert_proof(&db, &target, &op, &proof).await;
+        assert_proof(&db, &target, &op).await;
         let before = receipt(&db, &op).await;
         let lifecycle = target.row(&db).await;
         assert_eq!(
-            target.delete(&store, &op, &proof).await.unwrap(),
+            target.delete(&store, &op).await.unwrap(),
             MutationResult::rejected(NOT_FOUND_V1)
         );
         assert_eq!(receipt(&db, &op).await, before);
@@ -165,7 +177,7 @@ async fn delete_success_preserves_proof_and_lookup_but_rejects_old_and_fresh_red
         let (fresh, _) = admitted_operation(&store, target.method()).await;
         let prepared = receipt(&db, &fresh).await;
         assert_eq!(
-            target.delete(&store, &fresh, &[91; 32]).await.unwrap(),
+            target.delete(&store, &fresh).await.unwrap(),
             MutationResult::rejected(NOT_FOUND_V1)
         );
         assert_eq!(receipt(&db, &fresh).await, prepared);
@@ -194,7 +206,7 @@ async fn delete_missing_target_preserves_even_expired_prepared_receipt() {
             let before = receipt(&db, &op).await;
             assert!(before.is_some());
             assert_eq!(
-                target.delete(&store, &op, &[17; 32]).await.unwrap(),
+                target.delete(&store, &op).await.unwrap(),
                 MutationResult::rejected(NOT_FOUND_V1)
             );
             assert_eq!(receipt(&db, &op).await, before);
@@ -209,15 +221,18 @@ async fn delete_malformed_proof_rolls_back_receipt_and_lifecycle() {
     let store = store(&url).await;
     let db = client(&url).await;
     let target = fixture(&store, &db, true).await;
-    for width in [0, 31, 33] {
-        let (op, _) = admitted_operation(&store, target.method()).await;
-        let before = receipt(&db, &op).await;
-        let lifecycle = target.row(&db).await;
-        assert!(target.delete(&store, &op, &vec![41; width]).await.is_err());
-        assert_eq!(receipt(&db, &op).await, before);
-        assert_eq!(target.row(&db).await, lifecycle);
-    }
-    // Repository proofs no longer accept caller bytes. A stored generation that
+    db.execute(
+        "UPDATE lore_domain_branches SET generation=$2 WHERE repository_id=$1",
+        &[&target.repository, &i64::MAX],
+    )
+    .await
+    .unwrap();
+    let (op, _) = admitted_operation(&store, target.method()).await;
+    let before = receipt(&db, &op).await;
+    let lifecycle = target.row(&db).await;
+    assert!(target.delete(&store, &op).await.is_err());
+    assert_eq!(receipt(&db, &op).await, before);
+    assert_eq!(target.row(&db).await, lifecycle); // Repository proofs no longer accept caller bytes. A stored generation that
     // cannot advance must fail before any receipt or lifecycle write commits.
     let target = fixture(&store, &db, false).await;
     db.execute(
@@ -229,7 +244,7 @@ async fn delete_malformed_proof_rolls_back_receipt_and_lifecycle() {
     let (op, _) = admitted_operation(&store, target.method()).await;
     let before = receipt(&db, &op).await;
     let lifecycle = target.row(&db).await;
-    assert!(target.delete(&store, &op, &[41; 32]).await.is_err());
+    assert!(target.delete(&store, &op).await.is_err());
     assert_eq!(receipt(&db, &op).await, before);
     assert_eq!(target.row(&db).await, lifecycle);
 }
@@ -247,18 +262,14 @@ async fn delete_branch_under_missing_or_tombstoned_repository_preserves_receipt(
     };
     let (parent_op, _) = admitted_operation(&store, parent.method()).await;
     assert_eq!(
-        parent
-            .delete(&store, &parent_op, &[71; 32])
-            .await
-            .unwrap()
-            .outcome,
+        parent.delete(&store, &parent_op).await.unwrap().outcome,
         DomainOutcome::Applied
     );
     let lifecycle = target.row(&db).await;
     let (op, _) = admitted_operation(&store, target.method()).await;
     let before = receipt(&db, &op).await;
     assert_eq!(
-        target.delete(&store, &op, &[72; 32]).await.unwrap(),
+        target.delete(&store, &op).await.unwrap(),
         MutationResult::rejected(NOT_FOUND_V1)
     );
     assert_eq!(receipt(&db, &op).await, before);
@@ -270,10 +281,7 @@ async fn delete_branch_under_missing_or_tombstoned_repository_preserves_receipt(
     let (missing_op, _) = admitted_operation(&store, missing_parent.method()).await;
     let before = receipt(&db, &missing_op).await;
     assert_eq!(
-        missing_parent
-            .delete(&store, &missing_op, &[73; 32])
-            .await
-            .unwrap(),
+        missing_parent.delete(&store, &missing_op).await.unwrap(),
         MutationResult::rejected(NOT_FOUND_V1)
     );
     assert_eq!(receipt(&db, &missing_op).await, before);
@@ -291,20 +299,17 @@ async fn delete_competitors_have_one_winner_and_unchanged_loser_receipt() {
         let (b, _) = admitted_operation(&store, target.method()).await;
         let before_a = receipt(&db, &a).await;
         let before_b = receipt(&db, &b).await;
-        let (ra, rb) = tokio::join!(
-            target.delete(&store, &a, &[51; 32]),
-            target.delete(&store, &b, &[52; 32])
-        );
+        let (ra, rb) = tokio::join!(target.delete(&store, &a), target.delete(&store, &b));
         let (ra, rb) = (ra.unwrap(), rb.unwrap());
         if ra.outcome == DomainOutcome::Applied {
             assert_eq!(rb, MutationResult::rejected(NOT_FOUND_V1));
             assert_eq!(receipt(&db, &b).await, before_b);
-            assert_proof(&db, &target, &a, &[51; 32]).await;
+            assert_proof(&db, &target, &a).await;
         } else {
             assert_eq!(ra, MutationResult::rejected(NOT_FOUND_V1));
             assert_eq!(rb.outcome, DomainOutcome::Applied);
             assert_eq!(receipt(&db, &a).await, before_a);
-            assert_proof(&db, &target, &b, &[52; 32]).await;
+            assert_proof(&db, &target, &b).await;
         }
     }
 }

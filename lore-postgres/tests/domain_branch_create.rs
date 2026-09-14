@@ -495,9 +495,9 @@ async fn parent_head_advance_is_allowed_but_deleted_child_identity_is_permanent(
         repository_id: repo.repository_id.clone(),
         branch_id: input.branch_id.clone(),
         expected_generation: Some(1),
-        delete_proof: vec![7; 32],
         projection: vec![],
         events: vec![],
+        ..delete_observations::branch_delete_input(&repo.repository_id, &input.branch_id).await
     };
     assert_eq!(
         store

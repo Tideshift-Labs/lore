@@ -1002,10 +1002,6 @@ fn branch_deleted_event(branch_id: Vec<u8>, final_latest_hash: Vec<u8>) -> Pendi
     e
 }
 
-fn rand_delete_proof() -> Vec<u8> {
-    rand::random::<[u8; 32]>().to_vec()
-}
-
 /// Seed a live `lore_domain_branch_names` row directly, matching what a real
 /// branch create's name claim would leave. There is no governed branch-create
 /// method (see `insert_live_branch`'s own doc comment), so this is built with
@@ -1055,18 +1051,18 @@ async fn create_repository_with_one_extra_branch(
     (repository_id, branch_id)
 }
 
-fn branch_delete_input(
+async fn branch_delete_input(
     repository_id: Vec<u8>,
     branch_id: Vec<u8>,
     events: Vec<PendingEvent>,
 ) -> BranchDeleteInput {
     BranchDeleteInput {
-        repository_id,
-        branch_id,
+        repository_id: repository_id.clone(),
+        branch_id: branch_id.clone(),
         expected_generation: None,
-        delete_proof: rand_delete_proof(),
         projection: Vec::new(),
         events,
+        ..delete_observations::branch_delete_input(&repository_id, &branch_id).await
     }
 }
 
@@ -1096,7 +1092,8 @@ async fn branch_delete_commits_exactly_one_branch_deleted_row_at_the_committed_g
             branch_id.clone(),
             final_latest_hash.clone(),
         )],
-    );
+    )
+    .await;
     let result = store
         .branch_delete(&delete_op, &input)
         .await
@@ -1149,7 +1146,26 @@ async fn branch_delete_commits_exactly_one_branch_deleted_row_at_the_committed_g
     let deleted_at: Option<std::time::SystemTime> = branch_row.get("deleted_at");
     assert!(deleted_at.is_some());
     let delete_proof: Option<Vec<u8>> = branch_row.get("delete_proof");
-    assert_eq!(delete_proof, Some(input.delete_proof));
+    let expected_proof = blake3::hash(
+        &lore_postgres::domain::delete_proof::branch_delete_preimage(
+            &lore_postgres::domain::delete_proof::DeleteProofReceipt {
+                key: &delete_op.key,
+                binding: &delete_op.binding,
+                client_attempt_id: None,
+            },
+            &repository_id,
+            &branch_id,
+            1,
+            1,
+            2,
+            &input.expected_latest_hash,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        delete_proof.as_deref(),
+        Some(expected_proof.as_bytes().as_slice())
+    );
 }
 
 /// Deleting an absent branch (never existed, on an otherwise live repository)
@@ -1179,7 +1195,8 @@ async fn branch_delete_missing_branch_leaves_no_row() {
         repository_id.clone(),
         missing_branch_id.clone(),
         vec![branch_deleted_event(missing_branch_id.clone(), Vec::new())],
-    );
+    )
+    .await;
     let result = store
         .branch_delete(&delete_op, &input)
         .await
@@ -1213,7 +1230,8 @@ async fn branch_delete_missing_repository_leaves_no_row() {
         repository_id.clone(),
         branch_id.clone(),
         vec![branch_deleted_event(branch_id.clone(), Vec::new())],
-    );
+    )
+    .await;
     let result = store
         .branch_delete(&delete_op, &input)
         .await
@@ -1263,7 +1281,8 @@ async fn branch_delete_under_a_tombstoned_repository_leaves_no_row() {
         repository_id.clone(),
         branch_id.clone(),
         vec![branch_deleted_event(branch_id.clone(), Vec::new())],
-    );
+    )
+    .await;
     let result = store
         .branch_delete(&delete_op, &input)
         .await
@@ -1317,7 +1336,8 @@ async fn branch_delete_generation_mismatch_leaves_no_row() {
         repository_id.clone(),
         branch_id.clone(),
         vec![branch_deleted_event(branch_id.clone(), Vec::new())],
-    );
+    )
+    .await;
     input.expected_generation = Some(99); // deliberately stale; seeded branches start at 1
     let result = store
         .branch_delete(&delete_op, &input)
@@ -1358,7 +1378,8 @@ async fn branch_delete_of_the_default_branch_leaves_no_row() {
         repository_id.clone(),
         default_branch_id.clone(),
         vec![branch_deleted_event(default_branch_id.clone(), Vec::new())],
-    );
+    )
+    .await;
     let result = store
         .branch_delete(&delete_op, &input)
         .await
@@ -1405,7 +1426,8 @@ async fn branch_delete_retry_on_an_already_tombstoned_branch_leaves_no_second_ro
         repository_id.clone(),
         branch_id.clone(),
         vec![branch_deleted_event(branch_id.clone(), Vec::new())],
-    );
+    )
+    .await;
     let first = store
         .branch_delete(&first_op, &first_input)
         .await
@@ -1424,7 +1446,8 @@ async fn branch_delete_retry_on_an_already_tombstoned_branch_leaves_no_second_ro
         repository_id.clone(),
         branch_id.clone(),
         vec![branch_deleted_event(branch_id.clone(), Vec::new())],
-    );
+    )
+    .await;
     let second = store
         .branch_delete(&second_op, &second_input)
         .await
@@ -1464,7 +1487,8 @@ async fn branch_delete_admission_rejection_leaves_no_row() {
         repository_id.clone(),
         branch_id.clone(),
         vec![branch_deleted_event(branch_id.clone(), Vec::new())],
-    );
+    )
+    .await;
     let result = store
         .branch_delete(&delete_op, &input)
         .await
@@ -1547,7 +1571,8 @@ async fn branch_delete_releases_only_its_own_name_row_leaving_a_sibling_intact()
         repository_id.clone(),
         target_branch_id.clone(),
         vec![branch_deleted_event(target_branch_id.clone(), Vec::new())],
-    );
+    )
+    .await;
     store
         .branch_delete(&delete_op, &input)
         .await
@@ -1642,7 +1667,8 @@ async fn branch_delete_projection_removes_only_its_own_row() {
         repository_id.clone(),
         branch_id.clone(),
         vec![branch_deleted_event(branch_id.clone(), Vec::new())],
-    );
+    )
+    .await;
     input.projection = vec![ProjectionWrite {
         partition: repository_id.clone(),
         key_type: name_key_type,

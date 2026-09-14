@@ -21,9 +21,11 @@ use tracing::warn;
 
 use super::branch_record::build_branch;
 use crate::domain::DomainContext;
+use crate::domain::GovernedBranchDelete;
 use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
-use crate::domain::reject_unwired_governed_operation;
+use crate::domain_intent::CanonicalIntent;
+use crate::domain_intent::canonical_intent_digest;
 use crate::grpc::ServerResultExt;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -65,58 +67,40 @@ pub async fn handler(
     let request_authorization = get_authorization_optional(request.extensions());
     let req = request.into_inner();
 
-    // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
-    // at handler entry, before any handler logic or side effect — and before the
-    // forward/local split, so both of this handler's branches are covered by one
-    // gate. This site had no gate at all until now (WP-119 writer inventory B5),
-    // so carriage was silently ignored and a caller that asked for governed
-    // semantics got today's unsynchronised single-key write while believing its
-    // operation had been admitted and receipted.
-    //
-    // The scope is the repository, not the branch: `GovernedScope` keys a
-    // receipt namespace on the repository identity for every direct operation
-    // except create, and a branch is not its own tenant.
-    if let Some(admitted) = admit_at_entry(
+    let admitted = admit_at_entry(
         domain_context,
         &request_metadata,
         request_authorization.as_ref(),
         GovernedScope::TargetRepository {
             repository_id: caller_context.repository_id.data(),
         },
-    )? {
-        // BLOCKED(WP-116): branch delete_proof derivation unfrozen in CR-029,
-        // and CR-029 freezes no `CanonicalIntent::BranchDelete` family. The v0
-        // site at `crate::grpc::handlers::branch_delete` carries the full
-        // reasoning for both missing artefacts; it is recorded once there rather
-        // than copied here, because two copies of a blocked-reason record is how
-        // the two come to name different blockers.
-        //
-        // In short: `crate::domain::GovernedBranchDelete` and
-        // `PostgresDomainStore::branch_delete` are complete, the seam fails
-        // closed on the unfrozen tombstone proof, and this handler cannot even
-        // reach that fence because `GovernedBranchDelete::prepare` needs a
-        // canonical-intent digest no frozen family can produce for a branch
-        // delete.
-        //
-        // NOT covered by this gate: the forwarded entry point at
-        // `crate::grpc::forwarded_revision::v1::branch_delete`, which reaches
-        // `branch_delete_implementation` directly and holds no domain context.
-        // That is CR-029's CARRIAGE-02-LORE case — a forwarded request has no
-        // verified principal to admit against at all — and it is fenced by the
-        // same missing authenticated-forwarding contract that fences forwarded
-        // repository create, not by this handler.
-        return Err(reject_unwired_governed_operation(
-            &admitted,
-            "lore.revision.v1.RevisionService/BranchDelete",
-        ));
-    }
-
+    )?;
+    let governed = if admitted.is_some() {
+        let digest = canonical_intent_digest(&CanonicalIntent::BranchDelete {
+            repository_id: caller_context.repository_id.data(),
+            branch_id: &req.id,
+        })
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        // D6 runs before this forwarding decision, without any prepare write.
+        let governed = GovernedBranchDelete::prepare(domain_context, admitted, digest).await?;
+        if forwarded_requests
+            .as_ref()
+            .is_some_and(|forward| forward.rpc_flags().revision_branch_delete)
+        {
+            return Err(Status::failed_precondition(
+                "Governed branch delete forwarding is disabled",
+            ));
+        }
+        governed
+    } else {
+        None
+    };
     if let Some(forwarded_requests) = forwarded_requests
         && forwarded_requests.rpc_flags().revision_branch_delete
     {
         forward_branch_delete(req, caller_context, forwarded_requests).await
     } else {
-        branch_delete_implementation(
+        branch_delete_local(
             req,
             caller_context,
             immutable_store,
@@ -124,6 +108,7 @@ pub async fn handler(
             notification_sender,
             hook_dispatcher,
             instrument_provider,
+            governed,
         )
         .await
     }
@@ -159,6 +144,30 @@ pub async fn branch_delete_implementation(
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<BranchDeleteResponse>, Status> {
+    branch_delete_local(
+        req,
+        caller_context,
+        immutable_store,
+        mutable_store,
+        notification_sender,
+        hook_dispatcher,
+        instrument_provider,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn branch_delete_local(
+    req: BranchDeleteRequest,
+    caller_context: CallerContext,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    notification_sender: Arc<dyn NotificationSender>,
+    hook_dispatcher: &HookDispatcher,
+    instrument_provider: &impl InstrumentProvider,
+    governed: Option<GovernedBranchDelete>,
+) -> Result<Response<BranchDeleteResponse>, Status> {
     let repository_id = caller_context.repository_id;
     let user_id = caller_context.user_id;
     let correlation_id = caller_context.correlation_id;
@@ -185,6 +194,30 @@ pub async fn branch_delete_implementation(
                 .dispatch_pre(HookPoint::BranchDelete, &hook_ctx)
                 .map_err(hook_error_to_status)?;
 
+            if let Some(governed) = governed {
+                let committed = governed
+                    .commit_branch(repository.clone(), branch_id)
+                    .await?;
+                instrument_provider
+                    .counter("num_branches_deleted")
+                    .add(1, &[]);
+                notification_sender
+                    .branch_deleted(repository_id, branch_id)
+                    .await;
+                hook_dispatcher.spawn_post(HookPoint::BranchDelete, hook_ctx);
+                let mut record = build_branch(
+                    repository,
+                    branch_id,
+                    &committed.metadata,
+                    committed.metadata_hash,
+                    true,
+                )
+                .await?;
+                record.latest = committed.final_latest_hash.into();
+                return Ok(Response::new(BranchDeleteResponse {
+                    branch: Some(record),
+                }));
+            }
             // Load before delete so the idempotent already-deleted path
             // can still build the response from the preserved metadata.
             let pre_metadata = branch::metadata(repository.clone(), branch_id)

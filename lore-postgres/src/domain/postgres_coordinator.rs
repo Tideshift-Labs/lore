@@ -1277,7 +1277,47 @@ impl DomainTransactionStore for PostgresDomainStore {
             return Ok(result);
         }
 
+        // The protection bits were read from this immutable metadata object.
+        // Rechecking its pointer under lock makes those observations authoritative.
+        if existing.name != input.expected_name
+            || existing.metadata_hash != input.expected_metadata_hash
+            || existing.latest_hash != input.expected_latest_hash
+        {
+            let result = MutationResult::rejected(GENERATION_MISMATCH_V1);
+            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
+            classify_commit(tx.commit().await, "branch delete observation commit")?;
+            return Ok(result);
+        }
+        let refusal = if input.delete_protected {
+            Some(DELETE_PROTECTED_V1)
+        } else if input.legacy_default {
+            Some(DEFAULT_BRANCH_V1)
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            let result = MutationResult::rejected(reason);
+            receipts::commit_terminal(&tx, &operation.key, &result.outcome, None, clock).await?;
+            classify_commit(tx.commit().await, "branch delete protection commit")?;
+            return Ok(result);
+        }
         let generation = next_generation(existing.generation)?;
+        let (binding, attempt) =
+            super::delete_proof::persisted_receipt(&tx, &operation.key).await?;
+        let preimage = super::delete_proof::branch_delete_preimage(
+            &super::delete_proof::DeleteProofReceipt {
+                key: &operation.key,
+                binding: &binding,
+                client_attempt_id: attempt.as_deref(),
+            },
+            &input.repository_id,
+            &input.branch_id,
+            super::delete_proof::generation(repository.generation)?,
+            super::delete_proof::generation(existing.generation)?,
+            super::delete_proof::generation(generation)?,
+            &existing.latest_hash,
+        )?;
+        let delete_proof = blake3::hash(&preimage).as_bytes().to_vec();
 
         // `repository_generation` is restamped to the generation this branch is
         // now written against, which is the repository's current one. A branch
@@ -1296,7 +1336,7 @@ impl DomainTransactionStore for PostgresDomainStore {
                 &generation,
                 &repository.generation,
                 &clock,
-                &input.delete_proof,
+                &delete_proof,
             ],
         )
         .await
@@ -1329,7 +1369,7 @@ impl DomainTransactionStore for PostgresDomainStore {
         .await?;
 
         let outcome = DomainOutcome::Applied;
-        receipts::commit_delete(&tx, &operation.key, &input.delete_proof, clock).await?;
+        receipts::commit_delete(&tx, &operation.key, &delete_proof, clock).await?;
         classify_commit(tx.commit().await, "branch delete commit")?;
 
         Ok(MutationResult {

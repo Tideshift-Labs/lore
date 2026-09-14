@@ -81,6 +81,29 @@ pub fn repository_delete_preimage(
     Ok(out)
 }
 
+/// Exact branch proof preimage; its suffix is taken from the locked branch.
+pub fn branch_delete_preimage(
+    receipt: &DeleteProofReceipt<'_>,
+    repository_id: &[u8],
+    branch_id: &[u8],
+    repository_generation: u64,
+    prior: u64,
+    committed: u64,
+    final_latest_hash: &[u8],
+) -> Result<Vec<u8>, DomainError> {
+    fixed(repository_id, 16)?;
+    fixed(branch_id, 16)?;
+    fixed(final_latest_hash, 32)?;
+    let mut out = prefix(b"lore-branch-delete-proof-v1\0", receipt)?;
+    out.extend_from_slice(repository_id);
+    out.extend_from_slice(branch_id);
+    out.extend_from_slice(&repository_generation.to_be_bytes());
+    out.extend_from_slice(&prior.to_be_bytes());
+    out.extend_from_slice(&committed.to_be_bytes());
+    out.extend_from_slice(final_latest_hash);
+    Ok(out)
+}
+
 /// Load the already-locked receipt, never a replacement attempt from headers.
 pub(crate) async fn persisted_receipt(
     tx: &Transaction<'_>,

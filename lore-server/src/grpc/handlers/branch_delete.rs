@@ -20,9 +20,11 @@ use tracing::info;
 use tracing::warn;
 
 use crate::domain::DomainContext;
+use crate::domain::GovernedBranchDelete;
 use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
-use crate::domain::reject_unwired_governed_operation;
+use crate::domain_intent::CanonicalIntent;
+use crate::domain_intent::canonical_intent_digest;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization_optional;
 use crate::grpc::get_repository;
@@ -51,66 +53,26 @@ pub async fn handler(
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
-    let branch = BranchId::from(req.branch);
 
-    // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
-    // at handler entry, before any handler logic or side effect. This site had
-    // no gate at all until now (WP-119 writer inventory B4), so carriage was
-    // silently ignored and a caller that asked for governed semantics got
-    // today's unsynchronised single-key write while believing its operation had
-    // been admitted and receipted. Refusing is the strictly better answer.
-    if let Some(admitted) = admit_at_entry(
+    let admitted = admit_at_entry(
         domain_context,
         &request_metadata,
         request_authorization.as_ref(),
         GovernedScope::TargetRepository {
             repository_id: repository_id.data(),
         },
-    )? {
-        // BLOCKED(WP-116): branch delete_proof derivation unfrozen in CR-029,
-        // and CR-029 freezes no `CanonicalIntent::BranchDelete` family.
-        //
-        // Everything else this site needs is built and shared with the v1 site:
-        // `crate::domain::GovernedBranchDelete` carries the one projection row
-        // (`BranchDeletePublication::projection`, the single live-name key
-        // `branch::delete` retires), the one classified `branch.deleted` event
-        // CR-032 assigns to a branch tombstone, the `BranchDeleteInput`
-        // carriage, the coordinator call, and the outcome mapping.
-        // `PostgresDomainStore::branch_delete` is real and complete.
-        //
-        // Two inputs have no derivation, and the second is why the refusal is
-        // HERE rather than at the seam:
-        //
-        // 1. The 32-byte tombstone proof `lore_domain_branches_tombstone_evidence`
-        //    requires on any tombstoned branch row. CR-029 names it only as an
-        //    "attempt-compatible immutable tombstone proof" and freezes no
-        //    preimage, field list, serialisation, or domain separator. It is
-        //    committed into the principal-scoped receipt and returned by receipt
-        //    lookup, so a minted shape becomes permanent evidence.
-        //    `GovernedBranchDelete::commit` fails closed on it.
-        // 2. There is no `CanonicalIntent::BranchDelete`. CR-029's
-        //    canonical-intent contract freezes six families;
-        //    `crate::domain_intent` defines those six and the platform's
-        //    `repository-operation-intent.ts` defines the same six.
-        //    `GovernedBranchDelete::prepare` needs a digest this handler cannot
-        //    derive, and a Lore-side seventh family would fail every admission
-        //    the platform offered it. So this site cannot even reach the seam's
-        //    own fence, which is why it must refuse at entry.
-        //
-        // Refusing here also keeps a delete that will certainly refuse from
-        // first dispatching the pre-hook and the `branch_deleted` notification.
-        //
-        // Missing artefacts: a frozen branch `delete_proof` derivation and a
-        // frozen seventh canonical-intent family, both in CR-029 and both on the
-        // same terms as its existing canonical-intent digest contract: one
-        // canonical preimage, its exact field order and framing, and
-        // independently computed golden vectors on both sides.
-        return Err(reject_unwired_governed_operation(
-            &admitted,
-            "lore.RevisionService/BranchDelete",
-        ));
-    }
-
+    )?;
+    let governed = if admitted.is_some() {
+        let digest = canonical_intent_digest(&CanonicalIntent::BranchDelete {
+            repository_id: repository_id.data(),
+            branch_id: &req.branch,
+        })
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        GovernedBranchDelete::prepare(domain_context, admitted, digest).await?
+    } else {
+        None
+    };
+    let branch = BranchId::from(req.branch);
     debug!({BRANCH_ID} = %branch, "Handling branch delete");
 
     let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
@@ -134,6 +96,17 @@ pub async fn handler(
                 .dispatch_pre(HookPoint::BranchDelete, &hook_ctx)
                 .map_err(hook_error_to_status)?;
 
+            if let Some(governed) = governed {
+                governed.commit_branch(repository, branch).await?;
+                instrument_provider
+                    .counter("num_branches_deleted")
+                    .add(1, &[]);
+                notification_sender
+                    .branch_deleted(repository_id, branch)
+                    .await;
+                hook_dispatcher.spawn_post(HookPoint::BranchDelete, hook_ctx);
+                return Ok(Response::new(BranchDeleteResponse {}));
+            }
             match branch::delete(repository, branch).await {
                 Ok(_) => {
                     debug!({BRANCH_ID} = %branch, "Branch deleted");

@@ -5,6 +5,7 @@
 use lore_postgres::domain::coordinator::RepositoryDeleteBranchObservation;
 use lore_postgres::domain::coordinator::RepositoryDeleteInput;
 
+#[allow(dead_code)]
 pub async fn repository_delete_input(repository_id: &[u8]) -> RepositoryDeleteInput {
     let url = std::env::var("LORE_TEST_PG_URL").expect("owned test Postgres URL required");
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
@@ -40,5 +41,33 @@ pub async fn repository_delete_input(repository_id: &[u8]) -> RepositoryDeleteIn
         branches,
         projection: Vec::new(),
         events: Vec::new(),
+    }
+}
+
+/// Shared by suites which may use only one delete family.
+#[allow(dead_code)]
+pub async fn branch_delete_input(
+    repository_id: &[u8],
+    branch_id: &[u8],
+) -> lore_postgres::domain::coordinator::BranchDeleteInput {
+    let url = std::env::var("LORE_TEST_PG_URL").expect("owned test Postgres URL required");
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    lore_base::lore_spawn!(async move {
+        connection.await.unwrap();
+    });
+    let branch = client.query_opt("SELECT name,metadata_hash,latest_hash FROM lore_domain_branches WHERE repository_id=$1 AND branch_id=$2", &[&repository_id,&branch_id]).await.unwrap();
+    lore_postgres::domain::coordinator::BranchDeleteInput {
+        repository_id: repository_id.to_vec(),
+        branch_id: branch_id.to_vec(),
+        expected_generation: None,
+        expected_name: branch.as_ref().map(|r| r.get(0)).unwrap_or_default(),
+        expected_metadata_hash: branch.as_ref().map(|r| r.get(1)).unwrap_or_default(),
+        expected_latest_hash: branch.as_ref().map(|r| r.get(2)).unwrap_or_default(),
+        delete_protected: false,
+        legacy_default: false,
+        projection: vec![],
+        events: vec![],
     }
 }
