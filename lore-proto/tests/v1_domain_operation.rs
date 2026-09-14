@@ -14,6 +14,8 @@ use lore_proto::lore::domain::v1::DomainOperationProofNamespaceMaterializeStatus
 use lore_proto::lore::domain::v1::DomainOperationProofNamespaceRetireAckV1;
 use lore_proto::lore::domain::v1::DomainOperationProofNamespaceRetireRequestV1;
 use lore_proto::lore::domain::v1::DomainOperationProofNamespaceRetireStatusV1;
+use lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetRequestV1;
+use lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetResponseV1;
 use lore_proto::lore::domain::v1::DomainOperationReceiptGetRequest;
 use lore_proto::lore::domain::v1::DomainOperationReceiptGetResponse;
 use lore_proto::lore::domain::v1::DomainOperationReceiptStatus;
@@ -23,6 +25,7 @@ use lore_proto::lore::domain::v1::DomainOperationTerminalStatusAttachmentStatusV
 use lore_proto::lore::domain::v1::DomainOperationVerifiedStaleFinalizeRequest;
 use lore_proto::lore::domain::v1::DomainOperationVerifiedStaleFinalizeResponse;
 use lore_proto::lore::domain::v1::DomainOperationVerifiedStaleFinalizeStatus;
+use lore_proto::lore::domain::v1::ProofNamespaceStateStatus;
 use lore_proto::lore::domain::v1::TerminalStatusAttachPhase2ActionV1;
 use lore_proto::lore::domain::v1::TerminalStatusAttachPhaseV1;
 use lore_proto::lore::domain::v1::domain_operation_service_client::DomainOperationServiceClient;
@@ -32,6 +35,150 @@ use prost::Message;
 
 const PROTO: &str = include_str!("../proto/lore/domain/v1/domain_operation.proto");
 const GENERATED: &str = include_str!("../src/grpc/lore.domain.v1.rs");
+
+#[test]
+fn namespace_state_request_has_exact_six_field_wire_vector() {
+    let request = DomainOperationProofNamespaceStateGetRequestV1 {
+        protocol_revision: 2,
+        org_uuid: vec![0x11; 16].into(),
+        initiating_principal_namespace: b"principal-v1\0aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            .as_slice()
+            .into(),
+        namespace_epoch: vec![0x22; 16].into(),
+        namespace_claim_revision: 7,
+        namespace_claim_nonce: vec![0x33; 32].into(),
+    };
+    let raw = [
+        vec![0x08, 0x02, 0x12, 0x10],
+        vec![0x11; 16],
+        vec![0x1a, 0x31],
+        b"principal-v1\0aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_vec(),
+        vec![0x22, 0x10],
+        vec![0x22; 16],
+        vec![0x28, 0x07, 0x32, 0x20],
+        vec![0x33; 32],
+    ]
+    .concat();
+    assert_eq!(request.encode_to_vec(), raw);
+    assert_eq!(
+        DomainOperationProofNamespaceStateGetRequestV1::decode(raw.as_slice()).unwrap(),
+        request
+    );
+    let name = "DomainOperationProofNamespaceStateGetRequestV1";
+    validate_domain_operation_v2_raw(name, &raw).expect("frozen six-field request");
+    for revision in [0, i64::MAX as u64] {
+        let mut boundary = request.clone();
+        boundary.namespace_claim_revision = revision;
+        validate_domain_operation_v2_raw(name, &boundary.encode_to_vec())
+            .expect("valid claim revision boundary");
+    }
+    let mut overflow = request.clone();
+    overflow.namespace_claim_revision = i64::MAX as u64 + 1;
+    assert!(validate_domain_operation_v2_raw(name, &overflow.encode_to_vec()).is_err());
+    // A uint64 varint congruent to 2 modulo 2^32 must not become protocol 2
+    // when Prost narrows the wire value into the generated uint32 field.
+    let overflow_protocol = [vec![0x08, 0x82, 0x80, 0x80, 0x80, 0x10], raw[2..].to_vec()].concat();
+    assert!(validate_domain_operation_v2_raw(name, &overflow_protocol).is_err());
+    for suffix in [vec![0x38, 0x01], vec![0x08, 0x02], vec![0x32, 0x00]] {
+        let malformed = [raw.clone(), suffix].concat();
+        assert!(validate_domain_operation_v2_raw(name, &malformed).is_err());
+    }
+    for truncated in 0..raw.len() {
+        assert!(
+            validate_domain_operation_v2_raw(name, &raw[..truncated]).is_err(),
+            "accepted truncated request at {truncated}"
+        );
+    }
+}
+
+#[test]
+fn namespace_state_five_status_vectors_and_presence_are_frozen() {
+    let name = "DomainOperationProofNamespaceStateGetResponseV1";
+    let cases = [
+        (
+            ProofNamespaceStateStatus::Unspecified,
+            None,
+            None,
+            None,
+            vec![],
+            false,
+        ),
+        (
+            ProofNamespaceStateStatus::MatchedQuiescent,
+            Some(7),
+            Some(0),
+            Some(vec![0x44; 32]),
+            [
+                vec![0x08, 0x01, 0x10, 0x07, 0x18, 0x00, 0x22, 0x20],
+                vec![0x44; 32],
+            ]
+            .concat(),
+            true,
+        ),
+        (
+            ProofNamespaceStateStatus::MatchedNotQuiescent,
+            Some(7),
+            None,
+            None,
+            vec![0x08, 0x02, 0x10, 0x07],
+            true,
+        ),
+        (
+            ProofNamespaceStateStatus::Absent,
+            None,
+            None,
+            None,
+            vec![0x08, 0x03],
+            true,
+        ),
+        (
+            ProofNamespaceStateStatus::Mismatch,
+            None,
+            None,
+            None,
+            vec![0x08, 0x04],
+            true,
+        ),
+    ];
+    for (index, (status, quota_revision, final_high_water, digest, raw, valid)) in
+        cases.into_iter().enumerate()
+    {
+        assert_eq!(status as usize, index);
+        let response = DomainOperationProofNamespaceStateGetResponseV1 {
+            status: status as i32,
+            quota_revision,
+            final_high_water,
+            final_range_set_digest: digest.map(Into::into),
+        };
+        assert_eq!(response.encode_to_vec(), raw);
+        assert_eq!(
+            DomainOperationProofNamespaceStateGetResponseV1::decode(raw.as_slice()).unwrap(),
+            response
+        );
+        assert_eq!(
+            validate_domain_operation_v2_raw(name, &raw).is_ok(),
+            valid,
+            "{status:?}"
+        );
+    }
+    for raw in [
+        vec![0x08, 0x00],
+        vec![0x08, 0x05],
+        vec![0x08, 0x01],
+        vec![0x08, 0x02],
+        vec![0x08, 0x02, 0x10, 0x01, 0x18, 0x00],
+        vec![0x08, 0x03, 0x10, 0x00],
+        vec![0x08, 0x04, 0x18, 0x00],
+        vec![0x08, 0x03, 0x28, 0x01],
+        vec![0x08, 0x03, 0x08, 0x03],
+        vec![0x08, 0x01, 0x10, 0x00, 0x18, 0x00, 0x22, 0x00],
+    ] {
+        assert!(
+            validate_domain_operation_v2_raw(name, &raw).is_err(),
+            "accepted invalid response {raw:?}"
+        );
+    }
+}
 
 #[test]
 fn attempt_acquire_recovery_uses_additive_repeated_tag_nine_and_original_lock_token_field() {
@@ -836,7 +983,7 @@ fn live_prepare_and_receipt_get_reject_noncanonical_keys_and_high_unknown_tags()
 /// added without noticing would look exactly like the public one from out here. Failing this
 /// assertion is the prompt to decide which side a new method belongs on.
 #[test]
-fn the_service_declares_seven_private_rpcs_and_one_public_one() {
+fn the_service_declares_eight_private_rpcs_and_one_public_one() {
     let private = [
         "rpc DomainOperationClockGet",
         "rpc DomainOperationPrepare",
@@ -845,6 +992,7 @@ fn the_service_declares_seven_private_rpcs_and_one_public_one() {
         "rpc DomainOperationTerminalStatusAttach",
         "rpc DomainOperationProofNamespaceMaterialize",
         "rpc DomainOperationProofNamespaceRetire",
+        "rpc DomainOperationProofNamespaceStateGet",
     ];
     // WP-120. Served to an authenticated human, scoped to that principal's own receipts.
     let public = ["rpc DomainOperationAttemptReceiptGet"];
@@ -912,6 +1060,7 @@ fn generated_client_server_and_exact_method_paths_exist() {
         "/lore.domain.v1.DomainOperationService/DomainOperationTerminalStatusAttach",
         "/lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceMaterialize",
         "/lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceRetire",
+        "/lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceStateGet",
         "/lore.domain.v1.DomainOperationService/DomainOperationAttemptReceiptGet",
     ] {
         assert!(
@@ -921,8 +1070,8 @@ fn generated_client_server_and_exact_method_paths_exist() {
     }
     assert_eq!(
         GENERATED.matches("DomainOperationV2StrictCodec").count(),
-        16,
-        "all seven generated client calls and seven server routes must use the strict codec"
+        18,
+        "all nine generated client calls and nine server routes must use the strict codec"
     );
 }
 
@@ -933,6 +1082,13 @@ struct UnimplementedService;
 impl lore_proto::lore::domain::v1::domain_operation_service_server::DomainOperationService
     for UnimplementedService
 {
+    async fn domain_operation_proof_namespace_state_get(
+        &self,
+        _request: tonic::Request<DomainOperationProofNamespaceStateGetRequestV1>,
+    ) -> Result<tonic::Response<DomainOperationProofNamespaceStateGetResponseV1>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("test-only"))
+    }
     async fn domain_operation_clock_get(
         &self,
         _request: tonic::Request<DomainOperationClockGetRequest>,

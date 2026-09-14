@@ -78,6 +78,12 @@ Metadata-upload throttling returns `RESOURCE_EXHAUSTED`. If creation is already 
 authoritative metadata cannot be read, `ABORTED` requires receipt reconciliation; it does not mean
 the committed repository was rolled back. Ordinary uploads still require an existing repository.
 
+The fork-private `DomainOperationProofNamespaceStateGet` RPC reads proof-namespace state for an
+org-bound `lorehub-control-plane` service account. It uses the configured Postgres domain store
+for a consistent read-only snapshot. It does not repair state or authorize release when state is
+absent. See the [domain operation schema](../lore-proto/proto/lore/domain/v1/domain_operation.proto)
+for the wire interface.
+
 Run `pwsh -NoProfile -File lore-server/tests/run-clean-init-actual-cli-live.ps1` from the repository
 root for the disposable actual-CLI happy-path proof. Its auth callbacks are test doubles.
 

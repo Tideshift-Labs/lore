@@ -193,6 +193,8 @@ impl GovernedScope<'_> {
 /// path, not an error.
 pub struct DomainContext {
     store: Arc<dyn DomainTransactionStore>,
+    proof_namespace_reader:
+        Option<Arc<dyn lore_postgres::domain::proof_namespace_read::ProofNamespaceStateReader>>,
     enforcement: bool,
     lock_coordinator: Option<Arc<PostgresLockCoordinator>>,
     fragment_coordinator: Option<Arc<PostgresFragmentCoordinator>>,
@@ -228,6 +230,7 @@ impl DomainContext {
             cell_id: None,
             admission: OnceLock::new(),
             operation_verifier: None,
+            proof_namespace_reader: None,
         }
     }
 
@@ -247,6 +250,7 @@ impl DomainContext {
             cell_id: None,
             admission: OnceLock::new(),
             operation_verifier: None,
+            proof_namespace_reader: None,
         }
     }
 
@@ -301,6 +305,23 @@ impl DomainContext {
     /// The coordinator itself.
     pub fn store(&self) -> &Arc<dyn DomainTransactionStore> {
         &self.store
+    }
+
+    /// Attach read-only authority from the same connected Postgres store.
+    #[must_use]
+    pub fn with_proof_namespace_reader(
+        mut self,
+        reader: Arc<dyn lore_postgres::domain::proof_namespace_read::ProofNamespaceStateReader>,
+    ) -> Self {
+        self.proof_namespace_reader = Some(reader);
+        self
+    }
+
+    pub fn proof_namespace_reader(
+        &self,
+    ) -> Option<&Arc<dyn lore_postgres::domain::proof_namespace_read::ProofNamespaceStateReader>>
+    {
+        self.proof_namespace_reader.as_ref()
     }
 
     /// Whether this cell enforces domain transactions. False until backfill,
@@ -3042,15 +3063,14 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
                 crate::authnz::rebac::GrpcRepositoryOperationAuthorizationVerifier::new(auth_url),
             ) as Arc<dyn RepositoryOperationAuthorizationVerifier>
         });
+    let store = Arc::new(store);
+    let namespace_reader = store.clone();
     let context = if lock_fencing {
-        DomainContext::new_with_lock_coordinator(
-            Arc::new(store),
-            enforcement,
-            Arc::new(lock_coordinator),
-        )
+        DomainContext::new_with_lock_coordinator(store, enforcement, Arc::new(lock_coordinator))
     } else {
-        DomainContext::new(Arc::new(store), enforcement)
+        DomainContext::new(store, enforcement)
     }
+    .with_proof_namespace_reader(namespace_reader)
     .with_cell_id(cell_id)
     .with_operation_verifier(operation_verifier);
     let context = if fragment_coordinator

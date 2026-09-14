@@ -91,6 +91,253 @@ use crate::grpc::domain_operation_metadata::scope_key_mediated_namespace;
 
 const AUTHORIZATION_REVISION: u64 = 7;
 const CLOCK_MILLIS: u64 = 1_800_000_000_000;
+
+mod namespace_state {
+    use lore_postgres::domain::proof_namespace_read::ProofNamespaceState;
+    use lore_postgres::domain::proof_namespace_read::ProofNamespaceStateInput;
+    use lore_postgres::domain::proof_namespace_read::ProofNamespaceStateReader;
+    use lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetRequestV1;
+    use lore_proto::lore::domain::v1::ProofNamespaceStateStatus;
+
+    use super::*;
+    use crate::auth::jwt_interceptor::VerifiedServiceOrg;
+
+    struct Reader {
+        calls: Mutex<Vec<ProofNamespaceStateInput>>,
+        result: Mutex<Result<ProofNamespaceState, DomainError>>,
+    }
+
+    #[async_trait]
+    impl ProofNamespaceStateReader for Reader {
+        async fn proof_namespace_state_get(
+            &self,
+            input: &ProofNamespaceStateInput,
+        ) -> Result<ProofNamespaceState, DomainError> {
+            self.calls.lock().unwrap().push(input.clone());
+            std::mem::replace(
+                &mut *self.result.lock().unwrap(),
+                Ok(ProofNamespaceState::Absent),
+            )
+        }
+    }
+
+    fn setup(
+        result: Result<ProofNamespaceState, DomainError>,
+    ) -> (
+        LoreDomainOperationV1Service,
+        Arc<Reader>,
+        Arc<RecordingStore>,
+        Arc<EchoVerifier>,
+    ) {
+        let store = Arc::new(RecordingStore::new());
+        let verifier = Arc::new(EchoVerifier::new());
+        let reader = Arc::new(Reader {
+            calls: Mutex::new(Vec::new()),
+            result: Mutex::new(result),
+        });
+        let domain =
+            DomainContext::new(store.clone(), true).with_proof_namespace_reader(reader.clone());
+        (
+            LoreDomainOperationV1Service::new(Arc::new(domain), verifier.clone()),
+            reader,
+            store,
+            verifier,
+        )
+    }
+
+    fn valid() -> DomainOperationProofNamespaceStateGetRequestV1 {
+        DomainOperationProofNamespaceStateGetRequestV1 {
+            protocol_revision: 2,
+            org_uuid: vec![0x11; 16].into(),
+            initiating_principal_namespace: b"principal-v1\0aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                .as_slice()
+                .into(),
+            namespace_epoch: vec![0x22; 16].into(),
+            namespace_claim_revision: 7,
+            namespace_claim_nonce: vec![0x33; 32].into(),
+        }
+    }
+
+    fn request(
+        message: DomainOperationProofNamespaceStateGetRequestV1,
+    ) -> Request<DomainOperationProofNamespaceStateGetRequestV1> {
+        let mut request = authenticated(message);
+        request
+            .extensions_mut()
+            .insert(VerifiedServiceOrg(Uuid::from_bytes([0x11; 16])));
+        request
+    }
+
+    fn assert_no_mutation(store: &RecordingStore, verifier: &EchoVerifier) {
+        assert_eq!(store.maintenance_calls(), 0);
+        assert_eq!(store.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.receipt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.attempt_receipt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.clock_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(verifier.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn auth_and_signed_org_are_required_before_any_namespace_read() {
+        let (service, reader, store, verifier) = setup(Ok(ProofNamespaceState::Absent));
+        let mut human = request(valid());
+        human
+            .extensions_mut()
+            .insert(human_token("https://issuer.example", "human"));
+        let mut other_service = request(valid());
+        let mut token = service_token();
+        token.user_id = "other-service".into();
+        other_service.extensions_mut().insert(token);
+        let mut wrong_org = request(valid());
+        wrong_org
+            .extensions_mut()
+            .insert(VerifiedServiceOrg(Uuid::from_bytes([0x99; 16])));
+        for (request, code) in [
+            (Request::new(valid()), Code::Unauthenticated),
+            (authenticated(valid()), Code::PermissionDenied),
+            (human, Code::PermissionDenied),
+            (other_service, Code::PermissionDenied),
+            (wrong_org, Code::PermissionDenied),
+        ] {
+            let error = service
+                .domain_operation_proof_namespace_state_get(request)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), code);
+        }
+        assert!(reader.calls.lock().unwrap().is_empty());
+        assert_no_mutation(&store, &verifier);
+    }
+
+    #[tokio::test]
+    async fn each_namespace_state_maps_only_its_allowed_response_fields() {
+        for (state, status, quota, water, digest) in [
+            (
+                ProofNamespaceState::MatchedQuiescent {
+                    quota_revision: 7,
+                    final_high_water: 0,
+                    final_range_set_digest: vec![0x44; 32],
+                },
+                ProofNamespaceStateStatus::MatchedQuiescent,
+                Some(7),
+                Some(0),
+                Some(vec![0x44; 32]),
+            ),
+            (
+                ProofNamespaceState::MatchedNotQuiescent { quota_revision: 7 },
+                ProofNamespaceStateStatus::MatchedNotQuiescent,
+                Some(7),
+                None,
+                None,
+            ),
+            (
+                ProofNamespaceState::Absent,
+                ProofNamespaceStateStatus::Absent,
+                None,
+                None,
+                None,
+            ),
+            (
+                ProofNamespaceState::Mismatch,
+                ProofNamespaceStateStatus::Mismatch,
+                None,
+                None,
+                None,
+            ),
+        ] {
+            let (service, reader, store, verifier) = setup(Ok(state));
+            let wire = valid();
+            let response = service
+                .domain_operation_proof_namespace_state_get(request(wire.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                (
+                    response.status,
+                    response.quota_revision,
+                    response.final_high_water,
+                    response.final_range_set_digest.map(|v| v.to_vec())
+                ),
+                (status as i32, quota, water, digest)
+            );
+            let calls = reader.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            let input = &calls[0];
+            assert_eq!(input.key.verified_issuer, "https://issuer.example");
+            assert_eq!(input.key.authenticated_subject, "lorehub-control-plane");
+            assert_eq!(input.key.org_uuid, wire.org_uuid);
+            assert_eq!(
+                input.key.tenant_scope_key,
+                scope_key_mediated_namespace(&wire.org_uuid, &wire.initiating_principal_namespace)
+                    .unwrap()
+            );
+            assert_eq!(input.protocol_revision, 2);
+            assert_eq!(input.namespace_epoch, wire.namespace_epoch);
+            assert_eq!(input.namespace_claim_revision, 7);
+            assert_eq!(input.namespace_claim_nonce, wire.namespace_claim_nonce);
+            assert_no_mutation(&store, &verifier);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_namespace_request_never_reaches_reader() {
+        let (service, reader, store, verifier) = setup(Ok(ProofNamespaceState::Absent));
+        for field in 0..7 {
+            let mut wire = valid();
+            match field {
+                0 => wire.protocol_revision = 1,
+                1 => wire.org_uuid = vec![0; 15].into(),
+                2 => wire.initiating_principal_namespace = Bytes::new(),
+                3 => wire.initiating_principal_namespace = vec![b'x'; 50].into(),
+                4 => wire.namespace_epoch = vec![0; 15].into(),
+                5 => wire.namespace_claim_revision = i64::MAX as u64 + 1,
+                _ => wire.namespace_claim_nonce = vec![0; 31].into(),
+            }
+            assert_eq!(
+                service
+                    .domain_operation_proof_namespace_state_get(request(wire))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::InvalidArgument,
+                "field {field}"
+            );
+        }
+        assert!(reader.calls.lock().unwrap().is_empty());
+        assert_no_mutation(&store, &verifier);
+    }
+
+    #[tokio::test]
+    async fn zero_claim_revision_is_carried_and_corrupt_state_is_an_error() {
+        let (service, reader, store, verifier) = setup(Err(DomainError::Internal(
+            "corrupt proof namespace state".into(),
+        )));
+        let mut wire = valid();
+        wire.namespace_claim_revision = 0;
+        let error = service
+            .domain_operation_proof_namespace_state_get(request(wire))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Internal);
+        assert_eq!(reader.calls.lock().unwrap()[0].namespace_claim_revision, 0);
+        assert_no_mutation(&store, &verifier);
+    }
+
+    #[tokio::test]
+    async fn unavailable_reader_fails_closed_without_calling_mutation_store() {
+        let (service, store, verifier) = service();
+        assert_eq!(
+            service
+                .domain_operation_proof_namespace_state_get(request(valid()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+        assert_no_mutation(&store, &verifier);
+    }
+}
 #[derive(Clone)]
 struct RecordedPrepare {
     key: ReceiptKey,

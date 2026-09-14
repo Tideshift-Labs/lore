@@ -384,6 +384,62 @@ fn bounded_nonempty(field: &'static str, bytes: &[u8], maximum: usize) -> Result
     )))
 }
 
+pub(super) fn validate_proof_namespace_state_get(
+    request: &lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetRequestV1,
+) -> Result<(), Status> {
+    if request.protocol_revision != 2 || request.namespace_claim_revision > i64::MAX as u64 {
+        return Err(Status::invalid_argument("invalid namespace state revision"));
+    }
+    exact_len("org_uuid", &request.org_uuid, UUID_LEN)?;
+    bounded_nonempty(
+        "initiating_principal_namespace",
+        &request.initiating_principal_namespace,
+        MAX_PRINCIPAL_NAMESPACE_LEN,
+    )?;
+    crate::grpc::domain_operation_metadata::scope_key_mediated_namespace(
+        &request.org_uuid,
+        &request.initiating_principal_namespace,
+    )
+    .map_err(|e| Status::invalid_argument(e.to_string()))?;
+    exact_len("namespace_epoch", &request.namespace_epoch, UUID_LEN)?;
+    exact_len(
+        "namespace_claim_nonce",
+        &request.namespace_claim_nonce,
+        DIGEST_LEN,
+    )
+}
+
+pub(super) fn validate_proof_namespace_state_get_response(
+    response: &lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetResponseV1,
+) -> Result<(), Status> {
+    use lore_proto::lore::domain::v1::ProofNamespaceStateStatus;
+    let valid = match ProofNamespaceStateStatus::try_from(response.status) {
+        Ok(ProofNamespaceStateStatus::MatchedQuiescent) => {
+            response.quota_revision.is_some_and(|q| q > 0)
+                && response.final_high_water.is_some()
+                && response
+                    .final_range_set_digest
+                    .as_ref()
+                    .is_some_and(|d| d.len() == 32)
+        }
+        Ok(ProofNamespaceStateStatus::MatchedNotQuiescent) => {
+            response.quota_revision.is_some_and(|q| q > 0)
+                && response.final_high_water.is_none()
+                && response.final_range_set_digest.is_none()
+        }
+        Ok(ProofNamespaceStateStatus::Absent | ProofNamespaceStateStatus::Mismatch) => {
+            response.quota_revision.is_none()
+                && response.final_high_water.is_none()
+                && response.final_range_set_digest.is_none()
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(Status::internal("invalid namespace state response"));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_binding(
     org_uuid: &[u8],

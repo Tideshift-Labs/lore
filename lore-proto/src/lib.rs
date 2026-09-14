@@ -385,6 +385,74 @@ pub fn validate_domain_operation_v2_raw(name: &str, raw: &[u8]) -> Result<(), to
             ];
             domain_validate_fields(raw, &fields)?;
         }
+        "DomainOperationProofNamespaceStateGetRequestV1" => {
+            let (_, values) = domain_validate_fields(
+                raw,
+                &[
+                    domain_varint(1),
+                    domain_ld(2, U),
+                    domain_ld(3, P),
+                    domain_ld(4, U),
+                    domain_implicit_varint(5),
+                    domain_ld(6, D),
+                ],
+            )?;
+            if values[1] != 2 {
+                return Err(tonic::Status::invalid_argument(
+                    "invalid namespace state protocol revision",
+                ));
+            }
+            let request = <lore::domain::v1::DomainOperationProofNamespaceStateGetRequestV1 as prost::Message>::decode(raw)
+                .map_err(|_| tonic::Status::invalid_argument("invalid namespace state request"))?;
+            if request.protocol_revision != 2
+                || request.org_uuid.len() != U
+                || request.initiating_principal_namespace.is_empty()
+                || request.namespace_epoch.len() != U
+                || request.namespace_claim_revision > i64::MAX as u64
+                || request.namespace_claim_nonce.len() != D
+            {
+                return Err(tonic::Status::invalid_argument(
+                    "invalid namespace state binding",
+                ));
+            }
+        }
+        "DomainOperationProofNamespaceStateGetResponseV1" => {
+            let (seen, values) = domain_validate_fields(
+                raw,
+                &[
+                    domain_varint(1),
+                    domain_implicit_varint(2),
+                    domain_implicit_varint(3),
+                    domain_optional_ld(4, D),
+                ],
+            )?;
+            let expected = match values[1] {
+                1 if values[2] > 0 => domain_field_mask(&[1, 2, 3, 4]),
+                2 if values[2] > 0 => domain_field_mask(&[1, 2]),
+                3 | 4 => domain_field_mask(&[1]),
+                _ => {
+                    return Err(tonic::Status::invalid_argument(
+                        "invalid namespace state status",
+                    ));
+                }
+            };
+            if seen != expected {
+                return Err(tonic::Status::invalid_argument(
+                    "invalid namespace state response presence",
+                ));
+            }
+            let response = <lore::domain::v1::DomainOperationProofNamespaceStateGetResponseV1 as prost::Message>::decode(raw)
+                .map_err(|_| tonic::Status::invalid_argument("invalid namespace state response"))?;
+            if response
+                .final_range_set_digest
+                .as_ref()
+                .is_some_and(|d| d.len() != D)
+            {
+                return Err(tonic::Status::invalid_argument(
+                    "invalid namespace state digest",
+                ));
+            }
+        }
         "DomainOperationProofNamespaceRetireRequestV1" => {
             let fields = [
                 domain_varint(1),

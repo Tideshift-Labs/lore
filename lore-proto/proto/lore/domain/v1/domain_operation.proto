@@ -48,6 +48,35 @@ service DomainOperationService {
       returns (DomainOperationProofNamespaceMaterializeReceiptV1);
   rpc DomainOperationProofNamespaceRetire(DomainOperationProofNamespaceRetireRequestV1)
       returns (DomainOperationProofNamespaceRetireAckV1);
+  // FORK-LOCAL (Tideshift, CR-029): authenticated org-bound, read-only snapshot.
+  // Preserve /lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceStateGet
+  // and its ratified field tags during upstream reconciliation.
+  rpc DomainOperationProofNamespaceStateGet(DomainOperationProofNamespaceStateGetRequestV1)
+      returns (DomainOperationProofNamespaceStateGetResponseV1);
+}
+
+message DomainOperationProofNamespaceStateGetRequestV1 {
+  uint32 protocol_revision = 1;
+  bytes org_uuid = 2;
+  bytes initiating_principal_namespace = 3;
+  bytes namespace_epoch = 4;
+  uint64 namespace_claim_revision = 5;
+  bytes namespace_claim_nonce = 6;
+}
+
+enum ProofNamespaceStateStatus {
+  UNSPECIFIED = 0;
+  MATCHED_QUIESCENT = 1;
+  MATCHED_NOT_QUIESCENT = 2;
+  ABSENT = 3;
+  MISMATCH = 4;
+}
+
+message DomainOperationProofNamespaceStateGetResponseV1 {
+  ProofNamespaceStateStatus status = 1;
+  optional uint64 quota_revision = 2;
+  optional uint64 final_high_water = 3;
+  optional bytes final_range_set_digest = 4;
 }
 
 message DomainOperationClockGetRequest {}

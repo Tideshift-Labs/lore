@@ -489,6 +489,71 @@ fn outcome_fields(
 // lifts become the same bug.
 #[tonic::async_trait]
 impl DomainOperationService for LoreDomainOperationV1Service {
+    async fn domain_operation_proof_namespace_state_get(
+        &self,
+        request: Request<
+            lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetRequestV1,
+        >,
+    ) -> Result<
+        Response<lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetResponseV1>,
+        Status,
+    > {
+        use lore_postgres::domain::proof_namespace_read::ProofNamespaceState;
+        use lore_postgres::domain::proof_namespace_read::ProofNamespaceStateInput;
+        use lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetResponseV1;
+        use lore_proto::lore::domain::v1::ProofNamespaceStateStatus;
+        let token = authenticated_service(&request)?;
+        let org = request
+            .extensions()
+            .get::<crate::auth::jwt_interceptor::VerifiedServiceOrg>()
+            .ok_or_else(|| Status::permission_denied("verified organization binding required"))?
+            .0;
+        let request = request.into_inner();
+        super::strict_codec::validate_proof_namespace_state_get(&request)?;
+        if org.as_bytes().as_slice() != request.org_uuid.as_ref() {
+            return Err(Status::permission_denied("organization binding mismatch"));
+        }
+        let reader = self
+            .domain
+            .proof_namespace_reader()
+            .ok_or_else(|| Status::unavailable("proof namespace reader unavailable"))?;
+        let state = reader
+            .proof_namespace_state_get(&ProofNamespaceStateInput {
+                key: proof_namespace_key(
+                    &token,
+                    &request.org_uuid,
+                    &request.initiating_principal_namespace,
+                )?,
+                protocol_revision: request.protocol_revision as i32,
+                namespace_epoch: request.namespace_epoch.to_vec(),
+                namespace_claim_revision: request.namespace_claim_revision as i64,
+                namespace_claim_nonce: request.namespace_claim_nonce.to_vec(),
+            })
+            .await
+            .map_err(|e| map_domain_error_to_status(&e))?;
+        let mut response = DomainOperationProofNamespaceStateGetResponseV1::default();
+        response.status = match state {
+            ProofNamespaceState::Absent => ProofNamespaceStateStatus::Absent,
+            ProofNamespaceState::Mismatch => ProofNamespaceStateStatus::Mismatch,
+            ProofNamespaceState::MatchedNotQuiescent { quota_revision } => {
+                response.quota_revision = Some(quota_revision);
+                ProofNamespaceStateStatus::MatchedNotQuiescent
+            }
+            ProofNamespaceState::MatchedQuiescent {
+                quota_revision,
+                final_high_water,
+                final_range_set_digest,
+            } => {
+                response.quota_revision = Some(quota_revision);
+                response.final_high_water = Some(final_high_water);
+                response.final_range_set_digest = Some(Bytes::from(final_range_set_digest));
+                ProofNamespaceStateStatus::MatchedQuiescent
+            }
+        } as i32;
+        super::strict_codec::validate_proof_namespace_state_get_response(&response)?;
+        Ok(Response::new(response))
+    }
+
     async fn domain_operation_clock_get(
         &self,
         request: Request<DomainOperationClockGetRequest>,

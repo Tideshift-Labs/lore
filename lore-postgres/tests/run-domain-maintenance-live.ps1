@@ -19,7 +19,8 @@ only this runner's container and anonymous volume.
 
 [CmdletBinding()]
 param(
-    [switch]$KeepOnFailure
+    [switch]$KeepOnFailure,
+    [ValidateRange(1, 86400)][int]$CommandTimeoutSeconds = 600
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,6 +28,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 $crateRoot = Split-Path -Parent $PSScriptRoot
 $loreRoot = Split-Path -Parent $crateRoot
+. (Join-Path $PSScriptRoot 'common/foreground_process.ps1')
 $runId = [Guid]::NewGuid().ToString('N')
 $containerName = "wp116-domain-maintenance-live-$runId"
 $ownershipLabelName = 'com.tideshift.lore.domain-maintenance-live'
@@ -36,6 +38,10 @@ $runPassed = $false
 $setupError = $null
 
 $expectedCases = @(
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'namespace_state_absent_and_binding_mismatch_never_mutate' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'namespace_state_quiescent_and_outstanding_vectors_are_read_only' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'namespace_state_missing_coverage_is_nonquiescent_and_never_repaired' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'namespace_state_reads_one_snapshot_across_concurrent_retirement' },
     [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'stale_finalize_commits_once_replays_exactly_and_isolates_binding' },
     [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'stale_finalize_lost_commit_ack_is_unknown_then_authoritative_replay_adopts_commit' },
     [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tombstone' },
@@ -85,9 +91,9 @@ function Invoke-Checked {
         [string[]]$ArgumentList
     )
 
-    & $FilePath @ArgumentList
-    if ($LASTEXITCODE -ne 0) {
-        throw "$FilePath exited with code $LASTEXITCODE"
+    $result = Invoke-ForegroundProcess -FilePath $FilePath -ArgumentList $ArgumentList -WorkingDirectory $loreRoot -TimeoutSeconds $CommandTimeoutSeconds
+    if ($result.ExitCode -ne 0) {
+        throw "$FilePath exited with code $($result.ExitCode): $($result.Output)"
     }
 }
 
@@ -99,11 +105,12 @@ function Get-MaintenanceTestCatalog {
     Push-Location $loreRoot
     try {
         $listArgs = @(
-            'test', '-p', 'lore-postgres', '--test', $Target, '--',
+            'test', '-p', 'lore-postgres', '-j', '4', '--test', $Target, '--',
             '--ignored', '--list'
         )
-        $output = & cargo @listArgs 2>&1 | Out-String
-        $exitCode = $LASTEXITCODE
+        $result = Invoke-ForegroundProcess -FilePath cargo -ArgumentList $listArgs -WorkingDirectory $loreRoot -TimeoutSeconds $CommandTimeoutSeconds
+        $output = $result.Output
+        $exitCode = $result.ExitCode
     }
     finally {
         Pop-Location
@@ -137,8 +144,9 @@ function Assert-ExpectedCatalog {
 }
 
 function Assert-NoCollidingContainer {
-    $raw = & docker ps --all --filter "label=$ownershipLabelName" --format '{{.Names}}|{{.Status}}|{{.Label "com.tideshift.lore.domain-maintenance-live.pid"}}'
-    if ($LASTEXITCODE -ne 0) {
+    $inspection = Invoke-ForegroundProcess -FilePath docker -ArgumentList @('ps', '--all', '--filter', "label=$ownershipLabelName", '--format', '{{.Names}}|{{.Status}}|{{.Label "com.tideshift.lore.domain-maintenance-live.pid"}}') -WorkingDirectory $loreRoot -TimeoutSeconds $CommandTimeoutSeconds
+    $raw = $inspection.Output -split "`r?`n"
+    if ($inspection.ExitCode -ne 0) {
         throw 'failed to inspect existing domain-maintenance live containers'
     }
     $collisions = @($raw | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -166,8 +174,9 @@ try {
         'postgres:16'
     )
 
-    $portOutputRaw = & docker port $containerName '5432/tcp'
-    $portExitCode = $LASTEXITCODE
+    $portResult = Invoke-ForegroundProcess docker @('port', $containerName, '5432/tcp') $loreRoot $CommandTimeoutSeconds
+    $portOutputRaw = $portResult.Output
+    $portExitCode = $portResult.ExitCode
     $portOutput = if ($null -ne $portOutputRaw) { ($portOutputRaw | Out-String).Trim() } else { '' }
     if ($portExitCode -ne 0 -or $portOutput -notmatch ':(?<port>[0-9]+)$') {
         throw 'failed to resolve the disposable PostgreSQL host port'
@@ -176,7 +185,9 @@ try {
 
     $ready = $false
     foreach ($attempt in 1..120) {
-        $logOutput = (& docker logs $containerName 2>&1) -join "`n"
+        $logResult = Invoke-ForegroundProcess docker @('logs', $containerName) $loreRoot $CommandTimeoutSeconds
+        if ($logResult.ExitCode -ne 0) { throw "failed to read owned container logs: $($logResult.Output)" }
+        $logOutput = $logResult.Output
         $readyEvents = [regex]::Matches(
             $logOutput,
             'database system is ready to accept connections'
@@ -188,12 +199,13 @@ try {
         Start-Sleep -Milliseconds 500
     }
     if (-not $ready) {
-        & docker logs $containerName
+        Write-Host $logOutput
         throw 'disposable PostgreSQL did not become ready within 60 seconds'
     }
 
-    $serverVersionRaw = & docker exec $containerName psql -tA -v ON_ERROR_STOP=1 -U postgres -d postgres -c 'SHOW server_version_num;'
-    if ($LASTEXITCODE -ne 0) {
+    $versionResult = Invoke-ForegroundProcess docker @('exec', $containerName, 'psql', '-tA', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', 'postgres', '-c', 'SHOW server_version_num;') $loreRoot $CommandTimeoutSeconds
+    $serverVersionRaw = $versionResult.Output
+    if ($versionResult.ExitCode -ne 0) {
         throw 'failed to query the disposable PostgreSQL server version'
     }
     $serverVersion = [int](($serverVersionRaw | Out-String).Trim())
@@ -220,11 +232,12 @@ try {
             Write-Host "Running $($result.Test)..."
             try {
                 $cargoArgs = @(
-                    'test', '-p', 'lore-postgres', '--test', $result.Target, '--',
+                    'test', '-p', 'lore-postgres', '-j', '4', '--test', $result.Target, '--',
                     '--ignored', '--exact', $result.Test, '--test-threads=1'
                 )
-                $output = & cargo @cargoArgs 2>&1 | Out-String
-                $exitCode = $LASTEXITCODE
+                $processResult = Invoke-ForegroundProcess -FilePath cargo -ArgumentList $cargoArgs -WorkingDirectory $loreRoot -TimeoutSeconds $CommandTimeoutSeconds
+                $output = $processResult.Output
+                $exitCode = $processResult.ExitCode
             }
             finally {
                 [Environment]::SetEnvironmentVariable(
@@ -283,11 +296,13 @@ finally {
     [Environment]::SetEnvironmentVariable('LORE_TEST_PG_URL', $priorPgUrl, 'Process')
 
     if ($containerCreationAttempted -and ($runPassed -or -not $KeepOnFailure)) {
-        $actualLabelRaw = & docker inspect --format "{{ index .Config.Labels `"$ownershipLabelName`" }}|{{ index .Config.Labels `"com.tideshift.lore.domain-maintenance-live.pid`" }}" $containerName 2>$null
-        $inspectExitCode = $LASTEXITCODE
+        $inspection = Invoke-ForegroundProcess docker @('inspect', '--format', "{{ index .Config.Labels `"$ownershipLabelName`" }}|{{ index .Config.Labels `"com.tideshift.lore.domain-maintenance-live.pid`" }}", $containerName) $loreRoot $CommandTimeoutSeconds
+        $actualLabelRaw = $inspection.Output
+        $inspectExitCode = $inspection.ExitCode
         $actualLabel = if ($null -ne $actualLabelRaw) { ($actualLabelRaw | Out-String).Trim() } else { '' }
         if ($inspectExitCode -eq 0 -and $actualLabel -eq "$runId|$PID") {
-            & docker rm --force --volumes $containerName *> $null
+            $removal = Invoke-ForegroundProcess docker @('rm', '--force', '--volumes', $containerName) $loreRoot $CommandTimeoutSeconds
+            if ($removal.ExitCode -ne 0) { Write-Warning "failed to remove owned container: $($removal.Output)"; $runPassed = $false }
         }
         elseif ($inspectExitCode -eq 0) {
             Write-Warning "refusing to remove unowned container $containerName"

@@ -29,6 +29,9 @@ use lore_postgres::domain::maintenance::TerminalStatusAttachStatus;
 use lore_postgres::domain::maintenance::VerifiedStaleFinalizeInput;
 use lore_postgres::domain::maintenance::VerifiedStaleFinalizeStatus;
 use lore_postgres::domain::maintenance::proof_namespace_final_range_set_digest;
+use lore_postgres::domain::proof_namespace_read::ProofNamespaceState;
+use lore_postgres::domain::proof_namespace_read::ProofNamespaceStateInput;
+use lore_postgres::domain::proof_namespace_read::ProofNamespaceStateReader;
 use lore_postgres::domain::receipts::AuthorizationWitness;
 use lore_postgres::domain::receipts::ConsumeResult;
 use lore_postgres::domain::receipts::OperationBinding;
@@ -47,6 +50,316 @@ use tokio_postgres::Client;
 use uuid::NoContext;
 use uuid::Timestamp;
 use uuid::Uuid;
+
+fn namespace_state_input(materialize: &ProofNamespaceMaterializeInput) -> ProofNamespaceStateInput {
+    ProofNamespaceStateInput {
+        key: materialize.key.clone(),
+        protocol_revision: materialize.protocol_revision,
+        namespace_epoch: materialize.namespace_epoch.clone(),
+        namespace_claim_revision: materialize.namespace_claim_revision,
+        namespace_claim_nonce: materialize.namespace_claim_nonce.clone(),
+    }
+}
+
+// Include row versions: even a value-preserving UPDATE violates this RPC's read-only contract.
+async fn domain_rows(client: &Client) -> Vec<(String, Vec<String>)> {
+    let tables = client.query("SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'lore_domain_%' ORDER BY tablename", &[]).await.unwrap();
+    let mut snapshot = Vec::new();
+    for table in tables {
+        let name: String = table.get(0);
+        assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+        let sql =
+            format!("SELECT row_to_json(t)::text || ':' || xmin::text FROM {name} t ORDER BY 1");
+        let rows = client
+            .query(&sql, &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        snapshot.push((name, rows));
+    }
+    snapshot
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn namespace_state_absent_and_binding_mismatch_never_mutate() {
+    let url = pg_url().expect("disposable runner must provide LORE_TEST_PG_URL");
+    let store = store(&url).await;
+    let direct = client(&url).await;
+    let materialize = materialize_input(namespace_key(), 0, 1);
+    let input = namespace_state_input(&materialize);
+    let before = domain_rows(&direct).await;
+    assert_eq!(
+        store.proof_namespace_state_get(&input).await.unwrap(),
+        ProofNamespaceState::Absent
+    );
+    assert_eq!(
+        domain_rows(&direct).await,
+        before,
+        "absence must not provision counters or namespace"
+    );
+    assert_eq!(
+        store
+            .domain_operation_proof_namespace_materialize(&materialize)
+            .await
+            .unwrap()
+            .status,
+        ProofNamespaceMaterializeStatus::Materialized
+    );
+    let before = domain_rows(&direct).await;
+    for field in 0..4 {
+        let mut changed = input.clone();
+        match field {
+            0 => changed.key.org_uuid[0] ^= 1,
+            1 => changed.namespace_epoch[0] ^= 1,
+            2 => changed.namespace_claim_revision += 1,
+            _ => changed.namespace_claim_nonce[0] ^= 1,
+        }
+        assert_eq!(
+            store.proof_namespace_state_get(&changed).await.unwrap(),
+            ProofNamespaceState::Mismatch,
+            "binding field {field}"
+        );
+        assert_eq!(domain_rows(&direct).await, before);
+    }
+    for field in 0..3 {
+        let mut other = input.clone();
+        match field {
+            0 => other.key.verified_issuer.push_str("/other"),
+            1 => other.key.authenticated_subject.push_str("-other"),
+            _ => other.key.tenant_scope_key[0] ^= 1,
+        }
+        assert_eq!(
+            store.proof_namespace_state_get(&other).await.unwrap(),
+            ProofNamespaceState::Absent
+        );
+        assert_eq!(domain_rows(&direct).await, before);
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn namespace_state_quiescent_and_outstanding_vectors_are_read_only() {
+    let url = pg_url().expect("disposable runner must provide LORE_TEST_PG_URL");
+    let store = store(&url).await;
+    let direct = client(&url).await;
+    let materialize = materialize_input(namespace_key(), 0, 1);
+    store
+        .domain_operation_proof_namespace_materialize(&materialize)
+        .await
+        .unwrap();
+    let input = namespace_state_input(&materialize);
+    let before = domain_rows(&direct).await;
+    assert_eq!(
+        store.proof_namespace_state_get(&input).await.unwrap(),
+        ProofNamespaceState::MatchedQuiescent {
+            quota_revision: 1,
+            final_high_water: 0,
+            final_range_set_digest: retire_input(&materialize).final_range_set_digest,
+        }
+    );
+    assert_eq!(domain_rows(&direct).await, before);
+    for column in ["retained_marker_count", "outstanding_proof_claims"] {
+        let (retained, outstanding) = if column == "retained_marker_count" {
+            (1_i64, 0_i64)
+        } else {
+            (0_i64, 1_i64)
+        };
+        direct.execute("UPDATE lore_domain_proof_namespaces SET retained_marker_count=$1, outstanding_proof_claims=$2", &[&retained, &outstanding]).await.unwrap();
+        let before = domain_rows(&direct).await;
+        assert_eq!(
+            store.proof_namespace_state_get(&input).await.unwrap(),
+            ProofNamespaceState::MatchedNotQuiescent { quota_revision: 1 },
+            "{column}"
+        );
+        assert_eq!(domain_rows(&direct).await, before);
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn namespace_state_missing_coverage_is_nonquiescent_and_never_repaired() {
+    let url = pg_url().expect("disposable runner must provide LORE_TEST_PG_URL");
+    let store = store(&url).await;
+    let direct = client(&url).await;
+    let materialize = materialize_input(namespace_key(), 0, 1);
+    store
+        .domain_operation_proof_namespace_materialize(&materialize)
+        .await
+        .unwrap();
+    direct
+        .execute(
+            "UPDATE lore_domain_proof_namespaces SET high_water=1, next_sequence=2",
+            &[],
+        )
+        .await
+        .unwrap();
+    let before = domain_rows(&direct).await;
+    assert_eq!(
+        store
+            .proof_namespace_state_get(&namespace_state_input(&materialize))
+            .await
+            .unwrap(),
+        ProofNamespaceState::MatchedNotQuiescent { quota_revision: 1 }
+    );
+    assert_eq!(
+        domain_rows(&direct).await,
+        before,
+        "read must not repair missing coverage"
+    );
+    direct
+        .execute(
+            "UPDATE lore_domain_proof_namespaces SET fragment_count=1",
+            &[],
+        )
+        .await
+        .unwrap();
+    let before = domain_rows(&direct).await;
+    assert_eq!(
+        store
+            .proof_namespace_state_get(&namespace_state_input(&materialize))
+            .await
+            .unwrap_err(),
+        DomainError::Internal("corrupt proof namespace state".into())
+    );
+    assert_eq!(
+        domain_rows(&direct).await,
+        before,
+        "corrupt count must not be repaired"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn namespace_state_reads_one_snapshot_across_concurrent_retirement() {
+    let url = pg_url().expect("disposable runner must provide LORE_TEST_PG_URL");
+    let store = std::sync::Arc::new(store(&url).await);
+    let mut writer = client(&url).await;
+    let observer = client(&url).await;
+    let materialize = materialize_input(namespace_key(), 0, 1);
+    store
+        .domain_operation_proof_namespace_materialize(&materialize)
+        .await
+        .unwrap();
+    let key = &materialize.key;
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    for part in [
+        b"domain-marker-prune-interval-v3\0".as_slice(),
+        key.tenant_scope_key.as_slice(),
+        materialize.namespace_epoch.as_slice(),
+        &2_u64.to_be_bytes(),
+        &1_u64.to_be_bytes(),
+        &3_u64.to_be_bytes(),
+        &1_u64.to_be_bytes(),
+        &1_u64.to_be_bytes(),
+        &1_u64.to_be_bytes(),
+        &1_u64.to_be_bytes(),
+    ] {
+        hasher.update(&(part.len() as u32).to_be_bytes());
+        hasher.update(part);
+    }
+    let range_digest = hasher.finish().as_ref().to_vec();
+    let byte_charge = (key.verified_issuer.len()
+        + key.authenticated_subject.len()
+        + key.tenant_scope_key.len()
+        + 16
+        + 6 * 8
+        + 32) as i64;
+    writer.execute("INSERT INTO lore_domain_tombstone_marker_prune_ranges (verified_issuer, authenticated_subject, tenant_scope_key, epoch, protocol_revision, quota_revision, marker_interval_schema_revision, start_sequence, end_sequence, sequence_count, generation, created_at_ms, row_charge, byte_charge, interval_digest) VALUES ($1,$2,$3,$4,2,1,3,1,1,1,1,0,1,$5,$6)", &[&key.verified_issuer, &key.authenticated_subject, &key.tenant_scope_key, &materialize.namespace_epoch, &byte_charge, &range_digest]).await.unwrap();
+    writer
+        .execute(
+            "UPDATE lore_domain_proof_namespaces SET high_water=1,next_sequence=2,fragment_count=1",
+            &[],
+        )
+        .await
+        .unwrap();
+    let expected = ProofNamespaceState::MatchedQuiescent {
+        quota_revision: 1,
+        final_high_water: 1,
+        final_range_set_digest: proof_namespace_final_range_set_digest(
+            &key.tenant_scope_key,
+            &materialize.namespace_epoch,
+            2,
+            1,
+            1,
+            &[lore_postgres::domain::maintenance::ProofRange {
+                start_sequence: 1,
+                end_sequence: 1,
+                generation: 1,
+                digest: range_digest.clone(),
+            }],
+        )
+        .unwrap(),
+    };
+    let input = namespace_state_input(&materialize);
+    assert_eq!(
+        store.proof_namespace_state_get(&input).await.unwrap(),
+        expected
+    );
+    writer
+        .execute(
+            "UPDATE lore_domain_tombstone_marker_prune_ranges SET interval_digest=$1",
+            &[&vec![0xff_u8; 32]],
+        )
+        .await
+        .unwrap();
+    let before = domain_rows(&observer).await;
+    assert_eq!(
+        store.proof_namespace_state_get(&input).await.unwrap_err(),
+        DomainError::Internal("corrupt proof namespace state".into())
+    );
+    assert_eq!(
+        domain_rows(&observer).await,
+        before,
+        "corrupt digest must not be repaired"
+    );
+    writer
+        .execute(
+            "UPDATE lore_domain_tombstone_marker_prune_ranges SET interval_digest=$1",
+            &[&range_digest],
+        )
+        .await
+        .unwrap();
+    let tx = writer.transaction().await.unwrap();
+    // Hold only the range relation. The reader must first take its namespace snapshot,
+    // then demonstrably block at its range read before we publish retirement.
+    tx.batch_execute(
+        "LOCK TABLE lore_domain_tombstone_marker_prune_ranges IN ACCESS EXCLUSIVE MODE",
+    )
+    .await
+    .unwrap();
+    let reading_store = store.clone();
+    let reading_input = input.clone();
+    let read = lore_base::lore_spawn!(async move {
+        reading_store
+            .proof_namespace_state_get(&reading_input)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let waiting: bool = observer.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE '%SELECT start_sequence%')", &[]).await.unwrap().get(0);
+            if waiting { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("reader must reach range query after snapshotting namespace");
+    tx.batch_execute("DELETE FROM lore_domain_tombstone_marker_prune_ranges; DELETE FROM lore_domain_proof_namespaces").await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        expected,
+        "read may not combine old namespace with retired range inventory"
+    );
+    assert_eq!(
+        store.proof_namespace_state_get(&input).await.unwrap(),
+        ProofNamespaceState::Absent
+    );
+}
 
 fn pg_url() -> Option<String> {
     std::env::var("LORE_TEST_PG_URL").ok()

@@ -5,6 +5,10 @@
 This crate contains the proto files and the build code to generate and expose a crate, using `prost` and `tonic`.
 It also contains a package.json so the proto files can be published to artifactory.
 
+The fork-private [domain operation schema](proto/lore/domain/v1/domain_operation.proto)
+includes `DomainOperationProofNamespaceStateGet` for control-plane namespace reconciliation.
+Preserve its RPC path and wire tags during upstream reconciliation.
+
 ## Publish
 In order to publish do the following:
 

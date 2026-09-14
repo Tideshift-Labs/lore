@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use anyhow::Result;
+use base64::Engine;
 use lore_base::runtime::runtime;
 use lore_telemetry::tracing::fields::USER_ID;
 use tokio::task;
@@ -82,6 +84,25 @@ pub struct JWTAuthnInterceptor {
     jwt_verifier: JwtVerifier,
 }
 
+/// Organization read from the exact bearer only after signature and claim
+/// verification. Kept separate from repository permission claims.
+#[derive(Clone, Debug)]
+pub(crate) struct VerifiedServiceOrg(pub(crate) uuid::Uuid);
+
+fn service_org_after_verification(token: &str) -> Option<VerifiedServiceOrg> {
+    #[derive(serde::Deserialize)]
+    struct OrgClaim {
+        org: String,
+    }
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: OrgClaim = serde_json::from_slice(&bytes).ok()?;
+    let org = uuid::Uuid::parse_str(&claims.org).ok()?;
+    Some(VerifiedServiceOrg(org))
+}
+
 impl JWTAuthnInterceptor {
     pub fn new(jwt_verifier: &JwtVerifier) -> Self {
         Self {
@@ -103,6 +124,10 @@ impl Interceptor for JWTAuthnInterceptor {
         let authorization = authorize(&self.jwt_verifier, &token)?;
         add_auth_fields_to_current_span(&authorization);
 
+        if let Some(org) = service_org_after_verification(&token) {
+            request.extensions_mut().insert(org);
+        }
+
         request.extensions_mut().insert(authorization);
 
         Ok(request)
@@ -121,3 +146,7 @@ pub(crate) fn extract_bearer_token(metadata: &tonic::metadata::MetadataMap) -> O
             }
         })
 }
+
+#[cfg(test)]
+#[path = "jwt_interceptor_tests.rs"]
+mod tests;

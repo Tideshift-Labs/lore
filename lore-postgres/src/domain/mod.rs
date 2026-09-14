@@ -52,6 +52,7 @@ pub mod locks;
 pub mod maintenance;
 pub mod outbox;
 pub mod postgres_coordinator;
+pub mod proof_namespace_read;
 pub mod receipts;
 pub mod retry;
 pub mod schema;

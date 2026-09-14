@@ -238,6 +238,167 @@ fn append_part(out: &mut Vec<u8>, value: &[u8]) -> Result<(), DomainError> {
     Ok(())
 }
 
+/// Observe one repeatable-read, read-only snapshot. No retirement, pruning, or
+/// lazy repair is performed here, including on missing or corrupt state.
+pub async fn proof_namespace_state_get(
+    tx: &Transaction<'_>,
+    input: &super::proof_namespace_read::ProofNamespaceStateInput,
+) -> Result<super::proof_namespace_read::ProofNamespaceState, DomainError> {
+    use super::proof_namespace_read::ProofNamespaceState;
+    let corrupt = || DomainError::Internal("corrupt proof namespace state".to_owned());
+    if input.protocol_revision != RECEIPT_PROTOCOL_REVISION_V2
+        || input.key.org_uuid.len() != 16
+        || input.namespace_epoch.len() != 16
+        || input.namespace_claim_nonce.len() != 32
+        || input.namespace_claim_revision < 0
+    {
+        return Err(DomainError::InvalidInput(
+            "invalid proof namespace binding".to_owned(),
+        ));
+    }
+    let rows = tx.query(
+        "SELECT epoch, org_uuid, protocol_revision, quota_revision, marker_interval_schema_revision, \
+         claim_revision, claim_nonce, high_water, next_sequence, retained_marker_count, \
+         outstanding_proof_claims, fragment_count, state \
+         FROM lore_domain_proof_namespaces \
+         WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 \
+         AND state <> 2 LIMIT 2",
+        &[&input.key.verified_issuer, &input.key.authenticated_subject, &input.key.tenant_scope_key],
+    ).await.map_err(|e| DomainError::from_pg("proof namespace snapshot row", e))?;
+    if rows.len() > 1 {
+        return Err(corrupt());
+    }
+    let Some(row) = rows.first() else {
+        return Ok(ProofNamespaceState::Absent);
+    };
+    macro_rules! field {
+        ($name:literal, $ty:ty) => {
+            row.try_get::<_, $ty>($name).map_err(|_| corrupt())?
+        };
+    }
+    let epoch = field!("epoch", Vec<u8>);
+    let org = field!("org_uuid", Vec<u8>);
+    let protocol = field!("protocol_revision", i32);
+    let quota = field!("quota_revision", i32);
+    let interval = field!("marker_interval_schema_revision", i32);
+    let claim = field!("claim_revision", i64);
+    let nonce = field!("claim_nonce", Vec<u8>);
+    let high_water = field!("high_water", i64);
+    let next = field!("next_sequence", i64);
+    let retained = field!("retained_marker_count", i64);
+    let outstanding = field!("outstanding_proof_claims", i64);
+    let fragments = field!("fragment_count", i64);
+    let state = field!("state", i16);
+    if epoch.len() != 16
+        || org.len() != 16
+        || nonce.len() != 32
+        || claim < 0
+        || quota < 1
+        || protocol != RECEIPT_PROTOCOL_REVISION_V2
+        || interval != MARKER_INTERVAL_SCHEMA_REVISION_V3
+        || high_water < 0
+        || next <= high_water
+        || retained < 0
+        || outstanding < 0
+        || fragments < 0
+        || !matches!(
+            state,
+            schema_mediated::NAMESPACE_STATE_ACTIVE | schema_mediated::NAMESPACE_STATE_DRAINING
+        )
+        || i128::from(fragments) > i128::from(retained) + i128::from(outstanding) + 1
+    {
+        return Err(corrupt());
+    }
+    if epoch != input.namespace_epoch
+        || org != input.key.org_uuid
+        || protocol != input.protocol_revision
+        || claim != input.namespace_claim_revision
+        || !bool::from(nonce.ct_eq(&input.namespace_claim_nonce))
+    {
+        return Ok(ProofNamespaceState::Mismatch);
+    }
+    let quota_revision = quota as u64;
+    if retained != 0 || outstanding != 0 {
+        return Ok(ProofNamespaceState::MatchedNotQuiescent { quota_revision });
+    }
+    // With R=O=0 the frozen F <= R+O+1 inequality bounds the full range
+    // inventory to one row. A second row is corruption, never truncated proof.
+    let range_rows = tx.query(
+        "SELECT start_sequence, end_sequence, sequence_count, generation, interval_digest, \
+         protocol_revision, quota_revision, marker_interval_schema_revision, row_charge, byte_charge, created_at_ms \
+         FROM lore_domain_tombstone_marker_prune_ranges \
+         WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND epoch=$4 \
+         ORDER BY start_sequence LIMIT 2",
+        &[&input.key.verified_issuer, &input.key.authenticated_subject, &input.key.tenant_scope_key, &epoch],
+    ).await.map_err(|e| DomainError::from_pg("proof namespace snapshot ranges", e))?;
+    if range_rows.len() as i64 != fragments {
+        return Err(corrupt());
+    }
+    let mut ranges = Vec::new();
+    for row in &range_rows {
+        macro_rules! range_field {
+            ($name:literal, $ty:ty) => {
+                row.try_get::<_, $ty>($name).map_err(|_| corrupt())?
+            };
+        }
+        let start = range_field!("start_sequence", i64);
+        let end = range_field!("end_sequence", i64);
+        let count = range_field!("sequence_count", i64);
+        let generation = range_field!("generation", i64);
+        let digest = range_field!("interval_digest", Vec<u8>);
+        if start < 1
+            || end < start
+            || end > high_water
+            || count != end - start + 1
+            || generation != end
+            || range_field!("protocol_revision", i32) != protocol
+            || range_field!("quota_revision", i32) != quota
+            || range_field!("marker_interval_schema_revision", i32) != interval
+            || range_field!("row_charge", i32) != 1
+            || range_field!("created_at_ms", i64) < 0
+            || range_field!("byte_charge", i64) != proof_range_byte_charge(&input.key)?
+            || digest != proof_range_digest(&input.key, &epoch, protocol, quota, start, end)?
+        {
+            return Err(corrupt());
+        }
+        ranges.push(ProofRange {
+            start_sequence: start,
+            end_sequence: end,
+            digest,
+            generation,
+        });
+    }
+    let actual_markers: i64 = tx.query_one(
+        "SELECT count(*)::bigint FROM lore_domain_operation_tombstone_release_completion_markers \
+         WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND namespace_epoch=$4",
+        &[&input.key.verified_issuer, &input.key.authenticated_subject, &input.key.tenant_scope_key, &epoch],
+    ).await.map_err(|e| DomainError::from_pg("proof namespace snapshot markers", e))?
+        .try_get(0).map_err(|_| corrupt())?;
+    if actual_markers != 0 {
+        return Err(corrupt());
+    }
+    let complete = if high_water == 0 {
+        ranges.is_empty()
+    } else {
+        ranges.len() == 1 && ranges[0].start_sequence == 1 && ranges[0].end_sequence == high_water
+    };
+    if !complete {
+        return Ok(ProofNamespaceState::MatchedNotQuiescent { quota_revision });
+    }
+    Ok(ProofNamespaceState::MatchedQuiescent {
+        quota_revision,
+        final_high_water: high_water as u64,
+        final_range_set_digest: proof_namespace_final_range_set_digest(
+            &input.key.tenant_scope_key,
+            &epoch,
+            protocol,
+            quota,
+            high_water,
+            &ranges,
+        )?,
+    })
+}
+
 fn canonical_digest(domain: &[u8], parts: &[&[u8]]) -> Result<Vec<u8>, DomainError> {
     let mut canonical = Vec::new();
     append_part(&mut canonical, domain)?;
