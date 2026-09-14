@@ -111,6 +111,297 @@ pub async fn ensure_schema(pool: &Pool, ddl: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Domain replica bootstrap: never retain a DDL lock across statements.
+///
+/// Existing tables/indexes/columns are checked in the catalog before issuing
+/// DDL. Guarded DO blocks retain their own catalog predicates. This preserves
+/// the declarations' IF NOT EXISTS semantics; it is not schema attestation.
+/// Missing indexes on populated tables require out-of-band concurrent builds.
+pub async fn ensure_schema_online(pool: &Pool, ddl: &str) -> Result<(), String> {
+    ensure_schema_online_inner(pool, ddl)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, thiserror::Error)]
+enum OnlineSchemaError {
+    #[error("postgres bootstrap pool failed: {0}")]
+    Pool(#[from] PoolError),
+    #[error("postgres {stage} failed: {source:?}")]
+    Postgres {
+        stage: &'static str,
+        #[source]
+        source: tokio_postgres::Error,
+    },
+    #[error("unsupported online bootstrap SQL: {0}")]
+    Unsupported(String),
+    #[error(
+        "postgres schema index {0} is invalid or belongs to another table; repair it out of band"
+    )]
+    InvalidIndex(String),
+    #[error("invalid bootstrap SQL encoding: {0}")]
+    Encoding(#[from] std::string::FromUtf8Error),
+    #[error("{original}; schema rollback failed: {source}")]
+    Rollback {
+        original: Box<Self>,
+        #[source]
+        source: tokio_postgres::Error,
+    },
+}
+
+fn online_pg(stage: &'static str) -> impl FnOnce(tokio_postgres::Error) -> OnlineSchemaError {
+    move |source| OnlineSchemaError::Postgres { stage, source }
+}
+
+async fn ensure_schema_online_inner(pool: &Pool, ddl: &str) -> Result<(), OnlineSchemaError> {
+    let statements = schema_fragments(ddl, b';', true)?;
+    let mut client = pool.get().await?;
+    for statement in statements {
+        let step = SchemaStep::parse(&statement)?;
+        if step.complete(&**client).await? {
+            continue;
+        }
+        let tx = client
+            .transaction()
+            .await
+            .map_err(online_pg("schema transaction"))?;
+        let result = async {
+            // Wait for another installer before taking any table lock. Existing
+            // transaction-scoped installers use this same advisory key.
+            tx.execute("SELECT pg_advisory_xact_lock($1)", &[&SCHEMA_LOCK_KEY])
+                .await.map_err(online_pg("schema advisory lock"))?;
+            tx.batch_execute("SET LOCAL lock_timeout = '100ms'; SET LOCAL statement_timeout = '250ms'")
+                .await.map_err(online_pg("schema timeouts"))?;
+            if !step.complete(&*tx).await? {
+                let execution = if let SchemaStep::Index { table, .. } = &step {
+                    // One statement timeout covers lock, check, and build. No
+                    // writer can populate the table between check and build.
+                    // NOWAIT also avoids queuing behind an active writer.
+                    format!("DO $online_index$ BEGIN \
+                        LOCK TABLE \"{table}\" IN SHARE MODE NOWAIT; \
+                        IF EXISTS (SELECT 1 FROM \"{table}\" LIMIT 1) THEN \
+                        RAISE EXCEPTION 'postgres schema requires an out-of-band concurrent index build on {table}'; \
+                        END IF; {statement}; END $online_index$;")
+                } else { statement.clone() };
+                tx.batch_execute(&execution).await.map_err(online_pg("bounded schema DDL"))?;
+            }
+            Ok::<(), OnlineSchemaError>(())
+        }.await;
+        if let Err(error) = result {
+            if let Err(source) = tx.rollback().await {
+                return Err(OnlineSchemaError::Rollback {
+                    original: Box::new(error),
+                    source,
+                });
+            }
+            return Err(error);
+        }
+        tx.commit().await.map_err(online_pg("schema commit"))?;
+    }
+    Ok(())
+}
+
+enum SchemaStep {
+    Table(String),
+    Index { name: String, table: String },
+    Columns { table: String, names: Vec<String> },
+    GuardedBlock,
+}
+
+impl SchemaStep {
+    fn parse(sql: &str) -> Result<Self, OnlineSchemaError> {
+        let words: Vec<_> = sql.split_whitespace().collect();
+        let identifier = |word: &str| -> Result<String, OnlineSchemaError> {
+            if !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+            {
+                Ok(word.to_owned())
+            } else {
+                Err(OnlineSchemaError::Unsupported(format!("identifier {word}")))
+            }
+        };
+        if words.starts_with(&["CREATE", "TABLE", "IF", "NOT", "EXISTS"]) && words.len() > 5 {
+            return Ok(Self::Table(identifier(words[5])?));
+        }
+        let index_offset =
+            if words.starts_with(&["CREATE", "UNIQUE", "INDEX", "IF", "NOT", "EXISTS"]) {
+                Some(6)
+            } else if words.starts_with(&["CREATE", "INDEX", "IF", "NOT", "EXISTS"]) {
+                Some(5)
+            } else {
+                None
+            };
+        if let Some(offset) = index_offset
+            && words.get(offset + 1) == Some(&"ON")
+            && words.len() > offset + 2
+        {
+            return Ok(Self::Index {
+                name: identifier(words[offset])?,
+                table: identifier(words[offset + 2])?,
+            });
+        }
+        if words.starts_with(&["ALTER", "TABLE"]) && words.len() > 3 {
+            let actions = schema_fragments(&words[3..].join(" "), b',', false)?;
+            let mut names = Vec::new();
+            for action in actions {
+                let tokens: Vec<_> = action.split_whitespace().collect();
+                if !tokens.starts_with(&["ADD", "COLUMN", "IF", "NOT", "EXISTS"])
+                    || tokens.len() < 7
+                {
+                    return Err(OnlineSchemaError::Unsupported(format!(
+                        "ALTER action {action}"
+                    )));
+                }
+                names.push(identifier(tokens[5])?);
+            }
+            if !names.is_empty() {
+                return Ok(Self::Columns {
+                    table: identifier(words[2])?,
+                    names,
+                });
+            }
+        }
+        // The mediated schema seeds its singleton with ON CONFLICT DO NOTHING.
+        // Execute that existing idempotent statement; never infer a new value
+        // or overwrite counters that a serving replica has already advanced.
+        if words.first() == Some(&"DO")
+            || (words.starts_with(&["INSERT", "INTO"])
+                && words.ends_with(&["ON", "CONFLICT", "(id)", "DO", "NOTHING"]))
+        {
+            return Ok(Self::GuardedBlock);
+        }
+        Err(OnlineSchemaError::Unsupported(format!(
+            "statement {}",
+            words.iter().take(6).copied().collect::<Vec<_>>().join(" ")
+        )))
+    }
+
+    async fn complete(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+    ) -> Result<bool, OnlineSchemaError> {
+        let result = match self {
+            Self::Table(name) => client.query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_class WHERE oid = to_regclass($1) AND relkind IN ('r', 'p'))", &[name]).await,
+            Self::Index { name, table } => {
+                let row = client.query_opt(
+                    "SELECT COALESCE(i.indisvalid AND i.indisready AND i.indrelid = to_regclass($2), false) FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid = c.oid WHERE c.oid = to_regclass($1)",
+                    &[name, table]).await.map_err(online_pg("index catalog check"))?;
+                return match row {
+                    None => Ok(false),
+                    Some(row) if row.get::<_, bool>(0) => Ok(true),
+                    Some(_) => Err(OnlineSchemaError::InvalidIndex(name.clone())),
+                };
+            }
+            Self::Columns { table, names } => client.query_one(
+                "SELECT NOT EXISTS (SELECT 1 FROM unnest($2::text[]) AS wanted(name) WHERE NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1) AND attname = wanted.name AND attnum > 0 AND NOT attisdropped))", &[table, names]).await,
+            Self::GuardedBlock => return Ok(false),
+        };
+        result
+            .map(|row| row.get(0))
+            .map_err(online_pg("schema catalog check"))
+    }
+}
+
+/// Split the compiled SQL declarations, preserving quoted semicolons and DO
+/// bodies. Strip comments only outside quotes. Reject unfinished input.
+fn schema_fragments(
+    ddl: &str,
+    separator: u8,
+    require_terminator: bool,
+) -> Result<Vec<String>, OnlineSchemaError> {
+    let bytes = ddl.as_bytes();
+    let mut statements = Vec::new();
+    let mut current = Vec::new();
+    let mut offset = 0;
+    let mut quote = None;
+    let mut dollar: Option<Vec<u8>> = None;
+    let mut depth = 0_u32;
+    while offset < bytes.len() {
+        if let Some(tag) = &dollar {
+            if bytes[offset..].starts_with(tag) {
+                current.extend_from_slice(tag);
+                offset += tag.len();
+                dollar = None;
+            } else {
+                current.push(bytes[offset]);
+                offset += 1;
+            }
+            continue;
+        }
+        let byte = bytes[offset];
+        if let Some(delimiter) = quote {
+            current.push(byte);
+            offset += 1;
+            if byte == delimiter {
+                if bytes.get(offset) == Some(&delimiter) {
+                    current.push(delimiter);
+                    offset += 1;
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        if bytes[offset..].starts_with(b"--") {
+            while offset < bytes.len() && bytes[offset] != b'\n' {
+                offset += 1;
+            }
+            current.push(b' ');
+            continue;
+        }
+        if bytes[offset..].starts_with(b"/*") {
+            return Err(OnlineSchemaError::Unsupported("block comment".into()));
+        }
+        if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+        } else if byte == b'$' {
+            let mut end = offset + 1;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if bytes.get(end) == Some(&b'$') {
+                let tag = bytes[offset..=end].to_vec();
+                current.extend_from_slice(&tag);
+                dollar = Some(tag);
+                offset = end + 1;
+                continue;
+            }
+        } else if byte == b'(' {
+            depth += 1;
+        } else if byte == b')' {
+            depth = depth
+                .checked_sub(1)
+                .ok_or_else(|| OnlineSchemaError::Unsupported("unbalanced parentheses".into()))?;
+        } else if byte == separator && depth == 0 {
+            let statement = String::from_utf8(std::mem::take(&mut current))?;
+            if !statement.trim().is_empty() {
+                statements.push(statement.trim().to_owned());
+            }
+            offset += 1;
+            continue;
+        }
+        current.push(byte);
+        offset += 1;
+    }
+    if quote.is_some() || dollar.is_some() || depth != 0 {
+        return Err(OnlineSchemaError::Unsupported(
+            "unterminated quote or parentheses".into(),
+        ));
+    }
+    if !current.iter().all(u8::is_ascii_whitespace) {
+        if require_terminator {
+            return Err(OnlineSchemaError::Unsupported(
+                "unterminated statement".into(),
+            ));
+        }
+        statements.push(String::from_utf8(current)?.trim().to_owned());
+    }
+    Ok(statements)
+}
+
 /// Build a pooled Postgres connector with a rustls TLS provider. TLS
 /// negotiation follows the URL's `sslmode`; verification follows `tls` (see
 /// [`TlsConfig`] and the module docs).

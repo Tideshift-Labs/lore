@@ -58,6 +58,488 @@ async fn connect_domain_store(url: &str) -> PostgresDomainStore {
         .expect("connect domain store")
 }
 
+#[tokio::test]
+#[ignore = "requires owned live Postgres; online bootstrap overlap"]
+async fn online_bootstrap_completes_while_receipt_writer_keeps_its_transaction_open() {
+    let url = pg_url().expect("LORE_TEST_PG_URL is required");
+    let _initial = connect_domain_store(&url).await;
+    let mut writer = bounded_receipt_client(&url).await;
+    let tx = writer
+        .transaction()
+        .await
+        .expect("receipt writer transaction");
+    // The old bootstrap retained an index's ShareLock while waiting for
+    // AccessExclusiveLock here. Receipt admission then needed RowExclusiveLock.
+    tx.query(
+        "SELECT 1 FROM lore_domain_operation_receipts WHERE false FOR UPDATE",
+        &[],
+    )
+    .await
+    .expect("hold receipt RowShareLock until reconnect has completed");
+    let key = isolated_key(uuid_v7_at(admission_clock(&tx).await.expect("clock")));
+    let intent = binding("lore.domain.v1.test/OnlineBootstrap");
+    let reconnect_started = std::time::Instant::now();
+    let (reconnected, prepared) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            connect_domain_store(&url),
+            prepare(&tx, &key, &intent, None, None)
+        )
+    })
+    .await
+    .expect(
+        "reconnect and receipt admission must complete while the writer transaction stays open",
+    );
+    println!(
+        "real reconnect and concurrent receipt admission completed with writer transaction held: {:?}",
+        reconnect_started.elapsed()
+    );
+    let PrepareResult::Prepared { token, .. } =
+        prepared.expect("writer admission concurrent with reconnect")
+    else {
+        panic!("expected Prepared");
+    };
+    tx.commit().await.expect("commit admission");
+    let tx = writer.transaction().await.expect("consume transaction");
+    let ConsumeResult::Admitted(admission) = consume(&tx, &key, &intent, &token)
+        .await
+        .expect("consume after reconnect")
+    else {
+        panic!("expected Admitted");
+    };
+    commit_terminal(
+        &tx,
+        &key,
+        &DomainOutcome::Applied,
+        None,
+        admission.admission_clock,
+    )
+    .await
+    .expect("terminal receipt after reconnect");
+    tx.commit().await.expect("commit terminal receipt");
+    assert!(matches!(
+        reconnected
+            .domain_operation_receipt_get(&key, &intent)
+            .await
+            .expect("durable readback"),
+        ReceiptLookup::Committed {
+            outcome: DomainOutcome::Applied,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires owned live Postgres; online bootstrap lock budget"]
+async fn online_bootstrap_releases_previous_ddl_before_a_blocked_statement() {
+    let url = pg_url().expect("LORE_TEST_PG_URL is required");
+    let observer = bounded_receipt_client(&url).await;
+    let mut holder = bounded_receipt_client(&url).await;
+    let suffix = format!("{:016x}", rand::random::<u64>());
+    let first = format!("receipt_bootstrap_first_{suffix}");
+    let second = format!("receipt_bootstrap_second_{suffix}");
+    observer
+        .batch_execute(&format!(
+            "CREATE TABLE {first} (id integer); CREATE TABLE {second} (id integer)"
+        ))
+        .await
+        .expect("create isolated DDL fixture");
+    let holder_pid = receipt_backend_pid(&holder).await;
+    let tx = holder.transaction().await.expect("DDL blocker transaction");
+    tx.query(&format!("SELECT id FROM {second} FOR UPDATE"), &[])
+        .await
+        .expect("hold second relation RowShareLock");
+    let pool =
+        lore_postgres::pool::build_pool(&url, 1, &TlsConfig::default()).expect("bootstrap pool");
+    let ddl = format!(
+        "ALTER TABLE {first} ADD COLUMN IF NOT EXISTS added integer; \
+         ALTER TABLE {second} ADD COLUMN IF NOT EXISTS added integer;"
+    );
+    let (result, blocked_at) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(
+            lore_postgres::pool::ensure_schema_online(&pool, &ddl),
+            async {
+                loop {
+                    let waiting: bool = observer.query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = to_regclass($1) \
+                         AND mode = 'AccessExclusiveLock' AND NOT granted \
+                         AND $2 = ANY(pg_blocking_pids(pid)))",
+                        &[&second, &holder_pid],
+                    ).await.expect("observe exact blocked DDL relation").get(0);
+                    if waiting {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                // Visibility of the new column from this connection proves the
+                // preceding DDL committed before the next statement's lock wait.
+                let blocked_at = std::time::Instant::now();
+                observer
+                    .execute(
+                        &format!("INSERT INTO {first} (id, added) VALUES (1, 2)"),
+                        &[],
+                    )
+                    .await
+                    .expect("writer must not wait for the whole DDL sequence");
+                println!(
+                    "independent INSERT latency while next DDL was blocked: {:?}",
+                    blocked_at.elapsed()
+                );
+                blocked_at
+            }
+        )
+    })
+    .await
+    .expect("DDL failure and independent writer must be bounded");
+    let error = result.expect_err("held relation must exhaust the DDL lock budget");
+    assert!(
+        error.contains("55P03") || error.contains("lock timeout"),
+        "expected lock timeout, got {error}"
+    );
+    assert!(
+        blocked_at.elapsed() < Duration::from_secs(2),
+        "one blocked DDL must fail promptly"
+    );
+    println!(
+        "blocked DDL refused and independent writer completed in {:?}: {error}",
+        blocked_at.elapsed()
+    );
+    tx.rollback().await.expect("release owned blocker");
+    assert_eq!(
+        observer
+            .query_one(&format!("SELECT added FROM {first} WHERE id = 1"), &[])
+            .await
+            .expect("durable independent write")
+            .get::<_, i32>(0),
+        2
+    );
+    lore_postgres::pool::ensure_schema_online(&pool, &ddl)
+        .await
+        .expect("resume after bounded refusal");
+    observer
+        .batch_execute(&format!("DROP TABLE {first}; DROP TABLE {second}"))
+        .await
+        .expect("remove only owned fixture relations");
+}
+
+#[tokio::test]
+#[ignore = "requires owned live Postgres; online bootstrap index replay"]
+async fn online_bootstrap_skips_existing_index_during_an_open_write() {
+    let url = pg_url().expect("LORE_TEST_PG_URL is required");
+    let mut writer = bounded_receipt_client(&url).await;
+    let table = format!("receipt_bootstrap_index_{:016x}", rand::random::<u64>());
+    let ddl = format!("CREATE INDEX IF NOT EXISTS {table}_idx ON {table} (id);");
+    writer
+        .batch_execute(&format!("CREATE TABLE {table} (id integer); {ddl}"))
+        .await
+        .expect("create indexed fixture");
+    let tx = writer.transaction().await.expect("open writer");
+    tx.execute(&format!("INSERT INTO {table} VALUES (1)"), &[])
+        .await
+        .expect("hold RowExclusiveLock");
+    let pool = lore_postgres::pool::build_pool(&url, 1, &TlsConfig::default()).expect("pool");
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        lore_postgres::pool::ensure_schema_online(&pool, &ddl),
+    )
+    .await
+    .expect("existing index must not wait for a writer")
+    .expect("existing valid index accepted");
+    tx.commit().await.expect("commit writer");
+    writer
+        .batch_execute(&format!("DROP TABLE {table}"))
+        .await
+        .expect("remove owned fixture");
+}
+
+#[tokio::test]
+#[ignore = "requires owned live Postgres; online bootstrap invalid index"]
+async fn online_bootstrap_rejects_a_failed_concurrent_index() {
+    let url = pg_url().expect("LORE_TEST_PG_URL is required");
+    let client = bounded_receipt_client(&url).await;
+    let table = format!("receipt_bootstrap_invalid_{:016x}", rand::random::<u64>());
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (id integer); INSERT INTO {table} VALUES (1), (1)"
+        ))
+        .await
+        .expect("create duplicate data");
+    let failed_build = client
+        .batch_execute(&format!(
+            "CREATE UNIQUE INDEX CONCURRENTLY {table}_idx ON {table} (id)"
+        ))
+        .await
+        .expect_err("duplicate values must leave a failed concurrent index");
+    assert_eq!(
+        failed_build.code(),
+        Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+    );
+    let valid: bool = client
+        .query_one(
+            "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+            &[&format!("{table}_idx")],
+        )
+        .await
+        .expect("invalid index must actually exist")
+        .get(0);
+    assert!(!valid);
+    let pool = lore_postgres::pool::build_pool(&url, 1, &TlsConfig::default()).expect("pool");
+    let error = lore_postgres::pool::ensure_schema_online(
+        &pool,
+        &format!("CREATE UNIQUE INDEX IF NOT EXISTS {table}_idx ON {table} (id);"),
+    )
+    .await
+    .expect_err("invalid index must refuse startup");
+    assert!(error.contains("invalid"), "wrong refusal: {error}");
+    client
+        .batch_execute(&format!("DROP TABLE {table}"))
+        .await
+        .expect("remove owned fixture");
+}
+
+#[tokio::test]
+#[ignore = "requires owned live Postgres; online bootstrap index safety"]
+async fn online_bootstrap_refuses_missing_index_on_populated_table() {
+    let url = pg_url().expect("LORE_TEST_PG_URL is required");
+    let client = bounded_receipt_client(&url).await;
+    let table = format!("receipt_bootstrap_populated_{:016x}", rand::random::<u64>());
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (id integer); INSERT INTO {table} VALUES (1)"
+        ))
+        .await
+        .expect("create populated fixture");
+    let pool = lore_postgres::pool::build_pool(&url, 1, &TlsConfig::default()).expect("pool");
+    let error = lore_postgres::pool::ensure_schema_online(
+        &pool,
+        &format!("CREATE INDEX IF NOT EXISTS {table}_idx ON {table} (id);"),
+    )
+    .await
+    .expect_err("populated index requires out-of-band build");
+    assert!(
+        error.contains("out-of-band concurrent index build"),
+        "wrong refusal: {error}"
+    );
+    let absent: bool = client
+        .query_one("SELECT to_regclass($1) IS NULL", &[&format!("{table}_idx")])
+        .await
+        .expect("index absence")
+        .get(0);
+    assert!(absent, "refusal must not build the index");
+    client
+        .batch_execute(&format!("DROP TABLE {table}"))
+        .await
+        .expect("remove owned fixture");
+}
+
+#[tokio::test]
+#[ignore = "requires owned live Postgres; online bootstrap SQL splitting"]
+async fn online_bootstrap_preserves_quoted_semicolons_and_dollar_quoted_blocks() {
+    let url = pg_url().expect("LORE_TEST_PG_URL is required");
+    let client = bounded_receipt_client(&url).await;
+    let table = format!("receipt_bootstrap_quotes_{:016x}", rand::random::<u64>());
+    let pool = lore_postgres::pool::build_pool(&url, 1, &TlsConfig::default()).expect("pool");
+    let ddl = format!(
+        r#"
+        -- An outside comment; must not split the next statement.
+        CREATE TABLE IF NOT EXISTS {table} (id integer, label text DEFAULT 'it''s; -- literal');
+        DO $bootstrap$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '{table}_positive') THEN
+                ALTER TABLE {table} ADD CONSTRAINT {table}_positive CHECK (id > 0);
+            END IF;
+        END
+        $bootstrap$;
+    "#
+    );
+    for _ in 0..2 {
+        lore_postgres::pool::ensure_schema_online(&pool, &ddl)
+            .await
+            .expect("SQL splitter and guarded replay");
+    }
+    client
+        .execute(&format!("INSERT INTO {table} (id) VALUES (1)"), &[])
+        .await
+        .expect("default insert");
+    let label: String = client
+        .query_one(&format!("SELECT label FROM {table}"), &[])
+        .await
+        .expect("literal readback")
+        .get(0);
+    assert_eq!(label, "it's; -- literal");
+    let rejected = client
+        .execute(&format!("INSERT INTO {table} (id) VALUES (0)"), &[])
+        .await
+        .expect_err("DO constraint must execute");
+    assert_eq!(
+        rejected.code(),
+        Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION)
+    );
+    client
+        .batch_execute(&format!("DROP TABLE {table}"))
+        .await
+        .expect("remove owned fixture");
+}
+
+#[tokio::test]
+#[ignore = "requires owned live Postgres; online bootstrap seed replay"]
+async fn online_bootstrap_seed_replay_preserves_advanced_counters() {
+    let url = pg_url().expect("LORE_TEST_PG_URL is required");
+    let client = bounded_receipt_client(&url).await;
+    let table = format!("receipt_bootstrap_seed_{:016x}", rand::random::<u64>());
+    let pool = lore_postgres::pool::build_pool(&url, 1, &TlsConfig::default()).expect("pool");
+    let ddl = format!(
+        "CREATE TABLE IF NOT EXISTS {table} (id integer PRIMARY KEY, counter bigint); \
+        INSERT INTO {table} (id, counter) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;"
+    );
+    lore_postgres::pool::ensure_schema_online(&pool, &ddl)
+        .await
+        .expect("seed singleton");
+    assert_eq!(
+        client
+            .execute(
+                &format!("UPDATE {table} SET counter = 42 WHERE id = 1"),
+                &[]
+            )
+            .await
+            .expect("advance seeded counter"),
+        1
+    );
+    lore_postgres::pool::ensure_schema_online(&pool, &ddl)
+        .await
+        .expect("replay seed");
+    assert_eq!(
+        client
+            .query_one(&format!("SELECT counter FROM {table} WHERE id = 1"), &[])
+            .await
+            .expect("preserved counter")
+            .get::<_, i64>(0),
+        42
+    );
+    client
+        .batch_execute(&format!("DROP TABLE {table}"))
+        .await
+        .expect("remove owned fixture");
+}
+
+#[tokio::test]
+#[ignore = "requires owned live Postgres; online bootstrap ALTER clauses"]
+async fn online_bootstrap_rejects_mixed_alter_but_preserves_nested_and_quoted_commas() {
+    let url = pg_url().expect("LORE_TEST_PG_URL is required");
+    let client = bounded_receipt_client(&url).await;
+    let table = format!("receipt_bootstrap_alter_{:016x}", rand::random::<u64>());
+    client
+        .batch_execute(&format!("CREATE TABLE {table} (x integer, y integer)"))
+        .await
+        .expect("create existing-column fixture");
+    let pool = lore_postgres::pool::build_pool(&url, 1, &TlsConfig::default()).expect("pool");
+    let unsupported = format!(
+        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS x integer, ALTER COLUMN y SET NOT NULL;"
+    );
+    let error = lore_postgres::pool::ensure_schema_online(&pool, &unsupported)
+        .await
+        .expect_err("existing x must not mask the unsupported y alteration");
+    assert!(error.contains("unsupported"), "wrong refusal: {error}");
+    let mandatory: bool = client.query_one(
+        "SELECT attnotnull FROM pg_attribute WHERE attrelid = to_regclass($1) AND attname = 'y'",
+        &[&table],
+    ).await.expect("unchanged nullable column").get(0);
+    assert!(
+        !mandatory,
+        "unsupported mixed ALTER must not partly execute"
+    );
+    let supported = format!(
+        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS amount numeric(20,0), ADD COLUMN IF NOT EXISTS label text DEFAULT 'a,b''c';"
+    );
+    for _ in 0..2 {
+        lore_postgres::pool::ensure_schema_online(&pool, &supported)
+            .await
+            .expect("top-level ADD clauses with nested commas");
+    }
+    client
+        .execute(
+            &format!("INSERT INTO {table} (amount) VALUES (12345678901234567890)"),
+            &[],
+        )
+        .await
+        .expect("numeric precision and quoted default");
+    let row = client
+        .query_one(&format!("SELECT amount::text, label FROM {table}"), &[])
+        .await
+        .expect("DDL behavior readback");
+    assert_eq!(row.get::<_, String>(0), "12345678901234567890");
+    assert_eq!(row.get::<_, String>(1), "a,b'c");
+    client
+        .batch_execute(&format!("DROP TABLE {table}"))
+        .await
+        .expect("remove owned fixture");
+}
+
+#[tokio::test]
+#[ignore = "requires owned live Postgres; online bootstrap atomic index check"]
+async fn online_bootstrap_missing_index_refuses_an_uncommitted_writer_without_waiting() {
+    let url = pg_url().expect("LORE_TEST_PG_URL is required");
+    let mut writer = bounded_receipt_client(&url).await;
+    let observer = bounded_receipt_client(&url).await;
+    let table = format!("receipt_bootstrap_race_{:016x}", rand::random::<u64>());
+    writer
+        .batch_execute(&format!("CREATE TABLE {table} (id integer)"))
+        .await
+        .expect("create empty index fixture");
+    let tx = writer.transaction().await.expect("in-progress writer");
+    tx.execute(&format!("INSERT INTO {table} VALUES (1)"), &[])
+        .await
+        .expect("hold RowExclusive with invisible row");
+    let visible: i64 = observer
+        .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+        .await
+        .expect("pre-lock emptiness check sees no committed rows")
+        .get(0);
+    assert_eq!(visible, 0);
+    let pool = lore_postgres::pool::build_pool(&url, 1, &TlsConfig::default()).expect("pool");
+    let ddl = format!("CREATE INDEX IF NOT EXISTS {table}_idx ON {table} (id);");
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        lore_postgres::pool::ensure_schema_online(&pool, &ddl),
+    )
+    .await
+    .expect("index bootstrap cannot wait indefinitely on invisible writer")
+    .expect_err("NOWAIT must refuse while writer remains open");
+    println!(
+        "index NOWAIT refusal with uncommitted writer held: {:?}: {error}",
+        started.elapsed()
+    );
+    assert!(
+        error.contains("could not obtain lock"),
+        "must refuse NOWAIT, not wait until lock_timeout: {error}"
+    );
+    let absent: bool = observer
+        .query_one("SELECT to_regclass($1) IS NULL", &[&format!("{table}_idx")])
+        .await
+        .expect("no index published after NOWAIT refusal")
+        .get(0);
+    assert!(absent);
+    tx.rollback()
+        .await
+        .expect("release writer without publishing row");
+    lore_postgres::pool::ensure_schema_online(&pool, &ddl)
+        .await
+        .expect("now-empty table can build index");
+    let valid: bool = observer
+        .query_one(
+            "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+            &[&format!("{table}_idx")],
+        )
+        .await
+        .expect("successful empty-table index")
+        .get(0);
+    assert!(valid);
+    observer
+        .batch_execute(&format!("DROP TABLE {table}"))
+        .await
+        .expect("remove owned fixture");
+}
+
 async fn pg_client(url: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
         .await

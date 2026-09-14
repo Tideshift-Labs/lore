@@ -104,12 +104,11 @@ impl PostgresDomainStore {
         tls: &crate::pool::TlsConfig,
     ) -> Result<Self, String> {
         let pool = crate::pool::build_pool(url, pool_max, tls)?;
-        // One batch per logical schema so a failure names which block broke,
-        // but all three under the same `SCHEMA_LOCK_KEY` so concurrent replica
-        // boots cannot race the `IF NOT EXISTS` DDL.
-        crate::pool::ensure_schema(&pool, schema::SCHEMA).await?;
-        crate::pool::ensure_schema(&pool, MEDIATED_SCHEMA).await?;
-        crate::pool::ensure_schema(&pool, OUTBOX_SCHEMA).await?;
+        // Skip completed DDL and commit each missing statement before the next
+        // one. Replica joins must not retain schema locks across live writes.
+        crate::pool::ensure_schema_online(&pool, schema::SCHEMA).await?;
+        crate::pool::ensure_schema_online(&pool, MEDIATED_SCHEMA).await?;
+        crate::pool::ensure_schema_online(&pool, OUTBOX_SCHEMA).await?;
 
         let identity = read_database_identity(&pool)
             .await

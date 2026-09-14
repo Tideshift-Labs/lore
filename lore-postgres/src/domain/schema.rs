@@ -4,12 +4,13 @@
 //! generation, tombstone, and operation-receipt rows (WP-116 Phase 2).
 //!
 //! **Two declarations, one shape.** As with the three CR-007 stores, this
-//! `SCHEMA` const is applied at boot by [`crate::pool::ensure_schema`] under the
-//! shared advisory lock, and `migrations/0001_init.sql` carries a byte-equivalent
-//! copy for out-of-band provisioning. A change here is two edits, in one commit.
+//! `SCHEMA` is applied at boot by [`crate::pool::ensure_schema_online`], which
+//! skips completed DDL and commits each missing statement under the shared
+//! advisory lock. `migrations/0001_init.sql` carries the same declarations for
+//! out-of-band provisioning. Schema-shape changes must update both declarations.
 //!
-//! **No index here may block a populated cell.** `ensure_schema` runs its DDL
-//! inside a transaction and therefore cannot build `CONCURRENTLY`. Every table
+//! **No index here may block a populated cell.** Online bootstrap refuses to
+//! build a missing index on a populated table. Every table
 //! below is created empty by this WP, so its indexes are created with it and cost
 //! nothing. Any *later* index on a table that has accumulated rows follows the
 //! `lore-postgres` out-of-band `CONCURRENTLY` procedure and validates
