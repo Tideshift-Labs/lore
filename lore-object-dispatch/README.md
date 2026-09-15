@@ -234,9 +234,10 @@ resolver cannot repeat that three-way agreement check. Charge-time cell scope is
 
 `PostgresProviderChargeAuthority` accepts a preconnected dispatch-runtime client. Composition draws
 that client from the one dispatch pool shared by the replica's request path and future drain tasks.
-It does not create a pool per limiter or worker. The hard process inventory is the immutable,
-mutable, lock, domain, and dispatch pools. Every maximum is positive and their checked sum cannot
-exceed 20.
+It does not create a pool per limiter or worker. The hard process inventory is six pools: immutable,
+mutable, lock, domain, and dispatch, plus CR-032's relay pool when `[outbox_relay]` is enabled.
+Every maximum is positive except the relay's, which is zero exactly when the relay is disabled, and
+their checked sum cannot exceed 20.
 Provider-attempt deadlines are bounded to five minutes after the attempt UUIDv7 timestamp and to
 five minutes after the database admission clock. A grant must report a database time strictly
 before that deadline. `ATTEMPT_ALREADY_CHARGED` proves a prior durable grant and never increments
@@ -327,8 +328,12 @@ calls. `DispatchRuntimeClient` refuses a pool that is not the runtime identity a
 is not its own role, so a maintenance credential cannot reach a runtime mutation by mistake.
 
 **The connection budget, stated.** `DispatchConnectionBudget` checks the resolved immutable,
-mutable, lock, domain, and dispatch pool maxima before any dispatch connection. Each must be
-positive. Checked addition must succeed and the sum must not exceed the hard process cap of 20.
+mutable, lock, domain, dispatch, and relay pool maxima before any dispatch connection. Every pool
+but relay must be positive; `relay_pool_max` is the one component that may be zero, and it is zero
+exactly when `[outbox_relay]` is disabled, so `DISPATCH_PROCESS_CONNECTION_LIMIT` (still 20) is
+checked against a process inventory that is only built at all when the fragment provider is
+enabled — a relay-enabled, provider-disabled cell is not held to this ceiling. Checked addition
+must succeed and the sum must not exceed the hard process cap of 20.
 The configured dispatch maximum must equal the dispatch pool's own maximum. The sizing rule is
 `lorehub/docs/learnings/do-managed-pg-connection-budget.md`: an instance sized for the app pools
 alone rather than the full consumer set was exhausted at `max_connections = 25`, and the exhaustion
