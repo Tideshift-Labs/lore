@@ -237,6 +237,12 @@ pub(crate) const SWEEP_UNAVAILABLE: &str = "pool_unavailable";
 
 /// The bounded prune-table label set.
 pub(crate) const PRUNED_EVENTS: &str = "events";
+/// Consumer-safe rows reaped at a placement the cell has left, proven by the
+/// cleared reset chain rather than by the current frontier. Separate from
+/// `events` because the two have different proofs and different blockers: a
+/// cell with a stuck reset reaps nothing here while `events` keeps draining
+/// normally, and one counter would hide that.
+pub(crate) const PRUNED_SUPERSEDED: &str = "superseded_events";
 pub(crate) const PRUNED_DEAD_LETTERS: &str = "dead_letters";
 
 /// The bounded stream-reset outcome label set. Every value the reset service
@@ -406,6 +412,7 @@ mod tests {
             BLOCK_MEMBER_NOT_READY,
             BLOCK_MISSING_CHECKPOINT,
             PRUNED_EVENTS,
+            PRUNED_SUPERSEDED,
             PRUNED_DEAD_LETTERS,
             RESET_ACCEPTED,
             RESET_REPLAYED,

@@ -37,6 +37,7 @@ use std::sync::Arc;
 
 use lore_postgres::domain::outbox::prune_consumer_safe;
 use lore_postgres::domain::outbox::prune_dead_letters;
+use lore_postgres::domain::outbox::prune_superseded_epochs;
 use lore_postgres::pool::Pool;
 use tokio::sync::watch;
 use tracing::debug;
@@ -134,6 +135,15 @@ impl RetentionTask {
         let mut reaped = 0_u64;
         let mut blocked: Option<&'static str> = None;
         let mut drained = false;
+        // `deleted` is a `u64` and the configured batch an `i64`; convert once
+        // here rather than at each of the two comparison sites. The fallback is
+        // unreachable — `RetentionConfig` parsing refuses a `batch_rows`
+        // outside `1..=MAX_PRUNE_BATCH`, and the store refuses one below 1
+        // again — and it is deliberately the direction that reaps MORE rather
+        // than fewer: at 0 no batch ever compares short, so each loop runs its
+        // full `batches_per_sweep` instead of stopping early and leaving
+        // reapable rows behind.
+        let batch_rows = u64::try_from(self.retention.batch_rows).unwrap_or(0);
         for batch in 0..self.retention.batches_per_sweep {
             if *shutdown.borrow() {
                 debug!(
@@ -154,13 +164,20 @@ impl RetentionTask {
             {
                 Ok(outcome) => {
                     reaped = reaped.saturating_add(outcome.deleted);
+                    // First observation wins, for the reason spelled out at the
+                    // superseded loop's matching line below.
                     if let Some(block) = outcome.block.as_ref() {
-                        blocked = Some(block_label(block));
+                        blocked.get_or_insert(block_label(block));
                     }
-                    // A blocked or empty batch means there is nothing more to do
-                    // this sweep, and continuing would re-prove the same vector
-                    // for nothing.
-                    if outcome.deleted == 0 {
+                    // A short batch, not only an empty one, ends the sweep.
+                    // Deleting fewer rows than asked for means the candidate
+                    // scan reached the end of the reapable set, so the next
+                    // call would re-prove the same vector and then walk the
+                    // whole retained tail of `lore_outbox_events_safe_retention`
+                    // to find nothing — measured at 175 ms over 198,720 rows on
+                    // a 300k-row table, once per sweep, purely to learn that the
+                    // previous batch had already finished.
+                    if outcome.deleted < batch_rows {
                         break;
                     }
                 }
@@ -182,6 +199,80 @@ impl RetentionTask {
                 cell_id = %self.cell_id,
                 reaped,
                 "reaped consumer-safe outbox rows past the retention floor"
+            );
+        }
+
+        // Rows left behind at a placement the cell has reset away from, reaped
+        // under their own proof: an unbroken chain of `cleared` reset
+        // transitions from that placement to the current one. This runs after
+        // the current-placement batches, not before, because it is the rarer
+        // case by far — most cells never reset — and because a cell that has
+        // just reset wants its current backlog drained first.
+        //
+        // Its own bounded batch loop for the same reason the first one has one:
+        // a cell recovering from a broker-volume loss can have a whole epoch's
+        // history to reap, and one batch a sweep would take days to clear it.
+        // The shutdown check is between every transaction, as above.
+        let mut superseded = 0_u64;
+        // How many superseded placements the last proven walk admitted. Logged
+        // rather than only counted: "reaped 900 rows" and "reaped 900 rows
+        // across 3 placements" are different operational facts, and the second
+        // is the one that says how far back the cell's reset history goes.
+        let mut placements = 0_u64;
+        for batch in 0..self.retention.batches_per_sweep {
+            if *shutdown.borrow() {
+                debug!(
+                    cell_id = %self.cell_id,
+                    completed_batches = batch,
+                    "the superseded-epoch sweep stopped early for a drain"
+                );
+                drained = true;
+                break;
+            }
+            match prune_superseded_epochs(
+                &mut client,
+                &self.cell_id,
+                self.retention.consumer_safe_age,
+                self.retention.batch_rows,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    superseded = superseded.saturating_add(outcome.deleted);
+                    placements = outcome.superseded_placements;
+                    // `get_or_insert`, not an assignment: both loops derive
+                    // their block from the same `prove_safe_vector`, so the
+                    // second one's label is at best a restatement of the
+                    // first's — and at worst a fence that appeared mid-sweep,
+                    // which would relabel a sweep that had already reaped rows
+                    // under a verdict that was not true when it reaped them.
+                    // First observation wins.
+                    if let Some(block) = outcome.block.as_ref() {
+                        blocked.get_or_insert(block_label(block));
+                    }
+                    if outcome.deleted < batch_rows {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        %error,
+                        cell_id = %self.cell_id,
+                        "superseded-epoch pruning failed this sweep"
+                    );
+                    metrics::record_prune_sweep(metrics::SWEEP_FAILED);
+                    self.readiness.record_retention_failure();
+                    return;
+                }
+            }
+        }
+        if superseded > 0 {
+            metrics::record_pruned_rows(metrics::PRUNED_SUPERSEDED, superseded);
+            info!(
+                cell_id = %self.cell_id,
+                superseded,
+                placements,
+                "reaped consumer-safe outbox rows left at a superseded placement"
             );
         }
 
@@ -235,8 +326,15 @@ impl RetentionTask {
             (false, Some(_)) => metrics::SWEEP_BLOCKED,
             (false, None) => metrics::SWEEP_COMPLETED,
         });
-        self.readiness
-            .record_retention_sweep(reaped, dead_letters, blocked);
+        // The facet already folds dead letters into one total, so the superseded
+        // rows join it there too: the facet answers "is retention moving", and
+        // splitting the answer three ways would not make it a better answer.
+        // The two metric labels keep the reasons separable.
+        self.readiness.record_retention_sweep(
+            reaped.saturating_add(superseded),
+            dead_letters,
+            blocked,
+        );
     }
 }
 

@@ -27,7 +27,8 @@
 //!   writer of that state, and it never infers it from a broker
 //!   acknowledgement.
 //! * [`prune`] — Step C's bounded retention pruning, which re-proves the
-//!   checkpoint vector rather than trusting the state column.
+//!   checkpoint vector rather than trusting the state column, plus Phase 8's
+//!   superseded-epoch reaper over the cleared reset chain.
 //! * [`reset`] — Step C's durable stream-reset receipt: evidence, stored ack,
 //!   fence, retirement.
 //! * [`cutover`] — Step C's cutover marker, the key to Step B's fail-closed
@@ -89,8 +90,10 @@ pub use operator::OperatorStatus;
 pub use operator::ReplayOutcome;
 pub use operator::RequiredMember;
 pub use prune::PruneOutcome;
+pub use prune::SupersededPruneOutcome;
 pub use prune::prune_consumer_safe;
 pub use prune::prune_dead_letters;
+pub use prune::prune_superseded_epochs;
 pub use relay::AdmissionLimits;
 pub use relay::AdmissionRejection;
 pub use relay::AdmissionVerdict;
