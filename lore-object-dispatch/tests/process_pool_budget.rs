@@ -50,10 +50,13 @@ fn real_store_defaults_are_not_silently_admitted_with_an_enabled_dispatch_pool()
 
 #[test]
 fn every_zero_overflow_and_above_limit_inventory_fails_closed() {
-    // Only the first five. The relay's maximum is legitimately zero whenever
-    // `[outbox_relay]` is disabled, so refusing a zero there would refuse every
-    // cell running the relay off -- which is every cell today.
-    for index in 0..5 {
+    // Only the three pools a Postgres-mode process always opens: immutable,
+    // mutable, and the domain pool sized from the mutable store's own config.
+    // Lock, dispatch, and relay are each legitimately zero -- zero means this
+    // process does not open that pool, which is a non-Postgres lock store, a
+    // provider-disabled cell, and a relay-disabled one respectively. Refusing a
+    // zero there would refuse configurations that hold no such connections.
+    for index in [0, 1, 3] {
         let mut values = [1, 1, 1, 1, 1, 1];
         values[index] = 0;
         assert_invalid(
@@ -62,9 +65,21 @@ fn every_zero_overflow_and_above_limit_inventory_fails_closed() {
         );
     }
     assert!(
+        DispatchConnectionBudget::new(1, 1, 0, 1, 1, 1).is_ok(),
+        "a zero lock pool is a lock store outside Postgres mode, not an undeclared pool"
+    );
+    assert!(
         DispatchConnectionBudget::new(1, 1, 1, 1, 1, 0).is_ok(),
         "a zero relay pool is a disabled relay, not an undeclared pool"
     );
+    assert!(
+        DispatchConnectionBudget::new(1, 1, 1, 1, 0, 1).is_ok(),
+        "a zero dispatch pool is a cell with no fragment provider, not an undeclared pool"
+    );
+    let neither = DispatchConnectionBudget::new(5, 5, 5, 4, 0, 0)
+        .expect("a provider-disabled, relay-disabled cell is still a legal inventory");
+    assert!(!neither.opens_dispatch_pool());
+    assert_eq!(neither.connections_per_replica(), 19);
     assert_invalid(
         [u32::MAX, 1, 1, 1, 1, 0],
         "process pool inventory overflows the connection count",

@@ -1703,6 +1703,20 @@ pub struct ValidatedFragmentProcessPoolInventory {
     budget: DispatchConnectionBudget,
 }
 
+impl ValidatedFragmentProcessPoolInventory {
+    /// The checked budget behind this inventory.
+    ///
+    /// Read-only, and deliberately not a way back to a pool: the budget is a
+    /// `Copy` arithmetic record with no handle in it. Server composition uses it
+    /// to ask `opens_dispatch_pool` when choosing its boot order, rather than
+    /// re-deriving that from a raw field, and doing so costs the seam nothing —
+    /// a dispatch client still cannot be constructed here.
+    #[must_use]
+    pub const fn budget(&self) -> DispatchConnectionBudget {
+        self.budget
+    }
+}
+
 /// The one composition door for attestation, charge authority, and provider
 /// transport. It retains one Arc-backed pool through the typed client and
 /// charge authority; no second pool or raw connection is opened.

@@ -230,9 +230,7 @@ fn whole_server_validates_the_exact_six_pool_inventory_before_any_boot_io() {
     for invalid in [
         [0, 1, 1, 1, 1, 0],
         [1, 0, 1, 1, 1, 0],
-        [1, 1, 0, 1, 1, 0],
         [1, 1, 1, 0, 1, 0],
-        [1, 1, 1, 1, 0, 0],
         [u32::MAX, 1, 1, 1, 1, 0],
         [4, 4, 4, 4, 5, 0],
     ] {
@@ -241,6 +239,22 @@ fn whole_server_validates_the_exact_six_pool_inventory_before_any_boot_io() {
             "whole-server inventory {invalid:?} must fail before boot I/O"
         );
     }
+
+    // A Postgres-mode cell with neither a fragment provider nor the relay is a
+    // legal inventory, not an under-declared one — and it is now built and
+    // checked, where it used to escape the ceiling entirely.
+    assert!(
+        valid([1, 1, 1, 1, 0, 0]).is_ok(),
+        "a provider-disabled, relay-disabled cell must still declare a valid inventory"
+    );
+    assert!(
+        valid([1, 1, 0, 1, 1, 0]).is_ok(),
+        "a lock store outside Postgres mode declares a zero lock pool, not an invalid one"
+    );
+    assert!(
+        valid([5, 5, 5, 4, 0, 5]).is_err(),
+        "24 connections must fail before boot I/O on a provider-disabled cell too"
+    );
 }
 
 #[test]
@@ -267,12 +281,15 @@ fn actual_five_pool_maxima_flow_from_their_own_resolved_configs() {
     for required in [
         "let immutable = parse_config(PLUGIN_NAME, immutable_config)?",
         "let mutable = parse_config(PLUGIN_NAME, mutable_config)?",
-        "let lock = parse_config(PLUGIN_NAME, lock_config)?",
+        "Some(config) => parse_config(PLUGIN_NAME, config)?.pool_max",
         "immutable_pool_max: immutable.pool_max",
         "mutable_pool_max: mutable.pool_max",
-        "lock_pool_max: lock.pool_max",
+        "lock_pool_max,",
         "domain_pool_max: mutable.domain_pool_max",
-        "dispatch_pool_max: fragment_provider.dispatch_pool_max",
+        // Zero when no provider is configured, so a provider-disabled cell is
+        // still held to the ceiling. The mapping is still exact and still
+        // never inferred from another pool.
+        ".map_or(0, |fragment_provider| fragment_provider.dispatch_pool_max)",
     ] {
         assert!(
             inventory.contains(required),
@@ -285,7 +302,7 @@ fn actual_five_pool_maxima_flow_from_their_own_resolved_configs() {
         "fn postgres_fragment_process_pool_inventory(",
         "async fn configure_mutable_store_via_plugin(",
     );
-    assert!(server_inventory.contains("settings.mutable_store.mode != \"postgres\""));
+    assert!(server_inventory.contains("settings.mutable_store.mode == \"postgres\""));
     assert!(server_inventory.contains("Some(\"postgres\")"));
     for store_type in ["immutable_store", "mutable_store", "lock_store"] {
         assert!(server_inventory.contains(store_type));

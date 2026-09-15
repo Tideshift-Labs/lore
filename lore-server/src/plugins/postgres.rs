@@ -761,30 +761,44 @@ pub(crate) fn fragment_provider_enabled(config: &toml::Value) -> Result<bool, Pl
 /// `RELAY_POOL_MAX` connections when it runs and none at all when it does not,
 /// and reserving for a pool the process never opens would refuse cells that are
 /// genuinely inside the budget.
+/// The inventory is built for every Postgres-mode process, not only one with a
+/// fragment provider. The four store and domain pools open either way, and so
+/// does CR-032's relay pool when `[outbox_relay]` is enabled, so a
+/// provider-disabled cell holds real connections against the same ceiling. It
+/// previously escaped the ceiling entirely, because the inventory that carries
+/// the arithmetic was only built on the provider path.
+///
+/// `dispatch_pool_max` is therefore zero when no provider is configured, with
+/// the same meaning `relay_pool_max` zero has: this process does not open that
+/// pool. It is never inferred — an enabled provider must declare its own.
 pub(crate) fn fragment_process_pool_inventory(
     immutable_config: &toml::Value,
     mutable_config: &toml::Value,
-    lock_config: &toml::Value,
+    lock_config: Option<&toml::Value>,
     relay_enabled: bool,
-) -> Result<Option<FragmentProcessPoolInventory>, PluginError> {
+) -> Result<FragmentProcessPoolInventory, PluginError> {
     let immutable = parse_config(PLUGIN_NAME, immutable_config)?;
-    let Some(fragment_provider) = enabled_fragment_provider_config(PLUGIN_NAME, &immutable)? else {
-        return Ok(None);
-    };
     let mutable = parse_config(PLUGIN_NAME, mutable_config)?;
-    let lock = parse_config(PLUGIN_NAME, lock_config)?;
-    Ok(Some(FragmentProcessPoolInventory {
+    // `None` is a lock store that is not in Postgres mode: the pool is absent
+    // rather than undeclared, the same way an absent provider or relay is.
+    let lock_pool_max = match lock_config {
+        Some(config) => parse_config(PLUGIN_NAME, config)?.pool_max,
+        None => 0,
+    };
+    let dispatch_pool_max = enabled_fragment_provider_config(PLUGIN_NAME, &immutable)?
+        .map_or(0, |fragment_provider| fragment_provider.dispatch_pool_max);
+    Ok(FragmentProcessPoolInventory {
         immutable_pool_max: immutable.pool_max,
         mutable_pool_max: mutable.pool_max,
-        lock_pool_max: lock.pool_max,
+        lock_pool_max,
         domain_pool_max: mutable.domain_pool_max,
-        dispatch_pool_max: fragment_provider.dispatch_pool_max,
+        dispatch_pool_max,
         relay_pool_max: if relay_enabled {
             crate::event_relay::RELAY_POOL_MAX
         } else {
             0
         },
-    }))
+    })
 }
 
 /// Build the Postgres TLS settings from config: read the optional CA PEM bundle
@@ -2179,9 +2193,8 @@ pool_max = 3
         )
         .expect("lock config");
 
-        let inventory = fragment_process_pool_inventory(&immutable, &mutable, &lock, false)
-            .expect("valid inventory")
-            .expect("enabled provider inventory");
+        let inventory = fragment_process_pool_inventory(&immutable, &mutable, Some(&lock), false)
+            .expect("valid inventory");
         assert_eq!(
             inventory,
             FragmentProcessPoolInventory {
@@ -2197,15 +2210,83 @@ pool_max = 3
         // The relay flag decides presence, not size. With `[outbox_relay]` on,
         // the same three store configurations must reserve CR-032's whole pool
         // and nothing else about the inventory may move.
-        let with_relay = fragment_process_pool_inventory(&immutable, &mutable, &lock, true)
-            .expect("valid inventory")
-            .expect("enabled provider inventory");
+        let with_relay = fragment_process_pool_inventory(&immutable, &mutable, Some(&lock), true)
+            .expect("valid inventory");
         assert_eq!(
             with_relay,
             FragmentProcessPoolInventory {
                 relay_pool_max: crate::event_relay::RELAY_POOL_MAX,
                 ..inventory
             }
+        );
+    }
+
+    /// The escape this closes: a cell with NO fragment provider still opens the
+    /// four store and domain pools, and CR-032's relay pool when the relay is
+    /// on. It used to get no inventory at all, so nothing evaluated the
+    /// ceiling for it. Now it gets one whose dispatch component is zero.
+    #[test]
+    fn a_provider_disabled_cell_still_declares_an_inventory_and_is_held_to_the_ceiling() {
+        let immutable: toml::Value = toml::from_str(
+            r#"
+url = "postgresql://immutable@db.example/cell"
+pool_max = 5
+"#,
+        )
+        .expect("immutable config");
+        let mutable: toml::Value = toml::from_str(
+            r#"
+url = "postgresql://mutable@db.example/cell"
+pool_max = 5
+domain_pool_max = 4
+"#,
+        )
+        .expect("mutable config");
+        let lock: toml::Value = toml::from_str(
+            r#"
+url = "postgresql://lock@db.example/cell"
+pool_max = 5
+"#,
+        )
+        .expect("lock config");
+
+        // Relay off: no dispatch pool, no relay pool, 19 connections. Inside
+        // the ceiling, and it validates.
+        let relay_off = fragment_process_pool_inventory(&immutable, &mutable, Some(&lock), false)
+            .expect("valid inventory");
+        assert_eq!(relay_off.dispatch_pool_max, 0);
+        assert_eq!(relay_off.relay_pool_max, 0);
+        let validated = relay_off.validate().expect("19 is inside the ceiling");
+        assert!(
+            !validated.budget().opens_dispatch_pool(),
+            "a provider-disabled cell must not look like one that opens a dispatch pool"
+        );
+        assert_eq!(validated.budget().connections_per_replica(), 19);
+
+        // Relay on: the same cell is 24 and must now refuse, which is exactly
+        // the staging shape and exactly what used to pass unevaluated.
+        let relay_on = fragment_process_pool_inventory(&immutable, &mutable, Some(&lock), true)
+            .expect("valid inventory");
+        assert_eq!(relay_on.relay_pool_max, crate::event_relay::RELAY_POOL_MAX);
+        assert!(
+            relay_on.validate().is_err(),
+            "24 connections must be refused on a provider-disabled cell too"
+        );
+
+        // A lock store that is not in Postgres mode opens no lock pool, so it
+        // is declared as zero rather than skipping the ceiling. Without this
+        // the same cell escaped at 10 + 10 + 4 + 5 = 29 against a limit of 20,
+        // which is the escape this closes wearing a different hat.
+        let no_lock_store = fragment_process_pool_inventory(&immutable, &mutable, None, true)
+            .expect("valid inventory");
+        assert_eq!(no_lock_store.lock_pool_max, 0);
+        assert_eq!(
+            no_lock_store
+                .validate()
+                .expect("5 + 5 + 4 + 5 is inside the ceiling")
+                .budget()
+                .connections_per_replica(),
+            19
         );
     }
 

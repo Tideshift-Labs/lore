@@ -2105,7 +2105,7 @@ mod active_active_two_process_tests {
         let safe_replicas = (budget / per_replica).floor() - 1.0;
         println!(
             "PHASE5 replica-arithmetic measured_peak_two_processes={peak_servers} \
-             measured_per_replica={per_replica} configured_per_replica=24 \
+             measured_per_replica={per_replica} staging_configured_per_replica=24 \
              max_connections={STAGING_MAX_CONNECTIONS} budget_at_70pct={budget} \
              safe_replicas_with_one_loss={safe_replicas}"
         );

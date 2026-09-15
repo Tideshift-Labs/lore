@@ -88,12 +88,24 @@ pub struct DispatchConnectionBudget {
 impl DispatchConnectionBudget {
     /// Validate an exact process inventory before any dispatch pool or connection is constructed.
     ///
-    /// `relay_pool_max` is the one component that may be zero, and zero is a
-    /// statement rather than an omission: CR-032's relay pool is opened only
-    /// when `[outbox_relay]` is enabled, so a cell running the relay off opens
-    /// no such connections and must not reserve any. Every other pool is opened
-    /// unconditionally by a Postgres-mode process, so a zero there is a caller
-    /// that forgot to declare one.
+    /// Three components may be zero, and zero is a statement rather than an
+    /// omission: it means this process does not open that pool at all.
+    /// `dispatch_pool_max` is zero when no fragment provider is configured,
+    /// `relay_pool_max` when `[outbox_relay]` is disabled, and `lock_pool_max`
+    /// when the lock store is not in Postgres mode. None of those pools exists
+    /// on such a process, so reserving for one would refuse a configuration
+    /// that is genuinely inside the budget.
+    ///
+    /// The immutable, mutable, and domain pools may not be zero. A
+    /// Postgres-mode process opens all three unconditionally — the domain pool
+    /// is sized from the mutable store's own configuration — so a zero there is
+    /// a caller that forgot to declare one rather than a process that does
+    /// without it.
+    ///
+    /// A zero dispatch maximum cannot be turned into a pool by accident:
+    /// [`DispatchRuntimePool::new`] refuses a `pool_max` of zero and separately
+    /// refuses one that does not equal this declared maximum, so the two checks
+    /// together make a dispatch pool unconstructible under a zero budget.
     pub fn new(
         immutable_pool_max: u32,
         mutable_pool_max: u32,
@@ -102,15 +114,7 @@ impl DispatchConnectionBudget {
         dispatch_pool_max: u32,
         relay_pool_max: u32,
     ) -> Result<Self, DispatchPoolError> {
-        if [
-            immutable_pool_max,
-            mutable_pool_max,
-            lock_pool_max,
-            domain_pool_max,
-            dispatch_pool_max,
-        ]
-        .contains(&0)
-        {
+        if [immutable_pool_max, mutable_pool_max, domain_pool_max].contains(&0) {
             return Err(DispatchPoolError::InvalidConfiguration(
                 "every declared process pool maximum must be positive",
             ));
@@ -165,6 +169,17 @@ impl DispatchConnectionBudget {
     /// Zero when `[outbox_relay]` is disabled, which is the common case today.
     pub const fn relay_pool_max(self) -> u32 {
         self.relay_pool_max
+    }
+
+    /// Whether this inventory describes a process that opens a dispatch pool.
+    ///
+    /// A zero dispatch maximum is a Postgres-mode process with no fragment
+    /// provider configured. It still holds the four store and domain pools, and
+    /// possibly the relay's, so it is still subject to the ceiling — which is
+    /// the whole reason the inventory is built for it.
+    #[must_use]
+    pub const fn opens_dispatch_pool(self) -> bool {
+        self.dispatch_pool_max > 0
     }
 
     /// Total PostgreSQL connections one loreserver process may hold against the cell database.
@@ -654,9 +669,9 @@ mod tests {
         assert_eq!(budget.connections_per_replica(), 20);
     }
 
-    /// The relay's maximum is the one component that may be zero, because the
-    /// relay pool is opened only when `[outbox_relay]` is enabled. Zero must
-    /// therefore reserve nothing rather than be refused as an undeclared pool.
+    /// Dispatch and relay may be zero, because each pool is opened only on a
+    /// cell configured for it. Zero must reserve nothing rather than be refused
+    /// as an undeclared pool.
     #[test]
     fn a_zero_relay_pool_is_accepted_and_reserves_nothing() {
         let without =
@@ -664,19 +679,29 @@ mod tests {
         assert_eq!(without.relay_pool_max(), 0);
         assert_eq!(without.connections_per_replica(), 20);
 
+        // A provider-disabled cell: no dispatch pool either, and still legal.
+        let neither = DispatchConnectionBudget::new(5, 5, 4, 2, 0, 0)
+            .expect("provider-disabled and relay-disabled budget");
+        assert!(!neither.opens_dispatch_pool());
+        assert_eq!(neither.connections_per_replica(), 16);
+
+        // A lock store outside Postgres mode: no lock pool, and still legal.
+        assert!(
+            DispatchConnectionBudget::new(5, 5, 0, 4, 1, 5).is_ok(),
+            "a zero lock pool is a non-Postgres lock store, not an undeclared pool"
+        );
+
         for zero_elsewhere in [
             DispatchConnectionBudget::new(0, 5, 5, 4, 1, 5),
             DispatchConnectionBudget::new(5, 0, 5, 4, 1, 5),
-            DispatchConnectionBudget::new(5, 5, 0, 4, 1, 5),
             DispatchConnectionBudget::new(5, 5, 5, 0, 1, 5),
-            DispatchConnectionBudget::new(5, 5, 5, 4, 0, 5),
         ] {
             assert_eq!(
                 zero_elsewhere.err(),
                 Some(DispatchPoolError::InvalidConfiguration(
                     "every declared process pool maximum must be positive"
                 )),
-                "only the relay pool may be zero"
+                "the three pools a Postgres-mode process always opens may not be zero"
             );
         }
     }

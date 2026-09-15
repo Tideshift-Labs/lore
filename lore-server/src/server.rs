@@ -1270,32 +1270,60 @@ fn postgres_fragment_process_pool_inventory(
         return Ok(None);
     }
     let immutable_config = resolved_postgres_store_config(settings, "immutable_store")?;
-    if !plugins::postgres::fragment_provider_enabled(&immutable_config)
-        .map_err(|error| anyhow!("Invalid Postgres immutable store configuration: {error}"))?
-    {
-        return Ok(None);
-    }
-    if settings.mutable_store.mode != "postgres" {
+    let provider_enabled = plugins::postgres::fragment_provider_enabled(&immutable_config)
+        .map_err(|error| anyhow!("Invalid Postgres immutable store configuration: {error}"))?;
+    let mutable_is_postgres = settings.mutable_store.mode == "postgres";
+    let lock_is_postgres = settings
+        .lock_store
+        .as_ref()
+        .map(|store| store.mode.as_str())
+        == Some("postgres");
+
+    // An enabled provider REQUIRES the full governed shape, and says so. This
+    // is unchanged: a misconfigured provider cell must fail loudly rather than
+    // fall through to a partial inventory.
+    if provider_enabled && !mutable_is_postgres {
         return Err(anyhow!(
             "enabled fragment_provider requires mutable_store.mode = 'postgres' so its actual pool maximum and lifecycle coordinator are available"
         ));
     }
-    if settings
-        .lock_store
-        .as_ref()
-        .map(|store| store.mode.as_str())
-        != Some("postgres")
-    {
+    if provider_enabled && !lock_is_postgres {
         return Err(anyhow!(
             "enabled fragment_provider requires lock_store.mode = 'postgres' so its actual pool maximum is available"
         ));
     }
+
+    // Without a provider the inventory is still built, because the four store
+    // and domain pools open regardless and CR-032's relay pool may join them.
+    // That is the escape this closes: the ceiling used to apply only on the
+    // provider path, so a relay-enabled provider-disabled cell held real
+    // connections against a limit nothing evaluated.
+    //
+    // A non-Postgres LOCK store is not a reason to skip the ceiling: the cell
+    // still opens its immutable, mutable, domain, and possibly relay pools, and
+    // 10 + 10 + 4 + 5 is 29 against a limit of 20. That pool is simply absent,
+    // which the inventory expresses as zero, exactly as it does for a missing
+    // dispatch or relay pool.
+    //
+    // A non-Postgres MUTABLE store is different and does bail. Its
+    // configuration is where `domain_pool_max` lives, so without it the
+    // inventory cannot be built at all rather than built with a hole; the relay
+    // also refuses to start against a non-Postgres mutable store, so no relay
+    // pool joins that shape either. That is a real remaining narrowing, stated
+    // rather than papered over.
+    if !mutable_is_postgres {
+        return Ok(None);
+    }
     let mutable_config = resolved_postgres_store_config(settings, "mutable_store")?;
-    let lock_config = resolved_postgres_store_config(settings, "lock_store")?;
+    let lock_config = if lock_is_postgres {
+        Some(resolved_postgres_store_config(settings, "lock_store")?)
+    } else {
+        None
+    };
     // `[outbox_relay]` is a top-level setting rather than a store's own, so the
-    // relay's pool cannot be discovered from the three store configurations
-    // above. Composition is the only place that knows both, which is why the
-    // flag is passed rather than read.
+    // relay's pool cannot be discovered from the store configurations above.
+    // Composition is the only place that knows both, which is why the flag is
+    // passed rather than read.
     let relay_enabled = settings
         .outbox_relay
         .as_ref()
@@ -1303,9 +1331,10 @@ fn postgres_fragment_process_pool_inventory(
     plugins::postgres::fragment_process_pool_inventory(
         &immutable_config,
         &mutable_config,
-        &lock_config,
+        lock_config.as_ref(),
         relay_enabled,
     )
+    .map(Some)
     .map_err(|error| anyhow!("Invalid Postgres process pool inventory: {error}"))
 }
 
@@ -2252,12 +2281,19 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // Only an enabled governed fragment route needs the lifecycle coordinator
     // before immutable-store construction. Absent and disabled configurations
     // preserve the legacy boot order exactly: immutable first, domain second.
+    // Validated for every Postgres-mode cell, so the ceiling applies to a
+    // provider-disabled one too. Only a cell whose checked budget actually
+    // carries a dispatch pool takes the provider boot order below, and that
+    // question is asked of the validated budget rather than re-derived from a
+    // raw field — one place decides what a zero dispatch maximum means.
     let fragment_process_pool_inventory = postgres_fragment_process_pool_inventory(&settings)?
         .map(lore_postgres::domain::fragments::FragmentProcessPoolInventory::validate)
         .transpose()
         .map_err(|error| anyhow!("Invalid Postgres process pool inventory: {error}"))?;
     let (immutable_store, cell_retention_handle, configured_domain) =
-        if let Some(process_pool_inventory) = fragment_process_pool_inventory {
+        if let Some(process_pool_inventory) = fragment_process_pool_inventory
+            .filter(|inventory| inventory.budget().opens_dispatch_pool())
+        {
             let configured_domain = crate::domain::configure_domain_context(&settings).await?;
             let coordinator = configured_domain
             .fragment_coordinator

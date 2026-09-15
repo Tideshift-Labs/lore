@@ -79,8 +79,18 @@ mode = "postgres"
 [lock_store]
 mode = "postgres"
 
+# Pool maxima are declared rather than defaulted, because every Postgres-mode
+# process is now held to `DISPATCH_PROCESS_CONNECTION_LIMIT` (20 connections)
+# whether or not a fragment provider is configured. The compiled-in defaults are
+# 10 per store plus a domain pool of 4, which is 34 before CR-032's relay pool
+# adds 5 — a cell that would refuse to boot. These four sum to 15, and to
+# exactly 20 with the relay enabled, so this fixture also exercises the
+# at-the-ceiling shape. WP-109 Phase 5 measured a peak of 10 connections per
+# replica under a 16-way burst, so 15 leaves the proof half again as much
+# capacity as it has ever been observed to use.
 [plugins.postgres.immutable_store]
 url = "{{PG_URL}}"
+pool_max = 4
 
 [plugins.postgres.immutable_store.object_store]
 bucket = "{{S3_BUCKET}}"
@@ -90,9 +100,12 @@ force_path_style = true
 
 [plugins.postgres.mutable_store]
 url = "{{PG_URL}}"
+pool_max = 4
+domain_pool_max = 4
 
 [plugins.postgres.lock_store]
 url = "{{PG_URL}}"
+pool_max = 3
 
 # Every store above is in postgres mode, so the local-store settings the
 # compiled-in defaults carry should never be reached. They are pinned to this
