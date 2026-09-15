@@ -48,6 +48,20 @@ Run only the named cases (the short letters, e.g. -Case a,b). Default: all.
 .PARAMETER PortBase
 First loopback port of the first case's five-port band. Each case takes ten.
 
+.PARAMETER LorehubRoot
+Where the sibling `lorehub` checkout is. Defaults to the sibling of this
+repository, which is right for an ordinary checkout and WRONG when the tests
+run from a `git worktree` placed outside the workspace — there the derived path
+points at a directory that does not exist, and the failure surfaces as a
+missing gateway certificate script rather than as a bad root. Phase 5 runs from
+a worktree pinned at an exact revision, which is why this is a parameter.
+
+.PARAMETER ServerBin
+An already-built release `loreserver` to use instead of building one. Supply it
+to measure a binary from a KNOWN revision when the working tree is dirty: WP-109
+evidence has to name an exact revision, and a tree carrying another lane's
+uncommitted changes cannot. Skips the build step entirely.
+
 .EXAMPLE
 pwsh lore-integration-tests/tests/run-active-active-two-process-live.ps1
 #>
@@ -63,7 +77,9 @@ param(
     [string]$PostgresHostPort = '11832',
     [string]$PostgresRole = 'lorehub',
     [string]$MinioEndpoint = 'http://127.0.0.1:9000',
-    [string]$NatsUrl = 'nats://127.0.0.1:4222'
+    [string]$NatsUrl = 'nats://127.0.0.1:4222',
+    [string]$LorehubRoot,
+    [string]$ServerBin
 )
 
 $ErrorActionPreference = 'Stop'
@@ -72,7 +88,11 @@ $ProgressPreference = 'SilentlyContinue'
 $crateRoot = Split-Path -Parent $PSScriptRoot
 $loreRoot = Split-Path -Parent $crateRoot
 $workspaceRoot = Split-Path -Parent $loreRoot
-$lorehubRoot = Join-Path $workspaceRoot 'lorehub'
+$lorehubRoot = if ($LorehubRoot) { $LorehubRoot } else { Join-Path $workspaceRoot 'lorehub' }
+if (-not (Test-Path (Join-Path $lorehubRoot 'apps/notification-gateway'))) {
+    throw "no lorehub checkout at '$lorehubRoot' (no apps/notification-gateway under it). " +
+    'Pass -LorehubRoot when running from a worktree outside the workspace.'
+}
 $gatewayRoot = Join-Path $lorehubRoot 'apps/notification-gateway'
 $fixtures = Join-Path $lorehubRoot 'docker/test-fixtures'
 
@@ -95,6 +115,11 @@ $caseCatalog = @(
     [pscustomobject]@{ Key = 'g'; Test = "$testPrefix::case_g_both_processes_report_their_event_plane_facets_at_rest" }
     [pscustomobject]@{ Key = 'h'; Test = "$testPrefix::case_h_a_lock_acquired_through_one_process_is_released_through_the_other_only_with_its_token" }
     [pscustomobject]@{ Key = 'i'; Test = "$testPrefix::case_i_a_released_client_push_through_a_is_reconciled_through_b_by_attempt_id" }
+    # WP-109 Phase 5. Not a race: a MEASUREMENT, and the only case here whose
+    # value is the numbers it prints rather than the assertion it makes. Its
+    # `PHASE5 ` lines are the evidence, so this case is the reason the runner
+    # passes `--nocapture`.
+    [pscustomobject]@{ Key = 'j'; Test = "$testPrefix::case_j_two_processes_report_their_connection_and_relay_capacity" }
 )
 
 $selected = if ($Case) {
@@ -248,6 +273,13 @@ try {
     Invoke-Mc @('alias', 'set', 'local', 'http://127.0.0.1:9000', 'minioadmin', 'minioadmin') | Out-Null
 
     # -- build -------------------------------------------------------------
+    if ($ServerBin) {
+        if (-not (Test-Path $ServerBin)) { throw "-ServerBin '$ServerBin' does not exist" }
+        $serverBin = (Resolve-Path $ServerBin).Path
+        $commandLog.Add("# -ServerBin supplied; build skipped: $serverBin")
+        Write-Host "== using the supplied loreserver: $serverBin =="
+    }
+    else {
     Write-Host '== building loreserver (release) =='
     # Release, not debug: the AWS-SDK S3 path overflows the Windows main-thread
     # stack in a debug binary and the process panics before serving anything.
@@ -274,6 +306,7 @@ try {
     $serverBin = Join-Path $targetDirectory 'release/loreserver.exe'
     if (-not (Test-Path $serverBin)) { $serverBin = Join-Path $targetDirectory 'release/loreserver' }
     if (-not (Test-Path $serverBin)) { throw 'the release loreserver binary was not produced' }
+    }
 
     # -- gateway trust material and streams --------------------------------
     Write-Host '== provisioning the private gateway =='
@@ -485,6 +518,13 @@ try {
         if ($result.Ran -eq 1 -and $result.Passed -eq 1 -and $result.Failed -eq 0 -and $exitCode -eq 0) {
             $result.Status = 'PASS'
             Write-Host '   PASS'
+            # A passing case is otherwise silent, which is right for the race
+            # cases: their evidence is the pass itself. WP-109 Phase 5's case is
+            # a MEASUREMENT, and its numbers exist only on stdout — swallowing
+            # them on success would make a green run carry no evidence at all.
+            foreach ($line in ($output -split "`r?`n")) {
+                if ($line -match '^PHASE5 ') { Write-Host "   $line" }
+            }
         }
         elseif ($result.Ran -eq 1) {
             $result.Status = 'FAIL'

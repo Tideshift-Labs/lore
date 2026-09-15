@@ -616,6 +616,91 @@ impl SharedBackend {
     pub fn authority(&self) -> &Client {
         &self.authority
     }
+
+    /// One sample of every backend connected to this case's database.
+    ///
+    /// WP-109 Phase 5 needs idle and peak connection counts per loreserver
+    /// pool, and four of the six pools a process opens report
+    /// `pool_waiting`/`pool_available` only over OTLP
+    /// (`lore-postgres/src/metrics.rs:41-42`), while the relay and dispatch
+    /// pools report nothing at all. `pg_stat_activity` is therefore the only
+    /// place that sees all of them, which is why the measurement is taken from
+    /// the authority connection rather than from either server.
+    ///
+    /// The sampling connection excludes itself. Every OTHER harness connection
+    /// is still counted, because there is no reliable way to tell one from a
+    /// server's: nothing here sets `application_name`. A caller wanting the
+    /// server-only figure subtracts a baseline taken before either process
+    /// starts — see [`Self::connection_sample`]'s use in the Phase 5 case.
+    pub async fn connection_sample(&self) -> ConnectionSample {
+        let row = self
+            .authority
+            .query_one(
+                "SELECT count(*)::bigint AS total, \
+                 count(*) FILTER (WHERE state = 'active')::bigint AS active, \
+                 count(*) FILTER (WHERE state = 'idle')::bigint AS idle, \
+                 count(*) FILTER (WHERE state = 'idle in transaction')::bigint AS in_tx, \
+                 COALESCE(MAX(EXTRACT(EPOCH FROM (now() - xact_start)) * 1000), 0)::float8 \
+                 AS max_xact_ms \
+                 FROM pg_stat_activity \
+                 WHERE datname = current_database() AND pid <> pg_backend_pid()",
+                &[],
+            )
+            .await
+            .expect("sample pg_stat_activity on the case database");
+        ConnectionSample {
+            total: row.get("total"),
+            active: row.get("active"),
+            idle: row.get("idle"),
+            idle_in_transaction: row.get("in_tx"),
+            max_xact_ms: row.get("max_xact_ms"),
+        }
+    }
+
+    /// The highest `total` seen over `window`, sampled every `interval`.
+    ///
+    /// A peak is the point of the measurement, and a single reading after a
+    /// load finishes would report the trough: `deadpool` hands a connection
+    /// back the moment an operation ends, so concurrency is only visible while
+    /// it is happening. Returns the peak sample and how many samples it took.
+    pub async fn peak_over(
+        &self,
+        window: std::time::Duration,
+        interval: std::time::Duration,
+    ) -> (ConnectionSample, usize) {
+        let start = std::time::Instant::now();
+        let mut peak = self.connection_sample().await;
+        // Tracked separately and unconditionally. Folding it into the `total`
+        // comparison loses it: a later sample with a higher total but a shorter
+        // open transaction would replace the whole struct and discard a longer
+        // transaction already seen, reporting a maximum that is really just
+        // "whatever the busiest sample happened to hold".
+        let mut max_xact_ms = peak.max_xact_ms;
+        let mut samples = 1usize;
+        while start.elapsed() < window {
+            tokio::time::sleep(interval).await;
+            let next = self.connection_sample().await;
+            samples += 1;
+            max_xact_ms = max_xact_ms.max(next.max_xact_ms);
+            if next.total > peak.total {
+                peak = next;
+            }
+        }
+        peak.max_xact_ms = max_xact_ms;
+        (peak, samples)
+    }
+}
+
+/// One `pg_stat_activity` reading for a single database.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConnectionSample {
+    pub total: i64,
+    pub active: i64,
+    pub idle: i64,
+    pub idle_in_transaction: i64,
+    /// Longest open transaction at sample time, in milliseconds. Zero when no
+    /// backend held one.
+    pub max_xact_ms: f64,
 }
 
 /// A raw connection whose driver task runs for the life of the case.

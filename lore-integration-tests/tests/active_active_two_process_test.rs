@@ -1784,4 +1784,377 @@ mod active_active_two_process_tests {
             "an absent receipt must leak no method, got {absent:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Case J — WP-109 Phase 5: Postgres and relay capacity
+    // -----------------------------------------------------------------------
+
+    /// How many governed creates the driven-peak burst issues concurrently.
+    ///
+    /// Split evenly across both processes, so the peak is a two-replica figure
+    /// rather than one process measured twice.
+    const BURST: usize = 16;
+
+    /// How long the sampler watches during the burst.
+    ///
+    /// The case asserts the burst finished inside this window. A burst that
+    /// outran the sampler would report a peak from a partial overlap, which is
+    /// an understatement that looks like a result — so it fails instead.
+    const SAMPLE_WINDOW: Duration = Duration::from_secs(20);
+
+    /// How many kill/restart rounds the leak check runs.
+    const RESTART_ROUNDS: usize = 3;
+
+    /// Connections `max_connections` is sized for, for the replica arithmetic.
+    ///
+    /// Staging's live ceiling, confirmed by direct query in
+    /// `lorehub/docs/learnings/do-managed-pg-connection-budget.md` (the
+    /// instance was resized `db-s-1vcpu-1gb` -> `db-s-2vcpu-4gb`, 25 -> 100).
+    /// The disposable Postgres this case runs on is deliberately sized higher,
+    /// so the arithmetic is reported against the real target rather than
+    /// against the fixture.
+    const STAGING_MAX_CONNECTIONS: f64 = 100.0;
+
+    /// ADR-00025:418-419: planned use stays below 70% of `max_connections`
+    /// while retaining one-replica-loss headroom.
+    const HEADROOM_FRACTION: f64 = 0.70;
+
+    /// WP-109 Phase 5: idle and peak connections for every pool a loreserver
+    /// opens, transaction duration, outbox overhead, restart behavior, and the
+    /// safe replica count that follows.
+    ///
+    /// # Why this is measured from `pg_stat_activity` and not from the server
+    ///
+    /// A loreserver process opens SIX Postgres pools against its cell database
+    /// — immutable, mutable, lock, domain, dispatch, and the outbox relay — and
+    /// only four of them report anything. `pool_waiting`/`pool_available`
+    /// (`lore-postgres/src/metrics.rs:41-42`) cover the store and domain pools
+    /// over OTLP; the relay pool exposes backlog and lag only
+    /// (`lore-server/src/event_relay/metrics.rs`) and the dispatch pool exposes
+    /// no metric at all. No RPC or HTTP surface reports pool utilisation. The
+    /// database is the only vantage point that sees all six, which is why the
+    /// whole measurement is taken over the harness's authority connection.
+    ///
+    /// # What this case deliberately does NOT report
+    ///
+    /// WP-121 gates placement on "p95 pool acquisition exceeds 100 ms / 250 ms
+    /// for 15 minutes". **There is no acquisition-latency emitter anywhere in
+    /// the fork** — `latency_ms` (`lore-postgres/src/metrics.rs:50`) is
+    /// whole-operation duration, not checkout wait — and adding one would be a
+    /// production change WP-109 forbids. So this case reports the
+    /// `idle in transaction` and open-transaction-age figures it can actually
+    /// see, and reports NO p95 acquisition number. A proof must not quote a
+    /// gate it did not measure.
+    #[tokio::test]
+    #[ignore = "WP-109 Phase 5: needs the runner's disposable Postgres, bucket, gateway and certificates"]
+    async fn case_j_two_processes_report_their_connection_and_relay_capacity() {
+        let fixture = Fixture::open(Arming::GovernedOutbox).await;
+
+        // (1) The harness's own connections, before either process exists.
+        // Everything below subtracts this, because nothing in this stack sets
+        // `application_name` and a harness connection is otherwise
+        // indistinguishable from a server's.
+        let (harness, harness_samples) = fixture
+            .backend
+            .peak_over(Duration::from_secs(2), Duration::from_millis(100))
+            .await;
+        println!(
+            "PHASE5 harness-baseline total={} active={} idle={} in_tx={} samples={}",
+            harness.total,
+            harness.active,
+            harness.idle,
+            harness.idle_in_transaction,
+            harness_samples
+        );
+
+        let mut a = fixture.start("a", BootOptions::relaying()).await;
+        let mut b = fixture.start("b", BootOptions::relaying()).await;
+        a.wait_ready().await;
+        b.wait_ready().await;
+
+        // (2) Idle, both processes up and serving nothing. Pools are lazy
+        // (`lore-postgres/src/pool.rs` sets max size only — no min, no idle
+        // timeout), so this is expected to sit far below the configured maxima
+        // and is the number that makes "peak" the meaningful one.
+        let (idle, idle_samples) = fixture
+            .backend
+            .peak_over(Duration::from_secs(5), Duration::from_millis(100))
+            .await;
+        let idle_servers = idle.total - harness.total;
+        println!(
+            "PHASE5 idle-two-processes total={} minus-harness={} active={} idle={} in_tx={} \
+             samples={}",
+            idle.total,
+            idle_servers,
+            idle.active,
+            idle.idle,
+            idle.idle_in_transaction,
+            idle_samples
+        );
+
+        // (3) Driven peak. Carriage is prepared up front and sequentially, on
+        // purpose: preparation runs through the HARNESS's own domain pool, so
+        // preparing inside the burst would measure the harness queueing on
+        // itself rather than two servers queueing on their pools.
+        // One subject, used for BOTH the bearer and the carriage. The
+        // coordinator checks the receipt key's `authenticated_subject` against
+        // the authenticated bearer, so minting for one subject and preparing
+        // under another is refused `ADMISSION_REJECTED_V1`
+        // (`lore-postgres/src/domain/postgres_coordinator.rs:570`) — which
+        // looks like a capacity failure and is not one. A readable subject
+        // rather than `direct_subject()`: this is the governed create rail,
+        // which never reaches auth-grpc's 49-byte principal-namespace gate.
+        let subject = "case-j-capacity";
+        let token = fixture.minter.mint(subject);
+        let mut requests = Vec::with_capacity(BURST);
+        for index in 0..BURST {
+            let repository = id16();
+            let branch = id16();
+            let name = format!("wp109-j-{index}-{}", hex(&repository[..6]));
+            let description = "WP-109 Phase 5 capacity burst";
+            let branch_name = "main".to_owned();
+            let creator = Some("wp109-harness");
+            let prepared = carriage::prepare_repository_create(
+                &fixture.backend,
+                fixture.minter.issuer(),
+                subject,
+                &repository,
+                &name,
+                description,
+                &branch,
+                &branch_name,
+                creator,
+                0x11,
+            )
+            .await;
+            let request = carriage::create_request(
+                &token,
+                &repository,
+                &name,
+                description,
+                &branch,
+                &branch_name,
+                creator,
+                &prepared,
+            );
+            requests.push(request);
+        }
+
+        let outbox_before = fixture.backend.outbox_rows().await.len();
+
+        // Re-baseline immediately before the burst, and subtract THIS rather
+        // than the pre-boot reading. The eight preparations above ran on the
+        // harness's own domain pool, which is lazy: connections it opened
+        // persist, and counting them as a server's would inflate the peak by
+        // up to one pool's worth with no way to tell from the result.
+        let pre_burst = fixture.backend.connection_sample().await;
+        println!(
+            "PHASE5 pre-burst-baseline total={} drift_from_harness_baseline={}",
+            pre_burst.total,
+            pre_burst.total - harness.total
+        );
+
+        // Half through each process. `join_all` would be tidier, but this crate
+        // has no `futures` dependency and `tokio::spawn` is out (Lore spawns
+        // only through `lore_spawn!`), so the burst is an explicit join of
+        // futures — concurrency without tasks, which is all this needs.
+        let mut sends = Vec::with_capacity(BURST);
+        for (index, request) in requests.into_iter().enumerate() {
+            let endpoint = if index % 2 == 0 {
+                a.grpc_endpoint()
+            } else {
+                b.grpc_endpoint()
+            };
+            sends.push(carriage::repository_create(endpoint, request));
+        }
+        // The burst times ITSELF, inside its own future. Timing it around the
+        // `join!` would time the join — which never returns before the sampler's
+        // whole window — and the guard below would then fire on every run
+        // regardless of how fast the burst actually was.
+        let drive = async {
+            let started = Instant::now();
+            // Polled together rather than awaited in turn: awaiting each in
+            // sequence would issue one request at a time and measure no
+            // concurrency at all.
+            let outcomes = futures_join(sends).await;
+            (outcomes, started.elapsed())
+        };
+        // 5 ms, not 25: the burst lands in roughly a tenth of a second, so a
+        // coarse interval takes only a handful of readings inside the load and
+        // reports whichever of them happened to catch the most. The sample
+        // count is printed so the reported peak can be read as "the highest of
+        // N in-burst readings" rather than as the true maximum.
+        let watch = fixture
+            .backend
+            .peak_over(SAMPLE_WINDOW, Duration::from_millis(5));
+        let ((outcomes, burst_elapsed), (peak, peak_samples)) = tokio::join!(drive, watch);
+
+        for (index, outcome) in outcomes.iter().enumerate() {
+            outcome.as_ref().unwrap_or_else(|status| {
+                panic!("governed create {index} in the capacity burst must succeed: {status:?}")
+            });
+        }
+        assert!(
+            burst_elapsed < SAMPLE_WINDOW,
+            "the burst ({burst_elapsed:?}) outran the sampling window ({SAMPLE_WINDOW:?}); the \
+             peak below would be an understatement taken from a partial overlap"
+        );
+
+        let peak_servers = peak.total - pre_burst.total;
+        // Readings that actually landed inside the load, at the 5 ms interval.
+        // The peak is the highest of THESE, and no more than that.
+        let in_burst_samples = (burst_elapsed.as_millis() / 5).max(1);
+        println!(
+            "PHASE5 driven-peak total={} minus-pre-burst={} active={} idle={} in_tx={} \
+             max_xact_ms={:.1} samples={} in_burst_samples≈{} concurrency={} elapsed_ms={}",
+            peak.total,
+            peak_servers,
+            peak.active,
+            peak.idle,
+            peak.idle_in_transaction,
+            peak.max_xact_ms,
+            peak_samples,
+            in_burst_samples,
+            BURST,
+            burst_elapsed.as_millis()
+        );
+
+        // (4) Outbox overhead. A governed repository create appends exactly two
+        // rows — `repository.published` and `branch.created`
+        // (`lore-postgres/src/domain/postgres_coordinator.rs:747`) — so the
+        // per-mutation cost is a count, not an estimate.
+        wait_until!(
+            "every burst row to reach the broker",
+            RELAY_DEADLINE,
+            fixture
+                .backend
+                .outbox_rows()
+                .await
+                .iter()
+                .all(broker_accepted)
+        );
+        let rows = fixture.backend.outbox_rows().await;
+        let appended = rows.len() - outbox_before;
+        let attempts: i32 = rows.iter().map(|row| row.attempt_count).sum();
+        println!(
+            "PHASE5 outbox-overhead mutations={} rows_appended={} rows_per_mutation={:.2} \
+             total_attempts={} dead_letters={}",
+            BURST,
+            appended,
+            appended as f64 / BURST as f64,
+            attempts,
+            fixture.backend.dead_letter_count().await
+        );
+        assert_eq!(
+            appended,
+            BURST * 2,
+            "a governed repository create appends exactly two outbox rows; {BURST} creates must \
+             append {} and appended {appended}: {}",
+            BURST * 2,
+            describe(&rows)
+        );
+
+        // (5) Repeated restart. The question is whether a process that comes
+        // back reopens its pools and settles, or whether each cycle leaves
+        // connections behind — the failure mode that exhausts a shared instance
+        // after a rolling deploy rather than during one.
+        let mut after_restart = peak;
+        for round in 1..=RESTART_ROUNDS {
+            for (label, cell) in [("a", &mut a), ("b", &mut b)] {
+                cell.kill();
+                cell.wait_exit(Duration::from_secs(30)).await;
+                cell.restart_with(BootOptions::relaying()).await;
+                cell.wait_ready().await;
+                let sample = fixture
+                    .backend
+                    .peak_over(Duration::from_secs(3), Duration::from_millis(100))
+                    .await
+                    .0;
+                after_restart = sample;
+                println!(
+                    "PHASE5 restart round={round} process={label} total={} minus-pre-burst={} \
+                     active={} idle={}",
+                    sample.total,
+                    sample.total - pre_burst.total,
+                    sample.active,
+                    sample.idle
+                );
+            }
+        }
+        let settled_servers = after_restart.total - pre_burst.total;
+        // Compared against IDLE, not against the peak. Against the peak this
+        // would pass while a process leaked an entire pool every cycle, which
+        // is exactly the failure a rolling deploy produces. The tolerance is
+        // one replica's idle share: a just-restarted process can still overlap
+        // the departing one's connections for a moment.
+        let restart_tolerance = idle_servers / 2;
+        assert!(
+            settled_servers <= idle_servers + restart_tolerance,
+            "after {RESTART_ROUNDS} restart rounds the settled connection count \
+             ({settled_servers}) exceeded idle ({idle_servers}) by more than one replica's \
+             share ({restart_tolerance}); connections are leaking across restarts"
+        );
+
+        // (6) The replica arithmetic. Reported against staging's real ceiling,
+        // not this fixture's, and stated as what it is: derived from a measured
+        // two-process peak on one machine under a burst of `BURST`, not a
+        // production load model.
+        let per_replica = (peak_servers as f64 / 2.0).ceil();
+        let budget = HEADROOM_FRACTION * STAGING_MAX_CONNECTIONS;
+        let safe_replicas = (budget / per_replica).floor() - 1.0;
+        println!(
+            "PHASE5 replica-arithmetic measured_peak_two_processes={peak_servers} \
+             measured_per_replica={per_replica} configured_per_replica=24 \
+             max_connections={STAGING_MAX_CONNECTIONS} budget_at_70pct={budget} \
+             safe_replicas_with_one_loss={safe_replicas}"
+        );
+        assert!(
+            per_replica > 0.0,
+            "the burst drove no measurable server connection at all; the peak sampler saw \
+             nothing above the harness baseline, so this case measured nothing"
+        );
+    }
+
+    /// Poll a set of futures to completion together.
+    ///
+    /// This crate has no `futures` dependency, and Lore's task rule
+    /// (`lore-base/src/runtime.rs`) forbids a bare `tokio::spawn`, so the
+    /// burst needs a join that spawns nothing. Boxing keeps the future type
+    /// uniform across the vector.
+    ///
+    /// Every unfinished future is re-polled on every wake, so no wakeup is
+    /// lost to a future that was not the one woken. Polling the returned
+    /// future again after it is `Ready` would panic on the drained slots;
+    /// unreachable through the single `.await` here, and noted rather than
+    /// guarded because a guard would hide the misuse instead of ending it.
+    async fn futures_join<T>(futures: Vec<impl std::future::Future<Output = T>>) -> Vec<T> {
+        use std::pin::Pin;
+        use std::task::Poll;
+
+        let mut pinned: Vec<Pin<Box<_>>> = futures.into_iter().map(Box::pin).collect();
+        let mut results: Vec<Option<T>> = (0..pinned.len()).map(|_| None).collect();
+        std::future::poll_fn(move |context| {
+            let mut pending = false;
+            for (slot, future) in pinned.iter_mut().enumerate() {
+                if results[slot].is_some() {
+                    continue;
+                }
+                match future.as_mut().poll(context) {
+                    Poll::Ready(value) => results[slot] = Some(value),
+                    Poll::Pending => pending = true,
+                }
+            }
+            if pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(
+                    results
+                        .iter_mut()
+                        .map(|slot| slot.take().expect("every future resolved"))
+                        .collect(),
+                )
+            }
+        })
+        .await
+    }
 }
