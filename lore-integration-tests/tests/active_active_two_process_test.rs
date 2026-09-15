@@ -24,6 +24,7 @@ mod active_active_two_process_tests {
 
     use lore_base::types::Hash;
     use lore_base::types::RepositoryId;
+    use lore_postgres::domain::outbox::CheckpointOutcome;
     use lore_proto::lore::domain::v1::DomainOperationOutcome;
     use lore_proto::lore::domain::v1::DomainOperationReceiptStatus;
     use tonic::Code;
@@ -2112,6 +2113,448 @@ mod active_active_two_process_tests {
             per_replica > 0.0,
             "the burst drove no measurable server connection at all; the peak sampler saw \
              nothing above the harness baseline, so this case measured nothing"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Case K — receiver death and replacement inherits nothing
+    // -----------------------------------------------------------------------
+
+    /// A durable receiver generation dies holding an unresolved blocker; its
+    /// replacement captures its own position, takes its own baseline, and
+    /// drains before it may report ready — and the dead generation can never
+    /// again touch a checkpoint once its successor exists.
+    ///
+    /// Contract: `lorehub/docs/contracts/lore-notification-plane.md`,
+    /// "DURABLE_INVALIDATION" ("A hard-dead member may be retired only by
+    /// compare-and-set after a replacement with a newer generation proves an
+    /// authoritative baseline and persisted checkpoint. Name reuse never
+    /// inherits an old checkpoint.") and `report_checkpoint`'s own fenced
+    /// contract (`lore-postgres/src/domain/outbox/checkpoint.rs:24-29`): "a
+    /// stale generation therefore cannot advance its successor's frontier or
+    /// clear a blocker it did not resolve".
+    ///
+    /// # What is real and what this case injects
+    ///
+    /// Process B's FIRST generation is entirely real: it boots, joins,
+    /// captures, baselines, drains, and passes its readiness CAS exactly as
+    /// case G's does, and this case waits on the same `/event_readiness`
+    /// facet every other case does before touching anything. The kill is
+    /// real too (`Cell::kill`, a hard `SIGKILL`).
+    ///
+    /// What this case cannot get the harness to do on its own is make a real
+    /// process die HOLDING an unresolved blocker: `receiver.rs`'s own resume
+    /// rule means an ordinary clean kill-and-restart of a generation with no
+    /// blocker RESUMES that same generation, which would prove nothing about
+    /// replacement. Nothing in the shipped client surface lets this harness
+    /// hand a live receiver a message it cannot apply, and the harness cannot
+    /// keep a receiver task alive independently of its whole process. So the
+    /// harness stands in for the dying generation's own last gasp
+    /// (`receiver.rs`'s `final_checkpoint`, which a hard kill never runs) by
+    /// calling the exact function a real generation calls,
+    /// [`SharedBackend::report_synthetic_checkpoint`], under generation 1's
+    /// own real identity, membership version, and last real frontier, adding
+    /// one poison entry. This is the harness playing the role of the dead
+    /// process's own shutdown handler with the same write path, schema, and
+    /// generation the real process was just running — not a fabricated row.
+    #[tokio::test]
+    #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
+    async fn case_k_a_replacement_receiver_generation_inherits_nothing_from_its_dead_predecessor() {
+        let fixture = Fixture::open(Arming::GovernedOutbox).await;
+        let a = fixture.start("a", BootOptions::relaying()).await;
+        let mut b = fixture.start("b", BootOptions::relaying()).await;
+        let token = fixture.minter.mint("case-k-writer");
+
+        let (repository, branch, _) =
+            governed_repository(&fixture, &a, &token, "case-k-writer", "k").await;
+
+        // Real generation 1: real capture, real baseline, real drain, real
+        // readiness CAS.
+        wait_until!(
+            format!(
+                "process B's durable receiver to report itself ready; last seen {:?}",
+                b.event_readiness().await
+            ),
+            RECEIVER_DEADLINE,
+            b.event_readiness().await.receiver_ready == Some(true)
+        );
+        let identity = b.receiver_identity();
+        let readiness = b.event_readiness().await;
+        let first_generation = readiness
+            .receiver_generation
+            .expect("a ready receiver reports the generation it is running");
+        let (checkpointed_generation, first_frontier) = fixture
+            .backend
+            .checkpoint_frontier_of(&identity)
+            .await
+            .expect("a ready receiver has a persisted checkpoint at the current placement");
+        assert_eq!(
+            checkpointed_generation, first_generation,
+            "the checkpoint just read must belong to the generation that reported ready"
+        );
+
+        // The real kill. Not a graceful stop: a graceful stop drains and
+        // checkpoints on its way out, which is precisely the standing this
+        // case must NOT let the dead generation keep.
+        b.kill();
+        b.wait_exit(Duration::from_secs(30)).await;
+        assert!(b.has_exited(), "process B must actually be gone");
+
+        // The harness stands in for generation 1's own dying gasp: the exact
+        // write path a real generation uses, under its own identity,
+        // membership version, and last proven frontier, now carrying one
+        // poison entry. See the case doc comment for why this, and not a
+        // live-induced poison, is what the harness can produce here.
+        let poisoned_at = first_frontier + 1;
+        let outcome = fixture
+            .backend
+            .report_synthetic_checkpoint(
+                &fixture.env,
+                &identity,
+                first_generation,
+                first_frontier,
+                Vec::new(),
+                vec![(poisoned_at, "SIMULATED_RECEIVER_DEATH")],
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "generation {first_generation} is still current; its own last report must \
+                     be accepted: {error:?}"
+                )
+            });
+        assert_eq!(
+            outcome,
+            CheckpointOutcome::Applied {
+                contiguous_frontier: first_frontier
+            },
+            "the dying generation's own last report is legitimate and must be accepted verbatim"
+        );
+
+        // Restart under the SAME receiver identity. Per the resume rule this
+        // is not a fresh generation for free: it is refused resumption only
+        // because the persisted checkpoint now carries a blocker.
+        b.restart_with(BootOptions::relaying()).await;
+        wait_until!(
+            format!(
+                "process B's replacement receiver generation to report itself ready; last seen \
+                 {:?}",
+                b.event_readiness().await
+            ),
+            RECEIVER_DEADLINE,
+            b.event_readiness().await.receiver_ready == Some(true)
+        );
+        assert_eq!(
+            b.receiver_identity(),
+            identity,
+            "the replacement must run under the SAME receiver identity; name reuse is the case"
+        );
+        let readiness = b.event_readiness().await;
+        let second_generation = readiness
+            .receiver_generation
+            .expect("a ready receiver reports the generation it is running");
+        assert!(
+            second_generation > first_generation,
+            "a persisted blocker must force a NEW generation, not a resume of generation \
+             {first_generation}; got {second_generation}"
+        );
+
+        // The replacement's own checkpoint: a fresh generation, freshly
+        // captured and baselined, at or ahead of what the dead generation
+        // last proved — not a copy of it.
+        let (reported_generation, second_frontier) = fixture
+            .backend
+            .checkpoint_frontier_of(&identity)
+            .await
+            .expect("the replacement's own readiness compare-and-set refuses without a checkpoint");
+        assert_eq!(reported_generation, second_generation);
+        assert!(
+            second_frontier >= first_frontier,
+            "the replacement's fresh baseline must cover at least what the dead generation \
+             already proved; got {second_frontier} against {first_frontier}"
+        );
+
+        // The dead generation's OWN row must be exactly what the harness left
+        // it at: nobody may have advanced or cleared it on its behalf.
+        let (retired_frontier, retired_gaps) = fixture
+            .backend
+            .checkpoint_row(&identity, first_generation)
+            .await
+            .expect("the retired generation's own row must still exist");
+        assert_eq!(
+            retired_frontier, first_frontier,
+            "the retired generation's frontier must never move again"
+        );
+        assert!(
+            retired_gaps.is_empty(),
+            "this row's blocker was a poison entry, not a gap; a gap here would mean something \
+             wrote to this row after retirement"
+        );
+
+        // The direct proof: the dead generation itself can never again touch
+        // a checkpoint now that a successor exists. Submitted under its own
+        // real identity, version, and generation, attempting to advance PAST
+        // what the live successor has already proved.
+        let forged = fixture
+            .backend
+            .report_synthetic_checkpoint(
+                &fixture.env,
+                &identity,
+                first_generation,
+                second_frontier + 100,
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect("the fence is a normal outcome, not a database error");
+        assert_eq!(
+            forged,
+            CheckpointOutcome::StaleGeneration {
+                current_membership_generation: second_generation
+            },
+            "generation {first_generation} must be refused as stale once generation \
+             {second_generation} exists; got {forged:?}"
+        );
+
+        // And the refusal must have left the successor's own row untouched.
+        let (still_second, _) = fixture
+            .backend
+            .checkpoint_row(&identity, second_generation)
+            .await
+            .expect("the successor's row must still exist");
+        assert_eq!(
+            still_second, second_frontier,
+            "a stale generation's refused report must not have moved the successor's frontier"
+        );
+
+        // No retained row is stranded or silently credited: the replacement
+        // must actually go on to drain NEW work, not merely report a number.
+        let revision = fixture
+            .backend
+            .serialize_revision(repository_id(repository), Hash::default(), 1, None)
+            .await;
+        let prepared = carriage::prepare_push(
+            &fixture.backend,
+            fixture.minter.issuer(),
+            "case-k-writer",
+            &repository,
+            &branch,
+            revision.as_ref(),
+            false,
+            false,
+            0x51,
+        )
+        .await;
+        let request = carriage::push_request(
+            &token,
+            &repository,
+            &branch,
+            revision.as_ref(),
+            false,
+            false,
+            Some(&prepared),
+        );
+        carriage::branch_push(a.grpc_endpoint(), request)
+            .await
+            .unwrap_or_else(|status| panic!("the post-replacement push must succeed: {status:?}"));
+
+        let accepted = fixture.backend.max_broker_sequence().await.expect(
+            "the post-replacement push must have been accepted by the broker to have a sequence",
+        );
+        wait_until!(
+            format!(
+                "the replacement generation {second_generation} to drain the post-replacement \
+                 push to sequence {accepted}; last seen {:?}",
+                fixture.backend.checkpoint_frontier_of(&identity).await
+            ),
+            RECEIVER_DEADLINE,
+            fixture
+                .backend
+                .checkpoint_frontier_of(&identity)
+                .await
+                .is_some_and(|(generation, frontier)| {
+                    generation == second_generation && frontier >= accepted
+                })
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Case L — an unresolved gap blocks the frontier and cannot be skipped
+    // -----------------------------------------------------------------------
+
+    /// The contiguous-frontier rule, driven through the real production write
+    /// path a live receiver reports through:
+    /// [`SharedBackend::report_synthetic_checkpoint`] (over
+    /// `lore_postgres::domain::outbox::report_checkpoint`) refuses a
+    /// checkpoint report that claims a frontier at or above a gap it still
+    /// lists as open, and an unresolved gap sits there even though a later
+    /// sequence could otherwise have been acknowledged.
+    ///
+    /// Contract: `lorehub/docs/contracts/lore-notification-plane.md`,
+    /// "DURABLE_INVALIDATION" ("Each receiver frontier is contiguous: an
+    /// unresolved gap ... blocks advancement even when a later event was
+    /// acknowledged") and `report_checkpoint`'s own doc comment
+    /// (`lore-postgres/src/domain/outbox/checkpoint.rs:14-20`): "A receiver
+    /// that acknowledged 900-916 and 919-930 with 917-918 unresolved has a
+    /// frontier of 916, not 930 — and `report_checkpoint` refuses the report
+    /// that says otherwise rather than trusting the reporter to have computed
+    /// it correctly."
+    ///
+    /// # What is real, what this case injects, and why a live broker gap is
+    /// out of reach here
+    ///
+    /// Process A's receiver generation is entirely real: real join, real
+    /// capture, real baseline, real drain, real readiness CAS, waited on
+    /// through the same `/event_readiness` facet every other case uses.
+    ///
+    /// A genuine broker-sequence gap in `receiver.rs`'s own tracking
+    /// (`frontier.rs`'s `AckFrontier`) requires the broker to actually skip a
+    /// delivery to this consumer while delivering a later one — something a
+    /// single JetStream durable consumer does not do under ordinary
+    /// operation, and which this crate exposes no failpoint to force:
+    /// `LORE_FRAGMENT_FAILPOINTS` only reaches the outbox claim/accept sites
+    /// cases D and E use, and there is no receiver-side equivalent. **This
+    /// case does not claim to have made a live receiver observe a real
+    /// gap.** What it proves instead, honestly: the checkpoint PROJECTION
+    /// itself — the thing the retention reaper and every future generation's
+    /// resume decision reads — refuses a self-contradictory report under this
+    /// receiver's own real, live, still-current generation, exactly as its
+    /// own doc comment claims. A report is submitted through the exact
+    /// function and identity a real receiver would use, first with a
+    /// self-consistent unresolved gap (accepted, and provably does not move
+    /// the frontier), then a second time under the SAME generation claiming a
+    /// higher frontier while still listing that exact gap as open (refused,
+    /// pre-database, by the store's own validation, never applied).
+    #[tokio::test]
+    #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
+    async fn case_l_the_checkpoint_projection_refuses_a_frontier_that_skips_an_unresolved_gap() {
+        let fixture = Fixture::open(Arming::GovernedOutbox).await;
+        let a = fixture.start("a", BootOptions::relaying()).await;
+
+        wait_until!(
+            format!(
+                "process A's durable receiver to report itself ready; last seen {:?}",
+                a.event_readiness().await
+            ),
+            RECEIVER_DEADLINE,
+            a.event_readiness().await.receiver_ready == Some(true)
+        );
+        let identity = a.receiver_identity();
+        let readiness = a.event_readiness().await;
+        let generation = readiness
+            .receiver_generation
+            .expect("a ready receiver reports the generation it is running");
+        let (checkpointed_generation, baseline_frontier) = fixture
+            .backend
+            .checkpoint_frontier_of(&identity)
+            .await
+            .expect("a ready receiver has a persisted checkpoint at the current placement");
+        assert_eq!(
+            checkpointed_generation, generation,
+            "the checkpoint just read must belong to the generation that reported ready"
+        );
+
+        // A self-consistent report: an unresolved gap strictly above the
+        // frontier, the frontier itself unmoved. This is the legitimate shape
+        // a real receiver's `AckFrontier` produces once it observes a hole;
+        // see the case doc comment for why this harness injects it rather
+        // than a live broker skip.
+        let gap = (baseline_frontier + 2, baseline_frontier + 2);
+        let with_gap = fixture
+            .backend
+            .report_synthetic_checkpoint(
+                &fixture.env,
+                &identity,
+                generation,
+                baseline_frontier,
+                vec![gap],
+                Vec::new(),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a self-consistent report from the still-current generation must be \
+                     accepted: {error:?}"
+                )
+            });
+        assert_eq!(
+            with_gap,
+            CheckpointOutcome::Applied {
+                contiguous_frontier: baseline_frontier
+            },
+            "a report naming a gap strictly above its own frontier is legitimate and must be \
+             accepted as reported"
+        );
+        let (_, stored_frontier) = fixture
+            .backend
+            .checkpoint_frontier_of(&identity)
+            .await
+            .expect("the checkpoint just accepted must be readable");
+        assert_eq!(
+            stored_frontier, baseline_frontier,
+            "an unresolved gap must leave the persisted frontier exactly where it was"
+        );
+        let (_, stored_gaps) = fixture
+            .backend
+            .checkpoint_row(&identity, generation)
+            .await
+            .expect("the row this generation just wrote must exist");
+        assert_eq!(
+            stored_gaps,
+            vec![gap],
+            "the projection must carry the exact gap this generation reported"
+        );
+
+        // The forged report: the SAME still-current generation now claims a
+        // frontier past that gap while still listing it as open — exactly
+        // the "a later acknowledgement skips the gap" shape the contract
+        // forbids. The store's own input validation must refuse this before
+        // any write, per its doc comment.
+        let skip_attempt = fixture
+            .backend
+            .report_synthetic_checkpoint(
+                &fixture.env,
+                &identity,
+                generation,
+                gap.1 + 3,
+                vec![gap],
+                Vec::new(),
+            )
+            .await;
+        let error = skip_attempt.expect_err(
+            "a report claiming a frontier at or above its own unresolved gap must be refused, \
+             not accepted",
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("unresolved gap"),
+            "the refusal must be the frontier-versus-gap rule, not some other rejection: \
+             {message}"
+        );
+
+        // The refused report must not have touched the projection: the gap
+        // and the frontier are exactly what the first, legitimate report
+        // left them at.
+        let (unmoved_frontier, unmoved_gaps) = fixture
+            .backend
+            .checkpoint_row(&identity, generation)
+            .await
+            .expect("the row must still exist");
+        assert_eq!(
+            unmoved_frontier, baseline_frontier,
+            "a refused report must never move the frontier, forged or not"
+        );
+        assert_eq!(
+            unmoved_gaps,
+            vec![gap],
+            "a refused report must leave the previously reported gap exactly as it was"
+        );
+        assert_eq!(
+            a.event_readiness().await.receiver_ready,
+            Some(true),
+            "this harness-injected report never reached the live receiver's own in-memory \
+             session, so its facet is unaffected; asserted so a reader does not mistake this for \
+             a live-receiver gap"
         );
     }
 

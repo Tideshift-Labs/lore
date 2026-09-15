@@ -132,6 +132,17 @@ topic — chronological execution notes belong in `docs/worklogs/`.
 - To pin a "store only after X succeeds" ordering property through a realistic pipeline with many
   unrelated store calls first, fault-inject by key identity (computed ahead via its own public
   derivation), not ordinal call number, which only works for a fully enumerated narrow sequence.
+- To stand in for a real-process condition a black-box live harness cannot organically induce (a
+  receiver generation dying while holding an unresolved blocker; a self-contradictory checkpoint
+  report), call the exact production write path directly against the shared database
+  (`lore_postgres::domain::outbox::report_checkpoint`, not raw SQL) under the real process's own
+  identity/generation/membership-version, rather than fabricating a row. This exercises the real
+  fences (stale-generation, retired-generation, frontier-monotonicity) the same way a live caller
+  would, and keeps the harness honest about what it actually observed vs. what it injected -- every
+  case using this documents which fact is real and which is stood in for, in the case's own doc
+  comment. See cases K and L in
+  `lore-integration-tests/tests/active_active_two_process_test.rs` and
+  `SharedBackend::report_synthetic_checkpoint`.
 
 ### Postgres parameter typing and retry classification
 
@@ -438,6 +449,13 @@ current-thread/one-worker runs and event or stage-end counts do not prove topolo
   result.
 - Runtime-specific I/O backends and real QUIC drain behavior remain platform/live tiers; record the
   omission rather than representing a portable unit run as full coverage.
+- The `active_active_two_process` live harness has no seam to make a single JetStream durable
+  consumer skip a delivery (no receiver-side failpoint exists; `LORE_FRAGMENT_FAILPOINTS` only
+  reaches the outbox claim/accept sites), so a genuine broker-sequence gap in a live receiver's own
+  `AckFrontier` is not producible there today. Case L
+  (`case_l_an_unresolved_gap_blocks_the_frontier_and_cannot_be_skipped`) proves the checkpoint
+  store's own refusal of a self-contradictory report instead, and says so in its doc comment --
+  don't read a future green run of it as evidence a live gap was ever observed.
 - **Never source a candidate port from `bind(0)` when the port must be free for BOTH TCP and UDP;
   never "fix" the resulting failure by raising the retry count.** `scripts/test`'s
   `allocate_free_port` (gRPC and QUIC share one number) hard-failed all 20 attempts on Windows with

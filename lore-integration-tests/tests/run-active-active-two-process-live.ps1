@@ -120,6 +120,15 @@ $caseCatalog = @(
     # `PHASE5 ` lines are the evidence, so this case is the reason the runner
     # passes `--nocapture`.
     [pscustomobject]@{ Key = 'j'; Test = "$testPrefix::case_j_two_processes_report_their_connection_and_relay_capacity" }
+    # WP-119 Phase 10 failure-matrix cases not previously covered here:
+    # receiver death/replacement and gap/refetch. Both call the real
+    # `lore_postgres::domain::outbox::report_checkpoint` write path directly
+    # to stand in for facts the harness cannot make a live process produce on
+    # its own (a generation dying holding a blocker; a genuine broker-sequence
+    # gap). See each case's own doc comment for exactly what is real and what
+    # is injected.
+    [pscustomobject]@{ Key = 'k'; Test = "$testPrefix::case_k_a_replacement_receiver_generation_inherits_nothing_from_its_dead_predecessor" }
+    [pscustomobject]@{ Key = 'l'; Test = "$testPrefix::case_l_the_checkpoint_projection_refuses_a_frontier_that_skips_an_unresolved_gap" }
 )
 
 $selected = if ($Case) {

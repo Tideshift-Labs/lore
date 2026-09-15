@@ -37,11 +37,17 @@ use lore_postgres::domain::backfill::DomainBackfillSource;
 use lore_postgres::domain::backfill::OrphanKey;
 use lore_postgres::domain::backfill::RepositoryFacts;
 use lore_postgres::domain::errors::DomainError;
+use lore_postgres::domain::outbox::CheckpointOutcome;
+use lore_postgres::domain::outbox::CheckpointReport;
 use lore_postgres::domain::outbox::MembershipCas;
+use lore_postgres::domain::outbox::PoisonEntry;
+use lore_postgres::domain::outbox::SequenceGap;
 use lore_postgres::domain::outbox::membership::read_membership_state;
 use lore_postgres::domain::outbox::membership::set_current_placement;
+use lore_postgres::domain::outbox::report_checkpoint;
 use lore_postgres::domain::outbox::stamp_cutover;
 use lore_postgres::pool::TlsConfig;
+use lore_postgres::pool::build_pool;
 use lore_postgres::store::immutable_store::ObjectStoreSettings;
 use lore_postgres::store::immutable_store::PostgresImmutableStore;
 use lore_postgres::store::mutable_store::PostgresMutableStore;
@@ -578,6 +584,115 @@ impl SharedBackend {
                     row.get("contiguous_frontier"),
                 )
             })
+    }
+
+    /// One generation's own persisted checkpoint frontier and gaps, read by
+    /// EXACT generation rather than the receiver's highest.
+    ///
+    /// [`Self::checkpoint_frontier_of`] answers "what is this receiver's
+    /// current standing", which is always the highest generation once a
+    /// successor exists. Proving a retired generation's own row never moves
+    /// again needs to keep reading THAT generation specifically, which this
+    /// does.
+    pub async fn checkpoint_row(
+        &self,
+        receiver_identity: &str,
+        membership_generation: i64,
+    ) -> Option<(i64, Vec<(i64, i64)>)> {
+        let row = self
+            .authority
+            .query_opt(
+                "SELECT contiguous_frontier, gap_starts, gap_ends FROM lore_outbox_checkpoints \
+                  WHERE cell_id = $1 AND receiver_identity = $2 AND membership_generation = $3",
+                &[&self.cell_id, &receiver_identity, &membership_generation],
+            )
+            .await
+            .expect("read one generation's checkpoint row");
+        row.map(|row| {
+            let starts: Vec<i64> = row.get("gap_starts");
+            let ends: Vec<i64> = row.get("gap_ends");
+            (
+                row.get("contiguous_frontier"),
+                starts.into_iter().zip(ends).collect(),
+            )
+        })
+    }
+
+    /// Submit one checkpoint report through the REAL production write path
+    /// (`lore_postgres::domain::outbox::report_checkpoint`), under a
+    /// receiver's own identity and generation, exactly as that receiver's own
+    /// bootstrap or steady-state loop would call it.
+    ///
+    /// This exists for cases K and L, which need to act on behalf of a
+    /// generation the harness cannot make a live process do this for itself
+    /// on cue -- see their doc comments for exactly what each call stands in
+    /// for and why. It is not a raw SQL write: it is the same function, same
+    /// schema, and same fences (membership version, current placement,
+    /// current generation, frontier monotonicity) a real receiver's report
+    /// goes through.
+    ///
+    /// Retries ONLY on `MembershipVersionConflict`. The cell's membership
+    /// version is one counter shared by every receiver on the cell
+    /// (`lore_outbox_membership_state` is keyed by `cell_id`, not by
+    /// receiver identity), so a case running two relaying processes can see
+    /// it move between this method's own read and the store's transactional
+    /// read for a reason that has nothing to do with what the case is
+    /// proving. Every other outcome, including a deliberately provoked
+    /// `StaleGeneration`, is returned as-is.
+    pub async fn report_synthetic_checkpoint(
+        &self,
+        env: &Env,
+        receiver_identity: &str,
+        membership_generation: i64,
+        contiguous_frontier: i64,
+        gaps: Vec<(i64, i64)>,
+        poison: Vec<(i64, &str)>,
+    ) -> Result<CheckpointOutcome, DomainError> {
+        let pool = build_pool(&env.pg_url, 2, &TlsConfig::default()).unwrap_or_else(|error| {
+            panic!("open a short-lived pool for a synthetic checkpoint report: {error}")
+        });
+        let gaps: Vec<SequenceGap> = gaps
+            .into_iter()
+            .map(|(from, to)| SequenceGap { from, to })
+            .collect();
+        let poison: Vec<PoisonEntry> = poison
+            .into_iter()
+            .map(|(broker_sequence, class)| PoisonEntry {
+                broker_sequence,
+                class: class.to_owned(),
+            })
+            .collect();
+        for _ in 0..20 {
+            let membership_version = read_membership_state(&self.authority, &self.cell_id)
+                .await
+                .expect("read the current membership state")
+                .expect("the cell's membership-state row exists once stamp_cutover has run")
+                .membership_version;
+            let report = CheckpointReport {
+                stream_identity: env.stream_identity.clone(),
+                stream_epoch: env.stream_epoch,
+                receiver_identity: receiver_identity.to_owned(),
+                membership_generation,
+                membership_version,
+                contiguous_frontier,
+                gaps: gaps.clone(),
+                poison: poison.clone(),
+            };
+            let mut client = pool.get().await.unwrap_or_else(|error| {
+                panic!("check out a connection for the synthetic checkpoint report: {error}")
+            });
+            match report_checkpoint(&mut client, &self.cell_id, &report).await {
+                Ok(CheckpointOutcome::MembershipVersionConflict { .. }) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+                other => return other,
+            }
+        }
+        panic!(
+            "the cell's membership version never settled after 20 attempts while preparing a \
+             synthetic checkpoint report; something is continuously rejoining"
+        )
     }
 
     /// The highest broker sequence this cell has been told a row was accepted
