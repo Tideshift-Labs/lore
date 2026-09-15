@@ -444,7 +444,20 @@ pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool
 /// The `ForceUnlock` bar: the `owner` permission, and deliberately not
 /// [`can_admin_lock`]'s `migrate`.
 ///
-/// CR-030 P-030-2. The two halves of this authority used to disagree by name:
+/// **The platform table no longer says the same thing, and that is deliberate.**
+/// Owner ruling D8 (2026-09-15) lowered `lock.force_release` in the platform's
+/// direct-authorization table to `write`/`developer`, because that rail's
+/// request carries no target-owner field and so cannot tell a self force-release
+/// from an administrative one. This gate CAN tell them apart — that is what
+/// [`is_self_force_unlock`] is — so it keeps `owner` for the administrative half
+/// and does not follow the table down. Do NOT "re-align" this to the table on
+/// the strength of the paragraph below: the alignment argument it makes is
+/// historical, and acting on it now would hand every `developer` the authority
+/// to break another user's lock. See
+/// `lorehub/docs/lore-change-requests/cr-030-same-principal-force-unlock-amendment.md`.
+///
+/// CR-030 P-030-2, and the history that produced it. The two halves of this
+/// authority used to disagree by name:
 /// the wire gate here required `migrate`, while the platform's
 /// direct-authorization table gives `lock.force_release` the permission `owner`
 /// and `lock.admin_acquire` the permission `migrate`. Only the `owner` role
