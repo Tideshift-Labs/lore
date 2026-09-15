@@ -238,6 +238,10 @@ pub const RPC_INVENTORY: &[(&str, RpcClass)] = &[
         RpcClass::Mutation,
     ),
     (
+        "/lore.domain.v1.DomainOperationService/DomainOperationProofNamespaceStateGet",
+        RpcClass::Read,
+    ),
+    (
         "/lore.domain.v1.DomainOperationService/DomainOperationReceiptGet",
         RpcClass::Read,
     ),
