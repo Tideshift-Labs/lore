@@ -653,6 +653,11 @@ impl ::prost::Name for DomainOperationProofNamespaceRetireAckV1 {
         "/lore.domain.v1.DomainOperationProofNamespaceRetireAckV1".into()
     }
 }
+/// proto3 scopes enum VALUE names to the enclosing package, not to the enum, so
+/// every value here shares one namespace with every other enum in
+/// `lore.domain.v1`. Bare names would make the next `UNSPECIFIED` anywhere in the
+/// package a build failure rather than a local choice, which is why every other
+/// enum in this file is prefixed too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ProofNamespaceStateStatus {
@@ -669,21 +674,27 @@ impl ProofNamespaceStateStatus {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            Self::Unspecified => "UNSPECIFIED",
-            Self::MatchedQuiescent => "MATCHED_QUIESCENT",
-            Self::MatchedNotQuiescent => "MATCHED_NOT_QUIESCENT",
-            Self::Absent => "ABSENT",
-            Self::Mismatch => "MISMATCH",
+            Self::Unspecified => "PROOF_NAMESPACE_STATE_STATUS_UNSPECIFIED",
+            Self::MatchedQuiescent => "PROOF_NAMESPACE_STATE_STATUS_MATCHED_QUIESCENT",
+            Self::MatchedNotQuiescent => {
+                "PROOF_NAMESPACE_STATE_STATUS_MATCHED_NOT_QUIESCENT"
+            }
+            Self::Absent => "PROOF_NAMESPACE_STATE_STATUS_ABSENT",
+            Self::Mismatch => "PROOF_NAMESPACE_STATE_STATUS_MISMATCH",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
-            "UNSPECIFIED" => Some(Self::Unspecified),
-            "MATCHED_QUIESCENT" => Some(Self::MatchedQuiescent),
-            "MATCHED_NOT_QUIESCENT" => Some(Self::MatchedNotQuiescent),
-            "ABSENT" => Some(Self::Absent),
-            "MISMATCH" => Some(Self::Mismatch),
+            "PROOF_NAMESPACE_STATE_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "PROOF_NAMESPACE_STATE_STATUS_MATCHED_QUIESCENT" => {
+                Some(Self::MatchedQuiescent)
+            }
+            "PROOF_NAMESPACE_STATE_STATUS_MATCHED_NOT_QUIESCENT" => {
+                Some(Self::MatchedNotQuiescent)
+            }
+            "PROOF_NAMESPACE_STATE_STATUS_ABSENT" => Some(Self::Absent),
+            "PROOF_NAMESPACE_STATE_STATUS_MISMATCH" => Some(Self::Mismatch),
             _ => None,
         }
     }

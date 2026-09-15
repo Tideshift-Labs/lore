@@ -424,6 +424,52 @@ fn maintenance_request_and_response_field_shapes_are_frozen() {
 }
 
 #[test]
+fn proof_namespace_state_status_value_names_stay_package_prefixed() {
+    // proto3 scopes enum VALUE names to the PACKAGE, not to the enum. These once
+    // shipped bare (`UNSPECIFIED`, `ABSENT`, ...), which reserved those names
+    // across all of `lore.domain.v1` and would have made the next enum's
+    // `UNSPECIFIED` a build failure somewhere unrelated.
+    //
+    // The Rust variant names are NOT the guard here: prost strips the enum's own
+    // name as a prefix, so `Unspecified` reads identically either way and a
+    // regression to bare names would be invisible from the Rust side. The
+    // generated `as_str_name` strings are the only place the proto spelling
+    // survives, so that is what this pins.
+    for (status, name) in [
+        (
+            ProofNamespaceStateStatus::Unspecified,
+            "PROOF_NAMESPACE_STATE_STATUS_UNSPECIFIED",
+        ),
+        (
+            ProofNamespaceStateStatus::MatchedQuiescent,
+            "PROOF_NAMESPACE_STATE_STATUS_MATCHED_QUIESCENT",
+        ),
+        (
+            ProofNamespaceStateStatus::MatchedNotQuiescent,
+            "PROOF_NAMESPACE_STATE_STATUS_MATCHED_NOT_QUIESCENT",
+        ),
+        (
+            ProofNamespaceStateStatus::Absent,
+            "PROOF_NAMESPACE_STATE_STATUS_ABSENT",
+        ),
+        (
+            ProofNamespaceStateStatus::Mismatch,
+            "PROOF_NAMESPACE_STATE_STATUS_MISMATCH",
+        ),
+    ] {
+        assert_eq!(status.as_str_name(), name);
+        assert_eq!(ProofNamespaceStateStatus::from_str_name(name), Some(status));
+    }
+    // The bare spellings must no longer resolve, or a stale peer would keep
+    // decoding them silently.
+    assert_eq!(
+        ProofNamespaceStateStatus::from_str_name("UNSPECIFIED"),
+        None
+    );
+    assert_eq!(ProofNamespaceStateStatus::from_str_name("ABSENT"), None);
+}
+
+#[test]
 fn enum_discriminants_are_frozen() {
     assert_eq!(DomainOperationPrepareStatus::Prepared as i32, 1);
     assert_eq!(DomainOperationPrepareStatus::Committed as i32, 2);

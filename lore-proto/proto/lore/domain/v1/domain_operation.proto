@@ -64,12 +64,17 @@ message DomainOperationProofNamespaceStateGetRequestV1 {
   bytes namespace_claim_nonce = 6;
 }
 
+// proto3 scopes enum VALUE names to the enclosing package, not to the enum, so
+// every value here shares one namespace with every other enum in
+// `lore.domain.v1`. Bare names would make the next `UNSPECIFIED` anywhere in the
+// package a build failure rather than a local choice, which is why every other
+// enum in this file is prefixed too.
 enum ProofNamespaceStateStatus {
-  UNSPECIFIED = 0;
-  MATCHED_QUIESCENT = 1;
-  MATCHED_NOT_QUIESCENT = 2;
-  ABSENT = 3;
-  MISMATCH = 4;
+  PROOF_NAMESPACE_STATE_STATUS_UNSPECIFIED = 0;
+  PROOF_NAMESPACE_STATE_STATUS_MATCHED_QUIESCENT = 1;
+  PROOF_NAMESPACE_STATE_STATUS_MATCHED_NOT_QUIESCENT = 2;
+  PROOF_NAMESPACE_STATE_STATUS_ABSENT = 3;
+  PROOF_NAMESPACE_STATE_STATUS_MISMATCH = 4;
 }
 
 message DomainOperationProofNamespaceStateGetResponseV1 {
