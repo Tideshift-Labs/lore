@@ -103,6 +103,32 @@ topic — chronological execution notes belong in `docs/worklogs/`.
   inner fn through another caller — a merge can drop/replace one delegated argument at just that
   call site. Observe the caller-owned output's effect end-to-end, not just that the call returned
   `Ok` (`commit.rs`'s `commit_files_and_rehash_wrapper_forwards_callers_modified_times`).
+- A cross-repo fixture path (`CARGO_MANIFEST_DIR/../../lorehub/...`) hard-fails a standalone
+  checkout with no sibling `lorehub` (an upstream contributor's clone, or a fork clone without
+  `lorehub` beside it) even though the "must FAIL, never skip" convention is correct for OUR
+  workspace, where the sibling is always present. Distinguish the two facts by probing the sibling
+  **repo root directory**, not the fixture file: root absent -> print one loud notice and return
+  early (skip only this environment shape); root present but the named fixture missing/unreadable
+  -> panic exactly as before (real drift in our own workspace, so this branch is the only one our
+  own CI ever takes and costs zero coverage here). An env override
+  (`LORE_NOTIFICATION_PLANE_FIXTURES`) that fails to resolve is always a panic, never a skip — an
+  explicit request deserves an error. Put the resolver in one `tests/common/*.rs` file per crate
+  (`#[path = "common/fixture_resolution.rs"] mod fixture_resolution;` in each consuming
+  `tests/*.rs`, the same per-file `#[path]` convention `case_namespace.rs` already uses — cargo
+  autodiscovers each top-level `tests/*.rs` as its own binary, so this costs no shared-aggregator
+  edit other lanes are touching). Because a `#[test]` fn can't return a "skipped" status (no
+  runtime skip in libtest, only pre-declared `#[ignore]`), a helper that loads the fixture must
+  return `Option<Value>` and every direct call site becomes `let Some(x) = load_fixture(...) else
+  { return };` — a positive test's own "pass" therefore doesn't distinguish ran-for-real from
+  skipped-with-notice by exit code alone; grep stdout for the printed `SKIP <test_name>:` line to
+  tell them apart. Proven both ways rather than assumed: pointing the override at a temp directory
+  of copied fixtures reproduces the full green suite; pointing it at an empty temp directory
+  reproduces the exact same panic site/message as fixture drift, at `remote_notification_conformance.rs:78:29`
+  in this repro (`error: os error 2`) — a `.is_dir()` check on the resolved directory alone is not
+  enough, because an override can validly resolve to an existing-but-empty directory and must still
+  fail on the specific missing file, not silently succeed. See
+  `lore-server/tests/common/fixture_resolution.rs` and `lore-postgres/tests/common/fixture_resolution.rs`
+  (WP-111 residual, 2026-09-15).
 - To pin a "store only after X succeeds" ordering property through a realistic pipeline with many
   unrelated store calls first, fault-inject by key identity (computed ahead via its own public
   derivation), not ordinal call number, which only works for a fully enumerated narrow sequence.

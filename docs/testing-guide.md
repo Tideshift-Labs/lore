@@ -20,6 +20,14 @@ embedded engine is client-relevant.
 - Integration tests live under each crate's `tests/` and in `lore-integration-tests`.
 - Infrastructure-gated Postgres/S3 tests are `#[ignore]`; run them with `-- --ignored` and the
   documented environment variables. An unset environment must never report an infra test as passed.
+- **Always run `cargo` with the working directory inside `lore/`.** `.cargo/config.toml` is resolved
+  from the CWD, never from `--manifest-path`, so `cargo test --manifest-path <lore>/Cargo.toml -p
+  lore-server` from a parent directory silently drops `--cfg tokio_unstable` and `--cfg
+  uuid_unstable`. Symptom is a compile cascade in files you never touched — `unresolved import
+  crate::telemetry::OtelTokioRuntimeMetrics` ("found an item that was configured out") plus `Uuid:
+  IntoBytes/FromBytes/Immutable is not satisfied` at
+  `lore-server/src/protocol/replication_store/header.rs:10`. Do not read that as another lane's
+  in-flight edit; `Set-Location <lore>` first and rebuild.
 - After a conflict-heavy merge, build affected test targets before interpreting individual failures.
   Then run formatting and warnings-as-errors Clippy on the affected crates.
 

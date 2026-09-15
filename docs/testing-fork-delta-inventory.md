@@ -493,3 +493,25 @@ delta produced. Keep it durable, not chronological — chronological execution n
   fenced handler individually for a `handler(domain_context: None, ...)` call asserting the pre-gate
   outcome before assuming coverage exists.
 
+- **CR-032 superseded-epoch outbox pruning [SERVER, WP-119 Step C/Phase 8]**:
+  `lore-postgres/src/domain/outbox/prune.rs`'s `prune_superseded_epochs` reaps `consumer_safe` rows at
+  a placement the cell has reset away from, proven by a bounded backward walk of
+  `lore_outbox_reset_generations` admitting only an unbroken run of `cleared` hops from the proven
+  current tuple; the delete carries no frontier/sequence bound, since a superseded epoch's
+  `broker_sequence` is a different, incomparable sequence space from the current placement's.
+  **The reset-in-progress fence this reuses from `prune_consumer_safe` is cell-wide, not per-hop**:
+  `MembershipSnapshot::reset_in_progress` (`membership.rs`'s `read_membership_snapshot`) is
+  `EXISTS ... WHERE cell_id = $1 AND state = 'reset_in_progress'` with no `old_stream_*`/`new_stream_*`
+  filter, so an open fence ANYWHERE in a cell's reset history blocks `prove_safe_vector` -- and
+  therefore the whole walk -- before it starts, not just the hop it sits on and whatever is behind it.
+  The schema's own partial unique index (`lore_outbox_reset_generations_fence`) means only the
+  most-recently-accepted reset can ever be non-cleared, so a test meant to prove "a broken link blocks
+  only what's behind it" needs a genuinely MISSING transition row, not a `reset_in_progress` one -- an
+  in-progress hop anywhere blocks universally instead of narrowing the admitted set. Gate:
+  `cargo test -p lore-postgres --test domain_outbox_prune -- --ignored --test-threads=1` under a
+  disposable `LORE_TEST_PG_URL` (16 cases total in that file, following `prune_consumer_safe`'s
+  existing per-case `CaseNamespace` convention); pure unit cases (outcome constructors,
+  `MAX_RESET_CHAIN_DEPTH`) are `cargo test -p lore-postgres --lib domain::outbox::prune::tests`. The
+  64-hop `MAX_RESET_CHAIN_DEPTH` bound is pinned as a constant only -- building a real 64-row chain
+  fixture to prove the depth cutoff itself was judged disproportionate and was not attempted.
+
