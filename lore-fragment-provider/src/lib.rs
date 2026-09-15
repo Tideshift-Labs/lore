@@ -1656,7 +1656,9 @@ impl fmt::Debug for FragmentDispatchRuntimeConfig {
 /// Exact maxima of every pool the process opens against the cell database.
 ///
 /// Composition supplies every value from its owning configuration. The seam neither defaults nor
-/// infers one pool's maximum from another pool.
+/// infers one pool's maximum from another pool — including `relay_pool_max`, where the caller
+/// decides whether the relay is enabled and passes zero when it is not. The seam cannot read
+/// `[outbox_relay]` and must not guess at it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FragmentProcessPoolInventory {
     pub immutable_pool_max: u32,
@@ -1664,10 +1666,15 @@ pub struct FragmentProcessPoolInventory {
     pub lock_pool_max: u32,
     pub domain_pool_max: u32,
     pub dispatch_pool_max: u32,
+    /// CR-032's event-relay pool, or zero when `[outbox_relay]` is disabled and
+    /// the process opens none. The only member that may be zero, and the only
+    /// one whose presence depends on configuration rather than on the process
+    /// being Postgres-mode at all.
+    pub relay_pool_max: u32,
 }
 
 impl FragmentProcessPoolInventory {
-    /// Validate the exact five-pool process inventory before composition opens
+    /// Validate the exact six-pool process inventory before composition opens
     /// any database or object-store connection.
     pub fn validate(
         self,
@@ -1678,6 +1685,7 @@ impl FragmentProcessPoolInventory {
             self.lock_pool_max,
             self.domain_pool_max,
             self.dispatch_pool_max,
+            self.relay_pool_max,
         )
         .map_err(FragmentProviderActivationError::DispatchPool)?;
         Ok(ValidatedFragmentProcessPoolInventory {
@@ -1687,7 +1695,7 @@ impl FragmentProcessPoolInventory {
     }
 }
 
-/// Canonically validated five-pool inventory carried from server preflight to
+/// Canonically validated six-pool inventory carried from server preflight to
 /// the dispatch pool without repeating or reimplementing the arithmetic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ValidatedFragmentProcessPoolInventory {

@@ -165,7 +165,7 @@ fn lifecycle_is_composed_and_proven_ready_before_provider_activation() {
 }
 
 #[test]
-fn whole_server_validates_the_exact_five_pool_inventory_before_any_boot_io() {
+fn whole_server_validates_the_exact_six_pool_inventory_before_any_boot_io() {
     let startup = between(
         SERVER,
         "let fragment_process_pool_inventory = postgres_fragment_process_pool_inventory",
@@ -200,27 +200,41 @@ fn whole_server_validates_the_exact_five_pool_inventory_before_any_boot_io() {
         "server must use the seam-owned canonical validation exactly once"
     );
 
-    let valid = |values: [u32; 5]| {
-        let [immutable, mutable, lock, domain, dispatch] = values;
+    let valid = |values: [u32; 6]| {
+        let [immutable, mutable, lock, domain, dispatch, relay] = values;
         FragmentProcessPoolInventory {
             immutable_pool_max: immutable,
             mutable_pool_max: mutable,
             lock_pool_max: lock,
             domain_pool_max: domain,
             dispatch_pool_max: dispatch,
+            relay_pool_max: relay,
         }
         .validate()
     };
-    assert!(valid([1, 2, 3, 4, 5]).is_ok(), "total 15 must pass");
-    assert!(valid([2, 3, 4, 5, 6]).is_ok(), "exact total 20 must pass");
+    assert!(valid([1, 2, 3, 4, 5, 0]).is_ok(), "total 15 must pass");
+    assert!(
+        valid([2, 3, 4, 5, 5, 1]).is_ok(),
+        "exact total 20 must pass"
+    );
+    // A zero relay pool is a disabled relay, which every cell is today.
+    assert!(
+        valid([1, 1, 1, 1, 1, 0]).is_ok(),
+        "a disabled relay must not read as an undeclared pool"
+    );
+    // ...and counting an enabled one can legitimately push a cell over.
+    assert!(
+        valid([5, 5, 5, 4, 1, 5]).is_err(),
+        "24 connections must fail before boot I/O once the relay is counted"
+    );
     for invalid in [
-        [0, 1, 1, 1, 1],
-        [1, 0, 1, 1, 1],
-        [1, 1, 0, 1, 1],
-        [1, 1, 1, 0, 1],
-        [1, 1, 1, 1, 0],
-        [u32::MAX, 1, 1, 1, 1],
-        [4, 4, 4, 4, 5],
+        [0, 1, 1, 1, 1, 0],
+        [1, 0, 1, 1, 1, 0],
+        [1, 1, 0, 1, 1, 0],
+        [1, 1, 1, 0, 1, 0],
+        [1, 1, 1, 1, 0, 0],
+        [u32::MAX, 1, 1, 1, 1, 0],
+        [4, 4, 4, 4, 5, 0],
     ] {
         assert!(
             valid(invalid).is_err(),
@@ -479,7 +493,7 @@ fn get_remains_unmetered_and_phase5_config_has_no_spool_route() {
 ///
 /// Nothing else pins that it stays unused there. CD-8's contract is that the
 /// retention pass runs on the pool the provider entry already opened, so that
-/// `DISPATCH_PROCESS_CONNECTION_LIMIT`'s five-pool process inventory is not
+/// `DISPATCH_PROCESS_CONNECTION_LIMIT`'s six-pool process inventory is not
 /// renegotiated; a second pool opened anywhere in this crate would break that
 /// silently, since every pool validates its own budget in isolation and the
 /// inventory check would still pass.

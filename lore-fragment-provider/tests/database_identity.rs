@@ -68,9 +68,10 @@ fn dispatch_config_debug_redacts_url_ca_and_physical_identity() {
             lock_pool_max: 1,
             domain_pool_max: 1,
             dispatch_pool_max: 1,
+            relay_pool_max: 0,
         }
         .validate()
-        .expect("valid five-pool inventory"),
+        .expect("valid six-pool inventory"),
         connect_timeout: Duration::from_secs(1),
         acquire_timeout: Duration::from_secs(1),
         statement_timeout: Duration::from_secs(1),

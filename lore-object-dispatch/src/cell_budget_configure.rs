@@ -239,7 +239,7 @@ async fn configure_budget_inner(
         statement_timeout: Duration::from_secs(10),
         lock_timeout: Duration::from_secs(2),
         tls,
-        budget: DispatchConnectionBudget::new(1, 1, 1, 1, 1)
+        budget: DispatchConnectionBudget::new(1, 1, 1, 1, 1, 0)
             .map_err(|_| BudgetConfigureError::InvalidConfiguration)?,
     })
     .map_err(|_| BudgetConfigureError::ConnectionRefused)?;

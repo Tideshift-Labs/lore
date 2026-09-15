@@ -219,10 +219,16 @@ async fn rebuild_postgres_metering(settings: &Settings) -> Result<u64> {
     let fragment_provider_enabled = plugins::postgres::fragment_provider_enabled(&plugin_config)
         .map_err(|error| anyhow!("Invalid Postgres immutable store configuration: {error}"))?;
     if fragment_provider_enabled {
-        // Validate the exact five-pool inventory before opening even the
+        // Validate the exact six-pool inventory before opening even the
         // provider-free domain pool. This is the same activation invariant as
         // normal server boot, but the validated value is deliberately not used
         // to construct S3, a provider gateway, or an object-dispatch client.
+        //
+        // The inventory it builds counts CR-032's relay pool whenever
+        // `[outbox_relay]` is enabled, even though this maintenance path never
+        // spawns the relay. That over-declares by five connections rather than
+        // under-declaring, so it can only refuse a configuration that a serving
+        // process would also refuse — never admit one it would reject.
         let process_pool_inventory = postgres_fragment_process_pool_inventory(settings)?
             .ok_or_else(|| anyhow!("enabled fragment_provider has no process pool inventory"))?;
         let _validated_process_pool_inventory = process_pool_inventory
@@ -1286,10 +1292,19 @@ fn postgres_fragment_process_pool_inventory(
     }
     let mutable_config = resolved_postgres_store_config(settings, "mutable_store")?;
     let lock_config = resolved_postgres_store_config(settings, "lock_store")?;
+    // `[outbox_relay]` is a top-level setting rather than a store's own, so the
+    // relay's pool cannot be discovered from the three store configurations
+    // above. Composition is the only place that knows both, which is why the
+    // flag is passed rather than read.
+    let relay_enabled = settings
+        .outbox_relay
+        .as_ref()
+        .is_some_and(|relay| relay.enabled);
     plugins::postgres::fragment_process_pool_inventory(
         &immutable_config,
         &mutable_config,
         &lock_config,
+        relay_enabled,
     )
     .map_err(|error| anyhow!("Invalid Postgres process pool inventory: {error}"))
 }

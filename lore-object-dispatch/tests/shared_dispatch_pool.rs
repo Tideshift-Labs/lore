@@ -380,7 +380,7 @@ fn pool_config(role: DispatchPoolRole) -> DispatchPoolConfig {
         statement_timeout: Duration::from_millis(2_000),
         lock_timeout: Duration::from_millis(1_000),
         tls: DispatchTlsMode::Disabled,
-        budget: DispatchConnectionBudget::new(1, 1, 1, 1, 5).expect("test process budget"),
+        budget: DispatchConnectionBudget::new(1, 1, 1, 1, 5, 0).expect("test process budget"),
     }
 }
 

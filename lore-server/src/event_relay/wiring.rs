@@ -115,12 +115,24 @@ const REMOTE_NOTIFICATION_MODE: &str = "remote";
 /// borrowing from it would contend with the mutation transactions it exists to
 /// serve.
 ///
-/// TODO(WP-119 Phase 8): this is a sixth pool, outside the five-pool maxima
-/// `FragmentProcessPoolInventory` checks against the process budget. Fold it
-/// into that accounting the next time the inventory is revised; two
-/// connections is small enough not to move the sum today, which is why it is a
-/// constant rather than a knob.
-const RELAY_POOL_MAX: u32 = 5;
+/// This is the sixth pool in `FragmentProcessPoolInventory`'s process budget,
+/// which is where it is checked against the 20-connection per-process ceiling
+/// — but only on a cell whose fragment provider is enabled.
+/// `plugins::postgres::fragment_process_pool_inventory` returns `None` before
+/// it ever reads this value when the provider is off, so no sum is computed and
+/// a relay-enabled, provider-disabled cell is not held to the ceiling at all.
+/// That is the existing shape of the budget, which exists to gate dispatch-pool
+/// construction, and is stated here rather than left to be discovered.
+/// `plugins::postgres::fragment_process_pool_inventory` reads this constant and
+/// passes it as `relay_pool_max` when `[outbox_relay]` is enabled, and passes
+/// zero when it is not — the relay opens no pool at all in that case, so
+/// reserving for it would refuse configurations that are actually within
+/// budget.
+///
+/// It stays a constant rather than a knob because it is derived from the number
+/// of borrowers above, not from capacity: an operator who changes it is not
+/// tuning a pool, they are asserting a different set of concurrent loops.
+pub(crate) const RELAY_POOL_MAX: u32 = 5;
 
 /// What server composition keeps after the relay is wired.
 pub struct EventRelayHandles {

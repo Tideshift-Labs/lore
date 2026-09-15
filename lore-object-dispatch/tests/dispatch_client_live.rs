@@ -467,7 +467,7 @@ fn pool_config(
         statement_timeout,
         lock_timeout: Duration::from_millis(2_000),
         tls: DispatchTlsMode::Disabled,
-        budget: DispatchConnectionBudget::new(1, 1, 1, 1, 2).expect("live process budget"),
+        budget: DispatchConnectionBudget::new(1, 1, 1, 1, 2, 0).expect("live process budget"),
     }
 }
 
@@ -956,7 +956,7 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
     );
     single_slot.pool_max = 1;
     single_slot.budget =
-        DispatchConnectionBudget::new(1, 1, 1, 1, 1).expect("single-slot live process budget");
+        DispatchConnectionBudget::new(1, 1, 1, 1, 1, 0).expect("single-slot live process budget");
     single_slot.acquire_timeout = Duration::from_millis(500);
     let retrying = DispatchRuntimeClient::new(Arc::new(
         DispatchRuntimePool::new(single_slot).expect("single-slot runtime pool"),

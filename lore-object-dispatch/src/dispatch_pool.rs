@@ -1,14 +1,16 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! The separately credentialed dispatch-runtime connection pool (WP-114 CD-3), one of the five
+//! The separately credentialed dispatch-runtime connection pool (WP-114 CD-3), one of the
 //! steady-state pools against a cell database.
 //!
 //! CR-033 D1 made the cell's own PostgreSQL database the dispatch authority. Every retained
 //! mutation asserts `session_user = 'object_dispatch_retention_runtime'` and grants `EXECUTE` only
 //! to that role, and 0020's enrollment asserts the maintenance role, so `lore-postgres`'s
-//! immutable, mutable, lock, and domain pools cannot carry these calls. This module owns the fifth
-//! pool, its credential identity check, and its bounded-execution settings.
+//! immutable, mutable, lock, and domain pools cannot carry these calls. This module owns the
+//! dispatch pool, its credential identity check, and its bounded-execution settings, and it also
+//! carries [`DispatchConnectionBudget`], the arithmetic every pool in the process is checked
+//! against — including CR-032's event-relay pool, which this module does not own.
 //!
 //! The opt-in Phase 5 `fragment_provider` composition constructs one shared runtime pool after
 //! configuration, process-budget, and lifecycle preflight. The pool itself still installs no
@@ -47,19 +49,22 @@ pub const DISPATCH_PROCESS_CONNECTION_LIMIT: u32 = 20;
 /// The connection-budget statement this pool is sized against, stated rather than implied.
 ///
 /// CR-033 D1 makes the cell database the dispatch authority. A loreserver replica therefore opens
-/// this pool beside `lore-postgres`'s immutable, mutable, lock, and domain pools. All five target
-/// the same cell database and none coordinate on connections, so the process ceiling is the sum of
-/// their independently configured maxima, not a shared or inferred `pool_max`.
+/// this pool beside `lore-postgres`'s immutable, mutable, lock, and domain pools, and beside
+/// CR-032's relay pool when `[outbox_relay]` is enabled. All of them target the same cell database
+/// and none coordinate on connections, so the process ceiling is the sum of their independently
+/// configured maxima, not a shared or inferred `pool_max`.
 ///
 /// This is `lorehub/docs/learnings/do-managed-pg-connection-budget.md`'s finding: a managed
 /// instance sized for the app pools alone rather than the full consumer set was exhausted at
 /// `max_connections = 25`, and the exhaustion surfaced as SQLSTATE `53300` in three
 /// unrelated-looking failures rather than as an obvious pool error.
 pub const DISPATCH_CONNECTION_BUDGET_STATEMENT: &str = "\
-Per loreserver process in a cell: lore-postgres immutable, mutable, lock, and domain pools plus \
-one lore-object-dispatch dispatch-runtime pool, all against the same cell database and none \
-coordinating on connections. Composition must add the five independently configured maxima and \
-refuse a sum above 20 PostgreSQL connections before constructing the dispatch pool. The managed \
+Per loreserver process in a cell: lore-postgres immutable, mutable, lock, and domain pools, one \
+lore-object-dispatch dispatch-runtime pool, and CR-032's event-relay pool when [outbox_relay] is \
+enabled, all against the same cell database and none coordinating on connections. Composition \
+must add the six independently configured maxima and refuse a sum above 20 PostgreSQL \
+connections before constructing the dispatch pool. The relay's maximum is zero exactly when the \
+relay is disabled, so a cell that has not enabled it reserves nothing for it. The managed \
 instance must be sized for that sum across every replica plus every other consumer of the same \
 instance, per lorehub/docs/learnings/do-managed-pg-connection-budget.md.";
 
@@ -76,17 +81,26 @@ pub struct DispatchConnectionBudget {
     lock_pool_max: u32,
     domain_pool_max: u32,
     dispatch_pool_max: u32,
+    relay_pool_max: u32,
     connections_per_replica: u32,
 }
 
 impl DispatchConnectionBudget {
     /// Validate an exact process inventory before any dispatch pool or connection is constructed.
+    ///
+    /// `relay_pool_max` is the one component that may be zero, and zero is a
+    /// statement rather than an omission: CR-032's relay pool is opened only
+    /// when `[outbox_relay]` is enabled, so a cell running the relay off opens
+    /// no such connections and must not reserve any. Every other pool is opened
+    /// unconditionally by a Postgres-mode process, so a zero there is a caller
+    /// that forgot to declare one.
     pub fn new(
         immutable_pool_max: u32,
         mutable_pool_max: u32,
         lock_pool_max: u32,
         domain_pool_max: u32,
         dispatch_pool_max: u32,
+        relay_pool_max: u32,
     ) -> Result<Self, DispatchPoolError> {
         if [
             immutable_pool_max,
@@ -107,6 +121,7 @@ impl DispatchConnectionBudget {
             .and_then(|total| total.checked_add(lock_pool_max))
             .and_then(|total| total.checked_add(domain_pool_max))
             .and_then(|total| total.checked_add(dispatch_pool_max))
+            .and_then(|total| total.checked_add(relay_pool_max))
             .ok_or(DispatchPoolError::InvalidConfiguration(
                 "process pool inventory overflows the connection count",
             ))?;
@@ -122,6 +137,7 @@ impl DispatchConnectionBudget {
             lock_pool_max,
             domain_pool_max,
             dispatch_pool_max,
+            relay_pool_max,
             connections_per_replica,
         })
     }
@@ -144,6 +160,11 @@ impl DispatchConnectionBudget {
 
     pub const fn dispatch_pool_max(self) -> u32 {
         self.dispatch_pool_max
+    }
+
+    /// Zero when `[outbox_relay]` is disabled, which is the common case today.
+    pub const fn relay_pool_max(self) -> u32 {
+        self.relay_pool_max
     }
 
     /// Total PostgreSQL connections one loreserver process may hold against the cell database.
@@ -276,7 +297,7 @@ struct DispatchSession {
 }
 
 /// The separately credentialed dispatch pool beside the immutable, mutable, lock, and domain
-/// pools in the exact five-pool steady-state inventory.
+/// pools in the exact six-pool steady-state inventory.
 ///
 /// Connections are opened on demand up to `pool_max` and returned to the idle set when a lease is
 /// dropped. A lease the caller marks poisoned is closed rather than reused, which is what the
@@ -612,19 +633,80 @@ mod tests {
             statement_timeout: Duration::from_millis(2_000),
             lock_timeout: Duration::from_millis(1_000),
             tls: DispatchTlsMode::Disabled,
-            budget: DispatchConnectionBudget::new(1, 2, 3, 4, 5).expect("test process budget"),
+            budget: DispatchConnectionBudget::new(1, 2, 3, 4, 5, 0).expect("test process budget"),
         }
     }
 
     #[test]
-    fn exact_five_pool_budget_is_twenty_connections_per_replica() {
-        let budget = DispatchConnectionBudget::new(2, 3, 4, 5, 6).expect("exact process budget");
+    fn exact_six_pool_budget_is_twenty_connections_per_replica() {
+        // Six distinct values cannot sum to 20 (1+2+3+4+5+6 is already 21), so
+        // one pair must repeat. It is deliberately immutable/mutable rather
+        // than domain/dispatch: those two are the pair a constructor argument
+        // transposition would most plausibly swap, and equal values there would
+        // make this assertion blind to it.
+        let budget = DispatchConnectionBudget::new(2, 2, 4, 6, 5, 1).expect("exact process budget");
         assert_eq!(budget.immutable_pool_max, 2);
-        assert_eq!(budget.mutable_pool_max, 3);
+        assert_eq!(budget.mutable_pool_max, 2);
         assert_eq!(budget.lock_pool_max, 4);
-        assert_eq!(budget.domain_pool_max, 5);
-        assert_eq!(budget.dispatch_pool_max, 6);
+        assert_eq!(budget.domain_pool_max, 6);
+        assert_eq!(budget.dispatch_pool_max, 5);
+        assert_eq!(budget.relay_pool_max, 1);
         assert_eq!(budget.connections_per_replica(), 20);
+    }
+
+    /// The relay's maximum is the one component that may be zero, because the
+    /// relay pool is opened only when `[outbox_relay]` is enabled. Zero must
+    /// therefore reserve nothing rather than be refused as an undeclared pool.
+    #[test]
+    fn a_zero_relay_pool_is_accepted_and_reserves_nothing() {
+        let without =
+            DispatchConnectionBudget::new(5, 5, 5, 4, 1, 0).expect("relay-disabled budget");
+        assert_eq!(without.relay_pool_max(), 0);
+        assert_eq!(without.connections_per_replica(), 20);
+
+        for zero_elsewhere in [
+            DispatchConnectionBudget::new(0, 5, 5, 4, 1, 5),
+            DispatchConnectionBudget::new(5, 0, 5, 4, 1, 5),
+            DispatchConnectionBudget::new(5, 5, 0, 4, 1, 5),
+            DispatchConnectionBudget::new(5, 5, 5, 0, 1, 5),
+            DispatchConnectionBudget::new(5, 5, 5, 4, 0, 5),
+        ] {
+            assert_eq!(
+                zero_elsewhere.err(),
+                Some(DispatchPoolError::InvalidConfiguration(
+                    "every declared process pool maximum must be positive"
+                )),
+                "only the relay pool may be zero"
+            );
+        }
+    }
+
+    /// The point of counting the relay at all: a configuration that fits inside
+    /// the ceiling with the relay off must refuse once the relay is on.
+    ///
+    /// The staging loreserver is the live case. Its three store pools at 5 plus
+    /// a domain pool at 4 sum to 19, and CR-032's five relay connections take
+    /// that to 24. It does not refuse today only because its fragment provider
+    /// is off, so no inventory is built and this arithmetic never runs —
+    /// enabling both is what makes the refusal real, and retuning those pools
+    /// is an operator decision rather than something this crate should paper
+    /// over.
+    #[test]
+    fn a_configuration_inside_the_ceiling_without_the_relay_is_refused_with_it() {
+        let relay_off = DispatchConnectionBudget::new(5, 5, 4, 2, 1, 0);
+        assert_eq!(
+            relay_off
+                .expect("17 connections is inside the ceiling")
+                .connections_per_replica(),
+            17
+        );
+        assert_eq!(
+            DispatchConnectionBudget::new(5, 5, 4, 2, 1, 5).err(),
+            Some(DispatchPoolError::InvalidConfiguration(
+                "process pool inventory exceeds the hard per-process connection limit"
+            )),
+            "22 connections must be refused before any pool is opened"
+        );
     }
 
     #[test]
@@ -806,7 +888,7 @@ mod tests {
         let mut value = config();
         value.pool_max = 1;
         value.budget =
-            DispatchConnectionBudget::new(1, 2, 3, 4, 1).expect("single-slot test budget");
+            DispatchConnectionBudget::new(1, 2, 3, 4, 1, 0).expect("single-slot test budget");
         value.acquire_timeout = Duration::from_millis(20);
         let pool = DispatchRuntimePool::new(value).expect("pool");
         assert!(matches!(

@@ -1262,7 +1262,7 @@ fn pool_config(
         statement_timeout,
         lock_timeout: Duration::from_secs(1),
         tls: DispatchTlsMode::Disabled,
-        budget: DispatchConnectionBudget::new(1, 1, 1, 1, 1).expect("live process budget"),
+        budget: DispatchConnectionBudget::new(1, 1, 1, 1, 1, 0).expect("live process budget"),
     }
 }
 

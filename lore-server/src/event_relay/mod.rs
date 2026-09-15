@@ -104,5 +104,6 @@ pub use reset_service::StreamResetHandler;
 pub use reset_wire::StreamResetServiceServer;
 pub use startup::StartupRefusal;
 pub use startup::enforce_startup_preconditions;
+pub(crate) use wiring::RELAY_POOL_MAX;
 pub use worker::EventRelayWorker;
 pub use worker::RowOutcome;

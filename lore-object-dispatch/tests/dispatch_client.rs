@@ -1706,7 +1706,7 @@ fn both_new_files_carry_the_spdx_header() {
 
 #[test]
 fn the_connection_budget_statement_is_present_and_arithmetically_true() {
-    let exact_limit = DispatchConnectionBudget::new(2, 3, 4, 5, 6).expect("exact limit");
+    let exact_limit = DispatchConnectionBudget::new(2, 3, 4, 5, 6, 0).expect("exact limit");
     assert_eq!(exact_limit.connections_per_replica(), 20);
     for fragment in [
         "immutable, mutable, lock, and domain pools plus",
@@ -1773,7 +1773,7 @@ fn pool_config(role: DispatchPoolRole) -> DispatchPoolConfig {
 }
 
 fn test_budget(dispatch_pool_max: u32) -> DispatchConnectionBudget {
-    DispatchConnectionBudget::new(1, 1, 1, 1, dispatch_pool_max).expect("test process budget")
+    DispatchConnectionBudget::new(1, 1, 1, 1, dispatch_pool_max, 0).expect("test process budget")
 }
 
 // ------------------------------------------------------------------------------------------

@@ -32,6 +32,7 @@ async fn normal_construction_attests_clean_namespace_before_dispatch_setup() {
         lock_pool_max: 4,
         domain_pool_max: 4,
         dispatch_pool_max: 2,
+        relay_pool_max: 0,
     }
     .validate()
     .unwrap();
@@ -148,6 +149,7 @@ async fn clean_initialized_normal_provider_upload_query_read_and_grants_are_live
         lock_pool_max: 4,
         domain_pool_max: 4,
         dispatch_pool_max: 2,
+        relay_pool_max: 0,
     }
     .validate()
     .unwrap();

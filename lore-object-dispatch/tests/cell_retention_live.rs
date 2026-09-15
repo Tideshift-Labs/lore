@@ -113,7 +113,7 @@ impl Fixture {
                 statement_timeout: Duration::from_secs(5),
                 lock_timeout: Duration::from_secs(1),
                 tls: DispatchTlsMode::PinnedRootCa(pem),
-                budget: DispatchConnectionBudget::new(1, 1, 1, 1, 1).unwrap(),
+                budget: DispatchConnectionBudget::new(1, 1, 1, 1, 1, 0).unwrap(),
             })
             .unwrap(),
         );

@@ -42,6 +42,7 @@ async fn ordinary_put_after_committed_upload_loses_readable_epoch_and_returns_sl
         lock_pool_max: 4,
         domain_pool_max: 4,
         dispatch_pool_max: 2,
+        relay_pool_max: 0,
     }
     .validate()
     .unwrap();

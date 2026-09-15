@@ -393,7 +393,7 @@ fn pool_config(role: DispatchPoolRole) -> DispatchPoolConfig {
         statement_timeout: Duration::from_millis(250),
         lock_timeout: Duration::from_millis(250),
         tls: DispatchTlsMode::Disabled,
-        budget: DispatchConnectionBudget::new(1, 1, 1, 1, 1)
+        budget: DispatchConnectionBudget::new(1, 1, 1, 1, 1, 0)
             .expect("minimal process budget for the offline role-guard fixture"),
     }
 }

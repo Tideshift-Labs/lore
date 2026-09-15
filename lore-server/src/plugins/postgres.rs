@@ -97,7 +97,7 @@ pub struct PostgresStoreConfig {
     /// subsystem that is idle until cutover. The two things it actually does
     /// before then - bootstrap DDL and a singleton state read - need one
     /// connection, and the backfill walks one repository at a time. Raise it
-    /// only while keeping the five-pool checked sum within budget.
+    /// only while keeping the six-pool checked sum within budget.
     #[serde(default = "default_domain_pool_max")]
     pub domain_pool_max: u32,
     /// S3-compatible object storage for fragment bytes and authoritative
@@ -755,10 +755,17 @@ pub(crate) fn fragment_provider_enabled(config: &toml::Value) -> Result<bool, Pl
 /// the three store pools use their own `pool_max`, the domain pool uses the
 /// mutable configuration's `domain_pool_max`, and dispatch uses only its
 /// mandatory nested value.
+/// `relay_enabled` comes from `[outbox_relay]`, which lives in `Settings`
+/// rather than in any store's own configuration, so composition passes it in.
+/// It decides presence, not size: CR-032's relay opens exactly
+/// `RELAY_POOL_MAX` connections when it runs and none at all when it does not,
+/// and reserving for a pool the process never opens would refuse cells that are
+/// genuinely inside the budget.
 pub(crate) fn fragment_process_pool_inventory(
     immutable_config: &toml::Value,
     mutable_config: &toml::Value,
     lock_config: &toml::Value,
+    relay_enabled: bool,
 ) -> Result<Option<FragmentProcessPoolInventory>, PluginError> {
     let immutable = parse_config(PLUGIN_NAME, immutable_config)?;
     let Some(fragment_provider) = enabled_fragment_provider_config(PLUGIN_NAME, &immutable)? else {
@@ -772,6 +779,11 @@ pub(crate) fn fragment_process_pool_inventory(
         lock_pool_max: lock.pool_max,
         domain_pool_max: mutable.domain_pool_max,
         dispatch_pool_max: fragment_provider.dispatch_pool_max,
+        relay_pool_max: if relay_enabled {
+            crate::event_relay::RELAY_POOL_MAX
+        } else {
+            0
+        },
     }))
 }
 
@@ -2167,7 +2179,7 @@ pool_max = 3
         )
         .expect("lock config");
 
-        let inventory = fragment_process_pool_inventory(&immutable, &mutable, &lock)
+        let inventory = fragment_process_pool_inventory(&immutable, &mutable, &lock, false)
             .expect("valid inventory")
             .expect("enabled provider inventory");
         assert_eq!(
@@ -2178,6 +2190,21 @@ pool_max = 3
                 lock_pool_max: 3,
                 domain_pool_max: 4,
                 dispatch_pool_max: 5,
+                relay_pool_max: 0,
+            }
+        );
+
+        // The relay flag decides presence, not size. With `[outbox_relay]` on,
+        // the same three store configurations must reserve CR-032's whole pool
+        // and nothing else about the inventory may move.
+        let with_relay = fragment_process_pool_inventory(&immutable, &mutable, &lock, true)
+            .expect("valid inventory")
+            .expect("enabled provider inventory");
+        assert_eq!(
+            with_relay,
+            FragmentProcessPoolInventory {
+                relay_pool_max: crate::event_relay::RELAY_POOL_MAX,
+                ..inventory
             }
         );
     }
