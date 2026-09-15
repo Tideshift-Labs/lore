@@ -123,6 +123,19 @@ pub enum TerminalStatusAttachStatus {
     Phase2PostPruneCompletionReplayRequired,
     Mismatch,
     Invalid,
+    /// CR-029 D2 ordered completion. The request is well formed and carries the
+    /// assignment the platform durably allocated to it, but a LOWER-numbered
+    /// assignment in the same proof namespace has not produced its completion
+    /// marker yet, so this one is not eligible.
+    ///
+    /// NONTERMINAL, and every word of that matters: no marker row is inserted,
+    /// no tombstone is deleted, no reservation is released, no namespace or
+    /// counter revision moves, and the caller keeps the exact assignment it
+    /// sent. The same request becomes eligible, unchanged, once its
+    /// predecessors complete. A timeout on the predecessor is NOT a reason to
+    /// advance past it — that is the reviewed-reconciliation path, not this
+    /// status.
+    Phase2SequenceNotReady,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1782,6 +1795,7 @@ fn finish_terminal_ack(
         TerminalStatusAttachStatus::Phase2PostPruneCompletionReplayRequired => 8,
         TerminalStatusAttachStatus::Mismatch => 9,
         TerminalStatusAttachStatus::Invalid => 10,
+        TerminalStatusAttachStatus::Phase2SequenceNotReady => 11,
     }];
     ack.response_digest = canonical_digest(
         b"domain-terminal-status-attachment-response-v1",
@@ -2713,7 +2727,36 @@ pub async fn terminal_status_attach(
                     empty_terminal_ack(TerminalStatusAttachStatus::Mismatch),
                 );
             }
+            // CR-029 D2: completion markers commit in assigned sequence order.
+            // `next_sequence` is the next sequence ELIGIBLE for marker creation;
+            // `high_water` is the completed prefix. The two are distinguished
+            // here rather than collapsed into one Mismatch, because they mean
+            // opposite things to the caller:
+            //
+            //   ABOVE the head is a WAIT. The assignment is correct and the
+            //   request will become eligible unchanged once its predecessors
+            //   complete, so the caller must retain it and retry. Answering
+            //   Mismatch would tell a correct caller its binding was wrong, and
+            //   the only repair for that is a reviewed reconciliation nobody
+            //   needs.
+            //
+            //   AT OR BELOW the head is a conflict, and keeps the frozen
+            //   replay/mismatch rules untouched. An exact replay of an
+            //   already-completed sequence never reaches this arm at all: its
+            //   reserve-release tombstone is gone by then and the earlier
+            //   marker-lookup branch serves it.
+            //
+            // Nothing in this arm advances `next_sequence`, so a stalled
+            // predecessor can never be skipped by waiting it out. It is
+            // head-of-line blocking on purpose; the liveness hazard is carried
+            // by the platform's blocked-progress alert and its runbook.
             let expected_sequence: i64 = namespace.get("next_sequence");
+            if input.completion_marker_sequence > expected_sequence {
+                return finish_terminal_ack(
+                    input,
+                    empty_terminal_ack(TerminalStatusAttachStatus::Phase2SequenceNotReady),
+                );
+            }
             if input.completion_marker_sequence != expected_sequence {
                 return finish_terminal_ack(
                     input,

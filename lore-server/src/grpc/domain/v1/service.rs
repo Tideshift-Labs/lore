@@ -400,6 +400,9 @@ fn terminal_ack_response(
         }
         StoredStatus::Mismatch => DomainOperationTerminalStatusAttachmentStatusV1::Mismatch,
         StoredStatus::Invalid => DomainOperationTerminalStatusAttachmentStatusV1::Invalid,
+        StoredStatus::Phase2SequenceNotReady => {
+            DomainOperationTerminalStatusAttachmentStatusV1::Phase2SequenceNotReady
+        }
     };
     let range = ack.range;
     Ok(DomainOperationTerminalStatusAttachmentAckV1 {

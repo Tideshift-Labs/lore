@@ -368,6 +368,37 @@ delta produced. Keep it durable, not chronological — chronological execution n
   Mediated-schema setup seeds the singleton global counter at revision 0/quota 1; first
   materialization provisions the org row at revision/count 0 and atomically charges both. A
   capacity-revision rejection case must reread the seeded revision before submitting a mismatch.
+- **CR-029 D2 amendment: platform-ordered completion sequencing [SERVER]** (Part 3 of
+  `lorehub/docs/lore-change-requests/cr-029-delete-and-maintenance-amendments.md`): the
+  `TombstoneReleaseIntentComplete` arm in `maintenance.rs` compares
+  `input.completion_marker_sequence` against the namespace row's `next_sequence` three ways, not
+  one `!=`. `>` is `TerminalStatusAttachStatus::Phase2SequenceNotReady` (wire/status code 11,
+  nonterminal: no marker row, no tombstone delete, no counter/reserve mutation, exact assignment
+  retained for retry). `<` and every other conflicting field keep the frozen `Mismatch` path
+  unchanged. `==` is the unchanged success path. This only governs the arm reached while the
+  operation's own tombstone row still exists (pre-completion); once a marker exists and the
+  tombstone is gone, an unrelated earlier branch (`maintenance.rs` around line 2414, keyed by
+  tombstone-row absence) replays the stored marker regardless of current `next_sequence` — don't
+  route a "lower sequence" test through that path expecting the D2 comparison to run at all.
+  Coverage: `lore-postgres/tests/domain_maintenance.rs`'s
+  `terminal_phase2_completion_head_of_line_blocks_and_mutates_nothing` (head-of-line refusal +
+  full DB-untouched assertion, including counter revisions, which is also the structural proof
+  that `next_sequence` never advances outside the marker-insert transaction),
+  `..._unblocks_after_predecessor_retaining_assignment` (two operations sharing one namespace via
+  `prepare_operation_ready_for_completion`'s `shared_identity` param; the exact previously-refused
+  request succeeds unchanged once its predecessor completes; `high_water`/`next_sequence` pinned
+  1->2->3), `..._far_future_sequence_is_not_ready_not_mismatch` (ordering is strict, not a
+  one-ahead window), and `..._lower_sequence_and_replay_pin_current_behaviour` (a sequence below
+  `next_sequence` with no marker stays `Mismatch`; the frozen post-completion marker-replay path is
+  unaffected). `finish_terminal_ack` (the response-digest code mapping) is crate-private with no
+  inline `#[cfg(test)]` module, so code 11 is pinned only by independently re-deriving its BLAKE3
+  framing in the live test (`terminal_ack_response_digest`), not by a unit test — add one inline if
+  `maintenance.rs` ever grows a `mod tests`. Gate:
+  `cargo test -p lore-postgres -j 1 --test domain_maintenance -- --ignored --test-threads=1` under
+  `LORE_TEST_PG_URL` (or `run-domain-maintenance-live.ps1`, whose `$expectedCases` must list every
+  new case by exact name or `Assert-ExpectedCatalog` hard-fails before Docker even starts). Wire
+  pin: `lore-proto/tests/v1_domain_operation.rs`'s `enum_discriminants_are_frozen` asserts
+  `Phase2SequenceNotReady as i32 == 11` alongside the frozen 0-10.
 - **CR-030 lock fencing [SERVER, WP-117]**: `tests/run-lock-fencing-live.ps1` is the only evidence,
   and its `$inventory` is the definition of what ran — read it there rather than from a count
   written down here, which is how INV-EE P2-4 caught this entry restating a stale number inside its
@@ -389,6 +420,21 @@ delta produced. Keep it durable, not chronological — chronological execution n
   `grpc::handlers::branch_push::governed_tests` runs `publish`'s outcome mapping and CAS-retry
   suppression (P1-10) offline against `crate::domain::test_support::ScriptedDomainStore` (records
   every `branch_push_commit` input, every other method `unreachable!()`).
+  **D8 (2026-09-15): `ForceUnlock`'s gate gained a second arm.** `owner` OR "the caller IS the
+  lock's recorded holder" (`is_self_force_unlock`, `lore-server/src/grpc/mod.rs`). Unit gate:
+  `cargo test -p lore-server --lib -- is_self_force_unlock_tests`. A self-force still audits as
+  `LockTransition::ForceReleased` (`lock.force_released`, not `lock.released`) — the discriminator
+  is `lore_outbox_events.event_kind`, not the RPC's return code, so a positive case must assert the
+  event kind, not just `Ok`. Existing owner/migrate-gate refusal tests
+  (`p12_lock_service_fenced_routing.rs`) stay valid post-D8 only because their named target differs
+  from the caller's own subject — check that before assuming a permission-refusal test survives a
+  self-exception being added to its gate. One subtlety worth the extra test if you touch this again:
+  `is_self_force_unlock` builds both compared `VerifiedLockOwner`s from the SAME calling token's
+  issuer, so it cannot itself detect a same-subject-string caller under a *different* issuer than
+  the row's actual owner — that case is only caught one layer down, by
+  `release_inner`'s unconditional `row.owner.ct_matches(target)` (coordinator.rs:1002), which
+  refuses `FailedPrecondition`/`AuthorityMismatch`, never `PermissionDenied`. Test the gate and that
+  fallback separately; a gate-only test would wrongly look sufficient.
 - **CR-029 WP-116 Phase 4, gRPC metadata carriage, status mapping, and the admission gate
   [SERVER]**: offline, no Postgres. `domain_operation_metadata.rs`'s `extract`/`require` (R-BLOCK-2's
   one-reader header contract) and `scope_key_*` (R-BLOCK-5) are pinned in an inline `tests` module:

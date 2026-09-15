@@ -1568,6 +1568,478 @@ async fn terminal_phase1_mismatch_leaves_the_dispatch_fence_untouched() {
     );
 }
 
+/// A single operation carried through Phase 1 and the Phase-2 active-release acknowledgement,
+/// with its reserve-release tombstone aged so `TombstoneReleaseIntentComplete` no longer refuses
+/// on retention -- ready for a completion attempt at any sequence the caller supplies. CR-029's
+/// D2 amendment (`docs/lore-change-requests/cr-029-delete-and-maintenance-amendments.md`, Part 3).
+struct CompletionReadyOperation {
+    stale: VerifiedStaleFinalizeInput,
+    phase2_active: TerminalStatusAttachInput,
+    tombstone_digest: Vec<u8>,
+}
+
+/// Drive one operation identity through Phase 1 (fixture -> pending -> aged -> tombstone-ready)
+/// and the Phase-2 active-release acknowledgement, exactly as
+/// `terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tombstone` does inline,
+/// but factored so the D2 sequence-ordering tests below can drive more than one operation through
+/// it and, via `shared_identity`, share one namespace (verified_issuer/authenticated_subject/
+/// tenant_scope_key) across them the way real assignments in one namespace would.
+async fn prepare_operation_ready_for_completion(
+    store: &PostgresDomainStore,
+    direct: &mut Client,
+    clock: SystemTime,
+    shared_identity: Option<&ReceiptKey>,
+) -> CompletionReadyOperation {
+    let mut stale = stale_input(clock);
+    if let Some(shared) = shared_identity {
+        stale.key.verified_issuer = shared.verified_issuer.clone();
+        stale.key.authenticated_subject = shared.authenticated_subject.clone();
+        stale.key.tenant_scope_key = shared.tenant_scope_key.clone();
+        stale.witness.authorization_id = stale.key.operation_id.as_bytes().to_vec();
+    }
+    let public_result = prepare_terminal_fixture_by_the_rail(store, direct, &stale).await;
+    let phase1 = terminal_phase1_input(&stale, &public_result);
+    store
+        .domain_operation_terminal_status_attach(&phase1)
+        .await
+        .expect("phase1 pending attach");
+    direct
+        .execute(
+            "UPDATE lore_domain_operation_receipts SET compact_expires_at=clock_timestamp()-interval '1 second' \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4",
+            &[
+                &stale.key.verified_issuer,
+                &stale.key.authenticated_subject,
+                &stale.key.tenant_scope_key,
+                &stale.key.operation_id.as_bytes().as_slice(),
+            ],
+        )
+        .await
+        .expect("age receipt retention");
+    let ready = store
+        .domain_operation_terminal_status_attach(&phase1)
+        .await
+        .expect("phase1 exchange to tombstone");
+    assert_eq!(
+        ready.status,
+        TerminalStatusAttachStatus::Phase1TombstoneReady
+    );
+    let tombstone_digest = ready.fields[4]
+        .clone()
+        .expect("phase1 must return the tombstone digest");
+
+    let mut phase2 = phase1;
+    phase2.phase = TerminalStatusAttachPhase::Phase2ReleaseAck;
+    phase2.action = TerminalStatusAttachAction::ActiveReleaseIntentAck;
+    phase2.release_tombstone_digest = Some(tombstone_digest.clone());
+    phase2.active_release_intent_revision = Some(37);
+    phase2.active_release_intent_nonce = Some(rand::random::<[u8; 32]>().to_vec());
+    phase2.request_digest = rand::random::<[u8; 32]>().to_vec();
+    let active = store
+        .domain_operation_terminal_status_attach(&phase2)
+        .await
+        .expect("acknowledge active release intent");
+    assert_eq!(
+        active.status,
+        TerminalStatusAttachStatus::Phase2ActiveReleaseAcked
+    );
+
+    direct
+        .execute(
+            "UPDATE lore_domain_operation_reserve_release_tombstones \
+             SET created_at=clock_timestamp()-interval '3 seconds', \
+                 compact_after=clock_timestamp()-interval '2 seconds', \
+                 final_prune_after=clock_timestamp()-interval '1 second' \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4",
+            &[
+                &stale.key.verified_issuer,
+                &stale.key.authenticated_subject,
+                &stale.key.tenant_scope_key,
+                &stale.key.operation_id.as_bytes().as_slice(),
+            ],
+        )
+        .await
+        .expect("age tombstone retention past final prune");
+
+    CompletionReadyOperation {
+        stale,
+        phase2_active: phase2,
+        tombstone_digest,
+    }
+}
+
+/// Build a `TombstoneReleaseIntentComplete` request for `op` claiming `sequence`, with a correctly
+/// derived `expected_completion_marker_digest` for that exact sequence -- so a not-ready or
+/// out-of-order rejection below is decided by the D2 sequence gate itself, never by a coincidental
+/// digest mismatch.
+fn completion_request(
+    op: &CompletionReadyOperation,
+    epoch: &[u8],
+    sequence: i64,
+) -> TerminalStatusAttachInput {
+    let mut complete = op.phase2_active.clone();
+    complete.action = TerminalStatusAttachAction::TombstoneReleaseIntentComplete;
+    complete.final_prune_digest = Some(rand::random::<[u8; 32]>().to_vec());
+    complete.tombstone_release_intent_revision = Some(41);
+    complete.tombstone_release_intent_nonce = Some(rand::random::<[u8; 32]>().to_vec());
+    complete.request_digest = rand::random::<[u8; 32]>().to_vec();
+    complete.completion_marker_sequence = sequence;
+    complete.expected_completion_marker_digest = Some(completion_marker_digest(
+        &complete,
+        epoch,
+        &op.tombstone_digest,
+    ));
+    complete
+}
+
+async fn counter_revisions(client: &Client, org_uuid: &[u8]) -> (i64, i64) {
+    let row = client
+        .query_one(
+            "SELECT (SELECT counter_revision FROM lore_domain_proof_global_counters WHERE id=1), \
+                     (SELECT counter_revision FROM lore_domain_proof_org_counters WHERE org_uuid=$1)",
+            &[&org_uuid],
+        )
+        .await
+        .expect("read global/org counter revisions");
+    (row.get(0), row.get(1))
+}
+
+/// Independently reimplements `finish_terminal_ack`'s response-digest framing
+/// (`domain-terminal-status-attachment-response-v1`, BLAKE3, u32be length-prefixed
+/// `status_code || operation_id || request_digest || verification_digest`), the same way
+/// `completion_marker_digest` above independently reimplements the marker digest, so the D2
+/// amendment's new status code (11) is pinned by its own byte-exact digest, not merely by the
+/// returned `status` enum discriminant. `finish_terminal_ack` itself is crate-private with no
+/// unit-test module in `maintenance.rs`, so this is the only reachable way to pin its digest
+/// framing for the new code today.
+fn terminal_ack_response_digest(status_code: u8, input: &TerminalStatusAttachInput) -> Vec<u8> {
+    let mut canonical = Vec::new();
+    for part in [
+        b"domain-terminal-status-attachment-response-v1".as_slice(),
+        &[status_code],
+        input.key.operation_id.as_bytes(),
+        input.request_digest.as_slice(),
+        input.verification_digest.as_slice(),
+    ] {
+        let length =
+            u32::try_from(part.len()).expect("terminal ack response test field fits u32 frame");
+        canonical.extend_from_slice(&length.to_be_bytes());
+        canonical.extend_from_slice(part);
+    }
+    blake3::hash(&canonical).as_bytes().to_vec()
+}
+
+/// CR-029 D2 amendment (head-of-line blocking): a single operation's own tombstone is ready to
+/// complete, but its assigned sequence is one past the namespace's `next_sequence`. The completion
+/// attempt must be refused with `Phase2SequenceNotReady`, not `Mismatch`, and must mutate nothing:
+/// no completion marker row, the reserve-release tombstone still present, the namespace's
+/// `high_water`/`next_sequence` untouched, and neither proof counter's revision/retained-count/byte
+/// total moved. `next_sequence` only ever advances inside the same transaction that inserts a
+/// marker (there is no other writer of it in this file); asserting it is untouched here is that
+/// proof for this call, satisfying D2's "never skip a sequence because its operation timed out".
+#[tokio::test]
+#[ignore = "needs live Postgres env; run this test target serially with -- --ignored --test-threads=1"]
+async fn terminal_phase2_completion_head_of_line_blocks_and_mutates_nothing() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let mut direct = client(&url).await;
+    let clock = store.domain_operation_clock_get().await.expect("DB clock");
+
+    let op = prepare_operation_ready_for_completion(&store, &mut direct, clock, None).await;
+    let namespace = ProofNamespaceKey {
+        verified_issuer: op.stale.key.verified_issuer.clone(),
+        authenticated_subject: op.stale.key.authenticated_subject.clone(),
+        org_uuid: rand::random::<[u8; 16]>().to_vec(),
+        tenant_scope_key: op.stale.key.tenant_scope_key.clone(),
+    };
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let materialize = materialize_input(namespace, counter, quota);
+    let materialized = store
+        .domain_operation_proof_namespace_materialize(&materialize)
+        .await
+        .expect("materialize namespace");
+    assert_eq!(
+        materialized.status,
+        ProofNamespaceMaterializeStatus::Materialized
+    );
+
+    let not_ready = completion_request(&op, &materialize.namespace_epoch, 2);
+    let before_state = completion_state(&direct, &op.stale.key, &materialize).await;
+    let before_revisions = counter_revisions(&direct, &materialize.key.org_uuid).await;
+
+    let refused = store
+        .domain_operation_terminal_status_attach(&not_ready)
+        .await
+        .expect("a valid but not-yet-eligible sequence must not error");
+    assert_eq!(
+        refused.status,
+        TerminalStatusAttachStatus::Phase2SequenceNotReady,
+        "sequence 2 against a namespace whose next eligible sequence is 1 must be nonterminal, \
+         not Mismatch"
+    );
+    assert_eq!(
+        refused.response_digest,
+        terminal_ack_response_digest(11, &not_ready),
+        "the Phase2SequenceNotReady ack must use response-digest code 11"
+    );
+    assert_eq!(
+        completion_state(&direct, &op.stale.key, &materialize).await,
+        before_state,
+        "a not-yet-eligible completion must insert no marker, release no reserve, and leave the \
+         tombstone, namespace high_water/next_sequence, and retained-marker counts untouched"
+    );
+    assert_eq!(
+        counter_revisions(&direct, &materialize.key.org_uuid).await,
+        before_revisions,
+        "a not-yet-eligible completion must not advance either proof counter revision"
+    );
+
+    let replay = store
+        .domain_operation_terminal_status_attach(&not_ready)
+        .await
+        .expect("replay of the same not-yet-eligible request");
+    assert_eq!(
+        replay, refused,
+        "an identical not-ready request must replay to the exact same ack"
+    );
+    assert_eq!(
+        completion_state(&direct, &op.stale.key, &materialize).await,
+        before_state,
+        "the replay must not mutate state either"
+    );
+}
+
+/// CR-029 D2 amendment (unblocking + retained assignment): once the predecessor sequence
+/// completes, the exact same previously-refused higher-sequence request -- unchanged, not
+/// reconstructed -- now succeeds with `Phase2ReleaseCompletionReady`, retaining the assignment and
+/// binding it was refused with. `high_water`/`next_sequence` advance exactly 1 -> 2 -> 3 across the
+/// two completions.
+#[tokio::test]
+#[ignore = "needs live Postgres env; run this test target serially with -- --ignored --test-threads=1"]
+async fn terminal_phase2_completion_unblocks_after_predecessor_retaining_assignment() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let mut direct = client(&url).await;
+    let clock = store.domain_operation_clock_get().await.expect("DB clock");
+
+    let op1 = prepare_operation_ready_for_completion(&store, &mut direct, clock, None).await;
+    let shared_key = op1.stale.key.clone();
+    let op2 = prepare_operation_ready_for_completion(
+        &store,
+        &mut direct,
+        clock + Duration::from_secs(5),
+        Some(&shared_key),
+    )
+    .await;
+    assert_ne!(
+        op1.stale.key.operation_id, op2.stale.key.operation_id,
+        "the two operations sharing a namespace must still be distinct operations"
+    );
+
+    let namespace = ProofNamespaceKey {
+        verified_issuer: shared_key.verified_issuer.clone(),
+        authenticated_subject: shared_key.authenticated_subject.clone(),
+        org_uuid: rand::random::<[u8; 16]>().to_vec(),
+        tenant_scope_key: shared_key.tenant_scope_key.clone(),
+    };
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let materialize = materialize_input(namespace, counter, quota);
+    let materialized = store
+        .domain_operation_proof_namespace_materialize(&materialize)
+        .await
+        .expect("materialize shared namespace");
+    assert_eq!(
+        materialized.status,
+        ProofNamespaceMaterializeStatus::Materialized
+    );
+
+    let complete_1 = completion_request(&op1, &materialize.namespace_epoch, 1);
+    let complete_2 = completion_request(&op2, &materialize.namespace_epoch, 2);
+
+    let refused = store
+        .domain_operation_terminal_status_attach(&complete_2)
+        .await
+        .expect("higher sequence must be refused, not error");
+    assert_eq!(
+        refused.status,
+        TerminalStatusAttachStatus::Phase2SequenceNotReady
+    );
+    let op2_state_while_blocked = completion_state(&direct, &op2.stale.key, &materialize).await;
+    assert_eq!(
+        op2_state_while_blocked[0], 1,
+        "op2's own tombstone must still be present while it is blocked"
+    );
+    assert_eq!(
+        op2_state_while_blocked[1], 0,
+        "op2 must have no completion marker while it is blocked"
+    );
+
+    let completed_1 = store
+        .domain_operation_terminal_status_attach(&complete_1)
+        .await
+        .expect("predecessor sequence completes");
+    assert_eq!(
+        completed_1.status,
+        TerminalStatusAttachStatus::Phase2ReleaseCompletionReady
+    );
+    let after_first = completion_state(&direct, &op1.stale.key, &materialize).await;
+    assert_eq!(after_first[2], 1, "high_water must advance to 1");
+    assert_eq!(after_first[3], 2, "next_sequence must advance to 2");
+
+    let unblocked = store
+        .domain_operation_terminal_status_attach(&complete_2)
+        .await
+        .expect("the exact previously-refused request now completes");
+    assert_eq!(
+        unblocked.status,
+        TerminalStatusAttachStatus::Phase2ReleaseCompletionReady,
+        "the retained assignment must be honored once its predecessor is complete"
+    );
+    assert_eq!(
+        unblocked.fields[8], complete_2.expected_completion_marker_digest,
+        "unblocking must complete using the exact same marker digest/binding it was refused with"
+    );
+    let after_second = completion_state(&direct, &op2.stale.key, &materialize).await;
+    assert_eq!(after_second[0], 0, "op2's tombstone must now be deleted");
+    assert_eq!(after_second[1], 1, "op2 must now have exactly one marker");
+    assert_eq!(after_second[2], 2, "high_water must advance to 2");
+    assert_eq!(after_second[3], 3, "next_sequence must advance to 3");
+}
+
+/// CR-029 D2 amendment (ordering is strict, not a window): a sequence far past `next_sequence`
+/// (not merely one past it) is refused exactly the same way as the head-of-line case, covering "a
+/// valid higher sequence" generally rather than only an immediately-adjacent one, and must not be
+/// silently accepted or dropped.
+#[tokio::test]
+#[ignore = "needs live Postgres env; run this test target serially with -- --ignored --test-threads=1"]
+async fn terminal_phase2_completion_far_future_sequence_is_not_ready_not_mismatch() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let mut direct = client(&url).await;
+    let clock = store.domain_operation_clock_get().await.expect("DB clock");
+
+    let op = prepare_operation_ready_for_completion(&store, &mut direct, clock, None).await;
+    let namespace = ProofNamespaceKey {
+        verified_issuer: op.stale.key.verified_issuer.clone(),
+        authenticated_subject: op.stale.key.authenticated_subject.clone(),
+        org_uuid: rand::random::<[u8; 16]>().to_vec(),
+        tenant_scope_key: op.stale.key.tenant_scope_key.clone(),
+    };
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let materialize = materialize_input(namespace, counter, quota);
+    let materialized = store
+        .domain_operation_proof_namespace_materialize(&materialize)
+        .await
+        .expect("materialize namespace");
+    assert_eq!(
+        materialized.status,
+        ProofNamespaceMaterializeStatus::Materialized
+    );
+
+    let before_state = completion_state(&direct, &op.stale.key, &materialize).await;
+    let far_future = completion_request(&op, &materialize.namespace_epoch, 5);
+    let refused = store
+        .domain_operation_terminal_status_attach(&far_future)
+        .await
+        .expect("a far-future sequence must not error");
+    assert_eq!(
+        refused.status,
+        TerminalStatusAttachStatus::Phase2SequenceNotReady,
+        "a sequence far past next_sequence is still nonterminal, never Mismatch and never accepted"
+    );
+    assert_eq!(
+        completion_state(&direct, &op.stale.key, &materialize).await,
+        before_state
+    );
+}
+
+/// CR-029 D2 amendment (lower sequence keeps today's rules): a sequence below `next_sequence` that
+/// is not an existing marker stays `Mismatch`, exactly as before this amendment -- only the `>`
+/// case gained a new status; `<` is untouched. After the correct sequence completes, an exact
+/// replay of that same completion request (its own marker now exists, its tombstone is gone) must
+/// keep the current behaviour of `Phase2ReleaseCompletionReady`; this amendment does not touch
+/// that already-existing marker-replay code path.
+#[tokio::test]
+#[ignore = "needs live Postgres env; run this test target serially with -- --ignored --test-threads=1"]
+async fn terminal_phase2_completion_lower_sequence_and_replay_pin_current_behaviour() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping maintenance test");
+        return;
+    };
+    let store = store(&url).await;
+    let mut direct = client(&url).await;
+    let clock = store.domain_operation_clock_get().await.expect("DB clock");
+
+    let op = prepare_operation_ready_for_completion(&store, &mut direct, clock, None).await;
+    let namespace = ProofNamespaceKey {
+        verified_issuer: op.stale.key.verified_issuer.clone(),
+        authenticated_subject: op.stale.key.authenticated_subject.clone(),
+        org_uuid: rand::random::<[u8; 16]>().to_vec(),
+        tenant_scope_key: op.stale.key.tenant_scope_key.clone(),
+    };
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let materialize = materialize_input(namespace, counter, quota);
+    let materialized = store
+        .domain_operation_proof_namespace_materialize(&materialize)
+        .await
+        .expect("materialize namespace");
+    assert_eq!(
+        materialized.status,
+        ProofNamespaceMaterializeStatus::Materialized
+    );
+
+    let before_state = completion_state(&direct, &op.stale.key, &materialize).await;
+    let too_low = completion_request(&op, &materialize.namespace_epoch, 0);
+    let rejected = store
+        .domain_operation_terminal_status_attach(&too_low)
+        .await
+        .expect("a below-next sequence with no existing marker must not error");
+    assert_eq!(
+        rejected.status,
+        TerminalStatusAttachStatus::Mismatch,
+        "a sequence below next_sequence with no marker for it keeps the frozen Mismatch behaviour"
+    );
+    assert_eq!(
+        completion_state(&direct, &op.stale.key, &materialize).await,
+        before_state,
+        "a rejected below-next sequence must not mutate anything either"
+    );
+
+    let complete = completion_request(&op, &materialize.namespace_epoch, 1);
+    let completed = store
+        .domain_operation_terminal_status_attach(&complete)
+        .await
+        .expect("the correct sequence completes");
+    assert_eq!(
+        completed.status,
+        TerminalStatusAttachStatus::Phase2ReleaseCompletionReady
+    );
+
+    let replay = store
+        .domain_operation_terminal_status_attach(&complete)
+        .await
+        .expect("exact replay of the now-completed sequence");
+    assert_eq!(
+        replay.status,
+        TerminalStatusAttachStatus::Phase2ReleaseCompletionReady,
+        "an exact replay after the tombstone is gone and the marker exists keeps today's success \
+         reply -- this amendment does not add a Mismatch here"
+    );
+    assert_eq!(
+        replay, completed,
+        "the replay must return the exact same ack as the original completion"
+    );
+}
+
 /// Pure, offline pin over `WireTerminalOutcome` alone -- no `LORE_TEST_PG_URL` needed, so this
 /// runs (and would fail) with a plain `cargo test -p lore-postgres`, unlike every case around it
 /// that silently skips without a live Postgres.

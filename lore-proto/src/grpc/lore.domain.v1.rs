@@ -965,6 +965,13 @@ pub enum DomainOperationTerminalStatusAttachmentStatusV1 {
     Phase2PostPruneCompletionReplayRequired = 8,
     Mismatch = 9,
     Invalid = 10,
+    /// Nonterminal. The request is valid and its assignment is correct, but a
+    /// lower-numbered assignment in the same proof namespace has not completed
+    /// yet, so this completion marker is not eligible. No marker is created, no
+    /// reservation is released, and the caller keeps the exact assignment for a
+    /// later retry. Never returned for a lower or conflicting sequence: those
+    /// keep MISMATCH.
+    Phase2SequenceNotReady = 11,
 }
 impl DomainOperationTerminalStatusAttachmentStatusV1 {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1006,6 +1013,9 @@ impl DomainOperationTerminalStatusAttachmentStatusV1 {
             Self::Invalid => {
                 "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_INVALID"
             }
+            Self::Phase2SequenceNotReady => {
+                "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_SEQUENCE_NOT_READY"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1043,6 +1053,9 @@ impl DomainOperationTerminalStatusAttachmentStatusV1 {
             }
             "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_INVALID" => {
                 Some(Self::Invalid)
+            }
+            "DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_SEQUENCE_NOT_READY" => {
+                Some(Self::Phase2SequenceNotReady)
             }
             _ => None,
         }

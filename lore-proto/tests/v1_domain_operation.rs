@@ -517,6 +517,14 @@ fn enum_discriminants_are_frozen() {
         DomainOperationTerminalStatusAttachmentStatusV1::Invalid as i32,
         10
     );
+    // CR-029 D2 amendment: platform-ordered completion. 0-10 above are unchanged;
+    // this is the sole new value appended for a valid-but-not-yet-eligible
+    // completion sequence (a strictly higher `completion_marker_sequence` than
+    // the namespace's `next_sequence`).
+    assert_eq!(
+        DomainOperationTerminalStatusAttachmentStatusV1::Phase2SequenceNotReady as i32,
+        11
+    );
 
     assert_eq!(
         DomainOperationProofNamespaceMaterializeStatusV1::Materialized as i32,

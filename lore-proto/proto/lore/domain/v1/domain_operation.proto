@@ -314,6 +314,13 @@ enum DomainOperationTerminalStatusAttachmentStatusV1 {
   DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_POST_PRUNE_COMPLETION_REPLAY_REQUIRED = 8;
   DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_MISMATCH = 9;
   DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_INVALID = 10;
+  // Nonterminal. The request is valid and its assignment is correct, but a
+  // lower-numbered assignment in the same proof namespace has not completed
+  // yet, so this completion marker is not eligible. No marker is created, no
+  // reservation is released, and the caller keeps the exact assignment for a
+  // later retry. Never returned for a lower or conflicting sequence: those
+  // keep MISMATCH.
+  DOMAIN_OPERATION_TERMINAL_STATUS_ATTACHMENT_STATUS_V1_PHASE2_SEQUENCE_NOT_READY = 11;
 }
 
 message DomainOperationTerminalStatusAttachmentAckV1 {
